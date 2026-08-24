@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use freenet::conformance::ConformanceOracle;
 use freenet::conformance::generator::Corpus;
 use freenet::conformance::verifier::Bytes;
 use freenet::conformance::{
@@ -33,7 +34,7 @@ use freenet::conformance::{
     GeneratorConfig, Inconclusive, MinimizeConfig, OracleBuildError, PropertyOutcome, ReplayBundle,
     RuntimeOracle, Severity, Transition, generate_cases, minimize, verify_case,
 };
-use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId};
+use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId, State, UpdateData};
 use serde::Serialize;
 
 /// Run the contract conformance verifier (RFC #5320) against a contract's WASM.
@@ -68,6 +69,13 @@ pub struct ConformanceConfig {
     /// transition says the second was reached FROM the first, which is what makes
     /// "merging it back must reproduce it" a law rather than an accusation of
     /// last-write-wins against every conforming contract.
+    ///
+    /// ARGUMENT ORDER IS LOAD-BEARING AND CANNOT BE VERIFIED. BASE is the state
+    /// the peer HELD; RESULT is the state it REACHED. Supplied the other way
+    /// round, a perfectly conforming contract is reported as violating the law,
+    /// and nothing distinguishes that from a real finding — you are the witness
+    /// this property rests on. A likely-reversed pair is warned about, but the
+    /// check is a heuristic and cannot be conclusive.
     ///
     /// A capture bundle already carries these (`ReplayBundle::transitions`); this
     /// is how a developer supplies one by hand from two state files.
@@ -139,7 +147,12 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
         return verify_evidence(&config, &path).await;
     }
     let properties = parse_properties(&config.properties)?;
-    let (wasm, parameters, corpus) = load_inputs(&config)?;
+    let LoadedInputs {
+        wasm,
+        parameters,
+        corpus,
+        hand_supplied_steps,
+    } = load_inputs(&config)?;
 
     if corpus.is_empty() {
         anyhow::bail!("no states to check: the corpus is empty");
@@ -179,6 +192,7 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
         .await
         .map_err(describe_oracle_build_error)?;
     let instance = oracle.instance_id();
+    let _ = warn_on_reversed_transitions(&mut oracle, &hand_supplied_steps);
 
     let outcomes: Vec<(ConformanceCase, PropertyOutcome)> = cases
         .into_iter()
@@ -227,6 +241,57 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Warn when a hand-supplied `--transition BASE RESULT` pair looks reversed.
+///
+/// Argument order is load-bearing here and unverifiable. Every other malformed input
+/// to this command produces an error: an unreadable file, a WASM that will not load,
+/// a property name that does not exist. A REVERSED pair is the single exception,
+/// because it is structurally indistinguishable from a genuine finding - the whole
+/// reason `transition_path_agreement` is a law is that the corpus witnesses which
+/// state came first, and when a human types the two paths there is no witness but
+/// the order they typed them in.
+///
+/// The tell is that the law holds in the OTHER direction: if `merge(result, base)`
+/// reproduces `base`, then `base` sits above `result` in the merge's own order, so
+/// whatever was typed as `RESULT` is the earlier state. For a grow-only contract
+/// given the pair backwards this is exactly what happens, and the forward check then
+/// reports a violation against a perfectly conforming contract.
+///
+/// A warning rather than an error: a contract that genuinely disagrees in both
+/// directions is possible, and refusing to run would make a real finding
+/// unreportable. Stderr for the same reason `write_bundle` uses it - `--json` owns
+/// stdout.
+/// Returns how many pairs looked reversed, so a test can assert on the decision
+/// rather than on whether a line reached stderr.
+fn warn_on_reversed_transitions<O: ConformanceOracle + ?Sized>(
+    oracle: &mut O,
+    steps: &[(Bytes, Bytes)],
+) -> usize {
+    let mut suspicious = 0;
+    for (base, result) in steps {
+        let reversed =
+            oracle.update_state(result, &[UpdateData::State(State::from(base.to_vec()))]);
+        let Ok(modification) = reversed else {
+            continue;
+        };
+        let Some(state) = modification.new_state else {
+            continue;
+        };
+        if state.as_ref() == base.as_ref() {
+            suspicious += 1;
+            eprintln!(
+                "warning: for one --transition pair, merging BASE into RESULT \
+                 reproduces BASE, which is what a reversed pair looks like. \
+                 --transition takes the state the peer HELD first and the state it \
+                 REACHED second; supplied the other way round, a conforming \
+                 contract is reported as violating transition_path_agreement and \
+                 nothing can tell that apart from a real finding."
+            );
+        }
+    }
+    suspicious
+}
+
 /// Save the corpus under check as a replay bundle.
 ///
 /// Embeds the contract code, so the bundle names the contract it came from and
@@ -241,19 +306,48 @@ fn write_bundle(
 ) -> anyhow::Result<()> {
     let mut bundle = ReplayBundle::new(wasm.to_vec(), parameters.to_vec());
     bundle.states = corpus.states.iter().map(|s| s.to_vec()).collect();
-    bundle.deltas = corpus.deltas.iter().map(|d| d.to_vec()).collect();
     bundle.summaries = corpus.summaries.iter().map(|s| s.to_vec()).collect();
     // Carry the steps through, or `--bundle-out` would silently drop the one input
     // `transition_path_agreement` needs and the replayed bundle would report a clean
     // run where the original found something.
+    //
+    // Each step also reclaims the delta observed against its base. A `Transition` is
+    // the ONLY place a bundle can record what a delta was applied to:
+    // `ReplayBundle::to_corpus` fills `Corpus::delta_bases` from
+    // `transition.delta` + `transition.base_state`, and bundle-level `deltas` are
+    // explicitly given no base. Exporting the deltas loose therefore silently drops
+    // every pairing, and `delta_permutation_invariance` - which only pairs deltas
+    // observed against the SAME base - checks nothing on the re-exported bundle
+    // while the original run checked plenty. A replay that quietly covers less than
+    // the run it replays is the worst shape this command can have.
+    let (with_bases, loose): (Vec<usize>, Vec<usize>) =
+        (0..corpus.deltas.len()).partition(|i| corpus.delta_base(*i).is_some());
+    let mut unassigned = with_bases;
     bundle.transitions = corpus
         .transitions
         .iter()
-        .map(|(base, result)| Transition {
-            base_state: base.to_vec(),
-            result_state: result.to_vec(),
-            ..Default::default()
+        .map(|(base, result)| {
+            // Take one delta recorded against this exact base, at most one per step:
+            // that is the shape `to_corpus` produced them in, so re-pairing this way
+            // reconstructs the same `delta_bases` it built.
+            let taken = unassigned
+                .iter()
+                .position(|i| corpus.delta_base(*i).map(|b| b.as_ref()) == Some(base.as_ref()))
+                .map(|slot| unassigned.remove(slot));
+            Transition {
+                base_state: base.to_vec(),
+                result_state: result.to_vec(),
+                delta: taken.map(|i| corpus.deltas[i].to_vec()),
+                ..Default::default()
+            }
         })
+        .collect();
+    // Whatever no step claimed still travels, just without provenance - which is
+    // exactly what it had.
+    bundle.deltas = loose
+        .into_iter()
+        .chain(unassigned)
+        .map(|i| corpus.deltas[i].to_vec())
         .collect();
     bundle.note = Some(format!(
         "captured by fdev verify-merge {}",
@@ -506,7 +600,7 @@ fn find_code_in_store(store: &Path, bundle: &ReplayBundle) -> anyhow::Result<Vec
 
 /// Load the WASM, parameters and corpus, either from `--bundle` or from
 /// `--wasm` / `--params` / `--state`.
-fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>, Corpus)> {
+fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<LoadedInputs> {
     if let Some(bundle_path) = &config.bundle {
         let bundle = ReplayBundle::read_from(bundle_path)
             .with_context(|| format!("reading bundle {}", bundle_path.display()))?;
@@ -549,7 +643,14 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>, 
         }
 
         let corpus = bundle.to_corpus();
-        Ok((wasm, parameters, corpus))
+        // A bundle's steps carry real provenance from the capture path, so they are
+        // not hand-supplied and are not order-checked below.
+        Ok(LoadedInputs {
+            wasm,
+            parameters,
+            corpus,
+            hand_supplied_steps: Vec::new(),
+        })
     } else {
         let wasm_path = config
             .wasm
@@ -570,12 +671,16 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>, 
             states.push(read_file(path)?);
         }
         // `num_args = 2` guarantees an even count, so the chunks are always whole
-        // pairs; the assert states that rather than leaving a lone path to be
-        // silently dropped if the arg definition is ever loosened.
-        assert!(
-            config.transitions.len() % 2 == 0,
-            "--transition takes two paths per occurrence"
-        );
+        // pairs; this states that rather than leaving a lone path to be silently
+        // dropped if the arg definition is ever loosened. An error rather than a
+        // panic: this is a CLI invariant, and a user who somehow reaches it deserves
+        // a message rather than a backtrace.
+        if config.transitions.len() % 2 != 0 {
+            anyhow::bail!(
+                "--transition takes two paths per occurrence, got {}",
+                config.transitions.len()
+            );
+        }
         let mut steps: Vec<(Bytes, Bytes)> = Vec::with_capacity(config.transitions.len() / 2);
         for pair in config.transitions.chunks(2) {
             let base = read_file(&pair[0])?;
@@ -588,12 +693,32 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>, 
             steps.push((Bytes::from(base), Bytes::from(result)));
         }
         let corpus = Corpus {
-            transitions: steps,
+            transitions: steps.clone(),
             ..Corpus::from_states(states)
         }
         .deduplicated();
-        Ok((wasm, parameters, corpus))
+        Ok(LoadedInputs {
+            wasm,
+            parameters,
+            corpus,
+            hand_supplied_steps: steps,
+        })
     }
+}
+
+/// What a run was given: the contract, its parameters, the corpus, and separately
+/// the steps a human typed.
+///
+/// The last field exists only so [`warn_on_reversed_transitions`] can tell a
+/// hand-supplied pair from one a capture recorded. A bundle's steps are witnessed by
+/// the node that observed them; a `--transition BASE RESULT` pair is witnessed by
+/// nothing but argument order.
+#[derive(Debug)]
+struct LoadedInputs {
+    wasm: Vec<u8>,
+    parameters: Vec<u8>,
+    corpus: Corpus,
+    hand_supplied_steps: Vec<(Bytes, Bytes)>,
 }
 
 fn read_file(path: &PathBuf) -> anyhow::Result<Vec<u8>> {
@@ -634,6 +759,7 @@ fn write_evidence(
 
     let mut written = HashSet::new();
     let mut oversized = 0usize;
+    let mut local_only = 0usize;
     let mut shrunk_from = 0usize;
     let mut shrunk_to = 0usize;
     for (case, outcome) in outcomes {
@@ -657,6 +783,15 @@ fn write_evidence(
         let observed = verify_case(oracle, &minimized).violation().cloned();
         let evidence =
             ConformanceEvidence::new(instance, parameters.to_vec(), &minimized, observed);
+
+        // A property whose premise the bytes cannot carry is not evidence at all,
+        // and saying "could not be reduced to a shippable size" about one would be a
+        // false explanation of a permanent condition. It is not a failure either:
+        // the finding is real and this command reported it, it simply never travels.
+        if !minimized.property.is_self_verifying() {
+            local_only += 1;
+            continue;
+        }
 
         // Bounds-check with the same function a receiving peer uses, so this command
         // cannot report having written evidence that no peer would accept.
@@ -684,6 +819,7 @@ fn write_evidence(
     Ok(EvidenceSummary {
         directory: dir.display().to_string(),
         files_written: written.len(),
+        findings_local_only: local_only,
         findings_too_large: oversized,
         input_bytes_before_shrinking: shrunk_from,
         input_bytes_after_shrinking: shrunk_to,
@@ -694,6 +830,11 @@ fn write_evidence(
 struct EvidenceSummary {
     directory: String,
     files_written: usize,
+    /// Findings from a property that is not self-verifying, so no evidence can be
+    /// built for it at all. Reported rather than swallowed, and deliberately NOT
+    /// counted as "too large": the reason is permanent and has nothing to do with
+    /// size. See `ConformanceProperty::premise_source`.
+    findings_local_only: usize,
     /// Findings that stayed over the evidence size bound even after shrinking.
     /// Reported rather than swallowed: they are real findings that simply cannot be
     /// propagated, and silently writing nothing would look like there were none.
@@ -1024,6 +1165,186 @@ mod stdout_purity_pin {
 mod tests {
     use super::*;
     use freenet::conformance::Violation;
+
+    /// A grow-only union contract, enough to exercise the reversed-pair heuristic
+    /// without a WASM runtime.
+    struct GrowOnly;
+
+    impl ConformanceOracle for GrowOnly {
+        fn validate_state(
+            &mut self,
+            _state: &[u8],
+            _related: &freenet_stdlib::prelude::RelatedContracts<'_>,
+        ) -> Result<freenet_stdlib::prelude::ValidateResult, freenet::conformance::OracleError>
+        {
+            Ok(freenet_stdlib::prelude::ValidateResult::Valid)
+        }
+
+        fn update_state(
+            &mut self,
+            state: &[u8],
+            updates: &[UpdateData<'_>],
+        ) -> Result<
+            freenet_stdlib::prelude::UpdateModification<'static>,
+            freenet::conformance::OracleError,
+        > {
+            let mut out = state.to_vec();
+            for update in updates {
+                match update {
+                    UpdateData::State(incoming) => out.extend_from_slice(incoming.as_ref()),
+                    UpdateData::Delta(delta) => out.extend_from_slice(delta.as_ref()),
+                    _ => {}
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            Ok(freenet_stdlib::prelude::UpdateModification::valid(
+                State::from(out),
+            ))
+        }
+
+        fn summarize_state(
+            &mut self,
+            state: &[u8],
+        ) -> Result<Vec<u8>, freenet::conformance::OracleError> {
+            Ok(state.to_vec())
+        }
+
+        fn get_state_delta(
+            &mut self,
+            state: &[u8],
+            summary: &[u8],
+        ) -> Result<Vec<u8>, freenet::conformance::OracleError> {
+            Ok(state
+                .iter()
+                .copied()
+                .filter(|b| !summary.contains(b))
+                .collect())
+        }
+    }
+
+    /// A reversed `--transition BASE RESULT` pair is the one malformed input this
+    /// command cannot turn into an error, so it must at least be warned about.
+    ///
+    /// Argument order is the entire provenance `transition_path_agreement` rests on
+    /// when a human supplies the pair. Given the two paths the wrong way round, a
+    /// perfectly conforming grow-only contract is reported as violating the law and
+    /// nothing distinguishes that from a real finding — the failure is silent and
+    /// confident, which is the worst combination.
+    #[test]
+    fn a_reversed_transition_pair_is_warned_about_and_a_correct_one_is_not() {
+        let earlier = Bytes::from(vec![1u8, 2]);
+        let later = Bytes::from(vec![1u8, 2, 3]);
+
+        assert_eq!(
+            warn_on_reversed_transitions(&mut GrowOnly, &[(earlier.clone(), later.clone())]),
+            0,
+            "a correctly ordered pair must not be warned about, or the warning is \
+             noise on every run and stops being read"
+        );
+        assert_eq!(
+            warn_on_reversed_transitions(&mut GrowOnly, &[(later, earlier)]),
+            1,
+            "merging BASE into RESULT reproducing BASE is what a reversed pair \
+             looks like, and it is the only tell there is"
+        );
+    }
+
+    /// The `--transition` arity invariant is an error, not a panic.
+    ///
+    /// `num_args = 2` makes it unreachable through clap today; the point is that
+    /// loosening the arg definition later must not turn a user's mistake into a
+    /// backtrace, and must not silently drop a lone path either.
+    #[test]
+    fn an_odd_number_of_transition_paths_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wasm = dir.path().join("c.wasm");
+        // Never loaded: the arity check is reached long before any runtime exists.
+        std::fs::write(&wasm, b"\0asm-stand-in").expect("write wasm");
+        let config = ConformanceConfig {
+            wasm: Some(wasm),
+            params: None,
+            states: Vec::new(),
+            transitions: vec![PathBuf::from("only-one.bin")],
+            bundle: None,
+            contract_store: None,
+            max_cases: None,
+            properties: Vec::new(),
+            json: false,
+            evidence_out: None,
+            evidence_in: None,
+            bundle_out: None,
+        };
+        let err = load_inputs(&config).expect_err("an odd count must be rejected");
+        assert!(
+            err.to_string().contains("--transition takes two paths"),
+            "the error must name the argument, got: {err}"
+        );
+    }
+
+    /// `--bundle-out` must re-export a corpus that replays to the SAME corpus.
+    ///
+    /// Not just the same states and steps: the same `delta_bases`. A `Transition` is
+    /// the only place a bundle can record what a delta was applied to, because
+    /// `ReplayBundle::to_corpus` deliberately gives bundle-level deltas no base at
+    /// all — pairing causally sequenced deltas asks about a situation the protocol
+    /// never produces. So re-exporting a transition without its `delta` drops every
+    /// pairing, and `delta_permutation_invariance` — which pairs only deltas
+    /// observed against the SAME base — checks nothing on the replayed bundle while
+    /// the original run checked plenty.
+    ///
+    /// That is the worst shape this command can have: the replay reports a clean run
+    /// and reads as a reproduction of the original.
+    #[test]
+    fn a_re_exported_bundle_keeps_what_each_delta_was_applied_to() {
+        let code = b"\0asm-stand-in".to_vec();
+        let base = vec![1u8, 2];
+        // Two deltas against the SAME base: the pairing this exists to preserve.
+        let bundle_in = ReplayBundle {
+            transitions: vec![
+                Transition {
+                    base_state: base.clone(),
+                    result_state: vec![1, 2, 3],
+                    delta: Some(vec![3]),
+                    ..Default::default()
+                },
+                Transition {
+                    base_state: base.clone(),
+                    result_state: vec![1, 2, 4],
+                    delta: Some(vec![4]),
+                    ..Default::default()
+                },
+            ],
+            ..ReplayBundle::new(code.clone(), Vec::new())
+        };
+
+        let original = bundle_in.to_corpus();
+        assert_eq!(
+            original.delta_bases,
+            vec![
+                Some(Bytes::from(base.clone())),
+                Some(Bytes::from(base.clone()))
+            ],
+            "the fixture must actually carry provenance, or the round trip below \
+             has nothing to lose"
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("out.bin");
+        write_bundle(&path, &code, &[], &original).expect("write bundle");
+        let round_tripped = ReplayBundle::read_from(&path)
+            .expect("read bundle")
+            .to_corpus();
+
+        assert_eq!(round_tripped.transitions, original.transitions);
+        assert_eq!(round_tripped.deltas, original.deltas);
+        assert_eq!(
+            round_tripped.delta_bases, original.delta_bases,
+            "a re-exported bundle must pair each delta with the state it was \
+             applied to, exactly as the corpus it was written from did"
+        );
+        assert_eq!(round_tripped.states, original.states);
+    }
 
     /// Evidence is resolved by deriving each candidate's instance id, not by name.
     ///

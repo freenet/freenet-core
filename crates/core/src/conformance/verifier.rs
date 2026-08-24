@@ -551,14 +551,25 @@ fn run<O: ConformanceOracle + ?Sized>(
             require_valid(oracle, &settled, &case.related)?;
 
             let merged = merge(oracle, base, &settled)?;
+            // Both sides of the comparison get the same validity precondition, for
+            // the same reason `path_agreement` validates both of its outputs: a
+            // state the contract itself rejects never reaches another peer, so
+            // reasoning about it is reasoning about a history that cannot happen.
+            //
+            // Without this, a merge that EMITS an invalid state is reported under
+            // this property rather than under `EmittedStateValidity`, which is the
+            // law that actually names that defect. One law per property is the rule
+            // this module follows everywhere else.
+            require_valid(oracle, &merged, &case.related)?;
             Ok(compare(
                 case.property,
                 &merged,
                 &settled,
-                "merging a state a peer actually REACHED back into the state it came \
-                 from did not reproduce it, so the merge path cannot reach what the \
-                 update path reached: every peer that receives this state merges it \
-                 into something else, and the two can never agree",
+                "merging the settled form of a state a peer actually REACHED back \
+                 into the state it came from did not reproduce that settled form, so \
+                 the merge path cannot reach what the update path reached: every \
+                 peer that receives this state merges it into something else, and \
+                 the two can never agree",
             ))
         }
     }

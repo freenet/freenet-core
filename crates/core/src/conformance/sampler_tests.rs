@@ -5,6 +5,8 @@
 //! bytes once, byte budgets, large states, restart reconstruction, and focus
 //! rotation.
 
+use std::sync::Arc;
+
 use freenet_stdlib::prelude::ContractInstanceId;
 
 use super::focus::FocusSelector;
@@ -66,7 +68,22 @@ fn the_in_memory_corpus_carries_transition_provenance() {
     // transition is, or a finding on a live node would vanish on replay.
     let bundle = sampler.to_bundle(None, Some([0u8; 32]), Vec::new());
     assert_eq!(bundle.transitions.len(), 1);
-    assert_eq!(bundle.to_corpus().transitions, corpus.transitions);
+    let replayed = bundle.to_corpus();
+    assert_eq!(replayed.transitions, corpus.transitions);
+
+    // ...and about what a delta was applied TO. `delta_bases` is the second thing a
+    // transition carries, and the only thing that pairs deltas for
+    // `delta_permutation_invariance` — which pairs only deltas observed against the
+    // SAME base. Comparing transitions alone lets an export drop every base while
+    // this pin stays green, and a replay that quietly covers less than the run it
+    // replays is the worst shape an export can have.
+    assert_eq!(
+        corpus.delta_bases,
+        vec![Some(Arc::from(base.as_slice()))],
+        "the observed delta must be recorded against the state it was applied to"
+    );
+    assert_eq!(replayed.delta_bases, corpus.delta_bases);
+    assert_eq!(replayed.deltas, corpus.deltas);
 }
 
 // ------------------------------------------------------------------ deduplication

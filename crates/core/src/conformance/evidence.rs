@@ -9,6 +9,14 @@
 //! Consequently everything needed to re-run the check must be *in* the evidence,
 //! and the whole thing must stay small enough that verifying one is cheaper than
 //! being asked to.
+//!
+//! The sharper form of that first requirement is what [`ConformanceEvidence::check_bounds`]
+//! enforces first: a law whose PREMISE cannot be carried in the bytes is not
+//! shippable at all, however small it is. Re-execution re-establishes a universally
+//! quantified identity over valid states no matter where the states came from, but
+//! it cannot re-establish a fact about how the sender OBSERVED them - and the sender
+//! is precisely the party this design refuses to trust. Such a property is marked
+//! [`PremiseSource::LocalProvenance`] and refused at the door.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +24,7 @@ use std::sync::Arc;
 use freenet_stdlib::prelude::{ContractInstanceId, RelatedContracts, State};
 use serde::{Deserialize, Serialize};
 
-use super::property::{ConformanceProperty, Violation};
+use super::property::{ConformanceProperty, PremiseSource, Violation};
 use super::verifier::ConformanceCase;
 
 /// Bump when the meaning of a field changes. A peer that does not understand a
@@ -81,6 +89,13 @@ pub enum EvidenceRejected {
     TooLarge { found: usize, limit: usize },
     #[error("evidence carries {found} related contracts, limit is {limit}")]
     TooManyRelated { found: usize, limit: usize },
+    /// The property is not self-verifying, so no amount of re-execution could
+    /// establish its premise. See [`PremiseSource`].
+    #[error(
+        "{property} rests on provenance the evidence bytes cannot carry, so it is \
+         local-only and never shippable as evidence"
+    )]
+    NotSelfVerifying { property: ConformanceProperty },
     #[error(
         "{property} needs {want} states and {want_deltas} deltas, evidence has {got} and {got_deltas}"
     )]
@@ -149,6 +164,37 @@ impl ConformanceEvidence {
             return Err(EvidenceRejected::UnsupportedSchema {
                 found: self.schema_version,
                 supported: EVIDENCE_SCHEMA_VERSION,
+            });
+        }
+        // Refuse a property whose premise the recipient could not re-establish even
+        // by running every byte of this evidence through its own copy of the
+        // contract.
+        //
+        // This is the front door's most important check, and it is not a size or a
+        // schema question: it is the one place the ship-inputs-not-verdicts design
+        // can be subverted. Every other property here is a universally quantified
+        // identity over valid states, so re-execution re-establishes the whole
+        // premise and a fabricated case can only surface a real defect sooner. A
+        // property that is a law only because the SENDER observed something — that
+        // `result` was reached from `base`, in `TransitionPathAgreement`'s case —
+        // hands the recipient an accusation it can confirm but cannot check, because
+        // the witness is not in the bytes and cannot be put there. A fabricated pair
+        // from a conforming grow-only contract is structurally indistinguishable
+        // from a genuine information-losing update, so every peer that received it
+        // would independently reach a removal-eligible verdict against a correct
+        // contract.
+        //
+        // Refused rather than deprioritised: a lower rank still lets it in, and the
+        // whole point of the front door is that unsound input never reaches the
+        // WASM. The property keeps its full value where provenance is observed
+        // directly (shadow mode, `fdev`); it simply never travels.
+        if !self.property.is_self_verifying() {
+            debug_assert_eq!(
+                self.property.premise_source(),
+                PremiseSource::LocalProvenance
+            );
+            return Err(EvidenceRejected::NotSelfVerifying {
+                property: self.property,
             });
         }
         let bytes = self.input_bytes();

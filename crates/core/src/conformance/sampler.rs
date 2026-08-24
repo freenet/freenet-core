@@ -363,12 +363,31 @@ impl ContractSampler {
             .filter_map(|h| self.blobs.get(h))
             .map(|b| Arc::from(b.as_slice()))
             .collect();
-        let deltas: Vec<Bytes> = self
-            .transitions
-            .iter()
-            .filter_map(|t| t.delta.as_ref())
-            .map(|d| Arc::from(d.as_slice()))
-            .collect();
+        // Each delta travels WITH the state it was applied to.
+        //
+        // `delta_bases` is the only thing that pairs deltas for
+        // `DeltaPermutationInvariance`, which pairs only deltas observed against the
+        // SAME base — deltas with no recorded base are not paired at all, on purpose,
+        // because permuting causally sequenced deltas asks about a situation the
+        // protocol never produces. Leaving the bases behind therefore did not
+        // degrade that check on a live node, it disabled it: every delta arrived
+        // unprovenanced and no pair was ever built, while `ReplayBundle::to_corpus`
+        // — the offline path — filled them in and checked plenty. The two must
+        // agree, or shadow mode covers less than the replay of its own export.
+        let mut deltas: Vec<Bytes> = Vec::new();
+        let mut delta_bases: Vec<Option<Bytes>> = Vec::new();
+        for record in &self.transitions {
+            let Some(delta) = record.delta.as_ref() else {
+                continue;
+            };
+            deltas.push(Arc::from(delta.as_slice()));
+            // The same resolver the steps below use, so a delta and the step it came
+            // from cannot disagree about what the base was.
+            delta_bases.push(
+                self.materialize(record)
+                    .map(|m| Arc::from(m.base_state.as_slice())),
+            );
+        }
         let summaries: Vec<Bytes> = self
             .transitions
             .iter()
@@ -398,6 +417,7 @@ impl ContractSampler {
         Corpus {
             states,
             deltas,
+            delta_bases,
             summaries,
             transitions,
             ..Default::default()
@@ -431,7 +451,19 @@ impl ContractSampler {
             parameters,
             instance: None,
             states: corpus.states.iter().map(|s| s.to_vec()).collect(),
-            deltas: corpus.deltas.iter().map(|d| d.to_vec()).collect(),
+            // Only deltas that have no step to travel on. Every other delta rides on
+            // its `Transition`, which is the ONLY place a bundle can record what a
+            // delta was applied to — `ReplayBundle::to_corpus` gives bundle-level
+            // deltas no base at all, by design. Emitting a delta in both places used
+            // to leave the replayed corpus holding the unprovenanced copy, so the
+            // export of a corpus covered less than the corpus itself.
+            deltas: corpus
+                .deltas
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| corpus.delta_base(*i).is_none())
+                .map(|(_, d)| d.to_vec())
+                .collect(),
             summaries: corpus.summaries.iter().map(|s| s.to_vec()).collect(),
             transitions: self
                 .transitions

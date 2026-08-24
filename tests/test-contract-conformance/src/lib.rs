@@ -23,9 +23,12 @@
 //!                                the state: real wall-clock time, the #4857 class.
 //!   5 CAPPED_SET               — merge caps the collection at N entries, evicting
 //!                                by something other than the merge's own ordering.
-//!                                Commutative and idempotent; only a three-state
-//!                                case reveals it. The one mode the pairwise laws
-//!                                cannot catch.
+//!                                Commutative and idempotent, so no PAIRWISE state
+//!                                law sees it and only a three-state case reveals
+//!                                it. The transition law sees it too, from the same
+//!                                information loss, and that is asserted rather than
+//!                                left implicit — but associativity is the law that
+//!                                names it, and the pairwise ones stay silent.
 //!   6 NEVER_SETTLES            — merge rewrites the state on every apply, so
 //!                                merge(A, A) never reaches a fixpoint. Idempotence
 //!                                and associativity break; commutativity still HOLDS
@@ -151,6 +154,23 @@ fn collapse_by_key(entries: &[u8], keep_last: bool) -> Vec<u8> {
     out
 }
 
+/// Union, then evict down to [`CAP`] entries by an index derived from the set's own
+/// contents - i.e. by something INDEPENDENT of the merge's own ordering.
+///
+/// Shared by both write paths on purpose. A cap applied on one path and not the
+/// other would make [`CAPPED_SET`] a second path-disagreement mode, which is
+/// [`PATH_DISAGREEMENT`]'s job; worse, it would let the delta path emit a state with
+/// more than `CAP` entries, which the merge path can never produce, so any finding
+/// against such a state would be a finding about a state the contract cannot reach.
+fn capped(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut out = union(a, b);
+    while out.len() > CAP {
+        let sum: usize = out.iter().map(|byte| *byte as usize).sum();
+        out.remove(sum % out.len());
+    }
+    out
+}
+
 fn union(a: &[u8], b: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = a.iter().chain(b.iter()).copied().collect();
     out.sort_unstable();
@@ -214,14 +234,7 @@ fn merge_state(m: u8, current: &[u8], incoming: &[u8]) -> Vec<u8> {
         // The pairwise laws still hold: the result depends only on the union, so
         // it is commutative, and a state already at or under the cap merged with
         // itself is unchanged, so it is idempotent. Only the triple reveals it.
-        CAPPED_SET => {
-            let mut out = union(current, incoming);
-            while out.len() > CAP {
-                let sum: usize = out.iter().map(|b| *b as usize).sum();
-                out.remove(sum % out.len());
-            }
-            out
-        }
+        CAPPED_SET => capped(current, incoming),
         // First write wins on a key collision — `entry(key).or_insert(value)`.
         //
         // Resolving against the UNION rather than against "whichever argument the
@@ -251,6 +264,13 @@ fn merge_state(m: u8, current: &[u8], incoming: &[u8]) -> Vec<u8> {
 fn apply_delta(m: u8, current: &[u8], delta: &[u8]) -> Vec<u8> {
     match m {
         MUTUAL_REJECTION => current.to_vec(),
+        // The cap applies to BOTH write paths, or this mode's delta path emits a
+        // state with more than CAP entries - a state the merge path can never
+        // produce, and one `validate_state` would have to accept for the case to run
+        // at all. A transition recorded against such a state reaches the right
+        // verdict for the wrong reason: the finding would be about the missing cap,
+        // not about the eviction rule. See `capped`.
+        CAPPED_SET => capped(current, delta),
         // Last write wins on a key collision — `insert(key, value)`.
         //
         // Max-per-key, which is just as sound a semilattice as the merge path's

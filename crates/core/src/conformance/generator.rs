@@ -90,8 +90,16 @@ impl Corpus {
         self.delta_bases.get(i).and_then(Option::as_ref)
     }
 
+    /// Nothing here can produce a case.
+    ///
+    /// Transitions are counted as well as states. A corpus can legitimately carry
+    /// steps and no loose states (`fdev --transition` pushes both endpoints into
+    /// `states` today, but the sampler's own records and any future caller need
+    /// not), and a states-only test would short-circuit `generate_cases` before the
+    /// transition queue was ever built, so the one property that depends on
+    /// provenance would silently check nothing.
     pub fn is_empty(&self) -> bool {
-        self.states.is_empty()
+        self.states.is_empty() && self.transitions.is_empty()
     }
 }
 
@@ -100,13 +108,33 @@ fn dedup_with_bases(
     deltas: Vec<Bytes>,
     bases: Vec<Option<Bytes>>,
 ) -> (Vec<Bytes>, Vec<Option<Bytes>>) {
-    let mut seen = std::collections::HashSet::new();
-    let mut kept_deltas = Vec::with_capacity(deltas.len());
-    let mut kept_bases = Vec::with_capacity(deltas.len());
+    let mut seen: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
+    let mut kept_deltas: Vec<Bytes> = Vec::with_capacity(deltas.len());
+    let mut kept_bases: Vec<Option<Bytes>> = Vec::with_capacity(deltas.len());
     for (i, delta) in deltas.into_iter().enumerate() {
-        if seen.insert(*blake3::hash(&delta).as_bytes()) {
-            kept_bases.push(bases.get(i).cloned().flatten());
-            kept_deltas.push(delta);
+        let base = bases.get(i).cloned().flatten();
+        match seen.entry(*blake3::hash(&delta).as_bytes()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(kept_deltas.len());
+                kept_bases.push(base);
+                kept_deltas.push(delta);
+            }
+            // First-seen order still decides which copy is KEPT, but a later copy
+            // that carries provenance upgrades the one already kept.
+            //
+            // Dropping to the first copy unconditionally is how a delta that appears
+            // both loose and on a transition — which is exactly what a bundle
+            // carrying both looks like — ends up unprovenanced, and an unprovenanced
+            // delta is never paired at all, so the permutation law silently checks
+            // nothing. Two identical delta byte strings observed against different
+            // bases already had an arbitrary one chosen; None to Some is strictly
+            // more information than that.
+            std::collections::hash_map::Entry::Occupied(slot) => {
+                let at = *slot.get();
+                if kept_bases[at].is_none() {
+                    kept_bases[at] = base;
+                }
+            }
         }
     }
     (kept_deltas, kept_bases)
@@ -132,6 +160,15 @@ pub struct GeneratorConfig {
     pub max_case_bytes: usize,
     /// Cap on states considered for pairing, since pairs grow quadratically.
     pub max_states_paired: usize,
+    /// Cap on recorded steps considered for `TransitionPathAgreement`.
+    ///
+    /// The transition branch does not pair anything, so it does not grow
+    /// quadratically - but it is linear in a corpus a busy contract fills without
+    /// limit, and every other arity branch is bounded. An unbounded queue here would
+    /// let one contract's step history crowd the interleave and decide which laws
+    /// the case budget reaches, which is exactly what the interleave exists to
+    /// prevent.
+    pub max_transitions: usize,
     pub seed: u64,
 }
 
@@ -142,6 +179,7 @@ impl Default for GeneratorConfig {
             properties: ConformanceProperty::ALL.to_vec(),
             max_case_bytes: 4 * 1024 * 1024,
             max_states_paired: 24,
+            max_transitions: 24,
             seed: 0,
         }
     }
@@ -230,8 +268,8 @@ fn cases_for(
     // that branch would emit `(A, B)` for every pair in the corpus and accuse every
     // conforming contract of last-write-wins.
     if property == ConformanceProperty::TransitionPathAgreement {
-        for (base, result) in &corpus.transitions {
-            push(build(vec![base.clone(), result.clone()]));
+        for (base, result) in sampled_transitions(corpus, config) {
+            push(build(vec![base, result]));
         }
         return cases;
     }
@@ -314,6 +352,22 @@ fn paired_states(corpus: &Corpus, config: &GeneratorConfig) -> Vec<Bytes> {
     let stride = n as f64 / config.max_states_paired as f64;
     (0..config.max_states_paired)
         .map(|i| corpus.states[((i as f64) * stride) as usize % n].clone())
+        .collect()
+}
+
+/// Deterministically choose which recorded steps to check.
+///
+/// Strided rather than truncated, for the same reason [`paired_states`] strides:
+/// observations arrive in time order, so the first N steps are all from the same few
+/// minutes and would test a contract only against its own recent past.
+fn sampled_transitions(corpus: &Corpus, config: &GeneratorConfig) -> Vec<(Bytes, Bytes)> {
+    let n = corpus.transitions.len();
+    if n <= config.max_transitions {
+        return corpus.transitions.clone();
+    }
+    let stride = n as f64 / config.max_transitions as f64;
+    (0..config.max_transitions)
+        .map(|i| corpus.transitions[((i as f64) * stride) as usize % n].clone())
         .collect()
 }
 

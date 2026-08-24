@@ -213,11 +213,17 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
 
     // ------------------------------------------------- mode 5: capped collection
     //
-    // The only planted defect that the pairwise laws cannot see. Asserting the
+    // The only planted defect that the PAIRWISE state laws cannot see. Asserting the
     // associativity violation alone would not show that: a mode that also broke
     // commutativity would satisfy that assertion while proving nothing about the
     // three-state check. So assert the pairwise laws still HOLD here — that is
     // what makes this a test of associativity specifically.
+    //
+    // "Pairwise" is doing real work in that sentence: the transition law sees this
+    // mode too, from the same information loss, and that is asserted deliberately
+    // further down rather than being an exception this loop must dodge. The claim
+    // is that associativity is the law that NAMES the defect and no pairwise state
+    // law fires, not that nothing else in the module can see it.
     let mut capped = RuntimeOracle::standalone(wasm.clone(), vec![CAPPED_SET]).await?;
     let associativity_case = ConformanceCase::new(
         ConformanceProperty::StateAssociativity,
@@ -237,12 +243,13 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
             vec![bytes(&[1, 2]), bytes(&[3, 4])],
         ),
     ] {
-        let outcome = verify_case(&mut capped, &pairwise);
-        assert!(
-            !outcome.is_violation(),
-            "the capped-collection mode should break associativity ALONE, but {} \
-             also reported a violation: {outcome:?}",
-            pairwise.property
+        let property = pairwise.property;
+        assert_eq!(
+            verify_case(&mut capped, &pairwise),
+            PropertyOutcome::Holds,
+            "among the PAIRWISE state laws the capped-collection mode should break \
+             none — associativity is the one that names it — but {property} did not \
+             hold"
         );
     }
 
@@ -257,11 +264,30 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
     // removal-eligible either way; what matters is that it is a real divergence and
     // not an artifact of capping.
     //
+    // The cap applies to the mode's DELTA path as well as its merge path, which is
+    // what makes that true. Without it the recorded `result` would carry more than
+    // CAP entries — a state the merge path can never emit — and the assertion below
+    // would land on the right verdict for the wrong reason: it would be reporting
+    // the missing cap, not the eviction rule.
+    //
     // The contrasting SOUND cap (keep the largest N, evicting BY the merge order) is
     // pinned silent in `tests.rs::a_sound_bounded_collection_is_not_accused` — the
     // two together are what show the property discriminates rather than flagging
     // every bounded collection.
     let capped_transition = transition_case(&mut capped, &[1, 2], &[3, 4, 5])?;
+    // The recorded result must be a state the MERGE path could also have emitted.
+    //
+    // Without the cap on the delta path this is a five-entry state against a cap of
+    // three — something `merge_state` can never produce — and the violation below
+    // would be reporting the missing cap rather than the eviction rule. The
+    // assertion would land on the right verdict for the wrong reason, which is the
+    // failure shape this whole module is built to avoid.
+    assert!(
+        capped_transition.states[1].len() <= 3,
+        "the delta path must respect the cap, or this case is about a state the \
+         merge path can never reach: {:?}",
+        capped_transition.states[1]
+    );
     assert_violates(
         verify_case(&mut capped, &capped_transition),
         ConformanceProperty::TransitionPathAgreement,
@@ -398,14 +424,19 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
             1 => vec![bytes(&[0x52])],
             _ => vec![bytes(&[0x52]), bytes(&[0x63])],
         };
-        let outcome = verify_case(
-            &mut disagreeing,
-            &ConformanceCase::new(*property, states).with_deltas(deltas),
-        );
-        assert!(
-            !outcome.is_violation(),
-            "{property} fired on the disagreeing-paths mode, so it no longer \
-             isolates the one defect only path_agreement can see: {outcome:?}"
+        // `Holds`, not merely "not a violation": `Inconclusive` also satisfies
+        // `!is_violation()`, and the claim this loop supports is that every other
+        // law HOLDS on this mode. A case that stopped being evaluated at all would
+        // keep the loop green while the #5394 gap argument quietly lost its
+        // evidence.
+        assert_eq!(
+            verify_case(
+                &mut disagreeing,
+                &ConformanceCase::new(*property, states).with_deltas(deltas),
+            ),
+            PropertyOutcome::Holds,
+            "{property} did not HOLD on the disagreeing-paths mode, so it no longer \
+             isolates the one defect only path_agreement can see"
         );
     }
 

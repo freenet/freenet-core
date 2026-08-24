@@ -23,7 +23,9 @@ use super::evidence::{
 };
 use super::generator::{Corpus, GeneratorConfig, generate_cases};
 use super::oracle::{ConformanceOracle, OracleError};
-use super::property::{ConformanceProperty, Inconclusive, PropertyOutcome, Severity};
+use super::property::{
+    ConformanceProperty, Inconclusive, PremiseSource, PropertyOutcome, Severity,
+};
 use super::verifier::{Bytes, ConformanceCase, verify_case};
 
 // ---------------------------------------------------------------- fake contract
@@ -1064,12 +1066,20 @@ fn the_disagreeing_contract_satisfies_every_pre_existing_law() {
         let mut fake = disagreeing_paths();
         let built = ConformanceCase::new(property, states.iter().map(|s| bytes(s)).collect())
             .with_deltas(deltas);
-        let outcome = verify_case(&mut fake, &built);
-        assert!(
-            !outcome.is_violation(),
-            "{property} fired on the disagreeing-paths contract, so it no longer \
-             demonstrates the #5394 gap (a contract that satisfies every existing \
-             law and still diverges): {outcome:?}"
+        // `Holds`, not merely "not a violation".
+        //
+        // The claim the whole #5394 gap argument rests on is that every OTHER law
+        // HOLDS on this contract — a contract that satisfies the entire settled
+        // property set and still diverges. `!is_violation()` is also satisfied by
+        // `Inconclusive`, so a case that silently stopped being evaluated at all
+        // would keep this test green while the claim it exists to support quietly
+        // became unsupported.
+        assert_eq!(
+            verify_case(&mut fake, &built),
+            PropertyOutcome::Holds,
+            "{property} did not HOLD on the disagreeing-paths contract, so it no \
+             longer demonstrates the #5394 gap (a contract that satisfies every \
+             existing law and still diverges)"
         );
     }
 }
@@ -1367,6 +1377,104 @@ fn capped_collection_evicting_outside_the_merge_order_is_caught() {
     assert_holds(verify_case(&mut sound, &sound_case));
 }
 
+/// The PARTIALLY-ORDERED cap: keep the at-most-N maximal elements under a causal
+/// partial order, breaking ties among mutually incomparable survivors by a total
+/// order.
+///
+/// This is the bounded-collection shape the first version of this property could not
+/// rule out. Unlike "keep the largest N" it is not obviously a bounded semilattice,
+/// and unlike the content-indexed eviction in
+/// `capped_collection_evicting_outside_the_merge_order_is_caught` it does not look
+/// arbitrary — it is the shape a version-vector or causal-log application actually
+/// writes, and it survives the pairwise laws.
+///
+/// Brute-forced over its whole state space on 2026-08-23 (universe of five elements,
+/// `1` causally after `5`, N = 2, ties by keeping the largest: 15 valid states) it
+/// is commutative and idempotent with zero failures, and NOT associative — 532
+/// failing triples. So it is already removal-eligible under `StateAssociativity`
+/// before this property is consulted, which is what closes the gap: the transition
+/// law condemns no contract the settled algebra acquits. It fires here too, which is
+/// the consistency the semilattice argument in `TransitionPathAgreement`'s
+/// documentation predicts rather than a second, independent accusation.
+///
+/// Both halves are asserted. Asserting only the firing would leave the important
+/// half — that associativity already had it — as prose.
+#[test]
+fn a_partially_ordered_cap_is_already_caught_by_associativity() {
+    const N: usize = 2;
+    // `1` is causally after `5`, so a set holding both keeps only `1`.
+    fn dominates(after: u8, before: u8) -> bool {
+        after == 1 && before == 5
+    }
+    fn cap(a: &[u8], b: &[u8]) -> Result<Vec<u8>, OracleError> {
+        let all = union(a, b);
+        let mut out: Vec<u8> = all
+            .iter()
+            .copied()
+            .filter(|x| !all.iter().any(|y| dominates(*y, *x)))
+            .collect();
+        // Ties among incomparable survivors go to the total order.
+        while out.len() > N {
+            out.remove(0);
+        }
+        Ok(out)
+    }
+    let fake = || {
+        Fake::conforming()
+            .merging(cap)
+            .applying(cap)
+            .validating(|state| {
+                let canonical = cap(state, &[]).expect("cap is infallible");
+                if canonical == state {
+                    Ok(ValidateResult::Valid)
+                } else {
+                    Ok(ValidateResult::Invalid)
+                }
+            })
+    };
+
+    // The half that closes the gap: associativity already condemns it. The triple is
+    // the smallest of the 532 the brute force found.
+    assert_violates(
+        verify_case(
+            &mut fake(),
+            &case(
+                ConformanceProperty::StateAssociativity,
+                &[&[1], &[2], &[3, 5]],
+            ),
+        ),
+        ConformanceProperty::StateAssociativity,
+    );
+
+    // ...and the pairwise laws do NOT, which is why the shape looked plausible.
+    for pairwise in [
+        case(ConformanceProperty::StateCommutativity, &[&[1], &[3, 5]]),
+        case(ConformanceProperty::StateIdempotence, &[&[2, 5]]),
+    ] {
+        let property = pairwise.property;
+        assert_eq!(
+            verify_case(&mut fake(), &pairwise),
+            PropertyOutcome::Holds,
+            "{property} must hold, or this fixture is not the hard case it claims \
+             to be"
+        );
+    }
+
+    // The transition law fires too, on the step the brute force identified.
+    let mut oracle = fake();
+    let built = transition_case(&mut oracle, &[2, 5], &[1, 3]);
+    assert_eq!(
+        built.states[1].as_ref(),
+        &[2, 3],
+        "the op must actually reach the measured state, or the assertion below is \
+         about something else"
+    );
+    assert_violates(
+        verify_case(&mut oracle, &built),
+        ConformanceProperty::TransitionPathAgreement,
+    );
+}
+
 /// A contract that rewrites a stored state into canonical form on first merge must
 /// not be accused.
 ///
@@ -1399,6 +1507,46 @@ fn a_canonicalizing_contract_is_not_accused_by_the_transition_law() {
     assert_holds(verify_case(&mut fake, &built));
 }
 
+/// A merge that EMITS an invalid state is `EmittedStateValidity`'s defect, not this
+/// one.
+///
+/// Both sides of the comparison get the same validity precondition, for the reason
+/// every check in this module applies it: a state the contract itself rejects never
+/// reaches another peer, so reasoning about it is reasoning about a history that
+/// cannot happen. `path_agreement` validates both of its outputs already; without
+/// the matching check here the transition branch validated only the settled result
+/// and reported the emitted-invalid-state defect under its own name — accusing the
+/// right contract under the wrong law.
+#[test]
+fn a_merge_that_emits_an_invalid_state_is_not_reported_under_the_transition_law() {
+    // Merging anything into the base emits a state the contract rejects. The
+    // marker never appears in a state the delta path produces, so `result` and its
+    // fixpoint stay valid and only `merge(base, settled)` trips the check.
+    const MARKER: u8 = 0xFE;
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            let mut out = union(a, b);
+            if !out.is_empty() {
+                out.push(MARKER);
+            }
+            Ok(out)
+        })
+        .applying(|a, d| Ok(union(a, d)))
+        .validating(|state| {
+            if is_canonical(state) && !state.contains(&MARKER) {
+                Ok(ValidateResult::Valid)
+            } else {
+                Ok(ValidateResult::Invalid)
+            }
+        });
+
+    let built = case(
+        ConformanceProperty::TransitionPathAgreement,
+        &[&[1, 2], &[1, 2, 3]],
+    );
+    assert_inconclusive(verify_case(&mut fake, &built), Inconclusive::InputNotValid);
+}
+
 /// A result state that keeps rewriting itself cannot be judged here, and the defect
 /// already has a name. Reporting it under this law would accuse the right contract
 /// under the wrong one.
@@ -1423,6 +1571,68 @@ fn a_result_state_that_never_settles_is_inconclusive_not_a_violation() {
         ),
         Inconclusive::StateNotSettled,
     );
+}
+
+/// A corpus holding steps and no loose states is not empty.
+///
+/// `generate_cases` returns early on an empty corpus, so a states-only emptiness
+/// test short-circuits before the transition queue is ever built — and the one
+/// property that depends on provenance would silently check nothing while the run
+/// exited 0. The endpoints happen to be pushed into `states` by `fdev --transition`
+/// today, so this is a latent trap rather than a live one; it is exactly the kind
+/// that a future caller (the sampler's own records, a bundle carrying only steps)
+/// walks into.
+#[test]
+fn a_corpus_of_steps_alone_is_not_empty() {
+    let steps_only = Corpus {
+        transitions: vec![(bytes(&[1]), bytes(&[1, 2]))],
+        ..Default::default()
+    };
+    assert!(
+        !steps_only.is_empty(),
+        "a recorded step is material to check, so a corpus holding one is not empty"
+    );
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::TransitionPathAgreement],
+        ..Default::default()
+    };
+    assert_eq!(
+        generate_cases(&steps_only, &config).len(),
+        1,
+        "and the early return must not swallow it"
+    );
+
+    // The counterpart, so an `is_empty` that always returned false would fail here.
+    assert!(Corpus::default().is_empty());
+}
+
+/// The transition branch is bounded like every other arity branch.
+///
+/// It does not pair anything so it does not grow quadratically, but it is linear in
+/// a corpus a busy contract fills without limit, and an unbounded queue would let
+/// one contract's step history crowd the interleave and decide which laws the case
+/// budget reaches — the thing the interleave exists to prevent.
+///
+/// Strided, not truncated, for the same reason `paired_states` strides: steps arrive
+/// in time order, so the first N are all from the same few minutes.
+#[test]
+fn the_transition_branch_is_bounded_and_strided() {
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::TransitionPathAgreement],
+        max_transitions: 4,
+        max_cases: 1024,
+        ..Default::default()
+    };
+    let corpus = Corpus {
+        transitions: (0..40u8).map(|i| (bytes(&[i]), bytes(&[i, 200]))).collect(),
+        ..Corpus::from_states(vec![vec![1]])
+    };
+    let cases = generate_cases(&corpus, &config);
+    assert_eq!(cases.len(), 4, "the cap must bind");
+    // Strided over the whole history rather than the first four: the last step is
+    // reachable, which truncation could never manage.
+    let bases: Vec<u8> = cases.iter().map(|c| c.states[0][0]).collect();
+    assert_eq!(bases, vec![0, 10, 20, 30]);
 }
 
 /// The generator must build transition cases ONLY from recorded provenance.
@@ -1629,6 +1839,102 @@ fn evidence_at_the_related_contract_limit_is_accepted() {
         .map(|i| (instance(i as u8), vec![i as u8]))
         .collect();
     assert!(evidence.check_bounds().is_ok());
+}
+
+/// The fifth `check_bounds` branch, and the only one that is not about size or
+/// schema: a property whose premise the evidence bytes cannot carry is refused
+/// outright.
+///
+/// This is the branch that keeps the ship-inputs-not-verdicts design sound. Every
+/// other law is a universally quantified identity over valid states, so a recipient
+/// that re-executes the case re-establishes the whole premise and a fabricated case
+/// can only surface a real defect sooner. `TransitionPathAgreement` is a law only
+/// because the SENDER witnessed that `result` was reached from `base`, and that
+/// witness is not in the bytes — so a fabricated pair from a conforming grow-only
+/// contract would have every recipient independently confirm a removal-eligible
+/// violation against a correct contract.
+#[test]
+fn evidence_for_a_property_that_is_not_self_verifying_is_refused() {
+    let case = case(
+        ConformanceProperty::TransitionPathAgreement,
+        &[&[1], &[1, 2]],
+    );
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    assert!(
+        evidence.input_bytes() < MAX_EVIDENCE_INPUT_BYTES,
+        "the fixture must be well within every OTHER bound, or this could pass for \
+         the wrong reason"
+    );
+    assert_eq!(
+        evidence.check_bounds(),
+        Err(EvidenceRejected::NotSelfVerifying {
+            property: ConformanceProperty::TransitionPathAgreement,
+        })
+    );
+}
+
+/// The counterpart: a self-verifying property with identical shape is accepted.
+///
+/// Without this, a `check_bounds` that rejected everything would satisfy the test
+/// above.
+#[test]
+fn evidence_for_a_self_verifying_property_is_accepted() {
+    let case = case(ConformanceProperty::StateCommutativity, &[&[1], &[1, 2]]);
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    assert_eq!(evidence.check_bounds(), Ok(()));
+}
+
+/// Every property must have a CONSIDERED answer to "can a recipient re-establish
+/// this premise from the bytes alone?".
+///
+/// An exhaustive match already makes a new property fail to compile without an
+/// answer. This pins which answer was given, so a new provenance-dependent property
+/// lumped in with the self-verifying ones fails here instead of silently widening
+/// the untrusted path — the exact hazard `TransitionPathAgreement` introduced.
+///
+/// If you are here because you added a property: decide whether re-executing the
+/// case against a local copy of the contract re-establishes EVERYTHING the law
+/// asserts. If any part of it rests on how the inputs were observed, it is
+/// `LocalProvenance` and belongs in the list below.
+#[test]
+fn every_property_declares_whether_it_is_self_verifying() {
+    let local: Vec<ConformanceProperty> = ConformanceProperty::ALL
+        .iter()
+        .copied()
+        .filter(|p| p.premise_source() == PremiseSource::LocalProvenance)
+        .collect();
+    assert_eq!(
+        local,
+        vec![ConformanceProperty::TransitionPathAgreement],
+        "the set of properties that cannot travel as evidence changed; if that is \
+         deliberate, update this pin, and make sure `check_bounds` still refuses \
+         every one of them"
+    );
+    assert_eq!(
+        ConformanceProperty::ALL.len(),
+        14,
+        "a property was added or removed; say explicitly whether it is \
+         self-verifying (see `ConformanceProperty::premise_source`) rather than \
+         letting it inherit an answer, then update this count"
+    );
+
+    // The classification is not decorative: the gate reads it.
+    for property in ConformanceProperty::ALL {
+        let states = (0..property.state_arity())
+            .map(|i| bytes(&[i as u8]))
+            .collect();
+        let deltas = (0..property.delta_arity())
+            .map(|i| bytes(&[0x80 | i as u8]))
+            .collect();
+        let built = ConformanceCase::new(*property, states).with_deltas(deltas);
+        let evidence = ConformanceEvidence::new(instance(1), vec![], &built, None);
+        assert_eq!(
+            evidence.check_bounds().is_ok(),
+            property.is_self_verifying(),
+            "{property}: check_bounds must accept exactly the self-verifying \
+             properties"
+        );
+    }
 }
 
 #[test]

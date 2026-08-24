@@ -249,8 +249,40 @@ pub enum ConformanceProperty {
     ///
     /// # Why this is `Severity::Violation`
     ///
-    /// Two guards, and each one corresponds to a contract shape that would otherwise
-    /// be accused wrongly:
+    /// The argument is algebraic, and the measurement below only corroborates it.
+    ///
+    /// Suppose the contract satisfies [`ConformanceProperty::StateCommutativity`],
+    /// [`ConformanceProperty::StateAssociativity`] and
+    /// [`ConformanceProperty::StateIdempotence`] — the three laws that are already
+    /// removal-eligible on their own. Then `merge` is a semilattice join, and it
+    /// induces a partial order on states:
+    ///
+    /// ```text
+    /// x <= y   iff   merge(x, y) == y
+    /// ```
+    ///
+    /// Under that order `merge(base, result)` *is* `base ⊔ result`, the least upper
+    /// bound. So this property's comparison
+    ///
+    /// ```text
+    /// merge(base, result) == result      i.e.      base ⊔ result == result
+    /// ```
+    ///
+    /// holds **iff** `base <= result` in the merge's own order. A firing therefore
+    /// says precisely: the update path moved the peer to a state that is not above
+    /// the state it started from, in the order its own merge defines. That is
+    /// non-convergence by construction — the peer at `result` gossips it, every peer
+    /// that merges it lands on the strictly larger `base ⊔ result`, and the two never
+    /// agree — and it needs no carve-out for bounded collections or any other
+    /// contract shape.
+    ///
+    /// If the contract does NOT satisfy those three laws, it is already
+    /// removal-eligible under whichever of them it breaks, so a firing here costs it
+    /// nothing it had not already lost. Either way there is no contract that this
+    /// property alone condemns while the settled algebra would have acquitted it.
+    ///
+    /// Two guards keep it from firing on a contract that is merely doing bookkeeping
+    /// rather than losing information:
     ///
     /// 1. `result` is first driven to a fixpoint of its own merge, and the case is
     ///    declined if it never settles. A canonicalizing contract legitimately
@@ -261,21 +293,93 @@ pub enum ConformanceProperty {
     /// 2. The comparison is against that settled form, so canonicalization alone can
     ///    never produce a finding.
     ///
-    /// What survives both is a merge that cannot reach a state one of its own peers
-    /// is already holding, which is non-convergence by definition: the peer at
-    /// `result` gossips it, every peer that merges it lands somewhere else, and the
-    /// two never agree.
+    /// ## Corroboration: the bounded-collection shapes, measured
     ///
-    /// A bounded collection is the shape most likely to look like a false positive
-    /// here, and the distinction is measured rather than assumed. A cap that evicts
-    /// by the merge's OWN ordering (keep the largest N) is a genuine bounded
-    /// semilattice and passes: the entries `base` would re-add are exactly the ones
-    /// the cap drops again. A cap that evicts by something independent of that
-    /// ordering — arrival order, a hash, `CAPPED_SET` in the fixture contract — does
-    /// fire, and that contract is already removal-eligible under
-    /// [`ConformanceProperty::StateAssociativity`] for the same underlying reason.
-    /// Both are pinned by tests.
+    /// A bounded collection is the shape most likely to look like a false positive,
+    /// and each variant was run rather than argued.
+    ///
+    /// - A cap that evicts by the merge's OWN ordering (keep the largest N) is a
+    ///   genuine bounded semilattice and passes: the entries `base` would re-add are
+    ///   exactly the ones the cap drops again.
+    /// - A cap that evicts by something independent of that ordering — arrival
+    ///   order, a hash, `CAPPED_SET` in the fixture contract — does fire, and that
+    ///   contract is already removal-eligible under
+    ///   [`ConformanceProperty::StateAssociativity`] for the same underlying reason.
+    /// - The **partially-ordered** cap is the case the first version of this
+    ///   property could not rule out: keep the at-most-N *maximal* elements under a
+    ///   causal partial order, breaking ties among mutually incomparable survivors
+    ///   by a total order. It looks like a legitimate bounded join, and the pairwise
+    ///   laws do not immediately dispose of it. Brute-forced over its full state
+    ///   space on 2026-08-23 (universe of five elements, `1` causally after `5`,
+    ///   N = 2, ties by keeping the largest: 15 valid states) it is commutative and
+    ///   idempotent with zero failures — and **not associative**, 532 failing
+    ///   triples, the smallest being
+    ///   `(({1} ⊔ {2}) ⊔ {3,5}) = {2,3}` against `({1} ⊔ ({2} ⊔ {3,5})) = {1,3}`.
+    ///   So it is already removal-eligible under `StateAssociativity` before this
+    ///   property is consulted, which closes the gap: the transition law condemns no
+    ///   contract the settled algebra acquits. It does also fire here — base
+    ///   `{2,5}`, an op reaching `{2,3}`, `merge(base, result) = {3,5}` — which is
+    ///   the consistency the algebra above predicts, not a second accusation.
+    ///
+    /// All of these are pinned by tests.
+    ///
+    /// # Local provenance only: this property is NOT self-verifying
+    ///
+    /// This is the one property in this module whose premise is not re-establishable
+    /// from the evidence bytes. See [`PremiseSource`], which is what enforces it.
+    ///
+    /// Every other law is a universally quantified identity over valid states, so a
+    /// receiving peer that re-executes the case against its own copy of the contract
+    /// re-establishes the whole premise: if `merge(A, B) != merge(B, A)` for states
+    /// the contract itself validates, that is true no matter where `A` and `B` came
+    /// from. This one is a law only because the corpus WITNESSES that `result` was
+    /// reached from `base`. That witness is not in the bytes and cannot be put
+    /// there: no signature or attestation would help, because the sending peer is
+    /// exactly the party not being trusted.
+    ///
+    /// So a fabricated pair from a perfectly conforming grow-only contract — any two
+    /// valid states with `base ⊄ result` — is structurally indistinguishable from a
+    /// genuine information-losing update, and every receiving peer would
+    /// independently confirm a removal-eligible violation against a correct
+    /// contract. `check_bounds` therefore REFUSES evidence carrying this property
+    /// outright rather than merely deprioritising it.
+    ///
+    /// The property keeps its full value where it runs today — shadow mode and
+    /// `fdev`, both of which observe provenance directly. Evidence gossip (#5377,
+    /// unbuilt) may revisit it if a verifiable form of provenance ever exists.
     TransitionPathAgreement,
+}
+
+/// Whether a property's premise can be re-established from the evidence bytes alone.
+///
+/// This is the attribute the whole evidence model rests on, stated once so a new
+/// property cannot inherit the hazard by omission. `evidence.rs` explains the rule:
+/// a receiving peer does not trust the sender, it re-executes the case against its
+/// own copy of the contract and reaches its own conclusion. That is only safe when
+/// re-execution re-establishes the *entire* premise of the law.
+///
+/// For a universally quantified identity over valid states it does. `merge(A, B) ==
+/// merge(B, A)` is required of every conforming contract for every pair of states it
+/// validates, so where `A` and `B` came from is irrelevant: a peer that re-runs the
+/// case has checked everything the law asserts. A fabricated pair can only make the
+/// recipient discover a real defect sooner.
+///
+/// A property whose premise includes a fact about how the inputs were OBSERVED is a
+/// different thing entirely, and shipping it would be unsafe in a way no amount of
+/// re-execution repairs: the witness is not in the bytes, so the recipient confirms
+/// an accusation it cannot check. [`ConformanceEvidence::check_bounds`] refuses such
+/// evidence outright rather than ranking it lower.
+///
+/// [`ConformanceEvidence::check_bounds`]: super::evidence::ConformanceEvidence::check_bounds
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PremiseSource {
+    /// Everything the law asserts is re-checkable from the evidence's own bytes.
+    /// Safe to ship: this is what the RFC's propagate-evidence-not-verdicts design
+    /// assumes of every property it carries.
+    EvidenceBytes,
+    /// The law additionally rests on provenance the observing peer had and the
+    /// bytes cannot carry. Usable locally, never shippable as evidence.
+    LocalProvenance,
 }
 
 /// How seriously a failed property should be taken.
@@ -339,6 +443,47 @@ impl ConformanceProperty {
             | ConformanceProperty::PathAgreement
             | ConformanceProperty::TransitionPathAgreement => Severity::Violation,
         }
+    }
+
+    /// Where this property's premise comes from - see [`PremiseSource`].
+    ///
+    /// Deliberately an exhaustive match with no wildcard arm: adding a property
+    /// without answering this question must not compile. The partition is also
+    /// pinned by a test, so lumping a new provenance-dependent property in with the
+    /// self-verifying ones fails CI rather than silently widening the untrusted
+    /// path.
+    pub fn premise_source(self) -> PremiseSource {
+        match self {
+            // Each of these is an identity required of every conforming contract
+            // over every pair (or triple, or state-and-delta) of inputs it
+            // validates. Re-executing the case re-establishes all of it.
+            ConformanceProperty::StateIdempotence
+            | ConformanceProperty::StateCommutativity
+            | ConformanceProperty::StateAssociativity
+            | ConformanceProperty::EmittedStateValidity
+            | ConformanceProperty::UpdateDeterminism
+            | ConformanceProperty::SummaryDeterminism
+            | ConformanceProperty::DeltaDeterminism
+            | ConformanceProperty::DeltaIdempotence
+            | ConformanceProperty::DeltaPermutationInvariance
+            | ConformanceProperty::SelfDeltaEmpty
+            | ConformanceProperty::WholeStateSelfDelta
+            | ConformanceProperty::ReconciliationCycle
+            | ConformanceProperty::PathAgreement => PremiseSource::EvidenceBytes,
+            // The one exception, and the reason this method exists. See the
+            // variant's own documentation: `merge(base, result) == result` is
+            // last-write-wins for an arbitrary pair and a law only because the
+            // corpus witnessed that `result` was reached FROM `base`. Nothing in the
+            // bytes carries that witness, so a fabricated pair from a conforming
+            // grow-only contract would have every recipient independently confirm a
+            // removal-eligible violation against a correct contract.
+            ConformanceProperty::TransitionPathAgreement => PremiseSource::LocalProvenance,
+        }
+    }
+
+    /// Shorthand for [`Self::premise_source`] being [`PremiseSource::EvidenceBytes`].
+    pub fn is_self_verifying(self) -> bool {
+        matches!(self.premise_source(), PremiseSource::EvidenceBytes)
     }
 
     /// How many distinct input states a case for this property must carry.
