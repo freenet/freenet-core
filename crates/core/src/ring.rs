@@ -85,6 +85,7 @@ mod broken_invariants;
 mod connection_backoff;
 mod connection_manager;
 pub(crate) mod contract_ban_list;
+pub(crate) mod contract_exec_metrics;
 pub(crate) mod delta_incompat;
 /// Shadow-mode detector for repairs that never converge (see the module docs).
 pub(crate) mod futile_repair;
@@ -318,6 +319,15 @@ pub(crate) struct Ring {
     /// task *reads* it. Threading the `Arc` (rather than a process-global)
     /// keeps the gauges per-node so unit tests stay isolated (#4488).
     module_cache_metrics: Arc<crate::wasm_runtime::ModuleCacheMetrics>,
+    /// Per-node contract-exec WASM counters: how many `summarize_state` /
+    /// `get_state_delta` invocations this node actually ran, split from the
+    /// cache hits that elided them. Constructed once here and shared via `Arc`:
+    /// the executor increments it through `op_manager.ring`, while
+    /// `emit_router_snapshot_telemetry` reads it. Threading the `Arc` (rather
+    /// than a process-global) keeps the counters per-node so unit tests stay
+    /// isolated (#4488). See [`contract_exec_metrics`] for why an
+    /// undifferentiated span count could not answer the storm question.
+    contract_exec_metrics: Arc<contract_exec_metrics::ContractExecMetrics>,
     /// Per-node placement-migration activity counters (#4404 follow-up).
     /// Constructed once here and shared via `Arc`: the migration SEND site
     /// (`p2p_protoc::migration`) and the two RECEIVE sites (`node::process_message`)
@@ -704,6 +714,7 @@ impl Ring {
             // (the `RuntimePool` reaches it through `op_manager.ring`). See
             // the field docs and #4488.
             module_cache_metrics: Arc::new(crate::wasm_runtime::ModuleCacheMetrics::new()),
+            contract_exec_metrics: Arc::new(contract_exec_metrics::ContractExecMetrics::default()),
             // One placement-migration counter sink per node, shared with the
             // migration send/receive sites via the `Arc` (reached through
             // `op_manager.ring`). See the field docs.
@@ -873,6 +884,16 @@ impl Ring {
     /// this `Arc` is what replaced the old `MODULE_CACHE_METRICS` process-global.
     pub(crate) fn module_cache_metrics(&self) -> Arc<crate::wasm_runtime::ModuleCacheMetrics> {
         self.module_cache_metrics.clone()
+    }
+
+    /// Shared per-node contract-exec WASM counters. Returns a BORROW, not an
+    /// `Arc` clone: the increment sites sit on the contract-handling loop's hot
+    /// path (tens of calls/sec per node), where an `Arc` refcount bump would be
+    /// a needless atomic RMW on top of the counter's own. The snapshot reader
+    /// borrows the same way on its 5-minute cadence.
+    #[inline]
+    pub(crate) fn contract_exec_metrics(&self) -> &contract_exec_metrics::ContractExecMetrics {
+        &self.contract_exec_metrics
     }
 
     /// Shared per-node placement-migration counter sink (#4404 follow-up). The
@@ -1697,6 +1718,13 @@ impl Ring {
         let mut prev_broadcast_stream_failures_total: u64 = crate::node::BROADCAST_STREAM_METRICS
             .snapshot()
             .streaming_failures_total;
+        // Same shape for the contract-exec WASM counters: the monotonic totals
+        // are emitted for collector-side differencing, and these loop-local
+        // previous values turn the four headline arms into per-window deltas so
+        // a SINGLE snapshot says whether this node's summarize/delta load was
+        // cache hits or real WASM work. Seeded from the current values so the
+        // first emitted window covers only elapsed-since-start work.
+        let mut prev_exec = ring.contract_exec_metrics.snapshot();
         // The diagnostic block is substantially wider than the ordinary
         // snapshot gauges. Its counters are lifetime-monotonic, so collecting
         // locally on every event but exporting one in six snapshots preserves
@@ -2072,6 +2100,70 @@ impl Ring {
             snapshot.broadcast_stream_failures_last_snapshot =
                 Some(broadcast_stream_failures_delta);
 
+            // Contract-exec WASM counters: the split that makes a summarize rate
+            // interpretable. A high `fast_hits` rate with a low `wasm_calls` rate
+            // is a warm cache doing cheap work; the two converging means the
+            // change-detector has stopped covering the load and the storm class
+            // (#4473 / #4610 / #5040 / #5238) has re-armed.
+            //
+            // EVERY arm is windowed, not a chosen headline subset. Emitting some
+            // arms as a 5-minute delta and others as a lifetime total, under
+            // parallel names on one log line, invites reading them as comparable
+            // magnitudes — and the arm that would be understated that way is
+            // `delta_wasm_uncached`, the per-local-subscriber fan-out delta that
+            // has no cache in front of it at all and can dominate on a
+            // client-facing node. An overstated saving is worse than a missing
+            // one, because it terminates the investigation.
+            let ce = ring.contract_exec_metrics.snapshot();
+            let ce_d = ce.window_deltas(&mut prev_exec);
+            // Exhaustive destructure with no `..` rest pattern, on BOTH the
+            // lifetime snapshot and the window deltas. A 9th counter arm then
+            // fails to COMPILE here until it is exported, which is strictly
+            // stronger than the source-scrape pin below: a scrape that hardcodes
+            // today's eight names passes unchanged when a ninth is added, which
+            // is exactly how a counter ends up recorded but never exported.
+            let contract_exec_metrics::ContractExecSnapshot {
+                summarize_fast_hits: _,
+                summarize_reload_hits: _,
+                summarize_wasm_calls: _,
+                summarize_wasm_uncached: _,
+                delta_fast_hits: _,
+                delta_reload_hits: _,
+                delta_wasm_calls: _,
+                delta_wasm_uncached: _,
+            } = ce;
+            let contract_exec_metrics::ContractExecSnapshot {
+                summarize_fast_hits: _,
+                summarize_reload_hits: _,
+                summarize_wasm_calls: _,
+                summarize_wasm_uncached: _,
+                delta_fast_hits: _,
+                delta_reload_hits: _,
+                delta_wasm_calls: _,
+                delta_wasm_uncached: _,
+            } = ce_d;
+            snapshot.contract_exec_summarize_fast_hits_total = Some(ce.summarize_fast_hits);
+            snapshot.contract_exec_summarize_reload_hits_total = Some(ce.summarize_reload_hits);
+            snapshot.contract_exec_summarize_wasm_calls_total = Some(ce.summarize_wasm_calls);
+            snapshot.contract_exec_summarize_wasm_uncached_total = Some(ce.summarize_wasm_uncached);
+            snapshot.contract_exec_delta_fast_hits_total = Some(ce.delta_fast_hits);
+            snapshot.contract_exec_delta_reload_hits_total = Some(ce.delta_reload_hits);
+            snapshot.contract_exec_delta_wasm_calls_total = Some(ce.delta_wasm_calls);
+            snapshot.contract_exec_delta_wasm_uncached_total = Some(ce.delta_wasm_uncached);
+            snapshot.contract_exec_summarize_fast_hits_last_snapshot =
+                Some(ce_d.summarize_fast_hits);
+            snapshot.contract_exec_summarize_reload_hits_last_snapshot =
+                Some(ce_d.summarize_reload_hits);
+            snapshot.contract_exec_summarize_wasm_calls_last_snapshot =
+                Some(ce_d.summarize_wasm_calls);
+            snapshot.contract_exec_summarize_wasm_uncached_last_snapshot =
+                Some(ce_d.summarize_wasm_uncached);
+            snapshot.contract_exec_delta_fast_hits_last_snapshot = Some(ce_d.delta_fast_hits);
+            snapshot.contract_exec_delta_reload_hits_last_snapshot = Some(ce_d.delta_reload_hits);
+            snapshot.contract_exec_delta_wasm_calls_last_snapshot = Some(ce_d.delta_wasm_calls);
+            snapshot.contract_exec_delta_wasm_uncached_last_snapshot =
+                Some(ce_d.delta_wasm_uncached);
+
             // Placement-quality gauge (#4404 follow-up): host-to-hosted-key
             // ring-distance distribution. If the SubscribeHint placement
             // migration is working, hosting drifts toward each contract's key,
@@ -2307,6 +2399,20 @@ impl Ring {
                 broadcast_stream_attempts_total = bs.streaming_attempts_total,
                 broadcast_stream_failures_total = bs.streaming_failures_total,
                 broadcast_stream_failures_last_snapshot = broadcast_stream_failures_delta,
+                // The per-window arms are logged (not the lifetime totals) so a
+                // local operator reading `journalctl` gets the answer from ONE
+                // line, and ALL EIGHT are logged in the same unit — mixing
+                // 5-minute deltas with lifetime totals under parallel names
+                // would invite reading them as comparable magnitudes. `info!`
+                // survives `release_max_level_info`; `debug!` would not.
+                contract_exec_summarize_fast_hits_last_snapshot = ce_d.summarize_fast_hits,
+                contract_exec_summarize_reload_hits_last_snapshot = ce_d.summarize_reload_hits,
+                contract_exec_summarize_wasm_calls_last_snapshot = ce_d.summarize_wasm_calls,
+                contract_exec_summarize_wasm_uncached_last_snapshot = ce_d.summarize_wasm_uncached,
+                contract_exec_delta_fast_hits_last_snapshot = ce_d.delta_fast_hits,
+                contract_exec_delta_reload_hits_last_snapshot = ce_d.delta_reload_hits,
+                contract_exec_delta_wasm_calls_last_snapshot = ce_d.delta_wasm_calls,
+                contract_exec_delta_wasm_uncached_last_snapshot = ce_d.delta_wasm_uncached,
                 hosted_contracts_count = ?snapshot.hosted_contracts_count,
                 hosted_key_distance_median = ?snapshot.hosted_key_distance_median,
                 hosted_key_distance_p90 = ?snapshot.hosted_key_distance_p90,
@@ -7522,6 +7628,68 @@ mod k_closest_source_tests {
             }
         }
         assert_eq!(checked, 24, "expected exactly 24 export assignments");
+    }
+
+    /// Same mirror seam, for the contract-exec WASM counters. The export block
+    /// hand-copies each `ContractExecSnapshot` field into its `RouterSnapshotInfo`
+    /// twin, so a swap — feeding `..._wasm_calls_total` from `fast_hits`, say —
+    /// compiles cleanly and emits a plausible number that is measuring the
+    /// opposite thing.
+    ///
+    /// That failure mode is not hypothetical here: mistaking cache hits for WASM
+    /// work is the exact blindness these counters exist to remove, and an
+    /// overstated saving is worse than a missing one because it terminates the
+    /// investigation. Assert every assignment reads its own field.
+    /// Whitespace-normalized so rustfmt line-wrapping is irrelevant.
+    #[test]
+    fn contract_exec_export_maps_each_field_to_its_own_counter() {
+        let src = production_source();
+        let block = extract_fn_body(src, "async fn emit_router_snapshot_telemetry(");
+        let norm = block.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let fields = [
+            "summarize_fast_hits",
+            "summarize_reload_hits",
+            "summarize_wasm_calls",
+            "summarize_wasm_uncached",
+            "delta_fast_hits",
+            "delta_reload_hits",
+            "delta_wasm_calls",
+            "delta_wasm_uncached",
+        ];
+        for field in fields {
+            // Every arm is exported in BOTH units. A lifetime total sitting on
+            // a line of otherwise-parallel `_last_snapshot` names reads as a
+            // comparable magnitude and understates nothing visibly — which is
+            // why the pin demands both rather than either.
+            for expected in [
+                format!("snapshot.contract_exec_{field}_total = Some(ce.{field});"),
+                format!("snapshot.contract_exec_{field}_last_snapshot = Some(ce_d.{field});"),
+            ] {
+                assert!(
+                    norm.contains(&expected),
+                    "mirror-seam: export must contain `{expected}` — a field swap here \
+                     silently reports one arm's count under another arm's name"
+                );
+            }
+        }
+
+        // The delta computation itself is NOT scraped: it is
+        // `ContractExecSnapshot::window_deltas`, one function whose field
+        // correspondence is structural and unit-tested by
+        // `each_field_differences_its_own_twin`. What must be pinned here is
+        // that the emitter uses it rather than re-deriving eight deltas by hand
+        // at the call site, which is where a cross-wiring hides.
+        assert!(
+            norm.contains("let ce_d = ce.window_deltas(&mut prev_exec);"),
+            "the emitter must delegate to ContractExecSnapshot::window_deltas, not \
+             hand-difference each arm at the call site"
+        );
+        assert!(
+            !norm.contains("window_delta(ce."),
+            "no hand-written per-arm window_delta call may remain — that is the \
+             shape in which one arm gets differenced against another's previous value"
+        );
     }
 }
 
