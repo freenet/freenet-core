@@ -37,7 +37,12 @@ slow-timeout = { period = "300s", terminate-after = 3 }
 # tests/simulation_integration.rs (issue #4233).
 [[profile.ci.overrides]]
 filter = "test(test_fanout_liveness)"
-slow-timeout = { period = "600s", terminate-after = 2 }
+# WORKTREE-LOCAL VALIDATION OVERRIDE (NOT for commit): the incident-scale
+# diagnostics (test_fanout_liveness_incident_scale_migration_on/off) loop over
+# N=40/60/80 and take ~70 min each per the author — far beyond the 1200s CI cap.
+# Raised here only so this validation run is not killed mid-test. The N=8/16/24
+# always-on guards finish in well under this; revert before any CI use.
+slow-timeout = { period = "3600s", terminate-after = 3 }
 retries = 0
 
 # test_ping_blocked_peers is the canary for the CONNECT promotion-drop bug
