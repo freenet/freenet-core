@@ -264,7 +264,11 @@ enum Verify<'a> {
 /// Deterministic on purpose: the order is randomised to break the confound
 /// described on [`interleave`], but an order nobody can reproduce trades one
 /// diagnostic problem for another. The seed is logged next to the order it
-/// produced, and re-deriving it from the run id replays that run exactly.
+/// produced, and re-deriving it from the run id replays that run exactly --
+/// on any `rand` version, because [`interleave`] pins the generator, the seed
+/// expansion, and the shuffle algorithm rather than inheriting any of them.
+/// (The permutation still depends on how many ops the run had, which varies
+/// with which retention windows the manifest had populated.)
 fn interleave_seed(run_id: &str) -> u64 {
     let digest = blake3::hash(run_id.as_bytes());
     let head: [u8; 8] = digest.as_bytes()[..8]
@@ -281,18 +285,42 @@ fn interleave_seed(run_id: &str) -> u64 {
 /// end of a run could not be told apart from a failure of the oldest
 /// contracts — which is exactly the question this check exists to answer.
 fn interleave<T>(ops: &mut [T], seed: u64) {
-    use rand::SeedableRng;
-    use rand::seq::SliceRandom;
+    use rand::RngCore;
 
-    // `ChaCha8Rng`, not `StdRng`. `rand` documents `StdRng`'s algorithm as
-    // explicitly NOT reproducible across versions, so a dependabot bump would
-    // silently invalidate every historical replay while
-    // `the_order_is_reproducible_from_the_run_id` kept passing -- it only
-    // compares one build against itself. `rand_chacha` carries a portability
-    // guarantee, which is what makes the claim on `interleave_seed` true
-    // rather than merely intended.
-    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
-    ops.shuffle(&mut rng);
+    // Everything the permutation depends on is pinned here on purpose, because
+    // a replay that is only usually reproducible is not reproducible.
+    //
+    // Three separate things in the `rand` stack are version-unstable, and
+    // fixing one of them is not enough:
+    //
+    //  1. `StdRng`'s algorithm. Documented as NOT stable across releases. This
+    //     is why the generator below is `ChaCha8Rng` from `rand_chacha`, which
+    //     carries a portability guarantee.
+    //  2. `SeedableRng::seed_from_u64`. It is `rand_core`'s DEFAULT expansion,
+    //     not a ChaCha guarantee, and its own doc calls changing it merely
+    //     "a value-breaking change" -- a convention, not a promise. So the
+    //     seed bytes are built here rather than expanded by it.
+    //  3. `SliceRandom::shuffle`. This is the one that is easy to miss: the
+    //     algorithm lives in `rand`, not in the generator, and it changed
+    //     between 0.8 and 0.9 (reverse Fisher-Yates with `gen_index`, vs. a
+    //     forward pass driven by `IncreasingUniform`). Same seed, same
+    //     byte-identical ChaCha stream, different permutation. So the shuffle
+    //     is written out below rather than delegated.
+    //
+    // Every one of those would break replay silently while
+    // `the_order_is_reproducible_from_the_run_id` stayed green, since that test
+    // only compares one build against itself.
+    let mut seed_bytes = [0u8; 32];
+    seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
+    let mut rng = <rand_chacha::ChaCha8Rng as rand::SeedableRng>::from_seed(seed_bytes);
+
+    // Fisher-Yates. The modulo bias is bounded by `len / 2^64` and `len` here
+    // is at most a few dozen ops, so it is many orders of magnitude below the
+    // point where it could shape a diagnosis.
+    for i in (1..ops.len()).rev() {
+        let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+        ops.swap(i, j);
+    }
 }
 
 /// Record a GET.

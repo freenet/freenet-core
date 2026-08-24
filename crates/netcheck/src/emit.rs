@@ -255,6 +255,12 @@ pub async fn run(args: EmitArgs) -> Result<bool> {
                 "pinned_gateways": run_meta.pinned_gateways,
                 "ephemeral_peers": run_meta.ephemeral_peers,
                 "exit_code": args.exit_code,
+                // The marker for the ordering-methodology change. Unlike
+                // `seq`/`errors_ignored`, this one is NOT blocked on a fixed
+                // column list -- `conditions` is free-form JSON -- so there is
+                // no reason for the dashboard's verdict series to carry no
+                // record of the change. Null on runs from before the shuffle.
+                "order_seed": run_meta.order_seed,
             }),
         },
     )?);
@@ -404,14 +410,22 @@ mod tests {
             .find("\n#[cfg(test)]\nmod ")
             .map(|i| i + 1)
             .expect("test module not located — this guard cannot verify anything");
-        let at = src
-            .find("pub async fn run(args: EmitArgs) -> Result<bool> {")
-            .expect("emit::run not found");
+        let sig = "pub async fn run(args: EmitArgs) -> Result<bool> {";
+        let at = src.find(sig).expect("emit::run not found");
         assert!(
             at < tests_at,
             "anchor matched inside the test module — this pin would scrape its own source"
         );
-        let body = &src[at..tests_at];
+        // Bound to `run`'s own body. Slicing to the test module instead would
+        // be tight only for as long as `run` is the last item in the file: add
+        // a function after it and the window silently widens, at which point
+        // this pin passes with the mirrors living in that new function while
+        // `CheckOp` is zeroed.
+        let after_sig = &src[at + sig.len()..];
+        let end = after_sig
+            .find("\n}\n")
+            .expect("could not locate the end of emit::run");
+        let body = &after_sig[..end];
         for mirror in ["seq: op.seq,", "errors_ignored: op.errors_ignored,"] {
             assert!(
                 body.contains(mirror),

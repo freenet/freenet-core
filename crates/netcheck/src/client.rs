@@ -829,7 +829,7 @@ mod tests {
                 );
             }
             other => panic!(
-                "a NotFound naming this contract is a terminal answer and must fail the GET                  fast, not be ignored into a synthetic timeout: {}",
+                "a NotFound naming this contract is a terminal answer and must fail the GET fast, not be ignored into a synthetic timeout: {}",
                 reaction_name(&other)
             ),
         }
