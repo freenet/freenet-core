@@ -422,6 +422,12 @@ check "an unwritable output file aborts non-zero" "1" "$OUTPUT_FAIL_RC"
 WF="$SCRIPT_DIR/../.github/workflows/pr-backlog-sweep.yml"
 if [[ -f "$WF" ]]; then
     WF_TEXT="$(cat "$WF")"
+    # Comment-stripped copy for every pin that must find CODE. Mutation-tested:
+    # searching the raw text for the failure-notifier's step NAME passed with
+    # the step deleted, because the file's own header comment quotes that name
+    # while explaining why the step exists. A pin satisfied by the prose that
+    # justifies it is the repo's documented anchor trap, one file over.
+    WF_CODE="$(printf '%s\n' "$WF_TEXT" | sed -E 's/^[[:space:]]*#.*$//')"
     check_contains "the workflow invokes scripts/pr-backlog-sweep.sh" "$WF_TEXT" "scripts/pr-backlog-sweep.sh" yes
     check_contains "the workflow is scheduled" "$WF_TEXT" "schedule:" yes
     check_contains "the workflow can be run on demand" "$WF_TEXT" "workflow_dispatch:" yes
@@ -436,6 +442,21 @@ if [[ -f "$WF" ]]; then
         | sed -E 's/^[[:space:]]*#.*$//')"
     check_contains "the sweep step block was located" "$SWEEP_STEP" "pr-backlog-sweep.sh" yes
     check_contains "the sweep step is not continue-on-error" "$SWEEP_STEP" "continue-on-error:" no
+
+    # A red X on the Actions tab is not a notification. This workflow exists
+    # because a queue nobody watches accumulates silently, and scheduled runs
+    # are exactly such a queue -- so a BROKEN sweep must page the dev room too,
+    # or the instrument fails into the same blind spot it was built to close.
+    check_contains "a failed sweep notifies the dev room" "$WF_CODE" \
+        "Notify the dev room that the sweep is BROKEN" yes
+    check_contains "the failure notifier is gated on the sweep step failing" "$WF_CODE" \
+        "failure() && steps.sweep.outcome == 'failure'" yes
+    # And both notifiers must stay best-effort: a riverctl hiccup must never be
+    # mistaken for a sweep failure, nor add a second red X to an already-red run.
+    NOTIFY_STEPS="$(printf '%s\n' "$WF_CODE" \
+        | sed -n '/- name: Notify the dev room/,$p' \
+        | sed -E 's/^[[:space:]]*#.*$//' | grep -c 'continue-on-error: true')"
+    check "both notifier steps are continue-on-error" "2" "$NOTIFY_STEPS"
 else
     echo "FAIL - .github/workflows/pr-backlog-sweep.yml is missing; nothing runs the sweep" >&2
     FAILURES=$((FAILURES + 1))

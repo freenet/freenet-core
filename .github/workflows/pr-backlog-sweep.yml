@@ -1,9 +1,10 @@
 name: PR Backlog Sweep
 
 # Reports open PRs that have stalled: green and unmerged >48h, no activity >7d,
-# or decayed into conflicts. Nothing was measuring this, so nothing reported it,
-# and the backlog reached 59 open PRs -- 26 of them green and simply never
-# merged -- before a manual audit on 2026-08-24 noticed.
+# decayed into conflicts, or sitting behind an unapproved CI run. Nothing was
+# measuring any of it, so nothing reported it: the backlog reached 59 open PRs
+# -- 26 of them green and simply never merged -- and 58 workflow runs sat in
+# `action_required`, before a manual audit on 2026-08-24 noticed either.
 #
 # The job body is deliberately thin: all the logic is in
 # scripts/pr-backlog-sweep.sh, which is shellcheck-linted and has a self-test
@@ -13,7 +14,14 @@ name: PR Backlog Sweep
 # THE POINT IS THAT A BROKEN SWEEP LOOKS BROKEN. The script exits non-zero on
 # any failure to enumerate PRs, and the sweep step below is deliberately NOT
 # continue-on-error, so a red X appears here rather than a green run with an
-# empty report. Only the notifier is best-effort.
+# empty report. Only the notifiers are best-effort.
+#
+# A red X is NOT sufficient on its own, and saying so is the point: this whole
+# workflow exists because nobody was watching a queue, and the GitHub Actions
+# tab is another such queue. So a failed sweep ALSO pages the dev room -- see
+# the `Notify the dev room that the sweep is BROKEN` step. Without it the
+# instrument fails silently into a page nobody reads, which is the exact shape
+# it was built to close.
 
 on:
   schedule:
@@ -68,10 +76,11 @@ jobs:
       # that mattered is filtered out with it.
       #
       # The message is built from the script's own counts plus the run URL. No
-      # PR title and no author login is forwarded: those are attacker-controlled
-      # strings, and the sweep's headline output is pinned by its self-test to
-      # contain neither. Nothing repository-controlled is interpolated into a
-      # `run:` block anywhere in this workflow.
+      # PR title, author login, or branch name is forwarded: those are all
+      # contributor-controlled strings, and the sweep's headline output is
+      # pinned by its self-test to contain none of them. Nothing
+      # repository-controlled is interpolated into a `run:` block anywhere in
+      # this workflow.
       - name: Notify the dev room
         if: steps.sweep.outputs.notify == 'true'
         # Best-effort: a riverctl/gateway hiccup in the notifier must never
@@ -80,6 +89,28 @@ jobs:
         uses: ./.github/actions/river-dev-notify
         with:
           message: "🧹 PR backlog sweep — ${{ steps.sweep.outputs.headline }} — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
+
+      # A broken sweep must reach a human, not just the Actions tab. The premise
+      # of this whole workflow is that a queue nobody watches accumulates
+      # silently, and "scheduled runs on the Actions tab" is precisely such a
+      # queue: a cron job that starts failing goes unnoticed for as long as
+      # nobody happens to look. Paging on failure costs nothing in alarm fatigue
+      # because it fires only when the sweep is broken, which should be never.
+      #
+      # No counts here on purpose: if the sweep aborted, its counts are either
+      # unset or meaningless, and a number in this message would be a claim the
+      # run cannot support.
+      - name: Notify the dev room that the sweep is BROKEN
+        if: failure() && steps.sweep.outcome == 'failure'
+        # Best-effort like the other notifier: the job is already red, and a
+        # second red X from the notifier would only obscure which thing failed.
+        continue-on-error: true
+        uses: ./.github/actions/river-dev-notify
+        with:
+          message: "🚨 PR backlog sweep FAILED — it could not enumerate PRs, so nothing is known about the backlog today — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
           room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
           gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

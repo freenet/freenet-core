@@ -70,7 +70,11 @@
 #
 # Nothing here pipes a producer into a short-circuiting consumer (`grep -q`,
 # `head`, `read`), so the repo's SIGPIPE-under-pipefail hazard does not apply;
-# `jq` must read its input to EOF before it can answer. Keep it that way.
+# `jq` must read its input to EOF before it can answer. That was measured, not
+# assumed -- the hazard is volume-dependent, so a claim about it based on small
+# inputs is worthless: at a 1 MB payload all three jq forms used here returned
+# their real verdict (0 / logical-false 1 / 0), none returned 141. Keep it that
+# way: introducing a `grep -q` or `head` whose STATUS is consumed would arm it.
 set -uo pipefail
 
 REPO="${SWEEP_REPO:-freenet/freenet-core}"
@@ -181,6 +185,13 @@ if [ -z "$INPUT" ]; then
     # independent path (REST rather than the GraphQL-backed `gh pr list`) has to
     # agree that there are genuinely no open PRs before we accept "nothing to
     # report" as a fact about the repo.
+    #
+    # What this does NOT cover, stated so nobody reads it as broader than it is:
+    # it detects an EMPTY listing that should not be empty, not a listing that
+    # is merely SHORT. A silent partial page would slip past. That is accepted
+    # because `gh` surfaces a mid-pagination API error as a non-zero exit, which
+    # the check above already turns into a `die` -- but if that ever stops being
+    # true, this probe will not be the thing that catches it.
     if ! PROBE="$(gh api "repos/$REPO/pulls?state=open&per_page=1" --jq 'length' 2>&1)"; then
         die "corroborating REST probe failed for $REPO: $PROBE"
     fi
