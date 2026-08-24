@@ -696,6 +696,205 @@ CANARY_ATTEMPTS="$SAVED_ATTEMPTS"
 CANARY_RETRY_SLEEP="$SAVED_SLEEP"
 CANARY_OUTCOME_WAIT_SECS="$SAVED_OUTCOME"
 
+# ---------------------------------------------------------------------------
+# 10. The PLATFORM SEAM (CANARY_NODE_RUNNER), which is how Gate A reaches
+#     Windows (#5341).
+#
+# THE POINT OF THESE CASES. Gate A gated only the Linux musl asset, so a green
+# gate said nothing about the Windows updater -- the platform where a real
+# updater break has already shipped (#3933/#3934) and where ~80% of the peers
+# stranded by the 0.2.120 break actually are. The Windows gate is the SAME
+# script with the node-start step swapped out, precisely so there is one copy
+# of the assertions. That design is only worth anything if the seam cannot
+# weaken them, and "cannot weaken them" is a claim that has to be tested rather
+# than asserted -- a gate that can only go green is what this whole file exists
+# to remove.
+#
+# So these run the REAL cmd_preflight through a fake runner, on Linux, in CI,
+# and require it to still catch every fault the in-process path catches: the
+# #5221 parse failure, the silently-wrong comparator, and the exit-42
+# self-downgrade. Plus the three ways the seam itself can fail, which must all
+# hard-block rather than produce a verdict.
+#
+# make_fake_runner <path>
+#
+# Stands in for scripts/canary-run-node-windows.sh: boots the binary, captures
+# its output and its exit code, reaches no verdict. It ALSO asserts that every
+# marker and budget was exported to it -- that export is the anti-rot property
+# the real Windows runner depends on (it must never carry its own copy of a
+# marker), and without this check the seam could stop exporting them while the
+# Windows runner silently kept matching text the canary had since reworded.
+make_fake_runner() {
+    local path="$1"
+    cat > "$path" <<'RUNNER'
+#!/usr/bin/env bash
+set -uo pipefail
+binary="$1"
+work="$2"
+for v in CANARY_MARKER_CHECK_RAN CANARY_MARKER_CHECK_COMPLETE \
+         CANARY_MARKER_TRIGGERED_RE CANARY_MARKER_NOT_TRIGGERED \
+         CANARY_TIMEOUT_SECS CANARY_OUTCOME_WAIT_SECS \
+         CANARY_NETWORK_PORT CANARY_WS_PORT; do
+    if [ -z "${!v:-}" ]; then
+        echo "fake runner: $v was not exported to me by run_node_until_check" >&2
+        exit 1
+    fi
+done
+rc=0
+"$binary" network \
+    --config-dir "$work/cfg" \
+    --data-dir "$work/data" \
+    --log-dir "$work/logs" \
+    --network-port "$CANARY_NETWORK_PORT" \
+    --ws-api-port "$CANARY_WS_PORT" \
+    >"$work/node.out" 2>&1 || rc=$?
+printf '%s\n' "$rc" > "$work/node.exit"
+exit 0
+RUNNER
+    chmod +x "$path"
+}
+
+SEAM_RUNNER="$TMPROOT/fake-runner.sh"
+make_fake_runner "$SEAM_RUNNER"
+
+# seam_preflight <runner> <fake-node-path> -- run cmd_preflight through the
+# seam, leaving the result in SEAM_RC/SEAM_OUT. CANARY_NODE_RUNNER is set for
+# the call only, so it cannot leak into anything else in this file.
+SEAM_RC=0
+SEAM_OUT=""
+seam_preflight() {
+    SEAM_RC=0
+    SEAM_OUT="$(CANARY_NODE_RUNNER="$1" cmd_preflight "$2" 2>&1)" || SEAM_RC=$?
+}
+
+# 10a. A HEALTHY binary must still PASS through the seam. Checked first, and
+#      for the reason case 1 is: a gate that fails on success gets overridden,
+#      and an overridden gate catches nothing.
+SEAM_OK="$TMPROOT/fake-seam-ok"
+make_fake_node "$SEAM_OK" 0 "$LATEST_SEEN_LINE
+2026-08-08T02:00:00.200000Z  $COMPLETE_LINE" 1
+seam_preflight "$SEAM_RUNNER" "$SEAM_OK"
+if [[ "$SEAM_RC" -eq 0 ]]; then
+    ok "the external node runner passes a HEALTHY binary (the seam does not fail-on-success)"
+else
+    bad "cmd_preflight returned $SEAM_RC for a HEALTHY binary run through CANARY_NODE_RUNNER. The Windows gate would block every release. Output: $SEAM_OUT"
+fi
+
+# 10b. ...and must still CATCH the #5221 parse failure. This is the assertion
+#      that makes the Windows gate worth having: if the seam could only go
+#      green it would be decoration on the release path.
+SEAM_BAD="$TMPROOT/fake-seam-bad"
+make_fake_node "$SEAM_BAD" 0 "$PARSE_FAIL_LINE
+2026-08-08T02:00:00.200000Z  $COMPLETE_LINE" 1
+seam_preflight "$SEAM_RUNNER" "$SEAM_BAD"
+if [[ "$SEAM_RC" -eq 0 ]]; then
+    bad "cmd_preflight returned 0 through CANARY_NODE_RUNNER for a binary whose updater CANNOT PARSE the tag. The seam has disarmed the gate: the Windows canary would report green on the exact #5221 break it exists to catch."
+elif [[ "$SEAM_OUT" != *"could not parse the version GitHub returned"* ]]; then
+    bad "cmd_preflight blocked the parse-failure binary through the seam, but with the wrong diagnosis; got: $SEAM_OUT"
+else
+    ok "the external node runner still catches the #5221 parse failure, with the right diagnosis"
+fi
+
+# 10c. ...and the POSITIVE equality check must still be armed on the seam path.
+#      Nothing in 10b distinguishes "the gate ran" from "the gate ran its
+#      negative checks only": a comparator that parses the WRONG version
+#      produces a log with no error in it at all.
+SEAM_WRONG="$TMPROOT/fake-seam-wrong"
+make_fake_node "$SEAM_WRONG" 0 "INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.1
+2026-08-08T02:00:00.200000Z  $COMPLETE_LINE" 1
+seam_preflight "$SEAM_RUNNER" "$SEAM_WRONG"
+if [[ "$SEAM_RC" -eq 0 ]]; then
+    bad "cmd_preflight returned 0 through CANARY_NODE_RUNNER for a node that compared against the WRONG release (0.2.1 vs 0.2.121). The silently-wrong-comparator hole is open on the Windows path."
+elif [[ "$SEAM_OUT" != *"compared against the WRONG release"* ]]; then
+    bad "cmd_preflight blocked the wrong-release node through the seam but with the wrong diagnosis; got: $SEAM_OUT"
+else
+    ok "the external node runner keeps the positive-equality check armed"
+fi
+
+# 10d. ...and the node's OWN exit code must survive the round trip through
+#      node.exit. This is the seam's most losable property: the exit-42
+#      observer is the SECOND, independent witness to an inverted comparator,
+#      and a runner whose own exit code was read instead of the node's would
+#      silently retire it while every log assertion stayed green.
+SEAM_42="$TMPROOT/fake-seam-42"
+make_fake_node "$SEAM_42" 42 "$LATEST_SEEN_LINE
+2026-08-08T02:00:00.200000Z  $COMPLETE_LINE" 0
+seam_preflight "$SEAM_RUNNER" "$SEAM_42"
+if [[ "$SEAM_RC" -eq 0 ]]; then
+    bad "cmd_preflight returned 0 through CANARY_NODE_RUNNER for a node that exited 42 with a clean log -- that is a self-downgrade request. The node's exit code is not reaching NODE_EXIT across the seam, so Gate A's exit-code observer is dead on the Windows path."
+elif [[ "$SEAM_OUT" != *"exited 42"* ]]; then
+    bad "cmd_preflight blocked the exit-42 node through the seam but with the wrong diagnosis; got: $SEAM_OUT"
+else
+    ok "the node's own exit code survives the seam (the exit-42 self-downgrade observer still fires)"
+fi
+
+# 10e. A runner that FAILS must hard-block, and must say it was the harness.
+#      Fail-closed is the easy half; the wording is the half that matters at
+#      3am on a stuck release, because "auto-update is broken" and "the runner
+#      is missing" send the reader to completely different files.
+BROKEN_RUNNER="$TMPROOT/broken-runner.sh"
+printf '#!/usr/bin/env bash\nexit 7\n' > "$BROKEN_RUNNER"
+chmod +x "$BROKEN_RUNNER"
+seam_preflight "$BROKEN_RUNNER" "$SEAM_OK"
+if [[ "$SEAM_RC" -eq 0 ]]; then
+    bad "cmd_preflight returned 0 when CANARY_NODE_RUNNER exited non-zero. A runner that never started the node produced a PASSING release gate."
+elif [[ "$SEAM_OUT" != *"HARNESS failure"* ]]; then
+    bad "cmd_preflight blocked on a failing node runner but did not name it as a harness failure, so the operator is sent after the updater instead; got: $SEAM_OUT"
+else
+    ok "a failing external node runner hard-blocks, and is diagnosed as a harness failure"
+fi
+
+# 10f. A runner that exits 0 but reports no exit code must ALSO hard-block.
+#      This is the quiet direction: without it the canary would carry a
+#      previous attempt's NODE_EXIT into the exit-code observer, which is a
+#      dropped assertion rather than a visible failure.
+SILENT_RUNNER="$TMPROOT/silent-runner.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$SILENT_RUNNER"
+chmod +x "$SILENT_RUNNER"
+seam_preflight "$SILENT_RUNNER" "$SEAM_OK"
+if [[ "$SEAM_RC" -eq 0 ]]; then
+    bad "cmd_preflight returned 0 when CANARY_NODE_RUNNER wrote no node.exit. The gate assumed an exit code it never observed."
+elif [[ "$SEAM_OUT" != *"wrote no"* ]]; then
+    bad "cmd_preflight blocked on a runner that wrote no node.exit but with the wrong diagnosis; got: $SEAM_OUT"
+else
+    ok "a runner that reports no node exit code hard-blocks rather than assuming one"
+fi
+
+# 10g. ...and a non-numeric one likewise. The digit filter would otherwise turn
+#      "not-a-number" into an empty string and, without this branch, into a
+#      comparison against nothing.
+GARBAGE_RUNNER="$TMPROOT/garbage-runner.sh"
+cat > "$GARBAGE_RUNNER" <<'GARBAGE'
+#!/usr/bin/env bash
+printf 'not-a-number\n' > "$2/node.exit"
+exit 0
+GARBAGE
+chmod +x "$GARBAGE_RUNNER"
+seam_preflight "$GARBAGE_RUNNER" "$SEAM_OK"
+if [[ "$SEAM_RC" -eq 0 ]]; then
+    bad "cmd_preflight returned 0 when CANARY_NODE_RUNNER wrote a non-numeric node.exit."
+elif [[ "$SEAM_OUT" != *"no digits"* ]]; then
+    bad "cmd_preflight blocked on a non-numeric node.exit but with the wrong diagnosis; got: $SEAM_OUT"
+else
+    ok "a non-numeric node exit code hard-blocks rather than being coerced to nothing"
+fi
+
+# 10h. Gate B REFUSES the seam outright. Its second half -- `freenet update`,
+#      the self-replace, the re-read of the replaced binary -- is not covered
+#      by the runner contract, so honouring it would produce a gate that is
+#      only partly on the platform its log names. Refusing is the honest
+#      failure; half-supporting is the one that reports a Windows verdict for a
+#      Linux self-update.
+SEAM_RC=0
+SEAM_OUT="$(CANARY_NODE_RUNNER="$SEAM_RUNNER" cmd_selfupdate 0.2.120 0.2.121 2>&1)" || SEAM_RC=$?
+if [[ "$SEAM_RC" -eq 0 ]]; then
+    bad "cmd_selfupdate returned 0 with CANARY_NODE_RUNNER set. Gate B does not support the seam and must refuse rather than run half of itself through it."
+elif [[ "$SEAM_OUT" != *"does not support an external node runner"* ]]; then
+    bad "cmd_selfupdate refused the seam but without saying why; got: $SEAM_OUT"
+else
+    ok "Gate B refuses to run through an external node runner (no half-ported gate)"
+fi
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
     echo "All auto-update-canary lifecycle assertions passed."

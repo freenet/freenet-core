@@ -273,7 +273,7 @@ jobs:
       # clean when they landed but were not actually in this list, so nothing
       # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh
+        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/canary-run-node-windows.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh
       - name: Self-test install.sh service-mode decision
         run: sh scripts/test-install-sh.sh
       - name: Self-test uninstall.sh
@@ -966,18 +966,42 @@ jobs:
       - name: Build freenet bin
         run: cargo build --locked -p freenet --bin freenet
 
-      - name: Test service commands
-        run: cargo nextest run -p freenet --bin freenet --profile ci -E 'test(commands::service)'
+      # Widened past commands::service by #5341 for the same reason the Windows
+      # job was: `update.rs` carries seven `#[cfg(target_os = "macos")]` tests
+      # (the launchd wrapper/plist regeneration logic) that this filter never
+      # reached, so they had never executed on any runner. `--no-tests=fail`
+      # so a filter that matches nothing is red rather than green.
+      - name: Test service and updater commands
+        run: cargo nextest run -p freenet --bin freenet --profile ci --no-tests=fail -E 'test(commands::service) or test(commands::update) or test(commands::auto_update) or test(commands::rollback)'
 
-  # Windows unit tests for the wrapper's Windows-only code paths (named-mutex
-  # single-instance guard, process classification, etc). `windows_check` above
-  # only `cargo check`s — compilation is not verification of a `#[cfg(target_os
-  # = "windows")]` path (see .claude/rules/deployment.md) — so without this job
-  # the Windows-specific tests in commands::service would never actually run.
+  # Windows unit tests for the wrapper's and the updater's Windows-only code
+  # paths (named-mutex single-instance guard, process classification, the
+  # updater's zip/`.exe`/registry/move-aside branches). `windows_check` above
+  # only `cargo check`s — compilation is not verification of a
+  # `#[cfg(target_os = "windows")]` path (see .claude/rules/deployment.md) — so
+  # without this job those tests would never actually run.
   # Added alongside the #5132 fix (Windows wrapper had no single-instance
   # guard at all), mirroring macos_unit above.
+  #
+  # WIDENED BEYOND commands::service BY #5341. The filter was
+  # `test(commands::service)`, which meant that on a real Windows machine CI
+  # executed the service tests and NOTHING ELSE — in particular nothing in
+  # `commands::update`, `commands::auto_update` or `commands::rollback`. Those
+  # modules are where auto-update lives, they carry ~14 `cfg(windows)` sites,
+  # and Windows updater breaks have shipped before (#3933/#3934). The gap was
+  # not that those tests were Windows-hostile; it was that the filter simply
+  # never reached them.
+  #
+  # The tests themselves are mostly not `cfg(windows)`-gated — and that is the
+  # point, not a caveat. Compiling and running them FOR Windows takes the
+  # Windows arm of every `#[cfg(target_os = "windows")]` inside the code under
+  # test: `get_archive_extension` returns "zip" rather than "tar.gz",
+  # `extract_binary` looks for `freenet.exe`, and `rollback::restore_binary`
+  # takes its move-aside/restore-on-failure branch instead of the Unix
+  # `rename(2)` one. Before this, that `restore_binary` branch had no test
+  # executing it on any runner in CI.
   windows_unit:
-    name: Windows Service Unit
+    name: Windows Service & Updater Unit
     runs-on: windows-latest
     # This job is new (introduced alongside the #5132 fix), so unlike
     # macos_unit/windows_check it has no warm Swatinem cache from prior
@@ -1025,8 +1049,13 @@ jobs:
       - name: Build freenet bin
         run: cargo build --locked -p freenet --bin freenet
 
-      - name: Test service commands
-        run: cargo nextest run -p freenet --bin freenet --profile ci -E 'test(commands::service)'
+      # One nextest invocation rather than four, so a module that stops
+      # matching (a rename, a move) shows up as a drop in the test count in one
+      # place. `--no-tests=fail` is the half that makes that visible: without
+      # it, a filter that matches NOTHING is a green run, which is how a
+      # renamed module silently deletes its own coverage.
+      - name: Test service and updater commands
+        run: cargo nextest run -p freenet --bin freenet --profile ci --no-tests=fail -E 'test(commands::service) or test(commands::update) or test(commands::auto_update) or test(commands::rollback)'
 
   test_simulation:
     name: Simulation

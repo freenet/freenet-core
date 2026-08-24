@@ -335,6 +335,89 @@ jobs:
           name: binaries-x86_64-windows-fdev
           path: target/release/fdev.exe
 
+  # -----------------------------------------------------------------------
+  # Gate A on WINDOWS (#5341) — BLOCKS PUBLICATION.
+  #
+  # The two-sided auto-update canary (#5222) gates every release on the
+  # updater working, and until this job it only ever ran the Linux musl
+  # x86_64 asset. A green Gate A therefore said nothing whatsoever about the
+  # Windows updater — against ~14 `cfg(windows)` sites in
+  # `crates/core/src/bin/commands/update.rs` and a documented prior Windows
+  # updater break (#3933/#3934, the `FreeConsole()` invalid-handle class,
+  # where a child `Command::spawn()` inherits invalid standard handles and the
+  # update child silently never starts).
+  #
+  # WHY WINDOWS SPECIFICALLY, rather than "one gate per target". Measured on
+  # the live fleet 2026-08-24: the peers still stranded on the broken v0.2.120
+  # release are ~80% Windows (79.8% and 85.3% across the two most recent
+  # telemetry rotations), against 38-41% Windows among peers on the current
+  # release. Windows is simultaneously where the stranded users are, the
+  # platform with no accidental recovery path (#5228 — the wrapper does not
+  # run the updater on arbitrary non-zero exits, and autostart is an HKCU Run
+  # key rather than a supervised service), and, until now, the platform with
+  # no release gate at all. macOS has partial cover via
+  # `macos-dmg-swap-e2e.yml`.
+  #
+  # IT IS THE SAME GATE, NOT A SECOND ONE. It runs
+  # `auto-update-canary.sh preflight` — the same script, the same assertions,
+  # the same fixture-tested functions — with the node-start step swapped for a
+  # Windows runner via CANARY_NODE_RUNNER. See the "PLATFORM SEAM" block in
+  # that file's `run_node_until_check`. A Windows reimplementation of the
+  # assertions would drift from the Linux ones and its markers would rot
+  # silently; nothing here restates either.
+  #
+  # WHERE IT SITS. It runs on the shipped artifact (the same
+  # `binaries-x86_64-windows-freenet` upload that becomes
+  # `freenet-x86_64-pc-windows-msvc.zip` and the bare `freenet.exe` asset),
+  # and `attach-to-release` `needs:` it. So a failure here blocks publication
+  # EARLIER and more cheaply than the Linux Gate A does: no assets uploaded,
+  # no crates published, no tag to delete beyond the one that triggered the
+  # run. That is the correct fail-closed state.
+  #
+  # WHEN IT RUNS: release tags and manual dispatch, matching the Linux Gate A's
+  # tag-only scope (and this job's signing-step neighbours above). Deliberately
+  # NOT on main pushes: it boots a node and talks to github.com, and a network
+  # blip turning main red is how a gate earns the reputation that gets it
+  # ignored. The cost is that a Windows updater break is found at release time
+  # rather than at merge time — the same trade the Linux gate already makes.
+  # -----------------------------------------------------------------------
+  auto-update-windows-preflight:
+    name: Auto-update pre-flight canary (Windows, blocks publish)
+    runs-on: windows-latest
+    # The canary's own budget is CANARY_TIMEOUT_SECS (240s) per attempt with
+    # CANARY_ATTEMPTS (2) retries plus a 20s sleep between them, so ~9 min
+    # worst case, plus checkout and artifact download on a Windows runner.
+    timeout-minutes: 25
+    needs: build-x86_64-windows
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download the Windows freenet binary under test
+        uses: actions/download-artifact@v8
+        with:
+          name: binaries-x86_64-windows-freenet
+          path: windows-freenet
+
+      - name: Auto-update pre-flight canary (Windows)
+        # `shell: bash` is Git for Windows' bash. The canary script needs only
+        # text tools there (grep/awk/sed/tr/curl/sort -V) because the part that
+        # has no Windows equivalent — job control, `exec timeout`, a
+        # process-GROUP kill — is exactly what CANARY_NODE_RUNNER replaces.
+        shell: bash
+        # Step-level bound so a hung canary reads as the canary timing out
+        # rather than as the Windows build dying for unclear reasons.
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          chmod +x scripts/canary-run-node-windows.sh
+          # Absolute, because the canary invokes it as a command and its own
+          # working directory is not this one.
+          export CANARY_NODE_RUNNER="$PWD/scripts/canary-run-node-windows.sh"
+          bash scripts/auto-update-canary.sh preflight "$PWD/windows-freenet/freenet.exe"
+
   build-macos-dmg:
     name: Build Freenet.dmg (universal, signed + notarized)
     runs-on: macos-latest
@@ -495,7 +578,12 @@ jobs:
     # release, which is precisely the 0.2.124 state this move exists to make
     # unreachable. Budget generously.
     timeout-minutes: 60
-    needs: [build-x86_64-linux, build-arm64-linux, build-arm64-macos, build-x86_64-macos, build-x86_64-windows, build-macos-dmg]
+    # `auto-update-windows-preflight` is in this list to make it BLOCKING: it
+    # is Gate A for the Windows asset (#5341), and a gate nothing depends on is
+    # a report. With it here a Windows updater fault stops the release before
+    # any asset is uploaded and before crates.io is touched — strictly cheaper
+    # than the Linux Gate A's own position, which is downstream of the upload.
+    needs: [build-x86_64-linux, build-arm64-linux, build-arm64-macos, build-x86_64-macos, build-x86_64-windows, build-macos-dmg, auto-update-windows-preflight]
     if: startsWith(github.ref, 'refs/tags/v')
 
     permissions:
@@ -1093,11 +1181,21 @@ jobs:
     name: Notify dev room if the release pre-flight failed
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [attach-to-release, auto-update-selfupdate-canary]
+    # `auto-update-windows-preflight` is here for the reason the two-gate
+    # coverage below was written for in the first place: it BLOCKS, and a
+    # blocking gate that fails silently is indistinguishable from one that
+    # works. A Windows Gate A failure fails that job, which SKIPS
+    # `attach-to-release` — so `needs.attach-to-release.result` is 'skipped',
+    # none of the four clauses below match, and without the two added here the
+    # release would stop with nobody told. That is the exact hole this job was
+    # extended to close for Gate A (see the comment on this block's history).
+    needs: [attach-to-release, auto-update-selfupdate-canary, auto-update-windows-preflight]
     if: |
       always() && startsWith(github.ref, 'refs/tags/v') &&
       (needs.attach-to-release.result == 'failure' ||
        needs.attach-to-release.result == 'cancelled' ||
+       needs.auto-update-windows-preflight.result == 'failure' ||
+       needs.auto-update-windows-preflight.result == 'cancelled' ||
        needs.auto-update-selfupdate-canary.result == 'failure' ||
        needs.auto-update-selfupdate-canary.result == 'cancelled')
     continue-on-error: true
@@ -1170,7 +1268,7 @@ jobs:
           # red because the updater is broken OR because GitHub was unreachable,
           # and a message that overstates ("the fleet is stranded") on a network
           # blip trains people to ignore the channel.
-          message: "\U0001F6A8 RELEASE PRE-FLIGHT did not pass for ${{ github.ref_name }} (publish job: ${{ needs.attach-to-release.result }}, auto-update self-update canary: ${{ needs.auto-update-selfupdate-canary.result }}). Check WHICH step failed before concluding anything: the publish job also does artifact download, checksumming, signing and the crates.io upload, so a red result here is not by itself an auto-update fault. If the publish job failed, the release is STUCK AS A DRAFT and needs a decision — and note that whether the crates.io upload already ran decides the recovery, because it is the one step that cannot be undone (it sits AFTER the pre-flight canary and BEFORE the un-draft; read the job log to see which side of it the failure fell on). If the self-update canary failed, a node on the previous release may not be able to auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand). ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          message: "\U0001F6A8 RELEASE PRE-FLIGHT did not pass for ${{ github.ref_name }} (publish job: ${{ needs.attach-to-release.result }}, Windows pre-flight canary: ${{ needs.auto-update-windows-preflight.result }}, auto-update self-update canary: ${{ needs.auto-update-selfupdate-canary.result }}). If the WINDOWS pre-flight canary failed, the release is STUCK BEFORE ANY ASSET WAS UPLOADED — nothing irreversible has happened, and the updater in that Windows binary is what to look at (#5341; ~80% of the peers stranded by the last updater break were Windows). Check WHICH step failed before concluding anything: the publish job also does artifact download, checksumming, signing and the crates.io upload, so a red result here is not by itself an auto-update fault. If the publish job failed, the release is STUCK AS A DRAFT and needs a decision — and note that whether the crates.io upload already ran decides the recovery, because it is the one step that cannot be undone (it sits AFTER the pre-flight canary and BEFORE the un-draft; read the job log to see which side of it the failure fell on). If the self-update canary failed, a node on the previous release may not be able to auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand). ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
           room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
           gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

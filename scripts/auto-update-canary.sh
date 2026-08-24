@@ -886,6 +886,87 @@ run_node_until_check() {
     fail "could not create the canary workdir under $work -- this is a harness/disk problem, not an auto-update fault."
   fi
 
+  # --- PLATFORM SEAM: an external node runner ------------------------------
+  #
+  # Everything BELOW this block is Linux/macOS process handling -- `set -m`,
+  # `exec timeout`, a process-GROUP kill -- and every line of it is load-bearing
+  # on those platforms (see the comments there). None of it survives a port to
+  # Windows: Git Bash has no reliable job control over a native `.exe`, a group
+  # kill misses it, and a `wait` on a process the kill did not reach hangs until
+  # the job timeout. A hung blocking gate is worse than no gate.
+  #
+  # So Windows does not get a second copy of this file. It gets a runner for the
+  # ONE thing that is genuinely platform-specific -- start the binary, watch it,
+  # stop it, report its exit code -- and everything that DECIDES anything
+  # (`assert_detection_healthy`, `assert_gate_a_decision`, the equality check,
+  # the exit-42 observer, the retry/latch logic in `cmd_preflight`) stays here,
+  # single-sourced, already fixture-tested. A Windows gate that reimplemented
+  # the assertions would drift from these, and a gate that has drifted is a gate
+  # that no longer says what its name says.
+  #
+  # The contract is deliberately narrow and file-based, so the runner cannot
+  # influence a verdict:
+  #   in   $1 = binary path, $2 = workdir (dirs above already created)
+  #   out  $work/logs/freenet.*.log   the node's log dir (--log-dir)
+  #        $work/node.out             stdout+stderr, where the CRITICAL
+  #                                   fatal-abort lines land
+  #        $work/node.exit            the NODE's exit code, decimal, on one line
+  #   rc   0 = the runner did its job (whatever the node did)
+  #        non-zero = HARNESS failure; the gate refuses rather than guessing
+  #
+  # The node's exit code goes in a FILE rather than being the runner's own exit
+  # status, and that is the half that fails closed: with one channel, a runner
+  # that could not start the binary at all and a node that exited 1 are the same
+  # number, and the gate would read a broken harness as a broken updater (or,
+  # worse, the reverse). Two channels keep "the runner worked" and "what the
+  # node did" separable.
+  #
+  # The markers below are EXPORTED to it rather than restated inside it. That is
+  # the anti-rot property that makes this seam safe: the runner polls for
+  # "has the check produced an outcome yet", which needs the same strings the
+  # assertions use, and a Windows copy of those strings would rot silently the
+  # moment one is reworded -- the failure mode `.claude/rules/bug-prevention-
+  # patterns.md` describes for this canary's pins. Exported, a reword reaches
+  # the runner by construction, and `auto-update-canary_test.sh` already pins
+  # the markers against the Rust source.
+  #
+  # NOT AN ESCAPE HATCH. It changes only WHO STARTS THE PROCESS; every
+  # assertion still runs, on the same evidence, in this file. There is no value
+  # of CANARY_NODE_RUNNER that makes a gate greener than it would otherwise be
+  # -- a runner that produced no logs fails `assert_detection_healthy`, and one
+  # that lies about the exit code still has to get past the log assertions. It
+  # is nonetheless pinned OFF for the Linux gate by
+  # `release_canary_wiring_test.sh`, because "the Linux release gate started
+  # running something else" is the kind of thing that should be impossible to do
+  # by accident.
+  if [ -n "${CANARY_NODE_RUNNER:-}" ]; then
+    log "using external node runner: $CANARY_NODE_RUNNER"
+    rm -f "$work/node.exit"
+    if ! CANARY_MARKER_CHECK_RAN="$MARKER_CHECK_RAN" \
+         CANARY_MARKER_CHECK_COMPLETE="$MARKER_CHECK_COMPLETE" \
+         CANARY_MARKER_TRIGGERED_RE="$MARKER_TRIGGERED_RE" \
+         CANARY_MARKER_NOT_TRIGGERED="$MARKER_NOT_TRIGGERED" \
+         CANARY_TIMEOUT_SECS="$CANARY_TIMEOUT_SECS" \
+         CANARY_OUTCOME_WAIT_SECS="$CANARY_OUTCOME_WAIT_SECS" \
+         CANARY_NETWORK_PORT="$CANARY_NETWORK_PORT" \
+         CANARY_WS_PORT="$CANARY_WS_PORT" \
+         "$CANARY_NODE_RUNNER" "$binary" "$work"; then
+      fail "the external node runner ('$CANARY_NODE_RUNNER') failed before it could report a node exit code. This is a HARNESS failure, not an auto-update fault -- nothing was learned about the updater. See the runner's output above."
+      return 1
+    fi
+    if [ ! -s "$work/node.exit" ]; then
+      fail "the external node runner ('$CANARY_NODE_RUNNER') exited 0 but wrote no $work/node.exit. The gate refuses to assume an exit code: without it the exit-42 self-downgrade observer cannot run, and a gate that silently drops an assertion is the vacuous pass this file exists to remove."
+      return 1
+    fi
+    NODE_EXIT="$(tr -dc '0-9' < "$work/node.exit")"
+    if [ -z "$NODE_EXIT" ]; then
+      fail "the external node runner ('$CANARY_NODE_RUNNER') wrote a $work/node.exit that contains no digits. Same refusal as above: the exit-code observer cannot run on a value that is not a number."
+      return 1
+    fi
+    log "node exited with code $NODE_EXIT"
+    return 0
+  fi
+
   # An isolated HOME matters for more than tidiness: the node keeps its GitHub
   # poll token-bucket under $HOME/.local/state/freenet, so a shared HOME would
   # let one gate's budget throttle the other's check.
@@ -1390,7 +1471,17 @@ cmd_preflight() {
     # some future refactor reintroduces a lingering child.
     CANARY_NETWORK_PORT=$((CANARY_NETWORK_PORT + 1))
     CANARY_WS_PORT=$((CANARY_WS_PORT + 1))
-    run_node_until_check "$binary" "$work"
+    # A non-zero return is a HARNESS failure (only the external-node-runner
+    # seam produces one; the in-process path always returns 0). It is NOT
+    # retried and NOT classified as indeterminate: a runner that cannot start
+    # or cannot report an exit code is deterministic, and every classification
+    # below reads evidence the runner was supposed to produce. Hard-block, the
+    # same fail-closed shape a harness bug already gets here -- v0.2.124 is the
+    # standing example of a gate correctly blocking on its own harness.
+    if ! run_node_until_check "$binary" "$work"; then
+      dump_node_evidence "$work"
+      return 1
+    fi
     # Classify the port collision BEFORE the log assertion, because the log
     # assertion cannot see it: `assert_detection_healthy` never consults
     # NODE_EXIT, so a node that died on exit 43 without an update-check line
@@ -1530,6 +1621,19 @@ cmd_selfupdate() {
   local prev_version="$1" expected_version="$2"
   local work="$CANARY_WORKDIR/selfupdate"
   mkdir -p "$work"
+
+  # The external-node-runner seam covers ONE step -- boot the node, watch it,
+  # stop it -- and Gate B is not one step. It downloads a musl tarball, and
+  # after the node exits 42 it runs `freenet update` and re-reads the replaced
+  # binary's version. Honouring the seam here would run the boot through the
+  # runner and everything after it natively, which is a half-ported gate: the
+  # part that decides whether the fleet can move would still be Linux, while
+  # the log said a Windows runner was used. Refuse instead of half-supporting,
+  # and say what is missing -- Gate B has no Windows equivalent yet (#5341).
+  if [ -n "${CANARY_NODE_RUNNER:-}" ]; then
+    fail "CANARY_NODE_RUNNER is set, but Gate B (selfupdate) does not support an external node runner: its second half (\`freenet update\`, the self-replace, the re-read of the replaced binary) is not covered by the runner contract, so honouring it would produce a gate that is only partly on the platform its log claims. Run Gate B without CANARY_NODE_RUNNER. There is no Windows Gate B yet -- see docs/RELEASING.md, 'What the gates do NOT cover'."
+    return 1
+  fi
 
   log "=== Gate B: does v$prev_version self-update to v$expected_version? ==="
   mkdir -p "$work/bin"

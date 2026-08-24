@@ -122,21 +122,37 @@ line_of() {
     printf '%s\n' "$JOB_BLOCK" | grep -E "$1" | head -1 | cut -d: -f1
 }
 
-# step_block <line> -- the whole STEP containing <line>, as `NNN:text` lines.
+# step_block <line> [job-block] -- the whole STEP containing <line>, as
+# `NNN:text` lines. Searches [job-block] if given, else $JOB_BLOCK
+# (attach-to-release).
 #
 # Bounded by the `- name:` at or above <line> and the next one below it (or the
 # end of the job). Step keys such as `if:` and `continue-on-error:` sit ABOVE
 # the `run:` that holds the invocation, so anything anchored on the invocation
 # line alone cannot see them -- which is exactly how the publish step's own
 # `if:` went unpinned while the canary step's was covered.
+#
+# THE SECOND ARGUMENT IS A BUG FIX, not a generalisation. This function read
+# $JOB_BLOCK unconditionally while its callers passed line numbers resolved in
+# OTHER jobs' blocks. Both are absolute file line numbers, so nothing errored:
+# a line beyond attach-to-release's range simply selected that job's LAST step
+# and the caller went on to assert against it. Measured on the pre-fix file,
+# the CRITICAL_STEPS row for `auto-update-selfupdate-canary|Previous release
+# self-updates to this release` resolved to attach-to-release's
+# `Publish release` step -- so Gate B's step could have acquired an `if:` or a
+# `shell:` override and the conditionality and shell checks would have gone on
+# examining a different job's step and passing. The uniqueness and
+# is-it-in-that-job checks were unaffected, which is why this looked covered.
+# Found while adding the Windows Gate A row (#5341), whose step resolved to the
+# attach-to-release JOB HEADER and produced a check that could not fail.
 step_block() {
-    local at="$1" start end
-    start="$(printf '%s\n' "$JOB_BLOCK" \
+    local at="$1" block="${2:-$JOB_BLOCK}" start end
+    start="$(printf '%s\n' "$block" \
         | awk -F: -v a="$at" '$1 <= a && /^[0-9]+:      - name:/ { n = $1 } END { print n }')"
-    end="$(printf '%s\n' "$JOB_BLOCK" \
+    end="$(printf '%s\n' "$block" \
         | awk -F: -v a="$at" '$1 > a && /^[0-9]+:      - name:/ { print $1; exit }')"
     [[ -z "$end" ]] && end=999999
-    printf '%s\n' "$JOB_BLOCK" | awk -F: -v a="$start" -v b="$end" '$1 >= a && $1 < b'
+    printf '%s\n' "$block" | awk -F: -v a="$start" -v b="$end" '$1 >= a && $1 < b'
 }
 
 # status_swallowers <text> [allow-rc-capture]
@@ -1578,6 +1594,18 @@ fi
 #                  than "no always()": whether an arbitrary expression can
 #                  evaluate true after a failure is not a judgement for a grep.
 #   exact:<expr> -- the step's `if:` must equal <expr> exactly.
+#
+# `shell-policy` (OPTIONAL 4th field; absent means `none`):
+#   none         -- the step must carry NO `shell:` at all. This is the right
+#                   default on a Linux runner, where Actions' implicit
+#                   `bash -e` IS the gating mechanism and 2g's behavioural
+#                   harness reproduces it.
+#   exact:<sh>   -- the step's `shell:` must equal <sh> exactly. Needed only
+#                   for a step on a NON-Linux runner, where the default shell
+#                   is not bash at all and an override is mandatory rather than
+#                   suspicious. Declaring it keeps the property that matters:
+#                   the shell cannot CHANGE silently, which is the thing the
+#                   `none` policy is actually protecting against.
 CRITICAL_STEPS=(
     # The two checkout steps are here because assertions in this file READ them:
     # 2g-bis takes `path:` from the canary checkout to compare against Gate A's
@@ -1593,6 +1621,11 @@ CRITICAL_STEPS=(
     "attach-to-release|Publish crates to crates.io|exact:\${{ success() && startsWith(github.ref, 'refs/tags/v') }}"
     "attach-to-release|Publish release|none"
     "auto-update-selfupdate-canary|Previous release self-updates to this release|none"
+    # Windows Gate A (#5341). `shell: bash` is not an override to be suspicious
+    # of here: this step runs on windows-latest, where Actions' default shell is
+    # pwsh, so bash must be asked for by name. Pinned exactly so it cannot
+    # become something else without this line changing too.
+    "auto-update-windows-preflight|Auto-update pre-flight canary (Windows)|none|exact:bash"
 )
 
 # --- 2h-pre. the table is DERIVED-CHECKED, not merely declared -------------
@@ -1693,7 +1726,14 @@ _missing=""
 for _d in "${_derived[@]}"; do
     _found=0
     for _spec in "${CRITICAL_STEPS[@]}"; do
-        [[ "${_spec%|*}" == "$_d" ]] && _found=1 && break
+        # Fields 1-2, taken positionally rather than with `%|*`: that
+        # suffix-strip yields "job|name" for a 3-field row and "job|name|policy"
+        # for a 4-field one, so adding the shell-policy field would have made
+        # every 4-field row fail to match its derived counterpart -- i.e. the
+        # table would report the step as uncovered while it was listed right
+        # there. No step name contains a `|`.
+        _spec_key="$(printf '%s' "$_spec" | cut -d'|' -f1,2)"
+        [[ "$_spec_key" == "$_d" ]] && _found=1 && break
     done
     [[ "$_found" -eq 0 ]] && [[ "$_missing" != *"$_d"* ]] && _missing+="  $_d"$'\n'
 done
@@ -1717,10 +1757,13 @@ else
 fi
 
 for _spec in "${CRITICAL_STEPS[@]}"; do
-    _cjob="${_spec%%|*}"
-    _rest="${_spec#*|}"
-    _cname="${_rest%%|*}"
-    _cpol="${_rest##*|}"
+    _cjob="$(printf '%s' "$_spec" | cut -d'|' -f1)"
+    _cname="$(printf '%s' "$_spec" | cut -d'|' -f2)"
+    _cpol="$(printf '%s' "$_spec" | cut -d'|' -f3)"
+    # Absent 4th field means "no shell: at all", so every pre-existing row keeps
+    # exactly the behaviour it had.
+    _cshellpol="$(printf '%s' "$_spec" | cut -d'|' -f4)"
+    [[ -z "$_cshellpol" ]] && _cshellpol="none"
 
     # (1) UNIQUE NAME. This is what kills the decoy.
     _count="$(grep -cxF "      - name: $_cname" "$WF")"
@@ -1745,7 +1788,10 @@ for _spec in "${CRITICAL_STEPS[@]}"; do
             "something else."
         continue
     fi
-    _cstep="$(step_block "$_cline")"
+    # `$_cblock`, not the default: `$_cline` was resolved in THIS job's block,
+    # and handing it to a search over attach-to-release's block is the defect
+    # documented on step_block above.
+    _cstep="$(step_block "$_cline" "$_cblock")"
 
     # (2) CONDITIONALITY, per policy.
     _cif="$(printf '%s\n' "$_cstep" | grep -E '^[0-9]+:        if:' | head -1 | sed 's/^[0-9]*:        if:[[:space:]]*//')"
@@ -1780,13 +1826,30 @@ for _spec in "${CRITICAL_STEPS[@]}"; do
     #     set. `shell: bash {0}` drops errexit, changing real behaviour while
     #     the harness keeps testing the old semantics and stays green.
     _cshell="$(printf '%s\n' "$_cstep" | grep -E '^[0-9]+:        shell:')"
-    if [[ -n "$_cshell" ]]; then
-        fail "critical step '$_cname' overrides 'shell:'" \
-            "$(printf '%s\n' "$_cshell")" \
-            "2g runs this block under 'bash -e', Actions' default for a step with no" \
-            "'shell:'. An override changes the real semantics while the harness keeps" \
-            "testing the old ones. Update the harness deliberately, or drop this."
-    fi
+    _cshellval="$(printf '%s\n' "$_cshell" | head -1 | sed -E 's/^[0-9]*:        shell:[[:space:]]*//')"
+    case "$_cshellpol" in
+        none)
+            if [[ -n "$_cshell" ]]; then
+                fail "critical step '$_cname' overrides 'shell:'" \
+                    "$(printf '%s\n' "$_cshell")" \
+                    "2g runs this block under 'bash -e', Actions' default for a step with no" \
+                    "'shell:'. An override changes the real semantics while the harness keeps" \
+                    "testing the old ones. Update the harness deliberately, or declare the" \
+                    "shell in this step's CRITICAL_STEPS row (4th field, 'exact:<shell>')."
+            fi ;;
+        exact:*)
+            _wantsh="${_cshellpol#exact:}"
+            if [[ "$_cshellval" == "$_wantsh" ]]; then
+                pass "critical step '$_cname': runs under the declared shell ('$_wantsh')"
+            else
+                fail "critical step '$_cname' does not run under the declared shell" \
+                    "expected: $_wantsh" \
+                    "got:      ${_cshellval:-<none>}" \
+                    "A step on a non-Linux runner has to name its shell, and which one it" \
+                    "names decides whether errexit is in force at all. Silently becoming a" \
+                    "different shell is the same class of change the 'none' policy forbids."
+            fi ;;
+    esac
 done
 
 # --- 2h-bis. no `defaults.run.shell` anywhere above these steps -------------
@@ -2690,6 +2753,191 @@ else
     fail "the 'auto-update-selfupdate-canary' job (Gate B) is gone from cross-compile.yml" \
         "Gate B is what proves a node on the PREVIOUS release can actually reach" \
         "this one -- the #5221 failure mode. Nothing else covers it."
+fi
+
+# --- 8. Windows Gate A (#5341) ----------------------------------------------
+#
+# Gate A gated only the Linux musl x86_64 asset, so a green gate said nothing
+# about the Windows updater -- against ~14 `cfg(windows)` sites in the update
+# command, a documented prior Windows updater break (#3933/#3934) and a fleet
+# where ~80% of the peers stranded by the 0.2.120 break are Windows.
+#
+# The Windows gate is the SAME script (`auto-update-canary.sh preflight`) with
+# only the node-start step swapped, via CANARY_NODE_RUNNER. Everything below
+# pins the wiring that makes that true and blocking; the ASSERTIONS themselves
+# are pinned by auto-update-canary_test.sh and exercised end-to-end (through a
+# fake runner, on Linux) by auto-update-canary_lifecycle_test.sh case 10.
+WIN_JOB='auto-update-windows-preflight'
+WIN_STEP='Auto-update pre-flight canary (Windows)'
+WIN_JOB_BLOCK="$(yaml_job_block "$WIN_JOB" --numbered)"
+
+if [[ -z "$WIN_JOB_BLOCK" ]]; then
+    fail "cross-compile.yml no longer has an '$WIN_JOB' job" \
+        "That job is Gate A for the Windows asset. Without it a release ships a" \
+        "Windows binary whose updater nothing has run -- the #5341 blind spot," \
+        "which is where the stranded fleet actually lives."
+else
+    pass "cross-compile.yml still has the '$WIN_JOB' job (Windows Gate A)"
+
+    # (a) It must actually run on a release tag. A job that exists but whose
+    #     `if:` is never true on a tag push is the decoy attack at job scope,
+    #     and `attach-to-release` needing it would then be satisfied by a SKIP
+    #     rather than by a pass.
+    _win_if="$(printf '%s\n' "$WIN_JOB_BLOCK" | grep -E "^[0-9]+:    if:" | head -1 | sed -E 's/^[0-9]*:    if:[[:space:]]*//')"
+    if [[ "$_win_if" == *"refs/tags/v"* ]]; then
+        pass "the Windows Gate A job runs on release tags (if: $_win_if)"
+    else
+        fail "the Windows Gate A job's 'if:' no longer mentions refs/tags/v" \
+            "  if: ${_win_if:-<none>}" \
+            "A gate that does not run on the tag it is supposed to gate is not a gate," \
+            "and 'attach-to-release' needing a SKIPPED job is satisfied by the skip."
+    fi
+
+    # (b) It must run on Windows. Running the Windows canary on ubuntu would be
+    #     a green gate over the Linux binary a second time -- exactly the
+    #     coverage illusion #5341 is about.
+    if printf '%s\n' "$WIN_JOB_BLOCK" | grep -qE "^[0-9]+:    runs-on: windows-"; then
+        pass "the Windows Gate A job runs on a Windows runner"
+    else
+        fail "the '$WIN_JOB' job no longer declares a windows-* runner" \
+            "Running it anywhere else gates the Linux binary twice and reports it as" \
+            "Windows coverage."
+    fi
+fi
+
+# (c) BLOCKING: `attach-to-release` must need it. A gate nothing depends on is
+#     a report, and the whole reason this one is worth building is that a
+#     Windows updater break cannot be recovered from by the fleet itself.
+if printf '%s\n' "$JOB_BLOCK" | grep -E "^[0-9]+:    needs:" | grep -q "$WIN_JOB"; then
+    pass "attach-to-release needs '$WIN_JOB', so Windows Gate A BLOCKS publication"
+else
+    fail "attach-to-release no longer lists '$WIN_JOB' in 'needs:'" \
+        "Gate A for Windows then runs alongside the release instead of gating it:" \
+        "the assets upload and crates.io publishes whatever the Windows canary said." \
+        "This is the one line that makes the Windows gate blocking."
+fi
+
+# (d) The step must invoke the SAME canary in preflight mode. Not a Windows
+#     reimplementation: one copy of the assertions is the entire design.
+WIN_STEP_RUN="$(extract_step_run auto-update-windows-preflight 'Auto-update pre-flight canary (Windows)')"
+if [[ -z "$WIN_STEP_RUN" ]]; then
+    fail "could not extract the '$WIN_STEP' step's run block from $WF_BASENAME" \
+        "Every assertion below reads that block, so they are all vacuous without it."
+else
+    if [[ "$WIN_STEP_RUN" == *"auto-update-canary.sh preflight"* ]]; then
+        pass "the Windows gate invokes the shared canary in preflight mode"
+    else
+        fail "the Windows Gate A step no longer runs 'auto-update-canary.sh preflight'" \
+            "If it has grown its own assertions, they are a second copy that will drift" \
+            "from the Linux ones and whose markers will rot silently. The seam exists so" \
+            "there is exactly one implementation of the verdict."
+    fi
+
+    # (e) ...through the node-runner seam, at the path the runner is committed
+    #     at. Without CANARY_NODE_RUNNER the script takes its Linux in-process
+    #     path -- `set -m`, `exec timeout`, a process-GROUP kill -- which has no
+    #     working equivalent under Git Bash over a native .exe.
+    if [[ "$WIN_STEP_RUN" == *"CANARY_NODE_RUNNER"* ]]; then
+        pass "the Windows gate sets CANARY_NODE_RUNNER (it uses the platform seam)"
+    else
+        fail "the Windows Gate A step no longer sets CANARY_NODE_RUNNER" \
+            "Without it the canary takes its Linux process-handling path on a Windows" \
+            "runner, which does not work and, worse, can HANG rather than fail -- a" \
+            "blocking release gate that hangs is worse than one that is absent."
+    fi
+
+    if [[ "$WIN_STEP_RUN" == *"canary-run-node-windows.sh"* ]]; then
+        pass "the Windows gate points CANARY_NODE_RUNNER at canary-run-node-windows.sh"
+    else
+        fail "the Windows Gate A step no longer names scripts/canary-run-node-windows.sh" \
+            "The runner it does name is not the one this repo tests or shellchecks."
+    fi
+
+    # (f) The step must not be disabled in place, and must not swallow the
+    #     canary's exit status. Same two checks Gate A has (assertions 3/3a),
+    #     for the same reason: a blocking gate is only blocking while its
+    #     non-zero exit survives.
+    if [[ "$WIN_STEP_RUN" == *"continue-on-error"* ]]; then
+        fail "the Windows Gate A step carries 'continue-on-error'"
+    else
+        pass "the Windows Gate A step is not disabled in place"
+    fi
+    _win_sw="$(status_swallowers "$WIN_STEP_RUN")"
+    if [[ -z "$_win_sw" ]]; then
+        pass "the Windows Gate A step's shell does not swallow its own exit status"
+    else
+        fail "the Windows Gate A step can discard the canary's exit status" \
+            "$(printf '%s\n' "$_win_sw")" \
+            "The step's non-zero exit is what fails the job, and the job failing is what" \
+            "stops 'attach-to-release'. Anything that consumes it defeats the gate while" \
+            "leaving it visibly present."
+    fi
+fi
+
+# (g) Both halves of the runner must actually be in the tree. The seam
+#     hard-blocks on a missing runner, but discovering that during a release is
+#     a stuck draft; discovering it here is a red PR.
+for _f in scripts/canary-run-node-windows.sh scripts/canary-run-node-windows.ps1; do
+    if [[ -f "$SCRIPT_DIR/../$_f" ]]; then
+        pass "$_f is present"
+    else
+        fail "$_f is missing" \
+            "The Windows gate names it, so its absence turns every release into a" \
+            "blocked draft on a harness fault."
+    fi
+done
+
+# (h) ...and the canary must still READ the variable the workflow sets. A
+#     workflow that exports CANARY_NODE_RUNNER into a script that no longer
+#     honours it is the quietest possible break: the job looks configured, and
+#     the Windows runner is simply never used.
+if grep -q 'CANARY_NODE_RUNNER' "$SCRIPT_DIR/auto-update-canary.sh"; then
+    pass "auto-update-canary.sh still honours CANARY_NODE_RUNNER"
+else
+    fail "auto-update-canary.sh no longer mentions CANARY_NODE_RUNNER" \
+        "The Windows job sets a variable nothing reads, so the canary silently falls" \
+        "back to its Linux process handling on a Windows runner."
+fi
+
+# (i) The LINUX gate must NOT use the seam. Symmetric to assertion 4's
+#     CANARY_EXPECTED_LATEST check and for the same reason: the release path's
+#     behaviour should not be decidable by an environment variable set
+#     somewhere else in the job.
+if printf '%s\n' "$JOB_BLOCK" | grep -q 'CANARY_NODE_RUNNER'; then
+    fail "the attach-to-release job sets CANARY_NODE_RUNNER" \
+        "The Linux Gate A must boot the node in-process. Redirecting it through a" \
+        "runner would mean the blocking gate is running something other than the" \
+        "thing this suite and the lifecycle tests exercise."
+else
+    pass "the Linux Gate A does not use the node-runner seam (it boots in-process)"
+fi
+
+# (j) A Windows Gate A failure must be ANNOUNCED. This is the hole the notify
+#     job was already extended once to close for Gate A: a failure here fails
+#     this job, which SKIPS attach-to-release, so none of the attach-result
+#     clauses match and the release stops with nobody told.
+if [[ -n "${notify_block:-}" ]]; then
+    if [[ "$notify_block" == *"needs:"*"$WIN_JOB"* ]]; then
+        pass "the notify job still needs '$WIN_JOB'"
+    else
+        fail "the notify job no longer lists '$WIN_JOB' in 'needs:'" \
+            "A result expression for a job that is not needed evaluates to the empty" \
+            "string, so the clauses below silently stop matching."
+    fi
+    _win_clauses=0
+    for _r in failure cancelled; do
+        [[ "$notify_block" == *"needs.$WIN_JOB.result == '$_r'"* ]] && _win_clauses=$((_win_clauses + 1))
+    done
+    if [[ "$_win_clauses" -eq 2 ]]; then
+        pass "the notification fires for failure AND cancellation of the Windows gate"
+    else
+        fail "the notify job's 'if:' covers $_win_clauses/2 Windows-gate results" \
+            "A blocking gate that fails silently is indistinguishable from one that" \
+            "works. Windows Gate A skips attach-to-release when it fails, so without" \
+            "these clauses the release stops as a draft with no message at all."
+    fi
+else
+    fail "could not read the notify job block, so the Windows-gate notification is unpinned"
 fi
 
 echo
