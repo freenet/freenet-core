@@ -768,12 +768,17 @@ fn describe_oracle_build_error(err: OracleBuildError) -> anyhow::Error {
 /// "Distinct" is by [`ConformanceEvidence::id`] (a content hash of the
 /// inputs), so cases whose inputs coincide overwrite the same filename
 /// instead of piling up duplicate files for one finding.
-fn write_evidence(
+///
+/// Generic over the oracle purely so this function is testable: `minimize` and
+/// `verify_case` already are, and pinning this one to `RuntimeOracle` would have made
+/// "did minimisation run?" answerable only by scraping the source. A fake oracle that
+/// counts its calls answers it directly.
+fn write_evidence<O: ConformanceOracle + ?Sized>(
     dir: &PathBuf,
     instance: ContractInstanceId,
     parameters: &[u8],
     outcomes: &[(ConformanceCase, PropertyOutcome)],
-    oracle: &mut RuntimeOracle,
+    oracle: &mut O,
     state_candidates: &[Bytes],
     delta_candidates: &[Bytes],
 ) -> anyhow::Result<EvidenceSummary> {
@@ -1168,19 +1173,33 @@ fn inconclusive_label(reason: &Inconclusive) -> &'static str {
 /// one-token property. This asserts the property at the only place it can regress.
 #[cfg(test)]
 mod stdout_purity_pin {
-    /// Slice `load_inputs`' body by counting braces to its own closing one.
+    /// Slice a function's body by counting braces to its own closing one.
     ///
     /// Brace-counting rather than "up to the next `fn`": a region ended on a guessed
     /// anchor silently widens when the following item is not the shape assumed, and a
     /// widened region here would swallow the human-report code — which prints to stdout
     /// legitimately — and pass vacuously.
-    fn load_inputs_body() -> &'static str {
+    ///
+    /// Shared with `tests`, which pins other functions the same way, so that a second
+    /// source pin cannot hand-roll a `split_once` and inherit the self-satisfying
+    /// failure mode the project rules describe.
+    pub(super) fn fn_body(signature: &str) -> &'static str {
         let src = include_str!("conformance.rs");
         let start = src
-            .find("fn load_inputs(")
-            .expect("load_inputs not found in conformance.rs");
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found in conformance.rs"));
+        // A signature that only matches inside a test module means the real function
+        // was renamed or removed: the region would then be some test's body, where the
+        // searched-for token is as likely to appear as not. Fail loudly instead.
+        if let Some(tests) = src.find("\n#[cfg(test)]") {
+            assert!(
+                start < tests,
+                "{signature} matched only inside a test module, so this pin would be \
+                 scoped to a test rather than to production code"
+            );
+        }
         let after = &src[start..];
-        let open = after.find('{').expect("load_inputs has no body");
+        let open = after.find('{').expect("signature has no body");
         let mut depth = 0usize;
         for (offset, ch) in after[open..].char_indices() {
             match ch {
@@ -1194,13 +1213,13 @@ mod stdout_purity_pin {
                 _ => {}
             }
         }
-        panic!("load_inputs' body is not brace-balanced");
+        panic!("{signature}'s body is not brace-balanced");
     }
 
     /// Strip whole-line comments, so a comment mentioning `println!` cannot satisfy or
     /// defeat the assertion. The comment above the `eprintln!` call names both.
     fn code_only() -> String {
-        load_inputs_body()
+        fn_body("fn load_inputs(")
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
@@ -1241,8 +1260,10 @@ mod stdout_purity_pin {
 
 #[cfg(test)]
 mod tests {
+    use super::stdout_purity_pin::fn_body;
     use super::*;
-    use freenet::conformance::Violation;
+    use freenet::conformance::{OracleError, Violation};
+    use freenet_stdlib::prelude::{RelatedContracts, UpdateModification, ValidateResult};
 
     /// A grow-only union contract, enough to exercise the reversed-pair heuristic
     /// without a WASM runtime.
@@ -1493,6 +1514,170 @@ mod tests {
              one pairing this corpus can support is gone from the replay"
         );
         assert_eq!(round_tripped.states, original.states);
+    }
+
+    /// An oracle that records every call, so a test can ask whether the WASM path
+    /// was entered at all.
+    ///
+    /// Deliberately trivial otherwise: nothing here is checking merge behaviour, only
+    /// whether `write_evidence` decided to spend WASM calls on a case it was going to
+    /// discard.
+    #[derive(Default)]
+    struct CountingOracle {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl freenet::conformance::ConformanceOracle for CountingOracle {
+        fn validate_state(
+            &mut self,
+            _state: &[u8],
+            _related: &RelatedContracts<'_>,
+        ) -> Result<ValidateResult, OracleError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(ValidateResult::Valid)
+        }
+
+        fn update_state(
+            &mut self,
+            state: &[u8],
+            _updates: &[UpdateData<'_>],
+        ) -> Result<UpdateModification<'static>, OracleError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(UpdateModification::valid(State::from(state.to_vec())))
+        }
+
+        fn summarize_state(&mut self, _state: &[u8]) -> Result<Vec<u8>, OracleError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(Vec::new())
+        }
+
+        fn get_state_delta(
+            &mut self,
+            _state: &[u8],
+            _summary: &[u8],
+        ) -> Result<Vec<u8>, OracleError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(Vec::new())
+        }
+    }
+
+    /// A finding that can never become evidence must be discarded BEFORE minimisation.
+    ///
+    /// Two things go wrong when the check sits after `minimize`, and they are not the
+    /// same defect. The cheap one is waste: minimisation is the expensive part of this
+    /// loop, and every byte of it is spent on a case that is then thrown away. The
+    /// one that misleads a reader is `input_bytes_before_shrinking`, documented as the
+    /// measure of "whether shrinking is earning its keep" — accumulating for a finding
+    /// shrinking could not have helped puts a number in the denominator the ratio is
+    /// not about. Measured on a real run before the fix: `files_written: 0` alongside
+    /// `input_bytes_before_shrinking: 32335`.
+    #[test]
+    fn a_local_only_finding_costs_no_minimisation_and_no_shrink_bytes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("evidence");
+        let mut oracle = CountingOracle::default();
+
+        // `TransitionPathAgreement` is `Violation` (so it reaches the loop body) and
+        // `LocalProvenance` (so it can never be written).
+        let property = ConformanceProperty::TransitionPathAgreement;
+        assert!(
+            !property.is_self_verifying() && property.severity() == Severity::Violation,
+            "the fixture depends on this property being enforceable AND local-only"
+        );
+        let case = ConformanceCase::new(
+            property,
+            vec![Bytes::from(vec![7u8; 64]), Bytes::from(vec![8u8; 64])],
+        );
+        assert!(
+            case.input_bytes() > 0,
+            "the case must carry bytes, or the counter assertion below is vacuous"
+        );
+
+        let summary = write_evidence(
+            &out,
+            ContractInstanceId::new([3u8; 32]),
+            &[],
+            &[(case, PropertyOutcome::Violated(violation_of(property)))],
+            &mut oracle,
+            &[],
+            &[],
+        )
+        .expect("write evidence");
+
+        assert_eq!(summary.files_written, 0);
+        assert_eq!(summary.findings_local_only, 1);
+        assert_eq!(summary.findings_too_large, 0);
+        assert_eq!(
+            oracle.calls.get(),
+            0,
+            "minimisation and re-verification must not run for a finding that cannot \
+             travel; they are the expensive part of this loop"
+        );
+        assert_eq!(
+            (
+                summary.input_bytes_before_shrinking,
+                summary.input_bytes_after_shrinking
+            ),
+            (0, 0),
+            "and its bytes must not land in the shrink ratio, whose denominator is \
+             supposed to be work shrinking was asked to do"
+        );
+    }
+
+    /// The counterpart: a shippable finding DOES pay for minimisation and IS counted.
+    ///
+    /// Without this, moving the local-only check to the top of the loop body — or
+    /// deleting `minimize` outright — would satisfy the test above.
+    #[test]
+    fn a_shippable_finding_is_minimised_and_counted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("evidence");
+        let mut oracle = CountingOracle::default();
+
+        let property = ConformanceProperty::StateCommutativity;
+        assert!(property.is_self_verifying() && property.severity() == Severity::Violation);
+        let case = ConformanceCase::new(
+            property,
+            vec![Bytes::from(vec![7u8; 64]), Bytes::from(vec![8u8; 64])],
+        );
+
+        let summary = write_evidence(
+            &out,
+            ContractInstanceId::new([3u8; 32]),
+            &[],
+            &[(case, PropertyOutcome::Violated(violation_of(property)))],
+            &mut oracle,
+            &[],
+            &[],
+        )
+        .expect("write evidence");
+
+        assert_eq!(summary.files_written, 1);
+        assert_eq!(summary.findings_local_only, 0);
+        assert!(
+            oracle.calls.get() > 0,
+            "a shippable finding must actually go through minimisation"
+        );
+        assert_eq!(summary.input_bytes_before_shrinking, 128);
+    }
+
+    /// "wrote 0 evidence file(s)" must never stand alone.
+    ///
+    /// `findings_too_large`'s own doc comment says silently writing nothing would look
+    /// like there were none — and that is precisely what the DEFAULT (non-`--json`)
+    /// output did for both no-file reasons. The person who most needs the explanation
+    /// is the one who did not ask for JSON.
+    #[test]
+    fn the_human_report_says_why_no_evidence_was_written() {
+        let body = fn_body("fn print_human(");
+        for field in ["findings_local_only", "findings_too_large"] {
+            assert!(
+                body.contains(field),
+                "print_human never mentions {field}, so a run with such findings \
+                 prints 'wrote 0 evidence file(s)' and nothing else — which reads \
+                 exactly like a clean run"
+            );
+        }
     }
 
     /// Evidence is resolved by deriving each candidate's instance id, not by name.
