@@ -253,6 +253,30 @@ else
 fi
 check_contains "the crafted title is rendered as inert text" "$INJECT_REPORT" 'touch' yes
 
+# The report is read as markdown on a maintainer-only page, so a title of the
+# form "[click me](https://elsewhere)" must not become a working link.
+cat > "$WORK/markdown.json" <<EOF
+[
+  {
+    "number": 43, "title": "[click me](https://evil.invalid) and \`code\` and <b>",
+    "author": {"login": "mallory"},
+    "createdAt": "$OLD", "updatedAt": "$OLD", "mergeable": "MERGEABLE",
+    "isDraft": false, "url": "https://example.invalid/43", "headRefName": "b",
+    "statusCheckRollup": [
+      {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "$OLD"}
+    ]
+  }
+]
+EOF
+MD_REPORT="$(SWEEP_NOW_EPOCH="$NOW" "$BASH_BIN" "$SWEEP" --input "$WORK/markdown.json" 2>/dev/null)"
+check_contains "a link in a PR title is escaped, not rendered" "$MD_REPORT" '\[click me\](https://evil.invalid)' yes
+check_contains "the raw unescaped link form is absent" "$MD_REPORT" '- [click me](https://evil.invalid)' no
+# The needle is deliberately literal: it is the escaped text the report should
+# contain, backticks included, so SC2016 is an accurate observation about a
+# string that must not expand.
+# shellcheck disable=SC2016
+check_contains "backticks and angle brackets in a title are escaped" "$MD_REPORT" '\`code\` and \<b\>' yes
+
 # --- The failure paths: a broken sweep must never look clean -----------------
 # A stub `gh` drives the abort paths that a healthy CI run never touches.
 STUB="$WORK/stub"
@@ -345,6 +369,9 @@ check_contains "the headline carries no PR title" "$(grep '^headline=' "$OUTPUTS
 : > "$OUTPUTS"
 SWEEP_NOW_EPOCH="$NOW" GITHUB_OUTPUT="$OUTPUTS" "$BASH_BIN" "$SWEEP" \
     --input "$WORK/mixed-branches.json" --runs-input "$WORK/runs.json" >/dev/null 2>&1
+# The paired positive check matters: `check_contains ... no` passes trivially on
+# an empty haystack, so without this a broken $OUTPUTS would look like a pass.
+check_contains "a headline was written for the branch run" "$(grep '^headline=' "$OUTPUTS")" "awaiting CI approval" yes
 check_contains "the headline carries no branch name" "$(grep '^headline=' "$OUTPUTS")" "contrib-branch" no
 
 # A backlog whose ONLY finding is an unapproved CI queue must still notify --
