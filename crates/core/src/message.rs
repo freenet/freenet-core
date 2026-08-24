@@ -174,7 +174,7 @@ impl Transaction {
 impl<'a> arbitrary::Arbitrary<'a> for Transaction {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let ty: TransactionTypeId = u.arbitrary()?;
-        let bytes: u128 = Ulid::new().0;
+        let bytes: u128 = Ulid::generate().0;
         Ok(Self::update(ty.0, Ulid(bytes), None))
     }
 }
@@ -1483,14 +1483,14 @@ mod tests {
 
     #[test]
     fn pack_transaction_type() {
-        let ts_0 = Ulid::new();
+        let ts_0 = Ulid::generate();
         std::thread::sleep(Duration::from_millis(1));
-        let tx = Transaction::update(TransactionType::Connect, Ulid::new(), None);
+        let tx = Transaction::update(TransactionType::Connect, Ulid::generate(), None);
         assert_eq!(tx.transaction_type(), TransactionType::Connect);
-        let tx = Transaction::update(TransactionType::Subscribe, Ulid::new(), None);
+        let tx = Transaction::update(TransactionType::Subscribe, Ulid::generate(), None);
         assert_eq!(tx.transaction_type(), TransactionType::Subscribe);
         std::thread::sleep(Duration::from_millis(1));
-        let ts_1 = Ulid::new();
+        let ts_1 = Ulid::generate();
         assert!(
             tx.id.timestamp_ms() > ts_0.timestamp_ms(),
             "{:?} <= {:?}",
