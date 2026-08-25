@@ -2922,8 +2922,12 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Mid-cycle this resumes immediately after the last contract SENT to that
     /// peer, which is what makes successive windows contiguous in id space
     /// (see [`first_index_after`]). At a cycle BOUNDARY — no cursor yet, the
-    /// cursor evicted or lost, or the previous window ending on the highest id
-    /// — the next cycle starts at a RANDOM offset rather than at 0.
+    /// cursor evicted or lost, or the cycle genuinely COMPLETED — the next
+    /// cycle starts at a RANDOM offset rather than at 0.
+    ///
+    /// A window ending on the highest id is NOT a boundary. It has wrapped,
+    /// and the next window continues at index 0. Reading it as a boundary was
+    /// #5181; an earlier version of this very paragraph asserted the opposite.
     ///
     /// A fixed restart at 0 is the failure this codebase has already rejected
     /// twice, for the same reason each time: see the rotations in
@@ -2940,9 +2944,11 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ///   #5338; see [`Self::summary_window_cursor`].)
     /// - `sorted` is the INTERSECTION with the hash list the peer advertised,
     ///   so the peer influences where the cursor lands. Advertising a single
-    ///   high-id contract parks the cursor at the end, and the following full
-    ///   round would restart at 0 — repeat, and everything past the first
-    ///   window is never advertised.
+    ///   high-id contract parks the cursor at the end, and with a FIXED
+    ///   restart the following full round would begin at 0 — repeat, and
+    ///   everything past the first window is never advertised. (That
+    ///   alternation no longer ends our cycle at all: completion is measured
+    ///   against [`SummaryCursor::cycle_len`], a length the peer cannot move.)
     ///
     /// Randomising the boundary costs nothing in the ordinary case: a cycle
     /// beginning at any offset still advances contiguously and still covers
@@ -2972,38 +2978,48 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// `GlobalRng` is thread-local (`THREAD_RNG` / `THREAD_SEED` are
     /// `thread_local!`), so drawing under the lock cannot deadlock.
     ///
-    /// # Anti-steering is weaker than the pre-#5181 code, deliberately
+    /// # Anti-steering
     ///
     /// Before the fix, every round whose resume ran off the end re-randomised.
     /// That defeated steering — but only as a side effect of the bug, since it
-    /// also re-randomised mid-cycle, and restoring the coverage bound
-    /// necessarily removes it. The count does not fully replace it: completion
-    /// compares against `sorted.len()`, and the peer chooses `sorted`, so
-    /// alternating a single-hash `Interests` with a full one trips completion
-    /// and re-seeds the cycle from an id the peer picked.
-    ///
-    /// Accepted because the harm is almost entirely self-inflicted: what
-    /// starves is our advertisement to THAT peer, cursors are per-peer, and no
-    /// other peer's rotation is affected.
-    /// `a_peer_that_varies_the_shared_set_can_still_pin_the_window` asserts the
-    /// live behaviour so the limit is visible in CI rather than only in prose.
-    /// The principled fix is geometric (positional) completion, which also
-    /// makes a staleness bound stateable under churn: #5313.
+    /// also re-randomised mid-cycle, and restoring the coverage bound removes
+    /// it. The replacement must therefore not hand the peer a NEW lever, and
+    /// the obvious version of this fix did: comparing the cycle count against
+    /// the current `sorted.len()` lets a peer end our cycle whenever it likes,
+    /// since it chooses `sorted`. That would be a deterministic, permanent
+    /// starvation replacing a random, self-correcting one — worse than #5181.
+    /// Completion is measured against [`SummaryCursor::cycle_len`], the length
+    /// captured when the cycle began, so a peer cannot end our cycle on demand
+    /// by shrinking what it advertises;
+    /// `a_peer_that_shrinks_the_shared_set_cannot_pin_the_window` asserts it.
+    /// A positional (geometric) notion of completion would additionally make a
+    /// staleness bound stateable under churn: #5313.
     pub(crate) fn begin_summary_window(&self, peer: &PeerKey, sorted: &[ContractKey]) -> usize {
         if sorted.is_empty() {
             return 0;
         }
         let mut cursors = self.summary_window_cursor.lock();
-        match cursors.peek(peer) {
-            // Mid-cycle: resume immediately after the last entry sent, wrapping
-            // past the end of the set rather than reading the end as a
-            // boundary. The `% len` is what #5181 was missing.
-            Some(cursor) if cursor.advertised_in_cycle < sorted.len() => {
-                first_index_after(sorted, &cursor.last_sent) % sorted.len()
+        let resume = cursors.peek(peer).and_then(|cursor| {
+            // A run of rejected records means the cursor is not being driven by
+            // well-formed rounds, so resuming from it would re-send the same
+            // window forever. Fall back to a boundary instead of wedging.
+            if cursor.cycle_complete()
+                || cursor.consecutive_rejections >= MAX_CONSECUTIVE_CURSOR_REJECTIONS
+            {
+                None
+            } else {
+                // Resume immediately after the last entry sent, WRAPPING past
+                // the end of the set rather than reading the end as a boundary.
+                // The `% len` is what #5181 was missing.
+                Some(first_index_after(sorted, &cursor.last_sent) % sorted.len())
             }
-            // Cycle boundary: no cursor (first reply, restart, LRU eviction), or
-            // the cycle genuinely completed. Draw AND publish together.
-            _ => {
+        });
+        match resume {
+            Some(start) => start,
+            // Cycle boundary: no cursor (first reply, restart, LRU eviction),
+            // the cycle completed, or the escape above. Draw AND publish
+            // together.
+            None => {
                 let origin = crate::config::GlobalRng::random_range(0..sorted.len());
                 cursors.put(peer.clone(), SummaryCursor::starting_at(sorted, origin));
                 origin
@@ -3073,9 +3089,42 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         if len == 0 || entries_sent == 0 {
             return;
         }
+        debug_assert!(
+            entries_sent <= len,
+            "a round cannot send more entries than the set holds: \
+             rotation_window_indices caps the window at limit.min(len)"
+        );
         let new_pos = first_index_after(sorted, &last_sent) % len;
         let mut cursors = self.summary_window_cursor.lock();
         let updated = match cursors.peek(peer) {
+            Some(prev) if len < prev.cycle_len => {
+                // A round built against a SMALLER set than the cycle's own
+                // frame. Its last id is not a position in this cycle's ground,
+                // and applying it would drag `last_sent` to wherever the
+                // smaller set happens to end.
+                //
+                // That is the peer's lever: `sorted` is the intersection with
+                // the hashes IT advertised, so alternating a one-hash
+                // `Interests` with a full one would otherwise pull the cursor
+                // to that one hash every other round and stall the full
+                // rotation short of the set. Charging the rejection means the
+                // escape below still fires, so a set that has genuinely shrunk
+                // redraws within a bounded number of rounds instead of wedging.
+                self.summary_cursor_rejections
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let rejections = prev.consecutive_rejections.saturating_add(1);
+                tracing::debug!(
+                    ?peer,
+                    set_len = len,
+                    cycle_len = prev.cycle_len,
+                    consecutive = rejections,
+                    "ignored a summary-rotation record from a smaller set than the cycle frame"
+                );
+                let mut framed = *prev;
+                framed.consecutive_rejections = rejections;
+                cursors.put(peer.clone(), framed);
+                return;
+            }
             Some(prev) => {
                 let prev_pos = first_index_after(sorted, &prev.last_sent) % len;
                 let advance = (new_pos + len - prev_pos) % len;
@@ -3087,19 +3136,39 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                     // re-sent later, having never been charged.
                     self.summary_cursor_rejections
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let rejections = prev.consecutive_rejections.saturating_add(1);
+                    // Visible in the field, not only to tests: a RUN of these
+                    // means the cursor is not being driven by well-formed
+                    // rounds, and the only other symptom is that this peer
+                    // quietly stops converging on most contracts.
+                    tracing::debug!(
+                        ?peer,
+                        advance,
+                        entries_sent,
+                        set_len = len,
+                        consecutive = rejections,
+                        "discarded a summary-rotation record that did not advance the cycle"
+                    );
+                    let mut wedged = *prev;
+                    wedged.consecutive_rejections = rejections;
+                    cursors.put(peer.clone(), wedged);
                     return;
                 }
                 SummaryCursor {
                     last_sent,
                     advertised_in_cycle: prev.advertised_in_cycle.saturating_add(entries_sent),
+                    cycle_len: prev.cycle_len,
+                    consecutive_rejections: 0,
                 }
             }
             // Evicted between drawing the window and recording it. Nothing to
-            // check against, so start the count fresh rather than discarding a
+            // check against, so start a fresh cycle rather than discarding a
             // round's progress.
             None => SummaryCursor {
                 last_sent,
                 advertised_in_cycle: entries_sent,
+                cycle_len: len,
+                consecutive_rejections: 0,
             },
         };
         cursors.put(peer.clone(), updated);
@@ -3158,12 +3227,15 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         peer: &PeerKey,
         last_sent: ContractInstanceId,
         advertised: usize,
+        cycle_len: usize,
     ) {
         self.summary_window_cursor.lock().put(
             peer.clone(),
             SummaryCursor {
                 last_sent,
                 advertised_in_cycle: advertised,
+                cycle_len,
+                consecutive_rejections: 0,
             },
         );
     }
@@ -3172,8 +3244,14 @@ impl<T: TimeSource + Sync> InterestManager<T> {
 /// First index in `sorted` (ascending by contract id, as
 /// [`InterestManager::get_matching_contracts`] returns it) whose id is strictly
 /// greater than `after`. Returns `sorted.len()` when `after` is at or past the
-/// end, which [`InterestManager::begin_summary_window`] reads as the end of a
-/// cycle and answers with a fresh random offset.
+/// end.
+///
+/// That return is AMBIGUOUS and must not be read as "the cycle ended": it
+/// means either a cursor genuinely past the end or one sitting on the highest
+/// id, which is a mid-cycle wrap. [`InterestManager::begin_summary_window`]
+/// takes it modulo the set size and asks
+/// [`SummaryCursor::cycle_complete`] about the cycle instead. Conflating the
+/// two was #5181.
 ///
 /// This is the churn-safe half of the rotation. Because it is a binary search
 /// over ids rather than a stored offset, it behaves correctly when the set
@@ -3233,13 +3311,48 @@ pub(crate) fn first_index_after(sorted: &[ContractKey], after: &ContractInstance
 pub(crate) struct SummaryCursor {
     /// Contract id of the last entry actually SENT to this peer.
     last_sent: ContractInstanceId,
-    /// Entries sent so far in the current cycle. Compared against
-    /// `sorted.len()` to decide whether the cycle is finished.
+    /// Entries sent so far in the current cycle.
     advertised_in_cycle: usize,
+    /// Size of the shared set when this cycle BEGAN, and the target
+    /// `advertised_in_cycle` is measured against.
+    ///
+    /// Deliberately not the CURRENT `sorted.len()`. The peer chooses `sorted`
+    /// — it is the intersection with the hashes it advertised — so comparing
+    /// against the current length lets it end our cycle whenever it likes by
+    /// advertising a single hash, which re-seeds the rotation from an id it
+    /// picked. Measured against the length the cycle started with, a
+    /// one-element round contributes one entry towards a target it cannot
+    /// move, and the cycle still completes on our terms.
+    ///
+    /// Under genuine churn this is approximate in both directions: a set that
+    /// grew completes the cycle early (an arc waits an extra cycle), one that
+    /// shrank completes it late. Both are bounded by one cycle, unlike the
+    /// unbounded starvation the peer-controlled version allows.
+    cycle_len: usize,
+    /// Consecutive records rejected by the advance check.
+    ///
+    /// Bounds a rejection wedge. A record that never advances leaves the
+    /// cursor untouched, so if some caller-side defect made every record
+    /// ill-formed the same window would be re-sent forever and every other
+    /// contract starved for the process lifetime — strictly worse than the
+    /// staleness the check exists to stop, and exactly the unbounded-exemption
+    /// shape `.claude/rules/ring.md` warns about. After
+    /// [`MAX_CONSECUTIVE_CURSOR_REJECTIONS`] the next window is treated as a
+    /// boundary, degrading to a fresh random origin rather than to silence.
+    consecutive_rejections: u8,
 }
 
+/// Rejected records tolerated before [`InterestManager::begin_summary_window`]
+/// gives up on the current cycle and redraws.
+///
+/// Small on purpose: legitimate rejections are racy (a duplicate or a
+/// boundary-straddling reply) and self-correcting, so a run of three says the
+/// cursor is not being driven by well-formed rounds at all.
+const MAX_CONSECUTIVE_CURSOR_REJECTIONS: u8 = 3;
+
 impl SummaryCursor {
-    /// A cursor that resumes the next window AT `origin`.
+    /// A cursor that resumes the next window AT `origin`, beginning a cycle
+    /// measured against the current set size.
     ///
     /// Stores the origin's PREDECESSOR, because the stored id names the last
     /// entry sent and [`first_index_after`] resolves it to the next one. That
@@ -3251,7 +3364,14 @@ impl SummaryCursor {
         Self {
             last_sent: *predecessor.id(),
             advertised_in_cycle: 0,
+            cycle_len: sorted.len(),
+            consecutive_rejections: 0,
         }
+    }
+
+    /// Whether this cycle has covered the ground it set out to cover.
+    fn cycle_complete(&self) -> bool {
+        self.advertised_in_cycle >= self.cycle_len
     }
 }
 
@@ -8144,7 +8264,7 @@ mod tests {
 
         assert_eq!(mgr.peek_summary_cursor(&peer), None);
 
-        mgr.seed_summary_cursor(&peer, *sorted[2].id(), 1);
+        mgr.seed_summary_cursor(&peer, *sorted[2].id(), 1, sorted.len());
         assert_eq!(mgr.peek_summary_cursor(&peer), Some(*sorted[2].id()));
         assert_eq!(
             mgr.begin_summary_window(&peer, &sorted),
@@ -8154,7 +8274,7 @@ mod tests {
 
         // Cursors are per peer: one peer's progress must not advance another's.
         let other = make_peer_key(2);
-        mgr.seed_summary_cursor(&other, *sorted[6].id(), 1);
+        mgr.seed_summary_cursor(&other, *sorted[6].id(), 1, sorted.len());
         assert_eq!(mgr.begin_summary_window(&peer, &sorted), 3);
         assert_eq!(mgr.begin_summary_window(&other, &sorted), 7);
 
@@ -8200,7 +8320,12 @@ mod tests {
         let mut seen_completed = HashSet::new();
         for _ in 0..40 {
             // A whole cycle's worth of entries covered: genuinely finished.
-            mgr.seed_summary_cursor(&peer, *sorted[sorted.len() - 1].id(), sorted.len());
+            mgr.seed_summary_cursor(
+                &peer,
+                *sorted[sorted.len() - 1].id(),
+                sorted.len(),
+                sorted.len(),
+            );
             seen_completed.insert(mgr.begin_summary_window(&peer, &sorted));
         }
         assert!(
@@ -8234,7 +8359,7 @@ mod tests {
 
             // Mid-cycle by construction: one entry covered out of `len`, and
             // the cursor parked on the highest id in the set.
-            mgr.seed_summary_cursor(&peer, *sorted[len - 1].id(), 1);
+            mgr.seed_summary_cursor(&peer, *sorted[len - 1].id(), 1, len);
 
             // Deterministic: assert over repeats so a lucky random draw of 0
             // cannot be mistaken for a correct wrap.
@@ -8385,9 +8510,18 @@ mod tests {
             mgr.record_summary_cursor(&peer, *sorted[3].id(), 4, &sorted);
             let after = mgr.peek_summary_cursor_state(&peer).expect("cursor");
             assert_eq!(
-                before, after,
+                (after.last_sent, after.advertised_in_cycle, after.cycle_len),
+                (
+                    before.last_sent,
+                    before.advertised_in_cycle,
+                    before.cycle_len
+                ),
                 "a stale record must be discarded: charging it double-counts \
                  the cycle AND rewinding re-sends ground already covered"
+            );
+            assert_eq!(
+                after.consecutive_rejections, 1,
+                "the discard must be counted, so a RUN of them can break the wedge"
             );
             assert_eq!(mgr.summary_cursor_rejections(), 1);
         }
@@ -8402,7 +8536,11 @@ mod tests {
             let before = mgr.peek_summary_cursor_state(&peer).expect("cursor");
             mgr.record_summary_cursor(&peer, *sorted[23].id(), 4, &sorted);
             let after = mgr.peek_summary_cursor_state(&peer).expect("cursor");
-            assert_eq!(before, after, "a duplicate round must not be charged twice");
+            assert_eq!(
+                (after.last_sent, after.advertised_in_cycle),
+                (before.last_sent, before.advertised_in_cycle),
+                "a duplicate round must not be charged twice"
+            );
         }
 
         // 6. A single-entry set: every round is a whole-set round.
@@ -8455,42 +8593,50 @@ mod tests {
         assert_eq!(c.last_sent, last2, "the round must have been recorded");
     }
 
-    /// The anti-steering limit this fix knowingly leaves open, asserted so it
-    /// is visible in CI rather than only in prose.
+    /// A peer that shrinks the shared set must NOT be able to pin our window.
     ///
-    /// Cycle completion compares the count against `sorted.len()`, and the peer
-    /// chooses `sorted` — it is the intersection with the hashes IT advertised.
-    /// Alternating a single-hash `Interests` with a full one makes `len == 1`,
-    /// trips completion, and re-seeds the cycle from an id the peer picked.
+    /// The peer chooses `sorted` — it is the intersection with the hashes it
+    /// advertised — so if cycle completion were measured against the CURRENT
+    /// length, alternating a single-hash `Interests` with a full one would end
+    /// our cycle on demand and re-seed the rotation from an id the peer picked.
+    /// Every full round would then begin at the same index and everything past
+    /// the first window would go unadvertised indefinitely.
     ///
-    /// Accepted because the harm is self-inflicted: what starves is our
-    /// advertisement to THAT peer, cursors are per-peer, and no other peer's
-    /// rotation is affected. Inverting this assertion is part of #5313's fix;
-    /// if this test starts failing because the window no longer pins, that is
-    /// the improvement landing and the test should be inverted, not deleted.
+    /// That is not a theoretical concern about a hostile peer: it is what the
+    /// first version of this fix did, and it was strictly WORSE than the #5181
+    /// bug it replaced. Pre-#5181 the same alternation hit a boundary and drew
+    /// a random offset, so coverage was coupon-collector but complete. Trading
+    /// a random, self-correcting failure for a deterministic, permanent one is
+    /// not a fix. Completion is measured against `SummaryCursor::cycle_len`,
+    /// captured when the cycle began, which the peer cannot move.
     #[test]
-    fn a_peer_that_varies_the_shared_set_can_still_pin_the_window() {
+    fn a_peer_that_shrinks_the_shared_set_cannot_pin_the_window() {
         let (mgr, _clock) = make_manager();
         let peer = make_peer_key(1);
         let full = sorted_keys(0..64);
         let pinned = vec![full[63]];
 
         let mut full_round_starts = HashSet::new();
+        let mut covered = HashSet::new();
         for _ in 0..20 {
-            // The peer advertises just its highest-id contract. len == 1, so a
-            // single entry completes that "cycle".
-            let s = mgr.begin_summary_window(&peer, &pinned);
-            let w = rotation_window_indices(pinned.len(), s, 64);
+            // The peer advertises just its highest-id contract.
+            let s1 = mgr.begin_summary_window(&peer, &pinned);
+            let w1 = rotation_window_indices(pinned.len(), s1, 64);
             mgr.record_summary_cursor(
                 &peer,
-                *pinned[*w.last().expect("non-empty")].id(),
-                w.len(),
+                *pinned[*w1.last().expect("non-empty")].id(),
+                w1.len(),
                 &pinned,
             );
 
-            // Then the full set: the cursor resumes from the id the peer chose.
-            full_round_starts.insert(mgr.begin_summary_window(&peer, &full));
-            let w2 = rotation_window_indices(full.len(), 0, 8);
+            // Then the full set. The start must MOVE across rounds, and the
+            // union must eventually reach every contract.
+            let s2 = mgr.begin_summary_window(&peer, &full);
+            full_round_starts.insert(s2);
+            let w2 = rotation_window_indices(full.len(), s2, 8);
+            for &i in &w2 {
+                covered.insert(i);
+            }
             mgr.record_summary_cursor(
                 &peer,
                 *full[*w2.last().expect("non-empty")].id(),
@@ -8499,13 +8645,135 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            full_round_starts.len(),
-            1,
-            "KNOWN LIMIT (#5313): a peer that varies the shared set pins the \
-             full-round start. If this now varies, geometric completion has \
-             landed — invert this assertion rather than deleting it. Got {:?}",
+        assert!(
+            full_round_starts.len() > 1,
+            "a peer that alternates a one-hash Interests with a full one must \
+             not pin the full-round start: 20 rounds all began at {:?}",
             full_round_starts
+        );
+        assert_eq!(
+            covered.len(),
+            full.len(),
+            "20 rounds of 8 must still cover all {} contracts; covered {}",
+            full.len(),
+            covered.len()
+        );
+        assert!(
+            mgr.summary_cursor_rejections() > 0,
+            "the one-hash rounds must be IGNORED by the frame guard rather than \
+             dragging the cursor; if none were, the guard is not firing and the \
+             coverage above is passing for some other reason"
+        );
+    }
+
+    /// A cycle COMPLETES and then re-randomises, so the anti-starvation redraw
+    /// keeps firing.
+    ///
+    /// Pins `advertised_in_cycle` ACCUMULATING across rounds. Replacing the
+    /// `saturating_add` with a bare assignment leaves every other test in this
+    /// module green while cycles never complete for `limit < len`, so the
+    /// boundary redraw never fires again and tail starvation returns silently.
+    #[test]
+    fn a_cycle_completes_and_then_re_randomises() {
+        let sorted = sorted_keys(0..40);
+        let limit = 8usize;
+        let rounds = sorted.len().div_ceil(limit);
+
+        let mut second_cycle_starts = HashSet::new();
+        for i in 0..40u32 {
+            let (mgr, _clock) = make_manager();
+            let peer = make_unique_peer_key(9700 + i);
+            mgr.seed_summary_cursor_at_origin(&peer, &sorted, 3);
+
+            for r in 0..rounds {
+                let start = mgr.begin_summary_window(&peer, &sorted);
+                let w = rotation_window_indices(sorted.len(), start, limit);
+                mgr.record_summary_cursor(
+                    &peer,
+                    *sorted[*w.last().expect("non-empty")].id(),
+                    w.len(),
+                    &sorted,
+                );
+                let c = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+                assert_eq!(
+                    c.advertised_in_cycle,
+                    (r + 1) * limit,
+                    "the count must ACCUMULATE across rounds, not be replaced"
+                );
+            }
+
+            // The cycle is now complete, so the next window is a boundary.
+            second_cycle_starts.insert(mgr.begin_summary_window(&peer, &sorted));
+        }
+
+        assert!(
+            second_cycle_starts.len() > 1,
+            "a completed cycle must draw a fresh random origin; 40 trials all \
+             restarted at {second_cycle_starts:?}"
+        );
+    }
+
+    /// A run of ill-formed records must degrade to a fresh random origin, not
+    /// to permanent silence.
+    ///
+    /// A rejected record leaves the cursor untouched, so without a bound a
+    /// caller-side defect that made every record ill-formed would re-send the
+    /// same window forever and starve every other contract for the process
+    /// lifetime — strictly worse than the staleness the check exists to stop.
+    #[test]
+    fn a_run_of_rejected_records_falls_back_to_a_boundary() {
+        let sorted = sorted_keys(0..64);
+        let mut starts = HashSet::new();
+        for i in 0..40u32 {
+            let (mgr, _clock) = make_manager();
+            let peer = make_unique_peer_key(9800 + i);
+            mgr.seed_summary_cursor_at_origin(&peer, &sorted, 10);
+            let first = mgr.begin_summary_window(&peer, &sorted);
+
+            // Feed it records that can never be well-formed against the cycle.
+            for _ in 0..MAX_CONSECUTIVE_CURSOR_REJECTIONS {
+                mgr.record_summary_cursor(&peer, *sorted[30].id(), 1, &sorted);
+            }
+            assert_eq!(
+                mgr.summary_cursor_rejections(),
+                MAX_CONSECUTIVE_CURSOR_REJECTIONS as usize
+            );
+            starts.insert((first, mgr.begin_summary_window(&peer, &sorted)));
+        }
+        assert!(
+            starts.iter().any(|(a, b)| a != b),
+            "after {MAX_CONSECUTIVE_CURSOR_REJECTIONS} consecutive rejections \
+             the rotation must redraw rather than re-send the same window \
+             forever; every trial stayed put: {starts:?}"
+        );
+    }
+
+    /// A cursor evicted between drawing the window and recording it starts a
+    /// fresh cycle rather than discarding the round.
+    #[test]
+    fn a_record_with_no_cursor_starts_a_fresh_cycle() {
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(1);
+        let sorted = sorted_keys(0..16);
+
+        assert_eq!(mgr.peek_summary_cursor_state(&peer), None);
+        mgr.record_summary_cursor(&peer, *sorted[5].id(), 4, &sorted);
+        let c = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+        assert_eq!(c.advertised_in_cycle, 4);
+        assert_eq!(c.last_sent, *sorted[5].id());
+        assert_eq!(
+            mgr.summary_cursor_rejections(),
+            0,
+            "there is nothing to check a first record against"
+        );
+
+        // Degenerate inputs must be no-ops, not panics.
+        mgr.record_summary_cursor(&peer, *sorted[5].id(), 0, &sorted);
+        mgr.record_summary_cursor(&peer, *sorted[5].id(), 4, &[]);
+        assert_eq!(
+            mgr.peek_summary_cursor_state(&peer).expect("cursor"),
+            c,
+            "an empty round or an empty set must leave the cursor alone"
         );
     }
 
@@ -8519,9 +8787,24 @@ mod tests {
     #[test]
     fn summary_window_start_draws_its_offset_from_global_rng() {
         let src = include_str!("interest.rs");
+        // The needle must land in PRODUCTION code, not in this test's own
+        // source. When #5181 renamed the function, the old needle stopped
+        // matching anything above and silently resolved to the `.expect`
+        // string literal below it — the body then spanned this assertion,
+        // whose own text contains "GlobalRng::random_range", so the pin passed
+        // vacuously and a `random_range(..) -> 0` mutation stayed green. Guard
+        // against the whole class rather than the one spelling.
+        let test_mod_start = src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("test module not found");
         let at = src
-            .find("pub(crate) fn summary_window_start(")
-            .expect("summary_window_start not found");
+            .find("pub(crate) fn begin_summary_window(")
+            .expect("begin_summary_window not found — did it get renamed again?");
+        assert!(
+            at < test_mod_start,
+            "the pin's needle matched inside the test module, so it would \
+             assert against its own source rather than production code"
+        );
         let body_end = at + src[at..].find("\n    }\n").expect("body end not found");
         let body = &src[at..body_end];
         assert!(

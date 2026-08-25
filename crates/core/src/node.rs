@@ -10617,6 +10617,7 @@ mod tests {
                 &h.peer_key_of(h.old_peer),
                 *sorted[0].id(),
                 1,
+                sorted.len(),
             );
 
             let mut seen: Vec<u32> = Vec::new();
@@ -10790,6 +10791,7 @@ mod tests {
                 &h.peer_key_of(h.new_peer),
                 *sorted[0].id(),
                 1,
+                sorted.len(),
             );
 
             let mut covered: HashSet<u32> = HashSet::new();
@@ -11053,6 +11055,7 @@ mod tests {
                 &pk,
                 ContractInstanceId::new([0u8; 32]),
                 1,
+                all.len(),
             );
 
             let before = h.summary_queries.load(Ordering::Relaxed);
@@ -11462,9 +11465,12 @@ mod tests {
 
             // A known peer's cursor, which the stranger must not touch.
             let known = h.peer_key_of(h.new_peer);
-            h.op_manager
-                .interest_manager
-                .seed_summary_cursor(&known, *sorted[5].id(), 1);
+            h.op_manager.interest_manager.seed_summary_cursor(
+                &known,
+                *sorted[5].id(),
+                1,
+                sorted.len(),
+            );
 
             // Full bytes, not digests: the version gate fails closed on a
             // source we have no connection entry for.
@@ -11584,6 +11590,7 @@ mod tests {
                 &pk,
                 ContractInstanceId::new([0u8; 32]),
                 1,
+                tracked.len(),
             );
 
             let before = h.summary_queries.load(Ordering::Relaxed);
@@ -11948,6 +11955,7 @@ mod tests {
                 &h.peer_key_of(h.old_peer),
                 *sorted[0].id(),
                 1,
+                sorted.len(),
             );
 
             let mut covered: HashSet<u32> = HashSet::new();
