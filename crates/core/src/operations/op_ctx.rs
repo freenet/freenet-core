@@ -2494,12 +2494,19 @@ mod tests {
         let producer = tokio::spawn(async move {
             let (reply_sender, _outbound, _target) =
                 rx.recv().await.expect("outbound msg should be delivered");
-            // One fragment, landing just before the inactivity boundary. A
-            // single pass, not the original five: #5432 widened the window, so
-            // five would overrun the 600 s ceiling and quietly turn this into a
-            // duplicate of the ceiling test.
-            tokio::time::sleep(STREAM_OP_INACTIVITY_TIMEOUT - RACE_SLACK).await;
-            handle.record();
+            // Two fragments, each landing just before an inactivity boundary.
+            //
+            // Not the original five: #5432 widened the window, so five would
+            // overrun the 600 s ceiling and quietly turn this into a duplicate
+            // of the ceiling test. But TWO fit (2 x 239.5 + 5 = 484 s < 600 s),
+            // and two is the minimum that distinguishes "the window resets on
+            // EVERY fragment" from "the window resets once" — which, for a
+            // change that is entirely about window-reset semantics, is the one
+            // bit worth keeping.
+            for _ in 0..2 {
+                tokio::time::sleep(STREAM_OP_INACTIVITY_TIMEOUT - RACE_SLACK).await;
+                handle.record();
+            }
             tokio::time::sleep(Duration::from_secs(5)).await;
             reply_sender
                 .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))

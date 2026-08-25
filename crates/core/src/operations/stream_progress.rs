@@ -304,7 +304,10 @@ impl Drop for StreamProgressGuard {
 ///   the request is even emitted. The originator-loopback relay then runs
 ///   `relay_put_store_locally` — a wait on the single-threaded contract-handling
 ///   queue, then WASM `validate_state`/`update_state`, then a disk persist of
-///   the whole state — before streaming a single byte.
+///   the whole state, then `announce_contract_hosted` (a DELIBERATELY blocking
+///   `notify_node_event`, itself bounded by
+///   `OpManager::NOTIFICATION_SEND_TIMEOUT` at 30 s) — all before a single byte
+///   is streamed.
 /// - **After the last fragment.** Remote reassembly, the remote's own WASM
 ///   execution, further downstream relay hops (each re-streaming the payload),
 ///   and the terminal reply's return trip all happen with the send loop
@@ -317,18 +320,31 @@ impl Drop for StreamProgressGuard {
 /// streaming PUTs get a single attempt (`MAX_PEER_ADVANCEMENTS_STREAMING = 0`),
 /// that was an immediate, deterministic client-visible failure.
 ///
-/// So the window must be sized for the longest silence that is actually
-/// OBSERVED, and bounded above by how long the client will wait to hear the
-/// answer. Both ends are real constraints, and they conflict:
+/// So the window must be sized for the longest silence the pre-fragment phase
+/// can plausibly take, and bounded above by how long the client will wait to
+/// hear the answer. Both ends are real constraints, and they conflict:
 ///
 /// - **Lower.** The pre-fragment phase is a wait on the contract handler, and
-///   #4912 measured roughly 120 s of contract-handling queue starvation on a
-///   real gateway. The window has to clear that, or it keeps killing PUTs that
-///   were about to succeed. 240 s is ~2x the observed figure.
+///   the honest measured floor for it is only **">30 s"**: in both #4912 and
+///   the nova log on #5432 the stall fired at exactly 30 s while the local
+///   store was still running, which tells us the phase outlasts 30 s and
+///   nothing more. 120 s is an **extrapolation**, not a measurement of this
+///   phase — #4912's ~120 s was queue starvation BEFORE its attempt began (see
+///   the `TimeoutCause` rustdoc in `op_ctx.rs`, which says so explicitly), so
+///   it is outside the span this constant governs. The inference is that the
+///   same saturated node that starved the dispatch path for ~120 s will
+///   equally delay the in-window store, which waits on a handler permitted up
+///   to 300 s. Reasonable, and stated as inference so the next person tuning
+///   this does not treat it as a measured floor.
 /// - **Upper.** `fdev`'s default client-side wait is 300 s. Past that the user
 ///   stops seeing the node's specific `stream_stall` diagnosis and gets fdev's
-///   generic "may have succeeded, verify out-of-band" instead. The window has
-///   to stay under it for the node's own answer to be the one that lands.
+///   generic "may have succeeded, verify out-of-band" instead. Precisely: the
+///   verdict fires at `last_fragment + window`, not `attempt_start + window`,
+///   so staying under 300 s buys the node the last word only in the
+///   **no-progress** case — which is the common one, and the one #5432 is
+///   about. A stream that uploads for 300 s and then dies is declared at 540 s
+///   and fdev still speaks first; the ceiling, not this bound, is what limits
+///   that. Do not read the bound as an unconditional guarantee.
 ///
 /// **This does NOT cover the contract handler's full permitted budget.**
 /// `CH_EV_RESPONSE_TIME_OUT` allows a `PutQuery` up to 300 s, so in the extreme
@@ -366,9 +382,10 @@ mod tests {
     /// behind it, which is why they are pinned rather than left to prose:
     ///
     /// - **Too short kills healthy PUTs.** The pre-fragment phase is a wait on
-    ///   the contract handler; #4912 measured ~120 s of queue starvation on a
-    ///   real gateway. A window under that keeps declaring a stall on work that
-    ///   was about to succeed — the #5432 defect.
+    ///   the contract handler. Measured floor is only ">30 s"; the 120 s here
+    ///   is extrapolated from #4912 (see the constant's rustdoc — that 120 s
+    ///   was PRE-attempt starvation, not this phase). A window under it keeps
+    ///   declaring a stall on work that was about to succeed — the #5432 defect.
     /// - **Too long hands the answer to the client.** `fdev`'s default wait is
     ///   300 s. Above that the node's specific diagnosis never reaches the
     ///   user; they get fdev's generic message instead. Measured: raising the
@@ -380,29 +397,43 @@ mod tests {
     ///   than letting it shrink to nothing.
     ///
     /// `fdev`'s constant cannot be referenced from core (fdev depends on core,
-    /// not the reverse), so that bound is asserted against a local copy. Keep
-    /// the two in step: `crates/fdev/src/commands.rs`.
+    /// not the reverse), so that bound is asserted against a local copy. A
+    /// mirrored constant is a guard whose two inputs can drift apart from one
+    /// edit, so `crates/fdev`'s
+    /// `commands::tests::default_response_timeout_matches_the_core_stall_pin`
+    /// asserts the other side of the mirror and names this test. Change either
+    /// and BOTH fail, rather than one silently going stale.
     #[test]
     fn inactivity_window_is_bounded_at_both_ends() {
         let ceiling = crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP;
 
-        // Observed contract-handler queue starvation on a real gateway (#4912).
-        const OBSERVED_QUEUE_STARVATION: Duration = Duration::from_secs(120);
+        // The pre-fragment phase budget. NOT a measurement of that phase:
+        // the measured floor is only ">30 s" (see the constant's rustdoc);
+        // 120 s is extrapolated from #4912's pre-attempt starvation.
+        const PRE_FRAGMENT_PHASE_BUDGET: Duration = Duration::from_secs(120);
+        // Strict inequality is not enough: 121 s would "clear" a 120 s figure
+        // with no headroom, and 120 s is itself an extrapolation rather than a
+        // measurement of this phase (see the constant's rustdoc). The design
+        // margin is 2x, so pin the margin, not just the inequality.
         assert!(
-            STREAM_OP_INACTIVITY_TIMEOUT > OBSERVED_QUEUE_STARVATION,
+            STREAM_OP_INACTIVITY_TIMEOUT >= 2 * PRE_FRAGMENT_PHASE_BUDGET,
             "the stream watchdog ({STREAM_OP_INACTIVITY_TIMEOUT:?}) must clear \
-             the ~{OBSERVED_QUEUE_STARVATION:?} of handler queue starvation \
-             #4912 measured, or it keeps stalling PUTs that were about to \
-             succeed"
+             the ~{PRE_FRAGMENT_PHASE_BUDGET:?} pre-fragment phase budget with \
+             the 2x margin the sizing argument claims, or it keeps stalling \
+             PUTs that were about to succeed"
         );
 
         // Mirror of fdev's DEFAULT_RESPONSE_TIMEOUT; see the doc note above.
         const FDEV_DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+        // Same again at the top: 299 s is "under" 300 s and buys the node no
+        // room at all to get its verdict out. Require a real gap.
+        const CLIENT_MARGIN: Duration = Duration::from_secs(30);
         assert!(
-            STREAM_OP_INACTIVITY_TIMEOUT < FDEV_DEFAULT_RESPONSE_TIMEOUT,
-            "the stream watchdog ({STREAM_OP_INACTIVITY_TIMEOUT:?}) must fire \
-             before fdev gives up ({FDEV_DEFAULT_RESPONSE_TIMEOUT:?}), or the \
-             user sees fdev's generic timeout instead of the node's reason"
+            STREAM_OP_INACTIVITY_TIMEOUT + CLIENT_MARGIN <= FDEV_DEFAULT_RESPONSE_TIMEOUT,
+            "the stream watchdog ({STREAM_OP_INACTIVITY_TIMEOUT:?}) must fire at \
+             least {CLIENT_MARGIN:?} before fdev gives up \
+             ({FDEV_DEFAULT_RESPONSE_TIMEOUT:?}), or the user sees fdev's \
+             generic timeout instead of the node's reason"
         );
 
         assert!(
