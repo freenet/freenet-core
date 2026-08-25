@@ -212,8 +212,17 @@ fn website_init(config_home: &Path) -> anyhow::Result<String> {
 /// not treated as fatal: the freshly-spun fixture's Put driver can report a
 /// timeout while the insert still lands. We confirm the real outcome by
 /// polling the HTTP shell route instead.
+///
+/// And for the same reason as there, fdev's client-side wait is capped well
+/// below its 300 s default: waiting it out for an outcome we discard is dead
+/// time, and it silently couples this test to the node's stall watchdog
+/// (`operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT`). Measured
+/// during #5432: raising that window pushed this test from ~36 s straight to
+/// nextest's 240 s cap, three tries running, even though the shell still came
+/// up fine and the assertion this test makes was unaffected.
 fn website_publish_observed(config_home: &Path, ws_url: &str) {
     let output = isolated_fdev(config_home)
+        .env("FDEV_RESPONSE_TIMEOUT", "30")
         .args(["--node-url", ws_url, "website", "publish"])
         .arg(fixture_webapp_dir())
         .args(["--key", FIXTURE_KEY_NAME])
@@ -314,13 +323,14 @@ fn run_playwright(shell_url: &str) -> anyhow::Result<()> {
 /// `contract_home` fetches it locally and renders the shell without needing
 /// network propagation.
 // Budget: the harness times the WHOLE test, including the `fdev website
-// publish` step (which can burn its full ~90s single-shot Put timeout before
-// the insert lands — see `website_publish_observed`), the shell-readiness poll
-// (up to 120s), and the Playwright suite (~90s for the 16 specs in
-// shell.spec.ts, plus the two node-free suites). An observed local
-// run finished in ~282s, so 300s left almost no slack on a contended runner;
-// 600s gives comfortable headroom without masking a genuine hang (the
-// individual sub-steps have their own tighter internal deadlines).
+// publish` step (now capped at 30s of client wait by `website_publish_observed`
+// — it was previously bounded only by fdev's 300s default, which is what made
+// this test hit nextest's cap when #5432 widened the node-side stall window),
+// the shell-readiness poll (up to 120s), and the Playwright suite (~90s for the
+// 16 specs in shell.spec.ts, plus the two node-free suites). An observed local
+// run finished in ~282s BEFORE that cap; it is well under that now. 600s gives
+// comfortable headroom without masking a genuine hang (the individual sub-steps
+// have their own tighter internal deadlines).
 #[freenet_test(
     health_check_readiness = true,
     nodes = ["gateway"],

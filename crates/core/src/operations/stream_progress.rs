@@ -81,7 +81,7 @@ type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// establishment) while the reader measured against the op's `RealTime` (epoch
 /// = op start, strictly later), the stored "last progress" would exceed the
 /// reader's clock, `since_last` would `saturating_sub` to 0 forever, and the
-/// 30 s inactivity stall would NEVER fire — silently degrading to the 600 s
+/// inactivity stall would NEVER fire — silently degrading to the 600 s
 /// ceiling. Owning the clock here makes `record()` take **no caller timestamp**,
 /// guaranteeing one epoch for both sides and preserving VirtualTime/DST
 /// correctness (one injected clock).
@@ -289,15 +289,168 @@ impl Drop for StreamProgressGuard {
 /// individual transport fragments on one hop. The op-level timeout is larger on
 /// purpose: it must absorb whole transport retransmit cycles (a hop can stall
 /// for several seconds and recover) without the op layer prematurely declaring
-/// the stream dead and firing a version-conflicting retry. 30 s gives ~6× the
-/// transport inactivity window of slack.
-pub(crate) const STREAM_OP_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
+/// the stream dead and firing a version-conflicting retry.
+///
+/// # Sizing this against the phases that record nothing (#5432)
+///
+/// The original 30 s was chosen as ~6x the transport inactivity window, which
+/// sizes it for **one** of the three phases of an attempt: the stretch during
+/// which fragments are actually being dispatched. [`StreamProgressHandle::record`]
+/// is called only by the originator's outbound stream send loop, once per
+/// fragment, so an attempt has two further phases in which nothing can record
+/// and the clock runs unopposed:
+///
+/// - **Before the first fragment.** The clock starts at construction, before
+///   the request is even emitted. The originator-loopback relay then runs
+///   `relay_put_store_locally` — a wait on the single-threaded contract-handling
+///   queue, then WASM `validate_state`/`update_state`, then a disk persist of
+///   the whole state, then `announce_contract_hosted` (a DELIBERATELY blocking
+///   `notify_node_event`, itself bounded by
+///   `OpManager::NOTIFICATION_SEND_TIMEOUT` at 30 s) — all before a single byte
+///   is streamed.
+/// - **After the last fragment.** Remote reassembly, the remote's own WASM
+///   execution, further downstream relay hops (each re-streaming the payload),
+///   and the terminal reply's return trip all happen with the send loop
+///   finished.
+///
+/// A multi-MiB payload routinely spends more than 30 s in either. Every
+/// `fdev website publish`/`update` is such a payload (the embedded website
+/// contract WASM alone exceeds the 64 KiB streaming threshold), so healthy
+/// publishes were being abandoned as `stream_stall` at exactly 30 s — and since
+/// streaming PUTs get a single attempt (`MAX_PEER_ADVANCEMENTS_STREAMING = 0`),
+/// that was an immediate, deterministic client-visible failure.
+///
+/// So the window must be sized for the longest silence the pre-fragment phase
+/// can plausibly take, and bounded above by how long the client will wait to
+/// hear the answer. Both ends are real constraints, and they conflict:
+///
+/// - **Lower.** The pre-fragment phase is a wait on the contract handler, and
+///   the honest measured floor for it is only **">30 s"**: in both #4912 and
+///   the nova log on #5432 the stall fired at exactly 30 s while the local
+///   store was still running, which tells us the phase outlasts 30 s and
+///   nothing more. 120 s is an **extrapolation**, not a measurement of this
+///   phase — #4912's ~120 s was queue starvation BEFORE its attempt began (see
+///   the `TimeoutCause` rustdoc in `op_ctx.rs`, which says so explicitly), so
+///   it is outside the span this constant governs. The inference is that the
+///   same saturated node that starved the dispatch path for ~120 s will
+///   equally delay the in-window store, which waits on a handler permitted up
+///   to 300 s. Reasonable, and stated as inference so the next person tuning
+///   this does not treat it as a measured floor.
+/// - **Upper.** `fdev`'s default client-side wait is 300 s. Past that the user
+///   stops seeing the node's specific `stream_stall` diagnosis and gets fdev's
+///   generic "may have succeeded, verify out-of-band" instead. Precisely: the
+///   verdict fires at `last_fragment + window`, not `attempt_start + window`,
+///   so staying under 300 s buys the node the last word only in the
+///   **no-progress** case — which is the common one, and the one #5432 is
+///   about. A stream that uploads for 300 s and then dies is declared at 540 s
+///   and fdev still speaks first; the ceiling, not this bound, is what limits
+///   that. Do not read the bound as an unconditional guarantee.
+///
+/// **This does NOT cover the contract handler's full permitted budget.**
+/// `CH_EV_RESPONSE_TIME_OUT` allows a `PutQuery` up to 300 s, so in the extreme
+/// where the handler spends all of it, this watchdog still fires first. That is
+/// a deliberate bound, not an oversight: covering it would require a window
+/// above 300 s, which is precisely the upper limit above. Given a live path
+/// where the terminal reply is never delivered at all even though the store
+/// succeeded (`crates/core/tests/fdev_publish_e2e.rs` documents it, and
+/// measures the client hanging to its full 300 s once the window is raised past
+/// it), a long hang is a worse outcome than a fast wrong answer. The extreme
+/// handler case is rarer than the lost-reply case, so the bound goes to the
+/// common one.
+///
+/// The real fix for both is to make the terminal reply arrive; until then this
+/// constant is a compromise between two bad outcomes rather than a derivation
+/// with a single right answer. Do not "tighten" it toward either end without
+/// re-reading this block — each end has a demonstrated failure behind it.
+///
+/// It also stays well below the 600 s
+/// [`crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP`] ceiling, so a dead
+/// stream is still reported as a stall rather than swallowed by the ceiling
+/// (the #4912 misattribution class). All of these relationships are pinned by
+/// `tests::inactivity_window_is_bounded_at_both_ends`.
+pub(crate) const STREAM_OP_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::operations::put::PutMsg;
     use crate::simulation::VirtualTime;
+
+    /// The window must sit strictly inside both of its real bounds (#5432).
+    ///
+    /// Neither bound is local to this file, and each has a demonstrated failure
+    /// behind it, which is why they are pinned rather than left to prose:
+    ///
+    /// - **Too short kills healthy PUTs.** The pre-fragment phase is a wait on
+    ///   the contract handler. Measured floor is only ">30 s"; the 120 s here
+    ///   is extrapolated from #4912 (see the constant's rustdoc — that 120 s
+    ///   was PRE-attempt starvation, not this phase). A window under it keeps
+    ///   declaring a stall on work that was about to succeed — the #5432 defect.
+    /// - **Too long hands the answer to the client.** `fdev`'s default wait is
+    ///   300 s. Above that the node's specific diagnosis never reaches the
+    ///   user; they get fdev's generic message instead. Measured: raising the
+    ///   window to 330 s -- a candidate this PR REJECTED for exactly this
+    ///   reason -- made `fdev_publish_e2e` hang to fdev's full 300 s.
+    /// - **Above the ceiling, a stall can never fire at all**, and every dead
+    ///   stream is misreported as `stream_ceiling` (#4912's class again). The
+    ///   band assertion keeps the correctly-attributed span meaningful rather
+    ///   than letting it shrink to nothing.
+    ///
+    /// `fdev`'s constant cannot be referenced from core (fdev depends on core,
+    /// not the reverse), so that bound is asserted against a local copy. A
+    /// mirrored constant is a guard whose two inputs can drift apart from one
+    /// edit, so `crates/fdev`'s
+    /// `commands::tests::default_response_timeout_matches_the_core_stall_pin`
+    /// asserts the other side of the mirror and names this test. Change either
+    /// and BOTH fail, rather than one silently going stale.
+    #[test]
+    fn inactivity_window_is_bounded_at_both_ends() {
+        let ceiling = crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP;
+
+        // The pre-fragment phase budget. NOT a measurement of that phase:
+        // the measured floor is only ">30 s" (see the constant's rustdoc);
+        // 120 s is extrapolated from #4912's pre-attempt starvation.
+        const PRE_FRAGMENT_PHASE_BUDGET: Duration = Duration::from_secs(120);
+        // Strict inequality is not enough: 121 s would "clear" a 120 s figure
+        // with no headroom, and 120 s is itself an extrapolation rather than a
+        // measurement of this phase (see the constant's rustdoc). The design
+        // margin is 2x, so pin the margin, not just the inequality.
+        assert!(
+            STREAM_OP_INACTIVITY_TIMEOUT >= 2 * PRE_FRAGMENT_PHASE_BUDGET,
+            "the stream watchdog ({STREAM_OP_INACTIVITY_TIMEOUT:?}) must clear \
+             the ~{PRE_FRAGMENT_PHASE_BUDGET:?} pre-fragment phase budget with \
+             the 2x margin the sizing argument claims, or it keeps stalling \
+             PUTs that were about to succeed"
+        );
+
+        // Mirror of fdev's DEFAULT_RESPONSE_TIMEOUT; see the doc note above.
+        const FDEV_DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+        // Same again at the top: 299 s is "under" 300 s and buys the node no
+        // room at all to get its verdict out. Require a real gap.
+        const CLIENT_MARGIN: Duration = Duration::from_secs(30);
+        assert!(
+            STREAM_OP_INACTIVITY_TIMEOUT + CLIENT_MARGIN <= FDEV_DEFAULT_RESPONSE_TIMEOUT,
+            "the stream watchdog ({STREAM_OP_INACTIVITY_TIMEOUT:?}) must fire at \
+             least {CLIENT_MARGIN:?} before fdev gives up \
+             ({FDEV_DEFAULT_RESPONSE_TIMEOUT:?}), or the user sees fdev's \
+             generic timeout instead of the node's reason"
+        );
+
+        assert!(
+            STREAM_OP_INACTIVITY_TIMEOUT < ceiling,
+            "the stream watchdog ({STREAM_OP_INACTIVITY_TIMEOUT:?}) must stay \
+             below the hard ceiling ({ceiling:?}), or a stall can never fire"
+        );
+
+        // The span of upload during which a mid-stream death is still reported
+        // as the stall it is. `< ceiling` alone passed at 599 s.
+        let attributable_upload_span = ceiling - STREAM_OP_INACTIVITY_TIMEOUT;
+        assert!(
+            attributable_upload_span >= Duration::from_secs(120),
+            "only {attributable_upload_span:?} of upload would have its stalls \
+             attributed correctly; the window has crowded the ceiling"
+        );
+    }
 
     #[test]
     fn record_advances_last_progress_and_since_last_tracks_it() {
@@ -321,9 +474,9 @@ mod tests {
     /// Regression for the cross-epoch `RealTime` bug — the writer recorded
     /// against the connection's epoch (earlier than the op's), so the stored
     /// value exceeded the reader's clock and `since_last` saturated to 0
-    /// forever, defeating the 30 s stall. Because `record()` now reads the
+    /// forever, defeating the stall entirely. Because `record()` now reads the
     /// handle's OWN clock (no caller timestamp), a clone used by the "writer"
-    /// shares the reader's basis: after a record, then 30 s of silence,
+    /// shares the reader's basis: after a record, then a full window of silence,
     /// `since_last` reflects the REAL elapsed time and the stall fires.
     ///
     /// This test fails on the pre-fix code (where `record(now_millis)` took an

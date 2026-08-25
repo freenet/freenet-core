@@ -205,8 +205,8 @@ fn fdev_run_expect_failure(args: &[&str]) -> (Option<i32>, String) {
 /// non-zero exit as a fatal test failure.
 ///
 /// Why: in a freshly-spun-up 2-node test fixture the receiving node's
-/// Put driver hits its single-shot attempt timeout (~90s) before the
-/// actual insert is flushed — fdev faithfully reports the timeout to
+/// Put driver reports a timeout before the actual insert is flushed
+/// — fdev faithfully reports the timeout to
 /// the user, then the insert completes ~200ms later (the node logs a
 /// `Broadcasting hosting update` followed by a `PutResponse`). The
 /// race is a fixture quirk, not a code defect in fdev's load path,
@@ -215,8 +215,31 @@ fn fdev_run_expect_failure(args: &[&str]) -> (Option<i32>, String) {
 /// fix touches. Validate via [`wait_for_contract_via_get`] below
 /// instead of via exit code.
 async fn fdev_publish_observed(args: &[&str]) {
+    // Cap fdev's client-side wait well below its 300 s default.
+    //
+    // This helper deliberately DISCARDS the exit code and validates via
+    // `wait_for_contract_via_get` instead, so waiting the full default for an
+    // outcome we then throw away is pure dead time — and worse, it couples this
+    // test to whatever the node's internal stall watchdog happens to be. That
+    // coupling is not hypothetical: raising
+    // `operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT` for #5432
+    // pushed this test from 126 s to fdev's 300 s ceiling and timed it out,
+    // even though the bytes still landed and the assertion this test actually
+    // makes was unaffected.
+    //
+    // 30 s is ample for the fixture: the publish either completes quickly or
+    // hits the reply-never-arrives path this helper exists to tolerate. It
+    // bounds the dead time either way and makes the test independent of
+    // node-side timeout tuning.
+    //
+    // Note what is being tolerated: that path is a REAL defect, filed as #5458
+    // (the store succeeds and the originator never gets its terminal reply),
+    // not a fixture quirk. Capping the wait makes this helper absorb it more
+    // quietly than a 300 s hang did, so the issue reference belongs here — when
+    // #5458 is fixed, this cap and the polling below can both go.
     let output = Command::new(fdev_bin())
         .args(args)
+        .env("FDEV_RESPONSE_TIMEOUT", "30")
         .output()
         .expect("spawn fdev");
     if output.status.success() {
