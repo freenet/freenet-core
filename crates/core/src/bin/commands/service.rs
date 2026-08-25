@@ -95,13 +95,12 @@ pub enum ServiceCommand {
     },
     /// Disable the background daemon so it stays stopped across restarts.
     ///
-    /// Writes a persistent marker in the config directory that the node checks
-    /// at startup: while it is present, `freenet network` refuses to run and
-    /// stays idle instead, so systemd, launchd, or the tray wrapper cannot
-    /// bring the node back on reboot or re-login. The still-running service is
-    /// restarted so the change takes effect immediately (the supervisor stays
-    /// alive; only the node stops doing work). Re-enable with
-    /// `freenet service enable`.
+    /// This writes a marker in the config directory that the node checks at
+    /// startup. While the marker is there, `freenet network` stays idle rather
+    /// than running, so systemd, launchd, or the tray wrapper cannot bring the
+    /// node back on reboot or re-login. The running service is restarted so the
+    /// change takes effect straight away: the supervisor stays alive and only
+    /// the node stops doing work. Re-enable with `freenet service enable`.
     Disable {
         /// Target the system-wide service instead of the user service
         #[arg(long)]
@@ -117,12 +116,11 @@ pub enum ServiceCommand {
         #[arg(long)]
         system: bool,
     },
-    /// Recover a wedged service install: re-template the wrapper/unit to the
-    /// current binary, reap stale orphaned `freenet network` processes (PPID=1,
-    /// holding the port on an old binary), and restart cleanly. Use when the
-    /// node appears frozen on an old version (see issue #3967). Unlike
-    /// `restart`, this kills detached orphans and refreshes the wrapper, so it
-    /// closes the bootstrap gap that `restart` alone cannot.
+    /// Repair a stuck service install: point the wrapper and unit file at the
+    /// current binary, kill orphaned `freenet network` processes still holding
+    /// the port on an old binary, and restart cleanly. Use it when the node
+    /// looks frozen on an old version. `restart` on its own does neither of
+    /// those things, which is why it cannot recover this state.
     Doctor {
         /// Repair the system-wide service instead of the user service
         #[arg(long)]

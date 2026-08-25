@@ -113,104 +113,102 @@ pub struct ConfigArgs {
     #[arg(long, env = "MAX_BLOCKING_THREADS")]
     pub max_blocking_threads: Option<usize>,
 
-    /// Budget in bytes for hosted contract *state*. Once exceeded, contracts
-    /// are evicted (least-valuable-first) and their on-disk state reclaimed.
-    /// This bounds tracked contract state only — WASM code blobs and ReDb/
-    /// SQLite database overhead are additional and not counted against it.
-    /// Default: 1 GiB.
+    /// Budget in bytes for hosted contract state. Once it is exceeded,
+    /// contracts are evicted (least valuable first) and their on-disk state is
+    /// reclaimed. This counts contract state only; WASM code blobs and database
+    /// overhead are extra. Default: 1 GiB.
     #[arg(long, env = "MAX_HOSTING_STORAGE")]
     pub max_hosting_storage: Option<u64>,
 
-    /// Fraction (0.0–1.0) of the disk capacity *available to Freenet*
-    /// (`used + free` on the data-dir mount) used to size the aggregate disk
-    /// budget (#4683). The disk budget is the second floor on hosting eviction:
-    /// `effective_budget = min(ram_budget, disk_budget)`. Default: 0.5.
+    /// Fraction (0.0 to 1.0) of the disk space available to Freenet (`used +
+    /// free` on the data-dir mount) used to size the disk budget. Hosting
+    /// eviction uses whichever budget is smaller, memory or disk. Default: 0.5.
+    // Internal (#4683): `effective_budget = min(ram_budget, disk_budget)`.
     #[arg(long, env = "HOSTING_DISK_PCT")]
     pub hosting_disk_pct: Option<f64>,
 
-    /// Hard upper clamp in bytes for the aggregate disk budget (#4683). Mirrors
-    /// `--max-hosting-storage` for disk: the disk budget never exceeds this even
-    /// on a host with a very large data disk. Default: 32 GiB.
+    /// Upper limit in bytes on the disk budget, so a host with a very large
+    /// data disk does not get an unbounded budget. This is the disk equivalent
+    /// of `--max-hosting-storage`. Default: 32 GiB.
+    // Internal: #4683.
     #[arg(long, env = "MAX_HOSTING_DISK")]
     pub max_hosting_disk: Option<u64>,
 
-    /// Fraction (0.0-1.0) of LIVE host-wide surplus memory (this process's own
-    /// resident size plus currently-available system memory) the resident-
-    /// overhead (count-derived) eviction budget may claim, on top of its own
-    /// RSS (#5333). Bounds how aggressively an otherwise-idle host grows its
-    /// hosted-contract count so the process does not visibly dominate a
-    /// user's Task Manager even when the OS reports abundant free memory.
-    /// Does not shrink the budget below the host's already-declared static
-    /// caches. Default: 0.125 (1/8, matching qBittorrent's disk-cache "auto"
-    /// default and this codebase's own pre-existing `/8` convention).
+    /// Fraction (0.0 to 1.0) of spare host memory (this process's resident size
+    /// plus the memory the system reports as available) that the hosted-contract
+    /// budget may claim on top of what it already uses. This limits how far an
+    /// otherwise idle host grows its hosted-contract count, so Freenet does not
+    /// dominate the process list on a machine with plenty of free memory.
+    /// Default: 0.125.
+    // Internal (#5333): applies to the resident-overhead (count-derived)
+    // eviction budget, and never shrinks it below the host's already-declared
+    // static caches. The 1/8 default matches qBittorrent's disk-cache "auto"
+    // default and this codebase's own pre-existing `/8` convention.
     #[arg(long, env = "HOSTING_MEM_SHARE")]
     pub hosting_mem_share: Option<f64>,
 
-    /// Per-user secret-storage quota in bytes for HOSTED mode (#4561, P5 of
-    /// #4381). Bounds a single hosted user's (one `userToken`) TOTAL on-disk
-    /// footprint under their `users/<user_id>/` tree, summed across every
-    /// delegate — both the active secret-value blobs AND the `.keys`
-    /// enumeration registry (so many/large keys are charged too) — so a visitor
-    /// cannot fill the node's disk. Per-user secret-value snapshots are disabled
-    /// (hosted users are transient and don't need overwrite history), so there
-    /// is no `.snapshots/` growth to charge. REJECT-on-full (never evict —
-    /// secrets are authoritative identity/room keys, not a cache). Default:
-    /// 4 MiB. `0` disables enforcement. Has NO effect outside hosted mode —
-    /// local single-user secrets are never quota-checked (and keep snapshots).
+    /// Per-user secret-storage quota in bytes, for hosted mode. Limits the total
+    /// on-disk size of one hosted user's secrets across all delegates, so a
+    /// visitor cannot fill the node's disk. Writes past the quota are rejected;
+    /// nothing is evicted, since secrets are identity and room keys rather than
+    /// a cache. Default: 4 MiB. Use `0` to disable enforcement. Ignored outside
+    /// hosted mode, where secrets are never quota-checked.
+    // Internal (#4561, P5 of #4381): charges both the secret-value blobs and the
+    // `.keys` enumeration registry under `users/<user_id>/`, so many or large
+    // keys count too. Per-user snapshots are disabled (hosted users are
+    // transient), so there is no `.snapshots/` growth to charge. Local
+    // single-user secrets keep their snapshots.
     #[arg(long = "per-user-secret-quota", env = "PER_USER_SECRET_QUOTA")]
     pub per_user_secret_quota_bytes: Option<u64>,
 
-    /// Inactivity TTL, in seconds, after which a HOSTED user's entire
-    /// per-user data is reclaimed by a background sweep (#4561, P5 of #4381).
-    /// Keeps a public "try Freenet" node a transient demo with bounded storage:
-    /// a visitor who walks away has their namespace reclaimed after this many
-    /// real-calendar seconds of inactivity (durable across restarts). Default:
-    /// 2_592_000 (30 days). `0` disables the sweep entirely. Has NO effect
-    /// outside hosted mode — Local single-user data is never enumerated or
-    /// reclaimed (it lives outside the `users/<id>/` tree the sweep touches).
+    /// Seconds of inactivity after which a hosted user's data is reclaimed by a
+    /// background sweep. This keeps a public "try Freenet" node's storage
+    /// bounded: a visitor who walks away has their namespace reclaimed. The
+    /// clock is real calendar time and survives restarts. Default: 2_592_000
+    /// (30 days). Use `0` to disable the sweep. Ignored outside hosted mode.
+    // Internal (#4561, P5 of #4381): Local single-user data lives outside the
+    // `users/<id>/` tree the sweep walks, so it is never enumerated.
     #[arg(long = "per-user-inactive-ttl", env = "PER_USER_INACTIVE_TTL")]
     pub per_user_inactive_ttl_secs: Option<u64>,
 
-    /// How often, in seconds, the inactive-user reclaim sweep runs (#4561).
-    /// Only relevant when hosted mode is on and `per-user-inactive-ttl` is
-    /// non-zero. Default: 3_600 (hourly) — far finer than the 30-day TTL, so
-    /// reclamation lag is negligible while keeping the sweep's disk-walk cost
-    /// trivial. Must be > 0; `0` is treated as the default.
+    /// How often, in seconds, the inactive-user reclaim sweep runs. Only used
+    /// when hosted mode is on and `--per-user-inactive-ttl` is non-zero.
+    /// Default: 3_600 (hourly), which is fine-grained next to the 30-day
+    /// default TTL while keeping the sweep's disk walk cheap. A value of `0` is
+    /// treated as the default.
     #[arg(
         long = "inactive-user-sweep-interval",
         env = "INACTIVE_USER_SWEEP_INTERVAL"
     )]
     pub inactive_user_sweep_interval_secs: Option<u64>,
 
-    /// Byte budget for the compiled-WASM **contract** module cache. The
-    /// **delegate** cache gets a fraction of this value
-    /// (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`, currently 1/4), so the combined
-    /// ceiling is ~1.25× this. When a cache's tracked compiled-byte total would
-    /// exceed its budget on insert, least-recently-used modules are evicted
-    /// until it fits. Bounding by bytes (not entry count) stops a node hosting
-    /// many contracts from thrashing the cache and recompiling on every access
-    /// (issue #4441). When unset, the default scales with system RAM
-    /// (`clamp(total_ram / 8, 64 MiB, 4 GiB)`); set this to override.
+    /// Byte budget for the compiled-WASM contract module cache. The delegate
+    /// cache gets a quarter of this on top, so the combined ceiling is about
+    /// 1.25 times the value you set. When a cache would exceed its budget on
+    /// insert, least-recently-used modules are dropped until it fits. When
+    /// unset, the default scales with system RAM: total RAM / 8, clamped to
+    /// between 64 MiB and 4 GiB.
+    // Internal (#4441): the delegate fraction is
+    // `DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`, currently 1/4. Bounding by bytes
+    // rather than entry count is what stops a node hosting many contracts from
+    // thrashing the cache and recompiling on every access.
     #[arg(long, env = "FREENET_MODULE_CACHE_BUDGET_BYTES")]
     pub module_cache_budget_bytes: Option<usize>,
 
     /// Write the local append-only diagnostic event log (`_EVENT_LOG`).
     ///
-    /// Default: ON in `local` mode, OFF in `network` mode. Local mode is a
-    /// single-node development mode where the log is the point (and where
-    /// `fdev verify-state` consumes `_EVENT_LOG_LOCAL`); network mode is what
-    /// end users run, where the log costs real disk for a capability nothing
-    /// currently harvests.
+    /// On by default in `local` mode, off in `network` mode. Local mode is a
+    /// single-node development mode where the log is the whole point; in
+    /// network mode it costs real disk for something nothing currently reads.
     ///
-    /// This log is a PURELY LOCAL forensic record. It is NOT the telemetry that
-    /// feeds telemetry.freenet.org — that is a separate `TelemetryReporter`
-    /// sink fed in-memory off the same event stream, and it is unaffected by
-    /// this flag. Nothing in the node reads this log back to make decisions,
-    /// and `freenet service report` does not include it.
-    ///
-    /// Measured on a live 0.2.111 peer, writing it costs ~61 MiB/hour of
-    /// appends and accounted for 95% of every fsync the process issued
-    /// (#4968). Enable it on nodes you operate and want to post-mortem.
+    /// The log stays on this machine. It is separate from the telemetry that
+    /// feeds telemetry.freenet.org, which this flag does not affect, and
+    /// `freenet service report` does not include it. On a live peer, writing it
+    /// cost around 61 MiB per hour and accounted for 95% of the process's
+    /// fsyncs, so turn it on for nodes you operate and expect to post-mortem.
+    // Internal (#4968): `fdev verify-state` consumes `_EVENT_LOG_LOCAL`. The
+    // telemetry sink is a separate in-memory `TelemetryReporter` fed off the
+    // same event stream. The measurement above was on a live 0.2.111 peer.
     #[arg(
         long = "enable-event-log",
         env = "FREENET_ENABLE_EVENT_LOG",
@@ -219,29 +217,29 @@ pub struct ConfigArgs {
     )]
     pub enable_event_log: Option<bool>,
 
-    /// Seconds to wait on graceful shutdown for in-flight client
-    /// PUT/GET/UPDATE/SUBSCRIBE operations to finish before tearing
-    /// down peer connections. Set to 0 to disable. Default: 30s. See
-    /// `Config::shutdown_drain_secs` for the full rationale.
+    /// Seconds to wait on shutdown for in-flight client operations
+    /// (PUT, GET, UPDATE, SUBSCRIBE) to finish before peer connections are torn
+    /// down. Set to 0 to disable. Default: 30.
+    // See `Config::shutdown_drain_secs` for the full rationale.
     #[arg(long, env = "SHUTDOWN_DRAIN_SECS")]
     pub shutdown_drain_secs: Option<u64>,
 
-    /// Disable the node's automatic self-update check. Default: **false** — a
-    /// normal release node auto-updates and MUST NOT set this, or it stops
-    /// receiving security/protocol updates (which Freenet ships frequently).
+    /// Turn off the node's automatic update check. Off by default, and a normal
+    /// release node should leave it that way: with it set, the node stops
+    /// picking up the security and protocol updates Freenet ships frequently.
     ///
-    /// Intended ONLY for bespoke from-source deployments that intentionally run
-    /// *ahead* of the latest release (e.g. try.freenet.org). Such a build would
-    /// otherwise detect the newer published release, exit 42 to request an
-    /// update, and either be reinstalled as the stock release (clobbering its
-    /// unreleased build) or crash-loop under a plain restart-on-failure unit.
-    /// A dirty/dev build is already exempt via `build_info::GIT_DIRTY`; this
-    /// covers the clean-but-unofficial case that `GIT_DIRTY` misses (#4690).
-    ///
-    /// Plain boolean flag with no `env` binding: a truthy env value is easy to
-    /// leave set by accident, and silently disabling auto-update fleet-wide is
-    /// the exact failure this must avoid. The one bespoke deployment sets it
-    /// explicitly in its service `ExecStart`.
+    /// This is for deployments built from source that deliberately run ahead of
+    /// the latest release, such as try.freenet.org. Without it, such a build
+    /// spots the newer published release, exits with code 42 to request an
+    /// update, and is then either replaced by the stock release or left
+    /// restart-looping. Builds from a dirty working tree already skip the check.
+    // Internal (#4690): dirty builds are exempt via `build_info::GIT_DIRTY`;
+    // this flag covers the clean-but-unofficial case `GIT_DIRTY` misses.
+    //
+    // Deliberately a plain boolean flag with no `env` binding: a truthy env
+    // value is easy to leave set by accident, and silently disabling
+    // auto-update fleet-wide is the exact failure this must avoid. The one
+    // bespoke deployment sets it explicitly in its service `ExecStart`.
     #[arg(long = "disable-auto-update")]
     pub disable_auto_update: bool,
 
@@ -2079,16 +2077,17 @@ pub struct NetworkArgs {
     #[arg(long)]
     pub is_gateway: bool,
 
-    /// Skip fetching the remote gateway index. The on-disk gateways.toml
-    /// cache is also skipped in two cases: (1) the node is a gateway
-    /// (--is-gateway), which always runs isolated under this flag (any
-    /// --gateways JSON entries are still honored); (2) an explicit
-    /// --gateway CLI entry is supplied, in which case the CLI entries
-    /// (plus any --gateways JSON entries) REPLACE the on-disk cache.
-    /// Otherwise — non-gateway peer with no --gateway CLI entry — the
-    /// on-disk gateways.toml is still read (and merged with any
-    /// --gateways JSON), preserving the contract used by test harnesses
-    /// (e.g. freenet-test-network) that pre-populate it via --config-dir.
+    /// Skip fetching the remote gateway index.
+    ///
+    /// The on-disk gateways.toml cache is also skipped in two cases: when the
+    /// node is a gateway (`--is-gateway`), which always runs isolated under this
+    /// flag, and when an explicit `--gateway` entry is supplied, in which case
+    /// the command-line entries replace the cache. A non-gateway peer with no
+    /// `--gateway` entry still reads gateways.toml.
+    // Any hidden `--gateways` JSON entries are honored in all three cases, and
+    // merged with the cache in the last one. That last case preserves the
+    // contract test harnesses rely on (e.g. freenet-test-network), which
+    // pre-populate gateways.toml via `--config-dir`.
     #[arg(long)]
     pub skip_load_from_network: bool,
 
@@ -2111,16 +2110,16 @@ pub struct NetworkArgs {
     #[arg(long)]
     pub ignore_protocol_checking: bool,
 
-    /// Bandwidth limit for large streaming data transfers (in bytes per second).
-    /// NOTE: This only applies to the send_stream mechanism for large data transfers.
-    /// The general packet rate limiter is currently disabled due to reliability issues.
-    /// Default: 3 MB/s (3,000,000 bytes/second)
+    /// Bandwidth limit for large streaming data transfers, in bytes per second.
+    /// Applies only to the streaming path used for large transfers; the general
+    /// packet rate limiter is currently disabled for reliability reasons.
+    /// Default: 3 MB/s (3,000,000 bytes/second).
     #[arg(long)]
     pub bandwidth_limit: Option<usize>,
 
-    /// Total bandwidth limit across ALL connections (in bytes per second).
-    /// When set, individual connection rates are computed as: total / active_connections.
-    /// This overrides the per-connection bandwidth_limit.
+    /// Total bandwidth limit across all connections, in bytes per second. Each
+    /// connection is allowed total / active_connections. Overrides the
+    /// per-connection `--bandwidth-limit`.
     #[arg(long)]
     #[serde(
         rename = "total-bandwidth-limit",
@@ -2570,23 +2569,23 @@ fn default_bbr_startup_rate() -> Option<u64> {
 
 #[derive(clap::Parser, Debug, Default, Clone, Serialize, Deserialize)]
 pub struct WebsocketApiArgs {
-    /// Address to bind to for the local HTTP/WebSocket client API.
+    /// Address to bind for the local HTTP/WebSocket client API.
     ///
-    /// Defaults to loopback (`::1`, with a `127.0.0.1` companion bind) in BOTH
-    /// operation modes: running as a network peer says nothing about wanting
-    /// this node's fully-privileged control API driveable from other machines.
-    /// Pass `::` (or a specific interface address) to serve clients on other
-    /// hosts, and keep the flag in the node's invocation — a value left only in
-    /// config.toml is re-derived on the next boot.
+    /// Defaults to loopback (`::1`, plus a `127.0.0.1` companion bind) in both
+    /// operation modes, since running as a network peer says nothing about
+    /// wanting this node's fully privileged control API reachable from other
+    /// machines. Pass `::`, or a specific interface address, to serve clients on
+    /// other hosts, and keep the flag in the node's invocation: a value left
+    /// only in config.toml is re-derived on the next boot.
     ///
-    /// One flag widens the bind on its own, in network mode:
-    /// `--allowed-source-cidrs`, which is inert on a loopback socket and so can
-    /// only have been set by someone expecting non-local clients.
-    /// `--allowed-host` does NOT: it is a Host-header allowlist that works
-    /// perfectly on loopback, where a same-host reverse proxy lives. Running
-    /// the proxy on a DIFFERENT host needs this flag as well.
+    /// In network mode `--allowed-source-cidrs` widens this bind on its own,
+    /// because it is inert on a loopback socket and so can only have been set by
+    /// someone expecting non-local clients. `--allowed-host` does not widen it:
+    /// that is a Host-header allowlist, and it works on loopback, where a
+    /// same-host reverse proxy lives. A reverse proxy on a different host needs
+    /// this flag too.
     ///
-    /// SECURITY: anything that can reach this address and port can read and
+    /// Security: anything that can reach this address and port can read and
     /// modify your contract state, identities and keys.
     #[arg(
         name = "ws_api_address",
@@ -2626,27 +2625,27 @@ pub struct WebsocketApiArgs {
     #[serde(rename = "allowed-host", skip_serializing_if = "Option::is_none")]
     pub allowed_host: Option<Vec<String>>,
 
-    /// Additional source IP ranges (CIDR notation) permitted to reach the
+    /// Additional source IP ranges, in CIDR notation, allowed to reach the
     /// local HTTP/WebSocket API.
     ///
-    /// This flag does TWO things, and the first is easy to miss:
+    /// This flag does two things, and the first is easy to miss:
     ///
-    /// 1. With no `--ws-api-address`, in network mode, it BINDS THE API TO ALL
-    ///    INTERFACES. The source filter it relaxes never runs on a loopback
-    ///    socket, so the flag would otherwise be inert.
-    /// 2. It then admits the ranges named here IN ADDITION to loopback and the
-    ///    whole of RFC1918 / IPv6 ULA, which are always accepted. It does not
-    ///    narrow anything: this is not an "only these sources" allowlist.
+    /// 1. Without `--ws-api-address`, in network mode, it binds the API to all
+    ///    interfaces. The source filter it relaxes never runs on a loopback
+    ///    socket, so the flag would otherwise do nothing.
+    /// 2. It then accepts the ranges named here on top of loopback and all of
+    ///    RFC1918 and IPv6 ULA, which are always accepted. It never narrows
+    ///    access: this is not an "only these sources" allowlist.
     ///
-    /// Net effect of `--allowed-source-cidrs 100.64.0.0/10` on its own: listen
-    /// on every interface, accept your entire local network, plus that range.
-    /// Pass `--ws-api-address` as well to keep the bind under your control.
+    /// So `--allowed-source-cidrs 100.64.0.0/10` on its own means: listen on
+    /// every interface, accept your entire local network, and accept that range
+    /// as well. Pass `--ws-api-address` too to keep the bind under your control.
     ///
-    /// SECURITY: Only add ranges you fully control. CGNAT space like
+    /// Security: only add ranges you fully control. CGNAT space such as
     /// `100.64.0.0/10` is shared between subscribers of some ISPs (Starlink,
-    /// T-Mobile, many cable carriers) and is only safe on an overlay network
-    /// such as Tailscale or WireGuard. Anything that can reach the API port
-    /// can access your contract state, keys, and client API.
+    /// T-Mobile, many cable carriers) and is safe only on an overlay network
+    /// such as Tailscale or WireGuard. Anything that can reach the API port can
+    /// access your contract state, keys, and client API.
     #[arg(
         long = "allowed-source-cidrs",
         env = "FREENET_ALLOWED_SOURCE_CIDRS",
@@ -2658,60 +2657,51 @@ pub struct WebsocketApiArgs {
     )]
     pub allowed_source_cidrs: Option<Vec<String>>,
 
-    /// Opt-in hosted mode (P2 of #4381): honor a per-connection durable user
-    /// token (the `userToken` query parameter on the WebSocket upgrade) and
-    /// give that connection its own per-user delegate-secret namespace.
+    /// Run this node as a shared public proxy: honor the durable `userToken`
+    /// query parameter on the WebSocket upgrade and give each token its own
+    /// delegate-secret namespace.
     ///
-    /// OFF by default. When off, `userToken` is ignored and every connection is
-    /// single-user, byte-for-byte today's behavior. Enable only on a node you
-    /// intend to operate as a shared public proxy for untrusted users.
+    /// Off by default, in which case `userToken` is ignored and every connection
+    /// is single-user. Turn it on only for a node you intend to operate as a
+    /// shared proxy for untrusted users.
     ///
-    /// SECURE-CONNECTION REQUIREMENT (refuse-plaintext-token, #4381): even with
-    /// hosted mode on, the durable `userToken` is honored ONLY over a **loopback**
-    /// connection carrying `X-Forwarded-Proto: https` — i.e. behind a
-    /// TLS-terminating reverse proxy colocated on the same host. The loopback
-    /// source proves the proxy→node hop is local; the `https` XFP is positive
-    /// evidence (set by the TLS terminator) that the browser→proxy hop used TLS.
+    /// Even with hosted mode on, a `userToken` is honored only on a loopback
+    /// connection carrying `X-Forwarded-Proto: https`, which means a
+    /// TLS-terminating reverse proxy on the same host. The loopback source shows
+    /// the proxy-to-node hop is local, and the `https` header is the TLS
+    /// terminator's evidence that the browser-to-proxy hop used TLS. Everything
+    /// else is refused with a `403`, including a plaintext loopback connection.
     ///
-    /// Everything else is **rejected** with `403` (fail-closed): a non-loopback
-    /// source, OR a loopback source without `X-Forwarded-Proto: https` (header
-    /// missing or `http`). A direct plaintext connection — even loopback — is
-    /// refused. `Host` is deliberately NOT consulted: it is proxy-rewritable
-    /// (nginx's default rewrites it to the upstream `127.0.0.1:7509`), so it
-    /// cannot grant trust; only the `https` XFP can.
+    /// Required proxy configuration: run a TLS-terminating reverse proxy on the
+    /// same host, connecting to the node over loopback. The proxy has to set
+    /// `X-Forwarded-Proto` itself to the real browser-facing scheme, and strip
+    /// any `X-Forwarded-*` headers the client sent, so that a client cannot
+    /// forge the TLS attestation. Caddy does both by default. nginx needs
+    /// `proxy_set_header X-Forwarded-Proto $scheme;`, which is also what stops a
+    /// client-supplied header being passed through.
     ///
-    /// OPERATOR NOTE (REQUIRED proxy config): front the node with a
-    /// TLS-terminating reverse proxy on the SAME host that connects over
-    /// loopback. The proxy MUST (a) SET / OVERWRITE `X-Forwarded-Proto` itself to
-    /// the real browser→proxy scheme, AND (b) STRIP any client-supplied
-    /// `X-Forwarded-*` headers, so a client cannot forge the TLS attestation.
-    /// Caddy does both by default. nginx requires
-    /// `proxy_set_header X-Forwarded-Proto $scheme;` (a literal `https` is fine
-    /// for an HTTPS-only server block) and must NOT pass through a client-supplied
-    /// `X-Forwarded-Proto` — nginx forwards unknown client headers by default, so
-    /// the explicit `proxy_set_header` overwrite is what stops pass-through.
+    /// Known limitation: the node cannot tell an `X-Forwarded-Proto` the proxy
+    /// set from one it passed through. A proxy misconfigured to forward a
+    /// client-supplied `X-Forwarded-Proto: https` over a plaintext listener
+    /// would let a client spoof it and use a token over cleartext. Configuring
+    /// the proxy correctly is the operator's responsibility.
     ///
-    /// SECURITY NOTE (known limitation): the node trusts `X-Forwarded-Proto` from
-    /// a loopback source and cannot tell a header the proxy SET from one it merely
-    /// PASSED THROUGH from the client. If the proxy is misconfigured to forward a
-    /// client-supplied `X-Forwarded-Proto: https` over a plaintext listener, a
-    /// client could spoof it and the token would be honored over cleartext. The
-    /// node cannot detect this pass-through misconfiguration; correct proxy
-    /// configuration is the operator's responsibility.
+    /// Testing hosted mode locally needs the same setup, or the header sent by
+    /// hand (`curl -H 'X-Forwarded-Proto: https'` from loopback). A TLS
+    /// terminator on a different host, such as a remote load balancer, is not
+    /// supported, because its source address is not loopback.
     ///
-    /// A developer testing hosted mode locally must likewise front it with a TLS
-    /// proxy or send the header (`curl -H 'X-Forwarded-Proto: https'` from
-    /// loopback) — a plain plaintext loopback request is refused. A TLS terminator
-    /// on a **different** host (remote load balancer) is not supported today (its
-    /// source is not loopback) and would need future explicit trusted-proxy-IP
-    /// config.
-    ///
-    /// `--hosted-mode` is THE operator switch, so it works as a BARE flag:
-    /// `--hosted-mode` => `Some(true)`; `--hosted-mode=false` (or
-    /// `--hosted-mode false`) => `Some(false)`; absent => `None`. Kept as
-    /// `Option<bool>` (not a plain `bool` with `default_value`) so config-file /
-    /// env layering can still leave it unset (`None`) and the CLI only overrides
-    /// when actually present — `None` is then resolved to `false` in `build`.
+    /// Works as a bare flag: `--hosted-mode` turns it on, `--hosted-mode=false`
+    /// turns it off, and leaving it out keeps whatever the config file or
+    /// environment set.
+    // Internal (P2 of #4381, refuse-plaintext-token): `Host` is deliberately not
+    // consulted, because a proxy can rewrite it (nginx's default rewrites it to
+    // the upstream `127.0.0.1:7509`), so it cannot grant trust; only the
+    // `X-Forwarded-Proto` header can.
+    //
+    // Kept as `Option<bool>` rather than a `bool` with `default_value` so
+    // config-file and env layering can leave it unset (`None`) and the CLI only
+    // overrides when actually present. `None` resolves to `false` in `build`.
     #[arg(
         long = "hosted-mode",
         env = "FREENET_HOSTED_MODE",
@@ -2721,29 +2711,30 @@ pub struct WebsocketApiArgs {
     #[serde(rename = "hosted-mode", skip_serializing_if = "Option::is_none")]
     pub hosted_mode: Option<bool>,
 
-    /// Sustained per-user operation rate limit (requests/second) for HOSTED
-    /// mode (#4561, P5 of #4381). Bounds how fast a single hosted user (one
-    /// `userToken`) can issue contract operations (GET/PUT/UPDATE/SUBSCRIBE) so
-    /// one visitor cannot flood the node's executor and network. Over-rate
-    /// requests are REJECTED at the WebSocket boundary (the client retries).
-    /// Default: 10 req/sec. `0` disables operation rate limiting. Has NO effect
-    /// outside hosted mode — local single-user requests are never rate-limited.
+    /// Sustained per-user operation rate limit, in requests per second, for
+    /// hosted mode. Limits how fast one hosted user (one `userToken`) can issue
+    /// contract operations (GET, PUT, UPDATE, SUBSCRIBE), so a single visitor
+    /// cannot flood the node's executor and network. Requests over the rate are
+    /// refused at the WebSocket boundary and the client retries. Default: 10.
+    /// Use `0` to disable. Ignored outside hosted mode.
+    // Internal: #4561, P5 of #4381.
     #[arg(long = "per-user-op-rate-limit", env = "PER_USER_OP_RATE_LIMIT")]
     pub per_user_op_rate_limit: Option<u64>,
 
-    /// Per-user operation burst capacity for HOSTED mode (#4561). The maximum
-    /// number of operations a user who has been idle can issue back-to-back
-    /// before being throttled to the sustained `--per-user-op-rate-limit`.
-    /// Default: 100. Paired with the rate limit above; only meaningful when
-    /// op rate limiting is enabled.
+    /// Per-user operation burst capacity for hosted mode: how many operations an
+    /// idle user can issue back to back before being throttled to
+    /// `--per-user-op-rate-limit`. Default: 100. Only meaningful when operation
+    /// rate limiting is on.
+    // Internal: #4561.
     #[arg(long = "per-user-op-burst", env = "PER_USER_OP_BURST")]
     pub per_user_op_burst: Option<u64>,
 
-    /// Minimum seconds between hosted-export downloads PER USER (#4561). The
-    /// export endpoint enumerates and re-encrypts every secret in the user's
-    /// scope, so it is far more expensive than a single op and gets a separate,
-    /// tighter limit. A request inside this window returns HTTP 429. Default:
-    /// 10s. `0` disables export rate limiting. Hosted-mode only.
+    /// Minimum seconds between hosted-export downloads, per user. The export
+    /// endpoint enumerates and re-encrypts every secret in the user's scope, so
+    /// it is far more expensive than a single operation and gets its own,
+    /// tighter limit. A request inside this window returns HTTP 429.
+    /// Default: 10. Use `0` to disable. Hosted mode only.
+    // Internal: #4561.
     #[arg(
         long = "per-user-export-min-interval-secs",
         env = "PER_USER_EXPORT_MIN_INTERVAL_SECS"
@@ -2757,8 +2748,9 @@ pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "http://nova.locut.us:4318";
 
 #[derive(clap::Parser, Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryArgs {
-    /// Enable telemetry reporting to help improve Freenet (default: true during alpha).
-    /// Telemetry includes operation timing and network topology data, but never contract content.
+    /// Send telemetry to help improve Freenet. On by default during alpha.
+    /// It covers operation timing and network topology. Contract content is
+    /// never included.
     #[arg(
         long = "telemetry-enabled",
         env = "FREENET_TELEMETRY_ENABLED",
@@ -2784,13 +2776,12 @@ pub struct TelemetryArgs {
     )]
     pub transport_snapshot_interval_secs: Option<u64>,
 
-    /// Enable the Phase 1.5 reference-ping shadow probe (#4074): a 1Hz
-    /// UDP DNS query to a fixed external target (default 1.1.1.1:53)
-    /// whose RTT is recorded alongside the per-peer overlay RTT so the
-    /// collector can disentangle overlay queueing from local uplink
-    /// contention. Opt-in: defaults to false. Production gateway
-    /// configs set this to true; developer machines and integration
-    /// tests leave it off so they don't fire DNS traffic from CI.
+    /// Send a reference ping once a second: a UDP DNS query to a fixed external
+    /// target (1.1.1.1:53 by default) whose round-trip time is recorded next to
+    /// the per-peer overlay RTT, so overlay queueing can be told apart from
+    /// local uplink contention. Off by default; production gateways turn it on.
+    // Internal (Phase 1.5 of #4074): stays off on developer machines and in
+    // integration tests so CI does not fire DNS traffic.
     #[arg(
         long = "reference-ping-enabled",
         env = "FREENET_REFERENCE_PING_ENABLED",
@@ -2802,13 +2793,14 @@ pub struct TelemetryArgs {
     )]
     pub reference_ping_enabled: bool,
 
-    /// Enable the Phase 1.6 OS-interface-tx shadow probe (#4074): a 1Hz
-    /// read of `/proc/net/dev` (Linux) that emits aggregate interface tx
-    /// bytes and the derived `op = total - freenet_own` so the floor
-    /// analysis can attribute uplink saturation to Freenet vs the
-    /// operator's other traffic. Best-effort and opt-in: defaults to
-    /// false; production gateway configs set this to true. Like
-    /// reference-ping, it stays off on developer machines and in tests.
+    /// Report interface transmit totals once a second by reading
+    /// `/proc/net/dev` on Linux, along with how much of that traffic is not
+    /// Freenet's own, so uplink saturation can be attributed to Freenet or to
+    /// the operator's other traffic. Best-effort, and off by default;
+    /// production gateways turn it on.
+    // Internal (Phase 1.6 of #4074): emits aggregate tx bytes and the derived
+    // `op = total - freenet_own`. Like reference-ping, it stays off on
+    // developer machines and in tests.
     #[arg(
         long = "iface-tx-enabled",
         env = "FREENET_IFACE_TX_ENABLED",
