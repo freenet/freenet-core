@@ -478,6 +478,72 @@ reporting a healthy service as unhealthy — which is precisely the direction
 that survives unnoticed.
 
 
+## A count cap enforced by REFUSAL, over entries that ordinary use refreshes
+
+**A bound enforced by refusing newcomers is only safe when incumbents age out on
+their own.** If ordinary traffic restamps an entry's TTL, nothing ever rolls off:
+the cap is held permanently by whoever got in first and stayed active, and every
+newcomer is refused **forever**, with no recovery path. That is the
+permanently-refreshable GC exemption `AGENTS.md` forbids — wearing a memory bound
+as a disguise, which is why it reads as correct in review.
+
+#4981: the UPDATE limiter's 16,384 `(sender, contract)` slots. `*entry.get_mut() =
+now` on every accepted UPDATE meant a busy pair refreshed its own TTL indefinitely,
+so a new pair was refused, **never inserted**, and therefore stayed "new" forever —
+every subsequent UPDATE from it dropped and re-counted. Silent data loss on the
+UPDATE propagation path.
+
+Two things made it survive for months:
+
+- **Saturation was read as an attack signal, so exceeding the cap looked like the
+  bound working.** It is not. Tracked pairs are distinct senders x distinct
+  contracts, so 50 peers x ~330 contracts ~= 16,500 already exceeds the cap with
+  nobody malicious. The module justified its bound purely as an anti-attacker
+  measure and never reckoned with a healthy node simply outgrowing it.
+- **The drop logged at `debug!`**, which `release_max_level_info` compiles out, so
+  a production node discarding legitimate relayed UPDATEs left no greppable
+  evidence and a dashboard tile was the only signal.
+
+### Fix shape (#4997)
+
+**Evict least-recently-used instead of refusing**, and:
+
+- **Evict a BATCH** (`cap / 64`), not one entry. The victim scan is linear in the
+  cap and cannot run while holding a shard guard, so under the saturation this
+  targets — where the map is *persistently* full — one-per-admission means a
+  continuous full scan on the receive path.
+- **Release the shard guard before the walk**, and bound the post-eviction retry:
+  the freed slot is not reserved, so another caller may take it.
+- **Replace any incidental ceiling eviction removes.** Refuse-at-cap was also
+  (accidentally) throttling attacker-chosen keys. Add the replacement explicitly
+  and charge it **before** a slot is reserved, so a throttled peer cannot evict
+  anyone on its way to being refused.
+- **Count what you ACTUALLY removed, not the batch you selected.** A concurrent
+  reaper can take a victim first; over-counting drives the size counter **below**
+  the map's true length, letting the map grow past the cap — the one bound the
+  whole mechanism exists to enforce. Note this is unobservable unless a test
+  interleaves the reaper with an admission: with no such test, `remove()` always
+  returns `Some` and the mutation is behaviourally invisible.
+- **Make saturation visible in RELEASE builds**: `info!` plus a counter, never
+  `debug!` alone.
+
+### Where the wrong instruction came from
+
+`.claude/rules/code-style.md` said, without qualification, *"Reject new entries when
+the limit is reached"*. That is right for age-out-only collections and wrong for
+refresh-on-use ones. It now carries the distinction; keep the two files in step.
+
+Audit question for any bounded per-key map: **does ordinary use restamp this
+entry's TTL?** If yes, reject-at-cap is a starvation bug, not a bound.
+
+```bash
+# Bounded per-key maps whose entries are restamped by ordinary use:
+grep -rnE "get_mut\(\) = now|last_seen = now|last_refill = now" crates/core/src/
+# ...cross-check each against how its cap is enforced:
+grep -rnE "max_tracked|MAX_TRACKED" crates/core/src/
+```
+
+
 ## A refusal that is not counted renders as a clean zero
 
 **Any code path that DISCARDS an input must count the discard.** Three bare
