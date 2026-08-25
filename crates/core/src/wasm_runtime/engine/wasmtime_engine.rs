@@ -2893,7 +2893,19 @@ mod tests {
     /// `create_instance_recovers_store_on_guest_entry_failure` below.
     #[test]
     fn create_instance_allocates_its_own_instance_id() {
-        let src = include_str!("wasmtime_engine.rs");
+        // Cut the test module off BEFORE scraping. `include_str!` pulls in the
+        // whole file, this module included, and the needle below occurs here as
+        // a string literal. Without the cut, renaming `create_instance` would
+        // not panic: `find` would fall through to this function's own source,
+        // and the region would then be this test's tail -- whose assertion
+        // message contains `native_api::next_instance_id()`, so the pin would
+        // scrape its own error string and PASS while guarding nothing.
+        // Same remedy as `contract_ops.rs::production_source`; see #5450.
+        let full = include_str!("wasmtime_engine.rs");
+        let cutoff = full
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("wasmtime_engine.rs must have a top-level #[cfg(test)] mod tests");
+        let src = &full[..cutoff];
         let start = src
             .find("    fn create_instance(")
             .expect("create_instance not found");
@@ -3843,7 +3855,7 @@ mod tests {
 
         // Charge one instance to learn what the arena actually retains per
         // instance, then set a budget only a few instances wide.
-        let handle = engine.create_instance(&module, 0, 1024).unwrap();
+        let handle = engine.create_instance(&module, 1024).unwrap();
         engine.drop_instance(&handle);
         let per_instance = engine.retired_instance_bytes;
         assert!(
@@ -3859,8 +3871,8 @@ mod tests {
         // here is attributable to the byte bound alone.
         let creations = 40;
         assert!(creations < STORE_REFRESH_THRESHOLD);
-        for i in 1..=creations {
-            let handle = engine.create_instance(&module, i as i64, 1024).unwrap();
+        for _ in 1..=creations {
+            let handle = engine.create_instance(&module, 1024).unwrap();
             engine.drop_instance(&handle);
             if engine.lifetime_instances <= previous {
                 refreshes += 1;
@@ -3886,7 +3898,7 @@ mod tests {
             "engine must stay healthy across byte-budget refreshes"
         );
         let handle = engine
-            .create_instance(&module, 999_999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after byte-budget refresh");
         engine.drop_instance(&handle);
     }
@@ -3919,7 +3931,7 @@ mod tests {
 
         for i in 0..12 {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} must still be creatable: {e}"));
             assert_eq!(
                 engine.lifetime_instances, 1,
