@@ -45,15 +45,15 @@ pub enum ServiceCommand {
         /// servers, or environments without a user session bus.
         #[arg(long)]
         system: bool,
-        /// Do NOT enable systemd lingering for a user service.
+        /// Leave systemd lingering off for a user service.
         ///
         /// By default a user service enables lingering
-        /// (`loginctl enable-linger <user>`) so it keeps running without an
-        /// active login session — required for the auto-update self-heal to
-        /// work on a headless server (without it, a `--user` service is
+        /// (`loginctl enable-linger <user>`) so that it keeps running without
+        /// an active login session. That is what the auto-update self-heal
+        /// needs on a headless server: without it, a `--user` service is
         /// stopped at logout and never catches the node's exit-42 "update
-        /// needed" signal). Pass this to keep the service login-scoped
-        /// instead. Has no effect on a `--system` service.
+        /// needed" signal. Pass this to keep the service login-scoped instead.
+        /// Has no effect on a `--system` service.
         #[arg(long)]
         no_linger: bool,
     },
@@ -95,13 +95,12 @@ pub enum ServiceCommand {
     },
     /// Disable the background daemon so it stays stopped across restarts.
     ///
-    /// Writes a persistent marker in the config directory that the node checks
-    /// at startup: while it is present, `freenet network` refuses to run and
-    /// stays idle instead, so systemd, launchd, or the tray wrapper cannot
-    /// bring the node back on reboot or re-login. The still-running service is
-    /// restarted so the change takes effect immediately (the supervisor stays
-    /// alive; only the node stops doing work). Re-enable with
-    /// `freenet service enable`.
+    /// This writes a marker, kept across reboots, in the config directory that
+    /// the node checks at startup. While it is there, `freenet network` stays
+    /// idle rather than running, so systemd, launchd, or the tray wrapper
+    /// cannot bring the node back on reboot or re-login. The running service is restarted so the
+    /// change takes effect straight away: the supervisor stays alive and only
+    /// the node stops doing work. Re-enable with `freenet service enable`.
     Disable {
         /// Target the system-wide service instead of the user service
         #[arg(long)]
@@ -117,12 +116,15 @@ pub enum ServiceCommand {
         #[arg(long)]
         system: bool,
     },
-    /// Recover a wedged service install: re-template the wrapper/unit to the
-    /// current binary, reap stale orphaned `freenet network` processes (PPID=1,
-    /// holding the port on an old binary), and restart cleanly. Use when the
-    /// node appears frozen on an old version (see issue #3967). Unlike
-    /// `restart`, this kills detached orphans and refreshes the wrapper, so it
-    /// closes the bootstrap gap that `restart` alone cannot.
+    /// Repair a stuck service install: point the wrapper and unit file at the
+    /// current binary, kill orphaned `freenet network` processes still holding
+    /// the port on an old binary, and restart cleanly. An orphan shows up as a
+    /// `freenet network` process whose parent is init, so
+    /// `ps -o ppid= -p <pid>` reports 1.
+    /// Use this when the node looks frozen on an old version. `restart` on its
+    /// own neither kills detached orphans nor refreshes the wrapper, which is
+    /// why it cannot recover this state.
+    // Internal: #3967.
     Doctor {
         /// Repair the system-wide service instead of the user service
         #[arg(long)]

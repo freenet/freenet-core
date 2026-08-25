@@ -34,17 +34,17 @@ struct Cli {
 enum Command {
     /// Run the node in network mode (default if no subcommand specified)
     ///
-    /// NOTE ON AUTO-UPDATE: a node detects new releases and exits with code 42
-    /// to request an update, but it does NOT update itself. Applying the update
-    /// requires a supervisor that catches exit code 42 and runs `freenet update`
-    /// before restarting — this is set up by `freenet service install` (systemd
-    /// on Linux, a launchd wrapper on macOS, the tray wrapper on Windows).
+    /// About auto-update: the node spots new releases and exits with code 42 to
+    /// ask for an update, and something else has to apply it. That something is
+    /// a supervisor which catches exit code 42, runs `freenet update`, and
+    /// restarts the node. `freenet service install` sets one up: a systemd unit
+    /// on Linux, a launchd wrapper on macOS, the tray wrapper on Windows.
     ///
-    /// A bare `freenet network` run has no such supervisor: it will detect an
-    /// update, exit, and NOT be restarted, so it stays on its current version.
-    /// To keep a hand-run node current, either run `freenet update` yourself when
-    /// prompted in the logs, or install Freenet as a service. Dirty/dev builds
-    /// disable auto-update entirely (it would clobber local changes).
+    /// A bare `freenet network` run has no supervisor, so it spots an update,
+    /// exits, and is never restarted, leaving it on its current version. To keep
+    /// a hand-run node current, run `freenet update` yourself when the logs
+    /// prompt you, or install Freenet as a service. Builds from a dirty working
+    /// tree skip auto-update entirely, since it would discard local changes.
     Network {
         #[command(flatten)]
         config: ConfigArgs,
@@ -61,11 +61,12 @@ enum Command {
     Update(UpdateCommand),
     /// Completely uninstall Freenet (service, binaries, and optionally data)
     Uninstall(UninstallCommand),
-    /// Manage the node KEK (Key Encryption Key) backend.
+    /// Manage the node KEK (key encryption key) backend.
     ///
-    /// The KEK is the master key from which every per-delegate DEK is
-    /// derived via HKDF. Subcommands report status, rotate, or migrate
-    /// the KEK between backends (OS keyring / systemd credential / file).
+    /// The KEK is the master key that every per-delegate data encryption key
+    /// (DEK) is derived from, via HKDF. The subcommands report its status,
+    /// rotate it, or move it between backends: OS keyring, systemd credential,
+    /// or a file.
     Secrets(SecretsCliConfig),
 }
 
