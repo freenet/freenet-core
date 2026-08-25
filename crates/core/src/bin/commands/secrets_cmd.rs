@@ -52,9 +52,10 @@ pub enum SecretsCommand {
     /// which the automatic resolver skips on purpose so that starting the node
     /// never springs a Keychain or Credential Manager prompt on you.
     KekInit(KekInitArgs),
-    /// Generate a new KEK, re-encrypt every active secret and snapshot under
-    /// the newly derived data keys, swap the KEK in the backend atomically, and
-    /// delete the previous value. The node has to be stopped first.
+    /// Generate a new KEK, re-encrypt every active secret and snapshot under the
+    /// newly derived data encryption keys, swap the KEK in the backend
+    /// atomically, and delete the previous value. The node has to be stopped
+    /// first.
     KekRotate(KekRotateArgs),
     /// Move the KEK from its current backend to a target backend.
     /// Useful when migrating from `file` to `keyring` after installing
@@ -62,7 +63,8 @@ pub enum SecretsCommand {
     KekMigrate(KekMigrateArgs),
     /// List the per-secret snapshot history, meaning the backups taken on each
     /// write. Read-only, and prints metadata only: plaintext secret values are
-    /// never shown.
+    /// never shown. Secrets last written before snapshotting was added have no
+    /// history to show.
     SnapshotList(SnapshotListArgs),
     /// Roll a delegate secret back to an earlier snapshot. The current value is
     /// snapshotted first, so the restore can itself be undone. The node has to
@@ -102,9 +104,9 @@ pub struct KekInitArgs {
     /// Backend to provision the KEK into: `keyring`, `systemd`, or `file`.
     ///
     /// Choosing `keyring` writes to the OS keyring here and now, which is what
-    /// raises the platform's consent dialog on macOS and Linux for unsigned
-    /// builds. Running this command is how you give that consent deliberately,
-    /// rather than being asked at startup.
+    /// raises the platform's consent dialog on macOS and Linux for development
+    /// and unsigned builds. Running this command is how you give that consent
+    /// deliberately, rather than being asked at startup.
     #[clap(long)]
     pub backend: String,
     /// Acknowledge that this is an interactive provisioning step.
@@ -181,10 +183,11 @@ pub struct ExportArgs {
     /// Path to the node's secrets directory (the on-disk secret blobs).
     #[clap(long, value_parser)]
     pub secrets_dir: PathBuf,
-    /// Path to the node's data directory, holding the `db` file with the secrets
-    /// index. This is the node's `--db-dir`, or the data dir under which the
-    /// runtime created `db`. It is a different directory from `--secrets-dir`.
-    /// The export needs it to walk the index and work out what to gather.
+    /// Path to the node's data directory, holding the ReDb `db` file with the
+    /// secrets index. This is the node's `--db-dir`, or the data dir under which
+    /// the runtime created `db`. It is a different directory from
+    /// `--secrets-dir`. The export needs it to walk the index and work out what
+    /// to gather.
     #[clap(long, value_parser)]
     pub db_dir: PathBuf,
     /// Export every single-user (local) secret, which is the normal-node backup
@@ -227,7 +230,7 @@ pub struct ImportArgs {
     /// Path to the target node's secrets directory.
     #[clap(long, value_parser)]
     pub secrets_dir: PathBuf,
-    /// Path to the target node's data directory (the ReDb `db`). See the
+    /// Path to the target node's data directory, holding the ReDb `db`. See the
     /// matching `--db-dir` note on `export`.
     #[clap(long, value_parser)]
     pub db_dir: PathBuf,

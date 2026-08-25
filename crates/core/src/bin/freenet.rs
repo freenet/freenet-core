@@ -63,9 +63,10 @@ enum Command {
     Uninstall(UninstallCommand),
     /// Manage the node KEK (key encryption key) backend.
     ///
-    /// The KEK is the master key that every per-delegate data key is derived
-    /// from, via HKDF. The subcommands report its status, rotate it, or move it
-    /// between backends: OS keyring, systemd credential, or a file.
+    /// The KEK is the master key that every per-delegate data encryption key
+    /// (DEK) is derived from, via HKDF. The subcommands report its status,
+    /// rotate it, or move it between backends: OS keyring, systemd credential,
+    /// or a file.
     Secrets(SecretsCliConfig),
 }
 

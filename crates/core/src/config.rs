@@ -135,11 +135,12 @@ pub struct ConfigArgs {
     pub max_hosting_disk: Option<u64>,
 
     /// Fraction (0.0 to 1.0) of spare host memory (this process's resident size
-    /// plus the memory the system reports as available) that the hosted-contract
-    /// budget may claim on top of what it already uses. This limits how far an
-    /// otherwise idle host grows its hosted-contract count, so Freenet does not
-    /// dominate the process list on a machine with plenty of free memory.
-    /// Default: 0.125.
+    /// plus the memory the system reports as available) that the
+    /// resident-overhead budget may claim on top of what it already uses. That
+    /// budget limits how far an otherwise idle host grows the number of
+    /// contracts it hosts, so Freenet does not dominate the process list on a
+    /// machine with plenty of free memory. It is a separate axis from
+    /// `--max-hosting-storage`, which bounds state bytes. Default: 0.125.
     // Internal (#5333): applies to the resident-overhead (count-derived)
     // eviction budget, and never shrinks it below the host's already-declared
     // static caches. The 1/8 default matches qBittorrent's disk-cache "auto"
@@ -151,8 +152,9 @@ pub struct ConfigArgs {
     /// on-disk size of one hosted user's secrets across all delegates, so a
     /// visitor cannot fill the node's disk. Writes past the quota are rejected;
     /// nothing is evicted, since secrets are identity and room keys rather than
-    /// a cache. Default: 4 MiB. Use `0` to disable enforcement. Ignored outside
-    /// hosted mode, where secrets are never quota-checked.
+    /// a cache. Default: 4 MiB. Use `0` to disable enforcement. Outside hosted
+    /// mode the quota is ignored: local single-user secrets are never
+    /// quota-checked.
     // Internal (#4561, P5 of #4381): charges both the secret-value blobs and the
     // `.keys` enumeration registry under `users/<user_id>/`, so many or large
     // keys count too. Per-user snapshots are disabled (hosted users are
@@ -225,8 +227,8 @@ pub struct ConfigArgs {
     pub shutdown_drain_secs: Option<u64>,
 
     /// Turn off the node's automatic update check. Off by default, and a normal
-    /// release node should leave it that way: with it set, the node stops
-    /// picking up the security and protocol updates Freenet ships frequently.
+    /// release node must not set it: with it set, the node stops picking up the
+    /// security and protocol updates Freenet ships frequently.
     ///
     /// This is for deployments built from source that deliberately run ahead of
     /// the latest release, such as try.freenet.org. Without it, such a build
@@ -2657,28 +2659,33 @@ pub struct WebsocketApiArgs {
     )]
     pub allowed_source_cidrs: Option<Vec<String>>,
 
-    /// Run this node as a shared public proxy: honor the durable `userToken`
+    /// Opt in to hosted mode, off by default: honor the durable `userToken`
     /// query parameter on the WebSocket upgrade and give each token its own
-    /// delegate-secret namespace.
+    /// delegate-secret namespace. Turn it on only for a node you intend to
+    /// operate as a shared public proxy for untrusted users.
     ///
-    /// Off by default, in which case `userToken` is ignored and every connection
-    /// is single-user. Turn it on only for a node you intend to operate as a
-    /// shared proxy for untrusted users.
+    /// While it is off, `userToken` is ignored and every connection is
+    /// single-user.
     ///
     /// Even with hosted mode on, a `userToken` is honored only on a loopback
     /// connection carrying `X-Forwarded-Proto: https`, which means a
     /// TLS-terminating reverse proxy on the same host. The loopback source shows
     /// the proxy-to-node hop is local, and the `https` header is the TLS
-    /// terminator's evidence that the browser-to-proxy hop used TLS. Everything
-    /// else is refused with a `403`, including a plaintext loopback connection.
+    /// terminator's evidence that the browser-to-proxy hop used TLS. Two cases
+    /// are refused with a `403`: any non-loopback source, whatever headers it
+    /// sends, and a loopback source without `X-Forwarded-Proto: https`, so a
+    /// plaintext loopback connection is refused too. The `Host` header is never
+    /// consulted here, so `--allowed-host` grants nothing in hosted mode.
     ///
     /// Required proxy configuration: run a TLS-terminating reverse proxy on the
     /// same host, connecting to the node over loopback. The proxy has to set
     /// `X-Forwarded-Proto` itself to the real browser-facing scheme, and strip
     /// any `X-Forwarded-*` headers the client sent, so that a client cannot
-    /// forge the TLS attestation. Caddy does both by default. nginx needs
-    /// `proxy_set_header X-Forwarded-Proto $scheme;`, which is also what stops a
-    /// client-supplied header being passed through.
+    /// forge the TLS attestation. Caddy does both by default. nginx forwards
+    /// unknown client headers through by default, so it needs
+    /// `proxy_set_header X-Forwarded-Proto $scheme;`, which both sets the header
+    /// and stops the client's own copy being passed through. A literal `https`
+    /// works there too if the server block is HTTPS-only.
     ///
     /// Known limitation: the node cannot tell an `X-Forwarded-Proto` the proxy
     /// set from one it passed through. A proxy misconfigured to forward a
@@ -2694,9 +2701,9 @@ pub struct WebsocketApiArgs {
     /// Works as a bare flag: `--hosted-mode` turns it on, `--hosted-mode=false`
     /// turns it off, and leaving it out keeps whatever the config file or
     /// environment set.
-    // Internal (P2 of #4381, refuse-plaintext-token): `Host` is deliberately not
-    // consulted, because a proxy can rewrite it (nginx's default rewrites it to
-    // the upstream `127.0.0.1:7509`), so it cannot grant trust; only the
+    // Internal (P2 of #4381, refuse-plaintext-token): `Host` is not consulted
+    // because a proxy can rewrite it (nginx's default rewrites it to the
+    // upstream `127.0.0.1:7509`), so it cannot grant trust; only the
     // `X-Forwarded-Proto` header can.
     //
     // Kept as `Option<bool>` rather than a `bool` with `default_value` so
