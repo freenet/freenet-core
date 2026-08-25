@@ -361,6 +361,98 @@ impl Ping {
     pub fn is_empty(&self) -> bool {
         self.from.is_empty()
     }
+
+    /// What this state holds that `recipient` does not: the payload a delta should
+    /// carry.
+    ///
+    /// Returns `None` when the recipient is already up to date, which is the case a
+    /// delta exists to make cheap.
+    ///
+    /// # Why a delta is a difference and not the whole state
+    ///
+    /// A contract is free to return its entire state from `get_state_delta` and
+    /// still be correct — this one used to — but then synchronising costs the same
+    /// as transferring the state from scratch every time, and the conformance
+    /// verifier reports it (`self_delta_empty`, `whole_state_self_delta`; #5072).
+    /// Those are diagnostics rather than merge-law violations: wasteful, not wrong.
+    /// For the contract we hold up as the worked example, wasteful is reason enough.
+    ///
+    /// The correctness argument is short, and worth following because it is the
+    /// argument any delta implementation owes:
+    ///
+    /// - The recipient's summary IS its state (see `summarize_state`), so
+    ///   `recipient` here is exactly what the far side holds.
+    /// - `merge` is a union followed by a prune, so merging the difference gives
+    ///   `R ∪ (S \ R)`, which is `R ∪ S` — the same set as merging the whole state.
+    /// - The prune is anchored on the newest timestamp in that union, and dropping
+    ///   entries the recipient already has cannot change its maximum, so both paths
+    ///   prune identically too.
+    ///
+    /// Padding is carried only when ours would win the merge's comparison, for the
+    /// same reason: sending it otherwise changes nothing on arrival.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use freenet_ping_types::Ping;
+    /// # use std::time::Duration;
+    /// let ttl = Duration::from_secs(60);
+    ///
+    /// let mut recipient = Ping::new();
+    /// recipient.insert("alice".to_string());
+    ///
+    /// let mut sender = recipient.clone();
+    /// sender.insert("bob".to_string());
+    ///
+    /// // Only bob's observation is new, so only bob's is sent.
+    /// let delta = sender.delta_against(&recipient).expect("bob is missing");
+    /// assert!(delta.contains_key("bob"));
+    /// assert!(!delta.contains_key("alice"));
+    ///
+    /// // Applying it reaches the same state as sending everything.
+    /// let mut via_delta = recipient.clone();
+    /// via_delta.merge(delta, ttl);
+    /// let mut via_state = recipient.clone();
+    /// via_state.merge(sender.clone(), ttl);
+    /// assert_eq!(*via_delta, *via_state);
+    ///
+    /// // And a peer already holding our state is sent nothing at all.
+    /// assert!(sender.delta_against(&sender.clone()).is_none());
+    /// ```
+    pub fn delta_against(&self, recipient: &Self) -> Option<Self> {
+        let mut missing: BTreeMap<String, Vec<DateTime<Utc>>> = BTreeMap::new();
+        for (name, timestamps) in &self.from {
+            let held = recipient.from.get(name);
+            let new_entries: Vec<DateTime<Utc>> = timestamps
+                .iter()
+                .filter(|t| held.is_none_or(|h| !h.contains(t)))
+                .copied()
+                .collect();
+            if !new_entries.is_empty() {
+                missing.insert(name.clone(), new_entries);
+            }
+        }
+
+        // Exactly the comparison `merge` uses, so the delta carries padding in
+        // precisely the cases where merging the full state would have adopted ours.
+        let padding = match (&self.padding, &recipient.padding) {
+            (Some(ours), Some(theirs)) => match ours.len().cmp(&theirs.len()) {
+                std::cmp::Ordering::Greater => Some(ours.clone()),
+                std::cmp::Ordering::Less => None,
+                std::cmp::Ordering::Equal => (theirs < ours).then(|| ours.clone()),
+            },
+            (Some(ours), None) => Some(ours.clone()),
+            (None, _) => None,
+        };
+
+        if missing.is_empty() && padding.is_none() {
+            return None;
+        }
+        Some(Self {
+            from: missing,
+            padding,
+        })
+    }
 }
 
 impl Display for Ping {
@@ -793,6 +885,84 @@ mod tests {
             "two of the three tail entries are inside the window and one is not, so \
              pruning genuinely ran; equal-but-unpruned would satisfy commutativity \
              while saying nothing about it"
+        );
+    }
+
+    /// Applying the delta must reach the same state as applying the whole thing.
+    ///
+    /// This is the property that makes shrinking the delta safe, and it is the one
+    /// worth copying: a delta is an optimisation, and an optimisation you cannot
+    /// state an equivalence for is a guess. The pair here straddles the expiry
+    /// boundary on purpose, because the prune is where the two paths could most
+    /// easily diverge — the reference instant is derived from the union, and the
+    /// delta path unions a smaller set.
+    #[test]
+    fn applying_the_delta_reaches_the_same_state_as_applying_the_whole_state() {
+        let ttl = Duration::from_secs(60);
+        let newest = Utc::now() - Duration::from_secs(600);
+
+        let mut timestamps: Vec<DateTime<Utc>> = (0..MAX_HISTORY_PER_PEER)
+            .map(|i| newest - Duration::from_secs(i as u64))
+            .collect();
+        timestamps.push(newest - Duration::from_secs(45));
+        timestamps.push(newest - Duration::from_secs(75));
+
+        // Overlapping, not disjoint: the recipient already holds most of what the
+        // sender does, which is the ordinary case and the one where a difference is
+        // worth computing at all.
+        let mut recipient = Ping::new();
+        recipient
+            .from
+            .insert("Alice".to_string(), timestamps[..8].to_vec());
+        let mut sender = Ping::new();
+        sender.from.insert("Alice".to_string(), timestamps.clone());
+        sender.padding = Some(vec![0xAB; 32]);
+
+        // What the recipient reaches by being sent the sender's whole state.
+        let mut via_state = recipient.clone();
+        via_state.merge(sender.clone(), ttl);
+
+        // What it reaches by being sent only the difference.
+        let delta = sender
+            .delta_against(&recipient)
+            .expect("the sender holds entries the recipient does not");
+        let mut via_delta = recipient.clone();
+        via_delta.merge(delta.clone(), ttl);
+
+        assert_eq!(
+            *via_state, *via_delta,
+            "merging the difference must reach the same state as merging the whole \
+             state, or shrinking the delta silently loses observations"
+        );
+        assert_eq!(
+            via_state.padding, via_delta.padding,
+            "the delta must carry padding in exactly the cases where merging the \
+             full state would have adopted it"
+        );
+        assert!(
+            delta.len() < sender.len() || delta["Alice"].len() < sender["Alice"].len(),
+            "the delta must actually be smaller than the state, or nothing has been \
+             gained and this test would pass against the old whole-state delta"
+        );
+    }
+
+    /// A delta against an exact copy of our own state has nothing in it.
+    ///
+    /// `self_delta_empty` (#5072) in the conformance verifier, pinned here so it is
+    /// checked without needing to build the WASM and replay a corpus.
+    #[test]
+    fn a_delta_against_our_own_state_is_nothing() {
+        let mut ping = Ping::new();
+        ping.insert("Alice".to_string());
+        ping.insert("Bob".to_string());
+        ping.padding = Some(vec![0xAB; 16]);
+        ping.merge(Ping::new(), Duration::from_secs(60));
+
+        assert!(
+            ping.delta_against(&ping.clone()).is_none(),
+            "a peer that already holds our exact state must be sent nothing; \
+             returning the state instead makes synchronisation cost as much as a \
+             full transfer every time"
         );
     }
 
