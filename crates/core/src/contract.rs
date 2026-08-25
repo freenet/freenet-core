@@ -2142,9 +2142,20 @@ async fn handle_delegate_notification<CH, P>(
 
     // Notification-driven: there is no client waiting to answer, so an
     // execution failure has nothing to propagate to. Already logged inside
-    // `handle_delegate_with_contract_requests`; just stop here, matching the
-    // pre-existing behavior of falling through with nothing to route (#5263
-    // only changes what happens on the CLIENT-driven path below).
+    // `handle_delegate_with_contract_requests`; there is nothing to route.
+    //
+    // The TTL sweep runs BEFORE this return, not after. It is the registry's
+    // only production caller, and it is what time-bounds the delegate->apps
+    // map per the AGENTS.md GC-exemption rule. Returning above it would make
+    // the sweep conditional on the delegate SUCCEEDING -- and the failure that
+    // motivated #5263 is one a delegate repeats on every single invocation
+    // (rejecting `origin: None`), so on a node whose delegates are all failing
+    // that way the backstop would never run at all. Registrations for apps
+    // that vanished without a clean disconnect would then pin their slots
+    // against MAX_APPS_PER_DELEGATE until the process restarted. Sweeping is
+    // independent of whether this particular execution produced anything.
+    delegate_app_registry::sweep_expired();
+
     let Ok(outbound) = outbound else {
         return;
     };
@@ -2177,12 +2188,6 @@ async fn handle_delegate_notification<CH, P>(
             }
         })
         .collect();
-
-    // Opportunistic TTL sweep of the delegate->apps registry, mirroring how
-    // prune_expired_contexts sweeps on delegate activity rather than via a
-    // background task. Bounds stale registrations for apps that vanished
-    // without a clean disconnect (AGENTS.md GC-exemption rule).
-    delegate_app_registry::sweep_expired();
 
     if app_messages.is_empty() {
         return;
@@ -3089,6 +3094,55 @@ mod tests {
     ///  2. the notification path — which has no connection and therefore
     ///     hardcodes `Local` — is `InterDelegateDispatch::Suppressed`, so that
     ///     hardcoded value can never reach the hop.
+    /// Pin: the delegate->apps TTL sweep must run BEFORE the early return on
+    /// an execution failure.
+    ///
+    /// `sweep_expired` is the registry's ONLY production caller, and it is what
+    /// time-bounds the map per the AGENTS.md GC-exemption rule. #5263 added an
+    /// early `return` on a failed execution; putting the sweep after it makes
+    /// the backstop conditional on the delegate SUCCEEDING. The failure that
+    /// motivated #5263 is one a delegate repeats on EVERY invocation (rejecting
+    /// `origin: None`), so on a node whose delegates all fail that way the
+    /// sweep would never run and stale registrations would pin their slots
+    /// against `MAX_APPS_PER_DELEGATE` until restart.
+    ///
+    /// The source is truncated at the test module BEFORE scraping: both needles
+    /// below also occur in this function's own text, which `include_str!` pulls
+    /// in, so without the cut a rename would silently widen the region instead
+    /// of panicking (see #5450).
+    #[test]
+    fn ttl_sweep_precedes_the_execution_failure_return() {
+        let full = include_str!("contract.rs");
+        let cutoff = full
+            .find("\nmod tests {")
+            .expect("contract.rs must have a top-level `mod tests`");
+        let src = &full[..cutoff];
+
+        let start = src
+            .find("async fn handle_delegate_notification")
+            .expect("handle_delegate_notification must exist");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\nasync fn ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let sweep = body
+            .find("delegate_app_registry::sweep_expired()")
+            .expect("the TTL sweep must live in handle_delegate_notification");
+        let bail = body
+            .find("let Ok(outbound) = outbound else")
+            .expect("the execution-failure early return must exist");
+
+        assert!(
+            sweep < bail,
+            "the TTL sweep ({sweep}) must run BEFORE the execution-failure \
+             return ({bail}); after it, the registry's only production sweep \
+             becomes conditional on the delegate succeeding"
+        );
+    }
+
     #[test]
     fn inter_delegate_hop_forwards_the_originating_scope() {
         let src = include_str!("contract.rs");
