@@ -73,12 +73,18 @@ struct CheckOp<'a> {
     run_id: &'a str,
     vantage: &'a str,
     op: &'a str,
+    /// Position of this operation in the order the run executed. Every record
+    /// of a run is published with the same timestamp, so this is the only thing
+    /// that says which came first.
+    seq: usize,
     dimension: &'a str,
     dimension_secs: Option<i64>,
     contract_key: &'a str,
     ok: bool,
     latency_ms: u128,
     bytes: usize,
+    /// Errors this operation attributed to another contract and skipped.
+    errors_ignored: usize,
     error: Option<&'a str>,
     extra: serde_json::Value,
 }
@@ -217,12 +223,14 @@ pub async fn run(args: EmitArgs) -> Result<bool> {
                 run_id: &run_id,
                 vantage: &args.vantage,
                 op: &op.op,
+                seq: op.seq,
                 dimension: &op.age,
                 dimension_secs: dimension_secs(&op.age),
                 contract_key: &op.key,
                 ok: op.ok,
                 latency_ms: op.latency_ms,
                 bytes: op.size,
+                errors_ignored: op.errors_ignored,
                 error: op.error.as_deref(),
                 extra: serde_json::json!({ "label": op.label }),
             },
@@ -247,6 +255,12 @@ pub async fn run(args: EmitArgs) -> Result<bool> {
                 "pinned_gateways": run_meta.pinned_gateways,
                 "ephemeral_peers": run_meta.ephemeral_peers,
                 "exit_code": args.exit_code,
+                // The marker for the ordering-methodology change. Unlike
+                // `seq`/`errors_ignored`, this one is NOT blocked on a fixed
+                // column list -- `conditions` is free-form JSON -- so there is
+                // no reason for the dashboard's verdict series to carry no
+                // record of the change. Null on runs from before the shuffle.
+                "order_seed": run_meta.order_seed,
             }),
         },
     )?);
@@ -285,6 +299,7 @@ mod tests {
 
     fn op(op: &str, age: &str, ok: bool) -> OpReport {
         OpReport {
+            seq: 3,
             op: op.to_string(),
             age: age.to_string(),
             label: "small-0".to_string(),
@@ -292,6 +307,7 @@ mod tests {
             ok,
             latency_ms: 42,
             size: 123,
+            errors_ignored: 2,
             error: (!ok).then(|| "boom".to_string()),
         }
     }
@@ -312,6 +328,8 @@ mod tests {
         assert_eq!(read.ok, written.ok);
         assert_eq!(read.size, written.size);
         assert_eq!(read.error, written.error);
+        assert_eq!(read.seq, written.seq);
+        assert_eq!(read.errors_ignored, written.errors_ignored);
     }
 
     #[test]
@@ -370,5 +388,51 @@ mod tests {
         assert_eq!(dimension_secs("7d"), Some(604_800));
         assert_eq!(dimension_secs("hop-1"), None);
         assert_eq!(dimension_secs(""), None);
+    }
+
+    /// The OTLP half of the report is hand-mirrored from `OpReport` into
+    /// `CheckOp`, field by field, inside `run`. Nothing type-checks that the
+    /// mirror is faithful: replacing `seq: op.seq` with `seq: 0` compiles,
+    /// clippy-passes, and leaves every other test in this crate green, because
+    /// the only round-trip test covers the jsonl artifact and not the
+    /// published record.
+    ///
+    /// That is the "manually-mirrored telemetry field" shape in
+    /// `.claude/rules/bug-prevention-patterns.md`, whose prescribed remedy is a
+    /// source-scrape pin in the emitting module. `seq` in particular has no
+    /// second source: every record of a run is published with the same
+    /// timestamp, so a zeroed `seq` loses the run's order with no error
+    /// anywhere.
+    #[test]
+    fn the_published_record_mirrors_the_reports_seq_and_errors_ignored() {
+        let src = include_str!("emit.rs");
+        let tests_at = src
+            .find("\n#[cfg(test)]\nmod ")
+            .map(|i| i + 1)
+            .expect("test module not located — this guard cannot verify anything");
+        let sig = "pub async fn run(args: EmitArgs) -> Result<bool> {";
+        let at = src.find(sig).expect("emit::run not found");
+        assert!(
+            at < tests_at,
+            "anchor matched inside the test module — this pin would scrape its own source"
+        );
+        // Bound to `run`'s own body. Slicing to the test module instead would
+        // be tight only for as long as `run` is the last item in the file: add
+        // a function after it and the window silently widens, at which point
+        // this pin passes with the mirrors living in that new function while
+        // `CheckOp` is zeroed.
+        let after_sig = &src[at + sig.len()..];
+        let end = after_sig
+            .find("\n}\n")
+            .expect("could not locate the end of emit::run");
+        let body = &after_sig[..end];
+        for mirror in ["seq: op.seq,", "errors_ignored: op.errors_ignored,"] {
+            assert!(
+                body.contains(mirror),
+                "`{mirror}` is gone from the CheckOp built in `run`. The published record no \
+                 longer carries what the report recorded, and no other test in this crate can \
+                 tell: substituting a literal for either field is invisible to all of them."
+            );
+        }
     }
 }
