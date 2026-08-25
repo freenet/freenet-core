@@ -2910,8 +2910,18 @@ mod tests {
             .find("    fn create_instance(")
             .expect("create_instance not found");
         let body = &src[start..];
+        // `+ 1` because this `find` searches `body[1..]`, so its index is one
+        // short of the position in `body`. Without it the slice drops the byte
+        // before the next method -- harmless today (it is the ASCII newline
+        // closing this method), but `&body[..end]` would then slice at an
+        // arbitrary byte, and this file is full of multi-byte em dashes: one
+        // landing there turns the pin into a "byte index is not a char
+        // boundary" panic that says nothing about what it guards. Matches
+        // `create_instance_recovers_store_on_guest_entry_failure` below, which
+        // this test's rustdoc claims to follow.
         let end = body[1..]
             .find("\n    fn ")
+            .map(|i| i + 1)
             .expect("create_instance body must end at the next method");
         let body = &body[..end];
         assert!(
