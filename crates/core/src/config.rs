@@ -2677,8 +2677,8 @@ pub struct WebsocketApiArgs {
     /// plaintext loopback connection is refused too.
     ///
     /// The `Host` header plays no part in that decision, so `--allowed-host`
-    /// cannot make a token acceptable. It still governs which origins may open
-    /// the connection at all, so it remains relevant to a hosted node's attack
+    /// cannot make a token acceptable. It still governs which origins the node
+    /// accepts requests from, so it remains relevant to a hosted node's attack
     /// surface.
     ///
     /// Required proxy configuration: run a TLS-terminating reverse proxy on the

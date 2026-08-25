@@ -97,9 +97,8 @@ pub enum ServiceCommand {
     ///
     /// This writes a marker, kept across reboots, in the config directory that
     /// the node checks at startup. While it is there, `freenet network` stays
-    /// idle rather than running, so systemd, launchd, or the tray wrapper cannot
-    /// bring the
-    /// node back on reboot or re-login. The running service is restarted so the
+    /// idle rather than running, so systemd, launchd, or the tray wrapper
+    /// cannot bring the node back on reboot or re-login. The running service is restarted so the
     /// change takes effect straight away: the supervisor stays alive and only
     /// the node stops doing work. Re-enable with `freenet service enable`.
     Disable {
