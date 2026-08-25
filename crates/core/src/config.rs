@@ -4401,7 +4401,7 @@ impl GlobalSimulationTime {
     /// - Timestamp: Uses simulation time base + monotonic counter
     /// - Random: Uses seeded RNG from GlobalRng
     ///
-    /// When not in simulation mode, uses regular `Ulid::new()`.
+    /// When not in simulation mode, uses regular `Ulid::generate()`.
     pub fn new_ulid() -> ulid::Ulid {
         use ulid::Ulid;
 
@@ -4433,7 +4433,7 @@ impl GlobalSimulationTime {
             Ulid(ulid_value)
         } else {
             // Production mode: use standard ULID generation
-            Ulid::new()
+            Ulid::generate()
         }
     }
 }
