@@ -602,8 +602,7 @@ where
             // the cap allows, in which case converting it to `Err` would turn
             // working delegates into client-visible failures. Nobody has
             // established which it is, so #5263 deliberately did not touch it.
-            // Confirm the intent before changing this -- see the tracking
-            // issue linked from the PR.
+            // Confirm the intent before changing this -- tracked as #5454.
             return Ok(accumulated_messages);
         }
 
