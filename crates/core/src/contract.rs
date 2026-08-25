@@ -596,7 +596,14 @@ where
                 iterations = iterations,
                 "Exceeded maximum contract request iterations, possible infinite loop"
             );
-            // Return whatever we accumulated so far
+            // Stays `Ok` DELIBERATELY, and this is an OPEN QUESTION, not a
+            // settled decision. Exhausting the iteration budget may be a
+            // legitimate outcome for a delegate that simply has more work than
+            // the cap allows, in which case converting it to `Err` would turn
+            // working delegates into client-visible failures. Nobody has
+            // established which it is, so #5263 deliberately did not touch it.
+            // Confirm the intent before changing this -- see the tracking
+            // issue linked from the PR.
             return Ok(accumulated_messages);
         }
 
@@ -622,8 +629,16 @@ where
                     phase = "unexpected_response",
                     "Unexpected response type from delegate request"
                 );
-                // Return whatever we accumulated so far
-                return Ok(accumulated_messages);
+                // An internal invariant violation, not a delegate outcome: the
+                // executor answered a delegate request with a variant that is
+                // not a delegate response at all. Reporting it as an empty
+                // success is the same lie #5263 removes from the failure arm
+                // below -- the client cannot tell "the delegate said nothing"
+                // from "this node is confused". Nothing legitimate reaches
+                // here, so there is no working behaviour to regress.
+                return Err(ExecutorError::other(anyhow::anyhow!(
+                    "unexpected response variant for a delegate request on {delegate_key}"
+                )));
             }
             Err(err) => {
                 // Downgrade "not found" to warn — expected during legacy
@@ -3094,6 +3109,57 @@ mod tests {
     ///  2. the notification path — which has no connection and therefore
     ///     hardcodes `Local` — is `InterDelegateDispatch::Suppressed`, so that
     ///     hardcoded value can never reach the hop.
+    /// Pin: the unexpected-response arm must return `Err`, not a fake success.
+    ///
+    /// The executor answering a delegate request with a variant that is not a
+    /// delegate response is an internal invariant violation. Returning
+    /// `Ok(accumulated_messages)` there is the same lie #5263 removes from the
+    /// execution-failure arm: the client cannot distinguish "the delegate said
+    /// nothing" from "this node is confused".
+    ///
+    /// Pinned from source rather than behaviourally because both mock
+    /// executors (`MockWasmRuntime`, `MockRuntime`) return `Err`
+    /// unconditionally, so no fixture can drive the executor to hand back a
+    /// wrong-variant `Ok`. Truncated at the test module first -- the needles
+    /// occur in this function's own text (see #5450).
+    #[test]
+    fn unexpected_response_variant_does_not_become_a_fake_success() {
+        let full = include_str!("contract.rs");
+        let cutoff = full
+            .find("\nmod tests {")
+            .expect("contract.rs must have a top-level `mod tests`");
+        let src = &full[..cutoff];
+
+        let start = src
+            .find("async fn handle_delegate_with_contract_requests")
+            .expect("handle_delegate_with_contract_requests must exist");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\nasync fn ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let arm = body
+            .find("phase = \"unexpected_response\"")
+            .expect("the unexpected-response arm must exist");
+        let after = &body[arm..];
+        // Bound to this arm: stop at the next match arm's opening.
+        let arm_end = after.find("Err(err) => {").unwrap_or(after.len());
+        let arm = &after[..arm_end];
+
+        assert!(
+            arm.contains("return Err("),
+            "the unexpected-response arm must return an error; returning \
+             Ok(accumulated_messages) reports an internal invariant violation \
+             to the client as an empty SUCCESS (#5263). Arm: {arm:?}"
+        );
+        assert!(
+            !arm.contains("return Ok(accumulated_messages)"),
+            "the unexpected-response arm must not fall back to a fake success"
+        );
+    }
+
     /// Pin: the delegate->apps TTL sweep must run BEFORE the early return on
     /// an execution failure.
     ///
