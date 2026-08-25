@@ -2674,8 +2674,12 @@ pub struct WebsocketApiArgs {
     /// terminator's evidence that the browser-to-proxy hop used TLS. Two cases
     /// are refused with a `403`: any non-loopback source, whatever headers it
     /// sends, and a loopback source without `X-Forwarded-Proto: https`, so a
-    /// plaintext loopback connection is refused too. The `Host` header is never
-    /// consulted here, so `--allowed-host` grants nothing in hosted mode.
+    /// plaintext loopback connection is refused too.
+    ///
+    /// The `Host` header plays no part in that decision, so `--allowed-host`
+    /// cannot make a token acceptable. It still governs which origins may open
+    /// the connection at all, so it remains relevant to a hosted node's attack
+    /// surface.
     ///
     /// Required proxy configuration: run a TLS-terminating reverse proxy on the
     /// same host, connecting to the node over loopback. The proxy has to set

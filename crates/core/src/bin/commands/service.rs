@@ -95,10 +95,10 @@ pub enum ServiceCommand {
     },
     /// Disable the background daemon so it stays stopped across restarts.
     ///
-    /// This writes a marker in the config directory, kept across reboots, that
+    /// This writes a marker, kept across reboots, in the config directory that
     /// the node checks at startup. While it is there, `freenet network` stays
-    /// idle rather
-    /// than running, so systemd, launchd, or the tray wrapper cannot bring the
+    /// idle rather than running, so systemd, launchd, or the tray wrapper cannot
+    /// bring the
     /// node back on reboot or re-login. The running service is restarted so the
     /// change takes effect straight away: the supervisor stays alive and only
     /// the node stops doing work. Re-enable with `freenet service enable`.
@@ -120,7 +120,8 @@ pub enum ServiceCommand {
     /// Repair a stuck service install: point the wrapper and unit file at the
     /// current binary, kill orphaned `freenet network` processes still holding
     /// the port on an old binary, and restart cleanly. An orphan shows up as a
-    /// `freenet network` process whose parent is init (`ps -o ppid=` reports 1).
+    /// `freenet network` process whose parent is init, so
+    /// `ps -o ppid= -p <pid>` reports 1.
     /// Use this when the node looks frozen on an old version. `restart` on its
     /// own neither kills detached orphans nor refreshes the wrapper, which is
     /// why it cannot recover this state.
