@@ -212,8 +212,17 @@ fn website_init(config_home: &Path) -> anyhow::Result<String> {
 /// not treated as fatal: the freshly-spun fixture's Put driver can report a
 /// timeout while the insert still lands. We confirm the real outcome by
 /// polling the HTTP shell route instead.
+///
+/// And for the same reason as there, fdev's client-side wait is capped well
+/// below its 300 s default: waiting it out for an outcome we discard is dead
+/// time, and it silently couples this test to the node's stall watchdog
+/// (`operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT`). Measured
+/// during #5432: raising that window pushed this test from ~36 s straight to
+/// nextest's 240 s cap, three tries running, even though the shell still came
+/// up fine and the assertion this test makes was unaffected.
 fn website_publish_observed(config_home: &Path, ws_url: &str) {
     let output = isolated_fdev(config_home)
+        .env("FDEV_RESPONSE_TIMEOUT", "30")
         .args(["--node-url", ws_url, "website", "publish"])
         .arg(fixture_webapp_dir())
         .args(["--key", FIXTURE_KEY_NAME])

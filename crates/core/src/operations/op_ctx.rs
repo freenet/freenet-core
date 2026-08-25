@@ -515,7 +515,8 @@ const MAX_INFRA_RETRIES: usize = 3;
 /// Concretely, issue #4912 reported a gateway PUT logging `timeout_secs=117`.
 /// Measured from the attempt's own start (`PUT relay: processing Request` at
 /// 15:35:20.894 to `attempt timed out` at 15:35:50.895) that attempt ran
-/// 30.001 s, because the 30 s [`STREAM_OP_INACTIVITY_TIMEOUT`] stall check is
+/// 30.001 s, because the [`STREAM_OP_INACTIVITY_TIMEOUT`] stall check (30 s
+/// at the time; widened by #5432) is
 /// what abandoned it. The client-visible span was ~150 s, but the extra ~120 s
 /// was queue starvation BEFORE the attempt began, not attempt time. Reporting
 /// a 117 s budget described neither number.
@@ -599,6 +600,18 @@ async fn await_streaming_attempt(
     use crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT;
 
     let handle = progress.handle();
+    // NOTE: deliberately NOT resetting the progress clock here, though
+    // `StreamProgress` is built once per OPERATION and cloned per attempt so a
+    // retry does inherit the previous attempt's accrued silence. It cannot
+    // matter: the stall verdict below needs a full `STREAM_OP_INACTIVITY_TIMEOUT`
+    // sleep to expire, measured from the loop iteration, before it even reads
+    // `since_last()` — and that read can only ever SUPPRESS a stall, never
+    // bring one forward. So the earliest possible verdict is attempt start plus
+    // one window regardless of what the handle already holds, and a reset would
+    // be inert. An earlier revision of this fix added one anyway; it was
+    // removed once that was traced, rather than left in as a line no test could
+    // fail on. If the sleep ever stops being a full window per iteration, this
+    // reasoning expires with it.
     let round_trip = ctx.send_and_await(request);
     tokio::pin!(round_trip);
 
@@ -2116,7 +2129,7 @@ mod tests {
     /// 60 s `OPERATION_TTL` cliff that the OLD fixed-deadline path would fire
     /// at), then the peer replies at ~125 s. The streaming-inactivity path MUST
     /// return the terminal reply (`Ok`) — it MUST NOT time out — because the
-    /// 30 s inactivity window is continuously reset by progress.
+    /// inactivity window is continuously reset by progress.
     ///
     /// This FAILS against the pre-#4001 fixed-deadline behaviour: a 60 s
     /// (or even payload-scaled) deadline fires `TimeoutCause::Deadline` at
@@ -2152,16 +2165,21 @@ mod tests {
         producer.await.expect("producer task panicked");
     }
 
-    /// Progress flows for 40 s then stops. The 30 s inactivity timeout MUST
-    /// fire ~70 s in (40 s of progress + 30 s of silence), returning
+    /// Progress flows for 40 s then stops. The inactivity timeout MUST fire
+    /// exactly one window after the last fragment, returning
     /// `TimeoutCause::StreamStall` exactly once. Asserts the stall is
     /// detected on a genuinely dead stream.
+    ///
+    /// The expected instant is computed from `STREAM_OP_INACTIVITY_TIMEOUT`
+    /// rather than written as a literal, so #5432's resizing of that window
+    /// (30 s -> 240 s) could not silently invalidate it.
     #[tokio::test(start_paused = true)]
     async fn streaming_put_retries_on_true_stall() {
         let (mut ctx, tx, handle, progress, mut rx) = streaming_attempt_fixture();
 
         // Fake peer: progress every 10 s for 40 s, then go silent forever
-        // (never replies). The inactivity timeout must fire.
+        // (never replies). The inactivity timeout must fire one full window
+        // after the last fragment.
         let producer = tokio::spawn(async move {
             let (_reply_sender, _outbound, _target) =
                 rx.recv().await.expect("outbound msg should be delivered");
@@ -2188,18 +2206,225 @@ mod tests {
             Some(TimeoutCause::StreamStall),
             "a stalled stream must be attributed to StreamStall"
         );
-        // Stall detected after 40 s progress + 30 s silence ≈ 70 s, and well
-        // before the 600 s ceiling.
+        // Stall detected one full inactivity window after the last fragment
+        // at 40 s, and well before the 600 s ceiling.
+        //
+        // Stated in terms of the constant rather than a literal: #5432 resized
+        // the window (30 s -> 240 s) because it has to cover the phases in
+        // which nothing can record, and a hard-coded 70 s here would have had
+        // to be re-guessed. The bound is tight on both sides so a window that
+        // silently restarts, or one that stops firing at all, still fails.
+        let expected = Duration::from_secs(40) + STREAM_OP_INACTIVITY_TIMEOUT;
         assert!(
-            elapsed >= Duration::from_secs(60) && elapsed < Duration::from_secs(120),
-            "inactivity stall should fire ~70 s in (40 s progress + 30 s idle), \
-             got {elapsed:?}"
+            elapsed >= expected && elapsed < expected + Duration::from_secs(5),
+            "inactivity stall should fire one window after the last fragment \
+             ({expected:?}), got {elapsed:?}"
         );
         producer.abort();
     }
 
-    /// A stream that records a fragment forever (never replies, never stalls
-    /// for 30 s) MUST still be bounded: the hard 600 s
+    /// Regression for #5432 — the **pre-upload** no-progress window.
+    ///
+    /// The originator dispatches no fragment until the loopback relay has run
+    /// `relay_put_store_locally`: a wait on the single-threaded
+    /// contract-handling queue, then WASM `validate_state`/`update_state`, then
+    /// a disk persist of the whole state. For a multi-MiB `fdev website
+    /// publish`/`update` payload that regularly exceeds 30 s — and the
+    /// inactivity clock is already running, because it starts when
+    /// `StreamProgress` is constructed, before the request is even emitted.
+    /// So the attempt was killed with zero bytes ever streamed, and since
+    /// streaming PUTs get exactly one attempt
+    /// (`MAX_PEER_ADVANCEMENTS_STREAMING = 0`) that was an immediate
+    /// client-visible failure.
+    ///
+    /// Here NO progress is ever recorded and the reply lands 120 s in — the
+    /// contract-handler queue starvation #4912 actually measured on a real
+    /// gateway, which is the length this window has to clear to stop killing
+    /// PUTs that were about to succeed. This MUST return the reply.
+    ///
+    /// That figure, not a token "more than 30 s", is the point: it pins the
+    /// MAGNITUDE the fix is sized for, so a window nudged back down below the
+    /// observed starvation fails here and not only in the arithmetic pin.
+    ///
+    /// Against the pre-fix 30 s window this FAILS: the first inactivity expiry
+    /// at 30 s sees `since_last() == 30 s` and returns `StreamStall`.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_put_survives_local_store_before_first_fragment() {
+        let (mut ctx, tx, _handle, progress, mut rx) = streaming_attempt_fixture();
+
+        // Fake originator: no fragment is ever dispatched (the send loop has
+        // not been reached yet), then the terminal reply arrives after a
+        // realistic local-store stall — the ~120 s of contract-handling queue
+        // starvation #4912 measured on a real gateway.
+        let store_took = Duration::from_secs(120);
+        let producer = tokio::spawn(async move {
+            let (reply_sender, _outbound, _target) =
+                rx.recv().await.expect("outbound msg should be delivered");
+            tokio::time::sleep(store_took).await;
+            reply_sender
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
+                .expect("capacity-1 reply channel accepts the reply");
+        });
+
+        let outbound = dummy_reply_with_tx(tx);
+        let result = await_streaming_attempt(&mut ctx, outbound, &progress).await;
+        assert!(
+            result.is_ok(),
+            "silence before the first fragment is local work, not a dead \
+             stream: the attempt must survive it and deliver the reply, \
+             got {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().unwrap().id(), &tx);
+        producer.await.expect("producer task panicked");
+    }
+
+    /// Regression for #5432 — the **post-upload** no-progress window.
+    ///
+    /// `handle.record()` is only ever called by the originator's outbound
+    /// stream send loop, once per fragment dispatched. Once the last fragment
+    /// is out nothing records again, yet the operation still has to finish:
+    /// remote reassembly, the remote's own WASM execution, further downstream
+    /// relay hops (each re-streaming the payload), and the reply's return trip.
+    /// A 30 s window could not tell that from a dead stream.
+    ///
+    /// Here fragments flow for 60 s (the upload), then stop, and the reply
+    /// lands 90 s later at 150 s. This MUST return the reply.
+    ///
+    /// Against the pre-fix 30 s window this FAILS: 30 s after the last fragment
+    /// the window confirms `since_last() == 30 s` and returns `StreamStall` at
+    /// ~90 s, while the PUT was progressing normally.
+    ///
+    /// This is the half a floor measured from attempt start cannot fix: for a
+    /// payload whose upload outlasts the floor, the floor is already spent when
+    /// the last fragment goes out, leaving the same too-short grace behind it.
+    /// Sizing the window itself covers both phases at any payload size.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_put_survives_downstream_work_after_last_fragment() {
+        let (mut ctx, tx, handle, progress, mut rx) = streaming_attempt_fixture();
+
+        // Fake originator: 6 fragments over 60 s (the upload completing), then
+        // silence while the downstream hops do their work, reply at 150 s.
+        let producer = tokio::spawn(async move {
+            let (reply_sender, _outbound, _target) =
+                rx.recv().await.expect("outbound msg should be delivered");
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                handle.record();
+            }
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            reply_sender
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
+                .expect("capacity-1 reply channel accepts the reply");
+        });
+
+        let outbound = dummy_reply_with_tx(tx);
+        let result = await_streaming_attempt(&mut ctx, outbound, &progress).await;
+        assert!(
+            result.is_ok(),
+            "silence after the last fragment is downstream work, not a dead \
+             stream: the attempt must survive it and deliver the reply, \
+             got {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().unwrap().id(), &tx);
+        producer.await.expect("producer task panicked");
+    }
+
+    /// A long upload followed by downstream work must survive too (#5432).
+    ///
+    /// This is the case that rules out "just give the attempt a head start":
+    /// any grace measured from ATTEMPT START is already spent by the time a
+    /// large payload finishes uploading, so the post-upload phase is left with
+    /// whatever the bare window allows. Here fragments flow for 300 s — longer
+    /// than any plausible fixed head start — and the reply lands 120 s after
+    /// the last one, still inside the 600 s ceiling.
+    ///
+    /// It is the window itself, measured from the last fragment, that has to be
+    /// the right size; this test fails against a 30 s window AND against an
+    /// attempt-start floor of any value.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_put_survives_downstream_work_after_a_long_upload() {
+        let (mut ctx, tx, handle, progress, mut rx) = streaming_attempt_fixture();
+
+        let producer = tokio::spawn(async move {
+            let (reply_sender, _outbound, _target) =
+                rx.recv().await.expect("outbound msg should be delivered");
+            // 300 s of steady upload.
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                handle.record();
+            }
+            // Then downstream work, well inside the window but far past
+            // anything a head start would still have left.
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            reply_sender
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
+                .expect("capacity-1 reply channel accepts the reply");
+        });
+
+        let outbound = dummy_reply_with_tx(tx);
+        let result = await_streaming_attempt(&mut ctx, outbound, &progress).await;
+        assert!(
+            result.is_ok(),
+            "a long upload's downstream phase must get the full inactivity \
+             window measured from its OWN last fragment, got {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().unwrap().id(), &tx);
+        producer.await.expect("producer task panicked");
+    }
+
+    /// The widened window must still leave a stall REACHABLE and correctly
+    /// ATTRIBUTED, well short of the ceiling (#5432).
+    ///
+    /// This is the guard against the obvious wrong fix — widening the window
+    /// until stall detection can no longer fire and the 600 s ceiling becomes
+    /// the only bound, which would report every dead stream as
+    /// `stream_ceiling`: the #4912 misattribution class, reintroduced by the
+    /// #5432 fix itself. A stream dead from the outset must be abandoned as
+    /// `StreamStall`, at the window, with ceiling headroom to spare.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_put_stall_stays_reachable_below_the_ceiling() {
+        let (mut ctx, tx, _handle, progress, mut rx) = streaming_attempt_fixture();
+
+        // Fake originator: never a fragment, never a reply. Dead from t=0.
+        let producer = tokio::spawn(async move {
+            let (_reply_sender, _outbound, _target) =
+                rx.recv().await.expect("outbound msg should be delivered");
+            tokio::time::sleep(Duration::from_secs(7200)).await;
+        });
+
+        let start = RealTime::new();
+        let t0 = start.now();
+        let outbound = dummy_reply_with_tx(tx);
+        let result = await_streaming_attempt(&mut ctx, outbound, &progress).await;
+        let elapsed = start.now().saturating_sub(t0);
+
+        assert_eq!(
+            result.err(),
+            Some(TimeoutCause::StreamStall),
+            "a dead stream must still be reported as a stall, not laundered \
+             into a ceiling"
+        );
+        // Tight both ways: the verdict is due exactly one window in, and the
+        // gap to the ceiling is what keeps the attribution honest.
+        assert!(
+            elapsed >= STREAM_OP_INACTIVITY_TIMEOUT
+                && elapsed < STREAM_OP_INACTIVITY_TIMEOUT + Duration::from_secs(5),
+            "the stall must fire one inactivity window in, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP,
+            "a stall must be reached BEFORE the ceiling, or every dead stream \
+             gets reported as a ceiling, got {elapsed:?} against a {:?} ceiling",
+            crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP
+        );
+        producer.abort();
+    }
+
+    /// A stream that records a fragment forever (never replies, so the
+    /// inactivity window never expires) MUST still be bounded: the hard 600 s
     /// `STREAMING_ATTEMPT_TIMEOUT_CAP` ceiling fires and returns
     /// `TimeoutCause::StreamCeiling`.
     #[tokio::test(start_paused = true)]
@@ -2238,31 +2463,43 @@ mod tests {
         producer.abort();
     }
 
-    /// The atomic tiebreak: a fragment whose `record()` store lands inside the
-    /// inactivity window — but whose `Notify` ping is lost (the realistic race
-    /// `Notify` alone cannot cover) — MUST be observed via the `since_last`
-    /// atomic re-check and suppress a false stall.
+    /// A fragment landing just inside the inactivity window keeps the attempt
+    /// alive instead of stalling it.
     ///
-    /// To exercise the *atomic* path deterministically (not the task scheduler),
-    /// each fragment lands at `window - RACE_SLACK` of virtual time: every
-    /// window expiry therefore finds `since_last < window` and resets via the
-    /// atomic, keeping the attempt alive until the reply. A poll-/Notify-only
-    /// implementation that ignored the atomic would falsely stall.
+    /// # What this does NOT cover, despite its history
+    ///
+    /// This test was written as, and until #5432 was documented as, a pin on
+    /// the `since_last` **atomic tiebreak** — the re-check that suppresses a
+    /// false stall when a fragment's `Notify` ping is lost. It never exercised
+    /// that path. At `window - RACE_SLACK` the `record()` lands strictly BEFORE
+    /// the inactivity sleep's deadline, so `notify_one()`'s permit is always
+    /// waiting and `select!` resolves on the `notified()` arm; the inactivity
+    /// arm, and therefore the atomic re-check, is never reached — at any pass
+    /// count or slack value, because the loop restarts the sleep after every
+    /// consumed permit, so the sleep can only ever expire a full window after
+    /// the last record.
+    ///
+    /// The re-check is genuinely hard to drive deterministically here: with a
+    /// single consumer and `notify_one`, no permit is ever dropped, which is
+    /// the condition it defends against. It remains **defensive and unpinned**.
+    /// Renamed and re-documented rather than left asserting coverage it does
+    /// not provide — a false claim on a lost-wakeup guard is worse than a
+    /// visibly weak test, because it stops the next reviewer looking.
     #[tokio::test(start_paused = true)]
-    async fn streaming_put_progress_during_inactivity_race() {
-        // Land each fragment just inside the window so the atomic re-check —
-        // not a fresh timer — is what keeps the stream alive.
+    async fn streaming_put_survives_fragment_landing_inside_the_window() {
+        // Land the fragment just inside the window.
         const RACE_SLACK: Duration = Duration::from_millis(500);
         let (mut ctx, tx, handle, progress, mut rx) = streaming_attempt_fixture();
 
         let producer = tokio::spawn(async move {
             let (reply_sender, _outbound, _target) =
                 rx.recv().await.expect("outbound msg should be delivered");
-            // Several fragments landing just before each inactivity boundary.
-            for _ in 0..5 {
-                tokio::time::sleep(STREAM_OP_INACTIVITY_TIMEOUT - RACE_SLACK).await;
-                handle.record();
-            }
+            // One fragment, landing just before the inactivity boundary. A
+            // single pass, not the original five: #5432 widened the window, so
+            // five would overrun the 600 s ceiling and quietly turn this into a
+            // duplicate of the ceiling test.
+            tokio::time::sleep(STREAM_OP_INACTIVITY_TIMEOUT - RACE_SLACK).await;
+            handle.record();
             tokio::time::sleep(Duration::from_secs(5)).await;
             reply_sender
                 .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
@@ -2273,8 +2510,8 @@ mod tests {
         let result = await_streaming_attempt(&mut ctx, outbound, &progress).await;
         assert!(
             result.is_ok(),
-            "a fragment landing inside the inactivity window must reset it via \
-             the atomic tiebreak, not trigger a false stall"
+            "a fragment landing inside the inactivity window must reset it, \
+             not trigger a false stall"
         );
         assert_eq!(result.unwrap().unwrap().id(), &tx);
         producer.await.expect("producer task panicked");
@@ -2342,7 +2579,7 @@ mod tests {
     ///
     /// Before the fix all three conditions collapsed to `Err(())` and the
     /// shared warning logged `attempt_timeout` unconditionally. On the nova
-    /// gateway that printed `timeout_secs=117` for an attempt the 30 s stream
+    /// gateway that printed `timeout_secs=117` for an attempt the stream
     /// inactivity check had abandoned after 30.001 s, with nothing in the log
     /// to explain the gap, which sent the investigation after the wrong
     /// mechanism.
@@ -2376,7 +2613,7 @@ mod tests {
         assert_ne!(
             TimeoutCause::StreamStall.budget(attempt_timeout),
             attempt_timeout,
-            "#4912 regression: a 30s stream stall reported as a 117s \
+            "#4912 regression: a stream stall reported as a 117s \
              attempt deadline is exactly the misattribution this fixes"
         );
 
@@ -2474,7 +2711,7 @@ mod tests {
         assert!(
             !window.contains("timeout_secs = attempt_timeout.as_secs()"),
             "#4912 regression: logging attempt_timeout unconditionally \
-             misreports streaming stalls/ceilings by up to 20x"
+             misreports streaming stalls/ceilings by a wide margin"
         );
         // No measured-duration field here on purpose. An `elapsed_secs` would
         // need the SAME clock the path being timed uses: the streaming path
