@@ -30,7 +30,6 @@ When in doubt about which bucket you're in, file an issue first. It costs you a 
 ## Before You Start
 
 - **Read the codebase conventions.** See [AGENTS.md](AGENTS.md) for project structure, coding standards, and testing requirements.
-- **Ask questions.** If something is unclear, ask on the issue or in our [Matrix channel](https://matrix.to/#/#freenet:matrix.org) before writing code.
 
 ## Quality Standards
 
