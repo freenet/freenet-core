@@ -57,7 +57,7 @@ We require the use of a frontier-class model (as of early 2026: Claude Opus 4, G
 
 ## Getting Help
 
-- [Matrix chat](https://matrix.to/#/#freenet:matrix.org) for questions and discussion
+- [Matrix chat](https://matrix.to/#/#freenet-locutus:matrix.org) for questions and discussion
 - [Issue tracker](https://github.com/freenet/freenet-core/issues) for bugs and feature requests
 - [API docs](https://docs.rs/freenet) for code reference
 - [Freenet manual](https://freenet.org/resources/manual/) for architecture overview
