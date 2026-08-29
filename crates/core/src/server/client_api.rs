@@ -1179,38 +1179,55 @@ mod tests {
         // The obstruction: `$TMPDIR/freenet` exists, as a file.
         std::fs::write(tmp.path().join("freenet"), b"not a directory")
             .expect("stage the blocking file");
-        // Keep the child's REAL webapp cache off the developer's home cache;
-        // this is deliberately a different knob from the one under test, which
-        // honours neither it nor `--data-dir`.
-        let cache = tmp.path().join("webapp_cache");
 
-        let exe = std::env::current_exe().expect("test binary path");
-        let output = std::process::Command::new(exe)
-            .args(["--exact", "--test-threads=1", "--nocapture", CHILD_TEST])
-            .env(CHILD_ENV, "1")
-            // `temp_dir()` reads TMPDIR on unix and TMP/TEMP on Windows.
-            .env("TMPDIR", tmp.path())
-            .env("TMP", tmp.path())
-            .env("TEMP", tmp.path())
-            .env("FREENET_WEBAPP_CACHE_DIR", &cache)
-            .output()
-            .expect("re-exec the test binary");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success(),
-            "composing the router must not panic when $TMPDIR/freenet is not a \
-             directory (#5291).\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        );
-        // Fail CLOSED on a rename: libtest exits 0 when its filter matches
-        // nothing, so without this the check goes vacuous the moment this
-        // function moves or is renamed.
-        assert!(
-            stdout.contains("1 passed"),
-            "the child must actually have run {CHILD_TEST} — if this function \
-             was renamed or moved, update CHILD_TEST.\nstdout:\n{stdout}\n\
-             stderr:\n{stderr}",
-        );
+        // Two cache roots, because the deleted mkdir was not the only
+        // `create_dir_all` this function reaches.
+        //
+        // `benign` keeps the child's REAL webapp cache off the developer's home
+        // cache while the obstruction sits where the DELETED mkdir used to
+        // point. That is the #5291 case proper.
+        //
+        // `obstructed` puts the cache root itself under the blocking file, so
+        // the surviving `create_dir_all` in `WebappCache::with_root` fails too.
+        // `with_root` is documented to warn and carry on, and
+        // `with_root_tolerates_a_root_that_is_not_a_directory` pins that
+        // directly — but a guard on `with_root` says nothing about the caller,
+        // and it is this function's job not to turn that warning back into a
+        // dead node. Without this case, making `with_root` fatal would
+        // reinstate the whole #5291 class with the test still green.
+        let benign = tmp.path().join("webapp_cache");
+        let obstructed = tmp.path().join("freenet").join("webapp_cache");
+
+        for (label, cache) in [("benign", &benign), ("obstructed", &obstructed)] {
+            let exe = std::env::current_exe().expect("test binary path");
+            let output = std::process::Command::new(exe)
+                .args(["--exact", "--test-threads=1", "--nocapture", CHILD_TEST])
+                .env(CHILD_ENV, "1")
+                // `temp_dir()` reads TMPDIR on unix and TMP/TEMP on Windows.
+                .env("TMPDIR", tmp.path())
+                .env("TMP", tmp.path())
+                .env("TEMP", tmp.path())
+                .env("FREENET_WEBAPP_CACHE_DIR", cache)
+                .output()
+                .expect("re-exec the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "[{label}] composing the router must not panic when \
+                 $TMPDIR/freenet is not a directory (#5291).\nstdout:\n{stdout}\n\
+                 stderr:\n{stderr}",
+            );
+            // Fail CLOSED on a rename: libtest exits 0 when its filter matches
+            // nothing, so without this the check goes vacuous the moment this
+            // function moves or is renamed.
+            assert!(
+                stdout.contains("1 passed"),
+                "[{label}] the child must actually have run {CHILD_TEST} — if \
+                 this function was renamed or moved, update CHILD_TEST.\n\
+                 stdout:\n{stdout}\nstderr:\n{stderr}",
+            );
+        }
     }
 
     #[test]

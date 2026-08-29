@@ -59,7 +59,8 @@
 # outside it is touched.
 #
 # TMPDIR is in that list for a reason and must stay there, and the reason is not
-# the one it looks like. `client_api.rs` unconditionally `create_dir_all`s
+# the one it looks like. `client_api.rs` (through v0.2.124) unconditionally
+# `create_dir_all`s
 # `std::env::temp_dir()/freenet/webs` (`let contract_web_path =`) when it builds
 # the router. That directory is VESTIGIAL: nothing in the tree reads or writes
 # it, and web contracts are unpacked elsewhere (`default_webapp_cache_dir`). Its
@@ -881,9 +882,13 @@ NODE_EXIT=""
 run_node_until_check() {
   local binary="$1" work="$2"
   # `$work/tmp` is created HERE, with the rest of the tree, rather than inside
-  # the subshell next to the `export TMPDIR` that uses it. Gate A would not
-  # care -- the node's own `create_dir_all` builds its parents -- but Gate B
-  # does: the real updater stages through `tempfile::tempdir()` (`update.rs`),
+  # the subshell next to the `export TMPDIR` that uses it. BOTH gates need it.
+  # Gate A used to be indifferent, because the node's own vestigial
+  # `create_dir_all` built its parents on the way past -- #5291 deleted that,
+  # so from that release on a node built from main creates nothing under
+  # `$TMPDIR` and this `mkdir` is the only thing that puts it there. Do not
+  # scope it to the Gate B path. Gate B needs it independently anyway: the
+  # real updater stages through `tempfile::tempdir()` (`update.rs`),
   # which requires TMPDIR to EXIST and will not create it. A `mkdir` inside the
   # backgrounded subshell also fails invisibly (no `set -e`, and its output
   # goes to `node.out`), so a broken workdir would surface as a mystery
@@ -940,9 +945,10 @@ run_node_until_check() {
     # `client_api.rs` (through v0.2.124) unconditionally `create_dir_all`s
     # `std::env::temp_dir()/freenet/webs` (`let contract_web_path =`) when it
     # builds the router, and that path does NOT follow `--data-dir`. The
-    # directory itself is VESTIGIAL -- nothing reads or writes it (`"webs"` has
-    # exactly one occurrence in `crates/`, the mkdir), and unpacked web
-    # contracts live under `default_webapp_cache_dir` instead. So the only thing
+    # directory itself is VESTIGIAL -- nothing reads or writes it (at the time,
+    # `"webs"` had exactly one occurrence in `crates/`, the mkdir itself; after
+    # #5291 it has none), and unpacked web contracts live under
+    # `default_webapp_cache_dir` instead. So the only thing
     # it can still do is PANIC when the mkdir fails, which it does two ways:
     #
     #   1. `$TMPDIR/freenet` is a FILE. `cross-compile.yml` stages the binary it
