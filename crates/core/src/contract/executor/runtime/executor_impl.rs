@@ -150,7 +150,55 @@ where
             }
             container_key
         } else {
-            key
+            // #4978: with no container in hand the caller's code hash is all we
+            // have, and UPDATE is the one verb whose wire type carries a full
+            // `ContractKey` — so a client that can only supply an instance id
+            // hands us a code hash that names no blob, and the
+            // `code_blob_stored(key.code_hash())` gate below rejects the UPDATE
+            // with `MissingContract` even though this node holds the contract.
+            // GET and SUBSCRIBE never hit this because they carry only an
+            // instance id and are resolved by `lookup_key`.
+            //
+            // Concretely that is `fdev update`, which fills in an all-zero
+            // `CodeHash` placeholder, and any other client that sends a
+            // well-formed but wrong 32-byte hash. It is NOT yet the TypeScript
+            // SDK's `fromInstanceId()`: that emits a present-but-EMPTY code
+            // vector, which stdlib 0.8.5's `ContractKey::try_decode_fbs`
+            // refuses at the wire boundary, so it never reaches this function.
+            // Relaxing that decode to `Option<CodeHash>` is the stdlib half,
+            // deliberately sequenced after this one — this is the core-side
+            // resolution that makes a `None` answerable.
+            //
+            // Resolve the same way the rest of the store already does
+            // (`ContractStore::fetch_contract`, `prepare_contract_call_inner`):
+            // the instance id is derived from the code hash and the parameters,
+            // so the store's instance->code row is the authoritative answer and
+            // a correct caller-supplied hash resolves to itself. This is also
+            // what keeps a placeholder hash out of the DURABLE hosting-metadata
+            // row, which `storages/redb.rs` and `storages/sqlite.rs` write from
+            // `key.code_hash()` and read back to rebuild the key on restart.
+            //
+            // When this node has no row for the instance (it does not hold the
+            // contract) the caller's key is kept unchanged, so the existing
+            // `MissingContract` / auto-fetch behaviour is untouched.
+            match self.bridged_lookup_key(key.id()) {
+                Some(resolved) => resolved,
+                None => {
+                    // Worth a line: after this change an unresolvable instance
+                    // is the ONLY way to reach the `MissingContract` below with
+                    // a caller-supplied hash, and `ContractKey`'s `Display` is
+                    // instance-only, so nothing else in the log distinguishes
+                    // "no index row for this instance" from "this hash names no
+                    // blob".
+                    tracing::debug!(
+                        contract = %key,
+                        caller_code_hash = ?key.code_hash(),
+                        "update: no instance->code row for this contract; keeping \
+                         the caller's code hash (this node does not hold it)"
+                    );
+                    key
+                }
+            }
         };
 
         // Opportunistically clean up any stale initializations to prevent resource leaks

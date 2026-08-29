@@ -166,6 +166,26 @@ impl Executor<Runtime> {
         key: ContractKey,
         update: UpdateData<'_>,
     ) -> Response {
+        // #4978: resolve the code hash from the instance id, the same way
+        // `bridged_upsert_contract_state_inner` does for the network path. Local
+        // mode never hit the `code_blob_stored` gate, so this is not about
+        // letting the UPDATE through — it is about what the unresolved key
+        // DURABLY writes. `commit_state_update` below reaches
+        // `StateStore::update` → the backend `store()`, and both backends
+        // persist `key.code_hash()` into the hosting-metadata row used to
+        // reconstruct the `ContractKey` on restart (`storages/redb.rs`,
+        // `storages/sqlite.rs`). A placeholder hash there yields a hosting-cache
+        // key whose code half is zeros, so a later `remove_contract` computes
+        // the blob path from zeros and never reclaims the real `.wasm`.
+        //
+        // `unwrap_or` keeps the caller's key when nothing resolves, which does
+        // NOT fully close that hole: local mode has no `code_blob_stored` gate
+        // downstream, and `state_store.get_params` is instance-keyed, so a
+        // contract with state and params but no contract-index row still writes
+        // the placeholder. That divergence is pre-existing (`load_from_storage`
+        // already logs it as a failed migration), and the load-side resolution
+        // added for #4978 repairs such a row once the index does know it.
+        let key = self.bridged_lookup_key(key.id()).unwrap_or(key);
         let parameters = {
             self.state_store
                 .get_params(&key)
