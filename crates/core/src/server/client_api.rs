@@ -1228,6 +1228,19 @@ mod tests {
                  stdout:\n{stdout}\nstderr:\n{stderr}",
             );
         }
+
+        // The other half of the premise. The child asserts the TMPDIR knob took
+        // effect; this asserts the CACHE-ROOT knob did. If
+        // `FREENET_WEBAPP_CACHE_DIR` ever stopped being read, the obstructed
+        // case would quietly resolve to the ProjectDirs default, create it
+        // successfully, and pass while testing nothing.
+        assert!(
+            benign.is_dir(),
+            "premise: the child must honour FREENET_WEBAPP_CACHE_DIR — {} was \
+             never created, so the obstructed case did not exercise the \
+             surviving create_dir_all",
+            benign.display()
+        );
     }
 
     #[test]

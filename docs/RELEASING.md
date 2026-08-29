@@ -910,7 +910,8 @@ curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
    the binary differently — `cross-compile.yml` puts it at `/tmp/freenet`,
    which used to collide with a directory the node created under `$TMPDIR` and
    blocked v0.2.124 on a healthy binary. That mkdir is gone (#5291), but the
-   staging-environment difference it exposed is not, so the warning stands. Running from `./target/release/` is
+   staging-environment difference it exposed is not, so the warning stands.
+   Running from `./target/release/` is
    precisely the environment where that class of fault cannot occur, which is
    why local validation went 4/4 green while CI blocked. If local reproduces
    nothing, suspect the staging environment before the binary.

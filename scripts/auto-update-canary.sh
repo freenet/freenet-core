@@ -60,9 +60,8 @@
 #
 # TMPDIR is in that list for a reason and must stay there, and the reason is not
 # the one it looks like. `client_api.rs` (through v0.2.124) unconditionally
-# `create_dir_all`s
-# `std::env::temp_dir()/freenet/webs` (`let contract_web_path =`) when it builds
-# the router. That directory is VESTIGIAL: nothing in the tree reads or writes
+# `create_dir_all`s `std::env::temp_dir()/freenet/webs` (`let contract_web_path
+# =`) when it builds the router. That directory is VESTIGIAL: nothing in the tree reads or writes
 # it, and web contracts are unpacked elsewhere (`default_webapp_cache_dir`). Its
 # one surviving effect is the panic when the mkdir FAILS -- `$TMPDIR/freenet`
 # being a FILE, or a directory owned by another user. Through v0.2.124 this file
@@ -882,12 +881,19 @@ NODE_EXIT=""
 run_node_until_check() {
   local binary="$1" work="$2"
   # `$work/tmp` is created HERE, with the rest of the tree, rather than inside
-  # the subshell next to the `export TMPDIR` that uses it. BOTH gates need it.
-  # Gate A used to be indifferent, because the node's own vestigial
-  # `create_dir_all` built its parents on the way past -- #5291 deleted that,
-  # so from that release on a node built from main creates nothing under
-  # `$TMPDIR` and this `mkdir` is the only thing that puts it there. Do not
-  # scope it to the Gate B path. Gate B needs it independently anyway: the
+  # the subshell next to the `export TMPDIR` that uses it. Do NOT scope it to
+  # the Gate B path.
+  #
+  # Gate A used to have a node-side backstop: the vestigial `create_dir_all`
+  # built `$TMPDIR` on its way past. #5291 deleted it, so Gate A no longer has
+  # that backstop -- and the RELEASED binaries this gate runs (through
+  # v0.2.124) still write there, so the directory has to exist for them. (A
+  # node built from main does still create `$TMPDIR/freenet/webapp_cache` in
+  # one case, the `ProjectDirs`-returns-None fallback in
+  # `resolve_webapp_cache_dir`; the canary excludes it by exporting HOME,
+  # XDG_CACHE_HOME and FREENET_WEBAPP_CACHE_DIR below. Do not rely on it.)
+  #
+  # Gate B needs it independently anyway: the
   # real updater stages through `tempfile::tempdir()` (`update.rs`),
   # which requires TMPDIR to EXIST and will not create it. A `mkdir` inside the
   # backgrounded subshell also fails invisibly (no `set -e`, and its output
