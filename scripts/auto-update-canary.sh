@@ -59,9 +59,9 @@
 # outside it is touched.
 #
 # TMPDIR is in that list for a reason and must stay there, and the reason is not
-# the one it looks like. `client_api.rs` unconditionally `create_dir_all`s
-# `std::env::temp_dir()/freenet/webs` (`let contract_web_path =`) when it builds
-# the router. That directory is VESTIGIAL: nothing in the tree reads or writes
+# the one it looks like. `client_api.rs` (through v0.2.124) unconditionally
+# `create_dir_all`s `std::env::temp_dir()/freenet/webs` (`let contract_web_path
+# =`) when it builds the router. That directory is VESTIGIAL: nothing in the tree reads or writes
 # it, and web contracts are unpacked elsewhere (`default_webapp_cache_dir`). Its
 # one surviving effect is the panic when the mkdir FAILS -- `$TMPDIR/freenet`
 # being a FILE, or a directory owned by another user. Through v0.2.124 this file
@@ -69,6 +69,13 @@
 # `/tmp/freenet`, which is exactly that path: ENOTDIR, panic (exit 101) before
 # the update task spawned, and Gate A blocked a release whose binary was
 # perfectly healthy. See `run_node_until_check`.
+#
+# The mkdir itself is GONE from the tree as of #5291. The isolation stays, and
+# deleting it on the strength of that fix would be a mistake: this canary gates
+# RELEASED binaries, and every release up to and including v0.2.124 still
+# carries the panicking mkdir. The isolation is what lets the gate run them at
+# all. It is also still doing the ordinary job of keeping a throwaway node's
+# files out of the caller's temp dir.
 #
 # PORTS are the exception, and an earlier version of this header overstated it
 # by calling the runs "safe to run on a machine already running a node". They
@@ -874,9 +881,24 @@ NODE_EXIT=""
 run_node_until_check() {
   local binary="$1" work="$2"
   # `$work/tmp` is created HERE, with the rest of the tree, rather than inside
-  # the subshell next to the `export TMPDIR` that uses it. Gate A would not
-  # care -- the node's own `create_dir_all` builds its parents -- but Gate B
-  # does: the real updater stages through `tempfile::tempdir()` (`update.rs`),
+  # the subshell next to the `export TMPDIR` that uses it. Do NOT scope it to
+  # the Gate B path.
+  #
+  # Gate A used to have a node-side backstop: the vestigial `create_dir_all`
+  # built `$TMPDIR` on its way past (it builds missing parents, so the
+  # directory did not have to pre-exist). #5291 deleted it, so on a main-built
+  # binary this `mkdir` is now the ONLY thing that creates `$TMPDIR` -- the
+  # RELEASED binaries this gate runs (through v0.2.124) still bring their own.
+  # Do not read that as "Gate A needs it": Gate A works either way today. The
+  # point is that the backstop is gone, so scoping this line to Gate B leaves
+  # nothing creating the directory for anything else that may want it. (A
+  # node built from main does still create `$TMPDIR/freenet/webapp_cache` in
+  # one case, the `ProjectDirs`-returns-None fallback in
+  # `resolve_webapp_cache_dir`; the canary excludes it by exporting HOME,
+  # XDG_CACHE_HOME and FREENET_WEBAPP_CACHE_DIR below. Do not rely on it.)
+  #
+  # Gate B needs it independently anyway: the
+  # real updater stages through `tempfile::tempdir()` (`update.rs`),
   # which requires TMPDIR to EXIST and will not create it. A `mkdir` inside the
   # backgrounded subshell also fails invisibly (no `set -e`, and its output
   # goes to `node.out`), so a broken workdir would surface as a mystery
@@ -924,12 +946,19 @@ run_node_until_check() {
     # var removes the class outright for the cost of one line. Only the
     # canary's own throwaway node is affected.
     export FREENET_DISABLE_LOG_RATE_LIMIT=1
-    # `client_api.rs` unconditionally `create_dir_all`s
+    # #5291 DELETED the mkdir described below, so a node built from current
+    # main no longer has this failure mode. Keep the isolation anyway: the
+    # binaries this canary gates are RELEASES, and everything up to and
+    # including v0.2.124 still panics exactly as described. The measurements
+    # below were taken against those artifacts and still stand for them.
+    #
+    # `client_api.rs` (through v0.2.124) unconditionally `create_dir_all`s
     # `std::env::temp_dir()/freenet/webs` (`let contract_web_path =`) when it
     # builds the router, and that path does NOT follow `--data-dir`. The
-    # directory itself is VESTIGIAL -- nothing reads or writes it (`"webs"` has
-    # exactly one occurrence in `crates/`, the mkdir), and unpacked web
-    # contracts live under `default_webapp_cache_dir` instead. So the only thing
+    # directory itself is VESTIGIAL -- nothing reads or writes it (at the time,
+    # `"webs"` had exactly one occurrence in `crates/`, the mkdir itself; after
+    # #5291 it has none), and unpacked web contracts live under
+    # `default_webapp_cache_dir` instead. So the only thing
     # it can still do is PANIC when the mkdir fails, which it does two ways:
     #
     #   1. `$TMPDIR/freenet` is a FILE. `cross-compile.yml` stages the binary it
