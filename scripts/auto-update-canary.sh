@@ -885,9 +885,13 @@ run_node_until_check() {
   # the Gate B path.
   #
   # Gate A used to have a node-side backstop: the vestigial `create_dir_all`
-  # built `$TMPDIR` on its way past. #5291 deleted it, so Gate A no longer has
-  # that backstop -- and the RELEASED binaries this gate runs (through
-  # v0.2.124) still write there, so the directory has to exist for them. (A
+  # built `$TMPDIR` on its way past (it builds missing parents, so the
+  # directory did not have to pre-exist). #5291 deleted it, so on a main-built
+  # binary this `mkdir` is now the ONLY thing that creates `$TMPDIR` -- the
+  # RELEASED binaries this gate runs (through v0.2.124) still bring their own.
+  # Do not read that as "Gate A needs it": Gate A works either way today. The
+  # point is that the backstop is gone, so scoping this line to Gate B leaves
+  # nothing creating the directory for anything else that may want it. (A
   # node built from main does still create `$TMPDIR/freenet/webapp_cache` in
   # one case, the `ProjectDirs`-returns-None fallback in
   # `resolve_webapp_cache_dir`; the canary excludes it by exporting HOME,
