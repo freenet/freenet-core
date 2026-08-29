@@ -2952,16 +2952,23 @@ mod update_by_instance_id_tests {
     //! at face value and fed straight to the
     //! `code_blob_stored(key.code_hash())` gate in
     //! `bridged_upsert_contract_state_inner`. Clients that address a contract by
-    //! its instance id alone — the TypeScript SDK's `fromInstanceId()`, which
-    //! emits an empty code vector, and `fdev update`, which fills in an all-zero
+    //! its instance id alone — `fdev update`, which fills in an all-zero
     //! `CodeHash` placeholder — therefore failed that gate with
     //! `MissingContract` on a node that was holding the contract all along.
+    //!
+    //! Scope note: the TypeScript SDK's `fromInstanceId()` emits a
+    //! present-but-EMPTY code vector, which stdlib 0.8.5's
+    //! `ContractKey::try_decode_fbs` refuses at the wire boundary — so that
+    //! client is not fixed here and cannot be tested here. Only a well-formed
+    //! but wrong 32-byte hash reaches this gate.
     //!
     //! These drive a real `Executor<Runtime>` (real `ContractStore`, real
     //! `StateStore`, no network) because the gate under test exists only there:
     //! `MockRuntime`'s executor keys everything by instance id and has no
-    //! code-hash probe at all, so a mock-backed test would pass with the fix
-    //! reverted.
+    //! code-hash probe at all, so a `MockRuntime`-backed test would pass with
+    //! the fix reverted. (`MockWasmRuntime` does wrap a real `ContractStore` and
+    //! would hit the gate; a real `Runtime` is used anyway so the test exercises
+    //! the production type.)
 
     use std::sync::Arc;
 
@@ -3055,13 +3062,22 @@ mod update_by_instance_id_tests {
 
     /// True when `err` is the `code_blob_stored` gate's refusal.
     ///
-    /// Matched on the typed `Debug` marker `MissingContract`, NOT on the
-    /// Display text: `StdContractError` also renders a DIFFERENT failure as
-    /// "missing contract parameters" (the `state_store.get_params` miss, which
-    /// happens BEFORE the gate), so a lowercase "missing contract" substring
-    /// would conflate the two and report the wrong cause as the right one.
+    /// Two near-misses this deliberately excludes, because the negative control
+    /// below would silently accept either and report a broken fix as working:
+    ///
+    /// - the Display text "missing contract parameters" — a DIFFERENT failure
+    ///   (`state_store.get_params` missing), raised BEFORE the gate, so a
+    ///   lowercased "missing contract" substring would conflate the two;
+    /// - `StateStoreError::MissingContract`, which renders the same `Debug`
+    ///   marker from a different error type entirely.
+    ///
+    /// So match the gate's own shape: `ExecutorError`'s inner
+    /// `StdContractError::MissingContract` carries a bare `key` field and no
+    /// `cause`, which is what distinguishes it from the parameter miss
+    /// (`StdContractError::Put { key, cause }`).
     fn missing_contract(err: &crate::contract::ExecutorError) -> bool {
-        format!("{err:?}").contains("MissingContract")
+        let rendered = format!("{err:?}");
+        rendered.contains("ContractError(MissingContract")
     }
 
     /// An UPDATE addressed by instance id — the code hash a client that only
@@ -3191,6 +3207,93 @@ mod update_by_instance_id_tests {
             missing_contract(&err),
             "an unresolvable instance must still be refused with MissingContract, \
              got: {err:?}"
+        );
+    }
+
+    /// The other direction, and the one this change actually NARROWS: a code
+    /// hash naming a DIFFERENT contract's stored blob.
+    ///
+    /// Before the fix that hash passed `code_blob_stored` (the blob is on disk,
+    /// it just belongs to another contract) and was carried onward as the key —
+    /// into the state store, whose backends persist `key.code_hash()` into the
+    /// hosting-metadata row they rebuild the `ContractKey` from on restart. So
+    /// the pre-fix gate accepted the one wrong hash it should have caught and
+    /// rejected the harmless one. After the fix the store's instance->code row
+    /// overrides it and the key is the contract's own.
+    ///
+    /// The all-zero fixtures cannot see this: they exercise a hash that names no
+    /// blob at all. Without this test, "a wrong hash is corrected rather than
+    /// trusted" is an unverified claim.
+    #[tokio::test]
+    async fn update_with_another_contracts_code_hash_resolves_to_its_own() {
+        let (mut executor, _temp) = build_executor("update-foreign-code-hash").await;
+
+        let (container_a, key_a) = make_contract(7, 7);
+        seed_held_contract(
+            &mut executor,
+            container_a,
+            key_a,
+            WrappedState::new(vec![1u8; 8]),
+        )
+        .await;
+
+        // A second, genuinely-held contract with DIFFERENT code, so its blob is
+        // on disk and `code_blob_stored` says yes for its hash.
+        let (container_b, key_b) = make_contract(11, 11);
+        seed_held_contract(
+            &mut executor,
+            container_b,
+            key_b,
+            WrappedState::new(vec![1u8; 8]),
+        )
+        .await;
+        assert_ne!(
+            key_a.code_hash(),
+            key_b.code_hash(),
+            "the fixtures must have distinct code blobs"
+        );
+        assert!(
+            executor.runtime.code_blob_stored(key_b.code_hash()),
+            "B's blob must really be on disk, or this fixture proves nothing"
+        );
+
+        // A's instance, B's code hash: the shape that used to sail through.
+        let mismatched = ContractKey::from_id_and_code(*key_a.id(), *key_b.code_hash());
+
+        // The resolution is what is under test, so assert it directly rather
+        // than inferring it from an error string.
+        assert_eq!(
+            executor
+                .lookup_key(mismatched.id())
+                .expect("A is held, so its instance must resolve")
+                .code_hash(),
+            key_a.code_hash(),
+            "the store's instance->code row must win over the caller's hash"
+        );
+
+        let err = executor
+            .upsert_contract_state(
+                mismatched,
+                Either::Left(WrappedState::new(vec![2u8; 8])),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .expect_err("synthetic WASM cannot validate, so this must fail");
+        assert!(
+            !missing_contract(&err),
+            "a held contract must not be refused by the gate: {err:?}"
+        );
+        // The error carries the key the executor settled on, so it witnesses
+        // WHICH contract the update was attributed to — B's hash here would mean
+        // the foreign hash had been carried into the state store.
+        assert!(
+            format!("{err:?}").contains(&format!("{:?}", key_a.code_hash())),
+            "the update must be attributed to A's own code hash, got: {err:?}"
+        );
+        assert!(
+            !format!("{err:?}").contains(&format!("{:?}", key_b.code_hash())),
+            "the foreign code hash must not survive resolution, got: {err:?}"
         );
     }
 }

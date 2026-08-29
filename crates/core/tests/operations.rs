@@ -4730,10 +4730,15 @@ async fn test_get_after_update_observes_fresh_state_3357(ctx: &mut TestContext) 
 /// `ContractKey`, and its code hash used to be taken at face value and fed to
 /// the executor's `code_blob_stored(key.code_hash())` gate — so every client
 /// that can only supply an instance id got `MissingContract` from a node that
-/// was holding the contract. That is the TypeScript SDK's `fromInstanceId()`
-/// (which emits an empty code vector) and freenet-core's own `fdev update`
-/// (which fills in an all-zero `CodeHash`), reproduced here with the same
-/// all-zero placeholder.
+/// was holding the contract. That is freenet-core's own `fdev update` (which
+/// fills in an all-zero `CodeHash`), reproduced here with the same placeholder.
+///
+/// Not covered, and not coverable here: the TypeScript SDK's `fromInstanceId()`
+/// emits a present-but-EMPTY code vector, which stdlib 0.8.5's
+/// `ContractKey::try_decode_fbs` refuses at the wire boundary — and this test
+/// speaks bincode anyway (`ws_url()` appends `?encodingProtocol=native`), so no
+/// test here touches the FlatBuffers decode. Relaxing that decode is the stdlib
+/// half of freenet/freenet-core#4978.
 ///
 /// This runs in NETWORK mode deliberately. The bug was mode-dependent: local
 /// mode dispatches through `perform_contract_update`, which never reaches that
@@ -4817,9 +4822,23 @@ async fn test_update_contract_by_instance_id_4978(ctx: &mut TestContext) -> Test
             key,
             summary: _,
         }))) => {
+            // Compare INSTANCE IDs explicitly. `ContractKey`'s `PartialEq` is
+            // instance-only, so `assert_eq!(key, contract_key)` would pass on a
+            // zeroed code hash and read as a stronger check than it is.
             assert_eq!(
-                key, contract_key,
-                "Contract key mismatch in UPDATE response"
+                key.id(),
+                contract_key.id(),
+                "Contract instance mismatch in UPDATE response"
+            );
+            // The response echoes the key the client sent: the driver never
+            // rewrites it (only the executor resolves, and it does so on its own
+            // copy), so the placeholder comes back. Asserted so the day someone
+            // normalises the response key, this test says so out loud rather
+            // than quietly continuing to pass.
+            assert_eq!(
+                key.code_hash(),
+                instance_id_only_key.code_hash(),
+                "UPDATE response is expected to echo the client's key unchanged"
             );
         }
         Ok(Ok(other)) => bail!("unexpected response while waiting for update: {other:?}"),
