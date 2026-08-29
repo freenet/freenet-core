@@ -10210,14 +10210,14 @@ fn test_get_reliability_diagnostic() {
         success_rate * 100.0
     );
     // Network-traversal floor (#4361): before this assertion existed, every
-    // "success" in the failing runs was a local cache hit (attempts == 0)
-    // on a node that already held the contract — multi-hop GET was never
-    // exercised at all. This also guards the one gap in the retrievability
-    // metric above: `nodes_with_state` counts a node whether it obtained the
+    // "success" in the failing runs was a local cache hit on a node that
+    // already held the contract — multi-hop GET was never exercised at all.
+    // This also guards the one gap in the retrievability metric above:
+    // `nodes_with_state` counts a node whether it obtained the
     // contract over the network OR via relay-path caching, so on its own a high
     // count could in principle be reached with few client GETs actually
     // completing. Requiring a number of client GET operations that actually
-    // routed (`attempts >= 1`) closes that: broad routing must have happened,
+    // routed (`hop_count >= 1`) closes that: broad routing must have happened,
     // not just storage population. This now gates on the CLIENT-visible
     // network-success count (per client op) rather than the per-tx count. The
     // lattice run measured 73/100 client GETs routing over the network (27 were
@@ -10226,7 +10226,7 @@ fn test_get_reliability_diagnostic() {
     // routing happened, not just storage population (#4852/#4361).
     assert!(
         client_network_successes >= 30,
-        "Only {} client GET operations traversed the network (attempts >= 1) \
+        "Only {} client GET operations traversed the network (hop_count >= 1) \
          — too few client GETs actually routed; the success/retrievability \
          metrics may be measuring local availability, not routing (#4852/#4361)",
         client_network_successes
