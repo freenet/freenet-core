@@ -70,6 +70,13 @@
 # the update task spawned, and Gate A blocked a release whose binary was
 # perfectly healthy. See `run_node_until_check`.
 #
+# The mkdir itself is GONE from the tree as of #5291. The isolation stays, and
+# deleting it on the strength of that fix would be a mistake: this canary gates
+# RELEASED binaries, and every release up to and including v0.2.124 still
+# carries the panicking mkdir. The isolation is what lets the gate run them at
+# all. It is also still doing the ordinary job of keeping a throwaway node's
+# files out of the caller's temp dir.
+#
 # PORTS are the exception, and an earlier version of this header overstated it
 # by calling the runs "safe to run on a machine already running a node". They
 # bind real ports, so a run collides with anything already holding them --
@@ -924,7 +931,13 @@ run_node_until_check() {
     # var removes the class outright for the cost of one line. Only the
     # canary's own throwaway node is affected.
     export FREENET_DISABLE_LOG_RATE_LIMIT=1
-    # `client_api.rs` unconditionally `create_dir_all`s
+    # #5291 DELETED the mkdir described below, so a node built from current
+    # main no longer has this failure mode. Keep the isolation anyway: the
+    # binaries this canary gates are RELEASES, and everything up to and
+    # including v0.2.124 still panics exactly as described. The measurements
+    # below were taken against those artifacts and still stand for them.
+    #
+    # `client_api.rs` (through v0.2.124) unconditionally `create_dir_all`s
     # `std::env::temp_dir()/freenet/webs` (`let contract_web_path =`) when it
     # builds the router, and that path does NOT follow `--data-dir`. The
     # directory itself is VESTIGIAL -- nothing reads or writes it (`"webs"` has

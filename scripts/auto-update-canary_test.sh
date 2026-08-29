@@ -1625,7 +1625,10 @@ else
 fi
 
 # --- TMPDIR must be scoped before either process starts ---------------------
-# `client_api.rs` unconditionally `create_dir_all`s
+# #5291 removed the mkdir below from the tree. This pin stays: the canary gates
+# RELEASED binaries, and every release through v0.2.124 still carries it.
+#
+# `client_api.rs` (through v0.2.124) unconditionally `create_dir_all`s
 # `std::env::temp_dir()/freenet/webs` at router construction. The directory is
 # vestigial (nothing reads it), but the mkdir can FAIL -- `$TMPDIR/freenet`
 # being a file, or another user's directory -- and it panics when it does, exit
