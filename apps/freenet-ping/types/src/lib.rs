@@ -146,18 +146,45 @@ impl Ping {
     /// The two costs are real and worth understanding before copying this:
     ///
     /// 1. **A state nobody is writing to stops ageing.** With no new timestamps the
-    ///    reference does not advance, so nothing further expires. For this contract
-    ///    that is harmless — `MAX_HISTORY_PER_PEER` already bounds the state on its
-    ///    own, so a frozen state cannot grow — but a contract whose expiry is what
-    ///    bounds its size would need to think harder. It is also arguably the more
-    ///    honest behaviour: with no new information, a convergent type has no basis
-    ///    for a new decision.
+    ///    reference does not advance, so nothing further expires — and what is
+    ///    already there stays. Be precise about that, because the obvious reassurance
+    ///    is wrong: `MAX_HISTORY_PER_PEER` is a FLOOR, not a bound. `retain_history`
+    ///    keeps the newest ten entries PLUS every older entry still within TTL of the
+    ///    reference, so a peer that accumulated 500 timestamps inside one TTL window
+    ///    keeps all 500 once writes stop (measured, and still 500 after five further
+    ///    merges); under the old wall clock the same state decayed to ten with no
+    ///    traffic at all. A live state settles at roughly `ttl × write_rate` per peer
+    ///    and a frozen one holds whatever it settled at. Peer names are never swept
+    ///    either. Nothing here is an absolute cap, so a contract that needs one has to
+    ///    add it, and `validate_state` is the place. What the change does buy is that
+    ///    the retained set is now a function of the state alone: it is arguably the
+    ///    more honest behaviour, since with no new information a convergent type has
+    ///    no basis for a new decision.
     /// 2. **A future-dated timestamp drags the reference forward** and expires
-    ///    everything older than `future - ttl` at once. The floor of "keep the newest
-    ///    `MAX_HISTORY_PER_PEER` regardless of age" is what keeps that bounded here:
-    ///    each peer's ten newest entries survive it. A contract without such a floor
-    ///    would want `validate_state` to reject implausible timestamps — which is a
-    ///    fine place to read the clock, because rejecting an input is not a merge.
+    ///    everything older than `future - ttl` at once. The per-peer floor does hold —
+    ///    each peer keeps its newest ten — but that floor is the whole of the
+    ///    protection, and ping deliberately does not guard the rest:
+    ///
+    ///    - It is **global, not local to the sender.** The reference is a max over the
+    ///      whole union while the cap is per-peer, so one entry filed under one
+    ///      unrelated name truncates EVERY peer's history to ten, discarding entries
+    ///      that are well inside TTL. Measured: three peers holding 30 entries each
+    ///      drop to 10 apiece after a single injected entry dated a year ahead.
+    ///    - It is **permanent.** That entry is the newest under its own name, so it is
+    ///      always inside its own newest-ten and is never evicted; the reference stays
+    ///      pinned a year ahead and TTL retention stays dead. Five subsequent
+    ///      legitimate pings do not recover it.
+    ///    - It is **unauthenticated.** `validate_state` in the contract crate
+    ///      deserializes and returns `Valid` with no plausibility check of any kind,
+    ///      so any participant can inject it in an ordinary UPDATE.
+    ///
+    ///    That is a genuine regression against the wall clock rather than a wash:
+    ///    under the old rule a future timestamp had no cross-peer effect at all, and
+    ///    any local oddity ended as wall time carried past it. A contract that cannot
+    ///    accept the trade wants `validate_state` to reject implausible timestamps —
+    ///    which is a fine place to read the clock, because rejecting an input is not a
+    ///    merge. Ping does not, so anyone copying this pattern should decide that
+    ///    deliberately rather than inherit the omission.
     ///
     /// Note where the clock legitimately IS read: [`Ping::insert`], which records a
     /// new observation. Reading the clock at the WRITE is what makes it data;
