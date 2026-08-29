@@ -947,6 +947,88 @@ mod executor_pin_tests {
         );
     }
 
+    /// Source pin for freenet/freenet-core#4978: BOTH UPDATE apply paths must
+    /// resolve the code hash from the instance id BEFORE they touch the state
+    /// store.
+    ///
+    /// This is a source scrape rather than a behavioural test because the two
+    /// sites are not equally reachable. The network site
+    /// (`bridged_upsert_contract_state_inner`) is covered behaviourally by
+    /// `update_by_instance_id_tests`, but `perform_contract_update` lives in
+    /// `impl Executor<Runtime>` and only reaches the durable write after a real
+    /// WASM `update_state` succeeds — so exercising it needs a compiled test
+    /// contract, and nothing else in the tree calls it at all. Without this pin
+    /// the local-mode resolution can be deleted with the whole suite green,
+    /// which is exactly how it got missed the first time.
+    ///
+    /// Ordering matters, not just presence: the harm is what the UNRESOLVED key
+    /// writes durably (`StateStorage::store` persists `key.code_hash()` into the
+    /// hosting-metadata row), so a resolution placed after the first state-store
+    /// access would pin nothing.
+    #[test]
+    fn update_apply_paths_resolve_code_hash_before_touching_the_state_store() {
+        // Anchored on the API surface (`bridged_lookup_key(`), not on the `let
+        // key =` binding, so a rename of the local does not silently unpin it.
+        const RESOLVE: &str = "bridged_lookup_key(";
+
+        // Scan CODE only. Both sites carry long `//` rationale blocks that name
+        // `state_store` and `code_blob_stored` in prose, and an offset comparison
+        // against prose measures the comments rather than the code — this pin
+        // failed on exactly that before the strip was added.
+        fn code_only(src: &str) -> String {
+            src.lines()
+                .map(|line| match line.find("//") {
+                    Some(i) => &line[..i],
+                    None => line,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        // --- local mode ---
+        let contract_ops = code_only(include_str!("runtime/contract_ops.rs"));
+        let body = contract_ops
+            .split("async fn perform_contract_update(")
+            .nth(1)
+            .expect("perform_contract_update must exist");
+        let resolve_at = body.find(RESOLVE).unwrap_or_else(|| {
+            panic!(
+                "perform_contract_update must resolve the code hash from the \
+                 instance id (#4978): local mode has no code_blob_stored gate, so \
+                 an unresolved key reaches the durable hosting-metadata write"
+            )
+        });
+        let store_at = body
+            .find("state_store")
+            .expect("perform_contract_update must touch the state store");
+        assert!(
+            resolve_at < store_at,
+            "perform_contract_update must resolve BEFORE its first state_store \
+             access (#4978) — the persisted code hash is the thing being fixed"
+        );
+
+        // --- network path ---
+        let executor_impl = code_only(include_str!("runtime/executor_impl.rs"));
+        let inner = executor_impl
+            .split("async fn bridged_upsert_contract_state_inner(")
+            .nth(1)
+            .expect("bridged_upsert_contract_state_inner must exist");
+        let resolve_at = inner.find(RESOLVE).unwrap_or_else(|| {
+            panic!(
+                "bridged_upsert_contract_state_inner must resolve the code hash \
+                 from the instance id when no container is supplied (#4978)"
+            )
+        });
+        let gate_at = inner
+            .find("code_blob_stored(")
+            .expect("the disk gate must still exist");
+        assert!(
+            resolve_at < gate_at,
+            "the resolution must precede the code_blob_stored gate (#4978), or \
+             an instance-id-addressed UPDATE is still refused"
+        );
+    }
+
     /// Pin: `perform_contract_update` MUST NOT route the network branch
     /// through `UpdateContract` / `self.op_request` / `request_update`.
     /// Network-mode UPDATEs flow through `start_client_update`.
@@ -3068,13 +3150,21 @@ mod update_by_instance_id_tests {
     /// - the Display text "missing contract parameters" — a DIFFERENT failure
     ///   (`state_store.get_params` missing), raised BEFORE the gate, so a
     ///   lowercased "missing contract" substring would conflate the two;
-    /// - `StateStoreError::MissingContract`, which renders the same `Debug`
-    ///   marker from a different error type entirely.
+    /// - `StateStoreError::MissingContract`, a different error type that shares
+    ///   the variant NAME. (It reaches `ExecutorError` through
+    ///   `ExecutorError::other(anyhow)`, whose `Debug` prints the Display chain
+    ///   rather than the derived variant, so it would not in fact match the
+    ///   needle below — but the name collision is exactly the kind of thing a
+    ///   looser match would start catching, so the needle is anchored anyway.)
     ///
-    /// So match the gate's own shape: `ExecutorError`'s inner
-    /// `StdContractError::MissingContract` carries a bare `key` field and no
-    /// `cause`, which is what distinguishes it from the parameter miss
-    /// (`StdContractError::Put { key, cause }`).
+    /// So match the gate's own shape, `RequestError::ContractError` wrapping
+    /// `StdContractError::MissingContract`.
+    ///
+    /// This predicate is only honest while something asserts it POSITIVELY: two
+    /// of the three tests below assert `!missing_contract(..)`, which a needle
+    /// that stopped matching would satisfy vacuously. That job belongs to
+    /// `update_for_an_unheld_contract_still_reports_missing_contract` — do not
+    /// `#[ignore]` or weaken it.
     fn missing_contract(err: &crate::contract::ExecutorError) -> bool {
         let rendered = format!("{err:?}");
         rendered.contains("ContractError(MissingContract")
@@ -3142,16 +3232,22 @@ mod update_by_instance_id_tests {
             !missing_contract(&full_key_err),
             "the fully-specified control must not hit the gate either: {full_key_err:?}"
         );
-        // `ExecutorError` is a struct, so there is no variant to compare; the
-        // rendered error is the observable. Once the code hash is resolved the
-        // two calls are the same call, so their errors must be identical — a
-        // stronger claim than "both got past the gate", and the one that says
-        // instance-id addressing IS full-key addressing.
-        assert_eq!(
-            format!("{err:?}"),
-            format!("{full_key_err:?}"),
-            "instance-id addressing must fail in the same way as full-key \
-             addressing, not merely fail differently"
+        // `ExecutorError` is a struct, so there is no variant to compare, and
+        // the observable is the rendered error. Compare only the CONTRACT KEY
+        // each error carries, not the whole rendering: the full text includes
+        // the WASM engine's message, so equality on it would turn any engine
+        // bump — or any future per-attempt annotation — into an intermittent
+        // red with no useful diagnostic. The key is the part that says
+        // instance-id addressing resolved to the same contract full-key
+        // addressing did.
+        let key_witness = format!("{:?}", key.code_hash());
+        assert!(
+            format!("{err:?}").contains(&key_witness),
+            "the instance-id-addressed error must witness the resolved key: {err:?}"
+        );
+        assert!(
+            format!("{full_key_err:?}").contains(&key_witness),
+            "the full-key control must witness the same key: {full_key_err:?}"
         );
     }
 

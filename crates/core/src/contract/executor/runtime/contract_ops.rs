@@ -177,6 +177,14 @@ impl Executor<Runtime> {
         // `storages/sqlite.rs`). A placeholder hash there yields a hosting-cache
         // key whose code half is zeros, so a later `remove_contract` computes
         // the blob path from zeros and never reclaims the real `.wasm`.
+        //
+        // `unwrap_or` keeps the caller's key when nothing resolves, which does
+        // NOT fully close that hole: local mode has no `code_blob_stored` gate
+        // downstream, and `state_store.get_params` is instance-keyed, so a
+        // contract with state and params but no contract-index row still writes
+        // the placeholder. That divergence is pre-existing (`load_from_storage`
+        // already logs it as a failed migration), and the load-side resolution
+        // added for #4978 repairs such a row once the index does know it.
         let key = self.bridged_lookup_key(key.id()).unwrap_or(key);
         let parameters = {
             self.state_store

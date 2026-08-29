@@ -4857,10 +4857,16 @@ async fn test_update_contract_by_instance_id_4978(ctx: &mut TestContext) -> Test
     for attempt in 1..=MAX_VERSION_POLL_ATTEMPTS {
         let (response_contract, response_state) =
             get_contract(&mut client_api_a, contract_key, &gateway.temp_dir_path).await?;
+        // Instance ids compared explicitly, for the same reason as the UPDATE
+        // response above: `ContractKey`'s `PartialEq` is instance-only.
         assert_eq!(
-            response_contract.key(),
-            contract_key,
-            "Contract key mismatch in GET response"
+            response_contract.key().id(),
+            contract_key.id(),
+            "Contract instance mismatch in GET response"
+        );
+        assert_eq!(
+            response_contract, contract,
+            "Contract content mismatch in GET response"
         );
 
         let list: test_utils::TodoList = serde_json::from_slice(response_state.as_ref())
