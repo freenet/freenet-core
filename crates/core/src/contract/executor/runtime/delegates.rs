@@ -150,9 +150,11 @@ impl Executor<Runtime> {
 
     /// Register a delegate and record its WebApp origin, shared by the
     /// `RegisterDelegate` and `RegisterDelegateWithPredecessors` request arms so
-    /// the two cannot drift. Installs the client-supplied cipher/nonce, records
-    /// `origin_contract` as this delegate's attestation, and registers the WASM
-    /// module. Returns the delegate key on success, or a mapped
+    /// the two cannot drift. Forwards the client-supplied cipher/nonce to
+    /// `Runtime::register_delegate` (which discards them — the per-delegate DEK
+    /// is derived from the node KEK, see `SecretsStore::derive_delegate_dek`),
+    /// records `origin_contract` as this delegate's attestation, and registers
+    /// the WASM module. Returns the delegate key on success, or a mapped
     /// [`ExecutorError`] (already carrying `RegisterError(key)`) on failure.
     fn register_delegate_and_record_origin(
         &mut self,

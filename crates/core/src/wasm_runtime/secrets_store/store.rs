@@ -186,14 +186,18 @@ pub struct SecretsStore {
     /// `secrets_dir/kek_backend` so transient outages of a stronger
     /// backend cannot silently demote the node to a weaker one.
     kek_backend: KekBackendKind,
-    /// Per-delegate encryption keys. Each entry is either:
-    ///   - derived from the node KEK via HKDF-SHA256 (the common case
-    ///     after #4140); or
-    ///   - supplied by a client through `RegisterDelegate` (legacy path
-    ///     retained for wire-format compatibility; the supplied cipher
-    ///     overrides the derived one for that delegate).
+    /// Per-delegate encryption keys. Every entry is the DEK derived
+    /// from the node KEK via HKDF-SHA256 ([`Self::derive_delegate_dek`]);
+    /// there is no second source. Since #4140 / #4146 a client-supplied
+    /// cipher CANNOT land here: `register_delegate` still accepts the
+    /// `cipher` + `nonce` fields for wire-format compatibility with older
+    /// clients, but discards their values and caches the derived DEK
+    /// instead — accepting them would let a malicious or buggy client
+    /// substitute a key the operator does not control. Callers may send
+    /// anything (including zero bytes) in those fields. Pinned by
+    /// `register_delegate_discards_client_supplied_cipher`.
     ///
-    /// Cache-only; never persisted. On restart, derived entries are
+    /// Cache-only; never persisted. On restart, entries are
     /// reconstructed lazily on first `get_secret` / `store_secret` for
     /// each delegate.
     ciphers: std::collections::HashMap<DelegateKey, Encryption>,
@@ -498,9 +502,10 @@ impl SecretsStore {
     }
 
     /// Return the cipher for `delegate`, deriving and caching it from
-    /// the KEK on first use. If a client previously called
-    /// `register_delegate` for this key, the registered cipher takes
-    /// precedence over the derived one (legacy compatibility path).
+    /// the KEK on first use. A prior `register_delegate` only pre-warms
+    /// this cache with that SAME derived DEK — the cipher a client passed
+    /// to `register_delegate` is discarded and never reaches the map, so
+    /// there is no client-supplied entry that could take precedence here.
     fn cipher_for(&mut self, delegate: &DelegateKey) -> &Encryption {
         // Insert-if-absent then borrow. We can't use `Entry::or_insert_with`
         // here because `derive_delegate_dek` needs `&self` (the KEK is on
@@ -628,11 +633,12 @@ impl SecretsStore {
         let secret_file_path = scope_path.join(key.encode());
         let secret_key = *key.hash();
         // DEK selection. Local: `cipher_for` derives via HKDF from the node
-        // KEK and caches on first call (a prior `register_delegate` keeps its
-        // registered cipher). User: derive a fresh DEK from `dek_secret`,
-        // node-KEK-independent and uncached. The Local branch MUST go through
-        // `cipher_for` (not `encryption_for_scope`) so the caching behavior is
-        // byte-for-byte unchanged.
+        // KEK and caches on first call (a prior `register_delegate` has already
+        // pre-warmed the cache with that same derived DEK — never with the
+        // client-supplied cipher, which is discarded). User: derive a fresh DEK
+        // from `dek_secret`, node-KEK-independent and uncached. The Local
+        // branch MUST go through `cipher_for` (not `encryption_for_scope`) so
+        // the caching behavior is byte-for-byte unchanged.
         let encryption = match &scope {
             SecretScope::Local => self.cipher_for(delegate).clone(),
             SecretScope::User { dek_secret, .. } => self.derive_user_dek(delegate, dek_secret),
@@ -5860,11 +5866,14 @@ mod test {
     /// Behavioral-change pin for the `register_delegate` simplification:
     /// the old code skipped registration when the caller's nonce matched
     /// the historical default nonce, falling through to
-    /// `default_encryption` on reads. The new code always registers the
-    /// cipher. The two paths MUST be equivalent for legacy blobs written
-    /// under the default `(cipher, nonce)` pair — otherwise existing
-    /// default-configured nodes' data would suddenly become unreadable
-    /// after upgrade.
+    /// `default_encryption` on reads. Whatever `register_delegate` does
+    /// with the caller's `(cipher, nonce)` — and since #4146 it discards
+    /// them outright, caching the HKDF-derived DEK instead — legacy blobs
+    /// written under the default pair MUST stay readable, otherwise
+    /// existing default-configured nodes' data would suddenly become
+    /// unreadable after upgrade. Today that is carried by the
+    /// `legacy_migration_encryption` fallback in `decrypt_secret_blob`,
+    /// not by the registered cipher.
     #[tokio::test]
     async fn register_with_default_cipher_decrypts_legacy_default_blob()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -5881,8 +5890,11 @@ mod test {
         let default_nonce: XNonce = LEGACY_DEFAULT_NONCE.into();
 
         // Register with the historical defaults. Under the old code this
-        // was a silent no-op (skipped). Under the new code the cipher is
-        // registered and `legacy_nonce` holds DEFAULT_NONCE.
+        // was a silent no-op (skipped). Since #4146 the supplied pair is
+        // discarded and the HKDF-derived DEK is cached instead, so the
+        // legacy blob below is recovered through the
+        // `legacy_migration_encryption` fallback rather than through this
+        // registration.
         store.register_delegate(
             delegate.key().clone(),
             default_cipher.clone(),
@@ -6263,6 +6275,87 @@ mod test {
             .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
             .to_vec();
         assert_eq!(recovered, plaintext);
+        Ok(())
+    }
+
+    /// #5265: a client-supplied `RegisterDelegate` cipher is DISCARDED, not
+    /// installed. Since #4140 / #4146 the per-delegate DEK is always
+    /// `HKDF-SHA256(salt = delegate, ikm = node KEK)`; honouring a client key
+    /// would let a malicious or buggy client substitute a key the operator
+    /// does not control.
+    ///
+    /// `backcompat_register_delegate_wire_still_works` above cannot catch a
+    /// regression here: it only round-trips store→get, which succeeds whether
+    /// the DEK is derived or client-supplied. This test reads the blob off
+    /// disk and pins WHICH key it is under — decryptable under the derived
+    /// DEK, and NOT decryptable under the cipher the client passed.
+    #[tokio::test]
+    async fn register_delegate_discards_client_supplied_cipher()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![210].into(), &vec![].into()));
+        let (client_cipher, client_nonce) = fresh_cipher();
+        let client_encryption = Encryption {
+            cipher: client_cipher.clone(),
+            legacy_nonce: client_nonce,
+        };
+        // The derived DEK the node will actually use, captured BEFORE
+        // registration so the assertions below cannot be satisfied by
+        // whatever `register_delegate` happened to cache.
+        let derived_encryption = store.derive_delegate_dek(delegate.key());
+
+        store.register_delegate(delegate.key().clone(), client_cipher, client_nonce)?;
+
+        let secret_id = SecretsId::new(vec![211]);
+        let plaintext = b"discarded-client-cipher".to_vec();
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(plaintext.clone()),
+        )?;
+
+        let blob = std::fs::read(
+            secrets_dir
+                .join(delegate.key().encode())
+                .join(secret_id.encode()),
+        )?;
+
+        // The blob is under the HKDF-derived DEK.
+        let under_derived =
+            decrypt_secret_blob(&derived_encryption, &[], None, &blob, &secret_id.encode())
+                .expect("blob must decrypt under the HKDF-derived DEK")
+                .to_vec();
+        assert_eq!(
+            under_derived, plaintext,
+            "secret written after register_delegate must be encrypted with the derived DEK"
+        );
+
+        // ...and NOT under the cipher the client supplied. This is the
+        // assertion that fails if `register_delegate` ever starts honouring
+        // the client-supplied cipher again.
+        assert!(
+            decrypt_secret_blob(&client_encryption, &[], None, &blob, &secret_id.encode()).is_err(),
+            "client-supplied RegisterDelegate cipher must be discarded, never installed as the \
+             delegate DEK (#5265)"
+        );
+
+        // The cache entry `register_delegate` installed is the derived DEK
+        // too, so the fast path and the cold-derive path agree.
+        let cached = store
+            .ciphers
+            .get(delegate.key())
+            .expect("register_delegate pre-warms the cipher cache");
+        let under_cached = decrypt_secret_blob(cached, &[], None, &blob, &secret_id.encode())
+            .expect("cached entry must decrypt the blob")
+            .to_vec();
+        assert_eq!(under_cached, plaintext);
+
         Ok(())
     }
 

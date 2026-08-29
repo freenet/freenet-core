@@ -20,6 +20,15 @@ pub(crate) trait DelegateRuntimeInterface {
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>>;
 
+    /// Register a delegate and prepare its secrets-store entry.
+    ///
+    /// `cipher` and `nonce` are accepted for wire-format compatibility with
+    /// clients built against older `freenet-stdlib` releases and are then
+    /// DISCARDED: since #4140 / #4146 the per-delegate DEK is derived from the
+    /// node KEK via HKDF-SHA256 (`SecretsStore::derive_delegate_dek`), so these
+    /// values are not key material and a caller may pass anything, including
+    /// zero bytes. (`freenet-stdlib` 0.8.0 removed the `DEFAULT_CIPHER` /
+    /// `DEFAULT_NONCE` constants that used to be sent here.)
     fn register_delegate(
         &mut self,
         delegate: DelegateContainer,
