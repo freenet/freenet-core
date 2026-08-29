@@ -14,8 +14,9 @@
 //! history fits on disk. Worst case ~62 entries per secret in steady state,
 //! and at most ~`max_total_bytes` of disk for any one secret.
 //!
-//! Snapshots are encrypted with whatever cipher the delegate had configured
-//! when the snapshot was taken; without that cipher the bytes are useless.
+//! Snapshots are encrypted with the same key as the active secret — since
+//! #4146 the delegate's DEK, derived from the node KEK (a delegate does not
+//! configure its own cipher). Without that key the bytes are useless.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;

@@ -24,11 +24,11 @@ const TEST_DELEGATE_CIPHER: [u8; 32] = [
     0xa1, 0x9c, 0x42, 0x7e, 0x55, 0x3d, 0xe1, 0x08, 0xb4, 0xc7, 0x77, 0x21, 0x1f, 0x09, 0xd5, 0x6a,
     0x4e, 0x83, 0xee, 0x12, 0x6d, 0xaa, 0x90, 0x35, 0x88, 0x14, 0xc2, 0xfb, 0x29, 0x47, 0x6c, 0xb0,
 ];
-/// Per-test 24-byte registration nonce. Servers running freenet-core
-/// 0.2.59 or later ignore this value for encryption (per-write random
-/// nonces landed in PR #4143) and treat it only as a legacy-decrypt
-/// fallback for pre-0.2.59 on-disk files. The test never reads
-/// pre-existing files, so any constant value works.
+/// Per-test 24-byte nonce field. Servers running freenet-core 0.2.60 or
+/// later ignore it completely: per-write random nonces landed in #4143, and
+/// #4146 made `register_delegate` discard the client-supplied cipher/nonce,
+/// so the value never reaches any encrypt or decrypt path. Any constant
+/// value works.
 const TEST_DELEGATE_NONCE: [u8; 24] = [0u8; 24];
 
 async fn get_contract(
