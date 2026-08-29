@@ -16,7 +16,6 @@ use freenet_stdlib::{
     prelude::*,
 };
 use std::path::Path;
-use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
 
 use super::ModuleCache;
@@ -72,8 +71,6 @@ fn wasm_code_hash(contract: &ContractContainer) -> RuntimeResult<CodeHash> {
     }
 }
 
-static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
-
 /// A live WASM instance with RAII cleanup.
 ///
 /// On drop, removes the MEM_ADDR entry. The WASM `Instance` is cleaned
@@ -96,12 +93,16 @@ impl RunningInstance {
         key: Key,
         req_bytes: usize,
     ) -> RuntimeResult<Self> {
-        let id = INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Route the guest-entry call through classify_result so an epoch interrupt
         // during a runaway module start function normalizes to
         // MaxComputeTimeExceeded (Timeout class), not the generic "execution
         // timeout" that is_wasm_timeout misses (#4864 round-5).
-        let handle = super::classify_result(engine.create_instance(module, id, req_bytes))?;
+        //
+        // The engine issues the instance id from the single process-global
+        // allocator (`native_api::next_instance_id`) and hands it back in the
+        // handle. See that allocator's docs for why no caller may pick one.
+        let handle = super::classify_result(engine.create_instance(module, req_bytes))?;
+        let id = handle.id;
 
         // Record memory address and size for host function pointer arithmetic
         let (ptr, size) = engine.memory_info(&handle)?;
