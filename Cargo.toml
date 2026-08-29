@@ -119,9 +119,18 @@ wasmtime = { version = "47", default-features = false, features = [
     "profiling", "runtime", "std", "threads", "wat",
 ] }
 # Lightweight WASM section parser used to reject debug-compiled contracts at
-# PUT time (see crates/core/src/client_events.rs::contains_debug_sections).
-# Pinned to the same minor wasmtime 45 already resolves transitively so cargo
-# reuses one copy rather than locking a second wasmparser build.
+# PUT time (crates/core/src/client_events.rs::contains_debug_sections) and to
+# detect the deprecated host-clock import
+# (crates/core/src/conformance/host_clock.rs).
+#
+# This was pinned to match the copy wasmtime resolved transitively, so that
+# cargo reused one build. That is NO LONGER TRUE and the intent has not been
+# re-established: the lock now carries 0.244.0, 0.252.0 and 0.257.1, so we
+# parse with a different wasmparser from the one wasmtime validates with. It
+# is immaterial to both consumers today — each reads only section framing,
+# which is stable across these versions, and each runs immediately before a
+# real wasmtime validation that has the final say — but do not restate the
+# single-copy claim without re-checking `cargo tree -d -p wasmparser`.
 wasmparser = "0.257"
 # Test-only WAT assembler, so a fixture module can state its imports in text
 # rather than as hand-encoded LEB128. Already in the lock file: wasmtime's

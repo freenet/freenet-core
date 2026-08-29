@@ -156,7 +156,18 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
         hand_supplied_steps,
     } = load_inputs(&config)?;
 
+    // Computed as soon as the code is in hand, and BEFORE the two guards below
+    // that abort without building a `Report`. "Your contract reads the host
+    // clock" is the cheapest answer this command has and it does not depend on
+    // having a workable corpus, so gating it behind one meant an author whose
+    // corpus was too thin to generate a case — the common state early in
+    // development, and exactly when this is most useful — was told nothing.
+    // The normal path prints it as part of the report; the guards print it
+    // themselves, since they never reach one.
+    let code_diagnostics = code_diagnostics(&wasm);
+
     if corpus.is_empty() {
+        report_code_diagnostics_standalone(&code_diagnostics);
         anyhow::bail!("no states to check: the corpus is empty");
     }
 
@@ -174,6 +185,7 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
     // idempotence with no captured deltas) otherwise prints "0 cases run" and exits
     // 0, which any automation reads as "this contract passed".
     if cases.is_empty() {
+        report_code_diagnostics_standalone(&code_diagnostics);
         anyhow::bail!(
             "no cases could be generated from this corpus: {} state(s), {} delta(s), \
              {} summary/summaries for the selected properties. Nothing was checked, \
@@ -189,10 +201,6 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
     if let Some(path) = &config.bundle_out {
         write_bundle(path, &wasm, &parameters, &corpus)?;
     }
-
-    // Computed before the WASM moves into the oracle, and reported alongside the
-    // property outcomes rather than among them: see `CodeDiagnostic`.
-    let code_diagnostics = code_diagnostics(&wasm);
 
     let mut oracle = RuntimeOracle::standalone(wasm, parameters.clone())
         .await
@@ -487,6 +495,13 @@ async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::
              --contract-store pointing at a node that hosts it"
         ),
     };
+
+    // Same reasoning as in `conformance()`: this is a fact about the code, it is
+    // free, and this path has the code in hand. It is reported BEFORE the
+    // instance-id check below, because a contract that reads the clock is worth
+    // saying so about even when it turns out not to be the one the evidence
+    // accuses.
+    report_code_diagnostics_standalone(&code_diagnostics(&code));
 
     let mut oracle = RuntimeOracle::standalone(code, evidence.parameters.clone())
         .await
@@ -1016,13 +1031,16 @@ fn code_diagnostics(wasm: &[u8]) -> Vec<CodeDiagnostic> {
             diagnostic: "host_clock_import",
             detail: format!(
                 "this contract imports the host wall clock ({}::{}), which is \
-                 DEPRECATED for contracts and will be refused in a future release \
-                 (issue #5465). update_state must be a function of its inputs or \
-                 replicas cannot be guaranteed to converge, so the merge laws \
-                 checked above are not well-formed statements about a contract that \
-                 reads the clock. Carry a client-signed timestamp in the state and \
-                 enforce only monotonicity (new > current) instead. Delegates are \
-                 unaffected. See {}",
+                 DEPRECATED for contracts. update_state must be a function of its \
+                 inputs or replicas cannot be guaranteed to converge, so the merge \
+                 laws checked above are not well-formed statements about a contract \
+                 that reads the clock. In a future release the call will TRAP \
+                 (issue #5465): the contract will still load, but any actual call \
+                 to the clock will fail that operation. Trapping is per-call, so a \
+                 contract that imports the symbol without reaching it keeps working \
+                 and needs no re-key. Carry a client-signed timestamp in the state \
+                 and enforce only monotonicity (new > current) instead. Delegates \
+                 are unaffected. See {}",
                 host_clock::HOST_CLOCK_NAMESPACE,
                 host_clock::HOST_CLOCK_IMPORT,
                 host_clock::HOST_CLOCK_DEPRECATION_DOC,
@@ -1030,6 +1048,39 @@ fn code_diagnostics(wasm: &[u8]) -> Vec<CodeDiagnostic> {
         });
     }
     diagnostics
+}
+
+/// The standalone rendering of code diagnostics, for the paths that never build
+/// a [`Report`], or `None` when there is nothing to say.
+///
+/// Pure, so the decision is testable without running the command.
+fn render_code_diagnostics_standalone(diagnostics: &[CodeDiagnostic]) -> Option<String> {
+    if diagnostics.is_empty() {
+        return None;
+    }
+    let mut out =
+        String::from("code diagnostics (about the contract's code, not about a law it broke):\n");
+    for d in diagnostics {
+        out.push_str(&format!("  - {}: {}\n", d.diagnostic, d.detail));
+    }
+    Some(out)
+}
+
+/// Print code diagnostics on a path that aborts before a [`Report`] exists.
+///
+/// To STDERR deliberately. These call sites either precede an `anyhow::bail!`
+/// (so the run is failing and stdout may be a `--json` document a consumer is
+/// parsing) or sit in `verify_evidence`, whose stdout is its own fixed
+/// `key : value` report. In neither case may this be allowed to appear in the
+/// middle of stdout.
+///
+/// Note the node-side WARN does not cover these paths either:
+/// `conformance_log_level` returns `LevelFilter::OFF` for any `--json` run, so
+/// without this the answer exists nowhere.
+fn report_code_diagnostics_standalone(diagnostics: &[CodeDiagnostic]) {
+    if let Some(text) = render_code_diagnostics_standalone(diagnostics) {
+        eprint!("{text}");
+    }
 }
 
 #[derive(Serialize)]
@@ -1382,8 +1433,18 @@ mod stdout_purity_pin {
         }
         let after = &src[start..];
         let open = after.find('{').expect("signature has no body");
+        // Count braces over a copy with literals and comments blanked out, then
+        // slice the ORIGINAL at the offset that finds. Counting over raw source
+        // treats a brace inside a string literal as structure, so a
+        // `format!("...{...")` added to a scraped function later would silently
+        // widen its region into the next function — and both the `count() == 1`
+        // assertion and its vacuity anchor would still pass, so the pin would
+        // weaken quietly instead of failing. That is the exact failure mode
+        // these pins exist to prevent. `blank_literals` panics on syntax it
+        // cannot mask, so the failure direction is loud.
+        let masked = blank_literals(&after[open..]);
         let mut depth = 0usize;
-        for (offset, ch) in after[open..].char_indices() {
+        for (offset, ch) in masked.char_indices() {
             match ch {
                 '{' => depth += 1,
                 '}' => {
@@ -1396,6 +1457,121 @@ mod stdout_purity_pin {
             }
         }
         panic!("{signature}'s body is not brace-balanced");
+    }
+
+    /// `src` with the CONTENTS of string literals, char literals and comments
+    /// replaced by spaces, so brace counting sees structure only. Byte offsets
+    /// are preserved exactly, so an offset found in the result indexes the
+    /// original.
+    ///
+    /// Panics on raw strings and block comments rather than guessing at them:
+    /// a masker that silently mishandles syntax it does not know is the same
+    /// defect as not masking at all. If this fires, extend it — do not delete
+    /// the call. (Kept in step with the twin in
+    /// `freenet::wasm_runtime::runtime`'s call-site pin; they cannot be shared
+    /// across the crate boundary without making test-only helpers public.)
+    fn blank_literals(src: &str) -> String {
+        let bytes = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'r' if bytes[i + 1..].starts_with(b"\"") || bytes[i + 1..].starts_with(b"#") => {
+                    panic!(
+                        "a raw string appeared in the scraped region; blank_literals \
+                         cannot mask it, so extend it rather than trusting the scrape"
+                    );
+                }
+                b'/' if bytes[i + 1..].starts_with(b"*") => {
+                    panic!(
+                        "a block comment appeared in the scraped region; blank_literals \
+                         cannot mask it, so extend it rather than trusting the scrape"
+                    );
+                }
+                b'/' if bytes[i + 1..].starts_with(b"/") => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        out.push(' ');
+                        i += 1;
+                    }
+                }
+                b'"' => {
+                    out.push(' ');
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        if bytes[i] == b'\\' {
+                            out.push(' ');
+                            i += 1;
+                        }
+                        if i < bytes.len() {
+                            out.push(' ');
+                            i += 1;
+                        }
+                    }
+                    assert!(i < bytes.len(), "unterminated string literal");
+                    out.push(' ');
+                    i += 1;
+                }
+                b'\''
+                    if matches!(bytes.get(i + 1), Some(b'{') | Some(b'}'))
+                        && bytes.get(i + 2) == Some(&b'\'') =>
+                {
+                    out.push_str("   ");
+                    i += 3;
+                }
+                _ => {
+                    let ch = src[i..].chars().next().expect("in bounds");
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+        debug_assert_eq!(out.len(), src.len(), "blank_literals must preserve offsets");
+        out
+    }
+
+    /// A brace inside a string or char literal is not structure.
+    #[test]
+    fn braces_inside_literals_are_not_counted_as_structure() {
+        let masked = blank_literals("{ f(\"}}}{\"); g('{'); }");
+        assert_eq!(
+            masked.matches('{').count(),
+            1,
+            "a brace inside a literal was counted as structure: {masked}"
+        );
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert_eq!(
+            masked.len(),
+            "{ f(\"}}}{\"); g('{'); }".len(),
+            "the mask changed byte offsets, so they no longer index the original"
+        );
+    }
+
+    /// A brace in a comment is not structure, and an escaped quote does not end
+    /// the literal it is inside.
+    #[test]
+    fn comments_and_escaped_quotes_are_handled() {
+        let masked = blank_literals("{ // }}}\n f(\"a\\\"}\"); }");
+        assert_eq!(masked.matches('{').count(), 1, "{masked}");
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+    }
+
+    /// A lifetime is not a char literal.
+    #[test]
+    fn a_lifetime_is_not_mistaken_for_a_char_literal() {
+        let src = "{ fn f<'a>(x: &'a str) -> &'a str { x } }";
+        assert_eq!(blank_literals(src), src);
+    }
+
+    #[test]
+    #[should_panic(expected = "raw string")]
+    fn a_raw_string_fails_closed() {
+        blank_literals("{ let s = r\"}{\"; }");
+    }
+
+    #[test]
+    #[should_panic(expected = "block comment")]
+    fn a_block_comment_fails_closed() {
+        blank_literals("{ /* } */ }");
     }
 
     /// A function's body with whole-line comments stripped, so a comment mentioning
@@ -1477,6 +1653,55 @@ mod host_clock_diagnostic_pin {
         assert!(
             body.contains("Report::build("),
             "the scraped region is not `conformance`'s body any more:\n{body}"
+        );
+    }
+
+    /// The diagnostic must be computed BEFORE the guards that abort without a
+    /// report, or the cheapest answer the command has stays gated behind having
+    /// a workable corpus — which is exactly what an author early in development
+    /// does not have.
+    ///
+    /// Mutation this exists for: move `let code_diagnostics = ...` back below
+    /// the corpus/cases guards. Every other test in this file stays green.
+    #[test]
+    fn diagnostics_are_computed_before_the_guards_that_abort() {
+        let body = code_only("pub async fn conformance(");
+        let computed = body
+            .find("code_diagnostics(&wasm)")
+            .expect("conformance no longer computes code diagnostics");
+        let corpus_guard = body
+            .find("corpus.is_empty()")
+            .expect("the empty-corpus guard is gone; re-check what this pin is guarding");
+        let cases_guard = body
+            .find("cases.is_empty()")
+            .expect("the no-cases guard is gone; re-check what this pin is guarding");
+        assert!(
+            computed < corpus_guard && computed < cases_guard,
+            "code diagnostics are computed after a guard that aborts, so an author \
+             whose corpus cannot produce a case is told nothing about the clock"
+        );
+        assert_eq!(
+            body.matches("report_code_diagnostics_standalone(").count(),
+            2,
+            "both aborting guards must report the diagnostics they are about to \
+             skip past; found a different number of call sites:\n{body}"
+        );
+    }
+
+    /// `--evidence` returns before any of the above runs, and
+    /// `conformance_log_level` returns `OFF` for `--json`, so without this call
+    /// that mode reports the clock nowhere at all.
+    #[test]
+    fn verifying_evidence_also_reports_code_diagnostics() {
+        let body = code_only("async fn verify_evidence(");
+        assert_eq!(
+            body.matches("report_code_diagnostics_standalone(").count(),
+            1,
+            "`--evidence` no longer reports code diagnostics:\n{body}"
+        );
+        assert!(
+            body.contains("RuntimeOracle::standalone("),
+            "the scraped region is not `verify_evidence`'s body any more:\n{body}"
         );
     }
 }
@@ -2399,5 +2624,36 @@ mod tests {
             !rendered.contains("code diagnostic"),
             "a clean run was told about code diagnostics it does not have:\n{rendered}"
         );
+    }
+
+    /// The standalone rendering used by the paths that abort before a `Report`
+    /// exists carries the diagnostic's own detail, not just its name — that
+    /// detail is the whole message (what is wrong, what to do instead, and the
+    /// docs link).
+    #[test]
+    fn the_standalone_rendering_carries_the_detail() {
+        let wasm = module_importing(&[(
+            host_clock::HOST_CLOCK_NAMESPACE,
+            host_clock::HOST_CLOCK_IMPORT,
+        )]);
+        let rendered = render_code_diagnostics_standalone(&code_diagnostics(&wasm))
+            .expect("a clock-importing contract must render a standalone diagnostic");
+        assert!(
+            rendered.contains("host_clock_import"),
+            "the standalone rendering omits the diagnostic's machine-readable \
+             name:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(freenet::conformance::HOST_CLOCK_DEPRECATION_DOC),
+            "the standalone rendering omits the docs link, which is the only part \
+             that tells an author what to do:\n{rendered}"
+        );
+    }
+
+    /// And says nothing when there is nothing to say, so a clean contract's
+    /// aborted run does not grow a spurious section.
+    #[test]
+    fn the_standalone_rendering_is_silent_when_there_is_nothing_to_say() {
+        assert_eq!(render_code_diagnostics_standalone(&[]), None);
     }
 }

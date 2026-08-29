@@ -196,18 +196,32 @@ Contracts/delegates call into the host via registered functions:
 | Namespace | Purpose | Version |
 |-----------|---------|---------|
 | `freenet_log` | Logging | V1, V2 |
-| `freenet_random` | RNG | V1, V2 |
+| `freenet_rand` | RNG | V1, V2 |
 | `freenet_time` | UTC timestamp (**delegates only; deprecated for contracts**, see below) | V1, V2 |
-| `freenet_delegate_context` | Delegate state | V1, V2 |
+| `freenet_contract_io` | Buffer fill for contract/delegate I/O | V1, V2 |
+| `freenet_delegate_ctx` | Delegate state | V1, V2 |
 | `freenet_delegate_secrets` | Secret storage | V1, V2 |
-| `freenet_delegate_contracts` | Contract access | V2 only |
+| `freenet_delegate_contracts` | Contract access from a delegate | V2 only |
+| `freenet_delegate_management` | Delegate creation from a delegate | V2 only |
+
+These are the names the linker registers
+(`crates/core/src/wasm_runtime/engine/wasmtime_engine.rs`); import resolution is
+byte-exact, so a name that differs from this table by one character is a name no
+module can import.
 
 ### Contracts must not read the host clock
 
 **A contract must not call `freenet_time::__frnt__time__utc_now`.** Doing so is
-deprecated as of this release and will be **refused** in a future one: the node
-will decline to load a contract that can reach the clock while producing state.
-Delegates are unaffected and may keep using it.
+deprecated as of this release. In a future release the call will **trap**: the
+contract still loads, but any actual call to the clock fails that operation with
+a diagnosable error (issue #5465). Delegates are unaffected and may keep using
+it.
+
+Trapping is per-*call*, which is why it was chosen over refusing to load the
+module. A contract that imports the symbol but never reaches it on a live path
+keeps working and does not need to be rebuilt or re-keyed — and since a
+contract's address is a function of its code and parameters, a re-key would mean
+link rot for a web container rather than a republish.
 
 #### Why
 
@@ -220,7 +234,7 @@ merely violated by such a contract; they are not well-formed statements about
 it. Two peers whose clocks differ by eleven minutes can produce different states
 from the same delta, and neither of them is wrong.
 
-This is not hypothetical. Of 33 deployed contracts measured for issue #5465,
+This is not hypothetical. Among the deployed contracts measured for issue #5465,
 11 do not merely *reject* future-dated entries but silently **prune** them
 inside `update_state`, so the resulting state is a function of the evaluating
 peer's clock. That is the exact defect class contract conformance exists to
@@ -265,20 +279,33 @@ For the two shapes that show up in practice:
 
 Both answers come from the same detector
 (`freenet::conformance::host_clock::imports_host_clock`), so the
-developer-facing answer and the node-facing answer cannot disagree. Both are
-**import**-level today: a module that imports the function without calling it is
-reported too. The later release that refuses to load such a contract is the one
-that needs call-graph reachability from `update_state`, `summarize_state` and
-`get_state_delta`.
+developer-facing answer and the node-facing answer cannot disagree.
+
+Both are **import**-level: a module that imports the function without calling it
+is reported too. That superset is deliberate and it is what makes the phasing
+safe. The warning fires on any import; the later trap fires on any actual call;
+a call cannot happen without the import, so nothing traps that was not warned
+about first. No call-graph analysis is involved at either stage, and in
+particular the check is not scoped to a subset of the entry points — a clock
+read reached from `validate_state` makes two peers disagree about whether an
+update is *acceptable*, which is a convergence problem of a different shape
+rather than a non-problem, and the census behind #5465 found `validate_state` to
+be the most common route of all.
 
 #### Delegates are unaffected
 
 A delegate holds private per-node state, is never replicated, and has no merge
 laws, so reading the clock in one raises no convergence question at all. A
 deployed delegate does exactly this to do hourly rate limiting, and that is
-fine. Removing the namespace for contracts while keeping it for delegates
-requires the contract and delegate linkers to be split; until then the host
-function remains registered for both.
+fine.
+
+The namespace stays registered for both, and an earlier version of this plan
+that required splitting the contract and delegate linkers has been dropped. That
+split was only needed to enforce the rule at *import resolution*, which happens
+when the module is instantiated — a point at which the engine has no
+contract-vs-delegate parameter to consult. Enforcing at the *call* moves the
+decision to where the host already knows which instance is calling, so one
+linker still serves both.
 
 ### Delegate API Versions
 

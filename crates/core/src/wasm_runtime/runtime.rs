@@ -75,18 +75,27 @@ fn wasm_code_hash(contract: &ContractContainer) -> RuntimeResult<CodeHash> {
 /// Warn, at most once per contract code hash per process, that a contract reads
 /// the host wall clock.
 ///
-/// Returns whether this call emitted the warning, so the decision can be tested
-/// without capturing a tracing subscriber — capture is process-global and
-/// cross-test-visible in a way this repo has been bitten by (#5314), and the
-/// thing worth pinning here is the once-per-contract decision, not the
-/// formatting of a log line.
+/// Returns whether this call emitted the warning, so the once-per-contract
+/// DECISION can be unit-tested cheaply, without a subscriber and without a
+/// compiled contract.
+///
+/// That return value is a convenience, not the guard. A return value cannot
+/// distinguish `warn!` from `debug!`, so on its own it leaves the whole
+/// operator-facing deliverable removable by one token with every test green.
+/// The emission itself is pinned behaviourally by
+/// `tests::host_clock::a_clock_reading_contract_warns_at_load`, which drives a
+/// real stdlib-built clock importer through `prepare_contract_call` and asserts
+/// a WARN line. Log capture is safe to do that with:
+/// [`crate::util::test_log_capture::install`] exists precisely to defuse the
+/// process-global callsite-`Interest` problem (#5314/#4927) that an earlier
+/// version of this comment cited as the reason to avoid it.
 ///
 /// # Why the load path rather than the store path
 ///
 /// `ContractStore::store_contract` is the obvious hook and is the wrong one for
 /// this warning. It returns early whenever the code blob is already cached or
 /// already on disk, so it fires once per code hash per node's DISK lifetime and
-/// never again — which means it would never fire for any of the 33 deployed
+/// never again — which means it would never fire for any of the deployed
 /// clock-reading contracts found by the #5465 census, because those are already
 /// in every affected node's store. An operator upgrading into the deprecation
 /// would see nothing. Warning where the module is COMPILED fires for a contract
@@ -101,24 +110,44 @@ fn wasm_code_hash(contract: &ContractContainer) -> RuntimeResult<CodeHash> {
 /// exactly once per code hash for the life of the process, so module-cache
 /// thrash (#4441) cannot turn a deprecation notice into a log flood.
 ///
-/// `SEEN` grows without an explicit cap, which is deliberate: an entry is a
-/// 32-byte `CodeHash`, it is only inserted for a contract that actually imports
-/// the clock, and every such entry requires a contract WASM blob in the node's
-/// own store — orders of magnitude larger than the entry. Nothing
-/// contract-controlled is stored here (cf. the byte-bound rule for caches
-/// holding `StateDelta` / `WrappedState`).
+/// # Why `SEEN` is capped
+///
+/// The key is remotely influenced: a PUT decides what code hash gets inserted.
+/// An earlier version of this comment justified leaving the set unbounded on the
+/// grounds that every entry requires a WASM blob in the node's own store, which
+/// is wrong twice. The store EVICTS and `SEEN` does not, so the set outlives
+/// what it was claimed to be bounded by; and the insert happens BEFORE
+/// `engine.compile()` at the call site while [`crate::conformance::imports_host_clock`] returns as
+/// soon as it sees the import pair, so roughly 70 bytes of otherwise-malformed
+/// WASM buys a permanent entry with no compile at all.
+///
+/// The practical severity is low — reaching ~100 MB of node RSS takes on the
+/// order of 2M entries and 0.5-2 GB of upload, so the amplification is under 1x
+/// and the same PUTs would surface as store writes long before memory did — but
+/// `.claude/rules/code-style.md` forbids unbounded per-key collections keyed on
+/// externally-influenced data, and the justification for the exception was
+/// false. So it is capped.
+///
+/// Past the cap the warning still fires; only the dedup stops. That is the safe
+/// direction (the deprecation notice is never silently suppressed) and no honest
+/// node approaches four figures of DISTINCT clock-importing code hashes in one
+/// process — the #5465 census found dozens network-wide.
+///
+/// Do NOT instead move the insert after `compile`: a module that fails to
+/// compile would then be re-warned on every retry.
 fn warn_on_host_clock_import(key: &ContractKey, code_hash: &CodeHash, code: &[u8]) -> bool {
+    /// Enough for every clock-importing contract the network is known to carry,
+    /// several orders over. See "Why `SEEN` is capped".
+    const SEEN_CAP: usize = 4096;
+
     static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<CodeHash>>> =
         std::sync::OnceLock::new();
-    if !crate::conformance::imports_host_clock(code) {
-        return false;
-    }
     let seen = SEEN.get_or_init(Default::default);
-    if !seen
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(*code_hash)
-    {
+    let should_warn = {
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        decide_host_clock_warning(&mut seen, SEEN_CAP, code_hash, code)
+    };
+    if !should_warn {
         return false;
     }
     tracing::warn!(
@@ -128,11 +157,43 @@ fn warn_on_host_clock_import(key: &ContractKey, code_hash: &CodeHash, code: &[u8
         function = crate::conformance::HOST_CLOCK_IMPORT,
         docs = crate::conformance::HOST_CLOCK_DEPRECATION_DOC,
         "this contract imports the host wall clock, which is DEPRECATED for \
-         contracts and will be refused in a future release (issue #5465): a \
-         merge that reads the clock is not a function of its inputs, so replicas \
-         of this contract are not guaranteed to converge. Delegates are \
-         unaffected. See the docs link for what to do instead"
+         contracts: a merge that reads the clock is not a function of its \
+         inputs, so replicas of this contract are not guaranteed to converge. \
+         In a future release the call will TRAP (issue #5465) — the contract \
+         will still load, but any actual call to the clock will fail that \
+         operation. A contract that imports the symbol without reaching it \
+         keeps working and needs no re-key. Delegates are unaffected. See the \
+         docs link for what to do instead"
     );
+    true
+}
+
+/// Whether this load should warn, given what has already been warned about.
+///
+/// Split out from [`warn_on_host_clock_import`] so the dedup and its cap can be
+/// tested against a LOCAL set. The real set is a process-global static shared by
+/// every test in the binary, so a test that filled it to the cap would leave
+/// every later test's contract un-deduped — the process-global cross-test
+/// coupling `.claude/rules/testing.md` exists about, and one `cargo nextest`
+/// cannot see.
+fn decide_host_clock_warning(
+    seen: &mut std::collections::HashSet<CodeHash>,
+    cap: usize,
+    code_hash: &CodeHash,
+    code: &[u8],
+) -> bool {
+    if !crate::conformance::imports_host_clock(code) {
+        return false;
+    }
+    if seen.contains(code_hash) {
+        return false;
+    }
+    // Past the cap, stop recording but keep warning. Under-deduping is noisy;
+    // over-deduping would silently drop the deprecation notice for every
+    // contract after the cap, which is the one outcome this must not have.
+    if seen.len() < cap {
+        seen.insert(*code_hash);
+    }
     true
 }
 
@@ -2431,6 +2492,95 @@ mod host_clock_deprecation {
              warning; the dedup is keyed on the wrong thing"
         );
     }
+
+    /// The dedup set stops growing at its cap.
+    ///
+    /// The key is remotely influenced — a PUT decides what code hash reaches
+    /// this — and the insert happens before the module is compiled, so ~70 bytes
+    /// of malformed WASM that merely names the import buys a permanent entry.
+    /// `.claude/rules/code-style.md` forbids an unbounded per-key collection on
+    /// externally-influenced data.
+    ///
+    /// Mutation this exists for: drop the `seen.len() < cap` guard. The third
+    /// hash is then recorded, its second call dedups, and this goes red.
+    #[test]
+    fn the_dedup_set_stops_growing_at_its_cap() {
+        let mut seen = std::collections::HashSet::new();
+        let first = clock_module("cap_1");
+        let second = clock_module("cap_2");
+        let third = clock_module("cap_3");
+        let (_, hash_a) = key_for(&first);
+        let (_, hash_b) = key_for(&second);
+        let (_, hash_c) = key_for(&third);
+
+        assert!(decide_host_clock_warning(&mut seen, 2, &hash_a, &first));
+        assert!(decide_host_clock_warning(&mut seen, 2, &hash_b, &second));
+        assert_eq!(seen.len(), 2, "the set did not fill as expected");
+
+        // At the cap: this one warns, and is deliberately NOT recorded.
+        assert!(decide_host_clock_warning(&mut seen, 2, &hash_c, &third));
+        assert_eq!(
+            seen.len(),
+            2,
+            "the dedup set grew past its cap, so it is unbounded on \
+             externally-influenced keys after all"
+        );
+    }
+
+    /// ...and past the cap it keeps WARNING rather than falling silent.
+    ///
+    /// Capping by refusing to warn would be the dangerous direction: every
+    /// clock-reading contract after the cap would be silently exempted from the
+    /// deprecation notice. Noise is the acceptable failure here; silence is not.
+    #[test]
+    fn past_the_cap_the_warning_still_fires() {
+        let mut seen = std::collections::HashSet::new();
+        let recorded = clock_module("past_cap_recorded");
+        let overflow = clock_module("past_cap_overflow");
+        let (_, hash_recorded) = key_for(&recorded);
+        let (_, hash_overflow) = key_for(&overflow);
+
+        assert!(decide_host_clock_warning(
+            &mut seen,
+            1,
+            &hash_recorded,
+            &recorded
+        ));
+        for _ in 0..3 {
+            assert!(
+                decide_host_clock_warning(&mut seen, 1, &hash_overflow, &overflow),
+                "a contract past the dedup cap was silenced instead of merely \
+                 re-warned; the cap must never suppress the notice"
+            );
+        }
+        // The one that IS recorded still dedups, so the cap did not disable it.
+        assert!(!decide_host_clock_warning(
+            &mut seen,
+            1,
+            &hash_recorded,
+            &recorded
+        ));
+    }
+
+    /// The cap must not turn a non-clock contract into a warned one.
+    #[test]
+    fn a_full_dedup_set_does_not_warn_about_a_clockless_contract() {
+        let mut seen = std::collections::HashSet::new();
+        let clock = clock_module("full_set_clock");
+        let (_, clock_hash) = key_for(&clock);
+        assert!(decide_host_clock_warning(&mut seen, 1, &clock_hash, &clock));
+
+        let clockless = module_importing(
+            "full_set_clockless",
+            &[("freenet_log", "__frnt__logger__info")],
+        );
+        let (_, clockless_hash) = key_for(&clockless);
+        assert!(
+            !decide_host_clock_warning(&mut seen, 1, &clockless_hash, &clockless),
+            "a contract that never reads the clock was warned about because the \
+             dedup set happened to be full"
+        );
+    }
 }
 
 /// Source pin: the deprecation warning is actually reachable from contract load.
@@ -2443,6 +2593,83 @@ mod host_clock_deprecation {
 /// nothing. So the call site is pinned at the source level instead.
 #[cfg(test)]
 mod host_clock_warning_call_site_pin {
+    /// `src` with the CONTENTS of string literals, char literals and comments
+    /// replaced by spaces, so brace counting sees structure only.
+    ///
+    /// Byte offsets are preserved exactly (every replacement is one space per
+    /// byte), so an offset found in the result indexes the original.
+    ///
+    /// Panics on raw strings and block comments rather than guessing at them.
+    /// That is the whole point: a masker that silently mishandles syntax it does
+    /// not know is the same defect as not masking at all, one level up. If this
+    /// function ever fires, extend it — do not delete the call.
+    fn blank_literals(src: &str) -> String {
+        let bytes = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'r' if bytes[i + 1..].starts_with(b"\"") || bytes[i + 1..].starts_with(b"#") => {
+                    // `r"..."` / `r#"..."#`. Only a false alarm when an
+                    // identifier ends in `r` immediately before a quote or `#`,
+                    // which Rust syntax does not produce.
+                    panic!(
+                        "a raw string appeared in the scraped region; blank_literals \
+                         cannot mask it, so extend it rather than trusting the scrape"
+                    );
+                }
+                b'/' if bytes[i + 1..].starts_with(b"*") => {
+                    panic!(
+                        "a block comment appeared in the scraped region; blank_literals \
+                         cannot mask it, so extend it rather than trusting the scrape"
+                    );
+                }
+                b'/' if bytes[i + 1..].starts_with(b"/") => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        out.push(' ');
+                        i += 1;
+                    }
+                }
+                b'"' => {
+                    out.push(' ');
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        if bytes[i] == b'\\' {
+                            out.push(' ');
+                            i += 1;
+                        }
+                        if i < bytes.len() {
+                            out.push(' ');
+                            i += 1;
+                        }
+                    }
+                    assert!(i < bytes.len(), "unterminated string literal");
+                    out.push(' ');
+                    i += 1;
+                }
+                // A char literal holding a brace: `'{'` / `'}'` / `'\{'`. Only
+                // matched in that exact shape, so a lifetime (`'a`) is left
+                // alone.
+                b'\''
+                    if matches!(bytes.get(i + 1), Some(b'{') | Some(b'}'))
+                        && bytes.get(i + 2) == Some(&b'\'') =>
+                {
+                    out.push_str("   ");
+                    i += 3;
+                }
+                _ => {
+                    // Push the whole UTF-8 character so the output stays valid
+                    // and offsets keep matching.
+                    let ch = src[i..].chars().next().expect("in bounds");
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+        debug_assert_eq!(out.len(), src.len(), "blank_literals must preserve offsets");
+        out
+    }
+
     /// `prepare_contract_call_inner`'s body with whole-line comments stripped.
     ///
     /// Stripping is load-bearing: the call site carries a comment naming
@@ -2466,9 +2693,18 @@ mod host_clock_warning_call_site_pin {
         );
         let after = &src[start..];
         let open = after.find('{').expect("signature has no body");
+        // Count braces over a copy with string/char literals and comments blanked
+        // out, then slice the ORIGINAL at the offset that finds. Counting over
+        // the raw source treats a brace inside a literal as structure, so a
+        // `format!("...{...")` added to this function later would silently widen
+        // the region past its closing brace into the next one — and
+        // `count() == 1` and the vacuity anchor below would BOTH still pass, so
+        // the pin would weaken quietly instead of failing. `blank_literals`
+        // panics on syntax it cannot mask, so the failure direction is loud.
+        let masked = blank_literals(&after[open..]);
         let mut depth = 0usize;
         let mut end = None;
-        for (offset, ch) in after[open..].char_indices() {
+        for (offset, ch) in masked.char_indices() {
             match ch {
                 '{' => depth += 1,
                 '}' => {
@@ -2515,5 +2751,57 @@ mod host_clock_warning_call_site_pin {
             "comment stripping stopped working, so the pin can be satisfied by a \
              comment naming the function instead of by a call to it"
         );
+    }
+
+    /// A brace inside a string literal is not structure.
+    ///
+    /// Without the mask, the `}` in the format string closes the body early and
+    /// the scraped region stops short; the `{` case widens it instead. Both make
+    /// the pin above report on the wrong text while still passing.
+    #[test]
+    fn braces_inside_literals_are_not_counted_as_structure() {
+        let masked = blank_literals("{ f(\"}}}{\"); g('{'); }");
+        assert_eq!(
+            masked.matches('{').count(),
+            1,
+            "a brace inside a string or char literal was counted as structure: {masked}"
+        );
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert_eq!(
+            masked.len(),
+            "{ f(\"}}}{\"); g('{'); }".len(),
+            "the mask changed byte offsets, so they no longer index the original"
+        );
+    }
+
+    /// A brace in a comment is not structure either, and an escaped quote does
+    /// not end the literal it is inside.
+    #[test]
+    fn comments_and_escaped_quotes_are_handled() {
+        let masked = blank_literals("{ // }}}\n f(\"a\\\"}\"); }");
+        assert_eq!(masked.matches('{').count(), 1, "{masked}");
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+    }
+
+    /// Real code the mask must leave alone: a lifetime is not a char literal.
+    #[test]
+    fn a_lifetime_is_not_mistaken_for_a_char_literal() {
+        let src = "{ fn f<'a>(x: &'a str) -> &'a str { x } }";
+        assert_eq!(blank_literals(src), src);
+    }
+
+    /// Syntax the mask does not handle must PANIC rather than be guessed at —
+    /// a masker that silently mishandles a construct is the same defect it
+    /// exists to prevent.
+    #[test]
+    #[should_panic(expected = "raw string")]
+    fn a_raw_string_fails_closed() {
+        blank_literals("{ let s = r\"}{\"; }");
+    }
+
+    #[test]
+    #[should_panic(expected = "block comment")]
+    fn a_block_comment_fails_closed() {
+        blank_literals("{ /* } */ }");
     }
 }

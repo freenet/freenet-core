@@ -10,8 +10,11 @@
 //! they are not well-formed statements about it. Two peers eleven minutes apart
 //! can produce different states from the same delta and neither is wrong.
 //!
-//! Contract access to the clock is therefore DEPRECATED and will be refused in a
-//! future release (issue #5465). This module is the detector both halves of the
+//! Contract access to the clock is therefore DEPRECATED, and in a future release
+//! the call will TRAP: the contract still loads, but any actual call to the
+//! clock fails that operation with a diagnosable error (issue #5465). Trapping
+//! is per-call, so a contract that imports the symbol without reaching it keeps
+//! working and needs no re-key. This module is the detector both halves of the
 //! deprecation share: the node warns at contract load, and `fdev verify-merge`
 //! reports it as a code-level diagnostic, so a developer-facing answer and a
 //! node-facing answer cannot disagree — the same reason [`super::verify_case`]
@@ -20,13 +23,14 @@
 //! # Deliberately import-level, not reachability-level
 //!
 //! This answers exactly one question: does the module IMPORT the clock. It does
-//! not walk the call graph from the state-producing entry points, so a module
-//! that imports the function and never calls it is reported too. That is a
-//! deliberate superset for the WARNING stage — a false positive costs a log line
-//! and a docs link, and the census behind #5465 found 32 of 33 importers call it
-//! exactly once, so the superset is nearly tight in practice. The later stage
-//! that REFUSES to load such a contract is the one that needs reachability, and
-//! it is not this function.
+//! not walk the call graph, so a module that imports the function and never
+//! calls it is reported too. That superset is deliberate, and it is what makes
+//! the phasing safe: the warning fires on any import, the later trap fires on
+//! any actual call, and a call cannot happen without the import — so nothing
+//! traps that was not warned about first. A false positive costs a log line and
+//! a docs link, and the census behind #5465 found nearly every importer calls it
+//! exactly once, so the superset is nearly tight in practice. Trapping needs no
+//! reachability analysis at all, which is why no such function follows this one.
 //!
 //! # Failure direction
 //!
@@ -34,9 +38,14 @@
 //! a malformed module is rejected downstream by the WASM runtime with a precise
 //! error, and pre-empting it here with "your contract uses a deprecated host
 //! function" would be a misleading diagnosis of a different problem — the same
-//! reasoning as `contract::debug_sections`. A future refusal check must fail the
-//! OTHER way (refuse what it cannot parse), which is one more reason it is a
-//! separate function rather than a stricter mode of this one.
+//! reasoning as `contract::debug_sections`.
+//!
+//! The same direction is taken for an individual import entry that fails to
+//! decode: [`imports_host_clock`] skips it and keeps reading the section, so an
+//! undecodable entry positioned BEFORE the clock import discards the clock
+//! import along with itself and the module reports `false`. Such a module does
+//! not load either — wasmtime's validator rejects it — so the under-report is
+//! never the last word on it.
 
 /// The host-function namespace a contract imports the wall clock from.
 pub const HOST_CLOCK_NAMESPACE: &str = "freenet_time";
@@ -61,13 +70,28 @@ pub fn imports_host_clock(wasm: &[u8]) -> bool {
                         return true;
                     }
                 }
-                // A core module has at most ONE import section and it precedes
-                // every section that could carry a call, so the answer is final
-                // here. Stopping also makes the verdict independent of anything
-                // wrong with the rest of the module: a truncated tail can
-                // neither add an import nor remove one, and letting a late parse
-                // error void an import we have already read would silence the
-                // warning on exactly the modules least worth trusting.
+                // Stopping here makes the verdict independent of anything wrong
+                // with the rest of the module: a truncated tail can neither add
+                // an import nor remove one, and letting a late parse error void
+                // an import already read would silence the warning on exactly
+                // the modules least worth trusting.
+                //
+                // It does rest on a core module having at most ONE import
+                // section — and note where that guarantee comes from, because
+                // it is NOT from `Parser`. `wasmparser::Parser` will happily
+                // hand back a second `ImportSection`, so a module carrying an
+                // empty import section followed by a real one declaring the
+                // clock is parsed without complaint and answered `false` here.
+                // The guarantee is wasmtime's VALIDATOR, which rejects a
+                // duplicate section, and the call site is what makes that
+                // load-bearing: both callers validate right afterwards
+                // (`warn_on_host_clock_import` runs immediately before
+                // `engine.compile()`; `fdev`'s `code_diagnostics` runs
+                // immediately before the oracle instantiates the module), so
+                // any module this short-circuit under-reports is a module that
+                // then fails to load anyway. A caller that ever runs this
+                // WITHOUT a validation step behind it does not inherit that,
+                // and must scan every import section.
                 return false;
             }
             // Not a section that can declare an import.
@@ -101,9 +125,9 @@ mod tests {
         assert!(imports_host_clock(&wasm));
     }
 
-    /// The clock is one import among many, which is the shape every one of the
-    /// 33 deployed importers actually has: a contract also logs, and the log
-    /// import sorts before the time import.
+    /// The clock is one import among many, which is the shape every deployed
+    /// importer measured for #5465 actually has: a contract also logs, and the
+    /// log import sorts before the time import.
     #[test]
     fn the_clock_is_found_among_other_imports() {
         let wasm = module_importing(&[
@@ -175,5 +199,129 @@ mod tests {
         let mut truncated = module_importing(&[(HOST_CLOCK_NAMESPACE, HOST_CLOCK_IMPORT)]);
         truncated.truncate(10);
         assert!(!imports_host_clock(&truncated));
+    }
+
+    /// A parse error AFTER the import section must not void an import already
+    /// read. `an_unparseable_module_is_not_flagged` truncates to 10 bytes and
+    /// never reaches an import section, so it does not distinguish this.
+    ///
+    /// Mutation this exists for: collect the imports and decide after the parse
+    /// loop finishes, instead of answering as soon as the pair is found. The
+    /// trailing garbage then produces `Err` and the module reports clean —
+    /// silencing the warning on exactly the modules least worth trusting.
+    #[test]
+    fn a_corrupt_tail_does_not_void_an_import_already_read() {
+        let mut wasm = module_importing(&[(HOST_CLOCK_NAMESPACE, HOST_CLOCK_IMPORT)]);
+        // 0xFF is not a valid section id, so the parser fails here and not before.
+        wasm.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(
+            imports_host_clock(&wasm),
+            "a clock import already read was discarded by a later parse error"
+        );
+    }
+
+    /// The known limit of the single-import-section short-circuit, pinned so it
+    /// stays a documented decision rather than becoming an accident.
+    ///
+    /// `wasmparser::Parser` does not enforce one import section per module, so a
+    /// module whose FIRST import section lacks the clock and whose second
+    /// declares it is answered `false` here. That is safe only because
+    /// wasmtime's validator refuses such a module downstream — see the comment
+    /// at the short-circuit. If this test ever starts failing because the
+    /// answer became `true`, that is an improvement, not a regression: delete
+    /// the test and the caveat in the comment together.
+    #[test]
+    fn a_second_import_section_is_not_scanned_and_the_validator_is_why_that_is_safe() {
+        let first = module_importing(&[("freenet_log", "__frnt__logger__info")]);
+        let clock = module_importing(&[(HOST_CLOCK_NAMESPACE, HOST_CLOCK_IMPORT)]);
+        // Splice `clock`'s import section (id 0x02) onto the end of `first`.
+        let section = import_section_of(&clock);
+        let mut two_sections = first.clone();
+        two_sections.extend_from_slice(&section);
+        assert_ne!(
+            two_sections, first,
+            "the fixture must actually add a section"
+        );
+        assert!(
+            !imports_host_clock(&two_sections),
+            "the short-circuit now scans past the first import section; if that \
+             is deliberate, remove this test and the caveat it pins"
+        );
+        // ... and the module the short-circuit under-reports does not load.
+        assert!(
+            wasmparser::validate(&two_sections).is_err(),
+            "a module with two import sections is now accepted by the validator, \
+             so the short-circuit's safety argument no longer holds"
+        );
+    }
+
+    /// The bytes of `wasm`'s import section, id byte and length prefix included.
+    fn import_section_of(wasm: &[u8]) -> Vec<u8> {
+        for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+            if let Ok(wasmparser::Payload::ImportSection(reader)) = payload {
+                let range = reader.range();
+                let range = (range.start as usize)..(range.end as usize);
+                let mut out = vec![0x02];
+                let mut len = (range.end - range.start) as u32;
+                loop {
+                    let byte = (len & 0x7f) as u8;
+                    len >>= 7;
+                    if len == 0 {
+                        out.push(byte);
+                        break;
+                    }
+                    out.push(byte | 0x80);
+                }
+                out.extend_from_slice(&wasm[range]);
+                return out;
+            }
+        }
+        panic!("fixture has no import section");
+    }
+
+    /// The docs link the node's WARN and every `fdev` diagnostic point at must
+    /// resolve to a heading that exists.
+    ///
+    /// Mutation this exists for: reword the "Contracts must not read the host
+    /// clock" heading. Nothing else in this feature notices, and every operator
+    /// warned about a deprecated capability lands on a page with no such
+    /// section.
+    #[test]
+    fn the_deprecation_doc_link_points_at_a_heading_that_exists() {
+        const DOC: &str = include_str!("../../../../docs/architecture/contracts/README.md");
+        const DOC_PATH: &str = "docs/architecture/contracts/README.md";
+
+        assert!(
+            HOST_CLOCK_DEPRECATION_DOC.contains(DOC_PATH),
+            "the deprecation link no longer points at {DOC_PATH}, so this test is \
+             reading a different file from the one operators are sent to: {HOST_CLOCK_DEPRECATION_DOC}"
+        );
+        let (_, fragment) = HOST_CLOCK_DEPRECATION_DOC
+            .split_once('#')
+            .expect("the deprecation link carries no heading anchor");
+
+        /// GitHub's heading-anchor rule, near enough: lowercase, drop
+        /// punctuation, spaces to hyphens.
+        fn anchor(heading: &str) -> String {
+            heading
+                .trim_start_matches('#')
+                .trim()
+                .to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-')
+                .collect::<String>()
+                .replace(' ', "-")
+        }
+
+        let matches = DOC
+            .lines()
+            .filter(|line| line.starts_with('#'))
+            .filter(|line| anchor(line) == fragment)
+            .count();
+        assert_eq!(
+            matches, 1,
+            "the anchor `#{fragment}` matches {matches} headings in {DOC_PATH}; the \
+             node's deprecation warning and every fdev diagnostic link there"
+        );
     }
 }

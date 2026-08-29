@@ -1869,11 +1869,22 @@ impl WasmtimeEngine {
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
-        // Time namespace
+        // Time namespace.
+        //
+        // The two names come from `conformance::host_clock` rather than being
+        // written out here, because that module's detector — which decides
+        // whether a contract gets the #5465 deprecation warning, and what
+        // `fdev verify-merge` reports — matches on exactly these strings.
+        // Import resolution is byte-exact, so a literal here that drifted from
+        // the constants would leave the detector returning `false` forever: the
+        // node would warn about nothing and `fdev` would hand clean bills of
+        // health to contracts that do read the clock, with every test green.
+        // Sharing the constant is what makes that failure impossible rather
+        // than merely tested for.
         linker
             .func_wrap(
-                "freenet_time",
-                "__frnt__time__utc_now",
+                crate::conformance::HOST_CLOCK_NAMESPACE,
+                crate::conformance::HOST_CLOCK_IMPORT,
                 |mut caller: Caller<'_, HostState>, id: i64, ptr: i64| {
                     refresh_mem_addr_from_caller(&mut caller, id);
                     native_api::time::utc_now(id, ptr);
