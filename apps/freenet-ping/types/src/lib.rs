@@ -102,18 +102,99 @@ impl Ping {
     ///
     /// The retention policy itself is unchanged and deliberate: keep the newest
     /// `MAX_HISTORY_PER_PEER` entries regardless of age, plus any older entries
-    /// still within TTL. Applied to the union it is a pure function of (union, now),
-    /// so it is commutative, associative and idempotent at a given instant.
+    /// still within TTL.
+    ///
+    /// # TTL is measured against a LOGICAL clock, not the wall clock
+    ///
+    /// The reference instant is the newest timestamp anywhere in the merged state,
+    /// not `Utc::now()`. This is the single most important thing to copy from this
+    /// contract, so it is worth being explicit about why.
+    ///
+    /// The merge laws (freenet-core #5320) are statements about inputs determining
+    /// outputs: `merge(A, B) == merge(B, A)`, `merge(A, A) == A`, and so on. A merge
+    /// that reads the host clock is not a function of its inputs at all, so it
+    /// cannot satisfy any of them except by luck. Concretely, with a wall clock two
+    /// peers handed the SAME pair of states reach different states whenever a TTL
+    /// boundary falls between the moments they each ran the merge. `fdev
+    /// verify-merge` reports that as `update_determinism`, which is an ENFORCEABLE
+    /// property — the tier that is eventually meant to justify removing a contract
+    /// from the network.
+    ///
+    /// Be precise about how bad that is, because overstating it is its own kind of
+    /// wrong. This particular divergence is TRANSIENT, not permanent. The wall-clock
+    /// predicate is monotone in time — once an entry is old enough to be dropped it
+    /// never becomes young enough to be kept — and it was already applied to the
+    /// union rather than to the incoming side alone (#5352). Under those two
+    /// conditions two replicas whose clocks differ by at most δ re-converge once
+    /// wall time has carried both of them past the boundary. The old code was
+    /// therefore convergent, and this change is not repairing a permanent split.
+    ///
+    /// What it repairs is that the merge was not a function of its inputs. That
+    /// costs three things worth having: the reference contract stops producing
+    /// removal-eligible evidence against itself, the divergence window (however
+    /// short) disappears rather than being reasoned about, and — the part that
+    /// matters most for a file people copy — the example stops demonstrating that
+    /// reading the clock in a merge is acceptable if you argue carefully enough
+    /// afterwards.
+    ///
+    /// Deriving the instant from the state itself makes the whole function pure.
+    /// `max` over the union is exactly the right shape for this: it is idempotent,
+    /// commutative and associative, so both merge orders compute the same reference
+    /// and therefore prune identically, and it only ever moves forward as states
+    /// merge.
+    ///
+    /// The two costs are real and worth understanding before copying this:
+    ///
+    /// 1. **A state nobody is writing to stops ageing.** With no new timestamps the
+    ///    reference does not advance, so nothing further expires — and what is
+    ///    already there stays. Be precise about that, because the obvious reassurance
+    ///    is wrong: `MAX_HISTORY_PER_PEER` is a FLOOR, not a bound. `retain_history`
+    ///    keeps the newest ten entries PLUS every older entry still within TTL of the
+    ///    reference, so a peer that accumulated 500 timestamps inside one TTL window
+    ///    keeps all 500 once writes stop (measured, and still 500 after five further
+    ///    merges); under the old wall clock the same state decayed to ten with no
+    ///    traffic at all. A live state settles at roughly `ttl × write_rate` per peer
+    ///    and a frozen one holds whatever it settled at. Peer names are never swept
+    ///    either. Nothing here is an absolute cap, so a contract that needs one has to
+    ///    add it, and `validate_state` is the place. What the change does buy is that
+    ///    the retained set is now a function of the state alone: it is arguably the
+    ///    more honest behaviour, since with no new information a convergent type has
+    ///    no basis for a new decision.
+    /// 2. **A future-dated timestamp drags the reference forward** and expires
+    ///    everything older than `future - ttl` at once. The per-peer floor does hold —
+    ///    each peer keeps its newest ten — but that floor is the whole of the
+    ///    protection, and ping deliberately does not guard the rest:
+    ///
+    ///    - It is **global, not local to the sender.** The reference is a max over the
+    ///      whole union while the cap is per-peer, so one entry filed under one
+    ///      unrelated name truncates EVERY peer's history to ten, discarding entries
+    ///      that are well inside TTL. Measured: three peers holding 30 entries each
+    ///      drop to 10 apiece after a single injected entry dated a year ahead.
+    ///    - It is **permanent.** That entry is the newest under its own name, so it is
+    ///      always inside its own newest-ten and is never evicted; the reference stays
+    ///      pinned a year ahead and TTL retention stays dead. Five subsequent
+    ///      legitimate pings do not recover it.
+    ///    - It is **unauthenticated.** `validate_state` in the contract crate
+    ///      deserializes and returns `Valid` with no plausibility check of any kind,
+    ///      so any participant can inject it in an ordinary UPDATE.
+    ///
+    ///    That is a genuine regression against the wall clock rather than a wash:
+    ///    under the old rule a future timestamp had no cross-peer effect at all, and
+    ///    any local oddity ended as wall time carried past it. A contract that cannot
+    ///    accept the trade wants `validate_state` to reject implausible timestamps —
+    ///    which is a fine place to read the clock, because rejecting an input is not a
+    ///    merge. Ping does not, so anyone copying this pattern should decide that
+    ///    deliberately rather than inherit the omission.
+    ///
+    /// Note where the clock legitimately IS read: [`Ping::insert`], which records a
+    /// new observation. Reading the clock at the WRITE is what makes it data;
+    /// reading it at the MERGE is what makes the merge non-deterministic. If you take
+    /// one rule from this contract, take that one.
     pub fn merge(
         &mut self,
         mut other: Self,
         ttl: Duration,
     ) -> BTreeMap<String, Vec<DateTime<Utc>>> {
-        #[cfg(feature = "std")]
-        let now = Utc::now();
-        #[cfg(not(feature = "std"))]
-        let now = freenet_stdlib::time::now();
-
         // Preserve the larger padding. Rewriting this function wholesale dropped this
         // step, which is a convergence bug of exactly the kind this change exists to
         // fix: a peer starting with `padding: None` that merges an update carrying
@@ -152,8 +233,17 @@ impl Ping {
             self.from.entry(name).or_default().extend(incoming);
         }
 
-        for timestamps in self.from.values_mut() {
-            Self::retain_history(timestamps, now, ttl);
+        // The logical clock: the newest timestamp anywhere in the union. Computed
+        // AFTER the union so both merge orders see the same value — `max` over a set
+        // does not care how the set was assembled. See the doc comment above for why
+        // this is not `Utc::now()`.
+        //
+        // `None` means the union holds no timestamps at all, in which case there is
+        // nothing to prune and the empty-entry sweep below does the remaining work.
+        if let Some(reference) = self.from.values().flatten().max().copied() {
+            for timestamps in self.from.values_mut() {
+                Self::retain_history(timestamps, reference, ttl);
+            }
         }
 
         // Remove empty entries. `or_default()` above creates one for any name the
@@ -197,7 +287,44 @@ impl Ping {
     ///
     /// Sorting is by timestamp descending, a total order over the entries' own
     /// content, so the surviving set does not depend on the order they arrived in.
-    fn retain_history(timestamps: &mut Vec<DateTime<Utc>>, now: DateTime<Utc>, ttl: Duration) {
+    ///
+    /// `reference` is the instant TTL is measured back from. It is supplied by the
+    /// caller rather than read here, and [`Ping::merge`] supplies the newest
+    /// timestamp in the merged state — never the wall clock. See that function's
+    /// documentation for why.
+    ///
+    /// # The TTL branch does less work here than it looks like it does
+    ///
+    /// Note it is only reached when a peer's entries EXCEED `MAX_HISTORY_PER_PEER`.
+    /// Below the cap nothing is ever expired, however old it is, and `Ping::insert`
+    /// already truncates to the cap locally — so the branch is entered only in the
+    /// transient where two nodes hold different windows of the same peer's history
+    /// and their union overflows. The cap does nearly all the bounding; the TTL
+    /// trims the overlap.
+    ///
+    /// Worth being honest about, because it means this contract demonstrates the
+    /// DISCIPLINE of expiry-inside-a-convergent-merge well and the NEED for it
+    /// poorly. Anyone reaching for it as the reference for "how do I do TTL"
+    /// should know that the size bound here comes from the cap, and design their
+    /// own accordingly rather than assuming a TTL is load-bearing because this one
+    /// is present.
+    ///
+    /// # Nothing here is a tombstone
+    ///
+    /// Every entry is a positive fact ("this peer was seen at t"). Dropping one is
+    /// forgetting a positive fact, and a peer that still holds it may re-send it,
+    /// at which point it is simply re-evaluated against the same rule — harmless.
+    ///
+    /// Expiring a TOMBSTONE — a recorded negative fact, "this was deleted" — is a
+    /// different and genuinely unsafe shape, at any clock skew: forget the removal
+    /// and the removed thing resurrects from any replica that still holds it, then
+    /// propagates. If you add deletion to a contract shaped like this one, the
+    /// deletion marker cannot be expired on the same terms as the data.
+    fn retain_history(
+        timestamps: &mut Vec<DateTime<Utc>>,
+        reference: DateTime<Utc>,
+        ttl: Duration,
+    ) {
         timestamps.sort_by(|a, b| b.cmp(a));
         timestamps.dedup();
 
@@ -206,7 +333,7 @@ impl Ping {
             keep.extend(
                 timestamps[MAX_HISTORY_PER_PEER..]
                     .iter()
-                    .filter(|t| now <= **t + ttl)
+                    .filter(|t| reference <= **t + ttl)
                     .copied(),
             );
             *timestamps = keep;
@@ -503,6 +630,172 @@ mod tests {
         );
     }
 
+    /// Build a pair whose union exceeds `MAX_HISTORY_PER_PEER`, so that the TTL
+    /// branch of `retain_history` is actually reached.
+    ///
+    /// Below the cap nothing is ever pruned, which makes it very easy to write a
+    /// TTL test that exercises no TTL at all. Every test in this pair goes through
+    /// here so that the branch under test is definitely live.
+    fn split_across_two_states(name: &str, timestamps: &[DateTime<Utc>]) -> (Ping, Ping) {
+        assert!(
+            timestamps.len() > MAX_HISTORY_PER_PEER,
+            "the union must exceed the cap or retain_history never reaches its TTL \
+             branch and the test proves nothing"
+        );
+        let mut a = Ping::new();
+        let mut b = Ping::new();
+        for (i, t) in timestamps.iter().enumerate() {
+            let side = if i % 2 == 0 { &mut a } else { &mut b };
+            side.from.entry(name.to_string()).or_default().push(*t);
+        }
+        (a, b)
+    }
+
+    /// TTL is measured back from the state's own newest timestamp, not from the
+    /// moment the merge runs.
+    ///
+    /// This is the test that fails if the logical clock is reverted to `Utc::now()`.
+    /// Every timestamp here is an hour old, so a wall clock finds the entire tail
+    /// expired and returns exactly `MAX_HISTORY_PER_PEER` entries; the logical clock
+    /// puts the TTL window's edge 60s before the newest entry in the state and keeps
+    /// the one tail entry that falls inside it.
+    ///
+    /// An hour-old state is not a contrived case — it is any contract that was busy
+    /// and then went quiet, which is most of them.
+    #[test]
+    fn merge_prunes_against_the_states_own_newest_timestamp_not_the_wall_clock() {
+        let ttl = Duration::from_secs(60);
+        let newest = Utc::now() - Duration::from_secs(3600);
+
+        // Ten entries at the cap, then two older ones: one inside the TTL window
+        // measured from `newest`, one outside it.
+        let mut timestamps: Vec<DateTime<Utc>> = (0..MAX_HISTORY_PER_PEER)
+            .map(|i| newest - Duration::from_secs(i as u64))
+            .collect();
+        let inside_ttl = newest - Duration::from_secs(30);
+        let outside_ttl = newest - Duration::from_secs(90);
+        timestamps.push(inside_ttl);
+        timestamps.push(outside_ttl);
+
+        let (mut a, b) = split_across_two_states("Alice", &timestamps);
+        a.merge(b, ttl);
+
+        let kept = &a.from["Alice"];
+        assert!(
+            kept.contains(&inside_ttl),
+            "an entry 30s older than the state's newest observation is within a 60s \
+             TTL and must be kept; a wall-clock merge drops it purely because the \
+             state as a whole is old, which is what makes such a merge disagree with \
+             the same merge run a moment later"
+        );
+        assert!(
+            !kept.contains(&outside_ttl),
+            "an entry 90s older than the newest observation is outside a 60s TTL and \
+             must still be pruned — expiry is not being disabled, only anchored"
+        );
+        assert_eq!(
+            kept.len(),
+            MAX_HISTORY_PER_PEER + 1,
+            "the newest MAX_HISTORY_PER_PEER plus the one in-window tail entry"
+        );
+    }
+
+    /// Merging the same pair twice, at two different moments, must give the same
+    /// answer — which is only another way of saying `merge` is a function of its
+    /// inputs.
+    ///
+    /// The tail entry is positioned so that a TTL boundary is crossed DURING this
+    /// test: it is 200ms short of expiring when the first merge runs and 200ms past
+    /// expiring when the second does. A merge reading `Utc::now()` therefore returns
+    /// 11 entries and then 10. The logical clock returns the same answer both times
+    /// no matter how long the gap is, so the shipped code cannot make this flaky —
+    /// the timing only matters to the reverted version this is meant to catch.
+    ///
+    /// This is the shape of the real production divergence: not one merge going
+    /// wrong, but two peers running the same merge either side of a boundary and
+    /// reaching different states. That divergence is transient — the wall-clock
+    /// predicate is monotone in time, so both sides drop the entry once wall time
+    /// carries them past it — which is exactly why this needs a test rather than
+    /// being noticed in the field.
+    #[test]
+    fn merging_the_same_pair_at_two_moments_gives_the_same_answer() {
+        let ttl = Duration::from_secs(1);
+        let now = Utc::now();
+
+        let mut timestamps: Vec<DateTime<Utc>> = (0..MAX_HISTORY_PER_PEER)
+            .map(|i| now - Duration::from_millis(i as u64))
+            .collect();
+        // Crosses the wall-clock TTL boundary 200ms from now.
+        timestamps.push(now - ttl + Duration::from_millis(200));
+        // Never in the window, on either clock: the pruning still has work to do.
+        timestamps.push(now - Duration::from_secs(30));
+
+        let (a, b) = split_across_two_states("Alice", &timestamps);
+
+        let mut first = a.clone();
+        first.merge(b.clone(), ttl);
+
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let mut second = a.clone();
+        second.merge(b.clone(), ttl);
+
+        assert_eq!(
+            *first, *second,
+            "merge must be a pure function of its inputs; a merge that reads the \
+             host clock returns a different answer either side of a TTL boundary, \
+             and two peers that merge the same pair at different moments then \
+             disagree forever"
+        );
+        assert_eq!(
+            first["Alice"].len(),
+            MAX_HISTORY_PER_PEER + 1,
+            "the in-window tail entry is kept and the 30s-old one is not, so the \
+             boundary case is genuinely exercised rather than passing vacuously"
+        );
+    }
+
+    /// Commutativity across the expiry boundary, which is where a merge that prunes
+    /// is most likely to lose it.
+    ///
+    /// Both orders are given the identical pair, so any disagreement is the merge's
+    /// own. The final assertion checks the boundary was actually straddled: without
+    /// it the test would still pass if TTL pruning were deleted outright, which is
+    /// the failure mode a commutativity test most easily hides.
+    #[test]
+    fn merge_is_commutative_across_the_expiry_boundary() {
+        let ttl = Duration::from_secs(60);
+        let newest = Utc::now() - Duration::from_secs(600);
+
+        let mut timestamps: Vec<DateTime<Utc>> = (0..MAX_HISTORY_PER_PEER)
+            .map(|i| newest - Duration::from_secs(i as u64))
+            .collect();
+        // Three tail entries stepping across the 60s window edge.
+        timestamps.push(newest - Duration::from_secs(45));
+        timestamps.push(newest - Duration::from_secs(59));
+        timestamps.push(newest - Duration::from_secs(61));
+
+        let (a, b) = split_across_two_states("Alice", &timestamps);
+
+        let mut a_then_b = a.clone();
+        a_then_b.merge(b.clone(), ttl);
+        let mut b_then_a = b.clone();
+        b_then_a.merge(a.clone(), ttl);
+
+        assert_eq!(
+            *a_then_b, *b_then_a,
+            "merge(A, B) must equal merge(B, A) when the union straddles the expiry \
+             boundary"
+        );
+        assert_eq!(
+            a_then_b["Alice"].len(),
+            MAX_HISTORY_PER_PEER + 2,
+            "two of the three tail entries are inside the window and one is not, so \
+             pruning genuinely ran; equal-but-unpruned would satisfy commutativity \
+             while saying nothing about it"
+        );
+    }
+
     #[test]
     fn test_merge_ok() {
         let mut ping = Ping::new();
@@ -743,8 +1036,31 @@ mod tests {
         // Get the final entries
         let entries = ping_main.from.get(&name).unwrap();
 
-        // We should have at most MAX_HISTORY_PER_PEER entries after merging
-        assert!(entries.len() <= MAX_HISTORY_PER_PEER);
+        // The retention rule is "the newest MAX_HISTORY_PER_PEER regardless of age,
+        // PLUS any older entry still within TTL", so the result is a lower bound of
+        // MAX_HISTORY_PER_PEER, not an upper one. This assertion used to read
+        // `<= MAX_HISTORY_PER_PEER` and passed only because TTL was measured from
+        // `Utc::now()`: the newest entry here is 10s old, so a wall clock put the
+        // 25s window's far edge at t-25s and expired the two oldest entries, while
+        // the logical clock puts it at t-35s (25s before the state's own newest
+        // observation) and keeps one of them. That is the intended consequence of
+        // measuring TTL against the state rather than against the moment the merge
+        // happens to run, so the assertion is corrected to state the actual rule
+        // rather than the accident.
+        assert!(
+            entries.len() >= MAX_HISTORY_PER_PEER,
+            "the newest MAX_HISTORY_PER_PEER are kept regardless of age, so the \
+             result can never be shorter than that; got {}",
+            entries.len()
+        );
+        let newest = entries[0];
+        for extra in entries.iter().skip(MAX_HISTORY_PER_PEER) {
+            assert!(
+                newest <= *extra + ttl,
+                "an entry beyond the newest MAX_HISTORY_PER_PEER may only survive \
+                 if it is still within TTL of the state's newest observation"
+            );
+        }
 
         // The entries should be sorted newest first
         for i in 0..entries.len() - 1 {
