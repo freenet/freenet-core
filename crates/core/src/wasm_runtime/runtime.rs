@@ -128,10 +128,23 @@ fn wasm_code_hash(contract: &ContractContainer) -> RuntimeResult<CodeHash> {
 /// externally-influenced data, and the justification for the exception was
 /// false. So it is capped.
 ///
-/// Past the cap the warning still fires; only the dedup stops. That is the safe
-/// direction (the deprecation notice is never silently suppressed) and no honest
-/// node approaches four figures of DISTINCT clock-importing code hashes in one
-/// process — the #5465 census found dozens network-wide.
+/// Past the cap the warning still fires; only the dedup stops. Be explicit about
+/// what that trades: a process holding 4096+ DISTINCT clock-importing code
+/// hashes re-warns for any further contract on every module-cache miss, so the
+/// log gets noisier. Three reasons that is the right side to fail on:
+///
+/// - the alternative — stop warning past the cap — would silently exempt every
+///   clock-reading contract after the 4096th from a deprecation notice, which is
+///   the one outcome this must not have. Noise is recoverable; silence is not;
+/// - the noise is bounded by COMPILES, not by requests. The call site is the
+///   module-cache miss branch, so a hosted contract that executes constantly
+///   still warns about once. Losing the dedup raises the rate from once-ever to
+///   once-per-compile, not to once-per-operation;
+/// - the census found dozens of such contracts network-wide (37, itself a
+///   floor), so no honest node comes within two orders of magnitude of the cap.
+///   Reaching it means either an attack, in which case the cap is doing its job
+///   and the extra log lines are the signal, or an assumption here has gone
+///   badly stale and the noise is how we find out.
 ///
 /// Do NOT instead move the insert after `compile`: a module that fails to
 /// compile would then be re-warned on every retry.
@@ -2604,24 +2617,34 @@ mod host_clock_warning_call_site_pin {
     /// not know is the same defect as not masking at all, one level up. If this
     /// function ever fires, extend it — do not delete the call.
     fn blank_literals(src: &str) -> String {
+        // Kept BYTE-IDENTICAL with its twin; see the divergence pin in `fdev`'s
+        // `stdout_purity_pin::the_two_blank_literals_have_not_drifted`.
+        fn excerpt(src: &str, at: usize) -> &str {
+            let end = (at + 48).min(src.len());
+            src.get(at..end).unwrap_or("<not a char boundary>")
+        }
         let bytes = src.as_bytes();
         let mut out = String::with_capacity(src.len());
         let mut i = 0usize;
         while i < bytes.len() {
             match bytes[i] {
                 b'r' if bytes[i + 1..].starts_with(b"\"") || bytes[i + 1..].starts_with(b"#") => {
-                    // `r"..."` / `r#"..."#`. Only a false alarm when an
-                    // identifier ends in `r` immediately before a quote or `#`,
-                    // which Rust syntax does not produce.
                     panic!(
-                        "a raw string appeared in the scraped region; blank_literals \
-                         cannot mask it, so extend it rather than trusting the scrape"
+                        "blank_literals cannot mask a raw string, so the brace count \
+                         it feeds would be wrong and the scrape would silently cover \
+                         the wrong region. EXTEND this function to handle raw strings; \
+                         do not delete the call. At byte {i} of the scraped region: {:?}",
+                        excerpt(src, i)
                     );
                 }
                 b'/' if bytes[i + 1..].starts_with(b"*") => {
                     panic!(
-                        "a block comment appeared in the scraped region; blank_literals \
-                         cannot mask it, so extend it rather than trusting the scrape"
+                        "blank_literals cannot mask a block comment, so the brace count \
+                         it feeds would be wrong and the scrape would silently cover \
+                         the wrong region. EXTEND this function to handle block \
+                         comments; do not delete the call. At byte {i} of the scraped \
+                         region: {:?}",
+                        excerpt(src, i)
                     );
                 }
                 b'/' if bytes[i + 1..].starts_with(b"/") => {
@@ -2647,9 +2670,6 @@ mod host_clock_warning_call_site_pin {
                     out.push(' ');
                     i += 1;
                 }
-                // A char literal holding a brace: `'{'` / `'}'` / `'\{'`. Only
-                // matched in that exact shape, so a lifetime (`'a`) is left
-                // alone.
                 b'\''
                     if matches!(bytes.get(i + 1), Some(b'{') | Some(b'}'))
                         && bytes.get(i + 2) == Some(&b'\'') =>
@@ -2658,8 +2678,6 @@ mod host_clock_warning_call_site_pin {
                     i += 3;
                 }
                 _ => {
-                    // Push the whole UTF-8 character so the output stays valid
-                    // and offsets keep matching.
                     let ch = src[i..].chars().next().expect("in bounds");
                     out.push(ch);
                     i += ch.len_utf8();

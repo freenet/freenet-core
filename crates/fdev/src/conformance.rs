@@ -1471,6 +1471,12 @@ mod stdout_purity_pin {
     /// `freenet::wasm_runtime::runtime`'s call-site pin; they cannot be shared
     /// across the crate boundary without making test-only helpers public.)
     fn blank_literals(src: &str) -> String {
+        // Kept BYTE-IDENTICAL with its twin; see the divergence pin in `fdev`'s
+        // `stdout_purity_pin::the_two_blank_literals_have_not_drifted`.
+        fn excerpt(src: &str, at: usize) -> &str {
+            let end = (at + 48).min(src.len());
+            src.get(at..end).unwrap_or("<not a char boundary>")
+        }
         let bytes = src.as_bytes();
         let mut out = String::with_capacity(src.len());
         let mut i = 0usize;
@@ -1478,14 +1484,21 @@ mod stdout_purity_pin {
             match bytes[i] {
                 b'r' if bytes[i + 1..].starts_with(b"\"") || bytes[i + 1..].starts_with(b"#") => {
                     panic!(
-                        "a raw string appeared in the scraped region; blank_literals \
-                         cannot mask it, so extend it rather than trusting the scrape"
+                        "blank_literals cannot mask a raw string, so the brace count \
+                         it feeds would be wrong and the scrape would silently cover \
+                         the wrong region. EXTEND this function to handle raw strings; \
+                         do not delete the call. At byte {i} of the scraped region: {:?}",
+                        excerpt(src, i)
                     );
                 }
                 b'/' if bytes[i + 1..].starts_with(b"*") => {
                     panic!(
-                        "a block comment appeared in the scraped region; blank_literals \
-                         cannot mask it, so extend it rather than trusting the scrape"
+                        "blank_literals cannot mask a block comment, so the brace count \
+                         it feeds would be wrong and the scrape would silently cover \
+                         the wrong region. EXTEND this function to handle block \
+                         comments; do not delete the call. At byte {i} of the scraped \
+                         region: {:?}",
+                        excerpt(src, i)
                     );
                 }
                 b'/' if bytes[i + 1..].starts_with(b"/") => {
@@ -1572,6 +1585,73 @@ mod stdout_purity_pin {
     #[should_panic(expected = "block comment")]
     fn a_block_comment_fails_closed() {
         blank_literals("{ /* } */ }");
+    }
+
+    /// The two copies of `blank_literals` have not drifted apart.
+    ///
+    /// It exists in this crate and in `freenet`'s call-site pin. Sharing one
+    /// copy is not available: both live in `#[cfg(test)]` modules, and
+    /// `#[cfg(test)]` code is not compiled into the library `fdev` links, so
+    /// sharing would mean exposing a test-only helper on `freenet`'s public
+    /// surface (or gating it behind the `testing` feature and adding that edge
+    /// to `fdev`'s dev-dependencies) purely to avoid a duplicate.
+    ///
+    /// Duplication is the lesser cost, but only with this pin — because the way
+    /// two maskers drift is that one stops masking something, which makes its
+    /// scrape silently cover the wrong region while its own tests still pass.
+    /// That is precisely the failure class both pins exist to prevent, so it
+    /// must not become the failure class of the pins themselves.
+    ///
+    /// This crate is the right home for the check: it can read `freenet`'s
+    /// source, whereas a test inside `freenet` scraping its own file could be
+    /// satisfied by this very assertion's text. Byte equality is the assertion,
+    /// so an edit applied to BOTH copies passes — that is the correct
+    /// remediation, not a hole.
+    #[test]
+    fn the_two_blank_literals_have_not_drifted() {
+        const START: &str = "    fn blank_literals(src: &str) -> String {\n";
+        const END: &str = "        out\n    }\n";
+
+        fn extract(src: &str, whose: &str) -> String {
+            let start = src.find(START).unwrap_or_else(|| {
+                panic!(
+                    "{whose} has no `blank_literals`; if it was renamed or removed, \
+                     this pin must be updated, not deleted"
+                )
+            });
+            let rest = &src[start..];
+            let end = rest
+                .find(END)
+                .unwrap_or_else(|| panic!("{whose}'s `blank_literals` does not end as expected"))
+                + END.len();
+            rest[..end].to_string()
+        }
+
+        let ours = extract(include_str!("conformance.rs"), "fdev");
+        let theirs = extract(
+            include_str!("../../core/src/wasm_runtime/runtime.rs"),
+            "freenet's runtime.rs",
+        );
+
+        // Non-vacuity: whatever was extracted must be the real function, so a
+        // mis-anchored scrape cannot compare two empty strings and pass.
+        for (whose, body) in [("fdev", &ours), ("freenet", &theirs)] {
+            assert!(
+                body.contains("cannot mask a raw string")
+                    && body.contains("cannot mask a block comment")
+                    && body.contains("unterminated string literal"),
+                "the extracted `blank_literals` from {whose} is not the real \
+                 function:\n{body}"
+            );
+        }
+
+        assert_eq!(
+            ours, theirs,
+            "the two copies of `blank_literals` have drifted. One of them now \
+             masks something the other does not, which means one of the two \
+             source scrapes is silently covering the wrong region while its own \
+             tests still pass. Re-sync them byte for byte."
+        );
     }
 
     /// A function's body with whole-line comments stripped, so a comment mentioning
