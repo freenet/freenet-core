@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use freenet::conformance::ConformanceOracle;
 use freenet::conformance::generator::Corpus;
+use freenet::conformance::host_clock;
 use freenet::conformance::verifier::Bytes;
 use freenet::conformance::{
     ConformanceCase, ConformanceEvidence, ConformanceProperty, EVIDENCE_SCHEMA_VERSION,
@@ -189,6 +190,10 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
         write_bundle(path, &wasm, &parameters, &corpus)?;
     }
 
+    // Computed before the WASM moves into the oracle, and reported alongside the
+    // property outcomes rather than among them: see `CodeDiagnostic`.
+    let code_diagnostics = code_diagnostics(&wasm);
+
     let mut oracle = RuntimeOracle::standalone(wasm, parameters.clone())
         .await
         .map_err(describe_oracle_build_error)?;
@@ -216,7 +221,7 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
         None => None,
     };
 
-    let report = Report::build(&corpus, &outcomes, evidence);
+    let report = Report::build(&corpus, &outcomes, evidence, code_diagnostics);
     if config.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -979,6 +984,54 @@ struct EvidenceSummary {
     input_bytes_after_shrinking: usize,
 }
 
+/// A finding about the contract's CODE rather than about the outcome of checking
+/// a merge law.
+///
+/// [`Finding`] cannot express one. Its `property`, `left` and `right` fields are
+/// the law that was checked and the digests of the two states that disagreed, and
+/// there is no honest value for any of them here: nothing was executed, no state
+/// was produced, and no law was violated — the contract simply contains something
+/// worth telling its author about. Forcing it into a `Finding` would mean inventing
+/// a property name that `--property` cannot select and `ConformanceProperty::ALL`
+/// does not list, and stamping two empty digests on it. So this is a separate,
+/// deliberately small channel alongside the findings, and it is
+/// **never removal-eligible**: [`exit_code`] reads `PropertyOutcome`s only, so a
+/// code diagnostic cannot fail the command however it is worded.
+#[derive(Serialize, Clone, PartialEq, Eq, Debug)]
+struct CodeDiagnostic {
+    /// Stable machine-readable name, for a `--json` consumer.
+    diagnostic: &'static str,
+    /// What the author needs to know, in one paragraph.
+    detail: String,
+}
+
+/// Code-level diagnostics for the contract under check.
+///
+/// Kept as its own function, taking bytes and returning values, so the DECISION
+/// is testable without a WASM runtime, a corpus, or a running `conformance()`.
+fn code_diagnostics(wasm: &[u8]) -> Vec<CodeDiagnostic> {
+    let mut diagnostics = Vec::new();
+    if host_clock::imports_host_clock(wasm) {
+        diagnostics.push(CodeDiagnostic {
+            diagnostic: "host_clock_import",
+            detail: format!(
+                "this contract imports the host wall clock ({}::{}), which is \
+                 DEPRECATED for contracts and will be refused in a future release \
+                 (issue #5465). update_state must be a function of its inputs or \
+                 replicas cannot be guaranteed to converge, so the merge laws \
+                 checked above are not well-formed statements about a contract that \
+                 reads the clock. Carry a client-signed timestamp in the state and \
+                 enforce only monotonicity (new > current) instead. Delegates are \
+                 unaffected. See {}",
+                host_clock::HOST_CLOCK_NAMESPACE,
+                host_clock::HOST_CLOCK_IMPORT,
+                host_clock::HOST_CLOCK_DEPRECATION_DOC,
+            ),
+        });
+    }
+    diagnostics
+}
+
 #[derive(Serialize)]
 struct Report {
     /// What the cases were drawn FROM.
@@ -1000,6 +1053,9 @@ struct Report {
     findings: Vec<Finding>,
     inconclusive_reasons: Vec<InconclusiveReason>,
     evidence: Option<EvidenceSummary>,
+    /// See [`CodeDiagnostic`]. Separate from `findings` because these are not
+    /// property outcomes and must never be counted as violations.
+    code_diagnostics: Vec<CodeDiagnostic>,
 }
 
 /// One violated case, at full per-case granularity: exactly the digests that
@@ -1030,6 +1086,7 @@ impl Report {
         corpus: &Corpus,
         outcomes: &[(ConformanceCase, PropertyOutcome)],
         evidence: Option<EvidenceSummary>,
+        code_diagnostics: Vec<CodeDiagnostic>,
     ) -> Self {
         let mut holds = 0usize;
         let mut violations = 0usize;
@@ -1091,6 +1148,7 @@ impl Report {
             findings,
             inconclusive_reasons,
             evidence,
+            code_diagnostics,
         }
     }
 
@@ -1193,6 +1251,16 @@ impl Report {
             }
         }
 
+        if !self.code_diagnostics.is_empty() {
+            writeln!(
+                out,
+                "\ncode diagnostics (about the contract's code, not about a law it broke; these never fail this command):"
+            )?;
+            for d in &self.code_diagnostics {
+                writeln!(out, "  [{}] {}", d.diagnostic, d.detail)?;
+            }
+        }
+
         if self.enforceable_violations == 0 {
             writeln!(out, "\nno enforceable violations found.")?;
             if self.diagnostic_violations > 0 {
@@ -1200,6 +1268,16 @@ impl Report {
                     out,
                     "({} diagnostic finding(s) above are efficiency notes, not merge-law breaks, and do not fail this command.)",
                     self.diagnostic_violations
+                )?;
+            }
+            // Without this the line above is the last thing a reader sees, and
+            // "no enforceable violations found." reads as a clean bill of health
+            // for a contract that will stop loading in a future release.
+            if !self.code_diagnostics.is_empty() {
+                writeln!(
+                    out,
+                    "({} code diagnostic(s) above are about the contract's code rather than a merge law, so they do not fail this command, but they still need addressing.)",
+                    self.code_diagnostics.len()
                 )?;
             }
         }
@@ -1327,7 +1405,7 @@ mod stdout_purity_pin {
     ///
     /// Takes the signature rather than hard-coding one, so that the comment-stripping
     /// version is the ONLY way to scrape a body in this file.
-    fn code_only(signature: &str) -> String {
+    pub(super) fn code_only(signature: &str) -> String {
         fn_body(signature)
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
@@ -1365,6 +1443,40 @@ mod stdout_purity_pin {
             body.contains("eprintln!"),
             "the bundle note is no longer surfaced at all; a corpus whose related \
              state was refused would replay as a clean bill of health"
+        );
+    }
+}
+
+/// Source pin: the host-clock code diagnostic is actually computed by the command.
+///
+/// `code_diagnostics` is unit-tested above, but a diagnostic nothing calls is a
+/// diagnostic nobody sees — and deleting the call leaves every one of those unit
+/// tests green. Running the real command in a test needs a compiled contract, a
+/// corpus and a WASM runtime, which is a large fixture to guard one call, so the
+/// call is pinned at the source level instead.
+#[cfg(test)]
+mod host_clock_diagnostic_pin {
+    use super::stdout_purity_pin::code_only;
+
+    #[test]
+    fn the_command_computes_code_diagnostics() {
+        let body = code_only("pub async fn conformance(");
+        assert_eq!(
+            body.matches("code_diagnostics(&wasm)").count(),
+            1,
+            "`fdev verify-merge` no longer computes code diagnostics from the \
+             contract's WASM, so a clock-reading contract is reported as clean:\n{body}"
+        );
+    }
+
+    /// The pin above is only worth anything if its scrape can fail. An empty or
+    /// mis-anchored region would make it vacuous rather than false.
+    #[test]
+    fn the_scrape_sees_real_code() {
+        let body = code_only("pub async fn conformance(");
+        assert!(
+            body.contains("Report::build("),
+            "the scraped region is not `conformance`'s body any more:\n{body}"
         );
     }
 }
@@ -1806,6 +1918,7 @@ mod tests {
             inconclusive: 0,
             findings: Vec::new(),
             inconclusive_reasons: Vec::new(),
+            code_diagnostics: Vec::new(),
             evidence: Some(EvidenceSummary {
                 directory: "/tmp/evidence".to_string(),
                 files_written: 0,
@@ -1911,6 +2024,7 @@ mod tests {
             inconclusive: 0,
             findings: Vec::new(),
             inconclusive_reasons: Vec::new(),
+            code_diagnostics: Vec::new(),
             evidence: Some(EvidenceSummary {
                 directory: "/tmp/evidence".to_string(),
                 files_written: 0,
@@ -2155,5 +2269,135 @@ mod tests {
         let groups = group_findings(&findings);
         assert_eq!(groups.len(), 3);
         assert!(groups.iter().all(|(_, count)| *count == 1));
+    }
+
+    /// Assemble a module importing one function per `(namespace, name)` pair.
+    fn module_importing(imports: &[(&str, &str)]) -> Vec<u8> {
+        let mut wat = String::from("(module\n");
+        for (i, (namespace, name)) in imports.iter().enumerate() {
+            wat.push_str(&format!(
+                "  (import \"{namespace}\" \"{name}\" (func $f{i} (param i64 i64)))\n"
+            ));
+        }
+        wat.push_str(")\n");
+        wat::parse_str(&wat).expect("test fixture is valid wat")
+    }
+
+    fn report_with_code_diagnostics(diagnostics: Vec<CodeDiagnostic>) -> Report {
+        Report {
+            corpus_states: 2,
+            corpus_deltas: 0,
+            corpus_summaries: 0,
+            cases_run: 4,
+            holds: 4,
+            violations: 0,
+            enforceable_violations: 0,
+            diagnostic_violations: 0,
+            inconclusive: 0,
+            findings: Vec::new(),
+            inconclusive_reasons: Vec::new(),
+            evidence: None,
+            code_diagnostics: diagnostics,
+        }
+    }
+
+    /// A contract that reads the host clock must be reported (issue #5465): its
+    /// merge is not a function of its inputs, so the laws checked above are not
+    /// well-formed statements about it.
+    #[test]
+    fn a_clock_importing_contract_draws_a_code_diagnostic() {
+        let wasm = module_importing(&[(
+            host_clock::HOST_CLOCK_NAMESPACE,
+            host_clock::HOST_CLOCK_IMPORT,
+        )]);
+        let diagnostics = code_diagnostics(&wasm);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].diagnostic, "host_clock_import");
+    }
+
+    /// The counterpart. Without this, emitting the diagnostic unconditionally
+    /// passes the test above while telling every contract author that their
+    /// contract reads a clock it never touches.
+    #[test]
+    fn a_contract_that_reads_no_clock_draws_no_code_diagnostic() {
+        let wasm = module_importing(&[("freenet_log", "__frnt__logger__info")]);
+        assert_eq!(code_diagnostics(&wasm), Vec::new());
+    }
+
+    /// The whole point of the channel: a code diagnostic is DIAGNOSTIC. It must
+    /// not be counted as a violation, and it must not fail the command — a
+    /// deprecation notice that broke every affected author's build in release
+    /// *n* would make the two-release notice period meaningless.
+    #[test]
+    fn a_code_diagnostic_is_never_removal_eligible() {
+        let outcomes = vec![(
+            ConformanceCase::new(
+                ConformanceProperty::StateCommutativity,
+                vec![Bytes::from(vec![1u8]), Bytes::from(vec![2u8])],
+            ),
+            PropertyOutcome::Holds,
+        )];
+        let report = Report::build(
+            &Corpus::default(),
+            &outcomes,
+            None,
+            vec![CodeDiagnostic {
+                diagnostic: "host_clock_import",
+                detail: "reads the clock".to_string(),
+            }],
+        );
+        assert_eq!(
+            (report.violations, report.enforceable_violations),
+            (0, 0),
+            "a code diagnostic was counted as a merge-law violation; it is about \
+             the contract's code, no law was checked, and counting it here makes \
+             it removal-eligible"
+        );
+        assert_eq!(report.code_diagnostics.len(), 1);
+        // `exit_code` reads outcomes, never the report, so no code diagnostic can
+        // reach it however it is worded.
+        let just_outcomes: Vec<&PropertyOutcome> = outcomes.iter().map(|(_, o)| o).collect();
+        assert_eq!(exit_code(just_outcomes), 0);
+    }
+
+    /// The diagnostic has to reach a human who did not ask for `--json`, and it
+    /// has to reach one who did.
+    #[test]
+    fn the_human_report_shows_a_code_diagnostic() {
+        let report = report_with_code_diagnostics(vec![CodeDiagnostic {
+            diagnostic: "host_clock_import",
+            detail: "this contract imports the host wall clock".to_string(),
+        }]);
+
+        let rendered = render_human(&report);
+        assert!(
+            rendered.contains("host_clock_import")
+                && rendered.contains("this contract imports the host wall clock"),
+            "the code diagnostic never reached the default (non-json) output:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("code diagnostic(s) above"),
+            "'no enforceable violations found.' is the last thing this report \
+             says, so a contract that will stop loading in a future release \
+             reads as a clean bill of health:\n{rendered}"
+        );
+
+        let json = serde_json::to_string(&report).expect("the report serializes");
+        assert!(
+            json.contains("host_clock_import"),
+            "--json dropped the code diagnostic, so no automation can see it:\n{json}"
+        );
+    }
+
+    /// And a contract with nothing to say must not be told it has something to
+    /// say. Without this the pin above is satisfied by printing the section
+    /// unconditionally.
+    #[test]
+    fn a_report_with_no_code_diagnostics_prints_no_section() {
+        let rendered = render_human(&report_with_code_diagnostics(Vec::new()));
+        assert!(
+            !rendered.contains("code diagnostic"),
+            "a clean run was told about code diagnostics it does not have:\n{rendered}"
+        );
     }
 }

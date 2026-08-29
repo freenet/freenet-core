@@ -198,6 +198,7 @@ testresult = { workspace = true }
 tokio-tungstenite = { workspace = true }
 # console-subscriber = { version = "0.4" }
 which = { workspace = true }
+wat = { workspace = true }
 regex = { workspace = true }
 serial_test = { workspace = true }
 url = "2"

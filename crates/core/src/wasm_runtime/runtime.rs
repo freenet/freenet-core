@@ -72,6 +72,70 @@ fn wasm_code_hash(contract: &ContractContainer) -> RuntimeResult<CodeHash> {
     }
 }
 
+/// Warn, at most once per contract code hash per process, that a contract reads
+/// the host wall clock.
+///
+/// Returns whether this call emitted the warning, so the decision can be tested
+/// without capturing a tracing subscriber — capture is process-global and
+/// cross-test-visible in a way this repo has been bitten by (#5314), and the
+/// thing worth pinning here is the once-per-contract decision, not the
+/// formatting of a log line.
+///
+/// # Why the load path rather than the store path
+///
+/// `ContractStore::store_contract` is the obvious hook and is the wrong one for
+/// this warning. It returns early whenever the code blob is already cached or
+/// already on disk, so it fires once per code hash per node's DISK lifetime and
+/// never again — which means it would never fire for any of the 33 deployed
+/// clock-reading contracts found by the #5465 census, because those are already
+/// in every affected node's store. An operator upgrading into the deprecation
+/// would see nothing. Warning where the module is COMPILED fires for a contract
+/// that was already stored before the upgrade, and only for contracts the node
+/// actually runs.
+///
+/// # Why it is not noisy
+///
+/// The call site is the module-cache MISS branch, so it is already bounded by
+/// Cranelift compiles rather than by operations — a hosted contract executes
+/// constantly and compiles approximately once. The `SEEN` set then makes it
+/// exactly once per code hash for the life of the process, so module-cache
+/// thrash (#4441) cannot turn a deprecation notice into a log flood.
+///
+/// `SEEN` grows without an explicit cap, which is deliberate: an entry is a
+/// 32-byte `CodeHash`, it is only inserted for a contract that actually imports
+/// the clock, and every such entry requires a contract WASM blob in the node's
+/// own store — orders of magnitude larger than the entry. Nothing
+/// contract-controlled is stored here (cf. the byte-bound rule for caches
+/// holding `StateDelta` / `WrappedState`).
+fn warn_on_host_clock_import(key: &ContractKey, code_hash: &CodeHash, code: &[u8]) -> bool {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<CodeHash>>> =
+        std::sync::OnceLock::new();
+    if !crate::conformance::imports_host_clock(code) {
+        return false;
+    }
+    let seen = SEEN.get_or_init(Default::default);
+    if !seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(*code_hash)
+    {
+        return false;
+    }
+    tracing::warn!(
+        contract = %key,
+        %code_hash,
+        namespace = crate::conformance::HOST_CLOCK_NAMESPACE,
+        function = crate::conformance::HOST_CLOCK_IMPORT,
+        docs = crate::conformance::HOST_CLOCK_DEPRECATION_DOC,
+        "this contract imports the host wall clock, which is DEPRECATED for \
+         contracts and will be refused in a future release (issue #5465): a \
+         merge that reads the clock is not a function of its inputs, so replicas \
+         of this contract are not guaranteed to converge. Delegates are \
+         unaffected. See the docs link for what to do instead"
+    );
+    true
+}
+
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 
 /// A live WASM instance with RAII cleanup.
@@ -1410,6 +1474,10 @@ impl Runtime {
                 }
                 ContractContainer::Wasm(_) | _ => unimplemented!(),
             };
+            // Deprecation notice for #5465. On the cache-MISS path on purpose;
+            // see `warn_on_host_clock_import` for why here and not
+            // `store_contract`, and for the once-per-code-hash bound.
+            warn_on_host_clock_import(key, &code_hash, &code);
             let module = self.engine.compile(&code)?;
             let compiled_size = self.engine.module_compiled_size(&module);
             // Re-check cache: the lock was released before compilation, so
@@ -2258,6 +2326,194 @@ mod wasmtime_disk_cache_disk_sizing_tests {
             "sanity check failed: this scenario no longer demonstrates the \
              bug the fold-back fixes, so it's not exercising anything — \
              unstabilized_limit2={unstabilized_limit2}, limit1={limit1}"
+        );
+    }
+}
+
+/// Tests for the #5465 host-clock deprecation warning.
+///
+/// Every fixture builds its OWN module bytes, so every test gets its own
+/// `CodeHash` and the process-global `SEEN` set in
+/// [`warn_on_host_clock_import`] cannot make one test's outcome depend on
+/// another's having run first.
+#[cfg(test)]
+mod host_clock_deprecation {
+    use super::*;
+
+    /// A module importing one function per `(namespace, name)` pair, plus a
+    /// unique marker export so distinct fixtures hash differently.
+    fn module_importing(marker: &str, imports: &[(&str, &str)]) -> Vec<u8> {
+        let mut wat = String::from("(module\n");
+        for (i, (namespace, name)) in imports.iter().enumerate() {
+            wat.push_str(&format!(
+                "  (import \"{namespace}\" \"{name}\" (func $f{i} (param i64 i64)))\n"
+            ));
+        }
+        wat.push_str(&format!("  (func (export \"{marker}\"))\n)\n"));
+        wat::parse_str(&wat).expect("test fixture is valid wat")
+    }
+
+    fn clock_module(marker: &str) -> Vec<u8> {
+        module_importing(
+            marker,
+            &[(
+                crate::conformance::HOST_CLOCK_NAMESPACE,
+                crate::conformance::HOST_CLOCK_IMPORT,
+            )],
+        )
+    }
+
+    fn key_for(code: &[u8]) -> (ContractKey, CodeHash) {
+        let contract = WrappedContract::new(
+            std::sync::Arc::new(ContractCode::from(code.to_vec())),
+            Parameters::from(vec![]),
+        );
+        let key = *contract.key();
+        let hash = *key.code_hash();
+        (key, hash)
+    }
+
+    #[test]
+    fn a_clock_importing_contract_warns() {
+        let code = clock_module("a_clock_importing_contract_warns");
+        let (key, hash) = key_for(&code);
+        assert!(
+            warn_on_host_clock_import(&key, &hash, &code),
+            "a contract importing the host clock must draw the deprecation warning"
+        );
+    }
+
+    #[test]
+    fn a_contract_that_does_not_read_the_clock_never_warns() {
+        let code = module_importing(
+            "a_contract_that_does_not_read_the_clock_never_warns",
+            &[("freenet_log", "__frnt__logger__info")],
+        );
+        let (key, hash) = key_for(&code);
+        assert!(
+            !warn_on_host_clock_import(&key, &hash, &code),
+            "warning on a contract that imports no clock would make the notice \
+             worthless: every contract would carry it"
+        );
+    }
+
+    /// The whole point of the `SEEN` set. Without it the warning fires on every
+    /// module-cache miss, and a node thrashing its module cache (#4441) turns a
+    /// deprecation notice into a log flood at WARN level.
+    #[test]
+    fn the_same_contract_warns_exactly_once_per_process() {
+        let code = clock_module("the_same_contract_warns_exactly_once_per_process");
+        let (key, hash) = key_for(&code);
+        assert!(warn_on_host_clock_import(&key, &hash, &code));
+        for _ in 0..5 {
+            assert!(
+                !warn_on_host_clock_import(&key, &hash, &code),
+                "the same contract warned more than once; the once-per-code-hash \
+                 bound is gone and a module-cache thrash now floods the log"
+            );
+        }
+    }
+
+    /// The dedup must be keyed on the CONTRACT, not on "have we warned at all".
+    /// A single global flag would pass the test above and silence every
+    /// clock-reading contract after the first one a node happens to run.
+    #[test]
+    fn a_second_distinct_contract_still_warns() {
+        let first = clock_module("a_second_distinct_contract_still_warns_1");
+        let second = clock_module("a_second_distinct_contract_still_warns_2");
+        assert_ne!(first, second, "fixtures must be byte-distinct");
+        let (key_a, hash_a) = key_for(&first);
+        let (key_b, hash_b) = key_for(&second);
+        assert!(warn_on_host_clock_import(&key_a, &hash_a, &first));
+        assert!(
+            warn_on_host_clock_import(&key_b, &hash_b, &second),
+            "a DIFFERENT clock-reading contract was silenced by the first one's \
+             warning; the dedup is keyed on the wrong thing"
+        );
+    }
+}
+
+/// Source pin: the deprecation warning is actually reachable from contract load.
+///
+/// The behavioural tests above cover the decision `warn_on_host_clock_import`
+/// makes, but not that anything calls it. Exercising the real call site needs a
+/// compiled contract, a `Runtime`, a contract store and a module cache: a large
+/// fixture to guard one call, and deleting the call is exactly the regression
+/// that would leave every unit test above green while the node warns about
+/// nothing. So the call site is pinned at the source level instead.
+#[cfg(test)]
+mod host_clock_warning_call_site_pin {
+    /// `prepare_contract_call_inner`'s body with whole-line comments stripped.
+    ///
+    /// Stripping is load-bearing: the call site carries a comment naming
+    /// `warn_on_host_clock_import`, so a scrape over the raw body would be
+    /// satisfied by that comment alone and would stay green after the call
+    /// itself was deleted. This repo has shipped exactly that bug (see
+    /// `fdev`'s `code_only`).
+    fn call_site_code() -> String {
+        let src = include_str!("runtime.rs");
+        let signature = "fn prepare_contract_call_inner(";
+        let start = src
+            .find(signature)
+            .expect("prepare_contract_call_inner not found in runtime.rs");
+        let first_test_mod = src
+            .find("\n#[cfg(test)]")
+            .expect("runtime.rs has no test module");
+        assert!(
+            start < first_test_mod,
+            "the signature matched only inside a test module, so this pin would \
+             be scoped to a test rather than to production code"
+        );
+        let after = &src[start..];
+        let open = after.find('{').expect("signature has no body");
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        after[..end.expect("body is not brace-balanced")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn contract_load_calls_the_host_clock_warning() {
+        let body = call_site_code();
+        assert_eq!(
+            body.matches("warn_on_host_clock_import(").count(),
+            1,
+            "the host-clock deprecation warning is no longer called (exactly once) \
+             from the contract module-cache miss path, so no contract will ever \
+             draw the #5465 notice:\n{body}"
+        );
+    }
+
+    /// The pin above is only worth anything if the scrape it runs on can fail.
+    /// A signature that stopped matching, or a body that came back empty, would
+    /// make the assertion above vacuous rather than false.
+    #[test]
+    fn the_scrape_sees_real_code() {
+        let body = call_site_code();
+        assert!(
+            body.contains("self.engine.compile(&code)?"),
+            "the scraped region is not prepare_contract_call_inner's body any more"
+        );
+        assert!(
+            !body.contains("// Deprecation notice for #5465"),
+            "comment stripping stopped working, so the pin can be satisfied by a \
+             comment naming the function instead of by a call to it"
         );
     }
 }

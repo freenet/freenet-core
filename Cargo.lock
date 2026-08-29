@@ -1907,6 +1907,7 @@ dependencies = [
  "tokio-tungstenite 0.27.0",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
+ "wat",
  "xz2",
 ]
 
@@ -2151,6 +2152,7 @@ dependencies = [
  "url",
  "wasmparser 0.257.1",
  "wasmtime",
+ "wat",
  "which",
  "winapi",
  "winreg",

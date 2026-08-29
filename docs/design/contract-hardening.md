@@ -434,6 +434,8 @@ The meter sits on every executor hot path after Phase 3. `DashMap` swap addresse
 
 Governance decisions depend on `TimeSource` and meter readings. Thread `TimeSource` through `ContractScore` (matches core conventions).
 
+Contract-side determinism is a separate concern from this plan and is documented separately: a contract must not read the host wall clock, because a merge that does is not a function of its inputs and its replicas are not guaranteed to converge. That rule, why it exists and what to do instead are in [the contract execution architecture doc](../architecture/contracts/README.md#contracts-must-not-read-the-host-clock) (issue #5465). Nothing in this plan depends on it either way.
+
 ### Remaining arbitrary parameters — honest audit
 
 MAD-based detection moves the **load-bearing threshold** from arbitrary to principled. But the plan still contains parameters that aren't statistically derived:
