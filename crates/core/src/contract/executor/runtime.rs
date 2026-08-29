@@ -2941,3 +2941,256 @@ mod idempotency_probe_convergence_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod update_by_instance_id_tests {
+    //! Regression tests for freenet/freenet-core#4978.
+    //!
+    //! GET and SUBSCRIBE carry only an instance id on the wire, so the executor
+    //! resolves the real code hash for them via `lookup_key`. UPDATE carries a
+    //! full `ContractKey`, so whatever code hash the client put in it was taken
+    //! at face value and fed straight to the
+    //! `code_blob_stored(key.code_hash())` gate in
+    //! `bridged_upsert_contract_state_inner`. Clients that address a contract by
+    //! its instance id alone — the TypeScript SDK's `fromInstanceId()`, which
+    //! emits an empty code vector, and `fdev update`, which fills in an all-zero
+    //! `CodeHash` placeholder — therefore failed that gate with
+    //! `MissingContract` on a node that was holding the contract all along.
+    //!
+    //! These drive a real `Executor<Runtime>` (real `ContractStore`, real
+    //! `StateStore`, no network) because the gate under test exists only there:
+    //! `MockRuntime`'s executor keys everything by instance id and has no
+    //! code-hash probe at all, so a mock-backed test would pass with the fix
+    //! reverted.
+
+    use std::sync::Arc;
+
+    use either::Either;
+    use freenet_stdlib::prelude::{
+        CodeHash, ContractCode, ContractContainer, ContractInstanceId, ContractKey,
+        ContractWasmAPIVersion, Parameters, RelatedContracts, WrappedContract, WrappedState,
+    };
+
+    use crate::contract::executor::{ContractExecutor, Executor};
+    use crate::contract::storages::Storage;
+    use crate::wasm_runtime::{
+        ContractStore, ContractStoreBridge, DelegateStore, Runtime, SecretsStore, StateStore,
+    };
+
+    /// Build a disk-backed `Executor<Runtime>`, holding the `TempDir` alive for
+    /// the duration of the test.
+    async fn build_executor(name: &str) -> (Executor<Runtime>, tempfile::TempDir) {
+        let temp_dir = crate::util::tests::get_temp_dir();
+        let db = Storage::new(temp_dir.path())
+            .await
+            .expect("create storage db");
+        let contract_store = ContractStore::new(
+            temp_dir.path().join(format!("contracts-{name}")),
+            10_000,
+            db.clone(),
+        )
+        .expect("create contract store");
+        let delegate_store =
+            DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())
+                .expect("create delegate store");
+        let secrets_store = SecretsStore::new(
+            temp_dir.path().join("secrets"),
+            Default::default(),
+            db.clone(),
+        )
+        .expect("create secrets store");
+        let state_store = StateStore::new(db, 10_000_000).expect("create state store");
+        let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)
+            .expect("build runtime");
+        let executor = Executor::new(
+            state_store,
+            || Ok(()),
+            crate::contract::executor::OperationMode::Local,
+            runtime,
+            None,
+        )
+        .await
+        .expect("create executor");
+        (executor, temp_dir)
+    }
+
+    /// A synthetic contract container. The WASM bytes are deliberately garbage:
+    /// the gate under test runs BEFORE any module is compiled, so an UPDATE that
+    /// gets past it dies later in WASM validation instead. That asymmetry —
+    /// refused-at-the-gate versus reached-the-engine — is what makes these
+    /// assertions discriminating rather than a blanket "UPDATE fails".
+    fn make_contract(code_seed: u8, param_seed: u8) -> (ContractContainer, ContractKey) {
+        let code = ContractCode::from(vec![code_seed; 64]);
+        let params = Parameters::from(vec![param_seed; 8]);
+        let key = ContractKey::from_params_and_code(&params, &code);
+        let wrapped = WrappedContract::new(Arc::new(code), params);
+        (
+            ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped)),
+            key,
+        )
+    }
+
+    /// Seed the code blob, its instance→code index row, and the contract's
+    /// params + state, so the executor is a node that genuinely holds the
+    /// contract. Done through the store/state-store directly because this is
+    /// setup, not the behaviour under test — routing it through a PUT would die
+    /// in WASM validation on the synthetic bytes and remove the blob again.
+    async fn seed_held_contract(
+        executor: &mut Executor<Runtime>,
+        container: ContractContainer,
+        key: ContractKey,
+        state: WrappedState,
+    ) {
+        let params = container.params().into_owned();
+        executor
+            .runtime
+            .store_contract(container)
+            .expect("seeding the code blob must succeed");
+        executor
+            .state_store
+            .store(key, state, params)
+            .await
+            .expect("seeding params + state must succeed");
+    }
+
+    /// True when `err` is the `code_blob_stored` gate's refusal.
+    ///
+    /// Matched on the typed `Debug` marker `MissingContract`, NOT on the
+    /// Display text: `StdContractError` also renders a DIFFERENT failure as
+    /// "missing contract parameters" (the `state_store.get_params` miss, which
+    /// happens BEFORE the gate), so a lowercase "missing contract" substring
+    /// would conflate the two and report the wrong cause as the right one.
+    fn missing_contract(err: &crate::contract::ExecutorError) -> bool {
+        format!("{err:?}").contains("MissingContract")
+    }
+
+    /// An UPDATE addressed by instance id — the code hash a client that only
+    /// knows the base58 instance id can supply — must reach the same place a
+    /// fully-specified UPDATE reaches, on a node that holds the contract.
+    ///
+    /// Before the fix the placeholder-keyed call returned `MissingContract` from
+    /// the `code_blob_stored` gate while the correctly-keyed call sailed past
+    /// it, so this test fails on the first assertion with the fix reverted.
+    #[tokio::test]
+    async fn update_with_placeholder_code_hash_resolves_from_instance_id() {
+        let (mut executor, _temp) = build_executor("update-by-instance-id").await;
+
+        let (container, key) = make_contract(7, 7);
+        seed_held_contract(
+            &mut executor,
+            container,
+            key,
+            WrappedState::new(vec![1u8; 8]),
+        )
+        .await;
+
+        // Exactly what `fdev update` and the TS SDK's `fromInstanceId()` produce:
+        // the right instance id, a code hash that names no blob.
+        let placeholder = ContractKey::from_id_and_code(*key.id(), CodeHash::new([0u8; 32]));
+        assert_ne!(
+            placeholder.code_hash(),
+            key.code_hash(),
+            "the fixture must actually carry a wrong code hash"
+        );
+
+        let by_instance_id = executor
+            .upsert_contract_state(
+                placeholder,
+                Either::Left(WrappedState::new(vec![2u8; 8])),
+                RelatedContracts::default(),
+                None,
+            )
+            .await;
+        let err = by_instance_id
+            .expect_err("synthetic WASM cannot validate, so this must fail somewhere");
+        assert!(
+            !missing_contract(&err),
+            "an UPDATE addressed by instance id must resolve the code hash from \
+             the store instead of failing the code_blob_stored gate (#4978), \
+             got: {err:?}"
+        );
+
+        // Control: the fully-specified key must land in the same place, which is
+        // what "addressing by instance id now works like GET/SUBSCRIBE" means.
+        let by_full_key = executor
+            .upsert_contract_state(
+                key,
+                Either::Left(WrappedState::new(vec![2u8; 8])),
+                RelatedContracts::default(),
+                None,
+            )
+            .await;
+        let full_key_err =
+            by_full_key.expect_err("synthetic WASM cannot validate, so this must fail too");
+        assert!(
+            !missing_contract(&full_key_err),
+            "the fully-specified control must not hit the gate either: {full_key_err:?}"
+        );
+        // `ExecutorError` is a struct, so there is no variant to compare; the
+        // rendered error is the observable. Once the code hash is resolved the
+        // two calls are the same call, so their errors must be identical — a
+        // stronger claim than "both got past the gate", and the one that says
+        // instance-id addressing IS full-key addressing.
+        assert_eq!(
+            format!("{err:?}"),
+            format!("{full_key_err:?}"),
+            "instance-id addressing must fail in the same way as full-key \
+             addressing, not merely fail differently"
+        );
+    }
+
+    /// The resolution must not paper over a genuinely absent contract: with no
+    /// instance→code row to resolve, the caller's key stands and the existing
+    /// `MissingContract` refusal is unchanged. Without this the fix could look
+    /// like it works simply because it stopped rejecting anything.
+    #[tokio::test]
+    async fn update_for_an_unheld_contract_still_reports_missing_contract() {
+        let (mut executor, _temp) = build_executor("update-unheld-contract").await;
+
+        // A different contract is held, so the store is populated but has no row
+        // for the instance under test.
+        let (container, held_key) = make_contract(7, 7);
+        seed_held_contract(
+            &mut executor,
+            container,
+            held_key,
+            WrappedState::new(vec![1u8; 8]),
+        )
+        .await;
+
+        let (_absent_container, absent_key) = make_contract(9, 9);
+        let absent_instance: ContractInstanceId = *absent_key.id();
+        assert!(
+            executor.lookup_key(&absent_instance).is_none(),
+            "fixture must leave the instance unresolvable"
+        );
+
+        // Params are seeded so the failure is the code gate rather than the
+        // earlier "missing contract parameters" refusal.
+        executor
+            .state_store
+            .store(
+                absent_key,
+                WrappedState::new(vec![1u8; 8]),
+                Parameters::from(vec![9u8; 8]),
+            )
+            .await
+            .expect("seeding params + state must succeed");
+
+        let placeholder = ContractKey::from_id_and_code(absent_instance, CodeHash::new([0u8; 32]));
+        let err = executor
+            .upsert_contract_state(
+                placeholder,
+                Either::Left(WrappedState::new(vec![2u8; 8])),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .expect_err("an UPDATE for a contract this node does not hold must fail");
+        assert!(
+            missing_contract(&err),
+            "an unresolvable instance must still be refused with MissingContract, \
+             got: {err:?}"
+        );
+    }
+}

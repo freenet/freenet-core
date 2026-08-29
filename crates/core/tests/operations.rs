@@ -4721,3 +4721,156 @@ async fn test_get_after_update_observes_fresh_state_3357(ctx: &mut TestContext) 
 
     Ok(())
 }
+
+/// Regression test for freenet/freenet-core#4978: an UPDATE addressed by
+/// instance id alone must work, exactly as GET and SUBSCRIBE already do.
+///
+/// GET and SUBSCRIBE carry only a `ContractInstanceId` on the wire, so the node
+/// resolves the code hash itself. `ContractRequest::Update` carries a full
+/// `ContractKey`, and its code hash used to be taken at face value and fed to
+/// the executor's `code_blob_stored(key.code_hash())` gate — so every client
+/// that can only supply an instance id got `MissingContract` from a node that
+/// was holding the contract. That is the TypeScript SDK's `fromInstanceId()`
+/// (which emits an empty code vector) and freenet-core's own `fdev update`
+/// (which fills in an all-zero `CodeHash`), reproduced here with the same
+/// all-zero placeholder.
+///
+/// This runs in NETWORK mode deliberately. The bug was mode-dependent: local
+/// mode dispatches through `perform_contract_update`, which never reaches that
+/// gate, so the placeholder key worked against `freenet local` and failed the
+/// moment the same client pointed at the network.
+#[freenet_test(
+    health_check_readiness = true,
+    nodes = ["gateway", "peer-a"],
+    timeout_secs = 300,
+    startup_wait_secs = 30,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_update_contract_by_instance_id_4978(ctx: &mut TestContext) -> TestResult {
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+
+    let initial_state = test_utils::create_empty_todo_list();
+    let wrapped_state = WrappedState::from(initial_state);
+
+    let peer_a = ctx.node("peer-a")?;
+    let gateway = ctx.node("gateway")?;
+
+    let uri = peer_a.ws_url();
+    let (stream, _) = connect_async(&uri).await?;
+    let mut client_api_a = WebApi::start(stream);
+
+    make_put(
+        &mut client_api_a,
+        wrapped_state.clone(),
+        contract.clone(),
+        false,
+    )
+    .await?;
+
+    match tokio::time::timeout(Duration::from_secs(120), client_api_a.recv()).await {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+            assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+        }
+        Ok(Ok(other)) => bail!("unexpected response while waiting for put: {other:?}"),
+        Ok(Err(e)) => bail!("Error receiving put response: {e}"),
+        Err(_) => bail!("Timeout waiting for put response after 120 seconds"),
+    }
+
+    let mut todo_list: test_utils::TodoList = serde_json::from_slice(wrapped_state.as_ref())
+        .unwrap_or_else(|_| test_utils::TodoList {
+            tasks: Vec::new(),
+            version: 0,
+        });
+    todo_list.tasks.push(test_utils::Task {
+        id: 1,
+        title: "Update addressed by instance id".to_string(),
+        description: "Regression coverage for #4978".to_string(),
+        completed: false,
+        priority: 3,
+    });
+    let updated_state = WrappedState::from(serde_json::to_vec(&todo_list).unwrap());
+    let expected_version_after_update = todo_list.version + 1;
+
+    // The whole point of the test: everything about this key is right except the
+    // code hash, which is the all-zero placeholder an instance-id-only client
+    // has to supply.
+    let instance_id_only_key =
+        ContractKey::from_id_and_code(*contract_key.id(), CodeHash::new([0u8; 32]));
+    assert_ne!(
+        instance_id_only_key.code_hash(),
+        contract_key.code_hash(),
+        "the fixture must actually carry a placeholder code hash"
+    );
+
+    make_update(
+        &mut client_api_a,
+        instance_id_only_key,
+        updated_state.clone(),
+    )
+    .await?;
+
+    match tokio::time::timeout(Duration::from_secs(60), client_api_a.recv()).await {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+            key,
+            summary: _,
+        }))) => {
+            assert_eq!(
+                key, contract_key,
+                "Contract key mismatch in UPDATE response"
+            );
+        }
+        Ok(Ok(other)) => bail!("unexpected response while waiting for update: {other:?}"),
+        // Pre-fix this is where the bug lands: `MissingContract` for a contract
+        // the node just stored and can serve over GET.
+        Ok(Err(e)) => bail!("Error receiving update response: {e}"),
+        Err(_) => bail!("Timeout waiting for update response"),
+    }
+
+    // The response only says the operation was accepted; poll the state until the
+    // merge is observable, as `test_update_contract` does.
+    const MAX_VERSION_POLL_ATTEMPTS: usize = 30;
+    const VERSION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+    let mut observed: Option<test_utils::TodoList> = None;
+    for attempt in 1..=MAX_VERSION_POLL_ATTEMPTS {
+        let (response_contract, response_state) =
+            get_contract(&mut client_api_a, contract_key, &gateway.temp_dir_path).await?;
+        assert_eq!(
+            response_contract.key(),
+            contract_key,
+            "Contract key mismatch in GET response"
+        );
+
+        let list: test_utils::TodoList = serde_json::from_slice(response_state.as_ref())
+            .expect("Failed to deserialize response state");
+        tracing::info!(
+            "Version poll attempt {attempt}/{MAX_VERSION_POLL_ATTEMPTS}: got version {}, expected {}",
+            list.version,
+            expected_version_after_update
+        );
+        if list.version == expected_version_after_update {
+            observed = Some(list);
+            break;
+        }
+        if attempt < MAX_VERSION_POLL_ATTEMPTS {
+            tokio::time::sleep(VERSION_POLL_INTERVAL).await;
+        }
+    }
+
+    let observed = observed.ok_or_else(|| {
+        anyhow::anyhow!(
+            "an UPDATE addressed by instance id was accepted but never applied: \
+             expected version {expected_version_after_update}, never observed"
+        )
+    })?;
+    assert_eq!(observed.tasks.len(), 1, "Should have one task");
+    assert_eq!(
+        observed.tasks[0].title, "Update addressed by instance id",
+        "Task title should match"
+    );
+
+    Ok(())
+}

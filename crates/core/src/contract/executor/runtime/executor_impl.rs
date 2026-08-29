@@ -150,7 +150,24 @@ where
             }
             container_key
         } else {
-            key
+            // #4978: with no container in hand the caller's code hash is all we
+            // have, and UPDATE is the one verb whose wire type carries a full
+            // `ContractKey` — so a client that built its key from a base58
+            // instance id alone (the TS SDK's `fromInstanceId()`, `fdev
+            // update`'s all-zero placeholder) hands us a code hash that names
+            // no blob, and the `code_blob_stored(key.code_hash())` gate below
+            // rejects the UPDATE with `MissingContract` even though this node
+            // holds the contract. GET and SUBSCRIBE never hit this because they
+            // carry only an instance id and are resolved by `lookup_key`.
+            //
+            // Resolve the same way here. The instance id is derived from the
+            // code hash and the parameters, so the store's instance->code row
+            // is the authoritative answer and a correct caller-supplied hash
+            // resolves to itself. When this node has no row for the instance
+            // (it does not hold the contract) the caller's key is kept
+            // unchanged, so the existing `MissingContract` / auto-fetch
+            // behaviour is untouched.
+            self.bridged_lookup_key(key.id()).unwrap_or(key)
         };
 
         // Opportunistically clean up any stale initializations to prevent resource leaks

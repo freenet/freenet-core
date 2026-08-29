@@ -416,7 +416,10 @@ pub async fn get_contract_id(config: GetContractIdConfig) -> anyhow::Result<()> 
 }
 
 pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<()> {
-    // Create ContractKey with placeholder code hash - the node will look up the actual key
+    // `ContractRequest::Update` carries a full `ContractKey` while the user gave
+    // us only a base58 instance id, so the code hash is a placeholder the node
+    // resolves from its own instance->code index. That resolution is #4978; on a
+    // node older than that fix this placeholder fails with `missing contract`.
     let instance_id = ContractInstanceId::try_from(config.key)?;
     let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([0u8; 32]));
     println!("Updating contract {key}");
