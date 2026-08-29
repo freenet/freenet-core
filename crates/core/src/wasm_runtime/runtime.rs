@@ -148,13 +148,60 @@ fn wasm_code_hash(contract: &ContractContainer) -> RuntimeResult<CodeHash> {
 ///
 /// Do NOT instead move the insert after `compile`: a module that fails to
 /// compile would then be re-warned on every retry.
-fn warn_on_host_clock_import(key: &ContractKey, code_hash: &CodeHash, code: &[u8]) -> bool {
-    /// Enough for every clock-importing contract the network is known to carry,
-    /// several orders over. See "Why `SEEN` is capped".
-    const SEEN_CAP: usize = 4096;
+/// Ceiling on the `SEEN` dedup set in [`warn_on_host_clock_import`].
+///
+/// Enough for every clock-importing contract the network is known to carry,
+/// several orders over. See that function's "Why `SEEN` is capped".
+///
+/// Module-level rather than function-local so a test can assert on it: as a
+/// local it was invisible to the test module, and `SEEN_CAP = usize::MAX` — the
+/// mutation that restores the unbounded remotely-keyed collection this cap
+/// exists to prevent — left the whole suite green.
+const SEEN_CAP: usize = 4096;
 
+/// Compile-time guard on the value above.
+///
+/// A `#[test]` cannot do this job: clippy rejects a runtime assertion on a
+/// constant, and the two cap tests exercise `decide_host_clock_warning` with a
+/// LOCAL cap, so they say nothing about `SEEN_CAP` itself — measured,
+/// `SEEN_CAP = usize::MAX` left the entire suite green, restoring exactly the
+/// unbounded remotely-keyed collection the cap was added to prevent. As a
+/// `const` assertion a bad value fails the BUILD, which is stronger.
+///
+/// The upper bound is deliberately loose: this pins that the constant is a
+/// BOUND, not that it is 4096, so retuning it stays a one-line change.
+const _: () = assert!(
+    SEEN_CAP > 0 && SEEN_CAP <= 65_536,
+    "SEEN_CAP must be a real bound: `SEEN` is keyed on a contract code hash a \
+     remote PUT chooses, and .claude/rules/code-style.md forbids an unbounded \
+     per-key collection on externally-influenced data. A zero cap is also wrong \
+     — it records nothing, so every clock-reading contract re-warns on every \
+     module-cache miss."
+);
+
+fn warn_on_host_clock_import(key: &ContractKey, code_hash: &CodeHash, code: &[u8]) -> bool {
     static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<CodeHash>>> =
         std::sync::OnceLock::new();
+
+    // Parse BEFORE the lock, and take the lock only for a contract that
+    // actually imports the clock.
+    //
+    // Restores the ordering this function had before `decide_host_clock_warning`
+    // was extracted. The extraction was for testability and never needed the
+    // parse under the mutex; leaving it there meant EVERY module-cache miss took
+    // a process-global lock, including the overwhelming majority of contracts
+    // that import no clock. (It did not serialise compiles — the guard is
+    // dropped before `engine.compile` runs in the caller — but a global lock
+    // held across a parse for no reason is the wrong shape.)
+    //
+    // `decide_host_clock_warning` re-checks. That is deliberate: it is the
+    // tested unit and has to stand alone, the check is pure, and it
+    // short-circuits at the import section, so for the ~dozens of
+    // clock-importing contracts network-wide the duplicate is sub-microsecond
+    // against a Cranelift compile in the hundreds of milliseconds.
+    if !crate::conformance::imports_host_clock(code) {
+        return false;
+    }
     let seen = SEEN.get_or_init(Default::default);
     let should_warn = {
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -2623,6 +2670,23 @@ mod host_clock_warning_call_site_pin {
             let end = (at + 48).min(src.len());
             src.get(at..end).unwrap_or("<not a char boundary>")
         }
+        /// Length in bytes of the char literal starting at `at` (which must be
+        /// the opening `'`), or `None` when this is not a char literal — a
+        /// lifetime, or a label. Handles `'x'` and `'\x'`; a multi-byte char is
+        /// measured by finding the closing quote rather than assuming one byte.
+        fn char_literal_len(bytes: &[u8], at: usize) -> Option<usize> {
+            let escaped = bytes.get(at + 1) == Some(&b'\\');
+            let body_start = if escaped { at + 2 } else { at + 1 };
+            // A char literal's body is one char, so the close quote is within a
+            // few bytes; bounding the search is what stops a lifetime followed
+            // by an unrelated quote from being swallowed.
+            for (end, byte) in bytes.iter().enumerate().skip(body_start).take(4) {
+                if *byte == b'\'' {
+                    return (end > body_start).then_some(end - at + 1);
+                }
+            }
+            None
+        }
         let bytes = src.as_bytes();
         let mut out = String::with_capacity(src.len());
         let mut i = 0usize;
@@ -2670,12 +2734,26 @@ mod host_clock_warning_call_site_pin {
                     out.push(' ');
                     i += 1;
                 }
-                b'\''
-                    if matches!(bytes.get(i + 1), Some(b'{') | Some(b'}'))
-                        && bytes.get(i + 2) == Some(&b'\'') =>
-                {
-                    out.push_str("   ");
-                    i += 3;
+                // A char literal, `'x'` or `b'x'`, for ANY x — not just a brace.
+                //
+                // Matching only `'{'`/`'}'` here was a real bug with exactly the
+                // shape this function exists to prevent: `'"'` fell through to
+                // the `_` arm, its quote was pushed, and the NEXT iteration read
+                // that quote as a string opener and blanked everything to the
+                // following `"` in the file. Measured on `'"'` inserted into
+                // `prepare_contract_call_inner`: the scraped region grew from
+                // 5,389 to 21,441 bytes, swallowing three later functions, with
+                // every assertion still green.
+                //
+                // `\\`-escaped forms (`'\''`, `'\\'`, `'\n'`) are covered by the
+                // escape branch. A LIFETIME (`'a`, `'static`) is not matched,
+                // because it has no closing quote in the checked position.
+                b'\'' if char_literal_len(bytes, i).is_some() => {
+                    let len = char_literal_len(bytes, i).expect("just checked");
+                    for _ in 0..len {
+                        out.push(' ');
+                    }
+                    i += len;
                 }
                 _ => {
                     let ch = src[i..].chars().next().expect("in bounds");
@@ -2811,6 +2889,69 @@ mod host_clock_warning_call_site_pin {
     /// Syntax the mask does not handle must PANIC rather than be guessed at —
     /// a masker that silently mishandles a construct is the same defect it
     /// exists to prevent.
+    /// A char literal holding a QUOTE is masked, not treated as a string opener.
+    ///
+    /// The arm used to match only `'{'` and `'}'`; `'"'` fell through to `_`,
+    /// its quote was pushed, and the next iteration read that quote as a string
+    /// opener and blanked everything to the following `"` in the file. Measured
+    /// before the fix: inserting `let _q = '"';` into `prepare_contract_call_inner`
+    /// grew its scraped region from 5,389 to 21,441 bytes — three whole functions
+    /// — with all 26 tests still green. Precisely the silent widening this
+    /// function exists to prevent.
+    #[test]
+    fn a_char_literal_holding_a_quote_does_not_open_a_string() {
+        let masked = blank_literals("{ let _q = '\"'; f(); }");
+        assert_eq!(
+            masked.matches('{').count(),
+            1,
+            "structure was lost after a quote char literal: {masked}"
+        );
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert!(
+            masked.contains("f()"),
+            "the code after a quote char literal was blanked as if it were \
+             inside a string: {masked}"
+        );
+        assert_eq!(masked.len(), "{ let _q = '\"'; f(); }".len());
+    }
+
+    /// The byte-string form of the same trap.
+    #[test]
+    fn a_byte_char_literal_holding_a_quote_does_not_open_a_string() {
+        let masked = blank_literals("{ if c == b'\"' { g(); } }");
+        assert_eq!(
+            masked.matches('{').count(),
+            2,
+            "structure was lost after a byte quote literal: {masked}"
+        );
+        assert_eq!(masked.matches('}').count(), 2, "{masked}");
+    }
+
+    /// Escaped char literals are masked whole, so the escaped quote in `'\''`
+    /// does not leak either.
+    #[test]
+    fn escaped_char_literals_are_masked_whole() {
+        let masked = blank_literals("{ a('\\''); b('\\\\'); c('\\n'); d(); }");
+        assert_eq!(masked.matches('{').count(), 1, "{masked}");
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert!(masked.contains("d()"), "code after was blanked: {masked}");
+    }
+
+    /// Char literals other than braces and quotes are masked too, and masking
+    /// them must not disturb the surrounding structure.
+    #[test]
+    fn ordinary_char_literals_are_masked_without_losing_structure() {
+        let src = "{ m(' '); n('x'); o('é'); }";
+        let masked = blank_literals(src);
+        assert_eq!(masked.matches('{').count(), 1, "{masked}");
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert_eq!(
+            masked.len(),
+            src.len(),
+            "masking a multi-byte char literal changed byte offsets"
+        );
+    }
+
     #[test]
     #[should_panic(expected = "raw string")]
     fn a_raw_string_fails_closed() {

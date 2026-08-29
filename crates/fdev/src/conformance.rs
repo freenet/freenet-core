@@ -705,6 +705,17 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<LoadedInputs> {
             None => Vec::new(),
         };
         if config.states.is_empty() && config.transitions.is_empty() {
+            // `fdev verify-merge --wasm mycontract.wasm` — no corpus — is the
+            // FIRST thing an author runs, and this bail is the third and
+            // earliest of the three that abort before a `Report` exists. The
+            // other two are guarded in `conformance()`, but this one short
+            // circuits `load_inputs(&config)?` so that guard is never reached,
+            // which left the single most likely early-development invocation
+            // saying nothing about the clock. The WASM is already read above,
+            // so the answer costs nothing here.
+            //
+            // To stderr, so `load_inputs_never_writes_to_stdout` still holds.
+            report_code_diagnostics_standalone(&code_diagnostics(&wasm));
             anyhow::bail!(
                 "at least one --state or --transition is required unless --bundle is given"
             );
@@ -1323,7 +1334,7 @@ impl Report {
             }
             // Without this the line above is the last thing a reader sees, and
             // "no enforceable violations found." reads as a clean bill of health
-            // for a contract that will stop loading in a future release.
+            // for a contract whose clock call will trap in a future release.
             if !self.code_diagnostics.is_empty() {
                 writeln!(
                     out,
@@ -1477,6 +1488,23 @@ mod stdout_purity_pin {
             let end = (at + 48).min(src.len());
             src.get(at..end).unwrap_or("<not a char boundary>")
         }
+        /// Length in bytes of the char literal starting at `at` (which must be
+        /// the opening `'`), or `None` when this is not a char literal — a
+        /// lifetime, or a label. Handles `'x'` and `'\x'`; a multi-byte char is
+        /// measured by finding the closing quote rather than assuming one byte.
+        fn char_literal_len(bytes: &[u8], at: usize) -> Option<usize> {
+            let escaped = bytes.get(at + 1) == Some(&b'\\');
+            let body_start = if escaped { at + 2 } else { at + 1 };
+            // A char literal's body is one char, so the close quote is within a
+            // few bytes; bounding the search is what stops a lifetime followed
+            // by an unrelated quote from being swallowed.
+            for (end, byte) in bytes.iter().enumerate().skip(body_start).take(4) {
+                if *byte == b'\'' {
+                    return (end > body_start).then_some(end - at + 1);
+                }
+            }
+            None
+        }
         let bytes = src.as_bytes();
         let mut out = String::with_capacity(src.len());
         let mut i = 0usize;
@@ -1524,12 +1552,26 @@ mod stdout_purity_pin {
                     out.push(' ');
                     i += 1;
                 }
-                b'\''
-                    if matches!(bytes.get(i + 1), Some(b'{') | Some(b'}'))
-                        && bytes.get(i + 2) == Some(&b'\'') =>
-                {
-                    out.push_str("   ");
-                    i += 3;
+                // A char literal, `'x'` or `b'x'`, for ANY x — not just a brace.
+                //
+                // Matching only `'{'`/`'}'` here was a real bug with exactly the
+                // shape this function exists to prevent: `'"'` fell through to
+                // the `_` arm, its quote was pushed, and the NEXT iteration read
+                // that quote as a string opener and blanked everything to the
+                // following `"` in the file. Measured on `'"'` inserted into
+                // `prepare_contract_call_inner`: the scraped region grew from
+                // 5,389 to 21,441 bytes, swallowing three later functions, with
+                // every assertion still green.
+                //
+                // `\\`-escaped forms (`'\''`, `'\\'`, `'\n'`) are covered by the
+                // escape branch. A LIFETIME (`'a`, `'static`) is not matched,
+                // because it has no closing quote in the checked position.
+                b'\'' if char_literal_len(bytes, i).is_some() => {
+                    let len = char_literal_len(bytes, i).expect("just checked");
+                    for _ in 0..len {
+                        out.push(' ');
+                    }
+                    i += len;
                 }
                 _ => {
                     let ch = src[i..].chars().next().expect("in bounds");
@@ -1573,6 +1615,69 @@ mod stdout_purity_pin {
     fn a_lifetime_is_not_mistaken_for_a_char_literal() {
         let src = "{ fn f<'a>(x: &'a str) -> &'a str { x } }";
         assert_eq!(blank_literals(src), src);
+    }
+
+    /// A char literal holding a QUOTE is masked, not treated as a string opener.
+    ///
+    /// The arm used to match only `'{'` and `'}'`; `'"'` fell through to `_`,
+    /// its quote was pushed, and the next iteration read that quote as a string
+    /// opener and blanked everything to the following `"` in the file. Measured
+    /// before the fix: inserting `let _q = '"';` into `prepare_contract_call_inner`
+    /// grew its scraped region from 5,389 to 21,441 bytes — three whole functions
+    /// — with all 26 tests still green. Precisely the silent widening this
+    /// function exists to prevent.
+    #[test]
+    fn a_char_literal_holding_a_quote_does_not_open_a_string() {
+        let masked = blank_literals("{ let _q = '\"'; f(); }");
+        assert_eq!(
+            masked.matches('{').count(),
+            1,
+            "structure was lost after a quote char literal: {masked}"
+        );
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert!(
+            masked.contains("f()"),
+            "the code after a quote char literal was blanked as if it were \
+             inside a string: {masked}"
+        );
+        assert_eq!(masked.len(), "{ let _q = '\"'; f(); }".len());
+    }
+
+    /// The byte-string form of the same trap.
+    #[test]
+    fn a_byte_char_literal_holding_a_quote_does_not_open_a_string() {
+        let masked = blank_literals("{ if c == b'\"' { g(); } }");
+        assert_eq!(
+            masked.matches('{').count(),
+            2,
+            "structure was lost after a byte quote literal: {masked}"
+        );
+        assert_eq!(masked.matches('}').count(), 2, "{masked}");
+    }
+
+    /// Escaped char literals are masked whole, so the escaped quote in `'\''`
+    /// does not leak either.
+    #[test]
+    fn escaped_char_literals_are_masked_whole() {
+        let masked = blank_literals("{ a('\\''); b('\\\\'); c('\\n'); d(); }");
+        assert_eq!(masked.matches('{').count(), 1, "{masked}");
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert!(masked.contains("d()"), "code after was blanked: {masked}");
+    }
+
+    /// Char literals other than braces and quotes are masked too, and masking
+    /// them must not disturb the surrounding structure.
+    #[test]
+    fn ordinary_char_literals_are_masked_without_losing_structure() {
+        let src = "{ m(' '); n('x'); o('é'); }";
+        let masked = blank_literals(src);
+        assert_eq!(masked.matches('{').count(), 1, "{masked}");
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert_eq!(
+            masked.len(),
+            src.len(),
+            "masking a multi-byte char literal changed byte offsets"
+        );
     }
 
     #[test]
@@ -1689,6 +1794,69 @@ mod stdout_purity_pin {
             !body.contains("println!") && !body.contains("print!("),
             "load_inputs writes to stdout, which lands ahead of the --json document \
              and corrupts it for every consumer that parses stdout"
+        );
+    }
+
+    /// The standalone code-diagnostic report goes to stderr, never stdout.
+    ///
+    /// Its own rustdoc states the invariant — stdout may be a `--json` document
+    /// a consumer is parsing — but nothing enforced it: changing `eprint!` to
+    /// `print!` left all 101 fdev tests green. `load_inputs_never_writes_to_stdout`
+    /// is scoped to `fn load_inputs(` and does not reach this function.
+    ///
+    /// Both halves matter. The negative half alone would pass if the output
+    /// were deleted outright, which silences the diagnostic instead of
+    /// misplacing it.
+    #[test]
+    fn the_standalone_report_writes_to_stderr_only() {
+        let raw = code_only("fn report_code_diagnostics_standalone(");
+        assert!(
+            raw.contains("eprint!"),
+            "the standalone report no longer writes anything, so the paths that \
+             abort before a Report exists say nothing at all:\n{raw}"
+        );
+        // `eprint!`/`eprintln!` CONTAIN `print!`/`println!` as substrings, so
+        // they must be removed before the negative assertion — the same trap
+        // `stdout_macros_only` documents just above.
+        let stdout_only = raw.replace("eprintln!", "").replace("eprint!", "");
+        assert!(
+            !stdout_only.contains("print!") && !stdout_only.contains("println!"),
+            "the standalone report writes to stdout, which lands in the middle \
+             of a --json document and corrupts it for every consumer that parses \
+             stdout:\n{raw}"
+        );
+    }
+
+    /// The no-corpus bail reports code diagnostics BEFORE it aborts.
+    ///
+    /// `fdev verify-merge --wasm mycontract.wasm` is the invocation this is
+    /// about; see
+    /// `tests::the_plain_wasm_only_invocation_bails_on_a_contract_that_has_something_to_report`
+    /// for the behavioural half. The guards in `conformance()` cannot cover it,
+    /// because this bail short-circuits `load_inputs(&config)?` before any of
+    /// them run.
+    ///
+    /// Mutation this exists for: move the report call below the `bail!`, or
+    /// delete it. Every other test in both crates stays green.
+    #[test]
+    fn the_no_corpus_bail_reports_diagnostics_first() {
+        let body = code_only("fn load_inputs(");
+        let reported = body.find("report_code_diagnostics_standalone(").expect(
+            "the no-corpus bail no longer reports code diagnostics, so \
+                     `--wasm` with no corpus tells an author nothing about the clock",
+        );
+        let bail = body
+            .find("at least one --state or --transition")
+            .expect("the no-corpus bail is gone; re-check what this pin guards");
+        assert!(
+            reported < bail,
+            "code diagnostics are reported after the bail that aborts the run, \
+             so they are never reached:\n{body}"
+        );
+        assert_eq!(
+            body.matches("report_code_diagnostics_standalone(").count(),
+            1,
+            "expected exactly one report call in `load_inputs`:\n{body}"
         );
     }
 
@@ -2683,7 +2851,7 @@ mod tests {
         assert!(
             rendered.contains("code diagnostic(s) above"),
             "'no enforceable violations found.' is the last thing this report \
-             says, so a contract that will stop loading in a future release \
+             says, so a contract whose clock call will trap in a future release \
              reads as a clean bill of health:\n{rendered}"
         );
 
@@ -2735,5 +2903,46 @@ mod tests {
     #[test]
     fn the_standalone_rendering_is_silent_when_there_is_nothing_to_say() {
         assert_eq!(render_code_diagnostics_standalone(&[]), None);
+    }
+
+    /// `fdev verify-merge --wasm mycontract.wasm` — the plain invocation with no
+    /// corpus — reaches the bail that the diagnostic must be reported before.
+    ///
+    /// This is the exact case the reachability work was written for and the one
+    /// it originally missed: `load_inputs` bails on a missing corpus, which
+    /// short-circuits `load_inputs(&config)?` in `conformance()` and skips the
+    /// guards there entirely. This test fixes the invocation and establishes
+    /// both halves of the problem — that it bails, and that the contract it
+    /// bailed on genuinely has something to report. The ordering itself is
+    /// pinned by `the_no_corpus_bail_reports_diagnostics_first`.
+    #[test]
+    fn the_plain_wasm_only_invocation_bails_on_a_contract_that_has_something_to_report() {
+        use clap::Parser;
+
+        let wasm = module_importing(&[(
+            host_clock::HOST_CLOCK_NAMESPACE,
+            host_clock::HOST_CLOCK_IMPORT,
+        )]);
+        assert!(
+            !code_diagnostics(&wasm).is_empty(),
+            "the fixture must have something to report, or this test proves nothing"
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("mycontract.wasm");
+        std::fs::write(&path, &wasm).expect("write fixture");
+
+        let config = ConformanceConfig::parse_from([
+            "verify-merge",
+            "--wasm",
+            path.to_str().expect("utf-8 temp path"),
+        ]);
+        let err = load_inputs(&config)
+            .expect_err("--wasm with no --state must not silently succeed")
+            .to_string();
+        assert!(
+            err.contains("at least one --state or --transition is required"),
+            "this test is no longer exercising the no-corpus bail: {err}"
+        );
     }
 }
