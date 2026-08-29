@@ -993,6 +993,91 @@ mod tests {
         );
     }
 
+    /// Padding alone can be the whole difference.
+    ///
+    /// The case is two peers that already agree on every observation and disagree
+    /// only on padding: `missing` is empty and the delta exists solely to carry the
+    /// side that wins. Nothing covered it —
+    /// `applying_the_delta_reaches_the_same_state_as_applying_the_whole_state` also
+    /// has a `from` difference, so it cannot distinguish padding being handled from
+    /// padding riding along, and `a_delta_against_our_own_state_is_nothing` has both
+    /// sides identical.
+    ///
+    /// The assertions are deliberately not a restatement of the tie-break, because a
+    /// restatement would agree with a broken rule as readily as a correct one. Both
+    /// are derived from what `merge` actually does with the whole state: the delta
+    /// must leave the recipient where the whole state would have left it, and it must
+    /// carry padding exactly when the whole state would have changed the recipient's.
+    #[test]
+    fn a_delta_can_be_nothing_but_padding() {
+        let ttl = Duration::from_secs(60);
+        let observed = vec![
+            Utc::now() - Duration::from_secs(10),
+            Utc::now() - Duration::from_secs(20),
+        ];
+
+        // Both arms of the length comparison, both arms of the equal-length content
+        // tie-break, both `None` arms, and the case where there is nothing to choose.
+        let cases = [
+            (Some(vec![0xAA_u8; 32]), None),
+            (None, Some(vec![0xAA; 32])),
+            (Some(vec![0xAA; 64]), Some(vec![0xAA; 32])),
+            (Some(vec![0xAA; 32]), Some(vec![0xAA; 64])),
+            (Some(vec![0x02; 16]), Some(vec![0x01; 16])),
+            (Some(vec![0x01; 16]), Some(vec![0x02; 16])),
+            (Some(vec![0xAA; 16]), Some(vec![0xAA; 16])),
+        ];
+
+        for (ours, theirs) in cases {
+            let mut recipient = Ping::new();
+            recipient.from.insert("Alice".to_string(), observed.clone());
+            recipient.padding = theirs;
+            let mut sender = Ping::new();
+            sender.from.insert("Alice".to_string(), observed.clone());
+            sender.padding = ours;
+
+            let delta = sender.delta_against(&recipient);
+            if let Some(delta) = &delta {
+                assert!(
+                    delta.from.is_empty(),
+                    "the observations are identical, so a non-empty `from` means \
+                     this fixture is exercising some other branch: {sender:?} \
+                     against {recipient:?}"
+                );
+            }
+
+            let mut via_state = recipient.clone();
+            via_state.merge(sender.clone(), ttl);
+            let mut via_delta = recipient.clone();
+            if let Some(delta) = delta.clone() {
+                via_delta.merge(delta, ttl);
+            }
+
+            assert_eq!(
+                via_delta.padding, via_state.padding,
+                "sending the difference must leave the recipient's padding where \
+                 sending the whole state would have left it, or two peers that \
+                 agree on every observation disagree forever on padding neither is \
+                 wrong about: ours {:?}, theirs {:?}",
+                sender.padding, recipient.padding
+            );
+            assert_eq!(
+                *via_delta, *via_state,
+                "and it must not disturb the observations either"
+            );
+            assert_eq!(
+                delta.as_ref().and_then(|d| d.padding.as_ref()).is_some(),
+                via_state.padding != recipient.padding,
+                "the delta must carry padding exactly when merging the whole state \
+                 would have changed the recipient's: carrying it otherwise is \
+                 bandwidth the recipient discards, and not carrying it when the \
+                 whole state would have is a lost update. ours {:?}, theirs {:?}",
+                sender.padding,
+                recipient.padding
+            );
+        }
+    }
+
     /// The difference must not be quadratic in the size of the state.
     ///
     /// Nothing between the wire and here bounds the input: `validate_state` accepts
