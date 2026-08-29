@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fmt::Display, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Display,
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 
@@ -360,6 +364,121 @@ impl Ping {
     /// Returns whether there are no ping entries
     pub fn is_empty(&self) -> bool {
         self.from.is_empty()
+    }
+
+    /// What this state holds that `recipient` does not: the payload a delta should
+    /// carry.
+    ///
+    /// Returns `None` when the recipient is already up to date, which is the case a
+    /// delta exists to make cheap.
+    ///
+    /// # Why a delta is a difference and not the whole state
+    ///
+    /// A contract is free to return its entire state from `get_state_delta` and
+    /// still be correct — this one used to — but then synchronising costs the same
+    /// as transferring the state from scratch every time, and the conformance
+    /// verifier reports it (`self_delta_empty`, `whole_state_self_delta`; #5072).
+    /// Those are diagnostics rather than merge-law violations: wasteful, not wrong.
+    /// For the contract we hold up as the worked example, wasteful is reason enough.
+    ///
+    /// The correctness argument is short, and worth following because it is the
+    /// argument any delta implementation owes:
+    ///
+    /// - The recipient's summary IS its state (see `summarize_state`), so
+    ///   `recipient` here is exactly what the far side holds.
+    /// - `merge` is a union followed by a prune, so merging the difference gives
+    ///   `R ∪ (S \ R)`, which is `R ∪ S` — the same set as merging the whole state.
+    /// - The prune is anchored on the newest timestamp in that union, and dropping
+    ///   entries the recipient already has cannot change its maximum, so both paths
+    ///   prune identically too.
+    ///
+    /// Padding is carried only when ours would win the merge's comparison, for the
+    /// same reason: sending it otherwise changes nothing on arrival.
+    ///
+    /// # Membership goes through a set, and that is not a micro-optimisation
+    ///
+    /// The obvious way to write the difference is to scan the recipient's vector for
+    /// each of our timestamps. That is `O(n·m)`, and nothing upstream of here bounds
+    /// `n` or `m`: `validate_state` accepts any state that deserializes, so the only
+    /// ceiling is the node's 50 MiB `MAX_STATE_SIZE` — on the order of a million
+    /// timestamps. Measured on the linear version: 2.5 ms at 3,000 entries, 289 ms at
+    /// 30,000, 3.4 s at 100,000, which extrapolates past any plausible WASM execution
+    /// budget well before the state limit is reached.
+    ///
+    /// Building a set once per peer name makes it `O((n + m) log m)` for a few lines,
+    /// and it does not assume the vectors are sorted. `retain_history` does sort them,
+    /// so a binary search would usually work — but "usually" is the wrong standard
+    /// here, because a client can PUT hand-built JSON that `validate_state` accepts
+    /// unsorted, and the difference would then silently be wrong rather than slow.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use freenet_ping_types::Ping;
+    /// # use std::time::Duration;
+    /// let ttl = Duration::from_secs(60);
+    ///
+    /// let mut recipient = Ping::new();
+    /// recipient.insert("alice".to_string());
+    ///
+    /// let mut sender = recipient.clone();
+    /// sender.insert("bob".to_string());
+    ///
+    /// // Only bob's observation is new, so only bob's is sent.
+    /// let delta = sender.delta_against(&recipient).expect("bob is missing");
+    /// assert!(delta.contains_key("bob"));
+    /// assert!(!delta.contains_key("alice"));
+    ///
+    /// // Applying it reaches the same state as sending everything.
+    /// let mut via_delta = recipient.clone();
+    /// via_delta.merge(delta, ttl);
+    /// let mut via_state = recipient.clone();
+    /// via_state.merge(sender.clone(), ttl);
+    /// assert_eq!(*via_delta, *via_state);
+    ///
+    /// // And a peer already holding our state is sent nothing at all.
+    /// assert!(sender.delta_against(&sender.clone()).is_none());
+    /// ```
+    pub fn delta_against(&self, recipient: &Self) -> Option<Self> {
+        let mut missing: BTreeMap<String, Vec<DateTime<Utc>>> = BTreeMap::new();
+        for (name, timestamps) in &self.from {
+            // A set, not a scan of the recipient's vector: see the note on
+            // complexity above. `BTreeSet` rather than `HashSet` because this
+            // compiles into a contract and a std hasher is one more thing that has
+            // to behave identically on every node.
+            let held: Option<BTreeSet<DateTime<Utc>>> = recipient
+                .from
+                .get(name)
+                .map(|held| held.iter().copied().collect());
+            let new_entries: Vec<DateTime<Utc>> = timestamps
+                .iter()
+                .filter(|t| held.as_ref().is_none_or(|h| !h.contains(*t)))
+                .copied()
+                .collect();
+            if !new_entries.is_empty() {
+                missing.insert(name.clone(), new_entries);
+            }
+        }
+
+        // Exactly the comparison `merge` uses, so the delta carries padding in
+        // precisely the cases where merging the full state would have adopted ours.
+        let padding = match (&self.padding, &recipient.padding) {
+            (Some(ours), Some(theirs)) => match ours.len().cmp(&theirs.len()) {
+                std::cmp::Ordering::Greater => Some(ours.clone()),
+                std::cmp::Ordering::Less => None,
+                std::cmp::Ordering::Equal => (theirs < ours).then(|| ours.clone()),
+            },
+            (Some(ours), None) => Some(ours.clone()),
+            (None, _) => None,
+        };
+
+        if missing.is_empty() && padding.is_none() {
+            return None;
+        }
+        Some(Self {
+            from: missing,
+            padding,
+        })
     }
 }
 
@@ -793,6 +912,252 @@ mod tests {
             "two of the three tail entries are inside the window and one is not, so \
              pruning genuinely ran; equal-but-unpruned would satisfy commutativity \
              while saying nothing about it"
+        );
+    }
+
+    /// Applying the delta must reach the same state as applying the whole thing.
+    ///
+    /// This is the property that makes shrinking the delta safe, and it is the one
+    /// worth copying: a delta is an optimisation, and an optimisation you cannot
+    /// state an equivalence for is a guess. The pair here straddles the expiry
+    /// boundary on purpose, because the prune is where the two paths could most
+    /// easily diverge — the reference instant is derived from the union, and the
+    /// delta path unions a smaller set.
+    #[test]
+    fn applying_the_delta_reaches_the_same_state_as_applying_the_whole_state() {
+        let ttl = Duration::from_secs(60);
+        let newest = Utc::now() - Duration::from_secs(600);
+
+        let mut timestamps: Vec<DateTime<Utc>> = (0..MAX_HISTORY_PER_PEER)
+            .map(|i| newest - Duration::from_secs(i as u64))
+            .collect();
+        timestamps.push(newest - Duration::from_secs(45));
+        timestamps.push(newest - Duration::from_secs(75));
+
+        // Overlapping, not disjoint: the recipient already holds most of what the
+        // sender does, which is the ordinary case and the one where a difference is
+        // worth computing at all.
+        let mut recipient = Ping::new();
+        recipient
+            .from
+            .insert("Alice".to_string(), timestamps[..8].to_vec());
+        let mut sender = Ping::new();
+        sender.from.insert("Alice".to_string(), timestamps.clone());
+        sender.padding = Some(vec![0xAB; 32]);
+
+        // What the recipient reaches by being sent the sender's whole state.
+        let mut via_state = recipient.clone();
+        via_state.merge(sender.clone(), ttl);
+
+        // What it reaches by being sent only the difference.
+        let delta = sender
+            .delta_against(&recipient)
+            .expect("the sender holds entries the recipient does not");
+        let mut via_delta = recipient.clone();
+        via_delta.merge(delta.clone(), ttl);
+
+        assert_eq!(
+            *via_state, *via_delta,
+            "merging the difference must reach the same state as merging the whole \
+             state, or shrinking the delta silently loses observations"
+        );
+        assert_eq!(
+            via_state.padding, via_delta.padding,
+            "the delta must carry padding in exactly the cases where merging the \
+             full state would have adopted it"
+        );
+        assert!(
+            delta.len() < sender.len() || delta["Alice"].len() < sender["Alice"].len(),
+            "the delta must actually be smaller than the state, or nothing has been \
+             gained and this test would pass against the old whole-state delta"
+        );
+    }
+
+    /// A delta against an exact copy of our own state has nothing in it.
+    ///
+    /// `self_delta_empty` (#5072) in the conformance verifier, pinned here so it is
+    /// checked without needing to build the WASM and replay a corpus.
+    #[test]
+    fn a_delta_against_our_own_state_is_nothing() {
+        let mut ping = Ping::new();
+        ping.insert("Alice".to_string());
+        ping.insert("Bob".to_string());
+        ping.padding = Some(vec![0xAB; 16]);
+        ping.merge(Ping::new(), Duration::from_secs(60));
+
+        assert!(
+            ping.delta_against(&ping.clone()).is_none(),
+            "a peer that already holds our exact state must be sent nothing; \
+             returning the state instead makes synchronisation cost as much as a \
+             full transfer every time"
+        );
+    }
+
+    /// Padding alone can be the whole difference.
+    ///
+    /// The case is two peers that already agree on every observation and disagree
+    /// only on padding: `missing` is empty and the delta exists solely to carry the
+    /// side that wins. Nothing covered it —
+    /// `applying_the_delta_reaches_the_same_state_as_applying_the_whole_state` also
+    /// has a `from` difference, so it cannot distinguish padding being handled from
+    /// padding riding along, and `a_delta_against_our_own_state_is_nothing` has both
+    /// sides identical.
+    ///
+    /// The assertions are deliberately not a restatement of the tie-break, because a
+    /// restatement would agree with a broken rule as readily as a correct one. Both
+    /// are derived from what `merge` actually does with the whole state: the delta
+    /// must leave the recipient where the whole state would have left it, and it must
+    /// carry padding exactly when the whole state would have changed the recipient's.
+    #[test]
+    fn a_delta_can_be_nothing_but_padding() {
+        let ttl = Duration::from_secs(60);
+        let observed = vec![
+            Utc::now() - Duration::from_secs(10),
+            Utc::now() - Duration::from_secs(20),
+        ];
+
+        // Both arms of the length comparison, both arms of the equal-length content
+        // tie-break, both `None` arms, and the case where there is nothing to choose.
+        let cases = [
+            (Some(vec![0xAA_u8; 32]), None),
+            (None, Some(vec![0xAA; 32])),
+            (Some(vec![0xAA; 64]), Some(vec![0xAA; 32])),
+            (Some(vec![0xAA; 32]), Some(vec![0xAA; 64])),
+            (Some(vec![0x02; 16]), Some(vec![0x01; 16])),
+            (Some(vec![0x01; 16]), Some(vec![0x02; 16])),
+            (Some(vec![0xAA; 16]), Some(vec![0xAA; 16])),
+        ];
+
+        for (ours, theirs) in cases {
+            let mut recipient = Ping::new();
+            recipient.from.insert("Alice".to_string(), observed.clone());
+            recipient.padding = theirs;
+            let mut sender = Ping::new();
+            sender.from.insert("Alice".to_string(), observed.clone());
+            sender.padding = ours;
+
+            let delta = sender.delta_against(&recipient);
+            if let Some(delta) = &delta {
+                assert!(
+                    delta.from.is_empty(),
+                    "the observations are identical, so a non-empty `from` means \
+                     this fixture is exercising some other branch: {sender:?} \
+                     against {recipient:?}"
+                );
+            }
+
+            let mut via_state = recipient.clone();
+            via_state.merge(sender.clone(), ttl);
+            let mut via_delta = recipient.clone();
+            if let Some(delta) = delta.clone() {
+                via_delta.merge(delta, ttl);
+            }
+
+            assert_eq!(
+                via_delta.padding, via_state.padding,
+                "sending the difference must leave the recipient's padding where \
+                 sending the whole state would have left it, or two peers that \
+                 agree on every observation disagree forever on padding neither is \
+                 wrong about: ours {:?}, theirs {:?}",
+                sender.padding, recipient.padding
+            );
+            assert_eq!(
+                *via_delta, *via_state,
+                "and it must not disturb the observations either"
+            );
+            assert_eq!(
+                delta.as_ref().and_then(|d| d.padding.as_ref()).is_some(),
+                via_state.padding != recipient.padding,
+                "the delta must carry padding exactly when merging the whole state \
+                 would have changed the recipient's: carrying it otherwise is \
+                 bandwidth the recipient discards, and not carrying it when the \
+                 whole state would have is a lost update. ours {:?}, theirs {:?}",
+                sender.padding,
+                recipient.padding
+            );
+        }
+    }
+
+    /// The difference must not be quadratic in the size of the state.
+    ///
+    /// Nothing between the wire and here bounds the input: `validate_state` accepts
+    /// any state that deserializes, so the ceiling is the node's 50 MiB
+    /// `MAX_STATE_SIZE`. A scan of the recipient's vector per timestamp is `O(n·m)`
+    /// and stops being merely slow well before that.
+    ///
+    /// This is a wall-clock assertion, which is normally a bad idea, so the numbers
+    /// it rests on are worth stating. Measured in the debug profile CI builds, at
+    /// the 50,000 entries used here: about 40 ms with set membership and about 8.6 s
+    /// with the linear scan. The budget below sits roughly 75x above the first and
+    /// 3x below the second, and a slower machine moves both of them in the same
+    /// direction — so it fails on the algorithm, not on the load average.
+    #[test]
+    fn the_difference_is_not_quadratic_in_the_size_of_the_state() {
+        const N: i64 = 50_000;
+        const BUDGET: Duration = Duration::from_secs(3);
+
+        let base = Utc::now();
+        let shared: Vec<DateTime<Utc>> = (0..N)
+            .map(|i| base + chrono::TimeDelta::seconds(i))
+            .collect();
+
+        let mut recipient = Ping::new();
+        recipient.from.insert("Alice".to_string(), shared.clone());
+        let mut sender = Ping::new();
+        let mut ours = shared;
+        ours.push(base + chrono::TimeDelta::seconds(N + 1));
+        sender.from.insert("Alice".to_string(), ours);
+
+        let started = std::time::Instant::now();
+        let delta = sender
+            .delta_against(&recipient)
+            .expect("the sender holds one entry the recipient does not");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            delta["Alice"],
+            vec![base + chrono::TimeDelta::seconds(N + 1)],
+            "the difference must still be exactly the entries the recipient lacks"
+        );
+        assert!(
+            elapsed < BUDGET,
+            "computing the difference over {N} entries took {elapsed:?}, over the \
+             {BUDGET:?} budget: membership has gone back to scanning the \
+             recipient's vector, which is quadratic and unbounded"
+        );
+    }
+
+    /// The difference must not assume the vectors are sorted.
+    ///
+    /// `retain_history` does sort them, which makes a binary search look available
+    /// and makes this the tempting way to fix the complexity. It is not safe: a
+    /// client can PUT hand-built JSON, `validate_state` accepts it unsorted, and the
+    /// difference would then be silently wrong rather than slow.
+    #[test]
+    fn the_difference_does_not_assume_sorted_input() {
+        let base = Utc::now();
+        let at = |s: i64| base + chrono::TimeDelta::seconds(s);
+
+        // Deliberately not descending, and with a duplicate, exactly as a hand-built
+        // payload could arrive.
+        let mut recipient = Ping::new();
+        recipient
+            .from
+            .insert("Alice".to_string(), vec![at(10), at(30), at(20), at(30)]);
+        let mut sender = Ping::new();
+        sender
+            .from
+            .insert("Alice".to_string(), vec![at(20), at(40), at(10), at(30)]);
+
+        let delta = sender
+            .delta_against(&recipient)
+            .expect("the sender holds one entry the recipient does not");
+        assert_eq!(
+            delta["Alice"],
+            vec![at(40)],
+            "only the genuinely new entry may be sent; a membership test that \
+             assumes ordering reports entries the recipient already holds, or \
+             misses ones it does not"
         );
     }
 
