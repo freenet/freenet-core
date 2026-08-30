@@ -538,7 +538,8 @@ impl ContractStore {
         //
         // It DOES leave a gap on the PUT-rollback paths in
         // `contract/executor/runtime/contract_ops.rs`, which call
-        // `remove_contract` to undo a partially-installed contract. If a
+        // `remove_contract` to undo a partially-installed contract. Tracked,
+        // with its mirror-image counterpart on the eviction path, as #5487. If a
         // delegate had subscribed to an earlier instance of the same id, that
         // rollback drops its notification hook while its demand stays. The
         // contract is then pinned with nothing able to consume its updates.

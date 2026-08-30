@@ -81,10 +81,10 @@
 //!   that is #4669 parts 2-4 / #5467 Phase 3; until it lands a delegate pin
 //!   lapses on node restart and nowhere else.
 //!
-//!   Two known residuals of the same shape, both self-healing rather than
-//!   permanent, both closing properly only when the demand and the notification
-//!   hook become ONE record with one owner (#4669 part 3's durable
-//!   delegate-subscription store):
+//!   Two known residuals of the same shape, tracked as **#5487**. Both are
+//!   self-healing rather than permanent, and both close properly only when the
+//!   demand and the notification hook become ONE record with one owner (#4669
+//!   part 3's durable delegate-subscription store):
 //!   - `HostingManager::teardown_evicted_in_use_contract` clears
 //!     `client_subscriptions[key.id()]` wholesale on a subscriber-primary
 //!     eviction, so a delegate loses its demand while keeping its hook — the
