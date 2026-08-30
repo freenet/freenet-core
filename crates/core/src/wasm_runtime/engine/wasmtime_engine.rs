@@ -2955,9 +2955,22 @@ mod tests {
     /// Bound a scraped method body: from `fn_name` to whichever comes first of
     /// the next method or the end of the impl block.
     fn scrape_body<'a>(src: &'a str, fn_name: &str) -> &'a str {
+        // These pins scrape the file that CONTAINS them, and the fn names they
+        // look for also appear here as string literals. If the search key misses
+        // the real definition, `find` silently lands on this module's own source
+        // and the pin then measures itself. That is how the first version of this
+        // pin failed: the definition is `fn call_typed_blocking<P>(`, so the
+        // `fn call_typed_blocking(` form never matched it. Fail loudly instead.
+        let tests_start = src.find("\nmod tests {").unwrap_or(src.len());
         let start = src
             .find(fn_name)
             .unwrap_or_else(|| panic!("method `{fn_name}` not found"));
+        assert!(
+            start < tests_start,
+            "`{fn_name}` matched inside the test module rather than at its \
+             definition — this pin is scraping its own source. Check for a generic \
+             parameter (`fn foo<P>(`), which makes the `(` form miss."
+        );
         let rest = &src[start + fn_name.len()..];
         let end = [
             "\n    fn ",
@@ -3021,7 +3034,7 @@ mod tests {
             "fn call_void(",
             // #5480: the single shared body for all four contract/delegate
             // entry points.
-            "fn call_typed_blocking(",
+            "fn call_typed_blocking<",
         ];
 
         // The public entry points, which must NOT enter the guest themselves.
@@ -3194,7 +3207,7 @@ mod tests {
         let src = include_str!("wasmtime_engine.rs");
         // #5480: all four entry points share ONE body, so this scrapes that
         // body rather than the per-entry-point copies it replaced.
-        let fn_name = "fn call_typed_blocking(";
+        let fn_name = "fn call_typed_blocking<";
         let body = scrape_body(src, fn_name);
 
         let ewb = body
