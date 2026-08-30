@@ -203,6 +203,10 @@ pub(crate) const MAX_LAST_ERROR_BYTES: usize = 512;
 /// attributed CPU lives in this module's own entry instead, using the same
 /// `RunningAverage` type; only the map differs.
 ///
+/// Tracked as #5483, which proposes setting those two rows to `false` (a no-op
+/// today, since nothing reports delegate bandwidth) so the trap is disarmed
+/// rather than merely avoided here.
+///
 /// Pinned by `exec_cpu_is_not_reported_to_the_shared_topology_meter`.
 pub(crate) const EXEC_CPU_IS_NOT_REPORTED_TO_THE_SHARED_METER: () = ();
 
