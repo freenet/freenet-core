@@ -2983,7 +2983,30 @@ mod tests {
         .min()
         .map(|off| start + fn_name.len() + off)
         .unwrap_or(src.len());
-        &src[start..end]
+        let body = &src[start..end];
+
+        // Fail closed if the window was TRUNCATED. `scrape_body` bounds a window
+        // at BOTH ends, and an item added inside a method (or a `}` at column 0
+        // inside a string or macro) moves the end delimiter earlier. Every
+        // "this must be ABSENT" assertion then passes vacuously over the
+        // shortened window while the thing it forbids sits just past the new
+        // boundary.
+        //
+        // A delete-mutation cannot catch this: it validates the assertion while
+        // ASSUMING the window, so it reports the pin healthy in exactly the case
+        // where the window is intact. The structural check has to be separate.
+        // A complete method body has balanced braces; a truncated one does not.
+        let opens = body.matches('{').count();
+        let closes = body.matches('}').count();
+        assert_eq!(
+            opens, closes,
+            "`{fn_name}`: scraped body has {opens} `{{` but {closes} `}}` — the \
+             window is truncated, so any \"must be absent\" assertion over it is \
+             vacuous. Widen the end delimiters in `scrape_body`; do NOT delete \
+             the check."
+        );
+
+        body
     }
 
     /// Positions of every guest-entry call in a scraped body. Matches the
