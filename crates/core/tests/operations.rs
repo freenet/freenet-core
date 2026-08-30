@@ -4383,11 +4383,10 @@ async fn test_delegate_subscribe_on_peer_node(ctx: &mut TestContext) -> TestResu
     // contract handling — the risk in a change that touches `contract_in_use`,
     // renewal and the upstream-collapse gate — this is where it would show.
     tracing::info!("Step 5: UPDATE on the gateway, read it back on the peer");
-    let updated_state = test_utils::create_todo_list_with_item("after-update");
     make_update(
         &mut client_gw,
         contract_key,
-        WrappedState::from(updated_state.clone()),
+        WrappedState::from(test_utils::create_todo_list_with_item("after-update")),
     )
     .await?;
     let resp = timeout(Duration::from_secs(60), client_gw.recv()).await??;
@@ -4402,6 +4401,40 @@ async fn test_delegate_subscribe_on_peer_node(ctx: &mut TestContext) -> TestResu
         | other => bail!("Unexpected UPDATE response: {:?}", other),
     }
 
+    // Read back what the GATEWAY actually stored, and converge the peer against
+    // THAT rather than against the bytes we sent.
+    //
+    // Comparing the peer's state to a locally-built `updated_state` is wrong and
+    // fails even when convergence works perfectly: the contract merges an update
+    // into existing state rather than replacing it, so what lands on disk is not
+    // byte-identical to what was submitted. (The first version of this test made
+    // that mistake and failed while the event log showed the UPDATE routed to,
+    // and received by, the peer.) Comparing the two nodes to each other tests the
+    // property the test is actually about — that they agree — and is agnostic to
+    // whatever the contract's merge semantics happen to be.
+    make_get(&mut client_gw, contract_key, false, false).await?;
+    let resp = timeout(Duration::from_secs(60), client_gw.recv()).await??;
+    let gateway_state = match resp {
+        HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }) => {
+            ensure!(key == contract_key, "GET key mismatch on the gateway");
+            state
+        }
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::DelegateResponse { .. }
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Unexpected post-UPDATE GET response: {:?}", other),
+    };
+
+    // Without this the convergence assertion below is vacuous: if the UPDATE
+    // silently did nothing, both nodes would still hold the initial state and
+    // "the peer matches the gateway" would pass.
+    ensure!(
+        gateway_state.as_ref() != initial_state.as_slice(),
+        "the UPDATE did not change the gateway's own state, so comparing the \
+         peer against it would prove nothing"
+    );
+
     // Poll rather than assert once: convergence here is eventual by design, so
     // the meaningful failure is "never converges", not "briefly stale".
     let mut converged = false;
@@ -4414,8 +4447,8 @@ async fn test_delegate_subscribe_on_peer_node(ctx: &mut TestContext) -> TestResu
         }) = resp
         {
             ensure!(key == contract_key, "GET key mismatch while converging");
-            if state.as_ref() == updated_state.as_slice() {
-                tracing::info!(attempt, "peer converged on the updated state");
+            if state.as_ref() == gateway_state.as_ref() {
+                tracing::info!(attempt, "peer converged on the gateway's state");
                 converged = true;
                 break;
             }
