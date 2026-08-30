@@ -216,6 +216,28 @@ search with a blind spot; a fixed token is not.
    distinguishes a guard that works from one that happens to be passing.
 
 
+**A mutation harness leaves the tree dirty, and that is its own hazard.** The
+check above requires editing the source to break it, so for the duration of a
+run the worktree holds a deliberately broken line. During one such run
+`git status` showed `contract.rs` modified and a routine `git add -u` would
+have committed a stubbed-out call — the very line the branch existed to add —
+under a commit message about documentation. This is the cross-worktree
+contamination shape from `never-trust-cwd-with-parallel-agents.md`, arriving
+from your OWN tooling, where the usual guard ("am I in someone else's tree?")
+does not fire because you are in yours.
+
+```
+WHEN writing a mutation/falsification script:
+  → restore from git in an EXIT trap, not at the end of the happy path
+  → write a marker file (e.g. `.mutation-in-progress`) before the first
+    mutation and remove it in the SAME trap, so the two cannot disagree
+  → stage with an explicit pathspec while any run may be live, never
+    `git add -u`/`-A`, and confirm with `git show --stat` afterwards
+
+A SIGKILL then leaves the marker beside the dirty tree, which is the right way
+round: the loud state is the unsafe one.
+```
+
 ## Reference Patterns
 
 **Time injection:**
