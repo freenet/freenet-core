@@ -34,8 +34,16 @@ V2: Async host functions — delegates call contract methods directly:
                                          subscription does NOT register demand, #4669)
     Backend implementation: func_wrap_async (wasmtime native async support)
     Selected when state_store_db is configured on Runtime
-    NOTE: V2 PUT/UPDATE are local-only, bypass contract validation, and skip
-    hosting metadata. Network propagation is separate.
+    NOTE (updated by #5479): V2 PUT/UPDATE now emit BroadcastStateChange, so a
+    content-CHANGING write propagates to peers already interested in the
+    contract. Three caveats remain, and they matter:
+      - the write still bypasses the contract's own validate_state/update_state
+        merge on the writing node (receivers do merge it);
+      - it writes no hosting metadata, so `should_summarize_or_broadcast` drops
+        the broadcast for a contract this node holds ONLY because a delegate
+        wrote it (#4669 — a delegate subscription does not register demand);
+      - it does not reach this node's OWN WebSocket clients or other locally
+        subscribed delegates (#5486).
 ```
 
 ### WASM Call Modes

@@ -423,7 +423,10 @@ fn install_v2_delegate_state_write_hooks(
 ///    refresh, and the StateBytesWritten meter report. Without it the
 ///    EvictContract re-host race stays open for V2 writes and governance
 ///    scoring undercounts them.
-/// 3. **`NodeEvent::BroadcastStateChange`** — the propagation V1 gets for free
+/// 3. **`Ring::record_contract_update`** — the dashboard "last updated"
+///    timestamp. `commit_state_write` does not do this; the V1 UPDATE path
+///    does it separately, so it has to be here too.
+/// 4. **`NodeEvent::BroadcastStateChange`** — the propagation V1 gets for free
 ///    from `upsert_contract_state` (#5479). Suppressed for a contract flagged
 ///    as violating a CRDT invariant, mirroring
 ///    `Executor::broadcast_state_change`, and emitted NON-BLOCKING: a blocking
@@ -431,8 +434,24 @@ fn install_v2_delegate_state_write_hooks(
 ///    gateways in #4145, and this one runs inside a synchronous WASM host call,
 ///    where blocking would be worse still.
 ///
-/// Legs 2 and 3 need the ring, so they run only when `op_manager` is `Some`
+/// Legs 2-4 need the ring, so they run only when `op_manager` is `Some`
 /// (unit-test and local-only executors have none). Leg 1 always runs.
+///
+/// **What this deliberately does NOT re-apply**, so the next reader does not
+/// have to rediscover it — an explicit list is what stops the fourth omission:
+///
+/// - **Local fan-out** (this node's own WebSocket clients and other subscribed
+///   delegates). Not reachable from here: the `DelegateNotificationSender` is
+///   installed on the executor after this callback is built (`pool.rs`), and
+///   the WS subscriber maps need `&mut Executor`. Tracked as **#5486**.
+/// - **The no-change filter and the `MAX_STATE_SIZE` ceiling.** Both belong
+///   next to the write rather than after it, and live in
+///   `native_api::{state_content_changed, check_state_size}`.
+/// - **Hosting registration.** A V2 write does not make this node a host, so
+///   the emitted broadcast is still dropped by
+///   `should_summarize_or_broadcast` for a contract held only because a
+///   delegate wrote it. That is **#4669** (a delegate subscription must
+///   register demand), not this fix.
 ///
 /// Local fan-out — WebSocket clients and other delegates subscribed on THIS
 /// node — is deliberately NOT here and is not reachable from here: the
@@ -453,8 +472,31 @@ pub(super) fn v2_delegate_state_write_callback(
                 .ring
                 .commit_state_write(key, new_state.as_ref().len());
 
-            // Propagate, exactly as the V1 path does via
-            // `upsert_contract_state` → `Executor::finalize_state_commit`.
+            // Dashboard "last updated" telemetry. The V1 UPDATE path does
+            // this in `Executor::commit_state_update`; `commit_state_write`
+            // does not, so without this line a contract written only by a V2
+            // delegate shows a stale last-update timestamp forever.
+            op_manager.ring.record_contract_update(key);
+
+            // Propagate, mirroring `Executor::broadcast_state_change` (the
+            // helper the V1 commit path uses). Keep the two in step: a gate
+            // added there — the broken-invariant check below is the existing
+            // one — has to be added here as well, because these are two
+            // hand-written copies of one decision.
+            //
+            // KNOWN LIMIT, and it is the case #5467 cares about: the event is
+            // dropped downstream by `handle_broadcast_state_change`'s
+            // `Ring::should_summarize_or_broadcast` gate unless this node is
+            // hosting the contract or it is `contract_in_use` — and a DELEGATE
+            // subscription is neither (`ring::hosting::contract_in_use` counts
+            // client subscriptions and downstream subscribers only). So a
+            // contract this node holds ONLY because a delegate wrote it still
+            // does not propagate. Making a delegate subscription register
+            // demand is #4669 and is a hosting-invariants decision, not
+            // something to smuggle into a propagation fix.
+            //
+            // Not registered with `ring::broadcast_coverage` — see the
+            // residual list in that module, which this path is named in.
             if op_manager.ring.is_contract_broken(key) {
                 tracing::debug!(
                     contract = %key,
@@ -3071,13 +3113,26 @@ mod state_write_attribution_pin_tests {
              {installs}. A second installer is a copy-paste twin waiting to \
              drift — extend the shared one instead."
         );
-        let callers =
-            count_call_sites(RUNTIME_SRC, "install_v2_delegate_state_write_hooks(&mut rt");
+        // Both constructors must call it, AND must pass the op_manager
+        // through. `install_v2_delegate_state_write_hooks(&mut rt, &store,
+        // None)` would compile, disable network propagation on every
+        // production node, and leave every unit test and every pin above
+        // green — only the 3-node E2E would notice. Pin the argument, not
+        // just the call.
+        let callers = count_call_sites(
+            RUNTIME_SRC,
+            "install_v2_delegate_state_write_hooks(&mut rt, &state_store, op_manager.clone())",
+        ) + count_call_sites(
+            RUNTIME_SRC,
+            "install_v2_delegate_state_write_hooks(&mut rt, &shared_state_store, \
+             op_manager.clone())",
+        );
         assert_eq!(
             callers, 2,
             "expected both executor constructors (`from_config` and \
              `from_config_with_shared_modules`) to call \
-             install_v2_delegate_state_write_hooks; found {callers} call sites."
+             install_v2_delegate_state_write_hooks WITH `op_manager.clone()`; \
+             found {callers} matching call sites."
         );
 
         // And the one callback must still do all three legs. Anchored on API

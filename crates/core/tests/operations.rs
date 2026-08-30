@@ -4275,11 +4275,20 @@ mod v2_delegate_messages {
 /// set up. "node-b saw the state" was true and did not establish "the write
 /// propagated" — the assertion was measuring the wrong thing.
 ///
-/// Once interests are exchanged and summaries agree, anti-entropy does not fire
-/// again until `INTEREST_HEARTBEAT_INTERVAL` (300s,
-/// `crates/core/src/ring/interest.rs:73`). Quiescing first and asserting well
-/// inside that window leaves the write's own broadcast as the only route by
-/// which node-b can learn the new state.
+/// Quiescing first removes the heal that step 2 triggers, which is what made
+/// the earlier version pass. It does NOT make the isolation absolute, and the
+/// first wording of this comment claimed it did. The interest heartbeat is a
+/// FREE-RUNNING periodic timer with a random phase (`ring.rs`: a 15-45s initial
+/// delay, then `interval(INTEREST_HEARTBEAT_INTERVAL)` = 300s), not a timer the
+/// interest exchange restarts — so quiescence establishes that node-b is
+/// currently silent, not that the next periodic round is far away. A round
+/// landing inside the assertion window would heal node-b and the test would
+/// pass on unfixed code again.
+///
+/// So the window is kept SHORT rather than merely shorter than 300s: the fixed
+/// path delivers in about a second, so a 15s deadline costs nothing and leaves
+/// only a small residual chance of overlapping a periodic round. That residual
+/// is stated rather than denied.
 #[freenet_test(
     health_check_readiness = true,
     nodes = ["gateway", "node-a", "node-b"],
@@ -4396,15 +4405,27 @@ async fn test_v2_delegate_update_propagates_to_second_peer(ctx: &mut TestContext
             },
         ))
         .await?;
-    match timeout(Duration::from_secs(30), client_a.recv()).await?? {
-        HostResponse::DelegateResponse { key, .. } => {
-            ensure!(key == delegate_key, "delegate key mismatch on register");
+    // Drain-and-ignore, like every other phase of this test. `client_a` did
+    // `make_put(.., subscribe = true)`, so it holds a client subscription and
+    // can be handed an `UpdateNotification` at any point; a strict single
+    // `recv()` here would bail on one with a message blaming the register.
+    let mut registered = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !registered && std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(5), client_a.recv()).await {
+            Ok(Ok(HostResponse::DelegateResponse { key, .. })) => {
+                ensure!(key == delegate_key, "delegate key mismatch on register");
+                registered = true;
+            }
+            Ok(Ok(other)) => tracing::debug!(?other, "node-a: ignoring while registering"),
+            Ok(Err(e)) => bail!("node-a: websocket error awaiting register: {e}"),
+            Err(_) => {}
         }
-        other @ HostResponse::ContractResponse(_)
-        | other @ HostResponse::QueryResponse(_)
-        | other @ HostResponse::Ok
-        | other => bail!("unexpected register response: {other:?}"),
     }
+    ensure!(
+        registered,
+        "node-a: no DelegateResponse to RegisterDelegate in 30s"
+    );
 
     let contract_id_bytes: [u8; 32] = contract_id
         .as_bytes()
@@ -4427,32 +4448,39 @@ async fn test_v2_delegate_update_propagates_to_second_peer(ctx: &mut TestContext
         ))
         .await?;
 
-    match timeout(Duration::from_secs(60), client_a.recv()).await?? {
-        HostResponse::DelegateResponse { key, values } => {
-            ensure!(key == delegate_key, "delegate key mismatch on UPDATE");
-            let outcome = values
-                .iter()
-                .find_map(|v| {
-                    if let OutboundDelegateMsg::ApplicationMessage(msg) = v {
-                        bincode::deserialize::<OutboundAppMessage>(&msg.payload).ok()
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| anyhow::anyhow!("no ApplicationMessage in delegate response"))?;
-            match outcome {
-                OutboundAppMessage::Success { .. } => {}
-                other @ OutboundAppMessage::ContractState { .. }
-                | other @ OutboundAppMessage::ContractNotFound { .. }
-                | other @ OutboundAppMessage::Failed { .. } => {
-                    bail!("V2 delegate update_contract_state failed: {other:?}")
-                }
+    // Drain-and-ignore, for the same reason as the register step above.
+    let mut delegate_values = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while delegate_values.is_none() && std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(5), client_a.recv()).await {
+            Ok(Ok(HostResponse::DelegateResponse { key, values })) => {
+                ensure!(key == delegate_key, "delegate key mismatch on UPDATE");
+                delegate_values = Some(values);
             }
+            Ok(Ok(other)) => tracing::debug!(?other, "node-a: ignoring while awaiting delegate"),
+            Ok(Err(e)) => bail!("node-a: websocket error awaiting delegate response: {e}"),
+            Err(_) => {}
         }
-        other @ HostResponse::ContractResponse(_)
-        | other @ HostResponse::QueryResponse(_)
-        | other @ HostResponse::Ok
-        | other => bail!("unexpected delegate UPDATE response: {other:?}"),
+    }
+    let values =
+        delegate_values.ok_or_else(|| anyhow::anyhow!("no delegate UPDATE response in 60s"))?;
+    let outcome = values
+        .iter()
+        .find_map(|v| {
+            if let OutboundDelegateMsg::ApplicationMessage(msg) = v {
+                bincode::deserialize::<OutboundAppMessage>(&msg.payload).ok()
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| anyhow::anyhow!("no ApplicationMessage in delegate response"))?;
+    match outcome {
+        OutboundAppMessage::Success { .. } => {}
+        other @ OutboundAppMessage::ContractState { .. }
+        | other @ OutboundAppMessage::ContractNotFound { .. }
+        | other @ OutboundAppMessage::Failed { .. } => {
+            bail!("V2 delegate update_contract_state failed: {other:?}")
+        }
     }
 
     // --- 5. THE ASSERTION: node-b sees the write --------------------------
@@ -4460,12 +4488,14 @@ async fn test_v2_delegate_update_propagates_to_second_peer(ctx: &mut TestContext
     // that distinguishes a write the network learned about from one it did
     // not — and it only does so because of the quiescence in step 3.
     //
-    // The window is deliberately far shorter than INTEREST_HEARTBEAT_INTERVAL
-    // (300s): if it were longer, the periodic anti-entropy round could supply
-    // the state and the assertion would stop measuring propagation again.
+    // Kept SHORT on purpose. The fixed path delivers in about a second; a
+    // longer window buys nothing and only widens the chance of overlapping a
+    // free-running interest-heartbeat round, which would heal node-b and make
+    // this pass on unfixed code — the exact failure the quiescence above is
+    // there to remove. See the doc comment.
     let expected: test_utils::TodoList = serde_json::from_slice(&updated_state)?;
     let mut notified = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while !notified && std::time::Instant::now() < deadline {
         match timeout(Duration::from_secs(5), client_b.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
