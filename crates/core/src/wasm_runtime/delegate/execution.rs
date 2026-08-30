@@ -136,6 +136,7 @@ impl Runtime {
                 self.state_store_db.clone(),
                 self.state_write_callback.clone(),
                 self.state_admit_callback.clone(),
+                self.delegate_subscribe_callback.clone(),
                 delegate_key.clone(),
                 &mut self.delegate_store,
                 0, // creation_depth: always 0 for top-level calls

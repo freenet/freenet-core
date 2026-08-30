@@ -523,6 +523,17 @@ impl ContractStore {
         self.key_to_code_part.remove(key.id());
 
         // Clean up any delegate subscriptions for this contract instance.
+        //
+        // Only the notification hook is cleared here. The matching DEMAND
+        // registration (#4669 part 1, `contract::delegate_demand`) is NOT
+        // dropped from this site, deliberately: `wasm_runtime` is independent
+        // of `ring` and has no `OpManager` to reach, and it does not need one.
+        // A delegate's demand makes `contract_in_use` true, so this contract
+        // can only reach removal via the subscriber-primary eviction's
+        // in-use branch, and `HostingManager::teardown_evicted_in_use_contract`
+        // clears `client_subscriptions[key.id()]` wholesale BEFORE the
+        // reclamation funnel calls in here. By the time this runs, the demand
+        // record is already gone.
         super::DELEGATE_SUBSCRIPTIONS.remove(key.id());
 
         // The WASM blob on disk is keyed by code hash and shared by every

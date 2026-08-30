@@ -1008,6 +1008,32 @@ pub type StateAdmitCallback = Arc<
         + 'static,
 >;
 
+/// Demand registration for a V2 delegate `subscribe_contract()` call (#4669
+/// part 1 / #5467 Phase 1).
+///
+/// The V2 host function runs SYNCHRONOUSLY inside the WASM call, so it cannot
+/// await and cannot reach the ring directly — `wasm_runtime` is deliberately
+/// independent of `ring` (which lives in `crates/core/src/ring.rs`). This is
+/// the same trait-object plumbing [`StateWriteCallback`] and
+/// [`StateAdmitCallback`] use for the same reason.
+///
+/// Invoked with `(delegate_key, contract_key)` AFTER the contract has been
+/// resolved and the `(contract, delegate)` pair recorded in
+/// `DELEGATE_SUBSCRIPTIONS`. The closure SHOULD delegate to
+/// `contract::delegate_demand::register_subscription`, which registers the
+/// delegate as a local client subscriber so the subscription actually counts as
+/// demand. Without it, a V2 delegate subscribe is a passive notification hook
+/// that never sets `contract_in_use` — the #4669 defect.
+///
+/// Registration is a pure in-memory `DashMap` insert (no I/O, no await), so
+/// calling it on the WASM call stack is safe.
+pub type DelegateSubscribeCallback = Arc<
+    dyn Fn(&freenet_stdlib::prelude::DelegateKey, &freenet_stdlib::prelude::ContractKey)
+        + Send
+        + Sync
+        + 'static,
+>;
+
 pub struct Runtime {
     /// The WASM engine backend (wasmtime).
     pub(super) engine: Engine,
@@ -1054,6 +1080,12 @@ pub struct Runtime {
     /// present it runs BEFORE the raw `Storage` write and can abort it. See
     /// [`StateAdmitCallback`].
     pub(crate) state_admit_callback: Option<StateAdmitCallback>,
+
+    /// Optional demand registration for V2 delegate `subscribe_contract()`
+    /// calls (#4669 part 1). Without it a V2 delegate subscribe registers only
+    /// the notification hook and never counts as demand. See
+    /// [`DelegateSubscribeCallback`].
+    pub(crate) delegate_subscribe_callback: Option<DelegateSubscribeCallback>,
 }
 
 impl Runtime {
@@ -1086,6 +1118,14 @@ impl Runtime {
     /// aggregate disk budget.
     pub fn set_state_admit_callback(&mut self, cb: StateAdmitCallback) {
         self.state_admit_callback = Some(cb);
+    }
+
+    /// Install the demand registration invoked after a V2 delegate
+    /// `subscribe_contract()` call. See [`DelegateSubscribeCallback`]. Without
+    /// it, a V2 delegate subscription never sets `contract_in_use` and the pin
+    /// silently does not take (#4669).
+    pub fn set_delegate_subscribe_callback(&mut self, cb: DelegateSubscribeCallback) {
+        self.delegate_subscribe_callback = Some(cb);
     }
 
     /// Export every secret under `scope` from this runtime's secrets store into
@@ -1246,6 +1286,7 @@ impl Runtime {
             state_store_db: None,
             state_write_callback: None,
             state_admit_callback: None,
+            delegate_subscribe_callback: None,
         })
     }
 
@@ -1315,6 +1356,7 @@ impl Runtime {
             state_store_db: None,
             state_write_callback: None,
             state_admit_callback: None,
+            delegate_subscribe_callback: None,
         })
     }
 

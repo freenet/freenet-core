@@ -2435,6 +2435,23 @@ where
                     // Receiver is gone; clean up all subscriptions for this contract
                     // to prevent repeated failed sends on future state updates.
                     crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&instance_id);
+                    // Drop the matching DEMAND registrations too (#4669 part 1).
+                    // A delegate that can no longer be notified is no longer
+                    // holding useful interest, and leaving its demand behind
+                    // would pin the contract with nothing able to consume the
+                    // updates. Every delegate in the snapshot is covered — the
+                    // ones already sent to as well as the remainder — because
+                    // the registry entry they all came from has just been
+                    // removed wholesale.
+                    if let Some(op_manager) = &self.op_manager {
+                        for delegate_key in &subscribers {
+                            crate::contract::delegate_demand::drop_subscription(
+                                op_manager,
+                                delegate_key,
+                                &instance_id,
+                            );
+                        }
+                    }
                     return;
                 }
             }

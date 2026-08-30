@@ -419,6 +419,28 @@ impl Executor<Runtime> {
                 },
             ));
         }
+        // Demand registration for V2 delegate `subscribe_contract()` (#4669
+        // part 1 / #5467 Phase 1). The V2 host function runs synchronously
+        // inside the WASM call and only records a notification hook in
+        // `DELEGATE_SUBSCRIPTIONS`, which nothing in `ring/` reads — so without
+        // this callback a V2 delegate subscription never sets
+        // `contract_in_use`, never enters `contracts_needing_renewal()`, and
+        // never raises the contract's eviction tier. The V1 path registers the
+        // same demand directly (`contract.rs`, `SubscribeContractRequest` arm);
+        // both converge on `delegate_demand::register_subscription` so the two
+        // paths cannot drift.
+        let op_manager_for_subscribe = op_manager.clone();
+        if let Some(op_manager) = op_manager_for_subscribe {
+            rt.set_delegate_subscribe_callback(Arc::new(
+                move |delegate: &freenet_stdlib::prelude::DelegateKey, key: &ContractKey| {
+                    crate::contract::delegate_demand::register_subscription(
+                        &op_manager,
+                        delegate,
+                        key,
+                    );
+                },
+            ));
+        }
         Executor::new(
             state_store,
             move || {
@@ -564,6 +586,28 @@ impl Executor<Runtime> {
                         op_manager.ring.admit_state_write(key, state_size)
                     };
                     result.map_err(|over| over.to_string())
+                },
+            ));
+        }
+        // Demand registration for V2 delegate `subscribe_contract()` (#4669
+        // part 1 / #5467 Phase 1). The V2 host function runs synchronously
+        // inside the WASM call and only records a notification hook in
+        // `DELEGATE_SUBSCRIPTIONS`, which nothing in `ring/` reads — so without
+        // this callback a V2 delegate subscription never sets
+        // `contract_in_use`, never enters `contracts_needing_renewal()`, and
+        // never raises the contract's eviction tier. The V1 path registers the
+        // same demand directly (`contract.rs`, `SubscribeContractRequest` arm);
+        // both converge on `delegate_demand::register_subscription` so the two
+        // paths cannot drift.
+        let op_manager_for_subscribe = op_manager.clone();
+        if let Some(op_manager) = op_manager_for_subscribe {
+            rt.set_delegate_subscribe_callback(Arc::new(
+                move |delegate: &freenet_stdlib::prelude::DelegateKey, key: &ContractKey| {
+                    crate::contract::delegate_demand::register_subscription(
+                        &op_manager,
+                        delegate,
+                        key,
+                    );
                 },
             ));
         }

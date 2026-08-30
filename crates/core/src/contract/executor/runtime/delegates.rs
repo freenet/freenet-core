@@ -418,6 +418,18 @@ impl Executor<Runtime> {
                     !subscribers.is_empty()
                 });
 
+                // Drop the matching DEMAND registrations (#4669 part 1). The
+                // retain above clears only the notification hook; the demand
+                // this delegate holds in the ring's client-subscription map is
+                // a separate record, and leaving it behind would pin every
+                // contract the delegate ever subscribed to for the life of the
+                // process — a permanent, un-collapsible lease. Mirrors the
+                // WebSocket disconnect path in `client_events.rs`, including
+                // its upstream-collapse decision.
+                if let Some(op_manager) = &self.op_manager {
+                    crate::contract::delegate_demand::drop_delegate_demand(op_manager, &key);
+                }
+
                 // Clean up delegate creation tracking to prevent unbounded growth
                 self.runtime.inherited_origins.remove(&key);
 
