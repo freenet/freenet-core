@@ -2640,6 +2640,137 @@ mod tests {
         );
     }
 
+    /// Drive ONE delegate entry point with a guest that never returns, under a
+    /// SHORT wall clock and a deliberately LONG epoch deadline, and assert it
+    /// still comes back promptly.
+    ///
+    /// The two deadlines are separated on purpose — a 0.5s wall clock against a
+    /// ~10s epoch budget — so only ONE mechanism can possibly return the call.
+    /// Before #5480 the delegate entries ran `block_on_async` directly on the
+    /// caller's thread and had NO wall-clock backstop, so this would hang until
+    /// the epoch fired; and #4864 exists because the epoch ticker thread dying
+    /// is a real scenario, which left delegates with no preemption at all.
+    ///
+    /// The epoch budget is long but FINITE on purpose: `spawn_blocking` closures
+    /// cannot be cancelled, so the abandoned guest thread outlives this call
+    /// (exactly as it already does for contracts). A finite epoch deadline means
+    /// it still terminates instead of spinning for the life of the test binary.
+    fn assert_delegate_entry_has_wall_clock_backstop(async_imports: bool) {
+        let config = RuntimeConfig {
+            enable_metering: false,
+            ..RuntimeConfig::default()
+        };
+        let mut engine = WasmtimeEngine::new(&config, false).expect("engine must build");
+        engine.max_execution_seconds = 0.5;
+        // ~10s of ticks: far beyond the wall clock, so a prompt return CANNOT
+        // be the epoch trap.
+        engine.epoch_deadline_ticks = 100;
+
+        const ID: i64 = 4242;
+        // Instantiate directly into the engine's own store so the entry point
+        // finds the instance, without needing the `__frnt_set_id` / memory
+        // exports that `create_instance` requires of a real contract.
+        let store = engine.store.as_mut().expect("engine store present");
+        let eng = store.engine().clone();
+        let module = Module::new(&eng, INFINITE_LOOP_WAT.as_bytes()).expect("WAT must compile");
+        let instance = block_on_async(Linker::new(&eng).instantiate_async(&mut *store, &module))
+            .expect("instantiation must succeed");
+        engine.instances.insert(ID, instance);
+
+        let handle = InstanceHandle { id: ID };
+        let entry = if async_imports {
+            "call_3i64_async_imports"
+        } else {
+            "call_3i64"
+        };
+        let start = std::time::Instant::now();
+        let result = if async_imports {
+            engine.call_3i64_async_imports(&handle, "spin", 0, 0, 0)
+        } else {
+            engine.call_3i64(&handle, "spin", 0, 0, 0)
+        };
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("a guest that never returns must not return Ok");
+        assert!(
+            matches!(err, WasmError::Timeout),
+            "`{entry}`: the wall-clock backstop must surface as WasmError::Timeout, got {err:?}"
+        );
+        // 5s is comfortably above the 0.5s wall clock and comfortably below the
+        // ~10s epoch budget, so a pass here can ONLY be the wall-clock backstop.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "`{entry}` took {elapsed:?}: the 0.5s wall-clock backstop did not fire, and the \
+             epoch budget (~10s) is too far out to have returned this (#5480)"
+        );
+    }
+
+    /// REGRESSION (#5480): the V1 delegate entry must have the wall-clock
+    /// backstop that contract execution already had.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_v1_entry_has_wall_clock_backstop() {
+        assert_delegate_entry_has_wall_clock_backstop(false);
+    }
+
+    /// REGRESSION (#5480): same for the V2 delegate entry, which additionally
+    /// has the larger async host-function surface.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_v2_entry_has_wall_clock_backstop() {
+        assert_delegate_entry_has_wall_clock_backstop(true);
+    }
+
+    /// WAT whose exported entry immediately calls an imported host function.
+    /// Paired below with a linker that panics inside that import, this is a
+    /// HOST-side panic during delegate execution — which is the case #5480
+    /// actually covers, since a WASM trap (unreachable, OOB, div-by-zero) is
+    /// already an `Err` and never a Rust panic.
+    const HOST_PANIC_WAT: &str = r#"
+        (module
+          (import "freenet_test" "boom" (func $boom))
+          (func (export "process") (param i64 i64 i64) (result i64)
+            (call $boom)
+            (i64.const 0)))
+    "#;
+
+    /// REGRESSION (#5480): a panic in a host function called during delegate
+    /// execution must come back as an `Err`, not unwind into the calling task.
+    /// There is no `catch_unwind` on the delegate path; the capture comes
+    /// entirely from routing through `execute_wasm_blocking`, whose
+    /// `spawn_blocking` join turns a panic into `BlockingResult::Panic`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_entry_captures_host_panic() {
+        let config = RuntimeConfig {
+            enable_metering: false,
+            ..RuntimeConfig::default()
+        };
+        let mut engine = WasmtimeEngine::new(&config, false).expect("engine must build");
+
+        const ID: i64 = 4343;
+        let store = engine.store.as_mut().expect("engine store present");
+        let eng = store.engine().clone();
+        let module = Module::new(&eng, HOST_PANIC_WAT.as_bytes()).expect("WAT must compile");
+        let mut linker: Linker<HostState> = Linker::new(&eng);
+        linker
+            .func_wrap("freenet_test", "boom", |_: Caller<'_, HostState>| {
+                // Trailing semicolon so the closure's block types as `()` rather
+                // than `!`, which wasmtime's `IntoFunc` cannot resolve.
+                panic!("deliberate host-function panic (#5480 panic-capture test)");
+            })
+            .expect("registering the panicking host fn must succeed");
+        let instance = block_on_async(linker.instantiate_async(&mut *store, &module))
+            .expect("instantiation must succeed");
+        engine.instances.insert(ID, instance);
+
+        let handle = InstanceHandle { id: ID };
+        let err = engine
+            .call_3i64(&handle, "process", 0, 0, 0)
+            .expect_err("a host panic must surface as an Err, not unwind into the caller");
+        assert!(
+            matches!(err, WasmError::Other(_)),
+            "a captured panic must surface as WasmError::Other, got {err:?}"
+        );
+    }
+
     /// #4864 review (fix 3): `epoch_deadline_ticks` = `ceil(secs / 100ms) + 1`,
     /// the `+ 1` a phase-safety margin so a free-running ticker never traps a
     /// guest EARLY. Boundary cases.
@@ -2804,12 +2935,17 @@ mod tests {
             .find(fn_name)
             .unwrap_or_else(|| panic!("method `{fn_name}` not found"));
         let rest = &src[start + fn_name.len()..];
-        let end = ["\n    fn ", "\n    pub(crate) fn ", "\n    pub(super) fn ", "\n}"]
-            .iter()
-            .filter_map(|needle| rest.find(needle))
-            .min()
-            .map(|off| start + fn_name.len() + off)
-            .unwrap_or(src.len());
+        let end = [
+            "\n    fn ",
+            "\n    pub(crate) fn ",
+            "\n    pub(super) fn ",
+            "\n}",
+        ]
+        .iter()
+        .filter_map(|needle| rest.find(needle))
+        .min()
+        .map(|off| start + fn_name.len() + off)
+        .unwrap_or(src.len());
         &src[start..end]
     }
 
@@ -3054,9 +3190,9 @@ mod tests {
         // actually runs the guest, i.e. INSIDE the same closure. Installed
         // outside it, it lands on the caller's thread and every delegate host
         // function reads the default -1.
-        let install = body.find("GuestDelegateInstance::install").unwrap_or_else(|| {
-            panic!("`{fn_name}` must install the delegate instance id (#5480)")
-        });
+        let install = body
+            .find("GuestDelegateInstance::install")
+            .unwrap_or_else(|| panic!("`{fn_name}` must install the delegate instance id (#5480)"));
         assert!(
             install > ewb,
             "`{fn_name}`: GuestDelegateInstance::install must be INSIDE the \
