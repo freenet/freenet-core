@@ -5306,6 +5306,41 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
     Ok(gateways)
 }
 
+/// Test-only: build a `ConfigArgs` rooted at `dir` in the given mode, ready to
+/// `build()` into a real `Config` whose data dir is `dir`.
+///
+/// Lives at module level rather than inside `mod tests` so the event-log tests
+/// in `tracing::aof` and `node` can share one definition of "a config that
+/// builds" with the `#[cfg(test)]` config tests here — the three modules must
+/// agree on the shape or they stop testing the same thing.
+#[cfg(test)]
+pub(crate) fn event_log_test_args(dir: &std::path::Path, mode: OperationMode) -> ConfigArgs {
+    ConfigArgs {
+        mode: Some(mode),
+        // A non-gateway network node with no gateways is rejected by
+        // `build()`, so the network-mode cases build as a gateway. That is
+        // the realistic shape anyway: a gateway IS a network-mode node, and
+        // it is exactly the kind of node we operate and want the log on.
+        network_api: {
+            let is_network = matches!(mode, OperationMode::Network);
+            NetworkArgs {
+                is_gateway: is_network,
+                // A gateway must declare a public address.
+                public_address: is_network.then(|| "203.0.113.1".parse().unwrap()),
+                public_port: is_network.then_some(31337),
+                skip_load_from_network: true,
+                ..Default::default()
+            }
+        },
+        config_paths: ConfigPathsArgs {
+            config_dir: Some(dir.to_path_buf()),
+            data_dir: Some(dir.to_path_buf()),
+            log_dir: Some(dir.to_path_buf()),
+        },
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use httptest::{Expectation, Server, matchers::*, responders::*};
@@ -6620,30 +6655,7 @@ shutdown-drain-secs = 42
     /// Build a `ConfigArgs` rooted at `dir` in the given mode. Shared by the
     /// #4968 event-log default tests so each case differs only in what it sets.
     fn event_log_args(dir: &std::path::Path, mode: OperationMode) -> ConfigArgs {
-        ConfigArgs {
-            mode: Some(mode),
-            // A non-gateway network node with no gateways is rejected by
-            // `build()`, so the network-mode cases build as a gateway. That is
-            // the realistic shape anyway: a gateway IS a network-mode node, and
-            // it is exactly the kind of node we operate and want the log on.
-            network_api: {
-                let is_network = matches!(mode, OperationMode::Network);
-                NetworkArgs {
-                    is_gateway: is_network,
-                    // A gateway must declare a public address.
-                    public_address: is_network.then(|| "203.0.113.1".parse().unwrap()),
-                    public_port: is_network.then_some(31337),
-                    skip_load_from_network: true,
-                    ..Default::default()
-                }
-            },
-            config_paths: ConfigPathsArgs {
-                config_dir: Some(dir.to_path_buf()),
-                data_dir: Some(dir.to_path_buf()),
-                log_dir: Some(dir.to_path_buf()),
-            },
-            ..Default::default()
-        }
+        super::event_log_test_args(dir, mode)
     }
 
     /// #4968: a network-mode node (what end users run) must NOT write the local

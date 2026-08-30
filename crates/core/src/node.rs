@@ -507,6 +507,47 @@ impl NodeConfig {
     pub async fn new(config: Config) -> anyhow::Result<NodeConfig> {
         tracing::info!("Loading node configuration for mode {}", config.mode);
 
+        // Reclaim `_EVENT_LOG` segments written by an earlier release, now that
+        // the diagnostic event log is off by default on network nodes (#5035).
+        // No-ops (and logs nothing) unless there is something to remove, so
+        // every startup after the first is silent. The guards live in
+        // `reclaim_orphaned_event_log`: it refuses to touch anything while the
+        // log is enabled, and never sweeps the Local-mode `_EVENT_LOG_LOCAL`
+        // that `fdev verify-state` reads.
+        //
+        // Placed here rather than beside the `event_log_enabled()` gate in
+        // `build_with_flush_handle` because this is the first thing `freenet
+        // network` does with a fully-resolved `Config` (`run_network` ->
+        // `NodeConfig::new`), and unlike a full node build it is cheap enough
+        // to drive from a unit test — so the wiring is pinned by behaviour
+        // rather than by a source scrape.
+        // Audited 2026-08-30, every `NodeConfig::new` call site in the
+        // workspace: `bin/freenet.rs` (`run_network`) is the only caller on the
+        // REAL-NODE STARTUP PATH, so it is the only way this sweep reaches a
+        // real data dir.
+        //
+        // Every other caller is safe, but NOT for the reason an earlier draft
+        // of this comment gave. It said they are all `#[cfg(test)]` fixtures or
+        // the `#[freenet_test]` harness, and that all of them get a temp data
+        // dir from `ConfigPathsArgs::default_dirs`. Neither half is true, so do
+        // not re-derive safety from it: `node/testing_impl.rs` and `test_utils`
+        // are NOT cfg-gated (they compile into release builds), the
+        // `crates/core/tests/*` integration tests are neither fixtures nor the
+        // harness, and none of those reach `default_dirs` at all.
+        //
+        // The invariant that actually holds, checked caller by caller, is that
+        // each non-`run_network` caller trips at least one of:
+        //   - an explicit `tempfile` data dir — the `#[freenet_test]` harness
+        //     (`freenet-macros/src/codegen.rs`) and every `crates/core/tests/*`
+        //     integration test set one directly;
+        //   - `mode: Local`, which the Network-mode guard refuses —
+        //     `node/testing_impl.rs`;
+        //   - `enable_event_log: Some(true)`, which the enabled guard refuses —
+        //     also the `#[freenet_test]` harness.
+        // If you add a caller that starts a real node, re-check that it should
+        // be deleting files before it does.
+        crate::tracing::reclaim_orphaned_event_log(&config);
+
         // Get our own public key to filter out self-connections
         let own_pub_key = config.transport_keypair().public();
 
@@ -14149,5 +14190,78 @@ mod tests {
             DigestVerdict::PeerHasNoState,
             "neither side holds state: nothing to exchange, nothing to heal"
         );
+    }
+
+    /// #5035: the orphaned-`_EVENT_LOG`-segment reclaim must actually be wired
+    /// into node startup, and must respect the enabled/disabled decision there.
+    ///
+    /// These drive the real startup entry point (`NodeConfig::new`, what
+    /// `freenet network` calls) rather than the reclaim helper directly, so
+    /// deleting the call from `NodeConfig::new` turns them red. Six PRs in this
+    /// disk-usage series shipped tests that passed with the production call
+    /// site removed; this is the check that catches that.
+    mod event_log_reclaim_wiring {
+        use super::*;
+        use crate::contract::OperationMode;
+
+        fn seed_segments(dir: &std::path::Path) {
+            for name in ["_EVENT_LOG.0000000000", "_EVENT_LOG.0000000001"] {
+                std::fs::write(dir.join(name), vec![b'x'; 4_096]).expect("seed segment");
+            }
+        }
+
+        fn segments_present(dir: &std::path::Path) -> usize {
+            ["_EVENT_LOG.0000000000", "_EVENT_LOG.0000000001"]
+                .iter()
+                .filter(|name| dir.join(name).exists())
+                .count()
+        }
+
+        #[tokio::test]
+        async fn node_startup_reclaims_orphaned_segments_when_log_disabled() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let dir = temp_dir.path();
+            let config = crate::config::event_log_test_args(dir, OperationMode::Network)
+                .build()
+                .await
+                .expect("build Config");
+            assert!(
+                !config.event_log_enabled(),
+                "precondition: network mode defaults the event log OFF (#4968)"
+            );
+            // Seeded after `build()` because that is what creates the data dir.
+            seed_segments(dir);
+            assert_eq!(segments_present(dir), 2, "precondition: segments on disk");
+
+            NodeConfig::new(config).await.expect("build NodeConfig");
+
+            assert_eq!(
+                segments_present(dir),
+                0,
+                "node startup must reclaim orphaned `_EVENT_LOG` segments when the \
+                 event log is disabled (#5035) — if this fails, the reclaim is no \
+                 longer wired into `NodeConfig::new`"
+            );
+        }
+
+        #[tokio::test]
+        async fn node_startup_keeps_segments_when_log_enabled() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let dir = temp_dir.path();
+            let mut args = crate::config::event_log_test_args(dir, OperationMode::Network);
+            args.enable_event_log = Some(true);
+            let config = args.build().await.expect("build Config");
+            assert!(config.event_log_enabled(), "precondition: log is ON");
+            seed_segments(dir);
+
+            NodeConfig::new(config).await.expect("build NodeConfig");
+
+            assert_eq!(
+                segments_present(dir),
+                2,
+                "an operator who enabled the event log must keep every segment \
+                 across restarts (#5035)"
+            );
+        }
     }
 }
