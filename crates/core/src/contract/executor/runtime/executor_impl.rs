@@ -598,6 +598,17 @@ where
                             }
 
                             let completion_now = now_nanos();
+                            // The state this node ends up holding. Starts as
+                            // the incoming state and advances as queued
+                            // operations replay onto it below, so the fan-out
+                            // at the end of this branch reports what was
+                            // actually installed. Before this was hoisted, the
+                            // branch fanned out the PRE-replay state AFTER each
+                            // replay had already fanned out a newer one, so the
+                            // last thing a subscriber saw was the oldest state
+                            // (harmless for peers, which CRDT-merge, but not
+                            // for a delegate handed a full state).
+                            let mut installed_state = incoming_state.clone();
                             if let Some(completion_info) = self
                                 .init_tracker
                                 .complete_initialization(&key, completion_now)
@@ -624,7 +635,6 @@ where
                                 // These were UPDATE operations that couldn't proceed while the
                                 // contract was being initialized. Now that initialization is
                                 // complete, we apply them in order to the stored state.
-                                let mut current = incoming_state.clone();
                                 for op in completion_info.queued_ops {
                                     let queue_time = ContractInitTracker::queue_wait_duration(
                                         &op,
@@ -650,7 +660,7 @@ where
                                     match self
                                         .attempt_state_update(
                                             &params,
-                                            &current,
+                                            &installed_state,
                                             &key,
                                             &replay_updates,
                                         )
@@ -669,7 +679,9 @@ where
                                                 .map(|r| r == ValidateResult::Valid)
                                                 .unwrap_or(false);
 
-                                            if valid && new_state.as_ref() != current.as_ref() {
+                                            if valid
+                                                && new_state.as_ref() != installed_state.as_ref()
+                                            {
                                                 if let Err(e) = self
                                                     .commit_state_update(&key, &params, &new_state)
                                                     .await
@@ -680,7 +692,7 @@ where
                                                         "Failed to commit replayed queued operation"
                                                     );
                                                 } else {
-                                                    current = new_state;
+                                                    installed_state = new_state;
                                                 }
                                             } else if !valid {
                                                 tracing::warn!(
@@ -708,7 +720,7 @@ where
 
                             tracing::info!(
                                 contract = %key,
-                                new_size_bytes = incoming_state.as_ref().len(),
+                                new_size_bytes = installed_state.as_ref().len(),
                                 phase = "update_complete",
                                 event = "initial_state_installed",
                                 "Contract initial state installed"
@@ -724,9 +736,16 @@ where
                             // dropped leg, after WS clients had already been
                             // the dropped leg once before). Call the helper;
                             // do not re-inline.
-                            self.finalize_state_commit(&key, &params, &incoming_state)
+                            self.finalize_state_commit(&key, &params, &installed_state)
                                 .await;
 
+                            // NOTE: the RETURN value stays `incoming_state`
+                            // rather than `installed_state` — that is
+                            // pre-existing behaviour with its own callers
+                            // (PUT-response summary), and changing it is a
+                            // separate, client-visible decision. The fan-out
+                            // above is what subscribers observe, and that is
+                            // now the state this node actually holds.
                             return Ok(UpsertResult::Updated(incoming_state));
                         }
                     }
@@ -2215,22 +2234,30 @@ where
     ///    non-blocking (#4145).
     ///
     /// This exists because the legs kept getting dropped one at a time.
-    /// Both storing paths — the initial-state install in
-    /// `bridged_upsert_contract_state_inner` and `commit_state_update`
-    /// (the merge path) — re-inlined their own subset, and the
-    /// initial-install branch omitted the WS-client leg once, then the
-    /// delegate leg (#5481), each time silently: the subscription is
-    /// still registered, the delegate is still healthy, and no error is
+    /// All FOUR storing paths — the initial-state install in
+    /// `bridged_upsert_contract_state_inner`, `commit_state_update` (the
+    /// merge path), and both branches of `contract_ops::perform_contract_put`
+    /// (the local re-PUT merge and the fresh store) — re-inlined their own
+    /// subset. The initial-install branch omitted the WS-client leg once, then
+    /// the delegate leg (#5481); both `perform_contract_put` branches omitted
+    /// the telemetry AND delegate legs. Each time silently: the subscription
+    /// is still registered, the delegate is still healthy, and no error is
     /// produced anywhere. That is the "manually-inlined originator side
     /// effects" row in `.claude/rules/bug-prevention-patterns.md`. The
     /// source-scrape pin
     /// `pool_tests::delegate_notification_tests::finalize_state_commit_is_the_only_post_store_fan_out_site`
-    /// fails if a leg leaves this helper or a second site starts calling
-    /// one directly.
+    /// scrapes BOTH files and fails if a leg leaves this helper or a second
+    /// site starts calling one directly.
     ///
     /// Every leg is best-effort: none of them can fail the commit, which
-    /// has already landed on disk by the time this runs.
-    async fn finalize_state_commit(
+    /// has already landed on disk by the time this runs. Note this is a
+    /// deliberate change for `perform_contract_put`, which previously
+    /// propagated a `send_update_notification` error as a `Put` failure —
+    /// i.e. reported a PUT as failed after its state had already been stored
+    /// and metered, over a WASM `get_state_delta` trap for some OTHER
+    /// client's subscription. The merge path has always logged and continued
+    /// in exactly that situation; this makes the two agree.
+    pub(super) async fn finalize_state_commit(
         &mut self,
         key: &ContractKey,
         parameters: &Parameters<'_>,

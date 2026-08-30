@@ -122,16 +122,11 @@ impl Executor<Runtime> {
                 op_manager.ring.commit_state_write(&key, written_bytes);
             }
 
-            self.send_update_notification(&key, &params, &new_state)
-                .await
-                .map_err(|_| {
-                    ExecutorError::request(StdContractError::Put {
-                        key,
-                        cause: "failed while sending notifications".into(),
-                    })
-                })?;
-
-            self.broadcast_state_change(key, new_state.clone()).await;
+            // Full post-store fan-out (telemetry + WS clients + subscribed
+            // delegates + network). Before #5481 this site hand-inlined two of
+            // the four legs and silently dropped the other two; see
+            // `Executor::finalize_state_commit`.
+            self.finalize_state_commit(&key, &params, &new_state).await;
 
             // Uncached WASM `summarize_state` (PUT response summary).
             if let Some(m) = self.contract_exec_metrics() {
@@ -147,16 +142,11 @@ impl Executor<Runtime> {
         self.verify_and_store_contract(state.clone(), contract, related_contracts)
             .await?;
 
-        self.send_update_notification(&key, &params, &state)
-            .await
-            .map_err(|_| {
-                ExecutorError::request(StdContractError::Put {
-                    key,
-                    cause: "failed while sending notifications".into(),
-                })
-            })?;
-
-        self.broadcast_state_change(key, state.clone()).await;
+        // Full post-store fan-out — see the sibling call above and
+        // `Executor::finalize_state_commit`. This branch is a FRESH contract
+        // install, so before #5481 it dropped the delegate leg in exactly the
+        // shape the issue describes, one file over from where it was fixed.
+        self.finalize_state_commit(&key, &params, &state).await;
 
         Ok(ContractResponse::PutResponse { key }.into())
     }

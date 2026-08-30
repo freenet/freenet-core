@@ -35,8 +35,9 @@ pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateCallEnv>> =
 /// Global registry of delegate subscriptions to contracts.
 ///
 /// When a V2 delegate calls `subscribe_contract()`, the (contract, delegate) pair is
-/// recorded here. When `commit_state_update()` persists a new contract state, it checks
-/// this registry and sends notifications to subscribed delegates.
+/// recorded here. When this node commits a new contract state,
+/// `Executor::finalize_state_commit` checks this registry and sends
+/// notifications to subscribed delegates.
 pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
     DashMap<ContractInstanceId, HashSet<DelegateKey>>,
 > = LazyLock::new(DashMap::default);
@@ -899,8 +900,9 @@ impl DelegateCallEnv {
     /// Register a subscription interest for a contract.
     ///
     /// Validates the contract is known and records the (contract, delegate) pair in
-    /// the global subscription registry. When `commit_state_update()` persists a new
-    /// state for this contract, it will send a `ContractNotification` to the delegate.
+    /// the global subscription registry. When this node commits a new state for the
+    /// contract, `Executor::finalize_state_commit` sends a `ContractNotification`
+    /// to the delegate.
     pub(super) fn subscribe_contract_sync(
         &self,
         instance_id: &ContractInstanceId,
@@ -2105,8 +2107,8 @@ pub(super) mod delegate_contracts {
     ///
     /// Validates that the contract is known (code hash resolvable) and registers
     /// subscription interest in the global `DELEGATE_SUBSCRIPTIONS` registry.
-    /// When the subscribed contract's state changes via `commit_state_update()`,
-    /// a `ContractNotification` is delivered to this delegate.
+    /// When the subscribed contract's state changes, `Executor::finalize_state_commit`
+    /// delivers a `ContractNotification` to this delegate.
     ///
     /// ## Returns
     /// - `0`: success (contract is known, subscription registered)

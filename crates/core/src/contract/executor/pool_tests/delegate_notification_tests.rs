@@ -39,7 +39,13 @@ use super::super::mock_runtime::test::create_test_contract as test_contract;
 
 /// Build a real `OpManager` backed by a temp-dir `Config`, mirroring
 /// `identical_input_probe_tests.rs::build_op_manager`.
-async fn build_op_manager(id: &str) -> (Arc<OpManager>, Box<dyn std::any::Any>) {
+async fn build_op_manager(
+    id: &str,
+) -> (
+    Arc<OpManager>,
+    crate::node::EventLoopNotificationsReceiver,
+    Box<dyn std::any::Any>,
+) {
     let config_args = ConfigArgs {
         id: Some(id.to_string()),
         mode: Some(OperationMode::Local),
@@ -70,14 +76,9 @@ async fn build_op_manager(id: &str) -> (Arc<OpManager>, Box<dyn std::any::Any>) 
     );
     op_manager.ring.attach_op_manager(&op_manager);
 
-    let guards: Box<dyn std::any::Any> = Box::new((
-        notification_rx,
-        ch_channel,
-        wait_for_event,
-        result_router_rx,
-        task_monitor,
-    ));
-    (op_manager, guards)
+    let guards: Box<dyn std::any::Any> =
+        Box::new((ch_channel, wait_for_event, result_router_rx, task_monitor));
+    (op_manager, notification_rx, guards)
 }
 
 /// Registers one delegate against one contract in the process-global
@@ -91,6 +92,7 @@ async fn build_op_manager(id: &str) -> (Arc<OpManager>, Box<dyn std::any::Any>) 
 /// the test ends.
 struct SubscriptionGuard {
     instance_id: ContractInstanceId,
+    delegate: DelegateKey,
 }
 
 impl SubscriptionGuard {
@@ -98,14 +100,27 @@ impl SubscriptionGuard {
         DELEGATE_SUBSCRIPTIONS
             .entry(instance_id)
             .or_default()
-            .insert(delegate);
-        Self { instance_id }
+            .insert(delegate.clone());
+        Self {
+            instance_id,
+            delegate,
+        }
     }
 }
 
 impl Drop for SubscriptionGuard {
     fn drop(&mut self) {
-        DELEGATE_SUBSCRIPTIONS.remove(&self.instance_id);
+        // Remove only what this guard registered, and only drop the entry once
+        // it is empty — a blanket `remove(&instance_id)` would delete another
+        // test's subscription if the keys ever collided, which is the shape
+        // `.claude/rules/testing.md` warns about for shared globals. Mirrors
+        // how production cleans up in `runtime/delegates.rs`.
+        DELEGATE_SUBSCRIPTIONS.retain(|id, subs| {
+            if id == &self.instance_id {
+                subs.remove(&self.delegate);
+            }
+            !subs.is_empty()
+        });
     }
 }
 
@@ -134,7 +149,8 @@ async fn build_executor(
 /// notification lands.
 #[tokio::test(flavor = "current_thread")]
 async fn initial_state_install_notifies_subscribed_delegates() {
-    let (op_manager, _guards) = build_op_manager("delegate-notify-install").await;
+    let (op_manager, mut notifications, _guards) =
+        build_op_manager("delegate-notify-install").await;
     let contract = test_contract(b"delegate_notify_install_contract");
     let key = contract.key();
     let state = WrappedState::new((1u8..=32).collect::<Vec<u8>>());
@@ -182,6 +198,35 @@ async fn initial_state_install_notifies_subscribed_delegates() {
         state.as_ref(),
         "notification must carry the state that was just installed"
     );
+
+    // Leg 4 of the same fan-out. This is the leg the refactor REORDERED (the
+    // install branch used to broadcast before the local notifications, and now
+    // broadcasts after), so it is the one most worth asserting behaviourally
+    // rather than trusting the source-scrape pin for.
+    let mut broadcast = None;
+    while let Ok(event) = notifications.notifications_receiver.try_recv() {
+        if let either::Either::Right(crate::message::NodeEvent::BroadcastStateChange {
+            key: broadcast_key,
+            new_state,
+            ..
+        }) = event
+        {
+            if broadcast_key == key {
+                broadcast = Some(new_state);
+                break;
+            }
+        }
+    }
+    let broadcast = broadcast.expect(
+        "the initial-state install must also emit NodeEvent::BroadcastStateChange — \
+         the delegate leg and the network leg share one fan-out site, so a \
+         regression in the helper should be visible from either end",
+    );
+    assert_eq!(
+        broadcast.as_ref(),
+        state.as_ref(),
+        "the broadcast must carry the installed state"
+    );
 }
 
 /// Control for the test above: the MERGE path has always notified
@@ -193,7 +238,7 @@ async fn initial_state_install_notifies_subscribed_delegates() {
 /// This one passes both before and after the fix.
 #[tokio::test(flavor = "current_thread")]
 async fn merge_path_notifies_subscribed_delegates() {
-    let (op_manager, _guards) = build_op_manager("delegate-notify-merge").await;
+    let (op_manager, _notifications, _guards) = build_op_manager("delegate-notify-merge").await;
     let contract = test_contract(b"delegate_notify_merge_contract");
     let key = contract.key();
     let initial = WrappedState::new((1u8..=32).collect::<Vec<u8>>());
@@ -237,6 +282,14 @@ async fn merge_path_notifies_subscribed_delegates() {
         .expect("delegate notification channel closed");
     assert_eq!(notification.delegate_key, delegate);
     assert_eq!(notification.contract_id, *key.id());
+    let delivered: &[u8] = notification.new_state.as_ref().as_ref();
+    assert_eq!(
+        delivered,
+        merged.as_ref(),
+        "the merge notification must carry the MERGED state — asserting this \
+         rules out the alternative reading that the drain above missed an \
+         install notification and this is it"
+    );
 }
 
 /// Source-scrape pin: `finalize_state_commit` must own the WHOLE post-store
@@ -256,11 +309,21 @@ async fn merge_path_notifies_subscribed_delegates() {
 #[test]
 fn finalize_state_commit_is_the_only_post_store_fan_out_site() {
     const EXECUTOR_IMPL_SRC: &str = include_str!("../runtime/executor_impl.rs");
+    // `contract_ops.rs` holds the OTHER two state-storing paths (the local
+    // re-PUT merge and the fresh store in `perform_contract_put`). Scraping
+    // only `executor_impl.rs` would have reported "exactly one call site" while
+    // two more sat one file over — a green signal certifying something it never
+    // looked at.
+    const CONTRACT_OPS_SRC: &str = include_str!("../runtime/contract_ops.rs");
 
     // Production slice only: everything before the first `#[cfg(test)]`,
-    // so this file's own siblings and any test module in executor_impl.rs
+    // so this file's own siblings and any test module in the scraped files
     // cannot satisfy or break the pin.
     let production = EXECUTOR_IMPL_SRC
+        .split("#[cfg(test)]")
+        .next()
+        .expect("split always yields at least one slice");
+    let ops_production = CONTRACT_OPS_SRC
         .split("#[cfg(test)]")
         .next()
         .expect("split always yields at least one slice");
@@ -268,12 +331,15 @@ fn finalize_state_commit_is_the_only_post_store_fan_out_site() {
     let helper_start = production
         .find("async fn finalize_state_commit(")
         .expect("finalize_state_commit must exist — it is the post-store fan-out chokepoint");
-    // The helper ends where the next `fn ` at method indentation begins.
-    let helper_end = production[helper_start..]
-        .find("\n    /// ")
-        .map(|off| helper_start + off)
-        .unwrap_or(production.len());
-    let helper = &production[helper_start..helper_end];
+    // Bound the helper by BRACE MATCHING, not by "the next doc comment".
+    // An end anchor that can silently fail to match, then widen the region to
+    // end-of-file via `unwrap_or`, is precisely the self-satisfying-pin defect
+    // recorded in `.claude/rules/bug-prevention-patterns.md` ("Self-satisfying
+    // `include_str!` source-scrape pins") — every `helper.contains(..)` below
+    // would pass vacuously and the pin would be green forever. Brace matching
+    // cannot silently widen, and the `expect` below fails loud if the shape
+    // ever changes.
+    let helper = brace_delimited_body(production, helper_start);
 
     for required in [
         "record_contract_update(",
@@ -304,15 +370,15 @@ fn finalize_state_commit_is_the_only_post_store_fan_out_site() {
         ".send_delegate_contract_notifications(",
         ".broadcast_state_change(",
     ] {
-        let count = count_call_sites(production, leg);
+        let count = count_call_sites(production, leg) + count_call_sites(ops_production, leg);
         assert_eq!(
             count, 1,
-            "expected exactly 1 `{leg}` call site in the production slice of \
-             executor_impl.rs (inside finalize_state_commit); found {count}. A \
-             state-commit path must call `finalize_state_commit` rather than \
-             re-inlining a subset of its legs — see the \
-             'manually-inlined originator side effects' row in \
-             `.claude/rules/bug-prevention-patterns.md`."
+            "expected exactly 1 `{leg}` call site across the production slices \
+             of executor_impl.rs and contract_ops.rs (inside \
+             finalize_state_commit); found {count}. A state-commit path must \
+             call `finalize_state_commit` rather than re-inlining a subset of \
+             its legs — see the 'manually-inlined originator side effects' row \
+             in `.claude/rules/bug-prevention-patterns.md`."
         );
         assert!(
             helper.contains(leg),
@@ -320,20 +386,58 @@ fn finalize_state_commit_is_the_only_post_store_fan_out_site() {
         );
     }
 
-    // And both storing paths delegate to it.
+    // And every storing path delegates to it.
     let calls = count_call_sites(production, ".finalize_state_commit(");
     assert_eq!(
         calls, 2,
-        "expected exactly 2 `self.finalize_state_commit(` call sites (the \
-         initial-state-install branch and `commit_state_update`); found \
-         {calls}. If you added a third state-storing path, that is fine — it \
-         MUST call the helper, and this expectation should be bumped with a \
-         comment naming the new path."
+        "expected exactly 2 `self.finalize_state_commit(` call sites in \
+         executor_impl.rs (the initial-state-install branch and \
+         `commit_state_update`); found {calls}."
+    );
+    let ops_calls = count_call_sites(ops_production, ".finalize_state_commit(");
+    assert_eq!(
+        ops_calls, 2,
+        "expected exactly 2 `self.finalize_state_commit(` call sites in \
+         contract_ops.rs (the re-PUT merge and the fresh store in \
+         `perform_contract_put`); found {ops_calls}. If you added another \
+         state-storing path, that is fine — it MUST call the helper, and this \
+         expectation should be bumped with a comment naming the new path."
     );
 }
 
-/// Count non-comment occurrences of `needle`, ignoring anything inside a
-/// string literal (this file's own assertion messages contain the needles).
+/// The `{ .. }` body of the item starting at `start`, brace-matched.
+///
+/// Panics if the item has no body or the braces do not balance — a pin must
+/// fail loud rather than silently widen its search region (see the
+/// self-satisfying-pin row in `.claude/rules/bug-prevention-patterns.md`).
+/// String and char literals containing braces are not handled; there are none
+/// in the scraped bodies, and a stray one would make this fail loud, not pass.
+fn brace_delimited_body(src: &str, start: usize) -> &str {
+    let open = src[start..]
+        .find('{')
+        .map(|off| start + off)
+        .expect("the scraped item must have a body");
+    let mut depth = 0usize;
+    for (idx, ch) in src[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[start..open + idx + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces while scraping the item body starting at {start}");
+}
+
+/// Count `needle` occurrences, one per matching LINE (two calls on one line
+/// count once — rustfmt does not produce that shape here, and the assertions
+/// below would fail loud rather than pass if it ever did). Whole-line `//`
+/// comments and the contents of string literals are skipped, so the scraped
+/// file's own prose and log messages cannot satisfy a pin.
 fn count_call_sites(src: &str, needle: &str) -> usize {
     src.lines()
         .filter(|line| {
