@@ -308,6 +308,14 @@ pub(super) type InstanceId = i64;
 /// guest-supplied parameter and look it up in these same maps. Do not read the
 /// paragraph above as "every id reaching these maps was issued here".
 ///
+/// Nor is it a type-level guarantee. `InstanceHandle.id` is `pub(super)`, so
+/// anything inside `wasm_runtime` can still construct a handle with a chosen id
+/// and hand it to `drop_instance`; `delegate/test.rs` does exactly that twice,
+/// harmlessly, because `process_outbound` binds the handle as `_handle` and
+/// never touches these maps. What the signature closes is the `create_instance`
+/// parameter, which is where every id that actually reached these maps came
+/// from.
+///
 /// Regression this shape prevents (#4213 / #5023): `create_instance` used to
 /// take a caller-supplied id, and the engine unit tests passed hand-picked ones
 /// (`0..10_001`, `0..STORE_REFRESH_THRESHOLD`, `999`, ...). Their
