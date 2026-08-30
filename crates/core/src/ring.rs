@@ -4806,36 +4806,6 @@ impl Ring {
     /// cost. Per-contract attribution lets the shared governance
     /// outlier-detection module (`crate::governance`) score contracts
     /// against the network's observed cost-per-benefit distribution.
-    /// Attribute resource usage to a DELEGATE (#5467 Phase 0).
-    ///
-    /// Sibling of [`Self::report_contract_resource_usage`], writing under
-    /// `AttributionSource::Delegate` — an existing variant that shares the
-    /// meter's `MAX_ATTRIBUTION_SOURCES` cap and `ATTRIBUTION_SOURCE_TTL`
-    /// sweep, so this adds no new unbounded state.
-    ///
-    /// Deliberately does NOT feed `governance.ingest_cost`, unlike the contract
-    /// form. Governance's cost/benefit scoring drives bans, and #4903's own
-    /// notes say a future governance-on must use benefit-aware normalization
-    /// rather than raw axes (the #4296 "popular contract banned for being
-    /// popular" shape). A delegate that is busy because its user is busy would
-    /// be indistinguishable from one that spins, and #5467 is explicit that a
-    /// false positive here costs more than a false negative. Phase 0 is
-    /// measurement only; nothing reads this to make a decision.
-    pub(crate) fn report_delegate_resource_usage(
-        &self,
-        delegate: &freenet_stdlib::prelude::DelegateKey,
-        resource: crate::topology::meter::ResourceType,
-        amount: f64,
-    ) {
-        let source = crate::topology::meter::AttributionSource::Delegate(delegate.clone());
-        let mut topo = self.connection_manager.topology_manager.write();
-        // Read `now` under the lock, matching the contract form: concurrent
-        // reporters must insert in lock-acquisition order or they trip
-        // `RunningAverage::insert_with_time`'s monotonicity debug_assert.
-        let now = self.time_source.now();
-        topo.report_resource_usage(&source, resource, amount, now);
-    }
-
     pub(crate) fn report_contract_resource_usage(
         &self,
         contract_id: freenet_stdlib::prelude::ContractInstanceId,
@@ -5233,25 +5203,6 @@ impl Ring {
     /// Lock discipline: takes the topology read lock briefly and drops it
     /// before the caller takes the hosting-cache write lock — the two are
     /// never held together.
-    /// Windowed attributed CPU (µs/sec) per delegate (#5467 Phase 0).
-    ///
-    /// Reuses the same `topology::meter` attribution machinery the contract
-    /// cost axes use — `AttributionSource::Delegate` is an existing variant
-    /// with the same cap and TTL discipline. Observability only: unlike
-    /// [`Self::hosting_cost_pressure_axes`] nothing evicts or throttles on
-    /// this, so it applies no sustained-run gate (see `Meter::delegate_cost_rates`).
-    pub(crate) fn delegate_exec_cpu_rates(
-        &self,
-        now: tokio::time::Instant,
-    ) -> std::collections::HashMap<freenet_stdlib::prelude::DelegateKey, f64> {
-        let topo = self.connection_manager.topology_manager.read();
-        topo.delegate_cost_rates(
-            crate::topology::meter::ResourceType::ExecCpuMicros,
-            now,
-            hosting::COST_RATE_MIN_WINDOW,
-        )
-    }
-
     fn hosting_cost_pressure_axes(&self) -> Vec<hosting::CostAxisPressure> {
         use crate::topology::meter::ResourceType;
         let now = self.time_source.now();

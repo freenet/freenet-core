@@ -114,6 +114,42 @@ pub(crate) const DELEGATE_STATS_TTL: Duration = Duration::from_secs(6 * 60 * 60)
 /// bounds what is STORED and not merely what is shown.
 pub(crate) const MAX_LAST_ERROR_BYTES: usize = 512;
 
+/// Why attributed delegate CPU is NOT written to `topology::meter`.
+///
+/// The obvious implementation reports it as
+/// `AttributionSource::Delegate(key)` on the `ExecCpuMicros` axis, reusing the
+/// meter's cap, TTL sweep and `RunningAverage` — and that variant has existed
+/// for a long time. It is wrong, for a reason that is invisible at the call
+/// site and has nothing to do with the CPU axis:
+///
+/// `TopologyManager::report_resource_usage` inserts the source into
+/// `source_creation_times` **regardless of which resource is being reported**.
+/// `extrapolated_usage` then iterates that map for every axis, keeping any
+/// source whose `AttributionSource::contributes_to` is true for that axis — and
+/// `(Delegate(_), InboundBandwidthBytes)` and `(Delegate(_),
+/// OutboundBandwidthBytes)` are both `true`. So a source created solely by a
+/// CPU report is treated as a bandwidth contributor, and for the first
+/// `SOURCE_RAMP_UP_DURATION` (5 minutes) of its life it takes the ramping-up
+/// branch, which synthesizes a rate from the network-wide P50 estimator rather
+/// than reading its (empty) samples. The result is phantom bandwidth usage for
+/// a source that has produced zero bandwidth samples, inflating `total_usage`
+/// and driving **spurious connection removals** — precisely the failure
+/// `contributes_to`'s own doc comment describes, and why
+/// `(Contract(_), InboundBandwidthBytes)` is `false`.
+///
+/// Before this module nothing anywhere constructed an
+/// `AttributionSource::Delegate`, so those `true` rows were dormant. Reporting
+/// delegate CPU to the shared meter is what would wake them.
+///
+/// The fix is NOT to flip those rows here. That is a change to topology's load
+/// signal, it needs topology-focused review, and it belongs in its own PR —
+/// Phase 0 is measurement and must not alter connection management. So the
+/// attributed CPU lives in this module's own entry instead, using the same
+/// `RunningAverage` type; only the map differs.
+///
+/// Pinned by `exec_cpu_is_not_reported_to_the_shared_topology_meter`.
+pub(crate) const EXEC_CPU_IS_NOT_REPORTED_TO_THE_SHARED_METER: () = ();
+
 /// Number of samples retained for the invocation-rate window.
 ///
 /// Matches the production `Meter` window (`topology.rs`, `new_with_window_size(100)`).
@@ -134,6 +170,12 @@ struct DelegateExecEntry {
     /// entirely key-agnostic (it never touches the key type), so this is the
     /// existing machinery rather than a parallel one.
     invocation_rate: crate::topology::running_average::RunningAverage,
+    /// Windowed attributed CPU, in microseconds of guest execution per second.
+    ///
+    /// Kept HERE rather than in the shared `topology::meter` — see
+    /// [`EXEC_CPU_IS_NOT_REPORTED_TO_THE_SHARED_METER`]. It is the same
+    /// `RunningAverage` machinery either way; only the map it lives in differs.
+    exec_cpu_rate: crate::topology::running_average::RunningAverage,
 
     // --- per-request (one `handle_delegate_with_contract_requests` call) ---
     requests: u64,
@@ -161,6 +203,9 @@ impl DelegateExecEntry {
             last_error_at: None,
             total_exec_micros: 0,
             invocation_rate: crate::topology::running_average::RunningAverage::new(
+                INVOCATION_RATE_WINDOW,
+            ),
+            exec_cpu_rate: crate::topology::running_average::RunningAverage::new(
                 INVOCATION_RATE_WINDOW,
             ),
             requests: 0,
@@ -288,6 +333,9 @@ pub(crate) fn record_invocation(
         entry.invocations = entry.invocations.saturating_add(1);
         entry.total_exec_micros = entry.total_exec_micros.saturating_add(micros);
         entry.invocation_rate.insert_with_time(now, 1.0);
+        entry
+            .exec_cpu_rate
+            .insert_with_time(now, exec_duration.as_micros() as f64);
         if let InvocationOutcome::Failure(msg) = outcome {
             entry.errors = entry.errors.saturating_add(1);
             entry.last_error = Some(truncate_error(msg));
@@ -504,6 +552,7 @@ struct ExecFields {
     last_active_secs_ago: Option<u64>,
     total_exec_micros: u64,
     invocation_rate_per_sec: Option<f64>,
+    exec_cpu_micros_per_sec: Option<f64>,
     requests: u64,
     total_request_micros: u64,
     max_request_micros: u64,
@@ -535,6 +584,10 @@ fn exec_fields(stats: Option<&DelegateExecEntry>, now: Instant) -> ExecFields {
         total_exec_micros: entry.total_exec_micros,
         invocation_rate_per_sec: entry
             .invocation_rate
+            .get_rate_at_time(now)
+            .map(|rate| rate.per_second()),
+        exec_cpu_micros_per_sec: entry
+            .exec_cpu_rate
             .get_rate_at_time(now)
             .map(|rate| rate.per_second()),
         requests: entry.requests,
@@ -616,7 +669,6 @@ pub(crate) fn build_snapshot(ring: &crate::ring::Ring, now: Instant) -> Delegate
     // with a code hash we do not have and would have to invent.
     let in_use: std::collections::HashSet<ContractInstanceId> =
         ring.in_use_contract_ids().into_iter().collect();
-    let cpu_rates = ring.delegate_exec_cpu_rates(now);
 
     let mut delegates = Vec::with_capacity(by_delegate.len());
     let mut delegates_with_unpinned_subscriptions = 0usize;
@@ -648,7 +700,7 @@ pub(crate) fn build_snapshot(ring: &crate::ring::Ring, now: Instant) -> Delegate
             last_active_secs_ago: f.last_active_secs_ago,
             total_exec_micros: f.total_exec_micros,
             invocation_rate_per_sec: f.invocation_rate_per_sec,
-            exec_cpu_micros_per_sec: cpu_rates.get(&key).copied(),
+            exec_cpu_micros_per_sec: f.exec_cpu_micros_per_sec,
             requests: f.requests,
             total_request_micros: f.total_request_micros,
             max_request_micros: f.max_request_micros,
@@ -1117,6 +1169,44 @@ mod tests {
              registered_demand is no longer tracking the node's real demand \
              predicate and the panel is reporting a value it invented."
         );
+    }
+
+    /// Phase 0 must not touch topology's load signal.
+    ///
+    /// Reporting delegate CPU to the shared meter creates an
+    /// `AttributionSource::Delegate` in `source_creation_times`, which
+    /// `extrapolated_usage` then counts as a BANDWIDTH contributor (those
+    /// `contributes_to` rows are `true`), synthesizing a phantom rate during
+    /// the 5-minute ramp-up and driving spurious connection removals. Nothing
+    /// else in the tree constructs that variant, so this module is the only
+    /// thing that could wake it. See
+    /// [`EXEC_CPU_IS_NOT_REPORTED_TO_THE_SHARED_METER`].
+    #[test]
+    fn exec_cpu_is_not_reported_to_the_shared_topology_meter() {
+        for (name, src) in [
+            (
+                "delegates.rs",
+                include_str!("../contract/executor/runtime/delegates.rs"),
+            ),
+            ("delegate_observability.rs", include_str!("delegate_observability.rs")),
+        ] {
+            // Strip this module's own test section, which necessarily NAMES the
+            // thing it forbids.
+            let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+            assert!(
+                !production.contains("report_delegate_resource_usage"),
+                "{name} must not report delegate cost to the shared topology \
+                 meter: it creates an AttributionSource::Delegate, which \
+                 extrapolated_usage counts as a bandwidth contributor and \
+                 inflates perceived usage for 5 minutes, causing spurious \
+                 connection removals"
+            );
+            assert!(
+                !production.contains("AttributionSource::Delegate"),
+                "{name} must not construct AttributionSource::Delegate — see \
+                 EXEC_CPU_IS_NOT_REPORTED_TO_THE_SHARED_METER"
+            );
+        }
     }
 
     /// Phase 2 is not built on this branch. The flag must say so rather than

@@ -450,18 +450,6 @@ impl TopologyManager {
             .contract_cost_rates_multi(resources, now, min_window)
     }
 
-    /// Windowed per-delegate rates for one axis. Delegates to
-    /// [`crate::topology::meter::Meter::delegate_cost_rates`]. Read by the
-    /// dashboard's delegate provider (#5467 Phase 0); nothing acts on it.
-    pub(crate) fn delegate_cost_rates(
-        &self,
-        resource: ResourceType,
-        now: Instant,
-        min_window: std::time::Duration,
-    ) -> std::collections::HashMap<freenet_stdlib::prelude::DelegateKey, f64> {
-        self.meter.delegate_cost_rates(resource, now, min_window)
-    }
-
     /// Determine whether to add or remove connections based on current connection
     /// count and resource usage.
     ///

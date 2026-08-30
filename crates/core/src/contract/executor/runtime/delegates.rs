@@ -512,19 +512,12 @@ impl Executor<Runtime> {
                 );
                 let exec_duration = started.elapsed();
                 let recorded_at = tokio::time::Instant::now();
-                // Attribute the CPU to this delegate on the SAME meter the
-                // contract cost axes use, rather than standing up a parallel
-                // one (#5467: "reuse `CostAxisPressure` / the per-contract
-                // attributed-cost machinery"). Absent when this executor has
-                // no op_manager (the standalone/test construction), which is
-                // the same condition `commit_state_write` already tolerates.
-                if let Some(op_manager) = self.op_manager_handle() {
-                    op_manager.ring.report_delegate_resource_usage(
-                        &key,
-                        crate::topology::meter::ResourceType::ExecCpuMicros,
-                        exec_duration.as_micros() as f64,
-                    );
-                }
+                // The attributed CPU is accumulated inside
+                // `delegate_observability` rather than written to the shared
+                // `topology::meter`. That is deliberate and load-bearing — see
+                // `delegate_observability::EXEC_CPU_IS_NOT_REPORTED_TO_THE_SHARED_METER`
+                // for why writing it there synthesizes phantom BANDWIDTH usage
+                // and can trigger spurious connection removals.
                 match outcome {
                     Ok(values) => {
                         crate::node::delegate_observability::record_invocation(
