@@ -736,6 +736,29 @@ mod tests {
             .map(|(head, _)| head)
             .unwrap_or(SOURCE);
 
+        // Truncation guard, and it is load-bearing rather than belt-and-braces.
+        // `split_once` takes the FIRST `#[cfg(test)]` in the file and there are
+        // eight of them. A `#[cfg(test)]` item added ABOVE the constructors
+        // would shrink this window to nothing — and because the assertion below
+        // compares two counts WITHIN the window, `0 == 0` stays green while
+        // measuring nothing at all. A deliberate-failure check does not catch
+        // it either: deleting a callback install still leaves 0 == 0.
+        //
+        // Same family as a pin that scrapes its own test module because its
+        // anchor stopped matching: in both cases the key silently finds nothing
+        // and the pin passes forever. Anchoring on the constructors by name
+        // makes truncation fail closed.
+        for ctor in ["fn from_config(", "fn from_config_with_shared_modules("] {
+            assert!(
+                production.contains(ctor),
+                "the scraped production region no longer contains `{ctor}` — a \
+                 `#[cfg(test)]` item was almost certainly added above the \
+                 `Executor<Runtime>` constructors, truncating the window this \
+                 pin measures. Widen the split, do not delete this check: with \
+                 an empty window the count comparison below passes vacuously."
+            );
+        }
+
         // Count CONSTRUCTORS, not installs. Counting installs detects the
         // removal of one and is blind to the case the failure message is
         // actually about: a third constructor added later that forgets the
