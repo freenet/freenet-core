@@ -155,10 +155,34 @@ impl Runtime {
             )
         };
 
-        debug_assert!(
-            !DELEGATE_ENV.contains_key(&instance_id),
-            "Instance ID {instance_id} already exists in DELEGATE_ENV - this indicates a bug"
-        );
+        // HARD check, deliberately not `debug_assert!`: since #5480 this is a
+        // MEMORY-SAFETY invariant, not a tidiness one, and it must hold in
+        // release builds.
+        //
+        // A delegate guest now runs on a `spawn_blocking` worker, and on the
+        // wall-clock timeout path it KEEPS RUNNING after this function returns
+        // (`JoinHandle::abort()` cannot stop a `spawn_blocking` closure). One
+        // `RunningInstance` id is shared by every message in a batch (see
+        // `interface.rs`), so this insert runs once per message under the SAME
+        // id. If an env were inserted while a previous message's guest were
+        // still abandoned and running, that guest's `DELEGATE_ENV.get(&id)`
+        // would resolve to the NEW env and dereference its raw store pointers
+        // while this thread holds `&mut` to the very same stores -- aliasing UB
+        // across two threads.
+        //
+        // Today the batch loop aborts on the first error, so this is
+        // unreachable. That is an accident of control flow, not a guarantee: an
+        // edit making the loop error-tolerant ("collect errors and continue",
+        // "retry the message") would silently reintroduce it. Fail closed so
+        // such an edit gets an error instead of undefined behaviour.
+        if DELEGATE_ENV.contains_key(&instance_id) {
+            return Err(anyhow::anyhow!(
+                "delegate instance {instance_id} is already active in DELEGATE_ENV; \
+                 refusing to re-enter it while a previous guest may still be running \
+                 on an abandoned blocking thread (#5480)"
+            )
+            .into());
+        }
 
         DELEGATE_ENV.insert(instance_id, env);
         CURRENT_DELEGATE_INSTANCE.with(|c| c.set(instance_id));

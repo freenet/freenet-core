@@ -2640,6 +2640,27 @@ mod tests {
         );
     }
 
+    /// Run a test body that deliberately leaves a guest spinning on an abandoned
+    /// blocking-pool thread, WITHOUT waiting for that thread at teardown.
+    ///
+    /// `#[tokio::test]` drops its runtime at the end, and `Runtime::drop` waits
+    /// for blocking tasks that have already started. Since the whole point of
+    /// these tests is that the wall-clock backstop returns while the guest runs
+    /// on, that wait would (a) add the full epoch budget to every run and, worse,
+    /// (b) HANG FOREVER instead of failing if the epoch ticker thread were dead
+    /// -- which is exactly the #4864 scenario these tests exist to cover. A
+    /// zero-timeout shutdown detaches the thread instead; the epoch trap still
+    /// reaps it in the background.
+    fn run_abandoning_guest_test(body: impl FnOnce()) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime must build");
+        rt.block_on(async { body() });
+        rt.shutdown_timeout(Duration::from_millis(0));
+    }
+
     /// Drive ONE delegate entry point with a guest that never returns, under a
     /// SHORT wall clock and a deliberately LONG epoch deadline, and assert it
     /// still comes back promptly.
@@ -2707,16 +2728,16 @@ mod tests {
 
     /// REGRESSION (#5480): the V1 delegate entry must have the wall-clock
     /// backstop that contract execution already had.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delegate_v1_entry_has_wall_clock_backstop() {
-        assert_delegate_entry_has_wall_clock_backstop(false);
+    #[test]
+    fn delegate_v1_entry_has_wall_clock_backstop() {
+        run_abandoning_guest_test(|| assert_delegate_entry_has_wall_clock_backstop(false));
     }
 
     /// REGRESSION (#5480): same for the V2 delegate entry, which additionally
     /// has the larger async host-function surface.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delegate_v2_entry_has_wall_clock_backstop() {
-        assert_delegate_entry_has_wall_clock_backstop(true);
+    #[test]
+    fn delegate_v2_entry_has_wall_clock_backstop() {
+        run_abandoning_guest_test(|| assert_delegate_entry_has_wall_clock_backstop(true));
     }
 
     /// WAT whose exported entry immediately calls an imported host function.
@@ -2750,12 +2771,15 @@ mod tests {
         let eng = store.engine().clone();
         let module = Module::new(&eng, HOST_PANIC_WAT.as_bytes()).expect("WAT must compile");
         let mut linker: Linker<HostState> = Linker::new(&eng);
+        // A named fn, not a closure: a closure whose body diverges infers `!`
+        // as its return type, and wasmtime's `IntoFunc` has no `WasmTy` impl for
+        // `!`. An elided `()` return resolves it, and unlike an explicit `-> ()`
+        // it does not trip `clippy::unused_unit`.
+        fn boom(_: Caller<'_, HostState>) {
+            panic!("deliberate host-function panic (#5480 panic-capture test)");
+        }
         linker
-            .func_wrap("freenet_test", "boom", |_: Caller<'_, HostState>| {
-                // Trailing semicolon so the closure's block types as `()` rather
-                // than `!`, which wasmtime's `IntoFunc` cannot resolve.
-                panic!("deliberate host-function panic (#5480 panic-capture test)");
-            })
+            .func_wrap("freenet_test", "boom", boom)
             .expect("registering the panicking host fn must succeed");
         let instance = block_on_async(linker.instantiate_async(&mut *store, &module))
             .expect("instantiation must succeed");

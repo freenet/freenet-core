@@ -485,45 +485,62 @@ pub(super) struct DelegateCallEnv {
 // so these two impls are the whole basis for that soundness.
 //
 // The justification is NOT "WASM executes synchronously on the calling thread".
-// That was true when these impls were written and is FALSE since #5480: a
-// delegate guest now runs on a `spawn_blocking` worker, not on the thread that
-// built the env. Soundness rests on three properties instead, two of which the
-// compiler enforces:
+// That was true when these impls were written and is FALSE since #5480: the
+// guest now runs on a `spawn_blocking` worker, and on the wall-clock timeout
+// path it KEEPS RUNNING after the creating thread has returned, because
+// `JoinHandle::abort()` cannot stop a `spawn_blocking` closure. The argument
+// below is stated for that abandoned-guest path, since it is the hard one.
 //
-//  1. VALIDITY. The pointers address fields of the `Runtime` whose `&mut self`
-//     frame is `delegate::execution::exec_inbound_with_env`. That frame is
-//     parked inside `execute_wasm_blocking` for the whole guest call, so the
-//     `Runtime` can be neither moved nor dropped while a guest can reach it.
+//  1. VALIDITY IS BOUNDED BY THE GUARD, NOT BY THE CALL. The pointers address
+//     fields of a `Runtime` owned by an `Executor` that the pool MOVES back into
+//     its slot once the call returns (`contract/executor/runtime/pool.rs`), and
+//     may drop and replace. A move alone invalidates all three. So they are
+//     valid only until `DelegateEnvGuard::drop` returns; after that they may
+//     dangle at any moment. Do not read this as "the `Runtime` stays put while a
+//     guest can reach it" -- it does not. What makes the path safe is 2 and 4.
 //
-//  2. EXCLUSIVITY. Exactly one thread ever dereferences them: the single thread
-//     running the guest. The creating thread is parked, and one guest call is
-//     one call stack, so two delegate host functions are never in flight at
-//     once. `DashMap` additionally serializes `get`/`get_mut` on the entry.
+//  2. ONLY THE GUEST THREAD DEREFERENCES THEM, AND ONLY UNDER A MAP GUARD.
+//     Every dereference is inside one of the four private accessors below, each
+//     reached through a `Ref`/`RefMut` from `DELEGATE_ENV`. `DashMap::remove`
+//     takes the shard WRITE lock, so `DelegateEnvGuard::drop` waits for any
+//     in-flight host call's guard to release; every dereference therefore
+//     happens-before that removal returns, which happens-before the pool moves
+//     the `Runtime`. NOTE that the creating thread is NOT parked on this path:
+//     it concurrently takes its own `Ref` to read back `context`
+//     (`delegate/execution.rs`). That is safe only because it touches `context`
+//     alone -- whose sole mutator goes through `get_mut`, a shard write lock --
+//     and never dereferences a raw pointer. Adding another field read there,
+//     e.g. of `creations_this_call`, would be a data race with no `unsafe` at
+//     the edit site.
 //
-//  3. NO ESCAPE. Every reference derived from these pointers is produced by one
-//     of the four private accessors below (`secret_store`, `secret_store_mut`,
-//     `contract_store`, `delegate_store_mut`), each `&self -> &T`, so lifetime
-//     elision ties the result to the `Ref`/`RefMut` guard it came from. Nothing
-//     copies a raw pointer out: the fields are private and are dereferenced
-//     ONLY in those accessors. The borrow checker enforces this; it is not a
-//     convention a future edit can quietly break without `unsafe`.
+//  3. NO REFERENCE ESCAPES ITS GUARD. The four accessors are private and each is
+//     `&self -> &T`, so lifetime elision ties the result to the `Ref` that
+//     produced it, and nothing copies a raw pointer out. Be precise about what
+//     that buys: the compiler enforces the EXTENT of the borrow, NOT its
+//     exclusivity. `secret_store_mut(&self) -> &mut SecretsStore` manufactures a
+//     `&mut` from a `&`, so two simultaneously-live `&mut SecretsStore` from one
+//     env would compile today with no `unsafe` at the call site. Every current
+//     caller holds one at a time in a statement-scoped temporary; THAT half is a
+//     convention these accessors do not check.
 //
-// The wall-clock timeout added by #5480 is the one place 1 and 2 could break,
-// because the creating thread unparks while the guest thread keeps running
-// (`JoinHandle::abort()` cannot stop a `spawn_blocking` closure). Two things
-// close it:
+//  4. NO ENV IS INSERTED UNDER AN ID WHOSE GUEST MAY STILL BE RUNNING. This is
+//     what stands between the design and an aliased `&mut SecretsStore` across
+//     two threads, and it needs BOTH halves:
+//      - Ids are not recycled. `INSTANCE_ID` (`wasm_runtime::runtime`) is a
+//        monotonic `AtomicI64`, so an abandoned thread's `get(&old_id)` misses
+//        rather than resolving to a LATER call's env. (`fetch_add` does wrap in
+//        principle. At one increment per instance that is not reachable in a
+//        process lifetime, but it is an assumption, not a proof.)
+//      - One id IS reused WITHIN a batch. `delegate/interface.rs` creates a
+//        single `RunningInstance` and passes its id to `exec_inbound_with_env`
+//        for every message, so the insert runs again under the same id per
+//        message. The fail-closed `contains_key` check there is what makes that
+//        safe. Without it, an error-tolerant batch loop would re-insert under an
+//        id whose previous guest is still abandoned and running, and the two
+//        threads would alias the same stores.
 //
-//  - `DelegateEnvGuard::drop` removes the entry, and `DashMap::remove` takes
-//    the shard WRITE lock, so it waits for any in-flight host call's guard to
-//    release. That is precisely why that drop can block for the duration of one
-//    host call, and why property 3 above must hold for the wait to be enough.
-//  - After the remove returns, every later lookup by the abandoned thread
-//    misses. `INSTANCE_ID` (`wasm_runtime::runtime`) is a monotonic
-//    `AtomicI64`, so an id is NEVER reissued and a stale thread can never reach
-//    a LATER call's env. That non-reuse is load-bearing: keying instances by
-//    anything recycled (a pool slot, a code hash) would make these impls
-//    unsound, because the stale thread would alias the new call's `&mut`
-//    borrows of the very same stores.
+// Keying instances by anything recycled (a pool slot, a code hash) breaks the
+// first half of 4 and makes these impls unsound.
 unsafe impl Send for DelegateCallEnv {}
 // SAFETY: as for `Send` directly above -- the two are one argument.
 unsafe impl Sync for DelegateCallEnv {}
