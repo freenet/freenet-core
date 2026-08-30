@@ -4188,6 +4188,321 @@ async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
     Ok(())
 }
 
+// ============================================================================
+// #5479: a V2 delegate's contract write must reach the network
+// ============================================================================
+
+/// Application-message types for the `test-delegate-v2-contracts` fixture.
+///
+/// These MUST stay byte-compatible with the fixture's own definitions in
+/// `tests/test-delegate-v2-contracts/src/lib.rs` — they are bincode'd across
+/// the WASM boundary, so a field reorder here silently mis-deserializes.
+mod v2_delegate_messages {
+    use super::*;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub enum InboundAppMessage {
+        GetContractState {
+            contract_id: [u8; 32],
+        },
+        PutContractState {
+            contract_id: [u8; 32],
+            state: Vec<u8>,
+        },
+        UpdateContractState {
+            contract_id: [u8; 32],
+            state: Vec<u8>,
+        },
+        SubscribeContract {
+            contract_id: [u8; 32],
+        },
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub enum OutboundAppMessage {
+        ContractState {
+            contract_id: [u8; 32],
+            state: Vec<u8>,
+        },
+        ContractNotFound {
+            contract_id: [u8; 32],
+            error_code: i64,
+        },
+        Success {
+            contract_id: [u8; 32],
+        },
+        Failed {
+            contract_id: [u8; 32],
+            error_code: i64,
+        },
+    }
+}
+
+/// Regression test for #5479: a V2 delegate UPDATE is observed on a SECOND
+/// peer.
+///
+/// The V1 and V2 delegate contract APIs expose the same operations under the
+/// same names, but only V1 routed writes through `upsert_contract_state`,
+/// which emits `NodeEvent::BroadcastStateChange`. The V2 host functions
+/// (`put_contract_state` / `update_contract_state`) wrote straight to ReDb:
+/// the local read-back succeeded, the host function returned success, and the
+/// network never learned anything. Silent write loss.
+///
+/// **This test cannot be single-node.** The two pre-existing delegate E2E
+/// tests (`test_delegate_contract_put_and_update`,
+/// `test_delegate_contract_get`) run `nodes = ["gateway"]`, so they observe
+/// only the local store — where the buggy path looks perfectly healthy. The
+/// assertion that distinguishes the bug is on a peer that did NOT perform the
+/// write.
+///
+/// Shape:
+///   1. node-a PUTs the contract (initial state, version 0) and subscribes.
+///   2. node-b GETs it with `subscribe = true`, so it holds the contract and
+///      is registered as an interested co-host.
+///   3. **Quiesce.** Drain node-b until it has been silent for
+///      `QUIET_PERIOD`. This is load-bearing — see below.
+///   4. node-a registers the V2 delegate and asks it to
+///      `update_contract_state` with a version-1 state.
+///   5. node-b must receive an `UpdateNotification` carrying that state.
+///
+/// **Why step 3 is not optional.** The first version of this test omitted it
+/// and PASSED against unfixed main. The debug log showed node-a emitting only
+/// the PUT's own 24-byte `BroadcastStateChange` (twice — the initial emission
+/// found no targets and was retried) and never one carrying the delegate's
+/// 114-byte state, so the bug was real. But node-b acquired that state anyway,
+/// about a second later, through `SyncStateToPeer` / `ResyncResponse`
+/// anti-entropy fired by the interest exchange that the GET+subscribe had just
+/// set up. "node-b saw the state" was true and did not establish "the write
+/// propagated" — the assertion was measuring the wrong thing.
+///
+/// Once interests are exchanged and summaries agree, anti-entropy does not fire
+/// again until `INTEREST_HEARTBEAT_INTERVAL` (300s,
+/// `crates/core/src/ring/interest.rs:73`). Quiescing first and asserting well
+/// inside that window leaves the write's own broadcast as the only route by
+/// which node-b can learn the new state.
+#[freenet_test(
+    health_check_readiness = true,
+    nodes = ["gateway", "node-a", "node-b"],
+    timeout_secs = 600,
+    startup_wait_secs = 40,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_v2_delegate_update_propagates_to_second_peer(ctx: &mut TestContext) -> TestResult {
+    use v2_delegate_messages::{InboundAppMessage, OutboundAppMessage};
+
+    const TEST_DELEGATE: &str = "test-delegate-v2-contracts";
+    const TEST_CONTRACT: &str = "test-contract-integration";
+
+    let contract = load_contract(TEST_CONTRACT, Parameters::from(vec![]))?;
+    let contract_key = contract.key();
+    let contract_id = *contract_key.id();
+    let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
+    let delegate_key = delegate.key().clone();
+
+    let node_a = ctx.node("node-a")?;
+    let node_b = ctx.node("node-b")?;
+
+    let (stream_a, _) = connect_async(&node_a.ws_url()).await?;
+    let mut client_a = WebApi::start(stream_a);
+    let (stream_b, _) = connect_async(&node_b.ws_url()).await?;
+    let mut client_b = WebApi::start(stream_b);
+
+    // --- 1. node-a installs the contract and subscribes -------------------
+    let initial_state = WrappedState::from(test_utils::create_empty_todo_list());
+    make_put(&mut client_a, initial_state.clone(), contract.clone(), true).await?;
+
+    let mut put_ok = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !put_ok && std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(5), client_a.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                ensure!(key == contract_key, "PUT response for the wrong contract");
+                put_ok = true;
+            }
+            Ok(Ok(other)) => tracing::debug!(?other, "node-a: ignoring while awaiting PUT"),
+            Ok(Err(e)) => bail!("node-a: websocket error awaiting PUT: {e}"),
+            Err(_) => {}
+        }
+    }
+    ensure!(put_ok, "node-a: no PutResponse within 60s");
+
+    // --- 2. node-b fetches it and subscribes ------------------------------
+    // Retried: under CI resource pressure the first GET can be lost before
+    // the mesh settles (see issue #2682 and the sibling tests in this file).
+    let mut get_ok = false;
+    for attempt in 1..=3u32 {
+        make_get(&mut client_b, contract_key, true, true).await?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !get_ok && std::time::Instant::now() < deadline {
+            match timeout(Duration::from_secs(5), client_b.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    key,
+                    ..
+                }))) => {
+                    ensure!(key == contract_key, "GET response for the wrong contract");
+                    get_ok = true;
+                }
+                Ok(Ok(other)) => tracing::debug!(?other, "node-b: ignoring while awaiting GET"),
+                Ok(Err(e)) => bail!("node-b: websocket error awaiting GET: {e}"),
+                Err(_) => {}
+            }
+        }
+        if get_ok {
+            break;
+        }
+        tracing::warn!(attempt, "node-b: GET attempt timed out, retrying");
+    }
+    ensure!(get_ok, "node-b: no GetResponse after 3 attempts");
+
+    // --- 3. quiesce -------------------------------------------------------
+    // Wait until node-b has been silent for QUIET_PERIOD, so the interest
+    // exchange and any anti-entropy heal triggered by step 2 have finished and
+    // been discarded. Everything node-b receives after this point is caused by
+    // step 4. See the doc comment: without this, the anti-entropy heal supplies
+    // the state and the test passes against the unfixed code.
+    const QUIET_PERIOD: Duration = Duration::from_secs(8);
+    const QUIESCE_CAP: Duration = Duration::from_secs(60);
+    let quiesce_start = std::time::Instant::now();
+    let mut last_message = std::time::Instant::now();
+    while last_message.elapsed() < QUIET_PERIOD && quiesce_start.elapsed() < QUIESCE_CAP {
+        match timeout(Duration::from_secs(1), client_b.recv()).await {
+            Ok(Ok(msg)) => {
+                tracing::debug!(?msg, "node-b: draining pre-write traffic");
+                last_message = std::time::Instant::now();
+            }
+            Ok(Err(e)) => bail!("node-b: websocket error while quiescing: {e}"),
+            Err(_) => {}
+        }
+    }
+    ensure!(
+        last_message.elapsed() >= QUIET_PERIOD,
+        "node-b never went quiet within {QUIESCE_CAP:?}; the test cannot \
+         distinguish the write's own broadcast from background anti-entropy \
+         while traffic is still flowing, so it would pass for the wrong reason"
+    );
+    tracing::info!(
+        quiesced_after_ms = quiesce_start.elapsed().as_millis(),
+        "node-b quiet; anything it receives from here is caused by the delegate write"
+    );
+
+    // --- 4. node-a registers the V2 delegate and drives the write ---------
+    client_a
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
+                delegate: delegate.clone(),
+                cipher: TEST_DELEGATE_CIPHER,
+                nonce: TEST_DELEGATE_NONCE,
+            },
+        ))
+        .await?;
+    match timeout(Duration::from_secs(30), client_a.recv()).await?? {
+        HostResponse::DelegateResponse { key, .. } => {
+            ensure!(key == delegate_key, "delegate key mismatch on register");
+        }
+        other => bail!("unexpected register response: {other:?}"),
+    }
+
+    let contract_id_bytes: [u8; 32] = contract_id
+        .as_bytes()
+        .try_into()
+        .expect("a ContractInstanceId is 32 bytes");
+    let updated_state = test_utils::create_todo_list_with_item("V2 delegate propagation");
+    let command = InboundAppMessage::UpdateContractState {
+        contract_id: contract_id_bytes,
+        state: updated_state.clone(),
+    };
+    client_a
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params: Parameters::from(vec![]),
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                    ApplicationMessage::new(bincode::serialize(&command)?),
+                )],
+            },
+        ))
+        .await?;
+
+    match timeout(Duration::from_secs(60), client_a.recv()).await?? {
+        HostResponse::DelegateResponse { key, values } => {
+            ensure!(key == delegate_key, "delegate key mismatch on UPDATE");
+            let outcome = values
+                .iter()
+                .find_map(|v| {
+                    if let OutboundDelegateMsg::ApplicationMessage(msg) = v {
+                        bincode::deserialize::<OutboundAppMessage>(&msg.payload).ok()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("no ApplicationMessage in delegate response"))?;
+            match outcome {
+                OutboundAppMessage::Success { .. } => {}
+                other => bail!("V2 delegate update_contract_state failed: {other:?}"),
+            }
+        }
+        other => bail!("unexpected delegate UPDATE response: {other:?}"),
+    }
+
+    // --- 5. THE ASSERTION: node-b sees the write --------------------------
+    // Everything above passes with or without the fix. This is the only step
+    // that distinguishes a write the network learned about from one it did
+    // not — and it only does so because of the quiescence in step 3.
+    //
+    // The window is deliberately far shorter than INTEREST_HEARTBEAT_INTERVAL
+    // (300s): if it were longer, the periodic anti-entropy round could supply
+    // the state and the assertion would stop measuring propagation again.
+    let expected: test_utils::TodoList = serde_json::from_slice(&updated_state)?;
+    let mut notified = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    while !notified && std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(5), client_b.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                key,
+                update,
+            }))) => {
+                ensure!(
+                    key == contract_key,
+                    "UpdateNotification for the wrong contract"
+                );
+                if let UpdateData::State(state) = update {
+                    let got: test_utils::TodoList = serde_json::from_slice(state.as_ref())?;
+                    if got.tasks.len() == expected.tasks.len()
+                        && got.tasks.first().map(|t| t.title.as_str())
+                            == expected.tasks.first().map(|t| t.title.as_str())
+                    {
+                        notified = true;
+                    } else {
+                        tracing::debug!(
+                            tasks = got.tasks.len(),
+                            "node-b: notification did not yet carry the delegate's state"
+                        );
+                    }
+                }
+            }
+            Ok(Ok(other)) => {
+                tracing::debug!(?other, "node-b: ignoring while awaiting UpdateNotification")
+            }
+            Ok(Err(e)) => bail!("node-b: websocket error awaiting notification: {e}"),
+            Err(_) => {}
+        }
+    }
+
+    ensure!(
+        notified,
+        "node-b never observed the V2 delegate's contract write. The delegate's \
+         update_contract_state returned success and the state is readable on \
+         node-a, but nothing was pushed — this is #5479. V1 delegates propagate \
+         here because they route through upsert_contract_state, which emits \
+         BroadcastStateChange. Note the state may still reach node-b eventually \
+         via the 300s anti-entropy heartbeat; this test asserts the write's own \
+         propagation, which is what the API's success return implies."
+    );
+
+    Ok(())
+}
+
 /// Test that disconnecting a subscribed client does NOT trigger an *immediate*
 /// upstream Unsubscribe when the contract was recently read (demand-gated collapse).
 ///
