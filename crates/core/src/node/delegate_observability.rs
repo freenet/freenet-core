@@ -168,6 +168,37 @@
 //! Pinned by `exec_cpu_is_not_reported_to_the_shared_topology_meter`, which
 //! scans this file and `delegates.rs` for the forbidden construction.
 //!
+//! # What this panel can and cannot see (#5487)
+//!
+//! A delegate subscription is TWO records once it registers demand: the
+//! notification hook (`DELEGATE_SUBSCRIPTIONS`) and the demand registration in
+//! the ring. #5487 documents that they can silently diverge in both directions.
+//!
+//! This panel reads BOTH and reports where they disagree, which is the
+//! cross-check #5487 asks introspection to do rather than answering from the
+//! hook alone. But the two directions are NOT equally visible here, and the
+//! asymmetry follows from which map the rows are enumerated from:
+//!
+//! - **Hook present, demand absent — VISIBLE.** This is `registered_demand:
+//!   false`, the panel's main finding. It covers both the pre-#4669 "delegate
+//!   subscribe never registered demand at all" case and #5487's divergence 1,
+//!   where eviction cleared the demand and left the hook. The panel does not
+//!   distinguish those two causes; it reports the state, not how it arose.
+//!
+//! - **Demand present, hook absent — INVISIBLE.** #5487's divergence 2, where a
+//!   PUT rollback drops the hook and leaves the contract pinned. Rows are
+//!   enumerated from `DELEGATE_SUBSCRIPTIONS` (plus delegates with execution
+//!   history), so a contract that holds demand with no hook has no row to appear
+//!   on. It is pinned with nothing able to consume its updates, and nothing here
+//!   will say so.
+//!
+//! Do not read an all-`registered_demand: true` panel as "no divergence". It
+//! means no divergence *of the kind this panel enumerates*. Closing the second
+//! direction needs a per-delegate view of the ring's demand registrations, which
+//! does not exist as a queryable surface today — and #5487's own resolution is
+//! that both records should become one with one owner (#4669 part 3), at which
+//! point the divergence stops being representable rather than merely visible.
+//!
 //! # This phase is measurement only
 //!
 //! Nothing here throttles, quarantines, evicts or rate-limits. Phase 4
@@ -574,6 +605,12 @@ pub struct DelegateSubscriptionEntry {
     /// to be pinning the same contract. That divergence — subscribed, but not
     /// pinned — is the bug, rendered visible. When #4669 adds the delegate
     /// term this flips to `true` with no change needed here.
+    ///
+    /// `false` does NOT distinguish "the subscribe never registered demand" from
+    /// "demand was registered and later torn down by eviction" (#5487's
+    /// divergence 1). Both are real, both matter, and this reports the state
+    /// rather than its cause. The opposite divergence — demand held with no
+    /// notification hook — cannot appear here at all; see the module docs.
     pub registered_demand: bool,
 }
 
@@ -915,6 +952,27 @@ mod tests {
 
     fn key(byte: u8) -> DelegateKey {
         DelegateKey::new([byte; 32], CodeHash::new([byte; 32]))
+    }
+
+    /// Production source with comments stripped.
+    ///
+    /// Source-scrape guards must look at CODE. This module's own docs
+    /// necessarily NAME the constructions they forbid, so a raw substring
+    /// search over the file reports itself — which is exactly what
+    /// `exec_cpu_is_not_reported_to_the_shared_topology_meter` did on its first
+    /// run, failing against the doc comment explaining why it exists.
+    ///
+    /// Every caller must assert a POSITIVE control before relying on an absence
+    /// check here: if this ever returns an empty string, "X is absent" becomes
+    /// trivially true and the guard silently stops guarding.
+    fn code_only(src: &str) -> String {
+        src.split("#[cfg(test)]")
+            .next()
+            .unwrap_or(src)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The write-site pin for the PER-CALL counter (#4009/#4010 shape).
@@ -1339,29 +1397,29 @@ mod tests {
     /// [`EXEC_CPU_IS_NOT_REPORTED_TO_THE_SHARED_METER`].
     #[test]
     fn exec_cpu_is_not_reported_to_the_shared_topology_meter() {
-        // Scan CODE only. This module's own docs necessarily NAME the thing they
-        // forbid, so a raw substring search over the file reports itself — which
-        // is exactly what it did on the first run of this test.
-        fn code_only(src: &str) -> String {
-            src.split("#[cfg(test)]")
-                .next()
-                .unwrap_or(src)
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        for (name, src) in [
+        for (name, src, must_contain) in [
             (
                 "delegates.rs",
                 include_str!("../contract/executor/runtime/delegates.rs"),
+                "inbound_app_message",
             ),
             (
                 "delegate_observability.rs",
                 include_str!("delegate_observability.rs"),
+                "fn record_invocation",
             ),
         ] {
             let production = code_only(src);
+            // POSITIVE CONTROL. Both assertions below check for ABSENCE, which
+            // passes trivially if extraction returns nothing. Without this, a
+            // broken `code_only` would turn this guard into a no-op that reports
+            // success forever — the exact shape of a guard that measures nothing.
+            assert!(
+                production.contains(must_contain),
+                "code extraction is broken for {name}: it did not find \
+                 {must_contain}, which that file certainly contains. Every \
+                 absence assertion below would pass while checking nothing."
+            );
             assert!(
                 !production.contains("report_delegate_resource_usage"),
                 "{name} must not report delegate cost to the shared topology \
@@ -1401,28 +1459,53 @@ mod tests {
         clear_for_test();
     }
 
-    /// While the counter has no call site, the snapshot must SAY so rather than
-    /// letting a zero speak for it. Same rule as the wakeups flag: a count of
-    /// `0` from an unwired source is a fabricated measurement, and it is the
-    /// most reassuring possible one, which makes it the worst to get wrong.
+    /// The gate, the `#[allow(dead_code)]`, and the production call site must
+    /// move together.
+    ///
+    /// A plain `assert!(!SUBSCRIBE_DEMAND_TRACKING_WIRED)` would be an assertion
+    /// on a constant — clippy rejects it, and rightly: it restates the constant
+    /// rather than checking anything. What is actually worth pinning is the
+    /// RELATIONSHIP between the three, which is a property of the source and so
+    /// can be scraped.
+    ///
+    /// Flipping the flag without adding a call site would make the dashboard
+    /// present a permanent `0` as a real measurement — "no pin has ever failed
+    /// to take" — which is the most reassuring possible false reading. Leaving
+    /// the flag `false` after adding the call site is the milder inverse: a real
+    /// number hidden behind "not wired".
     #[test]
-    fn subscribe_demand_tracking_reports_whether_it_is_wired() {
-        let snap = DelegateStatusSnapshot::default();
+    fn wiring_flag_allow_attribute_and_call_site_move_together() {
+        let src = include_str!("delegate_observability.rs");
+        let code = code_only(src);
+
+        // Positive control: if the extractor ever returns nothing, every
+        // absence check below would pass while measuring nothing.
         assert!(
-            !snap.subscribe_demand_tracking_wired,
-            "Default must not claim the counter is wired"
+            code.contains("fn record_subscribe_without_demand"),
+            "code extraction is broken — it did not find a function this file \
+             certainly defines, so any absence assertion here proves nothing"
         );
-        // The gate and the count must move together. If a call site was added
-        // without flipping the flag, the dashboard would show a real number
-        // labelled "not wired"; if the flag was flipped without a call site, it
-        // would show a fabricated zero as fact.
-        assert!(
-            !SUBSCRIBE_DEMAND_TRACKING_WIRED,
-            "flip this only in the commit that adds the production call site in \
-             contract::delegate_demand::register_subscription, and remove the \
-             #[allow(dead_code)] on record_subscribe_without_demand at the same \
-             time"
-        );
+
+        let wired = code.contains("SUBSCRIBE_DEMAND_TRACKING_WIRED: bool = true");
+        let has_allow =
+            code.contains("#[allow(dead_code)]\npub(crate) fn record_subscribe_without_demand");
+
+        if wired {
+            assert!(
+                !has_allow,
+                "the flag says the counter is wired, but record_subscribe_without_demand \
+                 still carries #[allow(dead_code)] — if it genuinely has a production \
+                 call site the attribute is no longer needed, and if it does not, the \
+                 flag is claiming a measurement that is not happening"
+            );
+        } else {
+            assert!(
+                has_allow,
+                "the counter has no production call site yet, so it needs \
+                 #[allow(dead_code)] to pass clippy -D warnings; if you just added \
+                 the call site, flip SUBSCRIBE_DEMAND_TRACKING_WIRED in the same commit"
+            );
+        }
     }
 
     /// Phase 2 is not built on this branch. The flag must say so rather than
