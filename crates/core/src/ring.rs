@@ -9105,10 +9105,11 @@ mod hosting_observability_wiring_pin {
 /// reporter → meter → axes → sweep chain the manager-level storm test
 /// (`storm_frequency_profile_crosses_cost_trigger_through_real_meter`)
 /// bypasses by assembling its axes by hand from a standalone `Meter`.
-#[cfg(test)]
+///
 /// `pub(crate)` because `seam_fixture` below is the crate's one real-`OpManager`
 /// test seam, and the delegate-demand tests (`contract::delegate_demand`) need
 /// the same thing. A second copy of that setup is how the two drift.
+#[cfg(test)]
 pub(crate) mod cost_pressure_seam_tests {
     use std::time::Duration;
 

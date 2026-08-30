@@ -264,6 +264,13 @@ fn is_delegate_client(client_id: ClientId) -> bool {
 /// Note it narrows the window rather than closing it — a contract evicted
 /// immediately after this check lands in the same state. That residual is the
 /// same one the bootstrap work closes.
+///
+/// The `false` branch is the attachment point for #5467 Phase 0's
+/// "pins that never took" counter: a `warn!` is a trace of the event, not a
+/// record of it, and once the subscription is torn down there is no live row
+/// left to show the pin was missing. The counter is not called from here yet
+/// only because it lands in a later change; when it does, it goes beside the
+/// `warn!` below and needs nothing else from this function.
 pub(crate) fn register_subscription(
     op_manager: &OpManager,
     delegate: &DelegateKey,
