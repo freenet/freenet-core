@@ -2410,7 +2410,7 @@ where
         // Share one Arc allocation across all subscribers
         let shared_state = Arc::new(new_state.clone());
 
-        for delegate_key in subscribers {
+        for delegate_key in &subscribers {
             match tx.try_send(super::DelegateNotification {
                 delegate_key: delegate_key.clone(),
                 contract_id: instance_id,
@@ -2448,7 +2448,7 @@ where
                             crate::contract::delegate_demand::drop_subscription(
                                 op_manager,
                                 delegate_key,
-                                &instance_id,
+                                key,
                             );
                         }
                     }

@@ -196,24 +196,54 @@ pub(crate) fn register_subscription(
     );
 }
 
-/// Drop the demand `delegate` holds on `instance_id`, if any.
+/// Drop the demand `delegate` holds on `contract`, if any, and collapse the
+/// upstream subscription when nothing else is left interested.
 ///
-/// Returns `true` when a registration was actually removed.
+/// The collapse half is not optional. Dropping the registration alone leaves
+/// the node holding an upstream lease for a contract nothing wants: renewal is
+/// gated on `contract_in_use`, so the lease does eventually lapse on its own,
+/// but until it does the upstream peer keeps us in its fan-out. The
+/// client-disconnect path (`client_events.rs`, `ClientRequest::Disconnect`)
+/// collapses immediately for the same reason, and this path is the delegate's
+/// equivalent, so it uses the same gate.
 pub(crate) fn drop_subscription(
-    op_manager: &OpManager,
+    op_manager: &std::sync::Arc<OpManager>,
     delegate: &DelegateKey,
-    instance_id: &ContractInstanceId,
+    contract: &ContractKey,
 ) {
     let client_id = client_id_for(delegate);
     op_manager
         .ring
-        .remove_client_subscription(instance_id, client_id);
+        .remove_client_subscription(contract.id(), client_id);
     tracing::debug!(
         delegate = %delegate,
-        contract = %instance_id,
+        contract = %contract,
         %client_id,
         "delegate subscription demand dropped"
     );
+    collapse_if_no_interest(op_manager, contract);
+}
+
+/// Send `Unsubscribe` upstream for `contract` when nothing on this node is
+/// interested in it any more.
+///
+/// The gate is the reconcile controller's own
+/// (`reconcile_wants_collapse` = `!contract_in_use`), not a local
+/// re-derivation of it — a second copy of that predicate is exactly the
+/// mirrored-condition drift `.claude/rules/bug-prevention-patterns.md` warns
+/// about.
+fn collapse_if_no_interest(op_manager: &std::sync::Arc<OpManager>, contract: &ContractKey) {
+    if !op_manager.reconcile_wants_collapse(
+        contract,
+        crate::node::network_status::ReconcileShadowSite::Collapse,
+    ) {
+        return;
+    }
+    let op_mgr = op_manager.clone();
+    let contract = *contract;
+    crate::config::GlobalExecutor::spawn(async move {
+        op_mgr.send_unsubscribe_upstream(&contract).await;
+    });
 }
 
 /// Drop every demand registration held by `delegate` and collapse the upstream
@@ -240,16 +270,7 @@ pub(crate) fn drop_delegate_demand(op_manager: &std::sync::Arc<OpManager>, deleg
     // the same reconcile-controller collapse gate the client-disconnect path
     // uses (`reconcile_wants_collapse` = `!contract_in_use`).
     for contract in &result.affected_contracts {
-        if op_manager.reconcile_wants_collapse(
-            contract,
-            crate::node::network_status::ReconcileShadowSite::Collapse,
-        ) {
-            let op_mgr = op_manager.clone();
-            let contract = *contract;
-            crate::config::GlobalExecutor::spawn(async move {
-                op_mgr.send_unsubscribe_upstream(&contract).await;
-            });
-        }
+        collapse_if_no_interest(op_manager, contract);
     }
 }
 

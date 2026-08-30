@@ -4401,6 +4401,21 @@ impl Ring {
             .add_client_subscription(instance_id, client_id)
     }
 
+    /// Remove a single client subscription.
+    ///
+    /// Returns true when that was the last client subscription for the contract.
+    /// Used by the delegate demand path (`contract::delegate_demand`) to drop
+    /// one delegate's pin on one contract without disturbing the others it
+    /// holds — the whole-client teardown below is the wrong tool there.
+    pub fn remove_client_subscription(
+        &self,
+        instance_id: &ContractInstanceId,
+        client_id: crate::client_events::ClientId,
+    ) -> bool {
+        self.hosting_manager
+            .remove_client_subscription(instance_id, client_id)
+    }
+
     /// Remove a client from all its subscriptions (used when client disconnects).
     ///
     /// Returns a [`ClientDisconnectResult`] with:

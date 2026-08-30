@@ -402,6 +402,7 @@ mod tests {
                     Some(self.db.clone()),
                     None,
                     None,
+                    None, // delegate_subscribe_callback (#4669)
                     delegate_key,
                     &mut self.delegate_store,
                     depth,
@@ -432,6 +433,7 @@ mod tests {
                     Some(self.db.clone()),
                     Some(cb),
                     None,
+                    None, // delegate_subscribe_callback (#4669)
                     delegate_key,
                     &mut self.delegate_store,
                     0,
@@ -465,6 +467,7 @@ mod tests {
                     Some(self.db.clone()),
                     None,
                     Some(admit),
+                    None, // delegate_subscribe_callback (#4669)
                     delegate_key,
                     &mut self.delegate_store,
                     0,
@@ -495,6 +498,7 @@ mod tests {
                     Some(self.db.clone()),
                     None,
                     None,
+                    None, // delegate_subscribe_callback (#4669)
                     delegate_key,
                     &mut self.delegate_store,
                     0,
@@ -592,6 +596,7 @@ mod tests {
                 None, // No state store
                 None,
                 None,
+                None, // delegate_subscribe_callback (#4669)
                 delegate_key,
                 &mut env_holder.delegate_store,
                 0,
@@ -677,6 +682,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // delegate_subscribe_callback (#4669)
                 delegate_key,
                 &mut env_holder.delegate_store,
                 0,
@@ -708,6 +714,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // delegate_subscribe_callback (#4669)
                 delegate_key,
                 &mut env_holder.delegate_store,
                 0,
