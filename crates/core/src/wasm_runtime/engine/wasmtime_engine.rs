@@ -1244,7 +1244,7 @@ impl WasmtimeEngine {
         delegate_instance: Option<i64>,
     ) -> Result<i64, WasmError>
     where
-        P: wasmtime::WasmParams + Send + 'static,
+        P: wasmtime::WasmParams + Send + Sync + 'static,
     {
         let enabled_metering = self.enabled_metering;
         let mut store = self
@@ -2797,50 +2797,93 @@ mod tests {
         );
     }
 
-    /// Source-scrape pin (#4864 review, fix 8 + round-4 P2): EVERY guest-entry
-    /// call site (`instantiate_async` / `call_async`) — not just the first — MUST
-    /// be preceded by an `arm_epoch_deadline(` since the previous guest entry in
-    /// the same function. The store is reused across calls, so a SECOND guest
-    /// call that is not re-armed inherits the first call's remaining epoch budget
-    /// (the `__frnt_set_id` case). This also future-proofs against a refactor
-    /// adding a guest-entry path without arming the deadline.
+    /// Bound a scraped method body: from `fn_name` to whichever comes first of
+    /// the next method or the end of the impl block.
+    fn scrape_body<'a>(src: &'a str, fn_name: &str) -> &'a str {
+        let start = src
+            .find(fn_name)
+            .unwrap_or_else(|| panic!("method `{fn_name}` not found"));
+        let rest = &src[start + fn_name.len()..];
+        let end = ["\n    fn ", "\n    pub(crate) fn ", "\n    pub(super) fn ", "\n}"]
+            .iter()
+            .filter_map(|needle| rest.find(needle))
+            .min()
+            .map(|off| start + fn_name.len() + off)
+            .unwrap_or(src.len());
+        &src[start..end]
+    }
+
+    /// Positions of every guest-entry call in a scraped body. Matches the
+    /// method-call syntax (leading dot + open paren) so a prose mention of
+    /// "call_async" in a doc comment is not counted as an entry.
+    fn guest_entries(body: &str) -> Vec<usize> {
+        let mut entries: Vec<usize> = body
+            .match_indices(".call_async(")
+            .chain(body.match_indices(".instantiate_async("))
+            .map(|(i, _)| i)
+            .collect();
+        entries.sort_unstable();
+        entries
+    }
+
+    /// Source-scrape pin (#4864 review, fix 8 + round-4 P2; extended by #5480):
+    /// EVERY guest-entry call site (`instantiate_async` / `call_async`) — not
+    /// just the first — MUST be preceded by an `arm_epoch_deadline(` since the
+    /// previous guest entry in the same function. The store is reused across
+    /// calls, so a SECOND guest call that is not re-armed inherits the first
+    /// call's remaining epoch budget (the `__frnt_set_id` case). This also
+    /// future-proofs against a refactor adding a guest-entry path without arming
+    /// the deadline.
+    ///
+    /// #5480 made this pin's original form VACUOUS for half its list. Once the
+    /// four public entry points became thin wrappers around
+    /// `call_typed_blocking`, their bodies no longer contain `.call_async(`, and
+    /// the old `if entries.is_empty() { continue }` silently skipped them — the
+    /// pin would have stayed green with every safeguard deleted. So the list is
+    /// now split, and NEITHER half can pass by being empty:
+    ///
+    /// - `GUEST_ENTRY_FNS` really do enter the guest: each must contain at least
+    ///   one entry, and every entry must be armed.
+    /// - `DELEGATING_ENTRY_FNS` must contain NO guest entry of their own and
+    ///   must hand off to `call_typed_blocking`, which is what keeps the
+    ///   safeguards on one mechanism instead of a fifth hand-rolled near-copy.
     #[test]
     fn every_guest_entry_is_preceded_by_arm_epoch_deadline() {
         let src = include_str!("wasmtime_engine.rs");
-        for fn_name in [
+
+        // Functions that legitimately contain a guest entry.
+        const GUEST_ENTRY_FNS: &[&str] = &[
             // #4864 round-9 item 2: create_instance's guest entries moved into
             // instantiate_and_init so the store can be recovered on a guest-entry
             // timeout; scrape the new home of those entries.
             "fn instantiate_and_init(",
             "fn initiate_buffer(",
             "fn call_void(",
+            // #5480: the single shared body for all four contract/delegate
+            // entry points.
+            "fn call_typed_blocking(",
+        ];
+
+        // The public entry points, which must NOT enter the guest themselves.
+        const DELEGATING_ENTRY_FNS: &[&str] = &[
             "fn call_3i64(",
             "fn call_3i64_async_imports(",
             "fn call_2i64_blocking(",
             "fn call_3i64_blocking(",
-        ] {
-            let start = src
-                .find(fn_name)
-                .unwrap_or_else(|| panic!("guest-entry method `{fn_name}` not found"));
-            let after = &src[start..];
-            let end = after
-                .find("\n    fn ")
-                .or_else(|| after.find("\n    pub(crate) fn "))
-                .unwrap_or(after.len());
-            let body = &after[..end];
+        ];
 
-            // Every guest-entry occurrence (both call kinds), sorted. Match the
-            // method-call syntax (leading dot + open paren) so a prose mention of
-            // "call_async" in a doc comment is not treated as an entry.
-            let mut entries: Vec<usize> = body
-                .match_indices(".call_async(")
-                .chain(body.match_indices(".instantiate_async("))
-                .map(|(i, _)| i)
-                .collect();
-            entries.sort_unstable();
-            if entries.is_empty() {
-                continue;
-            }
+        for fn_name in GUEST_ENTRY_FNS {
+            let body = scrape_body(src, fn_name);
+            let entries = guest_entries(body);
+            // NOT `continue` — an empty list here means the scrape has drifted
+            // off the real guest entry and the pin is measuring nothing.
+            assert!(
+                !entries.is_empty(),
+                "`{fn_name}` is listed as a guest-entry method but contains no \
+                 `.call_async(`/`.instantiate_async(` — either it stopped entering \
+                 the guest (move it to DELEGATING_ENTRY_FNS) or this pin has gone \
+                 vacuous (#5480)"
+            );
             // Real arm CALLS only (`arm_epoch_deadline(`), not prose/identifier
             // mentions like this pin's own name.
             let arms: Vec<usize> = body
@@ -2863,6 +2906,23 @@ mod tests {
                 );
                 prev = entry_pos;
             }
+        }
+
+        for fn_name in DELEGATING_ENTRY_FNS {
+            let body = scrape_body(src, fn_name);
+            let entries = guest_entries(body);
+            assert!(
+                entries.is_empty(),
+                "`{fn_name}` enters the guest directly (`.call_async(` / \
+                 `.instantiate_async(` at {entries:?}). Every entry point must go \
+                 through `call_typed_blocking` so it gets spawn_blocking, the \
+                 wall-clock backstop and panic capture — a hand-rolled copy is how \
+                 delegates drifted without them (#5480)"
+            );
+            assert!(
+                body.contains("self.call_typed_blocking("),
+                "`{fn_name}` must delegate to `call_typed_blocking` (#5480)"
+            );
         }
     }
 
@@ -2972,33 +3032,43 @@ mod tests {
     #[test]
     fn blocking_paths_arm_epoch_inside_the_closure() {
         let src = include_str!("wasmtime_engine.rs");
-        for fn_name in ["fn call_2i64_blocking(", "fn call_3i64_blocking("] {
-            let start = src
-                .find(fn_name)
-                .unwrap_or_else(|| panic!("`{fn_name}` not found"));
-            let rest = &src[start + fn_name.len()..];
-            // Bound the body at the next method or the impl close.
-            let end = ["\n    fn ", "\n}"]
-                .iter()
-                .filter_map(|needle| rest.find(needle))
-                .min()
-                .map(|i| start + fn_name.len() + i)
-                .unwrap_or(src.len());
-            let body = &src[start..end];
+        // #5480: all four entry points share ONE body, so this scrapes that
+        // body rather than the per-entry-point copies it replaced.
+        let fn_name = "fn call_typed_blocking(";
+        let body = scrape_body(src, fn_name);
 
-            let ewb = body
-                .find("execute_wasm_blocking(")
-                .unwrap_or_else(|| panic!("`{fn_name}` must call execute_wasm_blocking"));
-            let arm = body
-                .find("arm_epoch_deadline(")
-                .unwrap_or_else(|| panic!("`{fn_name}` must arm the epoch deadline"));
-            assert!(
-                arm > ewb,
-                "`{fn_name}`: arm_epoch_deadline must be INSIDE the execute_wasm_blocking \
-                 closure (after the call), not before it — else queue wait consumes the \
-                 epoch budget and a healthy contract is quarantined (#4864 round-7)"
-            );
-        }
+        let ewb = body
+            .find("execute_wasm_blocking(")
+            .unwrap_or_else(|| panic!("`{fn_name}` must call execute_wasm_blocking"));
+        let arm = body
+            .find("arm_epoch_deadline(")
+            .unwrap_or_else(|| panic!("`{fn_name}` must arm the epoch deadline"));
+        assert!(
+            arm > ewb,
+            "`{fn_name}`: arm_epoch_deadline must be INSIDE the execute_wasm_blocking \
+             closure (after the call), not before it — else queue wait consumes the \
+             epoch budget and a healthy contract is quarantined (#4864 round-7)"
+        );
+
+        // #5480: the delegate instance id must be installed on the thread that
+        // actually runs the guest, i.e. INSIDE the same closure. Installed
+        // outside it, it lands on the caller's thread and every delegate host
+        // function reads the default -1.
+        let install = body.find("GuestDelegateInstance::install").unwrap_or_else(|| {
+            panic!("`{fn_name}` must install the delegate instance id (#5480)")
+        });
+        assert!(
+            install > ewb,
+            "`{fn_name}`: GuestDelegateInstance::install must be INSIDE the \
+             execute_wasm_blocking closure — on the blocking-pool thread that runs \
+             the guest, not the caller's thread (#5480)"
+        );
+        assert!(
+            install < arm,
+            "`{fn_name}`: install the delegate instance id BEFORE arming the epoch \
+             deadline, so a guest that traps immediately still had its env reachable \
+             (#5480)"
+        );
     }
 
     /// REGRESSION (issue #4441 fix-up): with `offload_compilation = true` on a

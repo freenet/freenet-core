@@ -479,14 +479,53 @@ pub(super) struct DelegateCallEnv {
     inherited_origins: SharedInheritedOrigins,
 }
 
-// SAFETY: DelegateCallEnv is only inserted into DELEGATE_ENV immediately before
-// a synchronous WASM process() call and removed immediately after. The raw pointer
-// to SecretsStore is valid for the entire duration because the Runtime (which owns
-// SecretsStore) is alive and on the same call stack. Wasmer's Singlepass compiler
-// executes WASM synchronously on the calling thread.
+// SAFETY: `DELEGATE_ENV` is a `static`, so its `DashMap` must be `Sync`, which
+// requires `DelegateCallEnv: Send + Sync`. This type holds raw pointers into the
+// `Runtime` that created it (`secret_store`, `contract_store`, `delegate_store`),
+// so these two impls are the whole basis for that soundness.
+//
+// The justification is NOT "WASM executes synchronously on the calling thread".
+// That was true when these impls were written and is FALSE since #5480: a
+// delegate guest now runs on a `spawn_blocking` worker, not on the thread that
+// built the env. Soundness rests on three properties instead, two of which the
+// compiler enforces:
+//
+//  1. VALIDITY. The pointers address fields of the `Runtime` whose `&mut self`
+//     frame is `delegate::execution::exec_inbound_with_env`. That frame is
+//     parked inside `execute_wasm_blocking` for the whole guest call, so the
+//     `Runtime` can be neither moved nor dropped while a guest can reach it.
+//
+//  2. EXCLUSIVITY. Exactly one thread ever dereferences them: the single thread
+//     running the guest. The creating thread is parked, and one guest call is
+//     one call stack, so two delegate host functions are never in flight at
+//     once. `DashMap` additionally serializes `get`/`get_mut` on the entry.
+//
+//  3. NO ESCAPE. Every reference derived from these pointers is produced by one
+//     of the four private accessors below (`secret_store`, `secret_store_mut`,
+//     `contract_store`, `delegate_store_mut`), each `&self -> &T`, so lifetime
+//     elision ties the result to the `Ref`/`RefMut` guard it came from. Nothing
+//     copies a raw pointer out: the fields are private and are dereferenced
+//     ONLY in those accessors. The borrow checker enforces this; it is not a
+//     convention a future edit can quietly break without `unsafe`.
+//
+// The wall-clock timeout added by #5480 is the one place 1 and 2 could break,
+// because the creating thread unparks while the guest thread keeps running
+// (`JoinHandle::abort()` cannot stop a `spawn_blocking` closure). Two things
+// close it:
+//
+//  - `DelegateEnvGuard::drop` removes the entry, and `DashMap::remove` takes
+//    the shard WRITE lock, so it waits for any in-flight host call's guard to
+//    release. That is precisely why that drop can block for the duration of one
+//    host call, and why property 3 above must hold for the wait to be enough.
+//  - After the remove returns, every later lookup by the abandoned thread
+//    misses. `INSTANCE_ID` (`wasm_runtime::runtime`) is a monotonic
+//    `AtomicI64`, so an id is NEVER reissued and a stale thread can never reach
+//    a LATER call's env. That non-reuse is load-bearing: keying instances by
+//    anything recycled (a pool slot, a code hash) would make these impls
+//    unsound, because the stale thread would alias the new call's `&mut`
+//    borrows of the very same stores.
 unsafe impl Send for DelegateCallEnv {}
-// SAFETY: Same rationale as Send above -- single-threaded synchronous WASM execution
-// means DelegateCallEnv is never accessed from multiple threads concurrently.
+// SAFETY: as for `Send` directly above -- the two are one argument.
 unsafe impl Sync for DelegateCallEnv {}
 
 /// Typed errors from `DelegateCallEnv` contract operations.
