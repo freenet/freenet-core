@@ -4419,6 +4419,51 @@ impl Ring {
             .add_client_subscription(instance_id, client_id)
     }
 
+    /// How many contracts `client_id` is subscribed to, and whether it already
+    /// holds one for a given contract. Used by the delegate demand path to
+    /// apply the same per-subscriber cap the WebSocket path gets.
+    pub fn client_subscription_count(&self, client_id: crate::client_events::ClientId) -> usize {
+        self.hosting_manager.client_subscription_count(client_id)
+    }
+
+    /// Whether `client_id` already holds a subscription for `instance_id`.
+    pub fn has_client_subscription(
+        &self,
+        instance_id: &ContractInstanceId,
+        client_id: crate::client_events::ClientId,
+    ) -> bool {
+        self.hosting_manager
+            .has_client_subscription(instance_id, client_id)
+    }
+
+    /// Remove a single client subscription for `contract`.
+    ///
+    /// Returns true when that was the last client subscription for it. Used by
+    /// the delegate demand path (`contract::delegate_demand`) to drop one
+    /// delegate's pin on one contract without disturbing the others it holds.
+    ///
+    /// Records abandonment on the way out, which the bare
+    /// `HostingManager::remove_client_subscription` does not: the
+    /// client-disconnect path gets that from
+    /// `remove_client_from_all_subscriptions`, and a single-subscription
+    /// removal has to do it here or the two teardowns disagree.
+    /// `record_abandonment` resets the contract's recency to the current
+    /// frontier at subscription TERMINATION (`hosting-invariants.md`
+    /// invariant 3), so without it a formerly-subscribed contract is ranked
+    /// for eviction on a stale last-read it accrued while parked in the
+    /// subscription tier, and is shed earlier than the invariant intends.
+    pub fn remove_client_subscription(
+        &self,
+        contract: &ContractKey,
+        client_id: crate::client_events::ClientId,
+    ) -> bool {
+        let was_last = self
+            .hosting_manager
+            .remove_client_subscription(contract.id(), client_id);
+        self.hosting_manager.maybe_record_abandonment(contract);
+        was_last
+    }
+
     /// Remove a client from all its subscriptions (used when client disconnects).
     ///
     /// Returns a [`ClientDisconnectResult`] with:

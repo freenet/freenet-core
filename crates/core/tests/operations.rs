@@ -4437,21 +4437,67 @@ async fn test_delegate_subscribe_on_peer_node(ctx: &mut TestContext) -> TestResu
 
     // Poll rather than assert once: convergence here is eventual by design, so
     // the meaningful failure is "never converges", not "briefly stale".
+    //
+    // The peer's delegate is subscribed, so this client also receives pushed
+    // `DelegateResponse` notifications once the UPDATE lands — the delegate
+    // answers every `ContractNotification` with an `ApplicationMessage`, which
+    // routes back to whichever client registered it. Those arrive interleaved
+    // with our GET responses. Discarding one silently would consume an attempt
+    // AND shift request/response pairing for the rest of the loop, so a stray
+    // notification could exhaust the budget and report "never converged" for
+    // entirely the wrong reason. Drain until the GetResponse for this request
+    // actually arrives, and count only GETs against the attempt budget.
     let mut converged = false;
     for attempt in 0..10 {
         tokio::time::sleep(Duration::from_secs(2)).await;
         make_get(&mut client_peer, contract_key, false, false).await?;
-        let resp = timeout(Duration::from_secs(30), client_peer.recv()).await??;
-        if let HostResponse::ContractResponse(ContractResponse::GetResponse {
-            key, state, ..
-        }) = resp
-        {
-            ensure!(key == contract_key, "GET key mismatch while converging");
-            if state.as_ref() == gateway_state.as_ref() {
-                tracing::info!(attempt, "peer converged on the gateway's state");
-                converged = true;
-                break;
+
+        let mut discarded = 0usize;
+        let state = loop {
+            let resp = timeout(Duration::from_secs(30), client_peer.recv()).await??;
+            match resp {
+                HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    key,
+                    state,
+                    ..
+                }) => {
+                    ensure!(key == contract_key, "GET key mismatch while converging");
+                    break state;
+                }
+                // A delegate notification, or anything else pushed while we
+                // were waiting. Log it rather than dropping it silently: if
+                // this test ever fails, whoever reads the output needs to know
+                // what else was on the wire. Variants are enumerated rather
+                // than wildcarded to match the house style in this file — a
+                // bare `_` would also swallow a future variant that ought to be
+                // looked at.
+                other @ HostResponse::ContractResponse(_)
+                | other @ HostResponse::DelegateResponse { .. }
+                | other @ HostResponse::QueryResponse(_)
+                | other @ HostResponse::Ok
+                | other @ HostResponse::StreamChunk { .. }
+                | other @ HostResponse::StreamHeader { .. }
+                | other => {
+                    discarded += 1;
+                    tracing::debug!(
+                        attempt,
+                        discarded,
+                        ?other,
+                        "discarding a pushed response while awaiting the GET"
+                    );
+                    ensure!(
+                        discarded < 20,
+                        "too many pushed responses while awaiting a GET — the \
+                         peer is emitting something unexpected"
+                    );
+                }
             }
+        };
+
+        if state.as_ref() == gateway_state.as_ref() {
+            tracing::info!(attempt, "peer converged on the gateway's state");
+            converged = true;
+            break;
         }
     }
     ensure!(

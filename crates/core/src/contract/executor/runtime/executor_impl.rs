@@ -2432,40 +2432,44 @@ where
                         contract = %key,
                         "Delegate notification channel closed — removing stale subscriptions"
                     );
-                    // The receiver is gone for EVERY contract, not just this
-                    // one. There is a single delegate-notification channel per
-                    // `RuntimePool`, cloned into each executor
-                    // (`pool.rs::set_delegate_notification_tx`), so `Closed`
-                    // means no delegate can be notified again about anything.
-                    // Retire these delegates from both maps entirely rather
-                    // than only from this contract's entry.
+                    // Scoped to THIS contract, deliberately, and it is worth
+                    // recording why the wider version is wrong.
                     //
-                    // Scoping the cleanup to `instance_id` (as this did before
-                    // #4669) was harmless while `DELEGATE_SUBSCRIPTIONS` was an
-                    // inert notification map: a leftover entry for some other
-                    // contract cost nothing until that contract next committed
-                    // state. It is not harmless now. A leftover DEMAND
-                    // registration is a ring-level pin: it holds
-                    // `contract_in_use`, drives renewal SUBSCRIBEs, and blocks
-                    // eviction — for a contract whose only consumer is provably
-                    // dead. And a quiet contract may never commit state again,
-                    // so the per-contract cleanup might never run for it.
+                    // The tempting argument is: there is one
+                    // delegate-notification channel per `RuntimePool` (created
+                    // in `pool.rs`, cloned into each executor), so `Closed`
+                    // means no delegate on this node can be notified again
+                    // about anything — therefore retire every delegate in the
+                    // snapshot from every contract. That is wrong, because the
+                    // two records this arm keeps in sync have DIFFERENT SCOPES:
+                    // `DELEGATE_SUBSCRIPTIONS` is a process-global `static`
+                    // (`wasm_runtime::native_api`), while demand lives in this
+                    // node's own `Ring`. Several nodes share one process in
+                    // every `#[freenet_test]`, so a node-wide sweep of the
+                    // global map would strip ANOTHER node's hooks while
+                    // dropping only THIS node's demand — manufacturing the
+                    // precise state the paragraph below says must never exist.
                     //
-                    // Both maps are cleared together on purpose. Clearing one
-                    // and not the other is the drift this module exists to
-                    // avoid: demand without a hook is an unconsumable pin, a
-                    // hook without demand is the original #4669 defect.
-                    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, delegates| {
-                        for delegate_key in &subscribers {
-                            delegates.remove(delegate_key);
-                        }
-                        !delegates.is_empty()
-                    });
+                    // So both maps are cleared together, for this contract, on
+                    // this node. Clearing one and not the other is the drift
+                    // this module exists to avoid: demand without a hook is an
+                    // unconsumable pin, a hook without demand is the original
+                    // #4669 defect.
+                    //
+                    // The residual — a delegate whose OTHER contracts are quiet
+                    // keeps their pins until it next subscribes or is
+                    // unregistered — is real and is #5487, along with the two
+                    // other same-shape divergences. It closes when the hook and
+                    // the demand become one record with one owner (#4669 part
+                    // 3), which is also the only fix that could make a
+                    // node-wide sweep coherent.
+                    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&instance_id);
                     if let Some(op_manager) = &self.op_manager {
                         for delegate_key in &subscribers {
-                            crate::contract::delegate_demand::drop_delegate_demand(
+                            crate::contract::delegate_demand::drop_subscription(
                                 op_manager,
                                 delegate_key,
+                                key,
                             );
                         }
                     }

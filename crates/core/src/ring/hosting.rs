@@ -1633,6 +1633,31 @@ impl HostingManager {
         no_more_subscriptions
     }
 
+    /// How many contracts `client_id` is subscribed to.
+    ///
+    /// A scan over `client_subscriptions`, because that map is keyed by
+    /// contract and there is no per-client index. Callers are subscribe paths,
+    /// which are infrequent relative to reads, so the scan is acceptable; do
+    /// not call it per message.
+    pub fn client_subscription_count(&self, client_id: crate::client_events::ClientId) -> usize {
+        self.client_subscriptions
+            .iter()
+            .filter(|entry| entry.value().contains(&client_id))
+            .count()
+    }
+
+    /// Whether `client_id` is already subscribed to `instance_id`.
+    pub fn has_client_subscription(
+        &self,
+        instance_id: &ContractInstanceId,
+        client_id: crate::client_events::ClientId,
+    ) -> bool {
+        self.client_subscriptions
+            .get(instance_id)
+            .map(|clients| clients.contains(&client_id))
+            .unwrap_or(false)
+    }
+
     /// Check if there are any client subscriptions for a contract.
     pub fn has_client_subscriptions(&self, instance_id: &ContractInstanceId) -> bool {
         self.client_subscriptions
@@ -2099,7 +2124,7 @@ impl HostingManager {
     /// lock. Callers must invoke this AFTER any subscription-map guard
     /// they hold has been dropped (the guard is needed to mutate state,
     /// not to read `contract_in_use`).
-    fn maybe_record_abandonment(&self, contract: &ContractKey) {
+    pub(super) fn maybe_record_abandonment(&self, contract: &ContractKey) {
         if !self.contract_in_use(contract) {
             self.hosting_cache.write().record_abandonment(contract);
         }

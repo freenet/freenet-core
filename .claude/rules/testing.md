@@ -231,12 +231,55 @@ WHEN writing a mutation/falsification script:
   → restore from git in an EXIT trap, not at the end of the happy path
   → write a marker file (e.g. `.mutation-in-progress`) before the first
     mutation and remove it in the SAME trap, so the two cannot disagree
+  → hash the mutated files before the first mutation and assert the hash
+    matches after the last restore
   → stage with an explicit pathspec while any run may be live, never
-    `git add -u`/`-A`, and confirm with `git show --stat` afterwards
+    `git add -u`/`-A`, and confirm by CONTENT (`git show HEAD:<path>` and grep
+    the invariant the mutation removes), not by filename
 
 A SIGKILL then leaves the marker beside the dirty tree, which is the right way
 round: the loud state is the unsafe one.
 ```
+
+**Keep both the marker and the hash — they fail differently.** The marker
+catches a run that was interrupted before its trap; the hash catches a restore
+that *ran* and put back the wrong bytes. `git checkout --` reporting success
+says the command executed, not that the tree matches.
+
+**Why the content check, and not just "verify the diff is yours".** That
+standing advice is NAME-based, and it fails in exactly the case a mutation
+harness creates: when the tool rewrites a file you were *also* editing
+legitimately, `M <file>` in `git status` looks identical whether the restore
+worked or not. One agent caught its near-miss only because the file was
+*unexpectedly* dirty; another was editing the same file the harness mutated, so
+nothing would have looked wrong at all — that one came out clean by ordering,
+not by a check.
+
+### A filtered `cargo test` that matches nothing exits 0
+
+`cargo test -- <filter>` with a filter matching no test prints `0 passed` and
+exits **0**. That is byte-for-byte indistinguishable from a clean run, so a
+verification step whose filter has drifted — a renamed test, a moved module, a
+changed `mod` path — reports success while executing nothing, and everything
+downstream inherits the falsehood. Seven instances surfaced in one day; the
+worst sat inside a verification harness rather than a test, so it laundered
+every claim built on it.
+
+```
+WHEN a script relies on a filtered test run:
+  → assert the test COUNT, never the exit code
+  → fail the step when zero tests ran, with a message saying the filter
+    matched nothing rather than that the tests passed
+  → name pins individually rather than relying on a module prefix that a
+    refactor can silently move out from under you
+```
+
+**Mutation results are self-evidencing against this trap and ordinary green
+runs are not.** A mutation that fails to fail is visible: if the filter matched
+nothing, the mutated run would report success and the round would show no red.
+So "8 of 8 mutations went red" survives the empty-filter trap in a way that "the
+tests passed" never does. When you cite a green run as evidence, cite the count
+with it.
 
 ## Reference Patterns
 

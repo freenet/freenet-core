@@ -42,8 +42,22 @@
 //! `teardown_evicted_in_use_contract` and governance's `beneficiary_counts`. A
 //! parallel delegate term would have to be added to each, and the next consumer
 //! added to `client_subscriptions` would silently not get it. Registering in the
-//! one map means every one of those consumers is correct by construction, now
-//! and later.
+//! one map means every consumer that READS THE MAP is correct by construction,
+//! now and later.
+//!
+//! That qualifier is load-bearing. It does not extend to side effects performed
+//! at the WebSocket CALL SITES rather than by the map, and there is one:
+//! `NetEventLog::hosting_started`, which both `client_events.rs` sites emit on
+//! `is_first_client` and this path cannot (see `register_subscription`). Nor
+//! does it extend to `InterestManager`, which is a separate map — see the
+//! `add_local_client` discussion on `register_subscription`, and note the
+//! consequence that `InterestManager::active_demand_count` (the denominator for
+//! the #3763 "renewal volume must scale with active demand" invariant) does not
+//! see delegate pins at all. A node with N delegate-pinned contracts reports N
+//! renewing subscriptions against zero active demand. That is the storm
+//! detector being blind to precisely the unbounded thing #5467 open question 1
+//! is about, and it is an argument for settling that bound rather than a reason
+//! to inflate a second counter from here.
 //!
 //! That breadth cuts both ways and the governance one is worth stating outright
 //! rather than leaving as a surprise: `beneficiary_counts` derives a contract's
@@ -113,6 +127,8 @@
 //! dedup, backoff, ban gate, outer-cancel deadline). Adding a second spawn site
 //! here would duplicate that scaffolding, which is exactly the drift the "one
 //! helper, not two" note on that function exists to prevent.
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use freenet_stdlib::prelude::{ContractKey, DelegateKey};
 
@@ -214,11 +230,15 @@ fn is_delegate_client(client_id: ClientId) -> bool {
 ///    inflate `local_client_count` on every repeat subscribe.
 /// 2. It would buy nothing. `InterestManager::is_interested` is
 ///    `hosting || local_client_count > 0 || downstream_subscriber_count > 0`,
-///    and `hosting` is already true for every contract this node holds
-///    (`register_local_hosting` runs on the PUT and GET store paths) — which is
-///    a precondition of subscribing at all, since both subscribe paths refuse a
-///    contract that is not local. So the contract already participates in
-///    anti-entropy.
+///    and `hosting` is true for every contract this node holds by the ordinary
+///    routes (`register_local_hosting` runs on the PUT and GET store paths),
+///    which the gate above has already required. One exception, narrow and
+///    known: `rehydrate_local_hosting_interest` skips restored hosting-cache
+///    keys whose state is absent, so after a restart such a key can be in the
+///    cache with `LocalInterest.hosting == false`, and a delegate pin on it
+///    does not join anti-entropy. There is no state to sync in that case, so
+///    the consequence is nil — but the claim is not absolute and reason 2 rests
+///    on it.
 ///
 /// The matching consequence is that [`drop_delegate_demand`] must NOT call
 /// `remove_local_client` either — doing so would decrement a count this module
@@ -277,23 +297,94 @@ pub(crate) fn register_subscription(
     contract: &ContractKey,
 ) -> bool {
     if !op_manager.ring.is_hosting_contract(contract) {
-        // WARN, not debug, and deliberately so. This whole module exists
-        // because a delegate subscribe could silently fail to pin; a silent
+        // WARN, not debug, and deliberately so: this whole module exists
+        // because a delegate subscribe could silently fail to pin, and a silent
         // variant of the same outcome is the one thing that must not ship
         // quiet. The delegate is still told the subscribe succeeded (changing
         // that would break callers that subscribe before the node settles), so
         // this line is the only signal that the pin did not take.
-        tracing::warn!(
-            delegate = %delegate,
-            contract = %contract,
-            "delegate subscribed to a contract this node resolves but does not \
-             host: no demand registered, so the pin did NOT take and the \
-             contract will not be renewed on the delegate's behalf. See \
-             `delegate_demand::register_subscription`"
-        );
+        //
+        // Rate-limited, because a delegate controls how often it lands here: a
+        // V2 delegate can call `subscribe_contract()` in a loop and a V1 one
+        // can emit many `SubscribeContractRequest`s per `process()`. An
+        // unrated per-occurrence WARN on a delegate-driven path is how #4238
+        // flooded gateways, and the `Full` arm of
+        // `send_delegate_contract_notifications` carries a counter for exactly
+        // that reason. Every occurrence is still counted; only the logging is
+        // thinned, so the total stays visible.
+        static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+        static LAST_LOGGED: AtomicU64 = AtomicU64::new(0);
+        let total = SUPPRESSED.fetch_add(1, Ordering::Relaxed) + 1;
+        let last = LAST_LOGGED.load(Ordering::Relaxed);
+        // Log the first, then on a widening cadence: 1, 2, 4, 8, ... so a
+        // runaway is visible without being per-occurrence.
+        if total == 1 || total >= last.saturating_mul(2) {
+            LAST_LOGGED.store(total, Ordering::Relaxed);
+            tracing::warn!(
+                delegate = %delegate,
+                contract = %contract,
+                occurrences = total,
+                "delegate subscribed to a contract this node resolves but does \
+                 not host: no demand registered, so the pin did NOT take and \
+                 the contract will not be renewed on the delegate's behalf. \
+                 See `delegate_demand::register_subscription`"
+            );
+        }
         return false;
     }
     let client_id = client_id_for(delegate);
+
+    // Apply the SAME per-subscriber cap a WebSocket client gets.
+    //
+    // This is not a bound invented here. `MAX_SUBSCRIPTIONS_PER_CLIENT` is an
+    // existing, deliberately network-uniform constant (see its doc: made
+    // non-configurable on purpose, because a per-node cap would mean a dApp
+    // works on some peers and not others). The WebSocket path gets it
+    // transitively: `client_events.rs` calls `add_client_subscription` only
+    // inside the `Ok` arm of the listener registration, and that registration
+    // is where `RuntimePool` enforces both this cap and
+    // `MAX_SUBSCRIBERS_PER_CONTRACT`. A client at the cap is refused and never
+    // reaches the ring.
+    //
+    // Registering demand directly, as this module does, walks straight past
+    // that gate. Without this check a delegate could hold unbounded ring
+    // demand while an ordinary client doing exactly the same thing is capped at
+    // 500 — and every entry drives `contract_in_use`, renewal traffic and
+    // eviction priority. That is not the "deliberate call" #5467 open question
+    // 1 asks for; it is an accidental exemption from a decision already taken.
+    // Reusing the existing constant is the opposite of inventing a number, and
+    // #5467 can still raise or reshape it for delegates specifically.
+    //
+    // Checked only for a NEW registration, so an idempotent re-subscribe at the
+    // cap is not refused.
+    if !op_manager
+        .ring
+        .has_client_subscription(contract.id(), client_id)
+        && op_manager.ring.client_subscription_count(client_id)
+            >= crate::contract::executor::MAX_SUBSCRIPTIONS_PER_CLIENT
+    {
+        tracing::warn!(
+            delegate = %delegate,
+            contract = %contract,
+            limit = crate::contract::executor::MAX_SUBSCRIPTIONS_PER_CLIENT,
+            "delegate is at the per-subscriber subscription cap; refusing to \
+             register further demand. The subscribe still succeeds and \
+             notifications still work, but this contract is not pinned."
+        );
+        return false;
+    }
+
+    // The `AddClientSubscriptionResult` is deliberately dropped. Both WebSocket
+    // call sites act on `is_first_client` to emit `NetEventLog::hosting_started`
+    // (`client_events.rs`), and this path does not — `register_events` is async
+    // and this function is sync, called on the WASM call stack by the V2 host
+    // function, where there is nothing to await on.
+    //
+    // The consequence is real and worth stating rather than leaving to be
+    // discovered: a contract whose hosting begins because of a delegate pin
+    // emits no hosting-started event. Mirroring it would mean spawning a task
+    // per first registration purely for telemetry; that is a judgement call for
+    // #5467 Phase 0, which owns per-delegate observability, not for this change.
     op_manager
         .ring
         .add_client_subscription(contract.id(), client_id);
@@ -306,6 +397,34 @@ pub(crate) fn register_subscription(
     true
 }
 
+/// Drop the demand `delegate` holds on `contract`, if any, and collapse the
+/// upstream subscription when nothing else is left interested.
+///
+/// Scoped to one contract on purpose. Its caller — the channel-closed arm in
+/// `contract/executor/runtime/executor_impl.rs` — clears the matching
+/// notification hook for the same single contract, and the two must move
+/// together. A wider sweep is not available to that caller: the hook map is a
+/// process-global `static` while demand is per-`Ring`, so retiring a delegate
+/// "everywhere" would cross node boundaries in any multi-node test process
+/// while dropping demand on one node only.
+pub(crate) fn drop_subscription(
+    op_manager: &std::sync::Arc<OpManager>,
+    delegate: &DelegateKey,
+    contract: &ContractKey,
+) {
+    let client_id = client_id_for(delegate);
+    op_manager
+        .ring
+        .remove_client_subscription(contract, client_id);
+    tracing::debug!(
+        delegate = %delegate,
+        contract = %contract,
+        %client_id,
+        "delegate subscription demand dropped"
+    );
+    collapse_if_no_interest(op_manager, contract);
+}
+
 /// Send `Unsubscribe` upstream for `contract` when nothing on this node is
 /// interested in it any more.
 ///
@@ -315,25 +434,33 @@ pub(crate) fn register_subscription(
 /// mirrored-condition drift `.claude/rules/bug-prevention-patterns.md` warns
 /// about.
 fn collapse_if_no_interest(op_manager: &std::sync::Arc<OpManager>, contract: &ContractKey) {
-    if !op_manager.reconcile_wants_collapse(
-        contract,
-        crate::node::network_status::ReconcileShadowSite::Collapse,
-    ) {
-        return;
-    }
+    // Sampled ONCE, inside the task, not here and again there.
+    //
+    // `reconcile_wants_collapse` is not a pure predicate: every call records a
+    // shadow comparison (`OpManager::reconcile_wants_collapse` →
+    // `network_status::record_reconcile_shadow_comparison`). That counter is
+    // the ship-gate falsifier for the #4642 P6 collapse flip, so gating here
+    // AND re-checking in the task would double its denominator from a path
+    // that has nothing to do with what it measures — the "metric describing a
+    // decision, re-derived at the call site" row of
+    // `.claude/rules/bug-prevention-patterns.md`, in its counting form.
+    //
+    // The in-task check is the one worth keeping: it is the decision closest to
+    // the send, so it also closes the window where a re-subscribe lands between
+    // the gate and the `Unsubscribe`. Spawning unconditionally costs an
+    // already-cheap task in the case where the contract is still in use.
     let op_mgr = op_manager.clone();
     let contract = *contract;
     crate::config::GlobalExecutor::spawn(async move {
-        // Re-check inside the task. The gate above and the send are not atomic,
-        // so a re-subscribe landing in between would otherwise send Unsubscribe
-        // upstream for a contract that is in use again — and
-        // `send_unsubscribe_upstream` does not re-check for itself. The
-        // client-disconnect path in `client_events.rs` has the same shape and
-        // does not re-check, which is tolerable there because a human-paced
-        // disconnect fires it once; here the channel-closed teardown can fire
-        // it in a loop over every delegate on a contract, so the window is
-        // worth closing. This narrows the race to the span inside the task
-        // rather than eliminating it; the renewal loop repairs the remainder.
+        // Decided here rather than before the spawn, so the check sits as close
+        // to the send as it can. A re-subscribe landing between the decision
+        // and the `Unsubscribe` would otherwise collapse a contract that is in
+        // use again, and `send_unsubscribe_upstream` does not re-check for
+        // itself. The client-disconnect path in `client_events.rs` decides
+        // before spawning, which is tolerable there because a human-paced
+        // disconnect fires it once; the delegate teardown can fire it in a loop
+        // over every contract a delegate pinned. This narrows the race rather
+        // than eliminating it; the renewal loop repairs the remainder.
         if !op_mgr.reconcile_wants_collapse(
             &contract,
             crate::node::network_status::ReconcileShadowSite::Collapse,
@@ -576,6 +703,77 @@ mod tests {
         assert_eq!((0, 0), ring.local_and_downstream_counts(&key));
     }
 
+    /// A delegate gets the SAME per-subscriber cap a WebSocket client gets.
+    ///
+    /// The WebSocket path receives `MAX_SUBSCRIPTIONS_PER_CLIENT` transitively:
+    /// `client_events.rs` calls `add_client_subscription` only inside the `Ok`
+    /// arm of the listener registration, and that registration is where
+    /// `RuntimePool` enforces the cap. Registering demand directly walks past
+    /// that gate, so without an explicit check a delegate would hold unbounded
+    /// ring demand while an ordinary client doing the same thing is refused.
+    #[tokio::test(start_paused = true)]
+    async fn a_delegate_gets_the_same_subscription_cap_as_a_websocket_client() {
+        let fixture = seam_fixture("delegate-demand-4669-cap").await;
+        let op_manager = fixture.op_manager.clone();
+        let ring = &op_manager.ring;
+        let delegate = delegate_key(71);
+        let cap = crate::contract::executor::MAX_SUBSCRIPTIONS_PER_CLIENT;
+
+        // Fill to the cap through the real registration path.
+        let mut keys = Vec::with_capacity(cap + 1);
+        for i in 0..=cap {
+            // Distinct 32-byte ids without colliding with the other tests'
+            // fixed seeds: index the first four bytes.
+            let mut raw = [0u8; 32];
+            raw[0] = 0xC0;
+            raw[1..5].copy_from_slice(&(i as u32).to_le_bytes());
+            let key = ContractKey::from_id_and_code(
+                freenet_stdlib::prelude::ContractInstanceId::new(raw),
+                freenet_stdlib::prelude::CodeHash::new([7u8; 32]),
+            );
+            let _ = ring.host_contract(
+                key,
+                121,
+                crate::ring::AccessType::Put,
+                crate::ring::HostingCause::Other,
+            );
+            keys.push(key);
+        }
+
+        for key in keys.iter().take(cap) {
+            assert!(
+                register_subscription(&op_manager, &delegate, key),
+                "registration below the cap must succeed"
+            );
+        }
+        assert_eq!(
+            cap,
+            ring.client_subscription_count(client_id_for(&delegate))
+        );
+
+        assert!(
+            !register_subscription(&op_manager, &delegate, &keys[cap]),
+            "the {cap}-th+1 registration must be refused — a delegate must not \
+             hold more ring demand than a WebSocket client is allowed"
+        );
+        assert!(
+            !ring.contract_in_use(&keys[cap]),
+            "the refused contract must not be pinned"
+        );
+
+        // An idempotent re-subscribe to something already registered must NOT
+        // be refused just because the delegate sits at the cap.
+        assert!(
+            register_subscription(&op_manager, &delegate, &keys[0]),
+            "a repeat subscribe to an already-registered contract must still \
+             succeed at the cap — it adds no new demand"
+        );
+        assert_eq!(
+            cap,
+            ring.client_subscription_count(client_id_for(&delegate))
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn dropping_one_delegates_demand_leaves_another_delegates_intact() {
         let fixture = seam_fixture("delegate-demand-4669-independent").await;
@@ -768,7 +966,7 @@ mod tests {
         // `Runtime::build`, so this substring counts both.
         let constructors = production.matches("Runtime::build").count();
         let installs = production
-            .matches("set_delegate_subscribe_callback(")
+            .matches("rt.set_delegate_subscribe_callback(")
             .count();
         assert_eq!(
             constructors, installs,
@@ -777,15 +975,38 @@ mod tests {
              and {installs} install(s). If a constructor was added, install the \
              callback in it; do not loosen this pin."
         );
+
+        // The callback value itself must come from the ONE shared constructor,
+        // not from an inline closure per call site. Inline closures are how the
+        // two installs drift apart — one gets updated and the other does not —
+        // and it is the duplication #5479/#5490 is collapsing for the sibling
+        // state-write callback. Anchor on the function so re-inlining fails.
+        assert_eq!(
+            1,
+            production
+                .matches("pub(super) fn v2_delegate_subscribe_callback(")
+                .count(),
+            "there must be exactly one `v2_delegate_subscribe_callback` \
+             definition — the shared value is what keeps the constructors from \
+             drifting"
+        );
         assert_eq!(
             installs,
             production
+                .matches("v2_delegate_subscribe_callback(op_manager")
+                .count(),
+            "every install must take its value from `v2_delegate_subscribe_callback`, \
+             not from an inline closure — an inline closure at one constructor \
+             and the helper at another is exactly the drift this pin exists for"
+        );
+        assert_eq!(
+            1,
+            production
                 .matches("delegate_demand::register_subscription(")
                 .count(),
-            "each installed subscribe callback must delegate to \
-             `delegate_demand::register_subscription` — the V1 arm calls the \
-             same helper, and the two paths converging on one helper is what \
-             stops them drifting"
+            "the shared callback must be the only thing in this file that calls \
+             `delegate_demand::register_subscription` — a second call site means \
+             the helper has been bypassed"
         );
     }
 

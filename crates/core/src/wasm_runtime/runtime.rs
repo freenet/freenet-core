@@ -1025,8 +1025,11 @@ pub type StateAdmitCallback = Arc<
 /// demand. Without it, a V2 delegate subscribe is a passive notification hook
 /// that never sets `contract_in_use` — the #4669 defect.
 ///
-/// Registration is a pure in-memory `DashMap` insert (no I/O, no await), so
-/// calling it on the WASM call stack is safe.
+/// Registration takes a `parking_lot` read lock on the hosting cache and then a
+/// `DashMap` insert — no I/O and no await, so calling it on the WASM call stack
+/// is safe. Nothing executes WASM while holding that lock for writing, so the
+/// nesting introduces no cycle; the read is worth naming because "pure DashMap
+/// insert" would understate what the call site is holding.
 pub type DelegateSubscribeCallback = Arc<
     dyn Fn(&freenet_stdlib::prelude::DelegateKey, &freenet_stdlib::prelude::ContractKey)
         + Send

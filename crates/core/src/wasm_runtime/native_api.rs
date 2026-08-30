@@ -2130,6 +2130,12 @@ pub(super) mod delegate_contracts {
     /// When the subscribed contract's state changes, `Executor::finalize_state_commit`
     /// delivers a `ContractNotification` to this delegate.
     ///
+    /// It ALSO registers ring demand, when this node is hosting the contract
+    /// (#4669) — see `contract::delegate_demand::register_subscription` for the
+    /// gate and for what happens when the node resolves the contract without
+    /// hosting it. Both halves are recorded; only the notification half was
+    /// recorded before.
+    ///
     /// ## Returns
     /// - `0`: success (contract is known, subscription registered)
     /// - `ERR_CONTRACT_CODE_NOT_REGISTERED (-10)`: unknown contract
