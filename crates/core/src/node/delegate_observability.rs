@@ -210,6 +210,20 @@ pub(crate) const DELEGATE_STATS_TTL: Duration = Duration::from_secs(6 * 60 * 60)
 /// bounds what is STORED and not merely what is shown.
 pub(crate) const MAX_LAST_ERROR_BYTES: usize = 512;
 
+/// Whether the subscribe-without-demand counter has a production call site yet.
+///
+/// The recorder ([`record_subscribe_without_demand`]) is built and tested here,
+/// but its call site lives in `contract::delegate_demand::register_subscription`
+/// — a file that arrives with the demand-wiring workstream's PR, which merges
+/// before this one. The call site is added when this branch rebases onto it,
+/// and this flips to `true` in the same commit.
+///
+/// It exists so the dashboard can say "not wired" instead of rendering `0`.
+/// A zero here would read as "no pin ever failed", which is the strongest
+/// possible claim and one this build cannot make — the same fabricated-value
+/// trap as reporting `0` pending wakeups for a scheduler that does not exist.
+pub(crate) const SUBSCRIBE_DEMAND_TRACKING_WIRED: bool = false;
+
 /// Number of samples retained for the invocation-rate window.
 ///
 /// Matches the production `Meter` window (`topology.rs`, `new_with_window_size(100)`).
@@ -429,6 +443,11 @@ pub(crate) fn record_invocation(
 /// silently miss it. Attribution is per DELEGATE, which is the right unit —
 /// the finding is about that delegate's subscription, not about the request
 /// that happened to carry it.
+///
+/// `#[allow(dead_code)]` until the call site lands — see
+/// [`SUBSCRIBE_DEMAND_TRACKING_WIRED`]. Remove the attribute in the same commit
+/// that adds the call, so an unused recorder cannot quietly become permanent.
+#[allow(dead_code)]
 pub(crate) fn record_subscribe_without_demand(key: &DelegateKey, now: Instant) {
     with_entry(key, now, |entry, _now| {
         entry.subscribes_without_demand = entry.subscribes_without_demand.saturating_add(1);
@@ -625,6 +644,11 @@ pub struct DelegateStatusSnapshot {
     /// delegates. Cumulative, so it is non-zero even after the subscriptions
     /// involved have gone.
     pub subscribes_without_demand_total: u64,
+    /// Whether [`SUBSCRIBE_DEMAND_TRACKING_WIRED`] holds — i.e. whether
+    /// `subscribes_without_demand_total` is a real measurement or a
+    /// not-yet-wired placeholder. The dashboard must not render the count as a
+    /// number while this is `false`.
+    pub subscribe_demand_tracking_wired: bool,
 
     /// Delegate module-cache gauges, read live from `Ring::module_cache_metrics`.
     /// These already existed but reached fleet telemetry only (`ring.rs`), never
@@ -843,6 +867,7 @@ pub(crate) fn build_snapshot(ring: &crate::ring::Ring, now: Instant) -> Delegate
         subscriptions_without_demand,
         iteration_cap_hits_total,
         subscribes_without_demand_total,
+        subscribe_demand_tracking_wired: SUBSCRIBE_DEMAND_TRACKING_WIRED,
         module_cache_entries: mc.delegate_entries,
         module_cache_total_bytes: mc.delegate_total_bytes,
         module_cache_budget_bytes: mc.delegate_budget_bytes,
@@ -1374,6 +1399,30 @@ mod tests {
         assert_eq!(entry.errors, 0, "a pin that did not take is not an error");
         drop(entry);
         clear_for_test();
+    }
+
+    /// While the counter has no call site, the snapshot must SAY so rather than
+    /// letting a zero speak for it. Same rule as the wakeups flag: a count of
+    /// `0` from an unwired source is a fabricated measurement, and it is the
+    /// most reassuring possible one, which makes it the worst to get wrong.
+    #[test]
+    fn subscribe_demand_tracking_reports_whether_it_is_wired() {
+        let snap = DelegateStatusSnapshot::default();
+        assert!(
+            !snap.subscribe_demand_tracking_wired,
+            "Default must not claim the counter is wired"
+        );
+        // The gate and the count must move together. If a call site was added
+        // without flipping the flag, the dashboard would show a real number
+        // labelled "not wired"; if the flag was flipped without a call site, it
+        // would show a fabricated zero as fact.
+        assert!(
+            !SUBSCRIBE_DEMAND_TRACKING_WIRED,
+            "flip this only in the commit that adds the production call site in \
+             contract::delegate_demand::register_subscription, and remove the \
+             #[allow(dead_code)] on record_subscribe_without_demand at the same \
+             time"
+        );
     }
 
     /// Phase 2 is not built on this branch. The flag must say so rather than

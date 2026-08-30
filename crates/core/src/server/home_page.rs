@@ -5157,6 +5157,7 @@ mod tests {
         snap.delegates = Some(DelegateStatusSnapshot {
             delegates: vec![entry],
             subscribes_without_demand_total: 3,
+            subscribe_demand_tracking_wired: true,
             ..Default::default()
         });
         let html = build_delegates_card(&Some(snap));
@@ -5168,6 +5169,38 @@ mod tests {
             html.contains(">3<"),
             "the cumulative count must render even though no subscription rows \
              remain; html was: {html}"
+        );
+    }
+
+    /// Before the counter has a call site the tile must say "not wired", never
+    /// `0`. A zero would read as "no pin has ever failed to take" — the most
+    /// reassuring reading available, from a source that is not reporting.
+    #[test]
+    fn delegates_card_says_not_wired_rather_than_zero_pins_that_never_took() {
+        let mut snap = base_snapshot();
+        snap.delegates = Some(DelegateStatusSnapshot {
+            subscribe_demand_tracking_wired: false,
+            ..Default::default()
+        });
+        let html = build_delegates_card(&Some(snap));
+        assert!(
+            html.contains("Pins that never took"),
+            "the tile must be present even unwired"
+        );
+        let tile = html
+            .split("Pins that never took")
+            .nth(1)
+            .expect("tile")
+            .split("</div>")
+            .nth(1)
+            .unwrap_or("");
+        assert!(
+            tile.contains("not wired"),
+            "an unwired counter must say so; tile was: {tile}"
+        );
+        assert!(
+            !tile.contains(">0<"),
+            "an unwired counter must never render 0; tile was: {tile}"
         );
     }
 

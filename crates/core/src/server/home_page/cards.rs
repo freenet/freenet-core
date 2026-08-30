@@ -2224,7 +2224,14 @@ pub fn build_delegates_card(snap: &Option<network_status::NetworkStatusSnapshot>
         pinned = d.subscriptions_total - d.subscriptions_without_demand,
         subs = d.subscriptions_total,
         unpinned_delegates = d.delegates_with_unpinned_subscriptions,
-        never_took = d.subscribes_without_demand_total,
+        // "not wired" rather than 0 while the recorder has no call site: a
+        // zero here would read as "no pin ever failed", the most reassuring
+        // possible claim and one this build cannot make.
+        never_took = if d.subscribe_demand_tracking_wired {
+            d.subscribes_without_demand_total.to_string()
+        } else {
+            "not wired".to_string()
+        },
         wakeups = wakeups_value,
         mc_entries = d.module_cache_entries,
         mc_used = format_bytes(d.module_cache_total_bytes),
