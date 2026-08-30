@@ -4158,6 +4158,11 @@ impl Ring {
     /// (`contract::delegate_demand`) is deliberately a LOCAL subscription — the
     /// tier evicted last — and that placement is a claim worth testing rather
     /// than only documenting.
+    ///
+    /// Test-only: production code reaches these counts through the
+    /// `HostingManager` closure the eviction ordering already passes. Un-gate
+    /// it when a production caller appears.
+    #[cfg(test)]
     pub(crate) fn local_and_downstream_counts(&self, contract: &ContractKey) -> (usize, usize) {
         self.hosting_manager.local_and_downstream_counts(contract)
     }

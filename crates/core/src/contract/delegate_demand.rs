@@ -38,11 +38,22 @@
 //! `.claude/rules/bug-prevention-patterns.md`: `client_subscriptions` is read by
 //! `contract_in_use`, `in_use_contract_ids`, `local_and_downstream_counts` (the
 //! eviction ordering key), `contracts_needing_renewal` branches 1 **and** 2,
-//! `is_receiving_updates`, `generate_topology_snapshot` and
-//! `teardown_evicted_in_use_contract`. A parallel delegate term would have to be
-//! added to each, and the next consumer added to `client_subscriptions` would
-//! silently not get it. Registering in the one map means every one of those
-//! consumers is correct by construction, now and later.
+//! `is_receiving_updates`, `generate_topology_snapshot`,
+//! `teardown_evicted_in_use_contract` and governance's `beneficiary_counts`. A
+//! parallel delegate term would have to be added to each, and the next consumer
+//! added to `client_subscriptions` would silently not get it. Registering in the
+//! one map means every one of those consumers is correct by construction, now
+//! and later.
+//!
+//! That breadth cuts both ways and the governance one is worth stating outright
+//! rather than leaving as a surprise: `beneficiary_counts` derives a contract's
+//! governance BENEFIT from `client_subscriptions.len()`, so a delegate pin also
+//! raises the contract's benefit score and makes a resource-usage ban less
+//! likely. That is the intended reading — a delegate subscription is real local
+//! demand and should count as a beneficiary exactly like a WebSocket client —
+//! but it does mean an app can raise its own contracts' benefit through its
+//! delegate, which is the same unbounded-pinning surface #5467 open question 1
+//! is about, reached by a second route.
 //!
 //! # Interaction with the hosting invariants (`.claude/rules/hosting-invariants.md`)
 //!
