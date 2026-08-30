@@ -203,11 +203,7 @@ fn warn_on_host_clock_import(key: &ContractKey, code_hash: &CodeHash, code: &[u8
         return false;
     }
     let seen = SEEN.get_or_init(Default::default);
-    let should_warn = {
-        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
-        decide_host_clock_warning(&mut seen, SEEN_CAP, code_hash, code)
-    };
-    if !should_warn {
+    if !decide_host_clock_warning(seen, SEEN_CAP, code_hash, code) {
         return false;
     }
     tracing::warn!(
@@ -230,14 +226,18 @@ fn warn_on_host_clock_import(key: &ContractKey, code_hash: &CodeHash, code: &[u8
 
 /// Whether this load should warn, given what has already been warned about.
 ///
-/// Split out from [`warn_on_host_clock_import`] so the dedup and its cap can be
-/// tested against a LOCAL set. The real set is a process-global static shared by
-/// every test in the binary, so a test that filled it to the cap would leave
-/// every later test's contract un-deduped — the process-global cross-test
-/// coupling `.claude/rules/testing.md` exists about, and one `cargo nextest`
-/// cannot see.
+/// Split out from [`warn_on_host_clock_import`] so the dedup, its cap and its
+/// concurrency can be tested against a LOCAL set. The real set is a
+/// process-global static shared by every test in the binary, so a test that
+/// filled it to the cap would leave every later test's contract un-deduped —
+/// the process-global cross-test coupling `.claude/rules/testing.md` exists
+/// about, and one `cargo nextest` cannot see.
+///
+/// Takes the `Mutex` rather than a `&mut` to the set it guards, so the
+/// check-then-insert atomicity is this function's own property and a test can
+/// hold it to it. See the comment on the guard below.
 fn decide_host_clock_warning(
-    seen: &mut std::collections::HashSet<CodeHash>,
+    seen: &Mutex<std::collections::HashSet<CodeHash>>,
     cap: usize,
     code_hash: &CodeHash,
     code: &[u8],
@@ -245,6 +245,21 @@ fn decide_host_clock_warning(
     if !crate::conformance::imports_host_clock(code) {
         return false;
     }
+    // ONE guard across the membership check AND the insert. The two must be
+    // atomic with respect to each other: `RuntimePool`'s worker threads reach
+    // this concurrently for the same code hash whenever a burst of first-touch
+    // requests races to compile a freshly-PUT contract, and a check-then-insert
+    // split across two acquisitions lets every racer observe "absent" and warn.
+    //
+    // The lock is taken HERE rather than by the caller so that this is the
+    // tested unit's own property rather than an unwritten obligation on
+    // whoever calls it — `concurrent_callers_for_one_contract_warn_exactly_once`
+    // drives this function from many threads and goes red if the guard is
+    // split. Taking `&mut HashSet` instead would make the race impossible to
+    // express, and therefore impossible to test for: the borrow checker would
+    // enforce atomicity here while the real regression moved to the call site,
+    // where nothing was watching.
+    let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
     if seen.contains(code_hash) {
         return false;
     }
@@ -2565,7 +2580,7 @@ mod host_clock_deprecation {
     /// hash is then recorded, its second call dedups, and this goes red.
     #[test]
     fn the_dedup_set_stops_growing_at_its_cap() {
-        let mut seen = std::collections::HashSet::new();
+        let seen = Mutex::new(std::collections::HashSet::new());
         let first = clock_module("cap_1");
         let second = clock_module("cap_2");
         let third = clock_module("cap_3");
@@ -2573,14 +2588,18 @@ mod host_clock_deprecation {
         let (_, hash_b) = key_for(&second);
         let (_, hash_c) = key_for(&third);
 
-        assert!(decide_host_clock_warning(&mut seen, 2, &hash_a, &first));
-        assert!(decide_host_clock_warning(&mut seen, 2, &hash_b, &second));
-        assert_eq!(seen.len(), 2, "the set did not fill as expected");
+        assert!(decide_host_clock_warning(&seen, 2, &hash_a, &first));
+        assert!(decide_host_clock_warning(&seen, 2, &hash_b, &second));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "the set did not fill as expected"
+        );
 
         // At the cap: this one warns, and is deliberately NOT recorded.
-        assert!(decide_host_clock_warning(&mut seen, 2, &hash_c, &third));
+        assert!(decide_host_clock_warning(&seen, 2, &hash_c, &third));
         assert_eq!(
-            seen.len(),
+            seen.lock().unwrap().len(),
             2,
             "the dedup set grew past its cap, so it is unbounded on \
              externally-influenced keys after all"
@@ -2594,41 +2613,119 @@ mod host_clock_deprecation {
     /// deprecation notice. Noise is the acceptable failure here; silence is not.
     #[test]
     fn past_the_cap_the_warning_still_fires() {
-        let mut seen = std::collections::HashSet::new();
+        let seen = Mutex::new(std::collections::HashSet::new());
         let recorded = clock_module("past_cap_recorded");
         let overflow = clock_module("past_cap_overflow");
         let (_, hash_recorded) = key_for(&recorded);
         let (_, hash_overflow) = key_for(&overflow);
 
         assert!(decide_host_clock_warning(
-            &mut seen,
+            &seen,
             1,
             &hash_recorded,
             &recorded
         ));
         for _ in 0..3 {
             assert!(
-                decide_host_clock_warning(&mut seen, 1, &hash_overflow, &overflow),
+                decide_host_clock_warning(&seen, 1, &hash_overflow, &overflow),
                 "a contract past the dedup cap was silenced instead of merely \
                  re-warned; the cap must never suppress the notice"
             );
         }
         // The one that IS recorded still dedups, so the cap did not disable it.
         assert!(!decide_host_clock_warning(
-            &mut seen,
+            &seen,
             1,
             &hash_recorded,
             &recorded
         ));
     }
 
+    /// Threads racing on the SAME contract warn exactly once between them.
+    ///
+    /// `RuntimePool`'s workers reach the module-cache miss path concurrently for
+    /// one code hash whenever a burst of first-touch requests races to compile a
+    /// freshly-PUT contract. Every other test here drives the decision from a
+    /// single thread, so none of them can see a check-then-insert that was split
+    /// across two lock acquisitions — each racer would observe "absent" and warn,
+    /// and the once-per-contract bound the whole design rests on would be gone.
+    ///
+    /// Mutation this exists for: release the guard between `contains` and
+    /// `insert` (the shape a future refactor produces by moving the
+    /// `imports_host_clock` recheck or the insert outside the lock).
+    ///
+    /// A racy guard is only worth having if it reliably goes red, so the loop
+    /// count is measured rather than guessed. Running the test binary directly
+    /// on this machine:
+    ///
+    /// - mutated, `ROUNDS = 64`: failed **199 / 200** runs. One run got through
+    ///   all 64 rounds without a collision, so a broken implementation would
+    ///   have passed about 1 time in 200. Not good enough for a guard.
+    /// - mutated, `ROUNDS = 256`: failed **300 / 300**, with the latest
+    ///   first-failing round observed at 75 — roughly 3.4x headroom.
+    /// - correct, `ROUNDS = 256`: failed **0 / 300**. No false positives.
+    ///
+    /// Per-round collision probability works out around 8%, so 256 rounds puts
+    /// the escape probability near 1e-9. If this ever does flake, the fix is
+    /// more rounds, not `#[ignore]` — a flaky guard here is a broken guard.
+    ///
+    /// `assert_eq!` on the count rather than `>= 1`, so a version that warns
+    /// twice fails rather than passing on the first success.
+    #[test]
+    fn concurrent_callers_for_one_contract_warn_exactly_once() {
+        // Enough racers to make the window easy to hit, and enough rounds that
+        // a split guard cannot get lucky across all of them.
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 256;
+
+        for round in 0..ROUNDS {
+            let code = clock_module(&format!("concurrent_round_{round}"));
+            let (_, hash) = key_for(&code);
+            let seen = Mutex::new(std::collections::HashSet::new());
+            // Start together, so the threads are actually contending rather
+            // than running one after another as they spawn.
+            let barrier = std::sync::Barrier::new(THREADS);
+
+            let warned = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            decide_host_clock_warning(&seen, SEEN_CAP, &hash, &code)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("no thread may panic"))
+                    .filter(|warned| *warned)
+                    .count()
+            });
+
+            assert_eq!(
+                warned, 1,
+                "round {round}: {THREADS} threads loading the SAME contract \
+                 produced {warned} warnings, not 1. The membership check and the \
+                 insert are no longer atomic with respect to each other, so every \
+                 racer sees the code hash as unseen and the once-per-contract \
+                 bound is gone."
+            );
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                1,
+                "round {round}: the dedup set holds more or fewer than the one \
+                 code hash these threads all shared"
+            );
+        }
+    }
+
     /// The cap must not turn a non-clock contract into a warned one.
     #[test]
     fn a_full_dedup_set_does_not_warn_about_a_clockless_contract() {
-        let mut seen = std::collections::HashSet::new();
+        let seen = Mutex::new(std::collections::HashSet::new());
         let clock = clock_module("full_set_clock");
         let (_, clock_hash) = key_for(&clock);
-        assert!(decide_host_clock_warning(&mut seen, 1, &clock_hash, &clock));
+        assert!(decide_host_clock_warning(&seen, 1, &clock_hash, &clock));
 
         let clockless = module_importing(
             "full_set_clockless",
@@ -2636,7 +2733,7 @@ mod host_clock_deprecation {
         );
         let (_, clockless_hash) = key_for(&clockless);
         assert!(
-            !decide_host_clock_warning(&mut seen, 1, &clockless_hash, &clockless),
+            !decide_host_clock_warning(&seen, 1, &clockless_hash, &clockless),
             "a contract that never reads the clock was warned about because the \
              dedup set happened to be full"
         );
