@@ -521,18 +521,29 @@ impl NodeConfig {
         // `NodeConfig::new`), and unlike a full node build it is cheap enough
         // to drive from a unit test — so the wiring is pinned by behaviour
         // rather than by a source scrape.
-        // Audited 2026-08-24: `bin/freenet.rs` (`run_network`) is the only
-        // caller of `NodeConfig::new` on the REAL-NODE STARTUP PATH, so it is
-        // the only way this sweep reaches a real data dir. Every other caller
-        // is a `#[cfg(test)]` fixture or the `#[freenet_test]` harness, and
-        // both get a temp data dir from `ConfigPathsArgs::default_dirs` (which
-        // returns `std::env::temp_dir()` under
-        // `cfg!(any(test, debug_assertions)) || id.is_some()`).
+        // Audited 2026-08-30, every `NodeConfig::new` call site in the
+        // workspace: `bin/freenet.rs` (`run_network`) is the only caller on the
+        // REAL-NODE STARTUP PATH, so it is the only way this sweep reaches a
+        // real data dir.
         //
-        // Phrased by startup path rather than "the only non-test caller"
-        // because `test_utils` and `node::testing_impl` are NOT cfg-gated —
-        // they compile into release builds — so a future helper there would
-        // falsify the stricter wording while leaving the intent intact.
+        // Every other caller is safe, but NOT for the reason an earlier draft
+        // of this comment gave. It said they are all `#[cfg(test)]` fixtures or
+        // the `#[freenet_test]` harness, and that all of them get a temp data
+        // dir from `ConfigPathsArgs::default_dirs`. Neither half is true, so do
+        // not re-derive safety from it: `node/testing_impl.rs` and `test_utils`
+        // are NOT cfg-gated (they compile into release builds), the
+        // `crates/core/tests/*` integration tests are neither fixtures nor the
+        // harness, and none of those reach `default_dirs` at all.
+        //
+        // The invariant that actually holds, checked caller by caller, is that
+        // each non-`run_network` caller trips at least one of:
+        //   - an explicit `tempfile` data dir — the `#[freenet_test]` harness
+        //     (`freenet-macros/src/codegen.rs`) and every `crates/core/tests/*`
+        //     integration test set one directly;
+        //   - `mode: Local`, which the Network-mode guard refuses —
+        //     `node/testing_impl.rs`;
+        //   - `enable_event_log: Some(true)`, which the enabled guard refuses —
+        //     also the `#[freenet_test]` harness.
         // If you add a caller that starts a real node, re-check that it should
         // be deleting files before it does.
         crate::tracing::reclaim_orphaned_event_log(&config);
