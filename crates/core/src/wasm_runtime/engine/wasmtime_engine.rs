@@ -2886,11 +2886,13 @@ mod tests {
     /// Source pin (#4213 / #5023): `create_instance` MUST allocate its instance
     /// id from the one process-global allocator.
     ///
-    /// The type system stops a CALLER passing an id, but nothing stops this
+    /// The signature stops a CALLER passing an id, but nothing stops this
     /// method itself from reverting to a per-engine counter, which is exactly
     /// the shape that made ids collide across engines in one process. The
     /// bounded-region scrape follows the `fn_body` convention used by
-    /// `create_instance_recovers_store_on_guest_entry_failure` below.
+    /// `create_instance_recovers_store_on_guest_entry_failure` below, including
+    /// the test-module cutoff that keeps either pin from scraping its own
+    /// source.
     #[test]
     fn create_instance_allocates_its_own_instance_id() {
         // Cut the test module off BEFORE scraping. `include_str!` pulls in the
@@ -2941,7 +2943,16 @@ mod tests {
     /// memory that never triggers a count-based refresh.
     #[test]
     fn create_instance_recovers_store_on_guest_entry_failure() {
-        let src = include_str!("wasmtime_engine.rs");
+        // Same cutoff as `create_instance_allocates_its_own_instance_id` above,
+        // and for the same reason: `include_str!` pulls in this test module,
+        // whose source contains `fn create_instance(` as a string literal. With
+        // the whole file in scope, renaming the production method would let
+        // `find` fall through into the test module rather than panicking.
+        let full = include_str!("wasmtime_engine.rs");
+        let cutoff = full
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("wasmtime_engine.rs must have a top-level #[cfg(test)] mod tests");
+        let src = &full[..cutoff];
         let start = src
             .find("fn create_instance(")
             .expect("create_instance not found");
@@ -3692,12 +3703,16 @@ mod tests {
     /// `test_store_and_retrieve_secret`, `error_code: -1` from
     /// `test_v2_delegate_update_existing_state`.
     ///
-    /// Ids now come from `native_api::next_instance_id`, which makes a
-    /// caller-supplied id a compile error rather than something a test can
-    /// catch. What this test pins is the one property still expressible at
-    /// runtime, and the one a future change could quietly break: the allocator
-    /// is process-global, not per-engine. Two live engines are never issued the
-    /// same id, so B's churn leaves A's entry intact.
+    /// Ids now come from `native_api::next_instance_id`, so a `create_instance`
+    /// CALLER can no longer pass one -- that surface is closed by the signature.
+    /// It is not closed everywhere: `InstanceHandle.id` is `pub(super)`, so code
+    /// inside `wasm_runtime` can still hand `drop_instance` a fabricated handle
+    /// (`delegate/test.rs` builds `InstanceHandle { id: 0 }` twice today, inert
+    /// only because `process_outbound` ignores it). What this test pins is the
+    /// one property still expressible at runtime, and the one a future change
+    /// could quietly break: the allocator is process-global, not per-engine. Two
+    /// live engines are never issued the same id, so B's churn leaves A's entry
+    /// intact.
     #[test]
     fn instance_ids_are_globally_unique_across_engines() {
         use crate::wasm_runtime::runtime::{InstanceInfo, Key};
