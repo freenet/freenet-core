@@ -4149,6 +4149,19 @@ impl Ring {
         self.hosting_manager.contract_in_use(contract)
     }
 
+    /// `(local client subscriptions, downstream peer subscribers)` for
+    /// `contract` — the first two components of the subscriber-primary eviction
+    /// ordering key (`.claude/rules/hosting-invariants.md`, invariant 3).
+    ///
+    /// Exposed so a caller can assert which eviction TIER a demand registration
+    /// lands in, rather than infer it. A delegate subscription
+    /// (`contract::delegate_demand`) is deliberately a LOCAL subscription — the
+    /// tier evicted last — and that placement is a claim worth testing rather
+    /// than only documenting.
+    pub(crate) fn local_and_downstream_counts(&self, contract: &ContractKey) -> (usize, usize) {
+        self.hosting_manager.local_and_downstream_counts(contract)
+    }
+
     /// Instance ids of every contract [`Self::contract_in_use`] holds for. See
     /// `HostingManager::in_use_contract_ids`.
     pub(crate) fn in_use_contract_ids(&self) -> Vec<ContractInstanceId> {
@@ -9103,7 +9116,10 @@ mod hosting_observability_wiring_pin {
 /// (`storm_frequency_profile_crosses_cost_trigger_through_real_meter`)
 /// bypasses by assembling its axes by hand from a standalone `Meter`.
 #[cfg(test)]
-mod cost_pressure_seam_tests {
+/// `pub(crate)` because `seam_fixture` below is the crate's one real-`OpManager`
+/// test seam, and the delegate-demand tests (`contract::delegate_demand`) need
+/// the same thing. A second copy of that setup is how the two drift.
+pub(crate) mod cost_pressure_seam_tests {
     use std::time::Duration;
 
     fn seam_key(seed: u8) -> freenet_stdlib::prelude::ContractKey {
@@ -9243,8 +9259,8 @@ mod cost_pressure_seam_tests {
     /// Everything a seam test needs kept alive for its whole run: the OpManager
     /// plus the channel ends and task monitor whose drop would tear the Ring's
     /// background tasks down mid-test.
-    struct SeamFixture {
-        op_manager: std::sync::Arc<crate::node::OpManager>,
+    pub(crate) struct SeamFixture {
+        pub(crate) op_manager: std::sync::Arc<crate::node::OpManager>,
         node_events: tokio::sync::mpsc::Receiver<
             either::Either<crate::message::NetMessage, crate::message::NodeEvent>,
         >,
@@ -9259,7 +9275,7 @@ mod cost_pressure_seam_tests {
     /// background tasks), with the node-event receiver handed back so a test can
     /// assert on EMITTED events rather than on internal bookkeeping. `id`
     /// isolates the on-disk state in its own temp dir.
-    async fn seam_fixture(id: &str) -> SeamFixture {
+    pub(crate) async fn seam_fixture(id: &str) -> SeamFixture {
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),

@@ -319,4 +319,297 @@ mod tests {
         );
         assert_ne!(client_id_for(&a), client_id_for(&b));
     }
+
+    // =====================================================================
+    // The falsifier: real `OpManager` over a real `Ring`.
+    //
+    // These are the three assertions #4669's own Testing section asks for
+    // ("Delegate subscribe sets `contract_in_use`, appears in
+    // `contracts_needing_renewal`, exempts from eviction"). They fail against
+    // main, because on main a delegate subscribe touches only
+    // `DELEGATE_SUBSCRIPTIONS` and nothing in `ring/` reads that map.
+    //
+    // They are in-crate rather than in `crates/core/tests/` on purpose, and it
+    // is worth writing down why, because "add a multi-node test" is the
+    // reflex here and it does not work for this defect:
+    //
+    //  - `mod ring` and `mod node` are crate-private, and `TestContext` hands
+    //    an integration test only a label, a temp dir and a WebSocket port
+    //    (`test_utils.rs:1245`), so no integration test can observe demand.
+    //    `NodeQuery::SubscriptionInfo` looks like the exception and is not: it
+    //    reports the executor's `update_notifications` map
+    //    (`contract/executor.rs::get_subscription_info`), i.e. WebSocket
+    //    notification channels, not ring demand.
+    //  - Inferring demand from update delivery does not work either. Live
+    //    fan-out targets come from `advertised_cohost_pub_keys`
+    //    (`operations/update.rs`), and a peer advertises as a co-host the
+    //    moment it CACHES the contract (`register_local_hosting`, called from
+    //    the every-hop PUT/GET store path) with no `contract_in_use` check. So
+    //    a peer receives the update whether or not demand registered, and a
+    //    "did the notification arrive" test passes on main.
+    //
+    // The multi-node test that DOES exist for this change
+    // (`crates/core/tests/operations.rs`) is a no-regression guard for the
+    // notification path River depends on, and says in its own doc comment that
+    // it cannot discriminate this fix.
+    // =====================================================================
+
+    use crate::ring::cost_pressure_seam_tests::seam_fixture;
+
+    fn contract_key(seed: u8) -> ContractKey {
+        ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([seed; 32]),
+            freenet_stdlib::prelude::CodeHash::new([seed.wrapping_add(1); 32]),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delegate_subscription_registers_demand_in_the_local_tier() {
+        let fixture = seam_fixture("delegate-demand-4669-registers").await;
+        let op_manager = fixture.op_manager.clone();
+        let ring = &op_manager.ring;
+
+        let key = contract_key(11);
+        // Host it the way a PUT would, so `contracts_needing_renewal` branch 2
+        // can resolve the instance id back to a `ContractKey` (it looks the key
+        // up in the hosting cache).
+        let _ = ring.host_contract(
+            key,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+
+        assert!(
+            !ring.contract_in_use(&key),
+            "precondition: hosting a contract is not by itself demand — if this \
+             fires, the fixture is granting demand from somewhere else and the \
+             rest of this test proves nothing"
+        );
+        assert!(
+            !ring.contracts_needing_renewal().contains(&key),
+            "precondition: a hosted, undemanded contract must not be renewed \
+             (this also rules out the `has_recent_local_client_access` branch, \
+              which would otherwise make the assertions below vacuous)"
+        );
+        assert_eq!((0, 0), ring.local_and_downstream_counts(&key));
+
+        register_subscription(&op_manager, &delegate_key(7), &key);
+
+        assert!(
+            ring.contract_in_use(&key),
+            "#4669: a delegate subscription must count as demand"
+        );
+        assert!(
+            ring.contracts_needing_renewal().contains(&key),
+            "#4669: demand must put the contract in the renewal set, which is \
+             what keeps it in the update mesh"
+        );
+        assert_eq!(
+            (1, 0),
+            ring.local_and_downstream_counts(&key),
+            "hosting-invariants invariant 3: a delegate pin is a LOCAL \
+             subscription — the tier evicted LAST — not a downstream one"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_one_delegates_demand_leaves_another_delegates_intact() {
+        let fixture = seam_fixture("delegate-demand-4669-independent").await;
+        let op_manager = fixture.op_manager.clone();
+        let ring = &op_manager.ring;
+
+        let key = contract_key(12);
+        let _ = ring.host_contract(
+            key,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+
+        let first = delegate_key(21);
+        let second = delegate_key(22);
+        register_subscription(&op_manager, &first, &key);
+        register_subscription(&op_manager, &second, &key);
+        assert_eq!((2, 0), ring.local_and_downstream_counts(&key));
+
+        drop_subscription(&op_manager, &first, &key);
+        assert!(
+            ring.contract_in_use(&key),
+            "one delegate unsubscribing must not drop another delegate's pin — \
+             the two hold distinct synthetic client ids"
+        );
+        assert_eq!((1, 0), ring.local_and_downstream_counts(&key));
+
+        drop_subscription(&op_manager, &second, &key);
+        assert!(
+            !ring.contract_in_use(&key),
+            "the last delegate unsubscribing must release the pin, or the \
+             contract is pinned forever with nothing wanting it"
+        );
+        assert!(!ring.contracts_needing_renewal().contains(&key));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unregistering_a_delegate_drops_every_contract_it_pinned() {
+        let fixture = seam_fixture("delegate-demand-4669-unregister").await;
+        let op_manager = fixture.op_manager.clone();
+        let ring = &op_manager.ring;
+
+        let pinned = [contract_key(31), contract_key(32), contract_key(33)];
+        for key in pinned {
+            let _ = ring.host_contract(
+                key,
+                121,
+                crate::ring::AccessType::Put,
+                crate::ring::HostingCause::Other,
+            );
+        }
+
+        let delegate = delegate_key(41);
+        // A second delegate keeps its own pin on one of them, to prove the
+        // teardown is scoped to the delegate being unregistered.
+        let survivor = delegate_key(42);
+        for key in pinned {
+            register_subscription(&op_manager, &delegate, &key);
+        }
+        register_subscription(&op_manager, &survivor, &pinned[2]);
+
+        drop_delegate_demand(&op_manager, &delegate);
+
+        assert!(!ring.contract_in_use(&pinned[0]));
+        assert!(!ring.contract_in_use(&pinned[1]));
+        assert!(
+            ring.contract_in_use(&pinned[2]),
+            "unregistering one delegate must not drop a DIFFERENT delegate's \
+             pin on the same contract"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_subscribe_by_the_same_delegate_is_idempotent() {
+        let fixture = seam_fixture("delegate-demand-4669-idempotent").await;
+        let op_manager = fixture.op_manager.clone();
+        let ring = &op_manager.ring;
+
+        let key = contract_key(13);
+        let _ = ring.host_contract(
+            key,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+
+        let delegate = delegate_key(51);
+        for _ in 0..5 {
+            register_subscription(&op_manager, &delegate, &key);
+        }
+        assert_eq!(
+            (1, 0),
+            ring.local_and_downstream_counts(&key),
+            "a delegate re-subscribing must not inflate the local-subscriber \
+             count — that count is the eviction ordering key, so an inflated \
+             one would silently outrank real demand"
+        );
+
+        // ...and a single drop must therefore be enough to release it.
+        drop_subscription(&op_manager, &delegate, &key);
+        assert!(!ring.contract_in_use(&key));
+    }
+
+    // =====================================================================
+    // Source-scrape pins: BOTH subscribe paths must reach this module.
+    //
+    // There are two delegate-subscribe entry points that converge on
+    // `DELEGATE_SUBSCRIPTIONS` (the V1 `SubscribeContractRequest` arm and the
+    // V2 `subscribe_contract()` host function), and they have to converge on
+    // the demand registration too. A future change that adds a third, or
+    // rewrites one of the two, has no compile-time reason to keep the demand
+    // call — which is exactly the "manually-inlined originator side effects"
+    // shape in `.claude/rules/bug-prevention-patterns.md` (#3851, #4223): the
+    // omission is silent, the subscribe still reports success, and every unit
+    // test still passes. These pins fail closed instead.
+    // =====================================================================
+
+    #[test]
+    fn v1_subscribe_arm_registers_demand() {
+        const SOURCE: &str = include_str!("../contract.rs");
+        let arm = SOURCE
+            .find("for req in subscribe_requests")
+            .expect("the V1 SubscribeContractRequest loop must still exist");
+        let body = &SOURCE[arm..arm + 3000.min(SOURCE.len() - arm)];
+        assert!(
+            body.contains("DELEGATE_SUBSCRIPTIONS"),
+            "the V1 subscribe arm must still record the notification hook — \
+             this change ADDS demand, it does not replace notification \
+             delivery, which River's private-room secret rotation depends on"
+        );
+        assert!(
+            body.contains("delegate_demand::register_subscription("),
+            "the V1 SubscribeContractRequest arm must register demand \
+             (#4669). Without it the subscribe succeeds, the delegate is \
+             notified while some other route keeps the node subscribed, and \
+             the pin silently does not take — which is the entire defect."
+        );
+    }
+
+    #[test]
+    fn both_runtime_executor_constructors_install_the_subscribe_callback() {
+        const SOURCE: &str = include_str!("executor/runtime.rs");
+        let installs = SOURCE.matches("set_delegate_subscribe_callback(").count();
+        assert_eq!(
+            2, installs,
+            "every `Executor<Runtime>` constructor that installs the state-write \
+             and state-admit callbacks must also install the delegate-subscribe \
+             callback, or a V2 delegate subscribing on an executor built by the \
+             constructor that forgot it registers no demand — silently. If a \
+             constructor was added or removed, update this pin deliberately \
+             rather than loosening it."
+        );
+        assert_eq!(
+            installs,
+            SOURCE
+                .matches("delegate_demand::register_subscription(")
+                .count(),
+            "each installed subscribe callback must delegate to \
+             `delegate_demand::register_subscription` — the V1 arm calls the \
+             same helper, and the two paths converging on one helper is what \
+             stops them drifting"
+        );
+    }
+
+    #[test]
+    fn v2_subscribe_host_fn_registers_demand_only_after_a_successful_resolve() {
+        const SOURCE: &str = include_str!("../wasm_runtime/native_api.rs");
+        let start = SOURCE
+            .find("fn subscribe_contract_sync(")
+            .expect("the V2 subscribe host function must still exist");
+        let body = &SOURCE[start..start + 2000.min(SOURCE.len() - start)];
+
+        let resolve = body
+            .find("resolve_contract_key(")
+            .expect("V2 subscribe must resolve the contract key before anything else");
+        let register = body
+            .find("delegate_subscribe_callback")
+            .expect("V2 subscribe must invoke the demand callback (#4669)");
+        assert!(
+            resolve < register,
+            "the demand callback must run only after the contract key resolves \
+             — registering demand for a contract this node does not hold would \
+             pin a key no hosting-cache lookup can match, and the delegate is \
+             told the subscribe FAILED, so it holds no record to unsubscribe with"
+        );
+    }
+
+    #[test]
+    fn unregistering_a_delegate_drops_its_demand() {
+        const SOURCE: &str = include_str!("executor/runtime/delegates.rs");
+        assert!(
+            SOURCE.contains("delegate_demand::drop_delegate_demand("),
+            "`UnregisterDelegate` cleanup must drop the delegate's demand as \
+             well as its notification hooks. There is no unsubscribe (#2830) \
+             and `DELEGATE_SUBSCRIPTIONS` is in-memory, so a demand record left \
+             behind here is a pin nothing can release for the life of the process."
+        );
+    }
 }
