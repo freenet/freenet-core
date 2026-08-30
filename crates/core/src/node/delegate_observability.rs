@@ -89,14 +89,39 @@
 //! epoch trap fired, or indefinitely if the epoch ticker thread had died
 //! (#4864).
 //!
-//! **Duration is measured at the EXECUTOR level, deliberately.** It brackets
-//! `Runtime::inbound_app_message`, not the engine's per-guest-call helper. That
-//! is the right boundary for two reasons: a V1 delegate request re-invokes
-//! `process()` up to `MAX_CONTRACT_REQUEST_ITERATIONS` times, so an
-//! engine-level timer would emit N records per logical invocation rather than
-//! one; and the executor-level span INCLUDES host-function round-trips, which is
-//! exactly the cost that matters, since a delegate parked inside a host call is
-//! interruptible by neither the epoch trap nor the wall clock.
+//! **`engine_invocations` counts ENGINE ROUND-TRIPS, not application messages.**
+//! This is the one number here most likely to be misread, so it is named for
+//! what it counts. The timing brackets `Runtime::inbound_app_message`, which
+//! sits INSIDE the V1 re-invocation loop: `handle_delegate_with_contract_requests`
+//! (`contract.rs`) calls `execute_delegate_request` once per iteration, up to
+//! `MAX_CONTRACT_REQUEST_ITERATIONS` (100) times, and each of those reaches
+//! this timer. So a V1 delegate handling ONE application message that performs
+//! four contract GETs records **five** engine invocations, not one.
+//!
+//! Two consequences a reader must not trip over:
+//!
+//! - **The per-logical-request unit is [`DelegateStatusEntry::requests`]**,
+//!   metered by [`RequestMeter`] at the loop boundary. That is the number that
+//!   answers "how often was this delegate asked to do something".
+//! - **This axis is NOT comparable across delegate API versions.** V2 delegates
+//!   use synchronous host functions and do not re-enter the loop, so the same
+//!   logical work counts as 1. Ranking a V1 and a V2 delegate against each other
+//!   on `engine_invocations` compares different quantities.
+//!
+//! Note also that `engine_invocations` counts work reaching the delegate from
+//! EVERY path, including inter-delegate hops (which `requests` attributes to the
+//! calling delegate) and paths that bypass the loop entirely. So
+//! `engine_invocations > 0` with `requests == 0` is meaningful rather than
+//! contradictory.
+//!
+//! **Measuring at the executor level rather than in the engine is still
+//! deliberate**, but not for the multiplicity reason: both points sit inside the
+//! loop. The reasons are that the engine's shared helper serves contracts AND
+//! delegates (discriminated only by a parameter, so instrumenting it means
+//! filtering a shared path), and that the executor-level span INCLUDES
+//! host-function round-trips — exactly the cost that matters, since a delegate
+//! parked inside a host call is interruptible by neither the epoch trap nor the
+//! wall clock.
 //!
 //! One consequence for `last_error`: with panic capture in place, a panic inside
 //! a delegate host function surfaces as a `WasmError` rather than unwinding into
@@ -191,7 +216,7 @@ const INVOCATION_RATE_WINDOW: usize = 100;
 #[derive(Debug)]
 struct DelegateExecEntry {
     // --- per-call (one `inbound_app_message` execution) ---
-    invocations: u64,
+    engine_invocations: u64,
     errors: u64,
     /// Truncated to [`MAX_LAST_ERROR_BYTES`] at insertion.
     last_error: Option<String>,
@@ -228,7 +253,7 @@ struct DelegateExecEntry {
 impl DelegateExecEntry {
     fn new(now: Instant) -> Self {
         Self {
-            invocations: 0,
+            engine_invocations: 0,
             errors: 0,
             last_error: None,
             last_error_at: None,
@@ -363,7 +388,7 @@ pub(crate) fn record_invocation(
 ) {
     let micros = exec_duration.as_micros().min(u64::MAX as u128) as u64;
     with_entry(key, now, |entry, now| {
-        entry.invocations = entry.invocations.saturating_add(1);
+        entry.engine_invocations = entry.engine_invocations.saturating_add(1);
         entry.total_exec_micros = entry.total_exec_micros.saturating_add(micros);
         entry.invocation_rate.insert_with_time(now, 1.0);
         entry
@@ -514,7 +539,10 @@ pub struct DelegateStatusEntry {
     pub subscriptions_registering_demand: usize,
 
     // --- per-call ---
-    pub invocations: u64,
+    /// Engine round-trips, NOT application messages — see the module docs.
+    /// A V1 delegate handling one message that does four contract GETs records
+    /// five here. The per-logical-request unit is `requests`.
+    pub engine_invocations: u64,
     pub errors: u64,
     pub last_error: Option<String>,
     pub last_error_secs_ago: Option<u64>,
@@ -522,7 +550,7 @@ pub struct DelegateStatusEntry {
     pub total_exec_micros: u64,
     /// Windowed invocations/sec. `None` when the window holds no samples —
     /// distinct from a genuine zero.
-    pub invocation_rate_per_sec: Option<f64>,
+    pub engine_invocation_rate_per_sec: Option<f64>,
     /// Windowed attributed CPU (µs/sec) from `topology::meter`. `None` when the
     /// meter holds no window for this delegate — again, distinct from zero.
     pub exec_cpu_micros_per_sec: Option<f64>,
@@ -578,13 +606,13 @@ pub struct DelegateStatusSnapshot {
 /// standing up a `Ring`. That branch is where fabricated zeros would creep in.
 #[derive(Debug, Clone, PartialEq, Default)]
 struct ExecFields {
-    invocations: u64,
+    engine_invocations: u64,
     errors: u64,
     last_error: Option<String>,
     last_error_secs_ago: Option<u64>,
     last_active_secs_ago: Option<u64>,
     total_exec_micros: u64,
-    invocation_rate_per_sec: Option<f64>,
+    engine_invocation_rate_per_sec: Option<f64>,
     exec_cpu_micros_per_sec: Option<f64>,
     requests: u64,
     total_request_micros: u64,
@@ -604,7 +632,7 @@ fn exec_fields(stats: Option<&DelegateExecEntry>, now: Instant) -> ExecFields {
         return ExecFields::default();
     };
     ExecFields {
-        invocations: entry.invocations,
+        engine_invocations: entry.engine_invocations,
         errors: entry.errors,
         last_error: entry.last_error.clone(),
         last_error_secs_ago: entry
@@ -615,7 +643,7 @@ fn exec_fields(stats: Option<&DelegateExecEntry>, now: Instant) -> ExecFields {
                 .as_secs(),
         ),
         total_exec_micros: entry.total_exec_micros,
-        invocation_rate_per_sec: entry
+        engine_invocation_rate_per_sec: entry
             .invocation_rate
             .get_rate_at_time(now)
             .map(|rate| rate.per_second()),
@@ -726,13 +754,13 @@ pub(crate) fn build_snapshot(ring: &crate::ring::Ring, now: Instant) -> Delegate
             key: key.to_string(),
             subscriptions,
             subscriptions_registering_demand: registering,
-            invocations: f.invocations,
+            engine_invocations: f.engine_invocations,
             errors: f.errors,
             last_error: f.last_error,
             last_error_secs_ago: f.last_error_secs_ago,
             last_active_secs_ago: f.last_active_secs_ago,
             total_exec_micros: f.total_exec_micros,
-            invocation_rate_per_sec: f.invocation_rate_per_sec,
+            engine_invocation_rate_per_sec: f.engine_invocation_rate_per_sec,
             exec_cpu_micros_per_sec: f.exec_cpu_micros_per_sec,
             requests: f.requests,
             total_request_micros: f.total_request_micros,
@@ -967,7 +995,7 @@ mod tests {
         );
 
         let entry = DELEGATE_EXEC_STATS.get(&k).expect("entry recorded");
-        assert_eq!(entry.invocations, 2, "both invocations counted");
+        assert_eq!(entry.engine_invocations, 2, "both invocations counted");
         assert_eq!(entry.errors, 1, "only the failure counted as an error");
         assert_eq!(entry.last_error.as_deref(), Some("boom"));
         assert_eq!(entry.total_exec_micros, 30, "durations accumulate");
@@ -1004,7 +1032,7 @@ mod tests {
             "a cap hit must be counted even though the request returned Ok"
         );
         assert_eq!(
-            entry.invocations, 0,
+            entry.engine_invocations, 0,
             "a request is not an invocation; conflating the two is the bug this \
              separation exists to prevent"
         );
@@ -1104,7 +1132,7 @@ mod tests {
     fn unknown_rates_are_none_not_zero() {
         let f = exec_fields(None, Instant::now());
         assert!(
-            f.invocation_rate_per_sec.is_none(),
+            f.engine_invocation_rate_per_sec.is_none(),
             "an unmeasured rate is None, never Some(0.0)"
         );
         assert!(
@@ -1114,7 +1142,7 @@ mod tests {
         assert!(f.last_error_secs_ago.is_none());
         assert!(f.last_error.is_none());
         // Counters, by contrast, ARE genuinely zero: we know it ran zero times.
-        assert_eq!(f.invocations, 0);
+        assert_eq!(f.engine_invocations, 0);
         assert_eq!(f.requests, 0);
     }
 
@@ -1131,13 +1159,13 @@ mod tests {
         let entry = DELEGATE_EXEC_STATS.get(&k).expect("entry recorded");
         let f = exec_fields(Some(&entry), t0 + Duration::from_secs(1));
         drop(entry);
-        assert_eq!(f.invocations, 1);
+        assert_eq!(f.engine_invocations, 1);
         assert!(
             f.last_active_secs_ago.is_some(),
             "a delegate that ran has a last-active time"
         );
         assert!(
-            f.invocation_rate_per_sec.is_some(),
+            f.engine_invocation_rate_per_sec.is_some(),
             "a delegate with a sample has a rate"
         );
         clear_for_test();

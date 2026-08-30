@@ -2107,8 +2107,8 @@ pub fn build_delegates_card(snap: &Option<network_status::NetworkStatusSnapshot>
                 .last_active_secs_ago
                 .map(format_ago)
                 .unwrap_or_else(|| dash.clone());
-            let avg_call = if e.invocations > 0 {
-                format!("{} µs", e.total_exec_micros / e.invocations)
+            let avg_call = if e.engine_invocations > 0 {
+                format!("{} µs", e.total_exec_micros / e.engine_invocations)
             } else {
                 dash.clone()
             };
@@ -2158,7 +2158,7 @@ pub fn build_delegates_card(snap: &Option<network_status::NetworkStatusSnapshot>
             };
             write!(
                 rows,
-                r#"<tr><td class="mono">{key}</td><td class="{subs_class}">{subs}</td><td class="right">{requests}</td><td class="right">{avg_req}</td><td class="right">{max_req}</td><td class="right">{max_iters}</td><td class="right">{cap}</td><td class="right">{invocations}</td><td class="right">{avg_call}</td><td class="right">{errors}</td><td class="right">{last_active}</td></tr>"#,
+                r#"<tr><td class="mono">{key}</td><td class="{subs_class}">{subs}</td><td class="right">{requests}</td><td class="right">{avg_req}</td><td class="right">{max_req}</td><td class="right">{max_iters}</td><td class="right">{cap}</td><td class="right">{engine_invocations}</td><td class="right">{avg_call}</td><td class="right">{errors}</td><td class="right">{last_active}</td></tr>"#,
                 key = html_escape(&e.key),
                 subs_class = subs_class,
                 subs = html_escape(&subs_cell),
@@ -2167,7 +2167,7 @@ pub fn build_delegates_card(snap: &Option<network_status::NetworkStatusSnapshot>
                 max_req = html_escape(&max_request),
                 max_iters = e.max_iterations,
                 cap = cap_cell,
-                invocations = e.invocations,
+                engine_invocations = e.engine_invocations,
                 avg_call = html_escape(&avg_call),
                 errors = error_cell,
                 last_active = html_escape(&last_active),
@@ -2180,14 +2180,14 @@ pub fn build_delegates_card(snap: &Option<network_status::NetworkStatusSnapshot>
                     <thead><tr>
                         <th data-sort-type="text">Delegate</th>
                         <th title="Subscriptions that actually registered demand, over subscriptions held. A subscription that did not register demand does NOT pin the contract — see the note above.">Pinned / subs</th>
-                        <th class="right" data-sort-type="num" title="Whole client requests. One request drives up to 100 delegate invocations, so this is the unit that matches what a user waited for.">Requests</th>
+                        <th class="right" data-sort-type="num" title="Whole client requests — the unit that matches what a user waited for. One request drives up to 100 engine calls, so compare this column with Engine calls rather than reading either alone.">Requests</th>
                         <th class="right" data-sort-type="num">Avg req</th>
                         <th class="right" data-sort-type="num">Max req</th>
                         <th class="right" data-sort-type="num" title="Most contract-request loop iterations any single request needed. Approaching 100 means it is close to the cap.">Max iters</th>
                         <th class="right" data-sort-type="num" title="Requests that hit the iteration cap. These return Ok, so they are NOT errors.">Cap hits</th>
-                        <th class="right" data-sort-type="num" title="Individual delegate executions (process() calls).">Invocations</th>
-                        <th class="right" data-sort-type="num">Avg call</th>
-                        <th class="right" data-sort-type="num" title="Failed invocations. Hover for the most recent error message.">Errors</th>
+                        <th class="right" data-sort-type="num" title="Engine round-trips, NOT application messages. A V1 delegate handling one message that performs four contract GETs records five here, because each contract request re-enters the delegate. V2 delegates use synchronous host functions and do not re-enter, so the same logical work counts as 1 — this column is not comparable across delegate API versions. The per-request unit is the Requests column.">Engine calls</th>
+                        <th class="right" data-sort-type="num" title="Average duration per engine round-trip, including host-function time.">Avg call</th>
+                        <th class="right" data-sort-type="num" title="Failed engine calls. Hover the value for the most recent error message. Note a delegate that spins until the iteration cap gives up returns success and contributes NOTHING here — see the Cap hits column.">Errors</th>
                         <th class="right" data-sort-type="num">Last active</th>
                     </tr></thead>
                     <tbody>{rows}</tbody>
@@ -2199,7 +2199,7 @@ pub fn build_delegates_card(snap: &Option<network_status::NetworkStatusSnapshot>
     format!(
         r##"<div class="card">
             <div class="card-header"><h2>Delegates</h2></div>
-            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Per-delegate activity on this node (#5467 Phase 0). Measurement only — nothing here throttles or suspends a delegate. Two units are shown because they differ by up to 100x: a REQUEST is one client call, which drives up to 100 delegate INVOCATIONS, so a healthy per-call time is consistent with a request that took seconds.</p>
+            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Per-delegate activity on this node (#5467 Phase 0). Measurement only — nothing here throttles or suspends a delegate. Two units are shown because they differ by up to 100x: a REQUEST is one client call, and it re-enters the delegate once per contract request it makes — up to 100 ENGINE CALLS. So a healthy per-call time is consistent with a request that took seconds. Engine calls are not comparable between V1 and V2 delegates: V2 uses synchronous host functions and does not re-enter, so the same logical work counts as one.</p>
             <div class="g-verdict-row">
                 <div class="g-norms">
                     <div class="g-norm"><div class="g-norm-label">Delegates</div><div class="g-norm-value">{count}</div></div>
