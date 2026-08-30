@@ -2432,23 +2432,40 @@ where
                         contract = %key,
                         "Delegate notification channel closed — removing stale subscriptions"
                     );
-                    // Receiver is gone; clean up all subscriptions for this contract
-                    // to prevent repeated failed sends on future state updates.
-                    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&instance_id);
-                    // Drop the matching DEMAND registrations too (#4669 part 1).
-                    // A delegate that can no longer be notified is no longer
-                    // holding useful interest, and leaving its demand behind
-                    // would pin the contract with nothing able to consume the
-                    // updates. Every delegate in the snapshot is covered — the
-                    // ones already sent to as well as the remainder — because
-                    // the registry entry they all came from has just been
-                    // removed wholesale.
+                    // The receiver is gone for EVERY contract, not just this
+                    // one. There is a single delegate-notification channel per
+                    // `RuntimePool`, cloned into each executor
+                    // (`pool.rs::set_delegate_notification_tx`), so `Closed`
+                    // means no delegate can be notified again about anything.
+                    // Retire these delegates from both maps entirely rather
+                    // than only from this contract's entry.
+                    //
+                    // Scoping the cleanup to `instance_id` (as this did before
+                    // #4669) was harmless while `DELEGATE_SUBSCRIPTIONS` was an
+                    // inert notification map: a leftover entry for some other
+                    // contract cost nothing until that contract next committed
+                    // state. It is not harmless now. A leftover DEMAND
+                    // registration is a ring-level pin: it holds
+                    // `contract_in_use`, drives renewal SUBSCRIBEs, and blocks
+                    // eviction — for a contract whose only consumer is provably
+                    // dead. And a quiet contract may never commit state again,
+                    // so the per-contract cleanup might never run for it.
+                    //
+                    // Both maps are cleared together on purpose. Clearing one
+                    // and not the other is the drift this module exists to
+                    // avoid: demand without a hook is an unconsumable pin, a
+                    // hook without demand is the original #4669 defect.
+                    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, delegates| {
+                        for delegate_key in &subscribers {
+                            delegates.remove(delegate_key);
+                        }
+                        !delegates.is_empty()
+                    });
                     if let Some(op_manager) = &self.op_manager {
                         for delegate_key in &subscribers {
-                            crate::contract::delegate_demand::drop_subscription(
+                            crate::contract::delegate_demand::drop_delegate_demand(
                                 op_manager,
                                 delegate_key,
-                                key,
                             );
                         }
                     }

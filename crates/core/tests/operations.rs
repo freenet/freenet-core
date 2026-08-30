@@ -4409,8 +4409,9 @@ async fn test_delegate_subscribe_on_peer_node(ctx: &mut TestContext) -> TestResu
         tokio::time::sleep(Duration::from_secs(2)).await;
         make_get(&mut client_peer, contract_key, false, false).await?;
         let resp = timeout(Duration::from_secs(30), client_peer.recv()).await??;
-        if let HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }) =
-            resp
+        if let HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key, state, ..
+        }) = resp
         {
             ensure!(key == contract_key, "GET key mismatch while converging");
             if state.as_ref() == updated_state.as_slice() {

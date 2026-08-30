@@ -927,42 +927,41 @@ where
                 let context = req.context;
 
                 // Validate contract existence before registering (matches V2 host function behavior)
-                let result = if let Some(full_key) =
-                    contract_handler.executor().lookup_key(&contract_id)
-                {
-                    // Register subscription in the global registry (the
-                    // REACTIVE half: this is what `ContractNotification`
-                    // delivery reads).
-                    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-                        .entry(contract_id)
-                        .or_default()
-                        .insert(delegate_key.clone());
-                    // Register the DEMAND half (#4669 part 1 / #5467 Phase 1):
-                    // without this the subscribe above is a passive local
-                    // notification hook — it does not set `contract_in_use`,
-                    // does not enter `contracts_needing_renewal()`, and does
-                    // not raise the contract's eviction tier, so the pin
-                    // silently does not take. See `delegate_demand`.
-                    //
-                    // `op_manager_handle()` is `None` for local-only / mock
-                    // executors with no ring; those have no demand machinery to
-                    // register with, and the notification half above still
-                    // works, so this degrades to exactly the old behavior.
-                    if let Some(op_manager) = contract_handler.executor().op_manager_handle() {
-                        delegate_demand::register_subscription(
-                            &op_manager,
-                            delegate_key,
-                            &full_key,
+                let result =
+                    if let Some(full_key) = contract_handler.executor().lookup_key(&contract_id) {
+                        // Register subscription in the global registry (the
+                        // REACTIVE half: this is what `ContractNotification`
+                        // delivery reads).
+                        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+                            .entry(contract_id)
+                            .or_default()
+                            .insert(delegate_key.clone());
+                        // Register the DEMAND half (#4669 part 1 / #5467 Phase 1):
+                        // without this the subscribe above is a passive local
+                        // notification hook — it does not set `contract_in_use`,
+                        // does not enter `contracts_needing_renewal()`, and does
+                        // not raise the contract's eviction tier, so the pin
+                        // silently does not take. See `delegate_demand`.
+                        //
+                        // `op_manager_handle()` is `None` for local-only / mock
+                        // executors with no ring; those have no demand machinery to
+                        // register with, and the notification half above still
+                        // works, so this degrades to exactly the old behavior.
+                        if let Some(op_manager) = contract_handler.executor().op_manager_handle() {
+                            delegate_demand::register_subscription(
+                                &op_manager,
+                                delegate_key,
+                                &full_key,
+                            );
+                        }
+                        Ok(())
+                    } else {
+                        tracing::debug!(
+                            contract = %contract_id,
+                            "Contract not found locally for delegate SubscribeContractRequest"
                         );
-                    }
-                    Ok(())
-                } else {
-                    tracing::debug!(
-                        contract = %contract_id,
-                        "Contract not found locally for delegate SubscribeContractRequest"
-                    );
-                    Err("Contract not found".to_string())
-                };
+                        Err("Contract not found".to_string())
+                    };
 
                 inbound_responses.push(InboundDelegateMsg::SubscribeContractResponse(
                     SubscribeContractResponse {

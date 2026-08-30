@@ -81,6 +81,27 @@
 //!   that is #4669 parts 2-4 / #5467 Phase 3; until it lands a delegate pin
 //!   lapses on node restart and nowhere else.
 //!
+//!   Two known residuals of the same shape, both self-healing rather than
+//!   permanent, both closing properly only when the demand and the notification
+//!   hook become ONE record with one owner (#4669 part 3's durable
+//!   delegate-subscription store):
+//!   - `HostingManager::teardown_evicted_in_use_contract` clears
+//!     `client_subscriptions[key.id()]` wholesale on a subscriber-primary
+//!     eviction, so a delegate loses its demand while keeping its hook — the
+//!     pre-#4669 state — with no notification and no re-registration path until
+//!     the delegate next subscribes.
+//!   - The PUT-rollback paths in `contract/executor/runtime/contract_ops.rs`
+//!     do the mirror image: `ContractStore::remove_contract` drops the hook and
+//!     cannot reach the ring to drop the demand.
+//!
+//! # Why there is no per-contract drop
+//!
+//! Only [`drop_delegate_demand`] exists, not a `drop_subscription(delegate,
+//! contract)`. Every teardown today is whole-delegate — `UnregisterDelegate`,
+//! and the notification channel closing — so a per-contract primitive would be
+//! unused code, and the natural place to write it is alongside its first real
+//! caller, the explicit unsubscribe in #4669 part 4 / #2830.
+//!
 //! # No new spawn path
 //!
 //! Registering demand is the whole change. The existing renewal loop
@@ -111,6 +132,19 @@ use crate::node::OpManager;
 /// a delegate unregister drop a live client's subscription.
 const DELEGATE_CLIENT_ID_BASE: usize = 1usize << (usize::BITS - 1);
 
+// The "structurally impossible" claim above is a 64-bit claim. On a 32-bit
+// target the reserved base is 2^31, and the real-client counter — seeded
+// `1 + thread_index * COUNTER_BLOCK` from a global thread counter that is never
+// reset — reaches it after a few thousand threads over a long-running process.
+// Every shipped target is 64-bit, so rather than weaken the claim, assert the
+// precondition it rests on and let a 32-bit port fail to build and re-derive it.
+const _: () = assert!(
+    usize::BITS >= 64,
+    "DELEGATE_CLIENT_ID_BASE reserves the top bit of a usize on the assumption \
+     that the real-client counter cannot reach it. That holds at 63 bits and \
+     not at 31 — re-derive the reservation before targeting a 32-bit platform."
+);
+
 /// The stable synthetic [`ClientId`] standing in for `delegate` as a local
 /// subscriber.
 ///
@@ -121,6 +155,20 @@ const DELEGATE_CLIENT_ID_BASE: usize = 1usize << (usize::BITS - 1);
 /// - **stateless**, so nothing has to be allocated, torn down, or kept in sync
 ///   with the delegate lifecycle.
 ///
+/// Hashes the delegate's **whole** identity — `bytes()` AND `code_hash()`.
+/// `DelegateKey` is a `(key, code_hash)` pair and its `Eq`/`Hash` cover both,
+/// which is what `DELEGATE_SUBSCRIPTIONS` and `Runtime::unregister_delegate`
+/// key on. Hashing `bytes()` alone would make this id alias across keys that
+/// every other consumer treats as distinct, and that aliasing is reachable from
+/// the wire: `DelegateKey::try_decode_fbs` length-checks the two fields
+/// independently and never verifies that `key == generate_id(params, code)`,
+/// while `UnregisterDelegate` takes the client's pair verbatim. A forged
+/// `(victim_key_bytes, any_code_hash)` would then leave the notification
+/// registry untouched (full-key equality, no match) yet drop every demand
+/// registration the real delegate holds. The `bytes()`-only version of this
+/// function had exactly that hole; the module's own stability test did not
+/// catch it, because its two fixtures differ in both fields.
+///
 /// Collision analysis: 63 bits of BLAKE3 output. Collision with a real client
 /// id is impossible (see [`DELEGATE_CLIENT_ID_BASE`]). Collision between two
 /// distinct delegates is a birthday event at ~2^31.5 delegates on one node, and
@@ -128,7 +176,10 @@ const DELEGATE_CLIENT_ID_BASE: usize = 1usize << (usize::BITS - 1);
 /// each keeping the other's contracts pinned — not a correctness or
 /// authorization failure. Neither is reachable in practice.
 pub(crate) fn client_id_for(delegate: &DelegateKey) -> ClientId {
-    let hash = blake3::hash(delegate.bytes());
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(delegate.bytes());
+    hasher.update(delegate.code_hash().as_ref());
+    let hash = hasher.finalize();
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&hash.as_bytes()[..8]);
     // Clear the top bit of the hash, then set it from the reserved base, so the
@@ -219,11 +270,18 @@ pub(crate) fn register_subscription(
     contract: &ContractKey,
 ) -> bool {
     if !op_manager.ring.is_hosting_contract(contract) {
-        tracing::debug!(
+        // WARN, not debug, and deliberately so. This whole module exists
+        // because a delegate subscribe could silently fail to pin; a silent
+        // variant of the same outcome is the one thing that must not ship
+        // quiet. The delegate is still told the subscribe succeeded (changing
+        // that would break callers that subscribe before the node settles), so
+        // this line is the only signal that the pin did not take.
+        tracing::warn!(
             delegate = %delegate,
             contract = %contract,
             "delegate subscribed to a contract this node resolves but does not \
-             host; recording the notification hook without demand — see \
+             host: no demand registered, so the pin did NOT take and the \
+             contract will not be renewed on the delegate's behalf. See \
              `delegate_demand::register_subscription`"
         );
         return false;
@@ -239,34 +297,6 @@ pub(crate) fn register_subscription(
         "delegate subscription registered as local client demand"
     );
     true
-}
-
-/// Drop the demand `delegate` holds on `contract`, if any, and collapse the
-/// upstream subscription when nothing else is left interested.
-///
-/// The collapse half is not optional. Dropping the registration alone leaves
-/// the node holding an upstream lease for a contract nothing wants: renewal is
-/// gated on `contract_in_use`, so the lease does eventually lapse on its own,
-/// but until it does the upstream peer keeps us in its fan-out. The
-/// client-disconnect path (`client_events.rs`, `ClientRequest::Disconnect`)
-/// collapses immediately for the same reason, and this path is the delegate's
-/// equivalent, so it uses the same gate.
-pub(crate) fn drop_subscription(
-    op_manager: &std::sync::Arc<OpManager>,
-    delegate: &DelegateKey,
-    contract: &ContractKey,
-) {
-    let client_id = client_id_for(delegate);
-    op_manager
-        .ring
-        .remove_client_subscription(contract.id(), client_id);
-    tracing::debug!(
-        delegate = %delegate,
-        contract = %contract,
-        %client_id,
-        "delegate subscription demand dropped"
-    );
-    collapse_if_no_interest(op_manager, contract);
 }
 
 /// Send `Unsubscribe` upstream for `contract` when nothing on this node is
@@ -287,6 +317,22 @@ fn collapse_if_no_interest(op_manager: &std::sync::Arc<OpManager>, contract: &Co
     let op_mgr = op_manager.clone();
     let contract = *contract;
     crate::config::GlobalExecutor::spawn(async move {
+        // Re-check inside the task. The gate above and the send are not atomic,
+        // so a re-subscribe landing in between would otherwise send Unsubscribe
+        // upstream for a contract that is in use again — and
+        // `send_unsubscribe_upstream` does not re-check for itself. The
+        // client-disconnect path in `client_events.rs` has the same shape and
+        // does not re-check, which is tolerable there because a human-paced
+        // disconnect fires it once; here the channel-closed teardown can fire
+        // it in a loop over every delegate on a contract, so the window is
+        // worth closing. This narrows the race to the span inside the task
+        // rather than eliminating it; the renewal loop repairs the remainder.
+        if !op_mgr.reconcile_wants_collapse(
+            &contract,
+            crate::node::network_status::ReconcileShadowSite::Collapse,
+        ) {
+            return;
+        }
         op_mgr.send_unsubscribe_upstream(&contract).await;
     });
 }
@@ -362,6 +408,48 @@ mod tests {
              replays a persisted subscription set against it"
         );
         assert_ne!(client_id_for(&a), client_id_for(&b));
+    }
+
+    /// The synthetic id must distinguish delegate keys that differ in EITHER
+    /// half, because `DelegateKey`'s own `Eq`/`Hash` do — and because the pair
+    /// arrives off the wire unvalidated.
+    ///
+    /// `DelegateKey::try_decode_fbs` length-checks `key` and `code_hash`
+    /// independently and never verifies `key == generate_id(params, code)`,
+    /// while `UnregisterDelegate` takes the client's pair verbatim. If the id
+    /// were derived from `bytes()` alone, a forged `(victim_key, any_code_hash)`
+    /// would miss the notification registry (full-key equality) and still drop
+    /// every demand registration the real delegate holds.
+    ///
+    /// Note `delegate_client_id_is_stable_and_distinct` above does NOT cover
+    /// this: its two fixtures differ in both fields, so it passes under the
+    /// aliasing bug.
+    #[test]
+    fn delegate_client_id_covers_both_halves_of_the_key() {
+        let same_bytes_different_code =
+            DelegateKey::new([9u8; 32], freenet_stdlib::prelude::CodeHash::new([1u8; 32]));
+        let forged = DelegateKey::new([9u8; 32], freenet_stdlib::prelude::CodeHash::new([2u8; 32]));
+        assert_ne!(
+            same_bytes_different_code, forged,
+            "precondition: DelegateKey equality covers code_hash"
+        );
+        assert_ne!(
+            client_id_for(&same_bytes_different_code),
+            client_id_for(&forged),
+            "the synthetic id must not alias across keys that DelegateKey \
+             itself treats as distinct — a forged code_hash would otherwise \
+             drop the real delegate's demand while leaving its notification \
+             registration untouched"
+        );
+
+        let same_code_different_bytes = DelegateKey::new(
+            [10u8; 32],
+            freenet_stdlib::prelude::CodeHash::new([1u8; 32]),
+        );
+        assert_ne!(
+            client_id_for(&same_bytes_different_code),
+            client_id_for(&same_code_different_bytes),
+        );
     }
 
     // =====================================================================
@@ -501,15 +589,16 @@ mod tests {
         register_subscription(&op_manager, &second, &key);
         assert_eq!((2, 0), ring.local_and_downstream_counts(&key));
 
-        drop_subscription(&op_manager, &first, &key);
+        drop_delegate_demand(&op_manager, &first);
         assert!(
             ring.contract_in_use(&key),
-            "one delegate unsubscribing must not drop another delegate's pin — \
-             the two hold distinct synthetic client ids"
+            "tearing one delegate down must not drop another delegate's pin on \
+             the same contract — the two hold distinct synthetic client ids, \
+             and a shared one would make every delegate's teardown a global one"
         );
         assert_eq!((1, 0), ring.local_and_downstream_counts(&key));
 
-        drop_subscription(&op_manager, &second, &key);
+        drop_delegate_demand(&op_manager, &second);
         assert!(
             !ring.contract_in_use(&key),
             "the last delegate unsubscribing must release the pin, or the \
@@ -581,7 +670,7 @@ mod tests {
         );
 
         // ...and a single drop must therefore be enough to release it.
-        drop_subscription(&op_manager, &delegate, &key);
+        drop_delegate_demand(&op_manager, &delegate);
         assert!(!ring.contract_in_use(&key));
     }
 
@@ -605,7 +694,15 @@ mod tests {
         let arm = SOURCE
             .find("for req in subscribe_requests")
             .expect("the V1 SubscribeContractRequest loop must still exist");
-        let body = &SOURCE[arm..arm + 3000.min(SOURCE.len() - arm)];
+        // Bound the window to the arm itself, not to a byte count. The
+        // `Err("Contract not found"` literal is the else-branch of the same
+        // `if let`, so everything before it is inside the arm — a byte window
+        // would spill into the neighbouring delegate-to-delegate section and
+        // keep passing if the call moved there.
+        let arm_end = SOURCE[arm..]
+            .find(r#"Err("Contract not found""#)
+            .expect("the V1 subscribe arm must still have its not-found branch");
+        let body = &SOURCE[arm..arm + arm_end];
         assert!(
             body.contains("DELEGATE_SUBSCRIPTIONS"),
             "the V1 subscribe arm must still record the notification hook — \
@@ -622,21 +719,37 @@ mod tests {
     }
 
     #[test]
-    fn both_runtime_executor_constructors_install_the_subscribe_callback() {
+    fn every_runtime_executor_constructor_installs_the_subscribe_callback() {
         const SOURCE: &str = include_str!("executor/runtime.rs");
-        let installs = SOURCE.matches("set_delegate_subscribe_callback(").count();
+        // Production region only. The test module at the end of that file
+        // builds many more `Runtime`s and installs no callbacks, which is
+        // fine — they have no ring to register with.
+        let production = SOURCE
+            .split_once("\n#[cfg(test)]")
+            .map(|(head, _)| head)
+            .unwrap_or(SOURCE);
+
+        // Count CONSTRUCTORS, not installs. Counting installs detects the
+        // removal of one and is blind to the case the failure message is
+        // actually about: a third constructor added later that forgets the
+        // callback leaves the install count unchanged, and a V2 delegate
+        // subscribing on an executor built by it registers no demand —
+        // silently. `Runtime::build_with_shared_module_caches` contains
+        // `Runtime::build`, so this substring counts both.
+        let constructors = production.matches("Runtime::build").count();
+        let installs = production
+            .matches("set_delegate_subscribe_callback(")
+            .count();
         assert_eq!(
-            2, installs,
-            "every `Executor<Runtime>` constructor that installs the state-write \
-             and state-admit callbacks must also install the delegate-subscribe \
-             callback, or a V2 delegate subscribing on an executor built by the \
-             constructor that forgot it registers no demand — silently. If a \
-             constructor was added or removed, update this pin deliberately \
-             rather than loosening it."
+            constructors, installs,
+            "every `Executor<Runtime>` constructor must install the \
+             delegate-subscribe callback: found {constructors} constructor(s) \
+             and {installs} install(s). If a constructor was added, install the \
+             callback in it; do not loosen this pin."
         );
         assert_eq!(
             installs,
-            SOURCE
+            production
                 .matches("delegate_demand::register_subscription(")
                 .count(),
             "each installed subscribe callback must delegate to \
@@ -652,7 +765,12 @@ mod tests {
         let start = SOURCE
             .find("fn subscribe_contract_sync(")
             .expect("the V2 subscribe host function must still exist");
-        let body = &SOURCE[start..start + 2000.min(SOURCE.len() - start)];
+        // Bound to the end of the function rather than to a byte count, so a
+        // call that moved OUT of it into the next one cannot keep this green.
+        let body_end = SOURCE[start..]
+            .find("\n    }\n")
+            .expect("subscribe_contract_sync must still be a closed fn body");
+        let body = &SOURCE[start..start + body_end];
 
         let resolve = body
             .find("resolve_contract_key(")
@@ -672,8 +790,17 @@ mod tests {
     #[test]
     fn unregistering_a_delegate_drops_its_demand() {
         const SOURCE: &str = include_str!("executor/runtime/delegates.rs");
+        // Scope to the arm. A whole-file `contains` would stay green if the
+        // call were left behind in dead code or moved to an unrelated arm.
+        let arm = SOURCE
+            .find("DelegateRequest::UnregisterDelegate(")
+            .expect("the UnregisterDelegate arm must still exist");
+        let arm_end = SOURCE[arm..]
+            .find("self.runtime.unregister_delegate(")
+            .expect("the UnregisterDelegate arm must still end in unregister_delegate");
+        let body = &SOURCE[arm..arm + arm_end];
         assert!(
-            SOURCE.contains("delegate_demand::drop_delegate_demand("),
+            body.contains("delegate_demand::drop_delegate_demand("),
             "`UnregisterDelegate` cleanup must drop the delegate's demand as \
              well as its notification hooks. There is no unsubscribe (#2830) \
              and `DELEGATE_SUBSCRIPTIONS` is in-memory, so a demand record left \
