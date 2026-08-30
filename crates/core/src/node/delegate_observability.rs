@@ -52,9 +52,12 @@
 //! Only the last row is mirrored, because no canonical store for it exists:
 //! delegate execution today has no timing at all and errors are logged
 //! per-call at `contract/executor/runtime/delegates.rs` without ever being
-//! counted. To keep that mirror honest there is exactly ONE per-call write site
-//! ([`record_invocation`]) and ONE per-request write site ([`RequestMeter`]),
-//! both pinned by source-scrape tests below.
+//! counted. To keep that mirror honest the write sites are source-pinned: the
+//! per-call counter ([`record_invocation`]) is called from exactly two places,
+//! the `Ok` and `Err` arms of the sole production `inbound_app_message` call,
+//! and the per-request counter ([`RequestMeter`]) from exactly one. The
+//! per-call pin asserts BOTH outcomes are recorded, since dropping only the
+//! failure arm would make a delegate that panics every time look healthy.
 //!
 //! # Bounding
 //!
@@ -316,9 +319,11 @@ pub(crate) enum InvocationOutcome<'a> {
 
 /// Record one delegate invocation (one `inbound_app_message` execution).
 ///
-/// **This is the only per-call write site**, pinned by
-/// `record_invocation_has_exactly_one_production_call_site`: a future refactor
-/// that adds a second call site, or moves this one, fails CI rather than
+/// Called from exactly two places — the `Ok` and `Err` arms of the sole
+/// production `inbound_app_message` call — and pinned by
+/// `both_delegate_invocation_outcomes_are_recorded`, which checks BOTH outcomes
+/// are still recorded rather than just counting calls. A refactor that moves the
+/// delegate execution path, or that drops the failure arm, fails CI rather than
 /// silently producing a counter that undercounts. That pin exists because
 /// #4009/#4010 are precisely the case where a migration re-homed an op path and
 /// the mirrored counter rotted without anything going red.
@@ -781,28 +786,49 @@ mod tests {
         DelegateKey::new([byte; 32], CodeHash::new([byte; 32]))
     }
 
-    /// The single-write-site pin for the PER-CALL counter (#4009/#4010 shape).
+    /// The write-site pin for the PER-CALL counter (#4009/#4010 shape).
     ///
     /// `record_invocation` is a mirrored counter, which is the failure mode
     /// bug-prevention-patterns.md warns about: a later migration re-homes the
     /// delegate call path, forgets to re-wire the call, and the counter reads a
-    /// plausible zero forever. Anchoring on the API surface (the call
-    /// expression) rather than a variable name keeps this from rotting on a
-    /// rename of the surrounding function.
+    /// plausible zero forever.
+    ///
+    /// There are exactly TWO call sites — the `Ok` and `Err` arms of the sole
+    /// production `inbound_app_message` call — and the test asserts BOTH
+    /// outcomes are recorded, not merely that some call exists. Asserting only
+    /// a total count would go green if someone deleted the failure arm and
+    /// duplicated the success one, which is the shape that matters: dropping
+    /// the failure recording makes a delegate that panics on every invocation
+    /// indistinguishable from a healthy one, and that is the exact blindness
+    /// this module was built to end.
+    ///
+    /// Anchored on the API surface (the call expression and the outcome
+    /// variants) rather than on variable names, so it does not rot on a rename
+    /// of the surrounding function.
     #[test]
-    fn record_invocation_has_exactly_one_production_call_site() {
+    fn both_delegate_invocation_outcomes_are_recorded() {
         let src = include_str!("../contract/executor/runtime/delegates.rs");
         let calls = src
             .matches("delegate_observability::record_invocation(")
             .count();
         assert_eq!(
-            calls, 1,
-            "expected exactly ONE production call site of record_invocation in \
-             delegates.rs (the sole production call site of inbound_app_message). \
-             Found {calls}. If the delegate execution path moved, move the \
-             instrumentation with it — do not add a second call site, and do not \
-             delete this one: an uncounted invocation is indistinguishable from a \
-             delegate that never ran."
+            calls, 2,
+            "expected exactly TWO production call sites of record_invocation in \
+             delegates.rs — the Ok and Err arms of the sole production \
+             inbound_app_message call. Found {calls}. If the delegate execution \
+             path moved, move the instrumentation with it; an uncounted \
+             invocation is indistinguishable from a delegate that never ran."
+        );
+        assert_eq!(
+            src.matches("InvocationOutcome::Success").count(),
+            1,
+            "the success arm must record exactly one Success outcome"
+        );
+        assert_eq!(
+            src.matches("InvocationOutcome::Failure").count(),
+            1,
+            "the failure arm must record exactly one Failure outcome — without \
+             it, a delegate that panics on every invocation reports zero errors"
         );
     }
 
@@ -1183,6 +1209,10 @@ mod tests {
     /// [`EXEC_CPU_IS_NOT_REPORTED_TO_THE_SHARED_METER`].
     #[test]
     fn exec_cpu_is_not_reported_to_the_shared_topology_meter() {
+        // Ties the documented rationale to the check that enforces it: deleting
+        // the constant breaks this test, so the explanation cannot silently
+        // outlive the guard (or vice versa).
+        let () = EXEC_CPU_IS_NOT_REPORTED_TO_THE_SHARED_METER;
         for (name, src) in [
             (
                 "delegates.rs",
