@@ -706,21 +706,6 @@ where
                                 }
                             }
 
-                            self.broadcast_state_change(key, incoming_state.clone())
-                                .await;
-
-                            // Notify locally-subscribed WS clients of the
-                            // new state. Without this, the very first state
-                            // install for a contract on this node never
-                            // reaches `register_contract_notifier` consumers
-                            // — only the merge path at the end of this
-                            // function calls `commit_state_update`, which
-                            // is the only other site that fans out to the
-                            // local notifier map. ResyncResponse-driven
-                            // applies hit this branch when the state_store
-                            // entry is missing, so subscribers would miss
-                            // every cross-node delivery that recovers via
-                            // resync.
                             tracing::info!(
                                 contract = %key,
                                 new_size_bytes = incoming_state.as_ref().len(),
@@ -728,22 +713,19 @@ where
                                 event = "initial_state_installed",
                                 "Contract initial state installed"
                             );
-                            // Dashboard "last updated" telemetry; no-op if
-                            // we're not subscribed to this contract.
-                            if let Some(op_manager) = &self.op_manager {
-                                op_manager.ring.record_contract_update(&key);
-                            }
-                            if let Err(err) = self
-                                .send_update_notification(&key, &params, &incoming_state)
-                                .await
-                            {
-                                tracing::error!(
-                                    contract = %key,
-                                    error = %err,
-                                    phase = "notification_failed",
-                                    "Failed to send initial-state notification"
-                                );
-                            }
+                            // The very first state install for a contract on
+                            // this node owes the SAME post-store fan-out the
+                            // merge path performs, and this branch is the one
+                            // a ResyncResponse-driven apply takes whenever the
+                            // `state_store` entry is missing — so a consumer
+                            // dropped here misses every cross-node delivery
+                            // that recovers via resync. Hand-inlining a subset
+                            // is how #5481 happened (delegates were the
+                            // dropped leg, after WS clients had already been
+                            // the dropped leg once before). Call the helper;
+                            // do not re-inline.
+                            self.finalize_state_commit(&key, &params, &incoming_state)
+                                .await;
 
                             return Ok(UpsertResult::Updated(incoming_state));
                         }
@@ -2209,13 +2191,57 @@ where
             "Contract state updated"
         );
 
-        // Record update timestamp for dashboard display. No-op if we're
-        // not subscribed (e.g., a relay forwarding an UPDATE for a
-        // contract this peer doesn't track).
+        self.finalize_state_commit(key, parameters, new_state).await;
+
+        Ok(())
+    }
+
+    /// The complete post-store fan-out for a contract state this node has
+    /// just committed. **Every path that stores a state MUST call this**
+    /// rather than hand-inlining a subset of its legs.
+    ///
+    /// The four legs, in order:
+    ///
+    /// 1. `Ring::record_contract_update` — dashboard "last updated"
+    ///    telemetry. No-op when this peer does not track the contract
+    ///    (e.g. a relay forwarding an UPDATE).
+    /// 2. `send_update_notification` — locally-subscribed WebSocket
+    ///    clients.
+    /// 3. `send_delegate_contract_notifications` — locally-subscribed
+    ///    delegates. Best-effort and lossy by design (`try_send`); see
+    ///    that method.
+    /// 4. `broadcast_state_change` — the network. Suppressed for a
+    ///    contract flagged as violating a CRDT invariant, and emitted
+    ///    non-blocking (#4145).
+    ///
+    /// This exists because the legs kept getting dropped one at a time.
+    /// Both storing paths — the initial-state install in
+    /// `bridged_upsert_contract_state_inner` and `commit_state_update`
+    /// (the merge path) — re-inlined their own subset, and the
+    /// initial-install branch omitted the WS-client leg once, then the
+    /// delegate leg (#5481), each time silently: the subscription is
+    /// still registered, the delegate is still healthy, and no error is
+    /// produced anywhere. That is the "manually-inlined originator side
+    /// effects" row in `.claude/rules/bug-prevention-patterns.md`. The
+    /// source-scrape pin
+    /// `pool_tests::delegate_notification_tests::finalize_state_commit_is_the_only_post_store_fan_out_site`
+    /// fails if a leg leaves this helper or a second site starts calling
+    /// one directly.
+    ///
+    /// Every leg is best-effort: none of them can fail the commit, which
+    /// has already landed on disk by the time this runs.
+    async fn finalize_state_commit(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters<'_>,
+        new_state: &WrappedState,
+    ) {
+        // 1. Dashboard "last updated" telemetry.
         if let Some(op_manager) = &self.op_manager {
             op_manager.ring.record_contract_update(key);
         }
 
+        // 2. Locally-subscribed WebSocket clients.
         if let Err(err) = self
             .send_update_notification(key, parameters, new_state)
             .await
@@ -2228,56 +2254,11 @@ where
             );
         }
 
-        // Notify subscribed delegates about the state change
+        // 3. Locally-subscribed delegates.
         self.send_delegate_contract_notifications(key, new_state);
 
-        if let Some(op_manager) = &self.op_manager {
-            // Skip the broadcast entirely if this contract has been flagged
-            // as violating a CRDT invariant (e.g. non-idempotent
-            // `update_state`). The idempotency probe in
-            // `bridged_upsert_contract_state` sets this flag when it
-            // catches `update_state(update_state(S, U), U) != update_state(S, U)`.
-            // Once flagged, propagating this contract's state changes
-            // re-engages the broadcast storm we are trying to suppress.
-            // See `crate::ring::broken_invariants`.
-            if op_manager.ring.is_contract_broken(key) {
-                tracing::debug!(
-                    contract = %key,
-                    event = "broadcast_suppressed_broken_contract",
-                    "Skipping BroadcastStateChange for contract flagged as broken"
-                );
-            } else if let Err(err) =
-                op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
-                    key: *key,
-                    new_state: new_state.clone(),
-                    is_retry: false,
-                    is_reemit: false,
-                })
-            {
-                // Non-blocking emit: a 30-second `notify_node_event(...).await`
-                // on this commit path was the primary back-pressure source
-                // that wedged both gateways on 2026-05-24 (#4145). Missed
-                // broadcasts heal via the next UPDATE or via summary-mismatch
-                // SyncStateToPeer rounds — the executor must not stall here.
-                //
-                // Best-effort by design (see comment block above and
-                // #4145): a missed broadcast heals via the next UPDATE
-                // or summary-mismatch SyncStateToPeer round. Per-
-                // occurrence WARN here flooded gateways under fan-out
-                // at the same rate as the helper-internal log it
-                // mirrored (#4238). The rate-limited `notify_node_event:
-                // Notification channel full for too long` ERROR in
-                // op_state_manager.rs is the sustained-back-pressure
-                // alert operators should grep for.
-                tracing::debug!(
-                    contract = %key,
-                    error = %err,
-                    "Failed to broadcast state change to network peers (best-effort)"
-                );
-            }
-        }
-
-        Ok(())
+        // 4. The network.
+        self.broadcast_state_change(*key, new_state.clone()).await;
     }
 
     /// Send notifications to delegates subscribed to a contract's state changes.
@@ -2693,9 +2674,14 @@ where
 
     pub(super) async fn broadcast_state_change(&self, key: ContractKey, new_state: WrappedState) {
         if let Some(op_manager) = &self.op_manager {
-            // Mirror the broken-invariant gate in `commit_state_update`
-            // above. Same rationale: a contract flagged as non-idempotent
-            // must not be propagated.
+            // Skip the broadcast entirely if this contract has been flagged
+            // as violating a CRDT invariant (e.g. non-idempotent
+            // `update_state`). The idempotency probe in
+            // `bridged_upsert_contract_state` sets this flag when it
+            // catches `update_state(update_state(S, U), U) != update_state(S, U)`.
+            // Once flagged, propagating this contract's state changes
+            // re-engages the broadcast storm we are trying to suppress.
+            // See `crate::ring::broken_invariants`.
             if op_manager.ring.is_contract_broken(&key) {
                 tracing::debug!(
                     contract = %key,
@@ -2704,8 +2690,11 @@ where
                 );
                 return;
             }
-            // Non-blocking emit — see comment in the update path above
-            // and #4145 for the wedge this prevents.
+            // Non-blocking emit: a 30-second `notify_node_event(...).await`
+            // on the commit path was the primary back-pressure source that
+            // wedged both gateways on 2026-05-24 (#4145). Missed broadcasts
+            // heal via the next UPDATE or via summary-mismatch
+            // SyncStateToPeer rounds — the executor must not stall here.
             if let Err(err) =
                 op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                     key,
@@ -2714,10 +2703,14 @@ where
                     is_reemit: false,
                 })
             {
-                // Best-effort by design — see #4145 and the sibling
-                // commit path above. Per-occurrence WARN here re-
-                // introduced the #4238 spam at the caller layer even
-                // after the helper-internal downgrade.
+                // Best-effort by design (see #4145): a missed broadcast
+                // heals via the next UPDATE or summary-mismatch
+                // SyncStateToPeer round. Per-occurrence WARN here flooded
+                // gateways under fan-out at the same rate as the
+                // helper-internal log it mirrored (#4238). The
+                // rate-limited `notify_node_event: Notification channel
+                // full for too long` ERROR in op_state_manager.rs is the
+                // sustained-back-pressure alert operators should grep for.
                 tracing::debug!(
                     contract = %key,
                     error = %err,
