@@ -211,8 +211,9 @@ fn truncate_error(msg: &str) -> String {
 /// it `retain`s and `remove`s across keys on the same DashMap, which
 /// self-deadlocks. Both callers drop their guard first.
 fn evict_if_full(now: Instant) {
-    DELEGATE_EXEC_STATS
-        .retain(|_, entry| now.saturating_duration_since(entry.last_active_at) < DELEGATE_STATS_TTL);
+    DELEGATE_EXEC_STATS.retain(|_, entry| {
+        now.saturating_duration_since(entry.last_active_at) < DELEGATE_STATS_TTL
+    });
     if DELEGATE_EXEC_STATS.len() < MAX_TRACKED_DELEGATES {
         return;
     }
@@ -314,7 +315,9 @@ pub(crate) fn record_request(key: &DelegateKey, sample: RequestSample, now: Inst
         entry.requests = entry.requests.saturating_add(1);
         entry.total_request_micros = entry.total_request_micros.saturating_add(micros);
         entry.max_request_micros = entry.max_request_micros.max(micros);
-        entry.total_iterations = entry.total_iterations.saturating_add(sample.iterations as u64);
+        entry.total_iterations = entry
+            .total_iterations
+            .saturating_add(sample.iterations as u64);
         entry.max_iterations = entry.max_iterations.max(sample.iterations);
         entry.total_inter_delegate_messages = entry
             .total_inter_delegate_messages
@@ -525,7 +528,10 @@ fn exec_fields(stats: Option<&DelegateExecEntry>, now: Instant) -> ExecFields {
         last_error_secs_ago: entry
             .last_error_at
             .map(|at| now.saturating_duration_since(at).as_secs()),
-        last_active_secs_ago: Some(now.saturating_duration_since(entry.last_active_at).as_secs()),
+        last_active_secs_ago: Some(
+            now.saturating_duration_since(entry.last_active_at)
+                .as_secs(),
+        ),
         total_exec_micros: entry.total_exec_micros,
         invocation_rate_per_sec: entry
             .invocation_rate
@@ -540,6 +546,42 @@ fn exec_fields(stats: Option<&DelegateExecEntry>, now: Instant) -> ExecFields {
         total_inter_delegate_messages: entry.total_inter_delegate_messages,
         max_inter_delegate_messages: entry.max_inter_delegate_messages,
     }
+}
+
+/// Resolve one delegate's subscription rows against the node's live demand set,
+/// returning the rows and how many of them registered demand.
+///
+/// Extracted as a pure function so the load-bearing field — `registered_demand`
+/// — is directly testable without standing up a `Ring` (`Ring::new` spawns
+/// background tasks and is deliberately avoided by every other unit test here).
+///
+/// The test asserts this TRACKS the supplied set rather than asserting any
+/// particular value. That distinction matters: today `Ring::contract_in_use`
+/// has no delegate term, so in practice every row reads `false` — but a test
+/// pinning `false` would have to be edited by the very change (#4669) it exists
+/// to guard, and would go green for the wrong reason in the meantime.
+fn subscription_rows(
+    mut instance_ids: Vec<ContractInstanceId>,
+    in_use: &std::collections::HashSet<ContractInstanceId>,
+) -> (Vec<DelegateSubscriptionEntry>, usize) {
+    // Deterministic order so the rendered table does not reshuffle between
+    // dashboard refreshes.
+    instance_ids.sort_by_key(|id| id.to_string());
+    let mut registering = 0usize;
+    let rows = instance_ids
+        .into_iter()
+        .map(|instance_id| {
+            let registered_demand = in_use.contains(&instance_id);
+            if registered_demand {
+                registering += 1;
+            }
+            DelegateSubscriptionEntry {
+                contract: instance_id.to_string(),
+                registered_demand,
+            }
+        })
+        .collect();
+    (rows, registering)
 }
 
 /// Build the snapshot by reading canonical state.
@@ -582,23 +624,10 @@ pub(crate) fn build_snapshot(ring: &crate::ring::Ring, now: Instant) -> Delegate
     let mut subscriptions_without_demand = 0usize;
     let mut iteration_cap_hits_total = 0u64;
 
-    for (key, mut instance_ids) in by_delegate {
-        instance_ids.sort_by_key(|id| id.to_string());
-        let mut subscriptions = Vec::with_capacity(instance_ids.len());
-        let mut registering = 0usize;
-        for instance_id in instance_ids {
-            let registered_demand = in_use.contains(&instance_id);
-            if registered_demand {
-                registering += 1;
-            } else {
-                subscriptions_without_demand += 1;
-            }
-            subscriptions_total += 1;
-            subscriptions.push(DelegateSubscriptionEntry {
-                contract: instance_id.to_string(),
-                registered_demand,
-            });
-        }
+    for (key, instance_ids) in by_delegate {
+        let (subscriptions, registering) = subscription_rows(instance_ids, &in_use);
+        subscriptions_total += subscriptions.len();
+        subscriptions_without_demand += subscriptions.len() - registering;
         if registering < subscriptions.len() {
             delegates_with_unpinned_subscriptions += 1;
         }
@@ -818,7 +847,12 @@ mod tests {
         let _guard = exclusive();
         let k = key(1);
         let t0 = Instant::now();
-        record_invocation(&k, Duration::from_micros(10), InvocationOutcome::Success, t0);
+        record_invocation(
+            &k,
+            Duration::from_micros(10),
+            InvocationOutcome::Success,
+            t0,
+        );
         record_invocation(
             &k,
             Duration::from_micros(20),
@@ -1001,6 +1035,88 @@ mod tests {
             "a delegate with a sample has a rate"
         );
         clear_for_test();
+    }
+
+    fn instance(byte: u8) -> ContractInstanceId {
+        ContractInstanceId::new([byte; 32])
+    }
+
+    /// **The load-bearing assertion of Phase 0.**
+    ///
+    /// `registered_demand` must TRACK the node's demand predicate, not carry a
+    /// baked-in value. Written deliberately as "follows the set" rather than
+    /// "is false": today `Ring::contract_in_use` has no delegate term, so in
+    /// production every row reads `false` — but pinning `false` would mean the
+    /// test had to be rewritten by #4669, the very change it exists to guard,
+    /// and would pass for the wrong reason until then. When #4669 makes a
+    /// delegate subscription register demand, the id lands in
+    /// `in_use_contract_ids()` and this test goes green unchanged.
+    #[test]
+    fn registered_demand_tracks_the_in_use_set_rather_than_a_fixed_value() {
+        let pinned = instance(1);
+        let unpinned = instance(2);
+        let in_use: std::collections::HashSet<ContractInstanceId> =
+            [pinned].into_iter().collect();
+
+        let (rows, registering) = subscription_rows(vec![pinned, unpinned], &in_use);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(registering, 1, "exactly one subscription registered demand");
+        let pinned_row = rows
+            .iter()
+            .find(|r| r.contract == pinned.to_string())
+            .expect("the pinned contract must have a row");
+        let unpinned_row = rows
+            .iter()
+            .find(|r| r.contract == unpinned.to_string())
+            .expect("the unpinned contract must have a row");
+        assert!(
+            pinned_row.registered_demand,
+            "a subscription whose contract IS in the demand set must report true"
+        );
+        assert!(
+            !unpinned_row.registered_demand,
+            "a subscription whose contract is NOT in the demand set must report \
+             false — that divergence is the #4669 bug this panel exists to show"
+        );
+    }
+
+    /// The complement: with an empty demand set nothing registers, and with a
+    /// full one everything does. Together with the test above this rules out a
+    /// helper that returns a constant either way.
+    #[test]
+    fn registered_demand_follows_an_empty_and_a_full_demand_set() {
+        let ids = vec![instance(3), instance(4)];
+
+        let (none_rows, none_registering) =
+            subscription_rows(ids.clone(), &std::collections::HashSet::new());
+        assert_eq!(none_registering, 0);
+        assert!(none_rows.iter().all(|r| !r.registered_demand));
+
+        let all: std::collections::HashSet<ContractInstanceId> = ids.iter().copied().collect();
+        let (all_rows, all_registering) = subscription_rows(ids, &all);
+        assert_eq!(all_registering, 2);
+        assert!(all_rows.iter().all(|r| r.registered_demand));
+    }
+
+    /// `build_snapshot` must read the demand predicate from the RING, not from
+    /// anything it computes itself. A source scrape because the alternative
+    /// needs `Ring::new`, which spawns background tasks and is avoided by every
+    /// unit test in this crate's ring module for that reason.
+    #[test]
+    fn build_snapshot_reads_demand_from_the_ring() {
+        let src = include_str!("delegate_observability.rs");
+        let body = src
+            .split("pub(crate) fn build_snapshot(")
+            .nth(1)
+            .expect("build_snapshot must exist");
+        assert!(
+            body.contains("ring.in_use_contract_ids()"),
+            "build_snapshot must derive the demand set from Ring::in_use_contract_ids \
+             (the instance-id form of Ring::contract_in_use). If that call is gone, \
+             registered_demand is no longer tracking the node's real demand \
+             predicate and the panel is reporting a value it invented."
+        );
     }
 
     /// Phase 2 is not built on this branch. The flag must say so rather than

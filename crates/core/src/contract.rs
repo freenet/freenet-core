@@ -594,8 +594,7 @@ where
     // messages, so a healthy per-call duration says almost nothing about what a
     // client actually waited for. Records on drop, which covers every exit from
     // this function without touching a single return site.
-    let request_meter =
-        crate::node::delegate_observability::RequestMeter::start(delegate_key);
+    let request_meter = crate::node::delegate_observability::RequestMeter::start(delegate_key);
 
     loop {
         iterations += 1;

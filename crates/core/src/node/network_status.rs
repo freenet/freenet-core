@@ -67,8 +67,9 @@ pub type HostingProvider = Arc<dyn Fn() -> HostingSnapshot + Send + Sync + 'stat
 /// `delegate_observability::build_snapshot`, which reads canonical state —
 /// `DELEGATE_SUBSCRIPTIONS`, `Ring::in_use_contract_ids`, the topology meter
 /// and the module-cache metrics — rather than any mirrored counter.
-pub type DelegateStatusProvider =
-    Arc<dyn Fn() -> crate::node::delegate_observability::DelegateStatusSnapshot + Send + Sync + 'static>;
+pub type DelegateStatusProvider = Arc<
+    dyn Fn() -> crate::node::delegate_observability::DelegateStatusSnapshot + Send + Sync + 'static,
+>;
 
 /// Snapshot of ring-level statistics exposed to the dashboard.
 #[derive(Debug, Clone, Default)]

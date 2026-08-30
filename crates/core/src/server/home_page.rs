@@ -200,7 +200,8 @@ mod tests {
     // Explicit imports from submodules (not re-exported from root).
     use super::assets::JS;
     use super::cards::{
-        build_ban_list_card, build_contracts_card, build_governance_card, build_ops_card,
+        build_ban_list_card, build_contracts_card, build_delegates_card, build_governance_card,
+        build_ops_card,
         build_peers_card, build_ring_svg, build_status_card, build_transfer_card, format_bytes,
         format_last_evaluated,
     };
@@ -4976,4 +4977,202 @@ mod tests {
         let html = build_ban_list_card(&None);
         assert!(html.is_empty());
     }
+
+    // ── Delegates card (#5467 Phase 0) ─────────────────────────────────────
+
+    use crate::node::delegate_observability::{
+        DelegateStatusEntry, DelegateStatusSnapshot, DelegateSubscriptionEntry,
+    };
+
+    fn delegate_entry(key: &str) -> DelegateStatusEntry {
+        DelegateStatusEntry {
+            key: key.to_string(),
+            subscriptions: Vec::new(),
+            subscriptions_registering_demand: 0,
+            invocations: 0,
+            errors: 0,
+            last_error: None,
+            last_error_secs_ago: None,
+            last_active_secs_ago: None,
+            total_exec_micros: 0,
+            invocation_rate_per_sec: None,
+            exec_cpu_micros_per_sec: None,
+            requests: 0,
+            total_request_micros: 0,
+            max_request_micros: 0,
+            total_iterations: 0,
+            max_iterations: 0,
+            iteration_cap_hits: 0,
+            total_inter_delegate_messages: 0,
+            max_inter_delegate_messages: 0,
+        }
+    }
+
+    /// An unregistered provider must render NOTHING, not an empty table. An
+    /// empty table would assert "this node has no delegates", which is a claim
+    /// the dashboard cannot make when nothing is reporting.
+    #[test]
+    fn delegates_card_is_absent_when_provider_is_unregistered() {
+        let snap = base_snapshot();
+        assert!(snap.delegates.is_none(), "fixture starts unwired");
+        assert!(
+            build_delegates_card(&Some(snap)).is_empty(),
+            "an unregistered provider must render no card at all"
+        );
+        assert!(build_delegates_card(&None).is_empty());
+    }
+
+    /// A WIRED provider with no delegates must render the card with an explicit
+    /// empty state. This is the distinction the Contract Ban List card
+    /// establishes and the one #5467 turns on: "nothing to report" and "nothing
+    /// is reporting" must not look the same.
+    #[test]
+    fn delegates_card_renders_explicit_empty_state_when_wired_but_empty() {
+        let mut snap = base_snapshot();
+        snap.delegates = Some(DelegateStatusSnapshot::default());
+        let html = build_delegates_card(&Some(snap));
+        assert!(!html.is_empty(), "a wired provider must render the card");
+        assert!(
+            html.contains("No delegates have run or subscribed"),
+            "the empty state must be explicit; html was: {html}"
+        );
+        assert!(
+            html.contains("genuine zero, not a missing data source"),
+            "the empty state must say the panel IS wired, which is the whole \
+             point of distinguishing it from the unwired case"
+        );
+    }
+
+    /// Phase 2 (#3972) is not built, so the wakeups tile must say so rather than
+    /// showing a `0` that reads as "none pending". Fabricating that zero is
+    /// exactly the failure AGENTS.md forbids.
+    #[test]
+    fn delegates_card_reports_wakeups_as_not_built_never_zero() {
+        let mut snap = base_snapshot();
+        snap.delegates = Some(DelegateStatusSnapshot::default());
+        let html = build_delegates_card(&Some(snap));
+        assert!(
+            html.contains("Pending wakeups"),
+            "the wakeups tile must be present"
+        );
+        assert!(
+            html.contains("not built"),
+            "an unbuilt mechanism must say so; html was: {html}"
+        );
+        let tile = html
+            .split("Pending wakeups")
+            .nth(1)
+            .expect("wakeups tile")
+            .split("</div>")
+            .nth(1)
+            .unwrap_or("");
+        assert!(
+            !tile.contains(">0<"),
+            "the wakeups tile must never render 0 — that reads as 'none pending' \
+             when the truth is 'this node cannot answer'"
+        );
+    }
+
+    /// The finding this panel exists to surface: a subscription that succeeded
+    /// but did not register demand. The warning must name it, and the count
+    /// tiles must agree with the row.
+    #[test]
+    fn delegates_card_flags_subscriptions_that_did_not_register_demand() {
+        let mut entry = delegate_entry("delegate-a");
+        entry.subscriptions = vec![
+            DelegateSubscriptionEntry {
+                contract: "contract-pinned".to_string(),
+                registered_demand: true,
+            },
+            DelegateSubscriptionEntry {
+                contract: "contract-unpinned".to_string(),
+                registered_demand: false,
+            },
+        ];
+        entry.subscriptions_registering_demand = 1;
+        entry.last_active_secs_ago = Some(5);
+
+        let mut snap = base_snapshot();
+        snap.delegates = Some(DelegateStatusSnapshot {
+            delegates: vec![entry],
+            delegates_with_unpinned_subscriptions: 1,
+            subscriptions_total: 2,
+            subscriptions_without_demand: 1,
+            ..Default::default()
+        });
+        let html = build_delegates_card(&Some(snap));
+        assert!(
+            html.contains("did not register demand"),
+            "the unpinned-subscription warning must be shown; html was: {html}"
+        );
+        assert!(
+            html.contains("1 / 2"),
+            "the pinned/subs tile must show 1 of 2; html was: {html}"
+        );
+        assert!(
+            html.contains("delegate-a"),
+            "the delegate must have a row"
+        );
+    }
+
+    /// A delegate that spins until the iteration cap gives up returns Ok, so it
+    /// contributes NO errors. The card must surface the cap hit separately, or
+    /// the most likely runaway shape reads as a perfectly healthy delegate.
+    #[test]
+    fn delegates_card_surfaces_iteration_cap_hits_separately_from_errors() {
+        let mut entry = delegate_entry("spinner");
+        entry.requests = 3;
+        entry.iteration_cap_hits = 3;
+        entry.max_iterations = 100;
+        entry.errors = 0;
+        entry.last_active_secs_ago = Some(1);
+
+        let mut snap = base_snapshot();
+        snap.delegates = Some(DelegateStatusSnapshot {
+            delegates: vec![entry],
+            iteration_cap_hits_total: 3,
+            ..Default::default()
+        });
+        let html = build_delegates_card(&Some(snap));
+        assert!(
+            html.contains("hit the contract-request iteration cap"),
+            "a cap hit must be called out; html was: {html}"
+        );
+        assert!(
+            html.contains("do NOT appear in the error column"),
+            "the card must say why a spinning delegate shows zero errors, or an \
+             operator reads the zero as healthy"
+        );
+    }
+
+    /// Unknown is rendered as a dash, never as 0. A delegate we have never seen
+    /// execute has no average call time; printing "0 µs" would invent one.
+    #[test]
+    fn delegates_card_renders_unknown_as_dash_not_zero() {
+        let mut entry = delegate_entry("never-ran");
+        entry.subscriptions = vec![DelegateSubscriptionEntry {
+            contract: "c".to_string(),
+            registered_demand: false,
+        }];
+        // invocations = 0 and requests = 0: nothing has ever run.
+        let mut snap = base_snapshot();
+        snap.delegates = Some(DelegateStatusSnapshot {
+            delegates: vec![entry],
+            subscriptions_total: 1,
+            subscriptions_without_demand: 1,
+            delegates_with_unpinned_subscriptions: 1,
+            ..Default::default()
+        });
+        let html = build_delegates_card(&Some(snap));
+        assert!(
+            html.contains("—"),
+            "an unmeasured value must render as a dash; html was: {html}"
+        );
+        assert!(
+            !html.contains("0 µs"),
+            "a delegate that never ran has no average call time — rendering 0 µs \
+             would fabricate a measurement"
+        );
+    }
+
 }

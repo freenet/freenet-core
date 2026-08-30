@@ -537,8 +537,10 @@ impl Executor<Runtime> {
                     }
                     Err(err) => {
                         let key_display = key.to_string();
-                        let exec_err =
-                            ExecutorError::execution(err, Some(InnerOpError::Delegate(key.clone())));
+                        let exec_err = ExecutorError::execution(
+                            err,
+                            Some(InnerOpError::Delegate(key.clone())),
+                        );
                         // Downgrade "not found" to warn — expected during legacy
                         // migration probes when old delegate WASM isn't on this node
                         if exec_err.is_missing_delegate() {
