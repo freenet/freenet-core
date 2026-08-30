@@ -2,6 +2,8 @@
 paths:
   - "crates/core/src/bin/**"
   - "crates/core/src/conformance/**"
+  - "crates/core/src/contract/**"
+  - "crates/core/src/operations/**"
   - "scripts/**"
 ---
 
@@ -694,3 +696,56 @@ grep -n "refused" crates/core/src/conformance/capture.rs
 
 Question to ask of any one of them: *if this branch fires a thousand times, what does
 a reader see?* If the answer is "an empty result", the count is missing.
+
+
+## A mandatory side-effect sequence, hand-inlined per branch
+
+**When two code paths both owe the same sequence of side effects, extract one
+helper that owns the whole sequence and call it from both. Never re-inline a
+subset at each branch.** The omission is always silent: the operation reports
+success, every existing test stays green, and the missing consumer simply never
+runs.
+
+The tell is a sequence that reads as a list — "record the telemetry, notify the
+local subscribers, notify the delegates, broadcast to the network" — appearing
+twice, in two orders, with two different subsets. Whichever leg is easiest to
+forget (it is usually the one added most recently, or the one behind an `await`
+or a `super::` import) is the one that gets dropped, and the branch that dropped
+it keeps working perfectly for every other consumer.
+
+### Repeat offender history
+
+| Issue | The path that re-inlined a subset | The leg it dropped |
+|---|---|---|
+| [#3851](https://github.com/freenet/freenet-core/issues/3851) | SUBSCRIBE originator, after the task-per-tx migration | The originator's own side-effect call |
+| [#4223](https://github.com/freenet/freenet-core/issues/4223) | GET originator driver | `fetch_contract_if_missing` — so ~37% of GETs through subscriber peers returned `NotFound` for months, for a contract whose body the node never fetched |
+| [#5481](https://github.com/freenet/freenet-core/issues/5481) | `bridged_upsert_contract_state_inner`'s initial-state-install branch | `send_delegate_contract_notifications`. The same branch had already dropped `send_update_notification` once before, been fixed, and carried a comment describing that fix — which did not stop the next leg being dropped |
+
+#5481 is the instructive one: a comment explaining the exact failure sat three
+lines above the code that repeated it. Prose does not prevent this; structure
+does.
+
+### The rule
+
+1. **One `finalize_*` helper owns the full sequence.** Both (all) paths call it.
+   Never hand-inline the sequence at a branch, because the next migration will
+   hand-inline a *subset* of it.
+2. **Anchor a source-scrape pin on the API surface**, not on local variable
+   names: assert the helper contains every required call, that each call has
+   exactly ONE site and that site is inside the helper, and that every storing
+   path delegates to it.
+3. **Pin ordering invariants** where one side effect gates another (fetch must
+   precede announce, so the node never advertises hosting without the body).
+4. **Verify the pin by deleting a leg and watching it go red.** Inspection is not
+   verification: a pin needle that no longer matches (rustfmt splitting a long
+   call across lines is the common cause) passes vacuously forever.
+
+### Audit
+
+```bash
+# The post-store fan-out legs: each must have exactly one call site.
+grep -rn "\.record_contract_update(\|\.send_update_notification(\|\.send_delegate_contract_notifications(\|\.broadcast_state_change(" crates/core/src/contract/
+# Op-originator side effects: every legacy-path hit needs an equivalent
+# reachable from the driver.
+grep -rn "ring.subscribe(\|complete_subscription_request\|announce_contract_hosted\|fetch_contract_if_missing" crates/core/src/operations/
+```
