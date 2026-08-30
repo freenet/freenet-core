@@ -54,9 +54,11 @@
 //!   into the top tier through its delegate. #5467 open question 1 asks where
 //!   that bound lives and explicitly wants a deliberate call rather than a
 //!   constant, so **this module imposes no bound** — see the PR body. Today's
-//!   de-facto limit is that both subscribe paths refuse a contract the node
-//!   does not already hold (`lookup_key` / `resolve_contract_key` must
-//!   resolve), so a delegate can only pin what is already local.
+//!   de-facto limit is that a delegate can only pin a contract this node is
+//!   already HOSTING (see [`register_subscription`], which is gated more
+//!   tightly than the subscribe paths themselves). It cannot enumerate the
+//!   network and pin it; it can still pin everything its own app has PUT
+//!   locally, which is the hole the PR body names.
 //! - **Invariant 2 (demand-driven hosting).** A delegate subscription is real
 //!   demand from a real resident component. It is not holding-driven: nothing
 //!   here makes a peer host a contract it was not already holding.
@@ -80,10 +82,7 @@
 //! here would duplicate that scaffolding, which is exactly the drift the "one
 //! helper, not two" note on that function exists to prevent.
 
-use std::sync::LazyLock;
-
-use dashmap::DashSet;
-use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey};
+use freenet_stdlib::prelude::{ContractKey, DelegateKey};
 
 use crate::client_events::ClientId;
 use crate::node::OpManager;
@@ -100,13 +99,6 @@ use crate::node::OpManager;
 /// (`remove_client_from_all_subscriptions`) silently drop a delegate's pin, or
 /// a delegate unregister drop a live client's subscription.
 const DELEGATE_CLIENT_ID_BASE: usize = 1usize << (usize::BITS - 1);
-
-/// Every synthetic delegate client id minted in this process, for the
-/// [`is_delegate_client`] predicate and for diagnostics (#5467 Phase 0 will
-/// surface these). Bounded by the number of distinct delegates that have ever
-/// subscribed on this node, and entries are removed by
-/// [`drop_delegate_demand`].
-static MINTED: LazyLock<DashSet<usize>> = LazyLock::new(DashSet::default);
 
 /// The stable synthetic [`ClientId`] standing in for `delegate` as a local
 /// subscriber.
@@ -130,18 +122,21 @@ pub(crate) fn client_id_for(delegate: &DelegateKey) -> ClientId {
     buf.copy_from_slice(&hash.as_bytes()[..8]);
     // Clear the top bit of the hash, then set it from the reserved base, so the
     // result is always in the reserved half regardless of the hash's own MSB.
-    let id = DELEGATE_CLIENT_ID_BASE | ((u64::from_le_bytes(buf) as usize) & !DELEGATE_CLIENT_ID_BASE);
-    MINTED.insert(id);
+    let id =
+        DELEGATE_CLIENT_ID_BASE | ((u64::from_le_bytes(buf) as usize) & !DELEGATE_CLIENT_ID_BASE);
     ClientId(id)
 }
 
 /// Whether `client_id` is a delegate's synthetic subscriber identity rather
 /// than a real WebSocket client.
 ///
-/// Checks the reserved range, not the minted set: the range is the invariant,
-/// and the answer must not depend on whether this process happens to have
-/// minted that particular id yet.
-pub(crate) fn is_delegate_client(client_id: ClientId) -> bool {
+/// Test-only: nothing in production needs to tell the two apart, because the
+/// point of the reserved range is that neither side ever has to. It exists so
+/// [`DELEGATE_CLIENT_ID_BASE`]'s no-collision claim is asserted rather than
+/// only asserted in prose. Un-gate it when a real consumer appears (#5467
+/// Phase 0's per-delegate diagnostics is the likely one).
+#[cfg(test)]
+fn is_delegate_client(client_id: ClientId) -> bool {
     usize::from(client_id) >= DELEGATE_CLIENT_ID_BASE
 }
 
@@ -179,11 +174,49 @@ pub(crate) fn is_delegate_client(client_id: ClientId) -> bool {
 /// interest regardless (`ring.rs`, the eviction sweep; likewise the PUT and GET
 /// eviction handlers). `remove_local_client` saturates at zero, so nothing
 /// underflows.
+/// Gated on the node actually HOSTING the contract, which is a stricter test
+/// than the one the two subscribe paths use to decide whether the subscribe
+/// succeeds. They gate on the contract *resolving* (`lookup_key` /
+/// `resolve_contract_key`), which reads the contract store's code index — and
+/// that index outlives the hosting cache entry during the window between a
+/// contract being evicted and its disk reclamation completing.
+///
+/// Registering demand in that window would be actively harmful, not merely
+/// useless. `contracts_needing_renewal` branch 2 resolves the instance id back
+/// to a `ContractKey` **through the hosting cache**, so a contract absent from
+/// it is never renewed and no network SUBSCRIBE is ever issued; meanwhile
+/// `reclaim_evicted_contract` early-returns on `contract_in_use`, so the
+/// pending reclamation is blocked for the life of the process. The result is a
+/// pin that neither fetches the contract nor releases it.
+///
+/// So this returns `false` and registers nothing rather than creating that
+/// state. The subscribe itself still succeeds and the notification hook is
+/// still recorded, so nothing regresses against the previous behavior — but the
+/// delegate gets no pin, which is the same silent no-pin outcome #5467 exists
+/// to eliminate. The real fix is for a subscribe to BOOTSTRAP a contract the
+/// node does not hold, via a network GET; that needs `perform_contract_get` to
+/// reach the network at all (today it is a bare local `state_store.get`) and is
+/// the follow-up PR. Until then this is the honest interim: no pin is better
+/// than a stuck one.
+///
+/// Note it narrows the window rather than closing it — a contract evicted
+/// immediately after this check lands in the same state. That residual is the
+/// same one the bootstrap work closes.
 pub(crate) fn register_subscription(
     op_manager: &OpManager,
     delegate: &DelegateKey,
     contract: &ContractKey,
-) {
+) -> bool {
+    if !op_manager.ring.is_hosting_contract(contract) {
+        tracing::debug!(
+            delegate = %delegate,
+            contract = %contract,
+            "delegate subscribed to a contract this node resolves but does not \
+             host; recording the notification hook without demand — see \
+             `delegate_demand::register_subscription`"
+        );
+        return false;
+    }
     let client_id = client_id_for(delegate);
     op_manager
         .ring
@@ -194,6 +227,7 @@ pub(crate) fn register_subscription(
         %client_id,
         "delegate subscription registered as local client demand"
     );
+    true
 }
 
 /// Drop the demand `delegate` holds on `contract`, if any, and collapse the
@@ -254,7 +288,6 @@ fn collapse_if_no_interest(op_manager: &std::sync::Arc<OpManager>, contract: &Co
 /// see [`register_subscription`] for why that pairing is deliberately absent.
 pub(crate) fn drop_delegate_demand(op_manager: &std::sync::Arc<OpManager>, delegate: &DelegateKey) {
     let client_id = client_id_for(delegate);
-    MINTED.remove(&usize::from(client_id));
     let result = op_manager
         .ring
         .remove_client_from_all_subscriptions(client_id);
@@ -411,6 +444,30 @@ mod tests {
             "hosting-invariants invariant 3: a delegate pin is a LOCAL \
              subscription — the tier evicted LAST — not a downstream one"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn demand_is_not_registered_for_a_contract_the_node_does_not_host() {
+        let fixture = seam_fixture("delegate-demand-4669-unhosted").await;
+        let op_manager = fixture.op_manager.clone();
+        let ring = &op_manager.ring;
+
+        // Deliberately NOT hosted. The two subscribe paths would still let a
+        // delegate subscribe here, because they gate on the contract store's
+        // code index, which outlives the hosting cache entry across the
+        // eviction-to-reclamation window.
+        let key = contract_key(14);
+        assert!(!ring.is_hosting_contract(&key), "precondition");
+
+        assert!(
+            !register_subscription(&op_manager, &delegate_key(61), &key),
+            "registering demand for a contract the node does not host creates a \
+             pin that can never be renewed (`contracts_needing_renewal` branch 2 \
+             resolves through the hosting cache) and never reclaimed \
+             (`reclaim_evicted_contract` early-returns on `contract_in_use`)"
+        );
+        assert!(!ring.contract_in_use(&key));
+        assert_eq!((0, 0), ring.local_and_downstream_counts(&key));
     }
 
     #[tokio::test(start_paused = true)]

@@ -4188,6 +4188,248 @@ async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
     Ok(())
 }
 
+/// Multi-node E2E: a delegate running on a PEER (not the gateway) can subscribe
+/// to a contract that reached the peer over the network, and the demand
+/// registration added in #4669 does not disturb the ordinary contract paths.
+///
+/// **This test cannot fail against main, and that is deliberate.** It is a
+/// no-regression guard, not the falsifier for #4669. Two structural reasons a
+/// multi-node test cannot observe the demand bug:
+///
+///  - The demand state is unreachable from here. `mod ring` and `mod node` are
+///    crate-private, and `TestContext` hands an integration test only a label,
+///    a temp dir and a WebSocket port. `NodeQuery::SubscriptionInfo` looks like
+///    the exception and is not — it reports the executor's
+///    `update_notifications` map (WebSocket notification channels), not ring
+///    demand.
+///  - Inferring demand from update delivery does not work either. Live fan-out
+///    targets come from `advertised_cohost_pub_keys`, and a peer advertises as
+///    a co-host the moment it CACHES a contract (`register_local_hosting`, on
+///    the every-hop store path) with no `contract_in_use` check anywhere in it.
+///    So a peer receives updates whether or not demand registered.
+///
+/// The falsifying assertions live in `crate::contract::delegate_demand`'s test
+/// module, which can hold a real `OpManager` over a real `Ring`. What this test
+/// adds that no in-crate test can is that the change does not break a delegate
+/// subscribe on a real, networked, non-gateway node — the shape River's
+/// private-room secret rotation runs in.
+#[freenet_test(
+    health_check_readiness = true,
+    nodes = ["gateway", "peer-a"],
+    timeout_secs = 300,
+    startup_wait_secs = 20,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_delegate_subscribe_on_peer_node(ctx: &mut TestContext) -> TestResult {
+    const TEST_DELEGATE: &str = "test-delegate-capabilities";
+    const TEST_CONTRACT: &str = "test-contract-integration";
+
+    let contract = load_contract(TEST_CONTRACT, Parameters::from(vec![]))?;
+    let contract_key = contract.key();
+    let contract_instance_id = *contract_key.id();
+    let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
+    let delegate_key = delegate.key().clone();
+
+    let gateway = ctx.node("gateway")?;
+    let peer = ctx.node("peer-a")?;
+
+    let (stream_gw, _) = connect_async(&gateway.ws_url()).await?;
+    let mut client_gw = WebApi::start(stream_gw);
+    let (stream_peer, _) = connect_async(&peer.ws_url()).await?;
+    let mut client_peer = WebApi::start(stream_peer);
+
+    // Step 1: PUT the contract on the GATEWAY, so the peer has to acquire it
+    // over the network rather than from its own client.
+    tracing::info!("Step 1: PUT on the gateway");
+    let initial_state = test_utils::create_todo_list_with_item("initial");
+    make_put(
+        &mut client_gw,
+        WrappedState::from(initial_state.clone()),
+        contract.clone(),
+        false,
+    )
+    .await?;
+    let resp = timeout(Duration::from_secs(60), client_gw.recv()).await??;
+    match resp {
+        HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+            ensure!(key == contract_key, "PUT key mismatch");
+        }
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::DelegateResponse { .. }
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Unexpected PUT response: {:?}", other),
+    }
+
+    // Step 2: GET on the PEER, with the contract code, so the peer holds both
+    // code and state locally. Both delegate-subscribe paths refuse a contract
+    // the node cannot resolve (`lookup_key` / `resolve_contract_key`), so this
+    // is the precondition the delegate needs — and it is exactly the reach
+    // limit this change leaves behind: a delegate can only pin what is already
+    // local. Making subscribe able to bootstrap an unheld contract is the
+    // network-GET work, not this change.
+    tracing::info!("Step 2: GET on the peer to bring the contract local");
+    make_get(&mut client_peer, contract_key, true, false).await?;
+    let resp = timeout(Duration::from_secs(60), client_peer.recv()).await??;
+    match resp {
+        HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }) => {
+            ensure!(key == contract_key, "GET key mismatch on the peer");
+            ensure!(
+                state.as_ref() == initial_state.as_slice(),
+                "the peer must have fetched the state the gateway PUT"
+            );
+        }
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::DelegateResponse { .. }
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Unexpected GET response on the peer: {:?}", other),
+    }
+
+    // Step 3: register the delegate on the PEER.
+    tracing::info!("Step 3: register the delegate on the peer");
+    client_peer
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
+                delegate: delegate.clone(),
+                cipher: TEST_DELEGATE_CIPHER,
+                nonce: TEST_DELEGATE_NONCE,
+            },
+        ))
+        .await?;
+    let resp = timeout(Duration::from_secs(30), client_peer.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, .. } => {
+            ensure!(key == delegate_key, "Delegate key mismatch on register");
+        }
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Unexpected register response: {:?}", other),
+    }
+
+    // Step 4: the delegate subscribes. On main this records a notification hook
+    // and nothing else; with #4669 it also registers demand in the peer's ring.
+    // Either way it must report success — a regression here would break River.
+    tracing::info!("Step 4: delegate subscribes to the contract");
+    let subscribe_cmd = DelegateCommand::SubscribeContract {
+        contract_id: contract_instance_id,
+    };
+    client_peer
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params: Parameters::from(vec![]),
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                    ApplicationMessage::new(bincode::serialize(&subscribe_cmd)?),
+                )],
+            },
+        ))
+        .await?;
+
+    let resp = timeout(Duration::from_secs(60), client_peer.recv()).await??;
+    match resp {
+        HostResponse::DelegateResponse { key, values } => {
+            ensure!(key == delegate_key, "Delegate key mismatch on subscribe");
+            let result = values
+                .iter()
+                .find_map(|v| {
+                    if let OutboundDelegateMsg::ApplicationMessage(msg) = v {
+                        bincode::deserialize::<DelegateCommandResponse>(&msg.payload).ok()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("No ApplicationMessage in delegate subscribe response")
+                })?;
+            match result {
+                DelegateCommandResponse::ContractSubscribeResult {
+                    contract_id,
+                    success,
+                    error,
+                } => {
+                    ensure!(
+                        contract_id == contract_instance_id,
+                        "subscribe contract id mismatch"
+                    );
+                    ensure!(
+                        success,
+                        "delegate subscribe on a peer node must succeed (error: {:?})",
+                        error
+                    );
+                }
+                other @ DelegateCommandResponse::ContractState { .. }
+                | other @ DelegateCommandResponse::MultipleContractStates { .. }
+                | other @ DelegateCommandResponse::Echo { .. }
+                | other @ DelegateCommandResponse::ContractPutResult { .. }
+                | other @ DelegateCommandResponse::ContractUpdateResult { .. }
+                | other @ DelegateCommandResponse::ContractNotificationReceived { .. }
+                | other @ DelegateCommandResponse::Error { .. } => {
+                    bail!("Expected ContractSubscribeResult, got {:?}", other)
+                }
+            }
+        }
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Unexpected subscribe response: {:?}", other),
+    }
+
+    // Step 5: an UPDATE committed on the gateway must still converge to the
+    // peer while the delegate holds its subscription. This is the path the
+    // demand registration sits beside; if registering demand wedged the peer's
+    // contract handling — the risk in a change that touches `contract_in_use`,
+    // renewal and the upstream-collapse gate — this is where it would show.
+    tracing::info!("Step 5: UPDATE on the gateway, read it back on the peer");
+    let updated_state = test_utils::create_todo_list_with_item("after-update");
+    make_update(
+        &mut client_gw,
+        contract_key,
+        WrappedState::from(updated_state.clone()),
+    )
+    .await?;
+    let resp = timeout(Duration::from_secs(60), client_gw.recv()).await??;
+    match resp {
+        HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
+            ensure!(key == contract_key, "UPDATE key mismatch");
+        }
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::DelegateResponse { .. }
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("Unexpected UPDATE response: {:?}", other),
+    }
+
+    // Poll rather than assert once: convergence here is eventual by design, so
+    // the meaningful failure is "never converges", not "briefly stale".
+    let mut converged = false;
+    for attempt in 0..10 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        make_get(&mut client_peer, contract_key, false, false).await?;
+        let resp = timeout(Duration::from_secs(30), client_peer.recv()).await??;
+        if let HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }) =
+            resp
+        {
+            ensure!(key == contract_key, "GET key mismatch while converging");
+            if state.as_ref() == updated_state.as_slice() {
+                tracing::info!(attempt, "peer converged on the updated state");
+                converged = true;
+                break;
+            }
+        }
+    }
+    ensure!(
+        converged,
+        "the peer never converged on the gateway's UPDATE while its delegate \
+         held a subscription"
+    );
+
+    tracing::info!("Delegate subscribe on a peer node E2E test passed");
+    Ok(())
+}
+
 /// Test that disconnecting a subscribed client does NOT trigger an *immediate*
 /// upstream Unsubscribe when the contract was recently read (demand-gated collapse).
 ///
