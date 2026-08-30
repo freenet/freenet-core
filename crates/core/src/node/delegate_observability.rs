@@ -11,25 +11,50 @@
 //! reports that the pin did not take*. This module exists so that failure is
 //! visible from the outside.
 //!
+//! # Two units of measurement, and why per-call alone is misleading
+//!
+//! A client request does not map to one delegate execution. One request drives
+//! the loop in `contract.rs::handle_delegate_with_contract_requests`, which
+//! re-invokes `process()` up to `MAX_CONTRACT_REQUEST_ITERATIONS` (100) times,
+//! and each iteration may emit inter-delegate messages that are dispatched
+//! single-hop but with **no cap on the batch size**. So a healthy-looking 40 ms
+//! per-call p99 is entirely consistent with one request burning seconds of
+//! executor time.
+//!
+//! Both units are therefore recorded:
+//!
+//! - **Per-call** ([`record_invocation`]): one `inbound_app_message` execution.
+//! - **Per-request** ([`RequestMeter`]): the whole `handle_delegate_with_contract_requests`
+//!   call — wall time, iteration count, inter-delegate message count, and
+//!   whether the iteration cap was hit.
+//!
+//! The iteration-cap counter matters out of proportion to its size. That arm
+//! returns `Ok(accumulated_messages)` (#5454 is where whether that should
+//! change is being decided), so the most likely runaway shape — a delegate
+//! spinning until the loop gives up — produces no error at all. Without this
+//! counter a spinning delegate reports as perfectly healthy.
+//!
 //! # What is canonical and what is stored here
 //!
 //! `.claude/rules/bug-prevention-patterns.md` ("manually-mirrored telemetry
 //! counters / dashboard providers", #4009/#4010) says to prefer a provider
 //! closure reading canonical state over re-mirroring counters at call sites.
-//! Applied here, three of the four data sources are read live and NOT mirrored:
+//! Applied here, most of the data is read live and NOT mirrored:
 //!
 //! | Field | Canonical source | Mirrored here? |
 //! |---|---|---|
-//! | subscriptions held | [`DELEGATE_SUBSCRIPTIONS`] | no — read live |
-//! | did it register demand | [`Ring::contract_in_use`] | no — read live |
+//! | subscriptions held | `DELEGATE_SUBSCRIPTIONS` | no — read live |
+//! | did it register demand | `Ring::in_use_contract_ids` | no — read live |
 //! | attributed CPU rate | `topology::meter::Meter` | no — read live |
-//! | invocations / errors / last error | *nothing* | **yes — this module** |
+//! | module-cache entries / bytes / evictions | `Ring::module_cache_metrics` | no — read live |
+//! | invocations / requests / errors / last error | *nothing* | **yes — this module** |
 //!
 //! Only the last row is mirrored, because no canonical store for it exists:
 //! delegate execution today has no timing at all and errors are logged
 //! per-call at `contract/executor/runtime/delegates.rs` without ever being
-//! counted. To keep that mirror honest there is exactly ONE write site
-//! ([`record_invocation`]), pinned by `record_invocation_has_exactly_one_production_call_site`.
+//! counted. To keep that mirror honest there is exactly ONE per-call write site
+//! ([`record_invocation`]) and ONE per-request write site ([`RequestMeter`]),
+//! both pinned by source-scrape tests below.
 //!
 //! # Bounding
 //!
@@ -46,7 +71,13 @@
 //!   reads like a memory bound and is not one. An untruncated error string is
 //!   delegate-controlled text, so the worst case would be
 //!   `MAX_TRACKED_DELEGATES` × (whatever the guest chose to panic with).
+//!
+//! # This phase is measurement only
+//!
+//! Nothing here throttles, quarantines, evicts or rate-limits. Phase 4
+//! containment reads these measurements; it is deliberately not built here.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -88,22 +119,37 @@ pub(crate) const MAX_LAST_ERROR_BYTES: usize = 512;
 /// Matches the production `Meter` window (`topology.rs`, `new_with_window_size(100)`).
 const INVOCATION_RATE_WINDOW: usize = 100;
 
-/// Live execution counters for one delegate.
-///
-/// Written only by [`record_invocation`]; read only by [`snapshot`].
+/// Live counters for one delegate. Written only by [`record_invocation`] and
+/// [`record_request`]; read only by [`build_snapshot`].
 #[derive(Debug)]
 struct DelegateExecEntry {
+    // --- per-call (one `inbound_app_message` execution) ---
     invocations: u64,
     errors: u64,
     /// Truncated to [`MAX_LAST_ERROR_BYTES`] at insertion.
     last_error: Option<String>,
     last_error_at: Option<Instant>,
-    last_invoked_at: Instant,
     total_exec_micros: u64,
     /// Windowed invocation rate. Reuses `topology::running_average`, which is
     /// entirely key-agnostic (it never touches the key type), so this is the
     /// existing machinery rather than a parallel one.
     invocation_rate: crate::topology::running_average::RunningAverage,
+
+    // --- per-request (one `handle_delegate_with_contract_requests` call) ---
+    requests: u64,
+    total_request_micros: u64,
+    max_request_micros: u64,
+    total_iterations: u64,
+    max_iterations: u32,
+    /// How many requests exhausted `MAX_CONTRACT_REQUEST_ITERATIONS`. See the
+    /// module docs: that arm returns `Ok`, so these never appear in `errors`.
+    iteration_cap_hits: u64,
+    total_inter_delegate_messages: u64,
+    max_inter_delegate_messages: u32,
+
+    /// Most recent activity of EITHER kind. Drives both the TTL sweep and the
+    /// LRU victim choice.
+    last_active_at: Instant,
 }
 
 impl DelegateExecEntry {
@@ -113,11 +159,19 @@ impl DelegateExecEntry {
             errors: 0,
             last_error: None,
             last_error_at: None,
-            last_invoked_at: now,
             total_exec_micros: 0,
             invocation_rate: crate::topology::running_average::RunningAverage::new(
                 INVOCATION_RATE_WINDOW,
             ),
+            requests: 0,
+            total_request_micros: 0,
+            max_request_micros: 0,
+            total_iterations: 0,
+            max_iterations: 0,
+            iteration_cap_hits: 0,
+            total_inter_delegate_messages: 0,
+            max_inter_delegate_messages: 0,
+            last_active_at: now,
         }
     }
 }
@@ -125,10 +179,10 @@ impl DelegateExecEntry {
 /// Process-global execution stats, keyed by delegate.
 ///
 /// Process-global for the same reason `DELEGATE_SUBSCRIPTIONS`
-/// (`wasm_runtime/native_api.rs:40`) is: the write site sits deep inside the
-/// executor's runtime where no per-node handle is threaded through. #4824
-/// tracks making that family of globals node-scoped; when it lands this should
-/// move with them rather than being left behind.
+/// (`wasm_runtime/native_api.rs:40`) is: the write sites sit deep inside the
+/// executor's runtime and the contract-handler loop, where no per-node handle
+/// is threaded through. #4824 tracks making that family of globals node-scoped;
+/// when it lands this should move with them rather than being left behind.
 static DELEGATE_EXEC_STATS: LazyLock<DashMap<DelegateKey, DelegateExecEntry>> =
     LazyLock::new(DashMap::default);
 
@@ -151,23 +205,58 @@ fn truncate_error(msg: &str) -> String {
 /// Evict aged-out entries, then make room if still at capacity.
 ///
 /// Both phases are bounded by absolute age so no entry is exempt from eviction
-/// indefinitely (the AGENTS.md GC rule, and the same two-phase shape as
-/// `Meter::evict_if_full`).
+/// indefinitely, and the shape mirrors `Meter::evict_if_full`.
+///
+/// MUST NOT be called while holding an entry guard on [`DELEGATE_EXEC_STATS`]:
+/// it `retain`s and `remove`s across keys on the same DashMap, which
+/// self-deadlocks. Both callers drop their guard first.
 fn evict_if_full(now: Instant) {
-    DELEGATE_EXEC_STATS.retain(|_, entry| {
-        now.saturating_duration_since(entry.last_invoked_at) < DELEGATE_STATS_TTL
-    });
+    DELEGATE_EXEC_STATS
+        .retain(|_, entry| now.saturating_duration_since(entry.last_active_at) < DELEGATE_STATS_TTL);
     if DELEGATE_EXEC_STATS.len() < MAX_TRACKED_DELEGATES {
         return;
     }
-    // Still full after the TTL sweep: drop the least-recently-invoked entry.
+    // Still full after the TTL sweep: drop the least-recently-active entry.
     let victim = DELEGATE_EXEC_STATS
         .iter()
-        .min_by_key(|entry| entry.value().last_invoked_at)
+        .min_by_key(|entry| entry.value().last_active_at)
         .map(|entry| entry.key().clone());
     if let Some(victim) = victim {
         DELEGATE_EXEC_STATS.remove(&victim);
     }
+}
+
+/// Apply `update` to `key`'s entry, creating it if absent.
+///
+/// The hot path (delegate already tracked) takes a single shard guard. A
+/// brand-new key drops the guard, evicts, then re-acquires — see
+/// [`evict_if_full`] for why the guard cannot be held across the scan.
+fn with_entry(key: &DelegateKey, now: Instant, update: impl Fn(&mut DelegateExecEntry, Instant)) {
+    use dashmap::mapref::entry::Entry;
+
+    if let Entry::Occupied(mut occupied) = DELEGATE_EXEC_STATS.entry(key.clone()) {
+        let entry = occupied.get_mut();
+        // Clamp the clock forward per entry. `RunningAverage::insert_with_time`
+        // carries a `debug_assert!(now >= last_sample_time)`, and this map is
+        // process-global: a test driving a PAUSED tokio clock and a test using
+        // the real one share it, so a later call can legitimately carry an
+        // earlier `now`. Clamping keeps the sample stream monotonic per entry
+        // rather than tripping a debug assertion on an unrelated test's
+        // interleaving — the process-global-cache cross-test trap (#5314).
+        let now = now.max(entry.last_active_at);
+        update(entry, now);
+        entry.last_active_at = now;
+        return;
+    }
+
+    evict_if_full(now);
+    let mut entry = DELEGATE_EXEC_STATS
+        .entry(key.clone())
+        .or_insert_with(|| DelegateExecEntry::new(now));
+    let value = entry.value_mut();
+    let now = now.max(value.last_active_at);
+    update(value, now);
+    value.last_active_at = now;
 }
 
 /// Outcome of one delegate invocation, as seen at the executor call site.
@@ -179,11 +268,12 @@ pub(crate) enum InvocationOutcome<'a> {
     Failure(&'a str),
 }
 
-/// Record one delegate invocation. **This is the only write site.**
+/// Record one delegate invocation (one `inbound_app_message` execution).
 ///
-/// Pinned by `record_invocation_has_exactly_one_production_call_site`: a future
-/// refactor that adds a second call site, or moves this one, fails CI rather
-/// than silently producing a counter that undercounts. That pin exists because
+/// **This is the only per-call write site**, pinned by
+/// `record_invocation_has_exactly_one_production_call_site`: a future refactor
+/// that adds a second call site, or moves this one, fails CI rather than
+/// silently producing a counter that undercounts. That pin exists because
 /// #4009/#4010 are precisely the case where a migration re-homed an op path and
 /// the mirrored counter rotted without anything going red.
 pub(crate) fn record_invocation(
@@ -192,36 +282,115 @@ pub(crate) fn record_invocation(
     outcome: InvocationOutcome<'_>,
     now: Instant,
 ) {
-    use dashmap::mapref::entry::Entry;
-
-    // Hot path (delegate already tracked) takes a single shard guard. The
-    // eviction scan must NOT run while an entry guard is held — it `retain`s
-    // and `remove`s across keys on the same DashMap, which self-deadlocks — so
-    // a brand-new key drops the guard, evicts, then re-acquires. Same shape as
-    // `Meter::report` (`topology/meter.rs`).
     let micros = exec_duration.as_micros().min(u64::MAX as u128) as u64;
-    let apply = |entry: &mut DelegateExecEntry| {
+    with_entry(key, now, |entry, now| {
         entry.invocations = entry.invocations.saturating_add(1);
         entry.total_exec_micros = entry.total_exec_micros.saturating_add(micros);
-        entry.last_invoked_at = entry.last_invoked_at.max(now);
         entry.invocation_rate.insert_with_time(now, 1.0);
         if let InvocationOutcome::Failure(msg) = outcome {
             entry.errors = entry.errors.saturating_add(1);
             entry.last_error = Some(truncate_error(msg));
             entry.last_error_at = Some(now);
         }
-    };
+    });
+}
 
-    if let Entry::Occupied(mut occupied) = DELEGATE_EXEC_STATS.entry(key.clone()) {
-        apply(occupied.get_mut());
-        return;
+/// What one completed request contributed. Separated from [`RequestMeter`] so
+/// the accumulation (which happens in `contract.rs`) and the recording (which
+/// happens here) can be tested independently of each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct RequestSample {
+    pub(crate) wall_time: Duration,
+    pub(crate) iterations: u32,
+    pub(crate) inter_delegate_messages: u32,
+    pub(crate) hit_iteration_cap: bool,
+}
+
+/// Record one completed delegate REQUEST. **This is the only per-request write
+/// site**, pinned by `record_request_has_exactly_one_production_call_site`.
+pub(crate) fn record_request(key: &DelegateKey, sample: RequestSample, now: Instant) {
+    let micros = sample.wall_time.as_micros().min(u64::MAX as u128) as u64;
+    with_entry(key, now, |entry, _now| {
+        entry.requests = entry.requests.saturating_add(1);
+        entry.total_request_micros = entry.total_request_micros.saturating_add(micros);
+        entry.max_request_micros = entry.max_request_micros.max(micros);
+        entry.total_iterations = entry.total_iterations.saturating_add(sample.iterations as u64);
+        entry.max_iterations = entry.max_iterations.max(sample.iterations);
+        entry.total_inter_delegate_messages = entry
+            .total_inter_delegate_messages
+            .saturating_add(sample.inter_delegate_messages as u64);
+        entry.max_inter_delegate_messages = entry
+            .max_inter_delegate_messages
+            .max(sample.inter_delegate_messages);
+        if sample.hit_iteration_cap {
+            entry.iteration_cap_hits = entry.iteration_cap_hits.saturating_add(1);
+        }
+    });
+}
+
+/// Meters one whole `handle_delegate_with_contract_requests` call.
+///
+/// RAII rather than an explicit `finish()` because that function has several
+/// return points (the iteration cap, the executor-error arms, the normal exit).
+/// Recording on `Drop` covers all of them without touching a single return
+/// site, which is also what keeps the `contract.rs` footprint to four lines —
+/// `contract.rs` is owned by another workstream (#4669).
+///
+/// Uses `std::time::Instant` for the wall clock: this measures real elapsed
+/// work, which a paused or simulated `TimeSource` would report as zero.
+pub(crate) struct RequestMeter {
+    key: DelegateKey,
+    started: std::time::Instant,
+    iterations: Cell<u32>,
+    inter_delegate_messages: Cell<u32>,
+    hit_iteration_cap: Cell<bool>,
+}
+
+impl RequestMeter {
+    pub(crate) fn start(key: &DelegateKey) -> Self {
+        Self {
+            key: key.clone(),
+            started: std::time::Instant::now(),
+            iterations: Cell::new(0),
+            inter_delegate_messages: Cell::new(0),
+            hit_iteration_cap: Cell::new(false),
+        }
     }
 
-    evict_if_full(now);
-    let mut entry = DELEGATE_EXEC_STATS
-        .entry(key.clone())
-        .or_insert_with(|| DelegateExecEntry::new(now));
-    apply(entry.value_mut());
+    /// One pass round the contract-request loop.
+    pub(crate) fn note_iteration(&self) {
+        self.iterations.set(self.iterations.get().saturating_add(1));
+    }
+
+    /// A batch of delegate-to-delegate messages was dispatched. Counted because
+    /// dispatch is single-hop but the batch size is uncapped, so this is a
+    /// fan-out axis that per-call duration cannot see.
+    pub(crate) fn note_inter_delegate_messages(&self, count: usize) {
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        self.inter_delegate_messages
+            .set(self.inter_delegate_messages.get().saturating_add(count));
+    }
+
+    /// The request exhausted `MAX_CONTRACT_REQUEST_ITERATIONS`. That arm
+    /// returns `Ok`, so this is the ONLY signal a runaway leaves behind.
+    pub(crate) fn note_iteration_cap_hit(&self) {
+        self.hit_iteration_cap.set(true);
+    }
+
+    fn sample(&self) -> RequestSample {
+        RequestSample {
+            wall_time: self.started.elapsed(),
+            iterations: self.iterations.get(),
+            inter_delegate_messages: self.inter_delegate_messages.get(),
+            hit_iteration_cap: self.hit_iteration_cap.get(),
+        }
+    }
+}
+
+impl Drop for RequestMeter {
+    fn drop(&mut self) {
+        record_request(&self.key, self.sample(), Instant::now());
+    }
 }
 
 /// One contract a delegate is subscribed to, plus whether that subscription
@@ -232,35 +401,60 @@ pub struct DelegateSubscriptionEntry {
     /// Whether the node considers this contract in use — i.e. whether the
     /// delegate's subscription actually pinned it.
     ///
-    /// **This is the load-bearing field of Phase 0.** Until #4669 lands,
-    /// `Ring::contract_in_use` is `has_client_subscriptions() ||
+    /// **This is the load-bearing field of Phase 0.** It is computed live from
+    /// `Ring::in_use_contract_ids`, the instance-id form of
+    /// `Ring::contract_in_use`, so it TRACKS that predicate rather than
+    /// asserting any particular value.
+    ///
+    /// Until #4669 lands, `contract_in_use` is `has_client_subscriptions() ||
     /// has_downstream_subscribers()` with no delegate term, so a delegate
     /// subscription that succeeded still reports `false` here unless some
     /// *other* route (typically the app's own WebSocket subscription) happens
     /// to be pinning the same contract. That divergence — subscribed, but not
-    /// pinned — is the bug, rendered visible.
+    /// pinned — is the bug, rendered visible. When #4669 adds the delegate
+    /// term this flips to `true` with no change needed here.
     pub registered_demand: bool,
 }
 
 /// Per-delegate observability record.
+///
+/// Every "unknown" is an `Option` rather than a zero. A delegate we have never
+/// seen execute has no rate and no last-invoked time, and reporting `0.0` for
+/// either would be fabricated data — the specific thing AGENTS.md forbids and
+/// the reason this whole module exists.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DelegateStatusEntry {
     pub key: String,
     pub subscriptions: Vec<DelegateSubscriptionEntry>,
     /// How many of `subscriptions` actually registered demand.
     pub subscriptions_registering_demand: usize,
+
+    // --- per-call ---
     pub invocations: u64,
     pub errors: u64,
     pub last_error: Option<String>,
     pub last_error_secs_ago: Option<u64>,
-    pub last_invoked_secs_ago: Option<u64>,
+    pub last_active_secs_ago: Option<u64>,
     pub total_exec_micros: u64,
-    /// Windowed invocations/sec. `None` when the window holds too few samples
-    /// to state a rate — distinct from a genuine zero.
+    /// Windowed invocations/sec. `None` when the window holds no samples —
+    /// distinct from a genuine zero.
     pub invocation_rate_per_sec: Option<f64>,
     /// Windowed attributed CPU (µs/sec) from `topology::meter`. `None` when the
     /// meter holds no window for this delegate — again, distinct from zero.
     pub exec_cpu_micros_per_sec: Option<f64>,
+
+    // --- per-request ---
+    /// Whole `handle_delegate_with_contract_requests` calls completed.
+    pub requests: u64,
+    pub total_request_micros: u64,
+    pub max_request_micros: u64,
+    pub total_iterations: u64,
+    pub max_iterations: u32,
+    /// Requests that exhausted `MAX_CONTRACT_REQUEST_ITERATIONS`. Non-zero is
+    /// the runaway signal that leaves no error behind (#5454).
+    pub iteration_cap_hits: u64,
+    pub total_inter_delegate_messages: u64,
+    pub max_inter_delegate_messages: u32,
 }
 
 /// Node-wide per-delegate observability snapshot.
@@ -274,13 +468,78 @@ pub struct DelegateStatusSnapshot {
     pub subscriptions_total: usize,
     /// Total subscriptions that did not register demand.
     pub subscriptions_without_demand: usize,
+    /// Requests that exhausted the iteration cap, summed over all delegates.
+    pub iteration_cap_hits_total: u64,
+
+    /// Delegate module-cache gauges, read live from `Ring::module_cache_metrics`.
+    /// These already existed but reached fleet telemetry only (`ring.rs`), never
+    /// the local dashboard.
+    pub module_cache_entries: u64,
+    pub module_cache_total_bytes: u64,
+    pub module_cache_budget_bytes: u64,
+    pub module_cache_evictions_total: u64,
+
     /// Whether scheduled execution (#5467 Phase 2 / #3972) is built.
     ///
     /// Always `false` today. It exists so the dashboard can say "not built"
     /// rather than rendering a `0` that an operator would read as "none
-    /// pending" — AGENTS.md forbids improvising a value for something that
-    /// does not exist, and a zero here would be exactly that.
+    /// pending" — AGENTS.md forbids improvising a value for something that does
+    /// not exist, and a zero here would be exactly that.
     pub wakeup_scheduling_available: bool,
+}
+
+/// The per-delegate execution fields, resolved from an optional stats entry.
+///
+/// Extracted so the "no execution history" branch is directly testable without
+/// standing up a `Ring`. That branch is where fabricated zeros would creep in.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct ExecFields {
+    invocations: u64,
+    errors: u64,
+    last_error: Option<String>,
+    last_error_secs_ago: Option<u64>,
+    last_active_secs_ago: Option<u64>,
+    total_exec_micros: u64,
+    invocation_rate_per_sec: Option<f64>,
+    requests: u64,
+    total_request_micros: u64,
+    max_request_micros: u64,
+    total_iterations: u64,
+    max_iterations: u32,
+    iteration_cap_hits: u64,
+    total_inter_delegate_messages: u64,
+    max_inter_delegate_messages: u32,
+}
+
+fn exec_fields(stats: Option<&DelegateExecEntry>, now: Instant) -> ExecFields {
+    // No execution history: the COUNTERS are genuinely zero (we have never seen
+    // it run), but the rates and timestamps are UNKNOWN rather than zero, so
+    // they stay `None`. `ExecFields::default()` gives exactly that.
+    let Some(entry) = stats else {
+        return ExecFields::default();
+    };
+    ExecFields {
+        invocations: entry.invocations,
+        errors: entry.errors,
+        last_error: entry.last_error.clone(),
+        last_error_secs_ago: entry
+            .last_error_at
+            .map(|at| now.saturating_duration_since(at).as_secs()),
+        last_active_secs_ago: Some(now.saturating_duration_since(entry.last_active_at).as_secs()),
+        total_exec_micros: entry.total_exec_micros,
+        invocation_rate_per_sec: entry
+            .invocation_rate
+            .get_rate_at_time(now)
+            .map(|rate| rate.per_second()),
+        requests: entry.requests,
+        total_request_micros: entry.total_request_micros,
+        max_request_micros: entry.max_request_micros,
+        total_iterations: entry.total_iterations,
+        max_iterations: entry.max_iterations,
+        iteration_cap_hits: entry.iteration_cap_hits,
+        total_inter_delegate_messages: entry.total_inter_delegate_messages,
+        max_inter_delegate_messages: entry.max_inter_delegate_messages,
+    }
 }
 
 /// Build the snapshot by reading canonical state.
@@ -321,6 +580,7 @@ pub(crate) fn build_snapshot(ring: &crate::ring::Ring, now: Instant) -> Delegate
     let mut delegates_with_unpinned_subscriptions = 0usize;
     let mut subscriptions_total = 0usize;
     let mut subscriptions_without_demand = 0usize;
+    let mut iteration_cap_hits_total = 0u64;
 
     for (key, mut instance_ids) in by_delegate {
         instance_ids.sort_by_key(|id| id.to_string());
@@ -344,65 +604,57 @@ pub(crate) fn build_snapshot(ring: &crate::ring::Ring, now: Instant) -> Delegate
         }
 
         let stats = DELEGATE_EXEC_STATS.get(&key);
-        let (
-            invocations,
-            errors,
-            last_error,
-            last_error_secs_ago,
-            last_invoked_secs_ago,
-            total_exec_micros,
-            invocation_rate_per_sec,
-        ) = match stats.as_deref() {
-            Some(entry) => (
-                entry.invocations,
-                entry.errors,
-                entry.last_error.clone(),
-                entry
-                    .last_error_at
-                    .map(|at| now.saturating_duration_since(at).as_secs()),
-                Some(now.saturating_duration_since(entry.last_invoked_at).as_secs()),
-                entry.total_exec_micros,
-                entry
-                    .invocation_rate
-                    .get_rate_at_time(now)
-                    .map(|rate| rate.per_second()),
-            ),
-            // No execution history: the counters are genuinely zero (we have
-            // never seen it run), but the rates and timestamps are UNKNOWN
-            // rather than zero, so they stay `None`.
-            None => (0, 0, None, None, None, 0, None),
-        };
+        let f = exec_fields(stats.as_deref(), now);
         drop(stats);
+        iteration_cap_hits_total = iteration_cap_hits_total.saturating_add(f.iteration_cap_hits);
 
         delegates.push(DelegateStatusEntry {
             key: key.to_string(),
             subscriptions,
             subscriptions_registering_demand: registering,
-            invocations,
-            errors,
-            last_error,
-            last_error_secs_ago,
-            last_invoked_secs_ago,
-            total_exec_micros,
-            invocation_rate_per_sec,
+            invocations: f.invocations,
+            errors: f.errors,
+            last_error: f.last_error,
+            last_error_secs_ago: f.last_error_secs_ago,
+            last_active_secs_ago: f.last_active_secs_ago,
+            total_exec_micros: f.total_exec_micros,
+            invocation_rate_per_sec: f.invocation_rate_per_sec,
             exec_cpu_micros_per_sec: cpu_rates.get(&key).copied(),
+            requests: f.requests,
+            total_request_micros: f.total_request_micros,
+            max_request_micros: f.max_request_micros,
+            total_iterations: f.total_iterations,
+            max_iterations: f.max_iterations,
+            iteration_cap_hits: f.iteration_cap_hits,
+            total_inter_delegate_messages: f.total_inter_delegate_messages,
+            max_inter_delegate_messages: f.max_inter_delegate_messages,
         });
     }
 
     // Most-recently-active first, so the delegate an operator is debugging is
     // at the top. Ties broken on the key so the render is deterministic.
     delegates.sort_by(|a, b| {
-        a.last_invoked_secs_ago
+        a.last_active_secs_ago
             .unwrap_or(u64::MAX)
-            .cmp(&b.last_invoked_secs_ago.unwrap_or(u64::MAX))
+            .cmp(&b.last_active_secs_ago.unwrap_or(u64::MAX))
             .then_with(|| a.key.cmp(&b.key))
     });
+
+    // Delegate module-cache gauges: already collected for fleet telemetry
+    // (`ring.rs`), never surfaced locally. Read live from the same metrics
+    // handle, so there is no counter to rot.
+    let mc = ring.module_cache_metrics().snapshot();
 
     DelegateStatusSnapshot {
         delegates,
         delegates_with_unpinned_subscriptions,
         subscriptions_total,
         subscriptions_without_demand,
+        iteration_cap_hits_total,
+        module_cache_entries: mc.delegate_entries,
+        module_cache_total_bytes: mc.delegate_total_bytes,
+        module_cache_budget_bytes: mc.delegate_budget_bytes,
+        module_cache_evictions_total: mc.delegate_evictions_total,
         // #3972 / #4666 are not merged; the WakeupScheduler does not exist on
         // this branch. Hardcoded false rather than probed, because there is
         // nothing to probe — and a plausible-looking `0` would be fabricated
@@ -424,12 +676,31 @@ pub(crate) fn tracked_delegate_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freenet_stdlib::prelude::CodeHash;
+    use std::sync::{Mutex, MutexGuard};
 
-    fn key(byte: u8) -> DelegateKey {
-        DelegateKey::from(&[byte; 32])
+    /// [`DELEGATE_EXEC_STATS`] is process-global and `cargo test` runs the tests
+    /// in this module concurrently in ONE process, so a test that calls
+    /// [`clear_for_test`] would otherwise wipe a sibling's entries mid-run.
+    /// That is the cross-test-interference-behind-a-process-global shape from
+    /// `.claude/rules/testing.md` (#5314) — and `cargo nextest`, which gives
+    /// each test its own process, could not observe it at any repeat count.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn exclusive() -> MutexGuard<'static, ()> {
+        // A panicking test poisons the mutex; the shared state is reset by the
+        // guard's own `clear_for_test` below, so recovering is correct here and
+        // keeps one failure from cascading into every sibling.
+        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_for_test();
+        guard
     }
 
-    /// The single-write-site pin (#4009/#4010 shape).
+    fn key(byte: u8) -> DelegateKey {
+        DelegateKey::new([byte; 32], CodeHash::new([byte; 32]))
+    }
+
+    /// The single-write-site pin for the PER-CALL counter (#4009/#4010 shape).
     ///
     /// `record_invocation` is a mirrored counter, which is the failure mode
     /// bug-prevention-patterns.md warns about: a later migration re-homes the
@@ -451,6 +722,63 @@ mod tests {
              instrumentation with it — do not add a second call site, and do not \
              delete this one: an uncounted invocation is indistinguishable from a \
              delegate that never ran."
+        );
+    }
+
+    /// The single-write-site pin for the PER-REQUEST counter.
+    ///
+    /// `RequestMeter` records on `Drop`, so a second `start` in the same
+    /// function would double-count every request while looking harmless at the
+    /// call site. Pinning the construction rather than the recording is what
+    /// catches that.
+    #[test]
+    fn record_request_has_exactly_one_production_call_site() {
+        let src = include_str!("../contract.rs");
+        let starts = src
+            .matches("delegate_observability::RequestMeter::start(")
+            .count();
+        assert_eq!(
+            starts, 1,
+            "expected exactly ONE production construction of RequestMeter in \
+             contract.rs (at the top of handle_delegate_with_contract_requests). \
+             Found {starts}. It records on Drop, so a second construction in the \
+             same call would double-count the request."
+        );
+    }
+
+    /// The iteration-cap counter must stay wired to the cap arm.
+    ///
+    /// That arm returns `Ok(accumulated_messages)`, so a runaway delegate leaves
+    /// NO error behind — this counter is the only trace. If a refactor drops the
+    /// call, the panel silently reports every spinning delegate as healthy,
+    /// which is the exact failure Phase 0 exists to end.
+    #[test]
+    fn iteration_cap_hit_is_recorded_at_the_cap_arm() {
+        let src = include_str!("../contract.rs");
+        assert_eq!(
+            src.matches("note_iteration_cap_hit()").count(),
+            1,
+            "the MAX_CONTRACT_REQUEST_ITERATIONS arm must record a cap hit exactly \
+             once; that arm returns Ok, so this counter is the only evidence a \
+             runaway delegate leaves"
+        );
+        // The cap arm and the recording must be in the same arm, not merely both
+        // present in the file. Anchor on the cap constant, which names the
+        // decision, and check the call appears before the arm's `return`.
+        let arm = src
+            .split("if iterations > MAX_CONTRACT_REQUEST_ITERATIONS")
+            .nth(1)
+            .expect("the iteration cap arm must exist in contract.rs");
+        let cap_call = arm
+            .find("note_iteration_cap_hit()")
+            .expect("the cap arm must record the hit");
+        let arm_return = arm
+            .find("return accumulated_messages")
+            .expect("the cap arm must still return the accumulated messages (#5454)");
+        assert!(
+            cap_call < arm_return,
+            "the cap hit must be recorded BEFORE the arm returns, or the counter \
+             never fires"
         );
     }
 
@@ -487,7 +815,7 @@ mod tests {
 
     #[test]
     fn record_invocation_counts_successes_and_failures_separately() {
-        clear_for_test();
+        let _guard = exclusive();
         let k = key(1);
         let t0 = Instant::now();
         record_invocation(&k, Duration::from_micros(10), InvocationOutcome::Success, t0);
@@ -507,19 +835,90 @@ mod tests {
         clear_for_test();
     }
 
+    /// The per-request unit must be recorded separately from the per-call one:
+    /// one request can drive up to 100 invocations, so conflating them is how a
+    /// seconds-long request hides behind a healthy per-call p99.
     #[test]
-    fn entry_count_is_bounded_and_evicts_least_recently_invoked() {
+    fn request_metering_records_iterations_and_fanout_separately_from_calls() {
+        let _guard = exclusive();
+        let k = key(2);
+        let t0 = Instant::now();
+        record_request(
+            &k,
+            RequestSample {
+                wall_time: Duration::from_millis(1500),
+                iterations: 100,
+                inter_delegate_messages: 40,
+                hit_iteration_cap: true,
+            },
+            t0,
+        );
+
+        let entry = DELEGATE_EXEC_STATS.get(&k).expect("entry recorded");
+        assert_eq!(entry.requests, 1);
+        assert_eq!(entry.max_iterations, 100);
+        assert_eq!(entry.max_inter_delegate_messages, 40);
+        assert_eq!(entry.max_request_micros, 1_500_000);
+        assert_eq!(
+            entry.iteration_cap_hits, 1,
+            "a cap hit must be counted even though the request returned Ok"
+        );
+        assert_eq!(
+            entry.invocations, 0,
+            "a request is not an invocation; conflating the two is the bug this \
+             separation exists to prevent"
+        );
+        assert_eq!(entry.errors, 0, "a cap hit is not an error (#5454)");
+        drop(entry);
         clear_for_test();
+    }
+
+    /// `RequestMeter` must record on drop from every exit path, and must carry
+    /// the counts accumulated through its `note_*` methods.
+    #[test]
+    fn request_meter_records_on_drop() {
+        let _guard = exclusive();
+        let k = key(3);
+        {
+            let meter = RequestMeter::start(&k);
+            meter.note_iteration();
+            meter.note_iteration();
+            meter.note_inter_delegate_messages(3);
+            meter.note_inter_delegate_messages(2);
+            assert_eq!(
+                tracked_delegate_count(),
+                0,
+                "nothing is recorded until the meter drops"
+            );
+        }
+        let entry = DELEGATE_EXEC_STATS.get(&k).expect("recorded on drop");
+        assert_eq!(entry.requests, 1);
+        assert_eq!(entry.total_iterations, 2);
+        assert_eq!(entry.total_inter_delegate_messages, 5);
+        assert_eq!(
+            entry.iteration_cap_hits, 0,
+            "no cap hit was noted on this request"
+        );
+        drop(entry);
+        clear_for_test();
+    }
+
+    #[test]
+    fn entry_count_is_bounded_and_evicts_least_recently_active() {
+        let _guard = exclusive();
         let t0 = Instant::now();
         // Insert one more than the cap; each successive key is invoked later,
-        // so key 0 is the least-recently-invoked and must be the victim.
+        // so key 0 is the least-recently-active and must be the victim.
         for i in 0..=MAX_TRACKED_DELEGATES {
-            let k = DelegateKey::from(&{
-                let mut b = [0u8; 32];
-                b[0] = (i % 256) as u8;
-                b[1] = (i / 256) as u8;
-                b
-            });
+            let k = DelegateKey::new(
+                {
+                    let mut b = [0u8; 32];
+                    b[0] = (i % 256) as u8;
+                    b[1] = (i / 256) as u8;
+                    b
+                },
+                CodeHash::new([0u8; 32]),
+            );
             record_invocation(
                 &k,
                 Duration::from_micros(1),
@@ -539,7 +938,7 @@ mod tests {
     /// controlled. This asserts the STORED size, not the rendered size.
     #[test]
     fn stored_error_size_is_bounded_even_at_max_entries() {
-        clear_for_test();
+        let _guard = exclusive();
         let k = key(7);
         record_invocation(
             &k,
@@ -557,30 +956,51 @@ mod tests {
         clear_for_test();
     }
 
-    /// The snapshot must distinguish "we have never seen this run" from
-    /// "it ran zero times per second" — fabricating the latter is the
-    /// AGENTS.md failure this whole module exists to avoid.
+    /// The snapshot must distinguish "we have never seen this run" from "it ran
+    /// zero times per second". This exercises the real resolver, not a
+    /// hand-built struct literal: asserting that fields you just set have the
+    /// values you set proves nothing.
     #[test]
     fn unknown_rates_are_none_not_zero() {
-        clear_for_test();
-        let entry = DelegateStatusEntry {
-            key: "k".into(),
-            subscriptions: vec![],
-            subscriptions_registering_demand: 0,
-            invocations: 0,
-            errors: 0,
-            last_error: None,
-            last_error_secs_ago: None,
-            last_invoked_secs_ago: None,
-            total_exec_micros: 0,
-            invocation_rate_per_sec: None,
-            exec_cpu_micros_per_sec: None,
-        };
+        let f = exec_fields(None, Instant::now());
         assert!(
-            entry.invocation_rate_per_sec.is_none(),
+            f.invocation_rate_per_sec.is_none(),
             "an unmeasured rate is None, never Some(0.0)"
         );
-        assert!(entry.exec_cpu_micros_per_sec.is_none());
+        assert!(
+            f.last_active_secs_ago.is_none(),
+            "a delegate we have never seen run has no last-active time"
+        );
+        assert!(f.last_error_secs_ago.is_none());
+        assert!(f.last_error.is_none());
+        // Counters, by contrast, ARE genuinely zero: we know it ran zero times.
+        assert_eq!(f.invocations, 0);
+        assert_eq!(f.requests, 0);
+    }
+
+    /// The mirror-image of the above: once a delegate HAS run, the same
+    /// resolver must report real values rather than staying `None`. Without
+    /// this, a resolver that returned `Default::default()` unconditionally
+    /// would pass the test above.
+    #[test]
+    fn known_delegate_reports_real_values() {
+        let _guard = exclusive();
+        let k = key(9);
+        let t0 = Instant::now();
+        record_invocation(&k, Duration::from_micros(5), InvocationOutcome::Success, t0);
+        let entry = DELEGATE_EXEC_STATS.get(&k).expect("entry recorded");
+        let f = exec_fields(Some(&entry), t0 + Duration::from_secs(1));
+        drop(entry);
+        assert_eq!(f.invocations, 1);
+        assert!(
+            f.last_active_secs_ago.is_some(),
+            "a delegate that ran has a last-active time"
+        );
+        assert!(
+            f.invocation_rate_per_sec.is_some(),
+            "a delegate with a sample has a rate"
+        );
+        clear_for_test();
     }
 
     /// Phase 2 is not built on this branch. The flag must say so rather than

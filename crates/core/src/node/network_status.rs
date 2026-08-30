@@ -60,6 +60,16 @@ pub type BanListProvider = Arc<dyn Fn() -> BanListSnapshot + Send + Sync + 'stat
 /// is deliberately not carried on these rows.
 pub type HostingProvider = Arc<dyn Fn() -> HostingSnapshot + Send + Sync + 'static>;
 
+/// Provider for the per-delegate observability snapshot (#5467 Phase 0). Same
+/// pattern as the other providers: registered at node startup, replaceable for
+/// multi-node test harnesses, read by `get_snapshot` on every dashboard
+/// request. In production the closure captures `Arc<Ring>` and calls
+/// `delegate_observability::build_snapshot`, which reads canonical state —
+/// `DELEGATE_SUBSCRIPTIONS`, `Ring::in_use_contract_ids`, the topology meter
+/// and the module-cache metrics — rather than any mirrored counter.
+pub type DelegateStatusProvider =
+    Arc<dyn Fn() -> crate::node::delegate_observability::DelegateStatusSnapshot + Send + Sync + 'static>;
+
 /// Snapshot of ring-level statistics exposed to the dashboard.
 #[derive(Debug, Clone, Default)]
 pub struct RingStatsSnapshot {
@@ -181,6 +191,21 @@ static HOSTING_PROVIDER: parking_lot::RwLock<Option<HostingProvider>> =
 /// in-process harnesses can re-wire to the current node.
 pub fn set_hosting_provider(provider: HostingProvider) {
     *HOSTING_PROVIDER.write() = Some(provider);
+}
+
+static DELEGATE_STATUS_PROVIDER: parking_lot::RwLock<Option<DelegateStatusProvider>> =
+    parking_lot::RwLock::new(None);
+
+/// Register the dashboard's per-delegate observability data source (#5467
+/// Phase 0). Replaces any previously-registered provider so multi-node
+/// in-process harnesses can re-wire to the current node.
+pub fn set_delegate_status_provider(provider: DelegateStatusProvider) {
+    *DELEGATE_STATUS_PROVIDER.write() = Some(provider);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_delegate_status_provider() {
+    *DELEGATE_STATUS_PROVIDER.write() = None;
 }
 
 /// Replaceable storage for the subscription provider. Wrapped in a
@@ -1440,6 +1465,17 @@ pub struct NetworkStatusSnapshot {
     /// orders. Drives the "Demand-driven eviction" card. Read from the
     /// canonical hosting cache via the provider closure — no mirrored counter.
     pub hosting: HostingSnapshot,
+    /// Per-delegate observability (#5467 Phase 0). Drives the "Delegates" card.
+    ///
+    /// `Option`, not a defaulted struct, and that distinction is the point:
+    /// `None` means the provider was never registered (the panel is not wired,
+    /// e.g. a node built without the p2p impl), while `Some` with an empty
+    /// `delegates` vec means the panel IS wired and this node genuinely has no
+    /// delegates. Every other provider here collapses those two states into one
+    /// empty struct; for this panel they must stay distinguishable, because
+    /// "nothing to report" and "nothing is reporting" is exactly the confusion
+    /// #5467 was opened about.
+    pub delegates: Option<crate::node::delegate_observability::DelegateStatusSnapshot>,
 }
 
 /// Snapshot of the contract ban list for the dashboard (#4302).
@@ -2012,6 +2048,12 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
             .as_ref()
             .map(|provider| provider())
             .unwrap_or_default(),
+        // `map`, NOT `unwrap_or_default`: an unregistered provider must stay
+        // distinguishable from a node with no delegates. See the field docs.
+        delegates: DELEGATE_STATUS_PROVIDER
+            .read()
+            .as_ref()
+            .map(|provider| provider()),
         // Read straight from the queue's gauge — no provider registration and
         // no mirrored counter to keep in sync (#4917).
         fair_queue: crate::contract::fair_queue_stats(),

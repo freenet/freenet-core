@@ -588,14 +588,30 @@ where
     // Accumulate non-contract-request messages across iterations
     let mut accumulated_messages: Vec<OutboundDelegateMsg> = Vec::new();
 
+    // Meter the whole REQUEST, not just the individual delegate calls (#5467
+    // Phase 0). One request drives up to MAX_CONTRACT_REQUEST_ITERATIONS
+    // executions, each of which may fan out an uncapped batch of inter-delegate
+    // messages, so a healthy per-call duration says almost nothing about what a
+    // client actually waited for. Records on drop, which covers every exit from
+    // this function without touching a single return site.
+    let request_meter =
+        crate::node::delegate_observability::RequestMeter::start(delegate_key);
+
     loop {
         iterations += 1;
+        request_meter.note_iteration();
         if iterations > MAX_CONTRACT_REQUEST_ITERATIONS {
             tracing::error!(
                 delegate_key = %delegate_key,
                 iterations = iterations,
                 "Exceeded maximum contract request iterations, possible infinite loop"
             );
+            // Count the cap hit before returning. This arm returns Ok (whether
+            // that is right is #5454, and is NOT decided here), so a delegate
+            // that spins until the loop gives up produces no error anywhere and
+            // reads as perfectly healthy. This counter is the only trace it
+            // leaves. Pinned by `iteration_cap_hit_is_recorded_at_the_cap_arm`.
+            request_meter.note_iteration_cap_hit();
             // Return whatever we accumulated so far
             return accumulated_messages;
         }
@@ -983,6 +999,10 @@ where
                 count = delegate_messages.len(),
                 "Delivering delegate-to-delegate messages"
             );
+            // Fan-out axis (#5467 Phase 0): dispatch is single-hop, but the
+            // batch size is uncapped, so this is work per-call duration cannot
+            // see.
+            request_meter.note_inter_delegate_messages(delegate_messages.len());
 
             for msg in delegate_messages {
                 let target_key = msg.target.clone();

@@ -2021,3 +2021,215 @@ pub fn build_ops_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> S
         },
     )
 }
+
+/// Per-delegate observability card (#5467 Phase 0).
+///
+/// There was previously ZERO delegate information anywhere on this dashboard.
+/// The gap is what let #4669 survive unnoticed: a delegate subscribes, the call
+/// returns success, notification delivery works, and nothing anywhere reports
+/// that the subscription did not actually pin the contract.
+///
+/// Three states, deliberately kept distinguishable — the whole point of the
+/// panel is that "nothing to report" and "nothing is reporting" must not look
+/// the same (the Contract Ban List card, `build_ban_list_card`, is the template
+/// for this, and its explicit empty state is the part that was worth copying):
+///
+/// 1. **Provider unregistered** (`snap.delegates == None`) — the card is not
+///    rendered at all, matching every other unwired panel.
+/// 2. **Wired, no delegates** — the card renders with an explicit empty state.
+/// 3. **Wired, delegates present** — the table.
+///
+/// Every value comes from the provider closure reading canonical state. The
+/// only mirrored numbers are the execution counters, which have no canonical
+/// source (see `delegate_observability`), and their write sites are source-pinned.
+pub fn build_delegates_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
+    let Some(snap) = snap else {
+        return String::new();
+    };
+    // `None` = the provider was never registered. Render nothing rather than an
+    // empty table, which would claim this node has no delegates.
+    let Some(d) = snap.delegates.as_ref() else {
+        return String::new();
+    };
+
+    // The headline warning. A non-zero count here IS the #4669 bug, visible.
+    let unpinned_note = if d.subscriptions_without_demand > 0 {
+        format!(
+            r#"<p class="empty" style="margin: 0 0.9rem 0.6rem; font-size: 0.82rem; color: var(--danger, #c0392b);">{n} delegate subscription{s} did not register demand — the contract is not pinned by it, so nothing keeps it hosted or renewed here. Until #4669 lands this is expected for every delegate subscription: <code>contract_in_use</code> has no delegate term, so a subscription only reads as pinned when some other route (usually the app's own WebSocket subscription) happens to pin the same contract.</p>"#,
+            n = d.subscriptions_without_demand,
+            s = if d.subscriptions_without_demand == 1 {
+                ""
+            } else {
+                "s"
+            },
+        )
+    } else {
+        String::new()
+    };
+
+    // A runaway delegate that spins until the loop gives up returns Ok, so it
+    // never appears in the error count. This is the only trace it leaves.
+    let cap_note = if d.iteration_cap_hits_total > 0 {
+        format!(
+            r#"<p class="empty" style="margin: 0 0.9rem 0.6rem; font-size: 0.82rem; color: var(--danger, #c0392b);">{n} request{s} hit the contract-request iteration cap and returned truncated results. That path returns success, so these do NOT appear in the error column — a delegate spinning until the loop gives up otherwise reads as healthy (#5454).</p>"#,
+            n = d.iteration_cap_hits_total,
+            s = if d.iteration_cap_hits_total == 1 {
+                ""
+            } else {
+                "s"
+            },
+        )
+    } else {
+        String::new()
+    };
+
+    // Phase 2 (#3972 scheduled execution) is not built. Say so explicitly: a
+    // "0 pending wakeups" tile would read as "none pending", which is a
+    // fabricated answer to a question this node cannot answer at all.
+    let wakeups_value = if d.wakeup_scheduling_available {
+        // Unreachable today; kept so wiring Phase 2 is a one-line change here
+        // rather than a rewrite that has to rediscover why the tile said this.
+        "—".to_string()
+    } else {
+        "not built".to_string()
+    };
+
+    let body = if d.delegates.is_empty() {
+        r#"<p class="empty" style="margin: 0.6rem 0.9rem;">No delegates have run or subscribed on this node. The panel is wired and reporting; this is a genuine zero, not a missing data source.</p>"#
+            .to_string()
+    } else {
+        let mut rows = String::new();
+        for e in &d.delegates {
+            // Unknown stays "—", never 0. A delegate we have never seen execute
+            // has no rate and no last-active time; printing 0 would invent one.
+            let dash = "—".to_string();
+            let last_active = e
+                .last_active_secs_ago
+                .map(format_ago)
+                .unwrap_or_else(|| dash.clone());
+            let avg_call = if e.invocations > 0 {
+                format!("{} µs", e.total_exec_micros / e.invocations)
+            } else {
+                dash.clone()
+            };
+            let avg_request = if e.requests > 0 {
+                format!("{} ms", e.total_request_micros / e.requests / 1000)
+            } else {
+                dash.clone()
+            };
+            let max_request = if e.requests > 0 {
+                format!("{} ms", e.max_request_micros / 1000)
+            } else {
+                dash.clone()
+            };
+            let subs_cell = if e.subscriptions.is_empty() {
+                "0".to_string()
+            } else {
+                format!(
+                    "{pinned} / {total}",
+                    pinned = e.subscriptions_registering_demand,
+                    total = e.subscriptions.len(),
+                )
+            };
+            // A subscription that did not pin is the finding, so colour it.
+            let subs_class = if e.subscriptions.is_empty()
+                || e.subscriptions_registering_demand == e.subscriptions.len()
+            {
+                "use-active"
+            } else {
+                "fresh-stale"
+            };
+            let error_cell = match (&e.last_error, e.last_error_secs_ago) {
+                (Some(msg), Some(secs)) => format!(
+                    r#"<span title="{full}">{n} · {ago}</span>"#,
+                    full = html_escape(msg),
+                    n = e.errors,
+                    ago = html_escape(&format_ago(secs)),
+                ),
+                _ => e.errors.to_string(),
+            };
+            let cap_cell = if e.iteration_cap_hits > 0 {
+                format!(
+                    r#"<span class="fresh-stale" title="Requests that exhausted MAX_CONTRACT_REQUEST_ITERATIONS. That arm returns Ok, so these are not counted as errors.">{}</span>"#,
+                    e.iteration_cap_hits
+                )
+            } else {
+                "0".to_string()
+            };
+            write!(
+                rows,
+                r#"<tr><td class="mono">{key}</td><td class="{subs_class}">{subs}</td><td class="right">{requests}</td><td class="right">{avg_req}</td><td class="right">{max_req}</td><td class="right">{max_iters}</td><td class="right">{cap}</td><td class="right">{invocations}</td><td class="right">{avg_call}</td><td class="right">{errors}</td><td class="right">{last_active}</td></tr>"#,
+                key = html_escape(&e.key),
+                subs_class = subs_class,
+                subs = html_escape(&subs_cell),
+                requests = e.requests,
+                avg_req = html_escape(&avg_request),
+                max_req = html_escape(&max_request),
+                max_iters = e.max_iterations,
+                cap = cap_cell,
+                invocations = e.invocations,
+                avg_call = html_escape(&avg_call),
+                errors = error_cell,
+                last_active = html_escape(&last_active),
+            )
+            .ok();
+        }
+        format!(
+            r#"<div class="table-wrap">
+                <table class="sortable" data-table-id="delegates">
+                    <thead><tr>
+                        <th data-sort-type="text">Delegate</th>
+                        <th title="Subscriptions that actually registered demand, over subscriptions held. A subscription that did not register demand does NOT pin the contract — see the note above.">Pinned / subs</th>
+                        <th class="right" data-sort-type="num" title="Whole client requests. One request drives up to 100 delegate invocations, so this is the unit that matches what a user waited for.">Requests</th>
+                        <th class="right" data-sort-type="num">Avg req</th>
+                        <th class="right" data-sort-type="num">Max req</th>
+                        <th class="right" data-sort-type="num" title="Most contract-request loop iterations any single request needed. Approaching 100 means it is close to the cap.">Max iters</th>
+                        <th class="right" data-sort-type="num" title="Requests that hit the iteration cap. These return Ok, so they are NOT errors.">Cap hits</th>
+                        <th class="right" data-sort-type="num" title="Individual delegate executions (process() calls).">Invocations</th>
+                        <th class="right" data-sort-type="num">Avg call</th>
+                        <th class="right" data-sort-type="num" title="Failed invocations. Hover for the most recent error message.">Errors</th>
+                        <th class="right" data-sort-type="num">Last active</th>
+                    </tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>"#
+        )
+    };
+
+    format!(
+        r##"<div class="card">
+            <div class="card-header"><h2>Delegates</h2></div>
+            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Per-delegate activity on this node (#5467 Phase 0). Measurement only — nothing here throttles or suspends a delegate. Two units are shown because they differ by up to 100x: a REQUEST is one client call, which drives up to 100 delegate INVOCATIONS, so a healthy per-call time is consistent with a request that took seconds.</p>
+            <div class="g-verdict-row">
+                <div class="g-norms">
+                    <div class="g-norm"><div class="g-norm-label">Delegates</div><div class="g-norm-value">{count}</div></div>
+                    <div class="g-norm" title="Subscriptions that actually registered demand, over subscriptions held across all delegates."><div class="g-norm-label">Pinned / subs</div><div class="g-norm-value">{pinned} / {subs}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">With unpinned subs</div><div class="g-norm-value">{unpinned_delegates}</div></div>
+                    <div class="g-norm" title="Scheduled execution (#3972 / Phase 2) is not merged, so this node cannot have pending wakeups. Shown as 'not built' rather than 0, which would read as 'none pending'."><div class="g-norm-label">Pending wakeups</div><div class="g-norm-value">{wakeups}</div></div>
+                </div>
+            </div>
+            <div class="g-verdict-row">
+                <div class="g-norms">
+                    <div class="g-norm" title="Compiled delegate WASM modules held in the module cache."><div class="g-norm-label">Module cache</div><div class="g-norm-value">{mc_entries}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Cache used</div><div class="g-norm-value">{mc_used} / {mc_budget}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Cache evictions</div><div class="g-norm-value">{mc_evictions}</div></div>
+                </div>
+            </div>
+            {unpinned_note}
+            {cap_note}
+            {body}
+        </div>"##,
+        count = d.delegates.len(),
+        pinned = d.subscriptions_total - d.subscriptions_without_demand,
+        subs = d.subscriptions_total,
+        unpinned_delegates = d.delegates_with_unpinned_subscriptions,
+        wakeups = wakeups_value,
+        mc_entries = d.module_cache_entries,
+        mc_used = format_bytes(d.module_cache_total_bytes),
+        mc_budget = format_bytes(d.module_cache_budget_bytes),
+        mc_evictions = d.module_cache_evictions_total,
+        unpinned_note = unpinned_note,
+        cap_note = cap_note,
+        body = body,
+    )
+}

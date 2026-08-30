@@ -20,8 +20,8 @@ pub(super) use std::fmt::Write;
 
 use assets::{CSS, JS};
 use cards::{
-    build_ban_list_card, build_contracts_card, build_governance_card, build_hosting_card,
-    build_ops_card, build_peers_card, build_status_card, build_transfer_card,
+    build_ban_list_card, build_contracts_card, build_delegates_card, build_governance_card,
+    build_hosting_card, build_ops_card, build_peers_card, build_status_card, build_transfer_card,
 };
 use contract_detail::contract_detail_html;
 use favicon::{build_dashboard_title, build_favicon_data_uri};
@@ -129,6 +129,7 @@ fn homepage_html() -> String {
     let governance_card = build_governance_card(&snap);
     let ban_list_card = build_ban_list_card(&snap);
     let contracts_card = build_contracts_card(&snap);
+    let delegates_card = build_delegates_card(&snap);
     let ops_card = build_ops_card(&snap);
     let transfer_card = build_transfer_card(&snap);
 
@@ -169,6 +170,7 @@ fn homepage_html() -> String {
         include_str!("home_page/assets/home.html"),
         CSS = CSS,
         JS = JS,
+        delegates_card = delegates_card,
         favicon = favicon,
         title = html_escape(&title),
         version = html_escape(version),
@@ -246,6 +248,10 @@ mod tests {
             governance: Default::default(),
             ban_list: Default::default(),
             hosting: Default::default(),
+            // `None` = provider unregistered, which is the correct default for a
+            // render-only test fixture. Tests that exercise the delegates card
+            // set this to `Some(..)` explicitly.
+            delegates: None,
         }
     }
 

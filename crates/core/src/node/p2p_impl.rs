@@ -524,6 +524,26 @@ impl NodeP2P {
             hosting_ring.dashboard_hosting_snapshot()
         }));
 
+        // Per-delegate observability (#5467 Phase 0). Same provider pattern:
+        // the closure reads canonical state on every dashboard request —
+        // `DELEGATE_SUBSCRIPTIONS` for what each delegate subscribed to,
+        // `Ring::in_use_contract_ids` for whether that subscription actually
+        // registered demand, the topology meter for attributed CPU, and the
+        // module-cache metrics. The only mirrored values are the execution
+        // counters, which have no canonical source (see the module docs).
+        //
+        // Registering this is also what makes the panel's "wired but empty"
+        // state reachable: `network_status` stores the snapshot as an `Option`,
+        // so an unregistered provider renders NO card rather than an empty one
+        // claiming this node has no delegates.
+        let delegate_ring = self.op_manager.ring.clone();
+        super::network_status::set_delegate_status_provider(std::sync::Arc::new(move || {
+            super::delegate_observability::build_snapshot(
+                &delegate_ring,
+                tokio::time::Instant::now(),
+            )
+        }));
+
         // Wire live ring stats for the dashboard: connection count +
         // hosted contracts + own public key, read on every homepage
         // request.
