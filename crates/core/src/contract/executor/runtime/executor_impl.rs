@@ -1,5 +1,25 @@
 use super::*;
 
+/// What [`Executor::commit_state_update`] actually did.
+///
+/// It used to return `Result<(), _>`, which made "stored the state and ran the
+/// full fan-out" and "suppressed the whole thing because the contract is
+/// flagged as violating a CRDT invariant" indistinguishable at every call
+/// site. A caller that reads a bare `Ok` as "committed" then acts on a state
+/// that was never written — and the initial-install branch's replay loop did
+/// exactly that, concluding a replay had fanned out and skipping its own
+/// fan-out, so the state it HAD stored reached nobody. That is #5481 again,
+/// relocated to the install-plus-flagged-contract corner. The outcome is
+/// explicit so the compiler makes the next caller choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::contract::executor) enum StateCommitOutcome {
+    /// The state was stored and `finalize_state_commit` ran.
+    Committed,
+    /// Nothing was stored and nothing was fanned out: the contract is flagged
+    /// in `ring::broken_invariants` (#4279).
+    SuppressedBrokenContract,
+}
+
 // ============================================================================
 // Single Executor Implementation
 // ============================================================================
@@ -691,18 +711,38 @@ where
                                             if valid
                                                 && new_state.as_ref() != installed_state.as_ref()
                                             {
-                                                if let Err(e) = self
+                                                match self
                                                     .commit_state_update(&key, &params, &new_state)
                                                     .await
                                                 {
-                                                    tracing::warn!(
-                                                        contract = %key,
-                                                        error = %e,
-                                                        "Failed to commit replayed queued operation"
-                                                    );
-                                                } else {
-                                                    installed_state = new_state;
-                                                    replay_committed = true;
+                                                    Ok(StateCommitOutcome::Committed) => {
+                                                        installed_state = new_state;
+                                                        replay_committed = true;
+                                                    }
+                                                    Ok(
+                                                        StateCommitOutcome::SuppressedBrokenContract,
+                                                    ) => {
+                                                        // Nothing stored, nothing fanned out. The
+                                                        // state must NOT advance and the trailing
+                                                        // fan-out must NOT be skipped — treating
+                                                        // this as a commit would leave the state
+                                                        // this branch DID store reaching nobody,
+                                                        // which is #5481 again at the
+                                                        // install-plus-flagged-contract corner.
+                                                        tracing::debug!(
+                                                            contract = %key,
+                                                            "Replayed operation suppressed \
+                                                             (contract flagged broken); \
+                                                             install fan-out still owed"
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            contract = %key,
+                                                            error = %e,
+                                                            "Failed to commit replayed queued operation"
+                                                        );
+                                                    }
                                                 }
                                             } else if !valid {
                                                 tracing::warn!(
@@ -1212,7 +1252,11 @@ where
                 return Ok(UpsertResult::NoChange);
             }
 
-            self.commit_state_update(&key, &params, &updated_state)
+            // Outcome discarded deliberately: a broken-contract suppression
+            // here is already reported to the caller as the `NoChange` above,
+            // and this path has no trailing fan-out to gate on it.
+            let _ = self
+                .commit_state_update(&key, &params, &updated_state)
                 .await?;
             Ok(UpsertResult::Updated(updated_state))
         }
@@ -2147,7 +2191,7 @@ where
         key: &ContractKey,
         parameters: &Parameters<'_>,
         new_state: &WrappedState,
-    ) -> Result<(), ExecutorError> {
+    ) -> Result<StateCommitOutcome, ExecutorError> {
         // Blanket gate: a contract flagged as violating a CRDT invariant
         // (e.g. non-idempotent merge) must not have its state extended
         // OR broadcast from this node. The merge in
@@ -2165,7 +2209,12 @@ where
                     event = "commit_suppressed_broken_contract",
                     "Skipping commit_state_update for contract flagged as broken"
                 );
-                return Ok(());
+                // NOT `Ok(())`. This path stores nothing and fans out
+                // nothing, and a caller that reads a bare `Ok` as "committed"
+                // will act on a state that was never written — which is
+                // exactly what happened to the initial-install branch's
+                // replay loop before the outcome was made explicit.
+                return Ok(StateCommitOutcome::SuppressedBrokenContract);
             }
         }
 
@@ -2236,7 +2285,7 @@ where
 
         self.finalize_state_commit(key, parameters, new_state).await;
 
-        Ok(())
+        Ok(StateCommitOutcome::Committed)
     }
 
     /// The complete post-store fan-out for a contract state this node has

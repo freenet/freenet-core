@@ -368,7 +368,10 @@ impl Executor<Runtime> {
             return Err(Self::validation_error(key, result));
         }
         if new_state.as_ref() != current_state.as_ref() {
-            self.commit_state_update(&key, parameters, &new_state)
+            // Outcome discarded deliberately: nothing after this depends on
+            // whether the commit was suppressed for a flagged contract.
+            let _ = self
+                .commit_state_update(&key, parameters, &new_state)
                 .await?;
         }
         Ok(new_state)

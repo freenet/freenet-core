@@ -386,6 +386,36 @@ fn finalize_state_commit_is_the_only_post_store_fan_out_site() {
         );
     }
 
+    // The queued-operation replay loop inside the install branch must consume
+    // `commit_state_update`'s OUTCOME, not a bare `Ok`.
+    //
+    // `commit_state_update` returns `Ok(SuppressedBrokenContract)` — storing
+    // nothing and fanning out nothing — for a contract flagged in
+    // `ring::broken_invariants`. When it returned `Result<(), _>` the replay
+    // loop read that as "this replay committed", advanced `installed_state`,
+    // and skipped the branch's own trailing fan-out, so the state the branch
+    // HAD stored reached no delegate, no WebSocket client and no peer. #5481
+    // again, at the install-plus-flagged-contract corner, introduced by the fix
+    // for #5481 and caught by the repo's rule review.
+    //
+    // The enum makes the conflation uncompilable — there is no `Ok(())` left to
+    // misread — so what is worth pinning is that the loop still matches on the
+    // variant rather than being rewritten to discard it with `let _ =` or
+    // `.is_ok()`, which would restore the same bug through a different door.
+    assert!(
+        helper_free_production_contains(production, "StateCommitOutcome::Committed"),
+        "the queued-operation replay loop must branch on \
+         `StateCommitOutcome::Committed`. Treating any `Ok` as a commit makes \
+         a broken-contract suppression look like a successful one, and the \
+         install branch then skips a fan-out it still owes."
+    );
+    assert!(
+        helper_free_production_contains(production, "StateCommitOutcome::SuppressedBrokenContract"),
+        "the replay loop must handle the suppression case explicitly, so the \
+         install branch's own fan-out is still performed when a replay stored \
+         nothing."
+    );
+
     // And every storing path delegates to it.
     let calls = count_call_sites(production, ".finalize_state_commit(");
     assert_eq!(
@@ -480,6 +510,11 @@ fn brace_delimited_body(src: &str, start: usize) -> &str {
         }
     }
     panic!("unbalanced braces while scraping the item body starting at {start}");
+}
+
+/// Whether `needle` appears in non-comment, non-string-literal source.
+fn helper_free_production_contains(src: &str, needle: &str) -> bool {
+    count_call_sites(src, needle) > 0
 }
 
 /// Count `needle` occurrences, one per matching LINE (two calls on one line
