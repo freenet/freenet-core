@@ -4400,7 +4400,10 @@ async fn test_v2_delegate_update_propagates_to_second_peer(ctx: &mut TestContext
         HostResponse::DelegateResponse { key, .. } => {
             ensure!(key == delegate_key, "delegate key mismatch on register");
         }
-        other => bail!("unexpected register response: {other:?}"),
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("unexpected register response: {other:?}"),
     }
 
     let contract_id_bytes: [u8; 32] = contract_id
@@ -4439,10 +4442,17 @@ async fn test_v2_delegate_update_propagates_to_second_peer(ctx: &mut TestContext
                 .ok_or_else(|| anyhow::anyhow!("no ApplicationMessage in delegate response"))?;
             match outcome {
                 OutboundAppMessage::Success { .. } => {}
-                other => bail!("V2 delegate update_contract_state failed: {other:?}"),
+                other @ OutboundAppMessage::ContractState { .. }
+                | other @ OutboundAppMessage::ContractNotFound { .. }
+                | other @ OutboundAppMessage::Failed { .. } => {
+                    bail!("V2 delegate update_contract_state failed: {other:?}")
+                }
             }
         }
-        other => bail!("unexpected delegate UPDATE response: {other:?}"),
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other => bail!("unexpected delegate UPDATE response: {other:?}"),
     }
 
     // --- 5. THE ASSERTION: node-b sees the write --------------------------

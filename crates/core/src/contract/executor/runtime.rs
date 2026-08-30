@@ -360,6 +360,133 @@ impl ContractExecutor for Executor<Runtime> {
     }
 }
 
+/// Install the two V2-delegate state-write hooks on `rt`: the pre-write
+/// disk-budget admission gate and the post-write side-effect callback.
+///
+/// **There is exactly one of these on purpose.** V2 delegate writes
+/// (`put_contract_state_sync` / `update_contract_state_sync`) go straight
+/// through the raw `Storage`, bypassing the executor's
+/// `state_store.{store,update}` chokepoints — so everything those chokepoints
+/// do has to be re-applied by these hooks, and until #5479 the installers were
+/// two copy-paste twins (`from_config` and `from_config_with_shared_modules`)
+/// guarded only by a pin test that counted occurrences. That is precisely the
+/// shape the "manually-inlined originator side effects" row in
+/// `.claude/rules/bug-prevention-patterns.md` warns about: the next side effect
+/// added to one twin and not the other is silent. One installer, two callers.
+fn install_v2_delegate_state_write_hooks(
+    rt: &mut Runtime,
+    state_store: &StateStore<Storage>,
+    op_manager: Option<Arc<OpManager>>,
+) {
+    rt.set_state_write_callback(v2_delegate_state_write_callback(
+        state_store.cache_invalidator(),
+        op_manager.clone(),
+    ));
+
+    // Disk-budget admission gate for the V2 delegate write path (#4683,
+    // PR 3): V2 PUT/UPDATE bypass the executor's `state_store` chokepoints
+    // (and hence the gate installed there), so install the same pre-write
+    // gate here. Returns Err(cause) → the native-API method aborts without
+    // writing. No-op admit until the disk tracker is seeded.
+    if let Some(op_manager) = op_manager {
+        rt.set_state_admit_callback(Arc::new(
+            move |key: &ContractKey, state_size: usize, is_update: bool| {
+                // V2 PUT → hard gate; V2 UPDATE → growth-only gate (#4683).
+                // A shrinking/holding V2 UPDATE must never block convergence.
+                let result = if is_update {
+                    op_manager.ring.admit_state_update(key, state_size)
+                } else {
+                    op_manager.ring.admit_state_write(key, state_size)
+                };
+                result.map_err(|over| over.to_string())
+            },
+        ));
+    }
+}
+
+/// The post-write callback `install_v2_delegate_state_write_hooks` installs.
+///
+/// Split out from the installer so a test can drive the PRODUCTION closure
+/// directly and observe what it emits — see
+/// `pool_tests::v2_delegate_propagation_tests`. Building a whole `Runtime`
+/// (contract, delegate and secret stores plus a WASM engine) just to reach the
+/// closure would make that test cost far more than the behaviour it checks.
+///
+/// It does three things:
+///
+/// 1. **Drops `StateStore`'s cached view of the contract — ALWAYS**, whether or
+///    not an `op_manager` is wired. The bypass write touches neither the moka
+///    state-bytes cache nor the change-detector, so without this a later read
+///    serves the OLD bytes and the summarize/delta fast path can serve a STALE
+///    summary/delta → state divergence.
+/// 2. **`Ring::commit_state_write`** — generation bump, hosting-cache snapshot
+///    refresh, and the StateBytesWritten meter report. Without it the
+///    EvictContract re-host race stays open for V2 writes and governance
+///    scoring undercounts them.
+/// 3. **`NodeEvent::BroadcastStateChange`** — the propagation V1 gets for free
+///    from `upsert_contract_state` (#5479). Suppressed for a contract flagged
+///    as violating a CRDT invariant, mirroring
+///    `Executor::broadcast_state_change`, and emitted NON-BLOCKING: a blocking
+///    `notify_node_event(...).await` on a commit path is what wedged both
+///    gateways in #4145, and this one runs inside a synchronous WASM host call,
+///    where blocking would be worse still.
+///
+/// Legs 2 and 3 need the ring, so they run only when `op_manager` is `Some`
+/// (unit-test and local-only executors have none). Leg 1 always runs.
+///
+/// Local fan-out — WebSocket clients and other delegates subscribed on THIS
+/// node — is deliberately NOT here and is not reachable from here: the
+/// `DelegateNotificationSender` is installed on the executor after this runs
+/// (`pool.rs`), and the WS subscriber maps need `&mut Executor`. Tracked
+/// separately.
+pub(super) fn v2_delegate_state_write_callback(
+    cache_invalidator: crate::wasm_runtime::StateCacheInvalidator,
+    op_manager: Option<Arc<OpManager>>,
+) -> crate::wasm_runtime::StateWriteCallback {
+    Arc::new(
+        move |key: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState| {
+            cache_invalidator.invalidate(key);
+            let Some(op_manager) = &op_manager else {
+                return;
+            };
+            op_manager
+                .ring
+                .commit_state_write(key, new_state.as_ref().len());
+
+            // Propagate, exactly as the V1 path does via
+            // `upsert_contract_state` → `Executor::finalize_state_commit`.
+            if op_manager.ring.is_contract_broken(key) {
+                tracing::debug!(
+                    contract = %key,
+                    event = "broadcast_suppressed_broken_contract",
+                    "Skipping BroadcastStateChange for contract flagged as broken"
+                );
+                return;
+            }
+            if let Err(err) =
+                op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
+                    key: *key,
+                    new_state: new_state.clone(),
+                    is_retry: false,
+                    is_reemit: false,
+                })
+            {
+                // Best-effort by design (#4145 / #4231): a missed broadcast
+                // heals via the next UPDATE or a summary-mismatch
+                // SyncStateToPeer round. The rate-limited `notify_node_event:
+                // Notification channel full for too long` ERROR in
+                // op_state_manager.rs is the sustained-back-pressure alert.
+                tracing::debug!(
+                    contract = %key,
+                    error = %err,
+                    "Failed to broadcast V2 delegate state change to network peers \
+                     (best-effort)"
+                );
+            }
+        },
+    )
+}
+
 impl Executor<Runtime> {
     /// Create an Executor for local-only mode (no network operations).
     /// Use this from the binary for local mode execution.
@@ -378,47 +505,10 @@ impl Executor<Runtime> {
         let mut rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
         // Enable V2 delegate contract access by providing the state store DB
         rt.set_state_store_db(state_store.storage());
-        // V2 delegate state writes (put/update_contract_state_sync) write
-        // directly through the raw `Storage`, bypassing the executor's
-        // `state_store.{store,update}` chokepoints. The callback restores the
-        // side effects those chokepoints perform on every write:
-        //   1. Drop StateStore's cached view of the contract — ALWAYS. The
-        //      bypass write doesn't touch the moka state-bytes cache OR the
-        //      change-detector, so without this a later read would serve the OLD
-        //      bytes from moka and the summarize/delta fast path could serve a
-        //      STALE summary/delta → state divergence (Codex review).
-        //   2. Bump+refresh+report via `Ring::commit_state_write` — only when an
-        //      op_manager is present (it owns the ring/governance state).
-        //      Without this, V2 PUT/UPDATE would leave the EvictContract re-host
-        //      race open AND undercount StateBytesWritten in the meter.
-        let cache_invalidator = state_store.cache_invalidator();
-        let op_manager_for_cb = op_manager.clone();
-        rt.set_state_write_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
-            cache_invalidator.invalidate(key);
-            if let Some(op_manager) = &op_manager_for_cb {
-                op_manager.ring.commit_state_write(key, state_size);
-            }
-        }));
-        // Disk-budget admission gate for the V2 delegate write path (#4683,
-        // PR 3): V2 PUT/UPDATE bypass the executor's `state_store` chokepoints
-        // (and hence the gate installed there), so install the same pre-write
-        // gate here. Returns Err(cause) → the native-API method aborts without
-        // writing. No-op admit until the disk tracker is seeded.
-        let op_manager_for_admit = op_manager.clone();
-        if let Some(op_manager) = op_manager_for_admit {
-            rt.set_state_admit_callback(Arc::new(
-                move |key: &ContractKey, state_size: usize, is_update: bool| {
-                    // V2 PUT → hard gate; V2 UPDATE → growth-only gate (#4683).
-                    // A shrinking/holding V2 UPDATE must never block convergence.
-                    let result = if is_update {
-                        op_manager.ring.admit_state_update(key, state_size)
-                    } else {
-                        op_manager.ring.admit_state_write(key, state_size)
-                    };
-                    result.map_err(|over| over.to_string())
-                },
-            ));
-        }
+        // V2 delegate state writes bypass the executor chokepoints — one
+        // shared installer restores every side effect they skip, propagation
+        // included. See `install_v2_delegate_state_write_hooks`.
+        install_v2_delegate_state_write_hooks(&mut rt, &state_store, op_manager.clone());
         Executor::new(
             state_store,
             move || {
@@ -533,40 +623,9 @@ impl Executor<Runtime> {
         )
         .unwrap();
         rt.set_state_store_db(db);
-        // V2 delegate state writes bypass the executor chokepoints — install the
-        // callback that (1) ALWAYS drops StateStore's cached view of the contract
-        // (both the moka state-bytes cache and the change-detector; a stale
-        // cached state or detector hash after a V2 write would serve a stale
-        // summary/delta → divergence; Codex review) and (2) mirrors the
-        // bump+refresh+report side effects via `Ring::commit_state_write` when an
-        // op_manager is present. See `from_config` and
-        // `Runtime::set_state_write_callback`.
-        let cache_invalidator = shared_state_store.cache_invalidator();
-        let op_manager_for_cb = op_manager.clone();
-        rt.set_state_write_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
-            cache_invalidator.invalidate(key);
-            if let Some(op_manager) = &op_manager_for_cb {
-                op_manager.ring.commit_state_write(key, state_size);
-            }
-        }));
-        // Disk-budget admission gate for the V2 delegate write path (#4683,
-        // PR 3) — see `from_config` for the rationale. Same gate the executor
-        // chokepoints apply, restored for the V2 bypass.
-        let op_manager_for_admit = op_manager.clone();
-        if let Some(op_manager) = op_manager_for_admit {
-            rt.set_state_admit_callback(Arc::new(
-                move |key: &ContractKey, state_size: usize, is_update: bool| {
-                    // V2 PUT → hard gate; V2 UPDATE → growth-only gate (#4683).
-                    // A shrinking/holding V2 UPDATE must never block convergence.
-                    let result = if is_update {
-                        op_manager.ring.admit_state_update(key, state_size)
-                    } else {
-                        op_manager.ring.admit_state_write(key, state_size)
-                    };
-                    result.map_err(|over| over.to_string())
-                },
-            ));
-        }
+        // Same shared installer as `from_config` — see
+        // `install_v2_delegate_state_write_hooks` for what the V2 bypass owes.
+        install_v2_delegate_state_write_hooks(&mut rt, &shared_state_store, op_manager.clone());
         Executor::new(
             shared_state_store,
             || Ok(()),
@@ -2910,9 +2969,10 @@ mod state_write_attribution_pin_tests {
     #[test]
     fn every_runtime_state_write_chokepoint_goes_through_commit_state_write() {
         // 4 executor-internal chokepoints (PUT-new, UPDATE, re-PUT,
-        // verify_and_store PUT) + 2 V2 delegate callback installers
-        // = 6 total commit_state_write call sites in runtime.rs.
-        const EXPECTED: usize = 6;
+        // verify_and_store PUT) + 1 V2 delegate callback (the two
+        // installers collapsed into `v2_delegate_state_write_callback`
+        // in #5479) = 5 total commit_state_write call sites in runtime.rs.
+        const EXPECTED: usize = 5;
         let count = count_call_sites(RUNTIME_SRC, ".commit_state_write(");
         assert_eq!(
             count, EXPECTED,
@@ -2926,28 +2986,41 @@ mod state_write_attribution_pin_tests {
     }
 
     #[test]
-    fn v2_delegate_state_write_paths_invoke_callback_with_state_size() {
-        // The V2 delegate PUT and UPDATE paths in native_api.rs MUST
-        // capture state.len() BEFORE the move into store_state_sync /
-        // update_state_sync, and pass it to the callback. Otherwise the
-        // governance scoring undercounts every V2 delegate write by the
-        // full state size of that write.
-        let calls = count_call_sites(NATIVE_API_SRC, "cb(&contract_key,");
+    fn v2_delegate_state_write_paths_run_the_shared_post_write_hook() {
+        // Both V2 delegate write paths in native_api.rs (PUT and UPDATE) MUST
+        // go through the one `after_state_write` helper, which is what fires
+        // the installed callback. Hand-inlining the callback invocation at
+        // each path is how a side effect ends up on one path and not the
+        // other — the "manually-inlined originator side effects" row in
+        // `.claude/rules/bug-prevention-patterns.md`.
+        let hook_calls = count_call_sites(NATIVE_API_SRC, "self.after_state_write(");
         assert_eq!(
-            calls, 2,
-            "expected exactly 2 callback invocations passing state_size \
-             in native_api.rs (one for PUT, one for UPDATE); found {calls}"
+            hook_calls, 2,
+            "expected exactly 2 `self.after_state_write(` call sites in \
+             native_api.rs (one for V2 PUT, one for V2 UPDATE); found \
+             {hook_calls}"
         );
-        // And state.len() MUST be captured before the move.
-        let captures = count_call_sites(NATIVE_API_SRC, "let state_size = state.len();");
+        // …and exactly one place that actually invokes the callback.
+        let invocations = count_call_sites(NATIVE_API_SRC, "cb(contract_key, new_state)");
+        assert_eq!(
+            invocations, 1,
+            "expected exactly 1 callback invocation in native_api.rs (inside \
+             after_state_write); found {invocations}. A second one means a \
+             write path has started re-inlining the post-write sequence."
+        );
+        // The state is wrapped ONCE and the same value is admitted, written
+        // and handed to the callback. Reconstructing it for the hook, or
+        // measuring a different value than the one written, is the drift this
+        // catches.
+        let captures = count_call_sites(
+            NATIVE_API_SRC,
+            "let new_state = freenet_stdlib::prelude::WrappedState::new(state);",
+        );
         assert_eq!(
             captures, 2,
-            "expected exactly 2 `let state_size = state.len();` captures \
-             in native_api.rs (one before each state-store move); found \
-             {captures}. The order matters — capturing AFTER the move \
-             into store_state_sync would not compile, but a refactor \
-             that moves state into an intermediate first could regress \
-             this silently."
+            "expected exactly 2 `WrappedState::new(state)` wraps in \
+             native_api.rs (one per V2 write path, before the admission \
+             gate); found {captures}."
         );
     }
 
@@ -2982,23 +3055,58 @@ mod state_write_attribution_pin_tests {
     }
 
     #[test]
-    fn v2_delegate_callback_installers_invalidate_state_caches() {
+    fn one_v2_delegate_write_callback_shared_by_both_executor_constructors() {
         // V2 delegate state writes (put/update_contract_state_sync) bypass
-        // `StateStore::{store,update}`, so both `state_write_callback` installers
-        // (in `from_config` and `from_config_with_shared_modules`) MUST drop
-        // StateStore's cached view of the contract (moka state cache + change
-        // detector). Dropping this would let a V2 write leave a stale cached
-        // state/detector hash and the summarize/delta fast path serve a STALE
-        // summary/delta → state divergence (Codex review).
-        let count = count_call_sites(RUNTIME_SRC, "cache_invalidator.invalidate(");
+        // `StateStore::{store,update}`, so the `state_write_callback` has to
+        // re-apply every side effect those chokepoints perform. Before #5479
+        // that callback was built TWICE — once in `from_config`, once in
+        // `from_config_with_shared_modules` — as copy-paste twins, which is
+        // exactly the shape that lets a side effect be added to one and not
+        // the other. There is now ONE builder and ONE installer.
+        let installs = count_call_sites(RUNTIME_SRC, "rt.set_state_write_callback(");
         assert_eq!(
-            count, 2,
-            "expected exactly 2 `cache_invalidator.invalidate(` calls in \
-             runtime.rs (one per V2 state_write_callback installer); found \
-             {count}. If a callback installer stopped invalidating StateStore's \
-             caches, a V2 delegate state write would leave stale cached state \
-             and the summarize/delta fast path could serve a stale result."
+            installs, 1,
+            "expected exactly 1 `rt.set_state_write_callback(` site in \
+             runtime.rs (inside install_v2_delegate_state_write_hooks); found \
+             {installs}. A second installer is a copy-paste twin waiting to \
+             drift — extend the shared one instead."
         );
+        let callers =
+            count_call_sites(RUNTIME_SRC, "install_v2_delegate_state_write_hooks(&mut rt");
+        assert_eq!(
+            callers, 2,
+            "expected both executor constructors (`from_config` and \
+             `from_config_with_shared_modules`) to call \
+             install_v2_delegate_state_write_hooks; found {callers} call sites."
+        );
+
+        // And the one callback must still do all three legs. Anchored on API
+        // surface, not local names, so a rename inside it cannot pass vacuously.
+        let start = RUNTIME_SRC
+            .find("pub(super) fn v2_delegate_state_write_callback(")
+            .expect("v2_delegate_state_write_callback must exist");
+        let body = &RUNTIME_SRC[start..];
+        let end = body
+            .find("\nimpl Executor<Runtime> {")
+            .expect("the callback builder sits just above impl Executor<Runtime>");
+        let body = &body[..end];
+        for required in [
+            "cache_invalidator.invalidate(",
+            ".commit_state_write(",
+            "NodeEvent::BroadcastStateChange",
+            "is_contract_broken(",
+        ] {
+            assert!(
+                body.contains(required),
+                "the V2 delegate write callback must invoke `{required}`. \
+                 Dropping the invalidation serves stale bytes and stale \
+                 summaries; dropping commit_state_write re-opens the \
+                 EvictContract race and undercounts the meter; dropping \
+                 BroadcastStateChange is #5479 (the write returns success \
+                 and the network never learns of it); dropping the \
+                 broken-contract check re-engages a suppressed storm."
+            );
+        }
     }
 }
 

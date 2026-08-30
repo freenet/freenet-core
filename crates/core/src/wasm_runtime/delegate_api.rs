@@ -788,12 +788,16 @@ mod tests {
         let contract_id = env_holder.store_contract(120, &[1, 2, 3]).await;
 
         let observed =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, usize)>::new()));
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
         let observed_for_cb = observed.clone();
-        let cb: super::super::runtime::StateWriteCallback =
-            std::sync::Arc::new(move |k: &ContractKey, state_size: usize| {
-                observed_for_cb.lock().unwrap().push((*k, state_size));
-            });
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            move |k: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState| {
+                observed_for_cb
+                    .lock()
+                    .unwrap()
+                    .push((*k, new_state.as_ref().to_vec()));
+            },
+        );
 
         // SAFETY: `env_holder` is alive for the duration of this test.
         let env = unsafe { env_holder.make_env_with_callback(cb) };
@@ -812,10 +816,12 @@ mod tests {
             "callback must receive the written contract key"
         );
         assert_eq!(
-            calls[0].1, 3,
-            "callback must receive the on-disk state byte count (vec![4, 5, 6] = 3 bytes) — \
-             this pins the StateBytesWritten attribution to the actual write size and would \
-             catch a refactor that hardcodes the size or passes a stale length"
+            calls[0].1,
+            vec![4, 5, 6],
+            "callback must receive the state that was actually written. This pins BOTH the \
+             StateBytesWritten attribution (derived from its length) and the payload of the \
+             BroadcastStateChange the production callback emits (#5479), so a refactor that \
+             reconstructs or re-reads the state instead of passing the written one fails here"
         );
     }
 
@@ -828,12 +834,16 @@ mod tests {
         let contract_id = env_holder.store_contract(121, &[10, 20, 30]).await;
 
         let observed =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, usize)>::new()));
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
         let observed_for_cb = observed.clone();
-        let cb: super::super::runtime::StateWriteCallback =
-            std::sync::Arc::new(move |k: &ContractKey, state_size: usize| {
-                observed_for_cb.lock().unwrap().push((*k, state_size));
-            });
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            move |k: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState| {
+                observed_for_cb
+                    .lock()
+                    .unwrap()
+                    .push((*k, new_state.as_ref().to_vec()));
+            },
+        );
 
         // SAFETY: `env_holder` is alive for the duration of this test.
         let env = unsafe { env_holder.make_env_with_callback(cb) };
@@ -852,8 +862,9 @@ mod tests {
             "callback must receive the updated contract key"
         );
         assert_eq!(
-            calls[0].1, 3,
-            "callback must receive the on-disk state byte count (vec![40, 50, 60] = 3 bytes)"
+            calls[0].1,
+            vec![40, 50, 60],
+            "callback must receive the state that was actually written — see the PUT sibling"
         );
     }
 
@@ -986,10 +997,11 @@ mod tests {
         // Wire the PRODUCTION invalidator as the callback — the exact shape used
         // in `Executor::from_config` / `from_config_with_shared_modules`.
         let invalidator = state_store.cache_invalidator();
-        let cb: super::super::runtime::StateWriteCallback =
-            std::sync::Arc::new(move |k: &ContractKey, _size: usize| {
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            move |k: &ContractKey, _new_state: &freenet_stdlib::prelude::WrappedState| {
                 invalidator.invalidate(k);
-            });
+            },
+        );
 
         {
             // SAFETY: `env_holder` is alive for the duration of this test. The
@@ -1041,10 +1053,11 @@ mod tests {
         assert!(state_store.cached_state_hash(&key).is_some());
 
         let invalidator = state_store.cache_invalidator();
-        let cb: super::super::runtime::StateWriteCallback =
-            std::sync::Arc::new(move |k: &ContractKey, _size: usize| {
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            move |k: &ContractKey, _new_state: &freenet_stdlib::prelude::WrappedState| {
                 invalidator.invalidate(k);
-            });
+            },
+        );
 
         {
             // SAFETY: see the PUT sibling test above (scoped to drop before the
@@ -1080,12 +1093,16 @@ mod tests {
         env_holder.contract_store.ensure_key_indexed(&key).unwrap();
 
         let observed =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, usize)>::new()));
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
         let observed_for_cb = observed.clone();
-        let cb: super::super::runtime::StateWriteCallback =
-            std::sync::Arc::new(move |k: &ContractKey, state_size: usize| {
-                observed_for_cb.lock().unwrap().push((*k, state_size));
-            });
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            move |k: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState| {
+                observed_for_cb
+                    .lock()
+                    .unwrap()
+                    .push((*k, new_state.as_ref().to_vec()));
+            },
+        );
 
         // SAFETY: `env_holder` is alive for the duration of this test.
         let env = unsafe { env_holder.make_env_with_callback(cb) };

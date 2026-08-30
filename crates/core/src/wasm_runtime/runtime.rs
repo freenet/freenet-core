@@ -963,21 +963,31 @@ impl Default for RuntimeConfig {
 ///
 /// V2 delegate writes go through `db.store_state_sync` / `db.update_state_sync`
 /// directly and bypass the executor's `state_store.{store,update}` chokepoints
-/// where the bump+refresh+report sites live. Without this callback those
-/// three side effects never fire on a V2 delegate write, leaving the
-/// EvictContract re-host race open AND undercounting StateBytesWritten in
-/// the topology meter for that path. The wiring lives outside `wasm_runtime/`
-/// (Ring lives in `crates/core/src/ring.rs`) so the callback is plumbed via
-/// a trait object owned by `Runtime` to keep `wasm_runtime` independent of
-/// the ring.
+/// where the bump+refresh+report sites live — and, until #5479, where the
+/// NETWORK PROPAGATION happened. Without this callback those side effects never
+/// fire on a V2 delegate write: the EvictContract re-host race stays open,
+/// StateBytesWritten is undercounted in the topology meter, and the write is
+/// never seen off this node even though the host function returned success. The
+/// wiring lives outside `wasm_runtime/` (Ring lives in `crates/core/src/ring.rs`)
+/// so the callback is plumbed via a trait object owned by `Runtime` to keep
+/// `wasm_runtime` independent of the ring.
 ///
-/// The closure SHOULD delegate to `Ring::commit_state_write(key, state_size)`
-/// — see `RuntimePool::contract_state_write_callback` for the production
-/// wiring. The `state_size` argument is the on-disk byte count of the
-/// newly-written state and is fed into the StateBytesWritten meter axis
-/// for governance scoring.
-pub type StateWriteCallback =
-    Arc<dyn Fn(&freenet_stdlib::prelude::ContractKey, usize) + Send + Sync + 'static>;
+/// The closure receives the newly-written state itself, not merely its length,
+/// because the production installer needs BOTH: the byte count for
+/// `Ring::commit_state_write(key, state_size)` (the StateBytesWritten meter axis
+/// that feeds governance scoring), and the state VALUE for the
+/// `NodeEvent::BroadcastStateChange` that gives V2 the same propagation V1 gets
+/// from `upsert_contract_state` (#5479). `WrappedState` is `Arc<Vec<u8>>`
+/// internally, so passing and cloning it is a refcount bump, not a state copy.
+///
+/// See `contract::executor::runtime::install_v2_delegate_state_write_hooks` for
+/// the single production installer.
+pub type StateWriteCallback = Arc<
+    dyn Fn(&freenet_stdlib::prelude::ContractKey, &freenet_stdlib::prelude::WrappedState)
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// Pre-write admission gate for V2 delegate state writes (#4683, PR 3).
 ///
@@ -1043,10 +1053,11 @@ pub struct Runtime {
     /// Optional state storage backend for V2 delegate contract access.
     pub(crate) state_store_db: Option<crate::contract::storages::Storage>,
 
-    /// Optional callback invoked after a successful V2 delegate state write,
-    /// used to bump the per-contract generation token and refresh the
-    /// hosting-cache snapshot from the V2 path (which bypasses the executor
-    /// chokepoints). See `StateWriteCallback`.
+    /// Optional callback invoked after a successful V2 delegate state write.
+    /// Bumps the per-contract generation token, refreshes the hosting-cache
+    /// snapshot, and propagates the write to the network — all of which the
+    /// V2 path would otherwise skip, because it bypasses the executor
+    /// chokepoints where they normally happen. See `StateWriteCallback`.
     pub(crate) state_write_callback: Option<StateWriteCallback>,
 
     /// Optional pre-write disk-budget admission gate for V2 delegate state
@@ -1074,8 +1085,9 @@ impl Runtime {
 
     /// Install a callback invoked after each successful V2 delegate state
     /// write. See `StateWriteCallback`. Without this, V2 PUT/UPDATE bypass
-    /// the executor's bump+refresh chokepoints and the EvictContract
-    /// re-host race stays open for V2 delegate writes.
+    /// the executor's bump+refresh chokepoints — the EvictContract re-host
+    /// race stays open, and the write never propagates to the network
+    /// (#5479).
     pub fn set_state_write_callback(&mut self, cb: StateWriteCallback) {
         self.state_write_callback = Some(cb);
     }
