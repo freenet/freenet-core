@@ -75,6 +75,34 @@
 //!   delegate-controlled text, so the worst case would be
 //!   `MAX_TRACKED_DELEGATES` × (whatever the guest chose to panic with).
 //!
+//! # How to read the durations (two artefacts, both real)
+//!
+//! **The ~5 s plateau is the backstop firing, not the cost.** Delegate
+//! execution gets the wall-clock backstop contracts already had (#5480). On a
+//! timeout the call returns at `max_execution_seconds` (default 5.0) while the
+//! abandoned guest thread keeps running, because a `spawn_blocking` closure
+//! cannot be cancelled. So timed-out invocations pile up just under ~5 s. In a
+//! p99 view that reads as a suspiciously clean cliff; it is genuine, and it
+//! means the backstop worked. It is NOT evidence that the delegate's real cost
+//! is 5 s — the true cost is unbounded and unmeasurable from here, which is the
+//! reason the backstop exists. Before #5480 the same delegate blocked until the
+//! epoch trap fired, or indefinitely if the epoch ticker thread had died
+//! (#4864).
+//!
+//! **Duration is measured at the EXECUTOR level, deliberately.** It brackets
+//! `Runtime::inbound_app_message`, not the engine's per-guest-call helper. That
+//! is the right boundary for two reasons: a V1 delegate request re-invokes
+//! `process()` up to `MAX_CONTRACT_REQUEST_ITERATIONS` times, so an
+//! engine-level timer would emit N records per logical invocation rather than
+//! one; and the executor-level span INCLUDES host-function round-trips, which is
+//! exactly the cost that matters, since a delegate parked inside a host call is
+//! interruptible by neither the epoch trap nor the wall clock.
+//!
+//! One consequence for `last_error`: with panic capture in place, a panic inside
+//! a delegate host function surfaces as a `WasmError` rather than unwinding into
+//! the calling task. Such an error string appearing here means the node
+//! SURVIVED something that previously would have unwound.
+//!
 //! # This phase is measurement only
 //!
 //! Nothing here throttles, quarantines, evicts or rate-limits. Phase 4
