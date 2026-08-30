@@ -296,6 +296,46 @@ impl Meter {
         results
     }
 
+    /// Windowed per-DELEGATE rates for one axis (#5467 Phase 0).
+    ///
+    /// Sibling of [`Self::contract_cost_rates_multi`], filtering on
+    /// [`AttributionSource::Delegate`] instead of `Contract`. `AttributionSource`
+    /// has had a `Delegate` variant since before this change, sharing the same
+    /// `MAX_ATTRIBUTION_SOURCES` cap, `ATTRIBUTION_SOURCE_TTL` sweep and
+    /// `RunningAverage` machinery — this is the read path that was missing, not
+    /// a parallel mechanism.
+    ///
+    /// **Deliberately applies NO sustained-run gate**, unlike the contract form.
+    /// That gate exists so a burst cannot trigger *eviction* (#4861/#4903); this
+    /// is observability only and nothing acts on it, so gating would hide a
+    /// delegate that ran briefly — precisely the delegate an operator debugging
+    /// a one-off failure is looking for. If Phase 4 containment ever acts on
+    /// these rates it must add the gate back at that decision point, not here.
+    pub(crate) fn delegate_cost_rates(
+        &self,
+        resource: ResourceType,
+        at_time: Instant,
+        min_window: Duration,
+    ) -> std::collections::HashMap<DelegateKey, f64> {
+        let mut out = std::collections::HashMap::new();
+        for entry in self.attribution_meters.iter() {
+            let AttributionSource::Delegate(key) = entry.key() else {
+                continue;
+            };
+            let Some(avg) = entry.value().map.get(&resource) else {
+                continue;
+            };
+            let Some(windowed) = avg.windowed_rate(at_time, min_window) else {
+                continue;
+            };
+            let per_second = windowed.rate.per_second();
+            if per_second > 0.0 {
+                out.insert(key.clone(), per_second);
+            }
+        }
+        out
+    }
+
     /// Estimates the usage rate for a given resource type based on existing data.
     ///
     /// This function calculates the estimated usage rate by taking the 50th percentile value (or another

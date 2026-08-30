@@ -99,6 +99,7 @@ pub(crate) use network_bridge::broadcast_payload_mix::ApplyOrigin;
 pub use network_bridge::in_memory::{FaultInjectorState, get_fault_injector, set_fault_injector};
 pub(crate) mod background_task_monitor;
 pub(crate) mod neighbor_hosting;
+pub(crate) mod delegate_observability;
 pub(crate) mod network_status;
 mod op_state_manager;
 mod p2p_impl;

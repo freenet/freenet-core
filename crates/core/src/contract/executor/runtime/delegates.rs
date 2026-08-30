@@ -483,7 +483,19 @@ impl Executor<Runtime> {
                          from a non-local connection (GHSA-824h-7x5x-wfmf)"
                     );
                 }
-                match self.runtime.inbound_app_message(
+                // #5467 Phase 0: time the invocation and record its outcome.
+                // Before this, delegate execution had NO timing of any kind and
+                // errors were logged per-call but never counted, so a delegate
+                // that panicked on every wake was invisible in aggregate.
+                //
+                // The DURATION uses `std::time::Instant`, matching the contract
+                // side's own WASM timing (`wasmtime_engine.rs`
+                // `execute_wasm_blocking`): this measures real work done by
+                // guest code, which a simulated `TimeSource` would report as
+                // zero. The store's own bookkeeping clock is separate — see
+                // `delegate_observability`.
+                let started = std::time::Instant::now();
+                let outcome = self.runtime.inbound_app_message(
                     &key,
                     &params,
                     origin.as_ref(),
@@ -497,12 +509,36 @@ impl Executor<Runtime> {
                         .into_iter()
                         .map(InboundDelegateMsg::into_owned)
                         .collect(),
-                ) {
-                    Ok(values) => Ok(DelegateResponse { key, values }),
+                );
+                let exec_duration = started.elapsed();
+                let recorded_at = tokio::time::Instant::now();
+                // Attribute the CPU to this delegate on the SAME meter the
+                // contract cost axes use, rather than standing up a parallel
+                // one (#5467: "reuse `CostAxisPressure` / the per-contract
+                // attributed-cost machinery"). Absent when this executor has
+                // no op_manager (the standalone/test construction), which is
+                // the same condition `commit_state_write` already tolerates.
+                if let Some(op_manager) = self.op_manager_handle() {
+                    op_manager.ring.report_delegate_resource_usage(
+                        &key,
+                        crate::topology::meter::ResourceType::ExecCpuMicros,
+                        exec_duration.as_micros() as f64,
+                    );
+                }
+                match outcome {
+                    Ok(values) => {
+                        crate::node::delegate_observability::record_invocation(
+                            &key,
+                            exec_duration,
+                            crate::node::delegate_observability::InvocationOutcome::Success,
+                            recorded_at,
+                        );
+                        Ok(DelegateResponse { key, values })
+                    }
                     Err(err) => {
                         let key_display = key.to_string();
                         let exec_err =
-                            ExecutorError::execution(err, Some(InnerOpError::Delegate(key)));
+                            ExecutorError::execution(err, Some(InnerOpError::Delegate(key.clone())));
                         // Downgrade "not found" to warn — expected during legacy
                         // migration probes when old delegate WASM isn't on this node
                         if exec_err.is_missing_delegate() {
@@ -518,6 +554,18 @@ impl Executor<Runtime> {
                                 "Failed executing delegate"
                             );
                         }
+                        // Record the rendered error as `last_error`. It is
+                        // truncated at insertion (the value is guest-controlled
+                        // text, so an entry-count cap alone would not bound
+                        // memory — bug-prevention-patterns.md).
+                        crate::node::delegate_observability::record_invocation(
+                            &key,
+                            exec_duration,
+                            crate::node::delegate_observability::InvocationOutcome::Failure(
+                                &exec_err.to_string(),
+                            ),
+                            recorded_at,
+                        );
                         Err(exec_err)
                     }
                 }
