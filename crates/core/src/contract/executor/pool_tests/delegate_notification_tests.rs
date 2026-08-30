@@ -396,13 +396,62 @@ fn finalize_state_commit_is_the_only_post_store_fan_out_site() {
     );
     let ops_calls = count_call_sites(ops_production, ".finalize_state_commit(");
     assert_eq!(
-        ops_calls, 2,
-        "expected exactly 2 `self.finalize_state_commit(` call sites in \
-         contract_ops.rs (the re-PUT merge and the fresh store in \
-         `perform_contract_put`); found {ops_calls}. If you added another \
-         state-storing path, that is fine — it MUST call the helper, and this \
-         expectation should be bumped with a comment naming the new path."
+        ops_calls, 3,
+        "expected exactly 3 `self.finalize_state_commit(` call sites in \
+         contract_ops.rs (the re-PUT merge, the fresh store in \
+         `perform_contract_put`, and the related-contract install in \
+         `get_updated_state`); found {ops_calls}."
     );
+
+    // Counting HELPER CALLS alone cannot notice a new storing path that calls
+    // nothing — the count simply stays right while the new path fans out
+    // nothing. So count the WRITES too, and make a new one fail closed until
+    // its author classifies it. (This is the gap the external review pass
+    // found: the related-contract install had been storing state with no
+    // fan-out at all, and every "exactly one call site" assertion above was
+    // still perfectly true.)
+    //
+    // The four writes, and where each one's fan-out happens:
+    //   executor_impl.rs
+    //     - the initial-state install      -> finalize at the end of the branch
+    //     - `commit_state_update`          -> finalize at the end of the method
+    //   contract_ops.rs
+    //     - the re-PUT merge               -> finalize immediately after
+    //     - `verify_and_store_contract`    -> finalize at EACH of its two
+    //       callers (the fresh PUT, and the related-contract install), because
+    //       they fan out under different keys
+    let writes = count_state_writes(production);
+    let ops_writes = count_state_writes(ops_production);
+    assert_eq!(
+        (writes, ops_writes),
+        (2, 2),
+        "expected 2 state writes in executor_impl.rs and 2 in contract_ops.rs; \
+         found ({writes}, {ops_writes}). A NEW state write must be classified: \
+         either route it through `finalize_state_commit`, or say in a comment \
+         here why that state owes no subscriber anything, and bump these counts."
+    );
+}
+
+/// Count `self.state_store.store(..)` / `.update(..)` sites, tolerating the
+/// line splits rustfmt introduces (a `self` on one line, `.state_store` on the
+/// next, `.store(` on the next).
+///
+/// Counting helper CALLS alone cannot notice a new storing path that calls
+/// nothing: the call count stays right while the new path fans out nothing.
+/// That is exactly how the related-contract install sat there storing state
+/// with no fan-out at all while every "exactly one call site" assertion above
+/// was true.
+fn count_state_writes(src: &str) -> usize {
+    // Strip ALL whitespace, so `self.state_store\n    .store(` and
+    // `self.state_store.store(` collapse to the same needle. Joining on a
+    // single space does NOT work: rustfmt breaks the line after
+    // `self.state_store`, not around each `.`, so the flattened form is
+    // `self.state_store .store(` and neither spaced nor unspaced needle
+    // matches. (Asked for it and got (0, 0) — which is why this pin asserts
+    // an exact count rather than "at least one".)
+    let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+    flat.matches("self.state_store.store(").count()
+        + flat.matches("self.state_store.update(").count()
 }
 
 /// The `{ .. }` body of the item starting at `start`, brace-matched.

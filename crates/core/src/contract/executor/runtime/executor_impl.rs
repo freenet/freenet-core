@@ -609,6 +609,15 @@ where
                             // (harmless for peers, which CRDT-merge, but not
                             // for a delegate handed a full state).
                             let mut installed_state = incoming_state.clone();
+                            // Set when a queued-operation replay commits. Each
+                            // replay goes through `commit_state_update`, which
+                            // runs the full fan-out itself, so the finalize at
+                            // the end of this branch would emit `installed_state`
+                            // a SECOND time — re-running every subscribed
+                            // delegate on a state that did not change, and
+                            // duplicating the WS and network notifications
+                            // (found by the external review pass).
+                            let mut replay_committed = false;
                             if let Some(completion_info) = self
                                 .init_tracker
                                 .complete_initialization(&key, completion_now)
@@ -693,6 +702,7 @@ where
                                                     );
                                                 } else {
                                                     installed_state = new_state;
+                                                    replay_committed = true;
                                                 }
                                             } else if !valid {
                                                 tracing::warn!(
@@ -736,8 +746,22 @@ where
                             // dropped leg, after WS clients had already been
                             // the dropped leg once before). Call the helper;
                             // do not re-inline.
-                            self.finalize_state_commit(&key, &params, &installed_state)
-                                .await;
+                            if replay_committed {
+                                // The last successful replay already ran the
+                                // full fan-out with exactly this state via
+                                // `commit_state_update`. Emitting it again
+                                // would run every subscribed delegate twice on
+                                // an unchanged state.
+                                tracing::debug!(
+                                    contract = %key,
+                                    event = "install_fan_out_skipped_after_replay",
+                                    "Queued-operation replay already fanned out the \
+                                     installed state; not emitting it twice"
+                                );
+                            } else {
+                                self.finalize_state_commit(&key, &params, &installed_state)
+                                    .await;
+                            }
 
                             // NOTE: the RETURN value stays `incoming_state`
                             // rather than `installed_state` — that is
