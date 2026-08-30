@@ -199,6 +199,18 @@
 //! that both records should become one with one owner (#4669 part 3), at which
 //! point the divergence stops being representable rather than merely visible.
 //!
+//! **#5494 records why this limit is deliberate rather than an oversight.** The
+//! obvious fix — enumerate from the union of the hook map and the ring's demand
+//! registrations — works, and costs one extra map walk. It is nonetheless the
+//! wrong trade here: the union can only interrogate delegates this module
+//! already knows, so a delegate whose hook was dropped by a PUT rollback and
+//! which has since aged out of [`DELEGATE_STATS_TTL`] leaves no key from which
+//! to derive its synthetic subscriber id. The panel would then make the
+//! STRONGER claim while keeping a blind spot — a reassuring reading from a
+//! source that cannot see everything it implies it sees, which is the failure
+//! this whole phase exists to end. The honest weaker claim is preferred, and
+//! the real fix (#4669 part 3) deletes the union rather than building on it.
+//!
 //! # This phase is measurement only
 //!
 //! Nothing here throttles, quarantines, evicts or rate-limits. Phase 4
@@ -611,6 +623,14 @@ pub struct DelegateSubscriptionEntry {
     /// divergence 1). Both are real, both matter, and this reports the state
     /// rather than its cause. The opposite divergence — demand held with no
     /// notification hook — cannot appear here at all; see the module docs.
+    ///
+    /// **The limit is deliberate, and #5494 records why.** The obvious fix is to
+    /// enumerate from the union of both maps rather than from the hook alone;
+    /// it works and is cheap, and it is still wrong here, because it would let
+    /// the panel claim "no divergence in either direction" while carrying a
+    /// residual it structurally cannot see. Read #5494 before "fixing" this —
+    /// the reasoning is the kind a reasonable person re-derives in the opposite
+    /// direction otherwise.
     pub registered_demand: bool,
 }
 
