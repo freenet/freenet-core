@@ -470,7 +470,15 @@ fi
 # 9. The canary must not let its own TMPDIR reach the node.
 #
 #    This is the #5290 fault, and it blocked v0.2.124 on a binary that was
-#    perfectly healthy. `client_api.rs` unconditionally `create_dir_all`s
+#    perfectly healthy.
+#
+#    #5291 has since deleted the mkdir, so a node built from current main
+#    cannot fail this way. The case stays, and the fake node below deliberately
+#    keeps modelling the OLD behaviour, because the canary gates RELEASED
+#    binaries: every release through v0.2.124 still panics like this, and the
+#    canary has to be able to run them.
+#
+#    `client_api.rs` (through v0.2.124) unconditionally `create_dir_all`s
 #    `std::env::temp_dir()/freenet/webs` when it builds the router and PANICS
 #    (exit 101) if it cannot -- and `cross-compile.yml` stages the binary it is
 #    about to gate at `/tmp/freenet`, which is exactly the path that mkdir
@@ -512,8 +520,10 @@ while [ \$# -gt 0 ]; do
     esac
 done
 mkdir -p "\$logdir"
-# Models client_api.rs: hardwired to temp_dir(), does NOT follow --data-dir,
-# and panics rather than degrading when the directory cannot be created.
+# Models client_api.rs THROUGH v0.2.124 (the mkdir was deleted in #5291):
+# hardwired to temp_dir(), does NOT follow --data-dir, and panics rather than
+# degrading when the directory cannot be created. Kept as-is on purpose -- this
+# canary gates released binaries, which still behave this way.
 webdir="\${TMPDIR:-/tmp}/freenet/webs"
 if ! mkdir -p "\$webdir" 2>/dev/null; then
     echo "thread 'main' panicked at crates/core/src/server/client_api.rs:256:13:" >&2

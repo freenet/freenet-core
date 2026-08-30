@@ -1,13 +1,17 @@
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 
-/// Default cipher key (same as DelegateRequest::DEFAULT_CIPHER)
+/// Historical `DelegateRequest::DEFAULT_CIPHER` value (the constant itself was
+/// removed in freenet-stdlib 0.8). The node discards this field and derives the
+/// delegate DEK from its own KEK (#4146), so the exact bytes are irrelevant --
+/// this is not key material and does not need to be kept or protected.
 const DEFAULT_CIPHER: [u8; 32] = [
     0, 24, 22, 150, 112, 207, 24, 65, 182, 161, 169, 227, 66, 182, 237, 215, 206, 164, 58, 161, 64,
     108, 157, 195, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
-/// Default nonce (same as DelegateRequest::DEFAULT_NONCE)
+/// Historical `DelegateRequest::DEFAULT_NONCE` value; discarded by the node for
+/// the same reason as the cipher above.
 const DEFAULT_NONCE: [u8; 24] = [
     57, 18, 79, 116, 63, 134, 93, 39, 208, 161, 156, 229, 222, 247, 111, 79, 210, 126, 127, 55,
     224, 150, 139, 80,

@@ -3131,7 +3131,20 @@ impl HostingManager {
                 instance_id_bytes.copy_from_slice(&key_bytes);
                 loaded_instance_ids.insert(instance_id_bytes);
                 let instance_id = ContractInstanceId::new(instance_id_bytes);
-                let code_hash = CodeHash::new(metadata.code_hash);
+                // #4978: prefer the contract store's instance->code row over the
+                // hash persisted in this row. The persisted hash is whatever key
+                // reached `StateStorage::store`, and a pre-fix binary could put a
+                // WRONG one there: local-mode UPDATE wrote the client's key
+                // verbatim, so `fdev update`'s all-zero placeholder landed here.
+                // Restoring that gives a hosting-cache key whose code half is
+                // zeros, and `ContractStore::remove_contract` derives the blob
+                // path from `key.code_hash()` — so eviction never reclaims the
+                // real `.wasm` and the row stays wrong across every subsequent
+                // restart. Resolving here repairs that corpus in place; the
+                // persisted hash remains the fallback for an instance the
+                // contract store has no row for.
+                let code_hash = code_hash_lookup(&instance_id)
+                    .unwrap_or_else(|| CodeHash::new(metadata.code_hash));
                 let key = ContractKey::from_id_and_code(instance_id, code_hash);
 
                 let access_type = match metadata.access_type {
@@ -3293,7 +3306,20 @@ impl HostingManager {
                 instance_id_bytes.copy_from_slice(&key_bytes);
                 loaded_instance_ids.insert(instance_id_bytes);
                 let instance_id = ContractInstanceId::new(instance_id_bytes);
-                let code_hash = CodeHash::new(metadata.code_hash);
+                // #4978: prefer the contract store's instance->code row over the
+                // hash persisted in this row. The persisted hash is whatever key
+                // reached `StateStorage::store`, and a pre-fix binary could put a
+                // WRONG one there: local-mode UPDATE wrote the client's key
+                // verbatim, so `fdev update`'s all-zero placeholder landed here.
+                // Restoring that gives a hosting-cache key whose code half is
+                // zeros, and `ContractStore::remove_contract` derives the blob
+                // path from `key.code_hash()` — so eviction never reclaims the
+                // real `.wasm` and the row stays wrong across every subsequent
+                // restart. Resolving here repairs that corpus in place; the
+                // persisted hash remains the fallback for an instance the
+                // contract store has no row for.
+                let code_hash = code_hash_lookup(&instance_id)
+                    .unwrap_or_else(|| CodeHash::new(metadata.code_hash));
                 let key = ContractKey::from_id_and_code(instance_id, code_hash);
 
                 let access_type = match metadata.access_type {
@@ -7968,6 +7994,101 @@ mod tests {
                 .admit_state_update(&make_contract_key(1), 300 * MIB)
                 .is_err(),
             "growth over budget must still reject"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "redb"))]
+mod restore_code_hash_repair_tests {
+    //! freenet/freenet-core#4978, the durable half.
+    //!
+    //! `StateStorage::store` persists whatever `key.code_hash()` it is handed
+    //! into the hosting-metadata row (`storages/redb.rs`, `storages/sqlite.rs`),
+    //! and `load_from_storage` rebuilds the `ContractKey` from it on restart.
+    //! A pre-fix binary could put a WRONG hash there — local-mode UPDATE wrote
+    //! the client's key verbatim, so `fdev update`'s all-zero placeholder
+    //! landed in the row. Restoring that verbatim gives a hosting-cache key
+    //! whose code half is zeros, and `ContractStore::remove_contract` derives
+    //! the blob path from `key.code_hash()`, so eviction never reclaims the
+    //! real `.wasm` and the bad row survives every subsequent restart.
+    //!
+    //! So the load path must prefer the contract store's instance->code row.
+    //! These tests are the guard for that, and they need no WASM engine: the
+    //! resolver is just the closure `load_from_storage` already takes.
+
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey, WrappedState};
+
+    use super::HostingManager;
+    use crate::contract::storages::Storage;
+    use crate::wasm_runtime::StateStorage;
+
+    const REAL_CODE_HASH: [u8; 32] = [0xAB; 32];
+
+    async fn storage_with_row(dir: &tempfile::TempDir, key: ContractKey) -> Storage {
+        let storage = Storage::new(dir.path()).await.expect("create storage");
+        // Goes through the production write, so the test cannot drift from how
+        // the row is actually produced.
+        storage
+            .store(key, WrappedState::new(vec![1u8; 8]))
+            .await
+            .expect("store state + hosting metadata");
+        storage
+    }
+
+    fn instance() -> ContractInstanceId {
+        ContractInstanceId::new([0x11; 32])
+    }
+
+    /// A row written by a pre-fix binary carries an all-zero code hash. The
+    /// contract store knows the real one, so the load must use it.
+    #[tokio::test]
+    async fn load_prefers_the_contract_index_over_a_placeholder_row() {
+        let dir = crate::util::tests::get_temp_dir();
+        let placeholder = ContractKey::from_id_and_code(instance(), CodeHash::new([0u8; 32]));
+        let storage = storage_with_row(&dir, placeholder).await;
+
+        let manager = HostingManager::new(10_000_000);
+        manager
+            .load_from_storage(&storage, |id| {
+                (*id == instance()).then(|| CodeHash::new(REAL_CODE_HASH))
+            })
+            .expect("load must succeed");
+
+        let restored = manager
+            .hosting_contract_keys()
+            .into_iter()
+            .find(|k| *k.id() == instance())
+            .expect("the row must be restored");
+        assert_eq!(
+            restored.code_hash(),
+            &CodeHash::new(REAL_CODE_HASH),
+            "the persisted placeholder must be repaired from the contract index, \
+             or eviction computes the blob path from zeros and leaks the .wasm"
+        );
+    }
+
+    /// The fallback must survive: an instance the contract store has no row for
+    /// keeps the persisted hash rather than being dropped or zeroed.
+    #[tokio::test]
+    async fn load_falls_back_to_the_persisted_hash_when_unresolvable() {
+        let dir = crate::util::tests::get_temp_dir();
+        let persisted = ContractKey::from_id_and_code(instance(), CodeHash::new(REAL_CODE_HASH));
+        let storage = storage_with_row(&dir, persisted).await;
+
+        let manager = HostingManager::new(10_000_000);
+        manager
+            .load_from_storage(&storage, |_| None)
+            .expect("load must succeed");
+
+        let restored = manager
+            .hosting_contract_keys()
+            .into_iter()
+            .find(|k| *k.id() == instance())
+            .expect("the row must still be restored when nothing resolves it");
+        assert_eq!(
+            restored.code_hash(),
+            &CodeHash::new(REAL_CODE_HASH),
+            "an unresolvable instance must keep its persisted hash"
         );
     }
 }

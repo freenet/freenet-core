@@ -629,8 +629,11 @@ impl DelegateCallEnv {
     /// # Arguments
     /// * `wasm_bytes` - Raw WASM code bytes (wrapped into versioned DelegateContainer internally)
     /// * `params` - Parameter bytes for the new delegate
-    /// * `cipher_bytes` - 32-byte XChaCha20Poly1305 cipher key
-    /// * `nonce_bytes` - 24-byte XNonce
+    /// * `cipher_bytes` - 32-byte field kept for wire-format compatibility.
+    ///   Since #4146 the secret store DISCARDS it and derives the new
+    ///   delegate's DEK from the node KEK; it is not key material and any
+    ///   value works. See `SecretsStore::register_delegate`.
+    /// * `nonce_bytes` - 24-byte field, discarded for the same reason.
     ///
     /// # Returns
     /// The new delegate's `DelegateKey` on success, or a `DelegateCreateError`.
