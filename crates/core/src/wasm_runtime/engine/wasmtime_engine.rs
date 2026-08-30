@@ -1110,23 +1110,14 @@ impl WasmEngine for WasmtimeEngine {
         b: i64,
         c: i64,
     ) -> Result<i64, WasmError> {
-        let enabled_metering = self.enabled_metering;
-        let epoch_ticks = self.epoch_deadline_ticks;
-        let store = self
-            .store
-            .as_mut()
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-        let instance = self
-            .instances
-            .get(&handle.id)
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("instance {} not found", handle.id)))?;
-        let func = instance
-            .get_typed_func::<(i64, i64, i64), i64>(&mut *store, name)
-            .map_err(|e| WasmError::Export(e.to_string()))?;
-        arm_epoch_deadline(store, epoch_ticks);
-        // Use call_async because async_support(true) is enabled in the engine Config
-        block_on_async(func.call_async(&mut *store, (a, b, c)))
-            .map_err(|e| classify_runtime_error(enabled_metering, store, e))
+        // V1 delegate `process()`. Routed through the SAME blocking helper as
+        // contract execution (#5480). Before that this ran `block_on_async`
+        // directly on the calling thread, so a delegate got the epoch trap and
+        // nothing else: no wall-clock backstop (so #4864's dead-ticker case left
+        // it with no preemption at all) and no panic capture. `Some(handle.id)`
+        // carries the delegate instance id onto the thread that runs the guest —
+        // see `GuestDelegateInstance`.
+        self.call_typed_blocking(handle, name, (a, b, c), Some(handle.id))
     }
 
     fn call_3i64_async_imports(
@@ -1137,30 +1128,15 @@ impl WasmEngine for WasmtimeEngine {
         b: i64,
         c: i64,
     ) -> Result<i64, WasmError> {
-        // Wasmtime's async host functions work seamlessly with call_async on the same Store.
-        //
-        // The async host functions (delegate_contracts) are registered via func_wrap_async,
-        // so we use call_async here. The closures complete synchronously (ReDb reads) but
-        // are registered as async to establish the pattern for future async operations.
-
-        let store = self
-            .store
-            .as_mut()
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-
-        let instance = self
-            .instances
-            .get(&handle.id)
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("instance {} not found", handle.id)))?;
-
-        let func = instance
-            .get_typed_func::<(i64, i64, i64), i64>(&mut *store, name)
-            .map_err(|e| WasmError::Export(e.to_string()))?;
-
-        arm_epoch_deadline(store, self.epoch_deadline_ticks);
-        // Call the async-aware function using block_on_async
-        let result = block_on_async(func.call_async(&mut *store, (a, b, c)));
-        result.map_err(|e| classify_runtime_error(self.enabled_metering, store, e))
+        // V2 delegate `process()`. Identical mechanism to `call_3i64` — the
+        // engine has `async_support(true)`, so EVERY guest entry already goes
+        // through `call_async`; the V2-only part is that this module's imports
+        // include `freenet_delegate_contracts`, registered with
+        // `func_wrap_async`. Those host functions are plain synchronous bodies
+        // wrapped in `async move` with no `.await` point (see their registration
+        // in `create_backend_engine`), so they run on the blocking-pool thread
+        // exactly as they ran on the caller's.
+        self.call_typed_blocking(handle, name, (a, b, c), Some(handle.id))
     }
 
     fn call_2i64_blocking(
@@ -1170,76 +1146,7 @@ impl WasmEngine for WasmtimeEngine {
         a: i64,
         b: i64,
     ) -> Result<i64, WasmError> {
-        let enabled_metering = self.enabled_metering;
-        let mut store = self
-            .store
-            .take()
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-
-        let instance = match self.instances.get(&handle.id) {
-            Some(i) => i,
-            None => {
-                self.store = Some(store);
-                return Err(WasmError::Other(anyhow::anyhow!(
-                    "instance {} not found",
-                    handle.id
-                )));
-            }
-        };
-
-        let func = match instance.get_typed_func::<(i64, i64), i64>(&mut store, name) {
-            Ok(f) => f,
-            Err(e) => {
-                self.store = Some(store);
-                return Err(WasmError::Export(e.to_string()));
-            }
-        };
-
-        // #4864 round-7: arm the epoch deadline INSIDE the blocking closure, as
-        // the guest's first act — NOT here, before the closure is enqueued.
-        // Arming before enqueue let the queue wait on a saturated blocking pool
-        // consume the epoch budget, so a queued job would insta-trap on start and
-        // a HEALTHY contract would be quarantined (contract-wide Timeout). Arming
-        // at guest-start makes the epoch budget (and the wall-clock backstop in
-        // execute_wasm_blocking) measure from when the guest actually runs. The
-        // wall-clock poll is a backstop; the epoch trap is what actually stops a
-        // runaway synchronous guest. Capture the tick budget by value since the
-        // closure can't borrow `self`.
-        let epoch_ticks = self.epoch_deadline_ticks;
-
-        let result = execute_wasm_blocking(
-            move || {
-                arm_epoch_deadline(&mut store, epoch_ticks);
-                // Use call_async because async_support(true) is enabled in the engine Config
-                let r = block_on_async(func.call_async(&mut store, (a, b)));
-                (r, store)
-            },
-            self.max_execution_seconds,
-        );
-
-        match result {
-            BlockingResult::Ok(value, store) => {
-                self.store = Some(store);
-                Ok(value)
-            }
-            BlockingResult::WasmError(err, mut store) => {
-                let wasm_err = classify_runtime_error(enabled_metering, &mut store, err);
-                self.store = Some(store);
-                Err(wasm_err)
-            }
-            BlockingResult::Timeout => {
-                self.recover_store();
-                Err(WasmError::Timeout)
-            }
-            BlockingResult::QueuedTimeout => {
-                self.recover_store();
-                Err(WasmError::SchedulerOverloaded)
-            }
-            BlockingResult::Panic(err) => {
-                self.recover_store();
-                Err(WasmError::Other(err))
-            }
-        }
+        self.call_typed_blocking(handle, name, (a, b), None)
     }
 
     fn call_3i64_blocking(
@@ -1250,73 +1157,7 @@ impl WasmEngine for WasmtimeEngine {
         b: i64,
         c: i64,
     ) -> Result<i64, WasmError> {
-        let enabled_metering = self.enabled_metering;
-        let mut store = self
-            .store
-            .take()
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-
-        let instance = match self.instances.get(&handle.id) {
-            Some(i) => i,
-            None => {
-                self.store = Some(store);
-                return Err(WasmError::Other(anyhow::anyhow!(
-                    "instance {} not found",
-                    handle.id
-                )));
-            }
-        };
-
-        let func = match instance.get_typed_func::<(i64, i64, i64), i64>(&mut store, name) {
-            Ok(f) => f,
-            Err(e) => {
-                self.store = Some(store);
-                return Err(WasmError::Export(e.to_string()));
-            }
-        };
-
-        // #4864 round-7: arm the epoch deadline INSIDE the blocking closure, as
-        // the guest's first act — NOT here, before the closure is enqueued (see
-        // call_2i64_blocking for the full rationale). This is the primary contract
-        // merge/validate path, so a pre-enqueue arm consumed by queue wait would
-        // quarantine a healthy contract under blocking-pool saturation. The wall-
-        // clock poll only aborts the tokio task; the epoch trap is what actually
-        // stops a runaway synchronous guest that ignores the timeout.
-        let epoch_ticks = self.epoch_deadline_ticks;
-
-        let result = execute_wasm_blocking(
-            move || {
-                arm_epoch_deadline(&mut store, epoch_ticks);
-                // Use call_async because async_support(true) is enabled in the engine Config
-                let r = block_on_async(func.call_async(&mut store, (a, b, c)));
-                (r, store)
-            },
-            self.max_execution_seconds,
-        );
-
-        match result {
-            BlockingResult::Ok(value, store) => {
-                self.store = Some(store);
-                Ok(value)
-            }
-            BlockingResult::WasmError(err, mut store) => {
-                let wasm_err = classify_runtime_error(enabled_metering, &mut store, err);
-                self.store = Some(store);
-                Err(wasm_err)
-            }
-            BlockingResult::Timeout => {
-                self.recover_store();
-                Err(WasmError::Timeout)
-            }
-            BlockingResult::QueuedTimeout => {
-                self.recover_store();
-                Err(WasmError::SchedulerOverloaded)
-            }
-            BlockingResult::Panic(err) => {
-                self.recover_store();
-                Err(WasmError::Other(err))
-            }
-        }
+        self.call_typed_blocking(handle, name, (a, b, c), None)
     }
 }
 
@@ -1368,6 +1209,119 @@ fn refresh_mem_addr_from_caller(caller: &mut Caller<'_, HostState>, instance_id:
 }
 
 impl WasmtimeEngine {
+    /// Shared body for EVERY guest entry point that runs contract or delegate
+    /// code: resolve the typed export, then run the call under
+    /// [`execute_wasm_blocking`] so it gets all three safeguards at once —
+    /// `spawn_blocking` (a stuck guest occupies a pool thread, not the caller's),
+    /// the wall-clock backstop that aborts the task when the epoch trap cannot,
+    /// and panic capture that turns a host-side panic into a `Result` instead of
+    /// unwinding into the calling task.
+    ///
+    /// The wall-clock backstop is not redundant with the epoch trap. The epoch
+    /// interrupt only fires at a guest instruction boundary, so it cannot cut off
+    /// a blocking HOST function in flight (a ReDb read/write, a secret-store
+    /// fsync) — see [`epoch_deadline_trap`] — and if the epoch ticker thread dies
+    /// (#4864) it does not fire at all.
+    ///
+    /// **Every entry point routes through here rather than hand-rolling a copy.**
+    /// Delegate execution reaching `block_on_async` directly on the calling
+    /// thread, with none of the three safeguards, is precisely the drift a fifth
+    /// near-copy would reproduce (#5480), so
+    /// `blocking_paths_arm_epoch_inside_the_closure` pins that every entry point
+    /// delegates here and that the epoch arm lives inside this closure.
+    ///
+    /// `delegate_instance` is `Some(handle.id)` for a delegate `process()` call
+    /// and `None` for a contract. Delegate host functions locate their
+    /// `native_api::DelegateCallEnv` through the `CURRENT_DELEGATE_INSTANCE`
+    /// THREAD-LOCAL, so a guest running on a blocking-pool thread needs that id
+    /// installed on the thread that actually executes it — see
+    /// [`GuestDelegateInstance`].
+    fn call_typed_blocking<P>(
+        &mut self,
+        handle: &InstanceHandle,
+        name: &str,
+        args: P,
+        delegate_instance: Option<i64>,
+    ) -> Result<i64, WasmError>
+    where
+        P: wasmtime::WasmParams + Send + 'static,
+    {
+        let enabled_metering = self.enabled_metering;
+        let mut store = self
+            .store
+            .take()
+            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
+
+        let instance = match self.instances.get(&handle.id) {
+            Some(i) => i,
+            None => {
+                self.store = Some(store);
+                return Err(WasmError::Other(anyhow::anyhow!(
+                    "instance {} not found",
+                    handle.id
+                )));
+            }
+        };
+
+        let func = match instance.get_typed_func::<P, i64>(&mut store, name) {
+            Ok(f) => f,
+            Err(e) => {
+                self.store = Some(store);
+                return Err(WasmError::Export(e.to_string()));
+            }
+        };
+
+        // #4864 round-7: arm the epoch deadline INSIDE the blocking closure, as
+        // the guest's first act — NOT here, before the closure is enqueued.
+        // Arming before enqueue let the queue wait on a saturated blocking pool
+        // consume the epoch budget, so a queued job would insta-trap on start and
+        // a HEALTHY contract would be quarantined (contract-wide Timeout). Arming
+        // at guest-start makes the epoch budget (and the wall-clock backstop in
+        // execute_wasm_blocking) measure from when the guest actually runs. The
+        // wall-clock poll is a backstop; the epoch trap is what actually stops a
+        // runaway synchronous guest. Capture the tick budget by value since the
+        // closure can't borrow `self`.
+        let epoch_ticks = self.epoch_deadline_ticks;
+
+        let result = execute_wasm_blocking(
+            move || {
+                // Installed BEFORE the guest runs and cleared by its `Drop` on
+                // every exit path (including a panic), so a reused blocking-pool
+                // thread never carries a stale delegate id into the next job.
+                let _delegate = delegate_instance.map(GuestDelegateInstance::install);
+                arm_epoch_deadline(&mut store, epoch_ticks);
+                // Use call_async because async_support(true) is enabled in the engine Config
+                let r = block_on_async(func.call_async(&mut store, args));
+                (r, store)
+            },
+            self.max_execution_seconds,
+        );
+
+        match result {
+            BlockingResult::Ok(value, store) => {
+                self.store = Some(store);
+                Ok(value)
+            }
+            BlockingResult::WasmError(err, mut store) => {
+                let wasm_err = classify_runtime_error(enabled_metering, &mut store, err);
+                self.store = Some(store);
+                Err(wasm_err)
+            }
+            BlockingResult::Timeout => {
+                self.recover_store();
+                Err(WasmError::Timeout)
+            }
+            BlockingResult::QueuedTimeout => {
+                self.recover_store();
+                Err(WasmError::SchedulerOverloaded)
+            }
+            BlockingResult::Panic(err) => {
+                self.recover_store();
+                Err(WasmError::Other(err))
+            }
+        }
+    }
+
     /// Check if a compiled module imports the streaming buffer host function.
     /// Contracts compiled against freenet-stdlib >= 0.3.4 import `freenet_contract_io`;
     /// older contracts do not and must use the legacy one-shot buffer protocol.
@@ -2245,6 +2199,37 @@ fn classify_runtime_error(
     }
     tracing::error!("WASM runtime error: {:?}", error);
     WasmError::Runtime(error.to_string())
+}
+
+/// Installs the executing delegate's instance id in the CURRENT thread's
+/// `CURRENT_DELEGATE_INSTANCE` thread-local for the duration of one guest call,
+/// clearing it on every exit path including a panic.
+///
+/// Every delegate host function — the `freenet_delegate_ctx`,
+/// `freenet_delegate_secrets`, `freenet_delegate_contracts` and
+/// `freenet_delegate_management` namespaces — reads that thread-local to find
+/// its entry in `native_api::DELEGATE_ENV`. Delegate guests now run on a
+/// blocking-pool thread (#5480) rather than the caller's, so the id must be
+/// installed on the thread that actually executes the guest; without it every
+/// delegate host function reads the default `-1` and fails.
+///
+/// The `Drop` is load-bearing, not tidiness: blocking-pool threads are reused,
+/// and the wall-clock backstop can return while the guest is still running, so
+/// an uncleared id would outlive its `DELEGATE_ENV` entry on a thread that later
+/// serves an unrelated job.
+struct GuestDelegateInstance;
+
+impl GuestDelegateInstance {
+    fn install(instance_id: i64) -> Self {
+        native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.set(instance_id));
+        Self
+    }
+}
+
+impl Drop for GuestDelegateInstance {
+    fn drop(&mut self) {
+        native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+    }
 }
 
 // =============================================================================
