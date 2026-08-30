@@ -2205,6 +2205,7 @@ pub fn build_delegates_card(snap: &Option<network_status::NetworkStatusSnapshot>
                     <div class="g-norm"><div class="g-norm-label">Delegates</div><div class="g-norm-value">{count}</div></div>
                     <div class="g-norm" title="Subscriptions that actually registered demand, over subscriptions held across all delegates."><div class="g-norm-label">Pinned / subs</div><div class="g-norm-value">{pinned} / {subs}</div></div>
                     <div class="g-norm"><div class="g-norm-label">With unpinned subs</div><div class="g-norm-value">{unpinned_delegates}</div></div>
+                    <div class="g-norm" title="Cumulative count of subscribes that returned success but registered no demand. Unlike the live Pinned/subs figure, this survives the subscription being torn down, so a pin that never took still leaves evidence after the fact."><div class="g-norm-label">Pins that never took</div><div class="g-norm-value">{never_took}</div></div>
                     <div class="g-norm" title="Scheduled execution (#3972 / Phase 2) is not merged, so this node cannot have pending wakeups. Shown as 'not built' rather than 0, which would read as 'none pending'."><div class="g-norm-label">Pending wakeups</div><div class="g-norm-value">{wakeups}</div></div>
                 </div>
             </div>
@@ -2223,6 +2224,7 @@ pub fn build_delegates_card(snap: &Option<network_status::NetworkStatusSnapshot>
         pinned = d.subscriptions_total - d.subscriptions_without_demand,
         subs = d.subscriptions_total,
         unpinned_delegates = d.delegates_with_unpinned_subscriptions,
+        never_took = d.subscribes_without_demand_total,
         wakeups = wakeups_value,
         mc_entries = d.module_cache_entries,
         mc_used = format_bytes(d.module_cache_total_bytes),

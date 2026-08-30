@@ -515,9 +515,10 @@ impl Executor<Runtime> {
                 // The attributed CPU is accumulated inside
                 // `delegate_observability` rather than written to the shared
                 // `topology::meter`. That is deliberate and load-bearing — see
-                // `delegate_observability::EXEC_CPU_IS_NOT_REPORTED_TO_THE_SHARED_METER`
-                // for why writing it there synthesizes phantom BANDWIDTH usage
-                // and can trigger spurious connection removals.
+                // the "Why attributed delegate CPU is NOT written to
+                // topology::meter" section of `delegate_observability`'s module
+                // docs (and #5483) for why writing it there synthesizes phantom
+                // BANDWIDTH usage and can trigger spurious connection removals.
                 match outcome {
                     Ok(values) => {
                         crate::node::delegate_observability::record_invocation(

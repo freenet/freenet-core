@@ -201,9 +201,8 @@ mod tests {
     use super::assets::JS;
     use super::cards::{
         build_ban_list_card, build_contracts_card, build_delegates_card, build_governance_card,
-        build_ops_card,
-        build_peers_card, build_ring_svg, build_status_card, build_transfer_card, format_bytes,
-        format_last_evaluated,
+        build_ops_card, build_peers_card, build_ring_svg, build_status_card, build_transfer_card,
+        format_bytes, format_last_evaluated,
     };
     use super::contract_detail::contract_detail_html_from;
     use super::estimator::{
@@ -5005,6 +5004,7 @@ mod tests {
             iteration_cap_hits: 0,
             total_inter_delegate_messages: 0,
             max_inter_delegate_messages: 0,
+            subscribes_without_demand: 0,
         }
     }
 
@@ -5109,10 +5109,7 @@ mod tests {
             html.contains("1 / 2"),
             "the pinned/subs tile must show 1 of 2; html was: {html}"
         );
-        assert!(
-            html.contains("delegate-a"),
-            "the delegate must have a row"
-        );
+        assert!(html.contains("delegate-a"), "the delegate must have a row");
     }
 
     /// A delegate that spins until the iteration cap gives up returns Ok, so it
@@ -5145,6 +5142,35 @@ mod tests {
         );
     }
 
+    /// A pin that never took must stay visible after the subscription is gone.
+    /// The live Pinned/subs figure cannot show that — once the subscription is
+    /// torn down there is no row left to be false — so the cumulative count is
+    /// the only evidence the failure ever happened.
+    #[test]
+    fn delegates_card_shows_pins_that_never_took_after_the_subscription_is_gone() {
+        let mut entry = delegate_entry("ghost");
+        // No live subscriptions at all: the pin failed and was torn down.
+        entry.subscribes_without_demand = 3;
+        entry.last_active_secs_ago = Some(90);
+
+        let mut snap = base_snapshot();
+        snap.delegates = Some(DelegateStatusSnapshot {
+            delegates: vec![entry],
+            subscribes_without_demand_total: 3,
+            ..Default::default()
+        });
+        let html = build_delegates_card(&Some(snap));
+        assert!(
+            html.contains("Pins that never took"),
+            "the cumulative tile must be present; html was: {html}"
+        );
+        assert!(
+            html.contains(">3<"),
+            "the cumulative count must render even though no subscription rows \
+             remain; html was: {html}"
+        );
+    }
+
     /// Unknown is rendered as a dash, never as 0. A delegate we have never seen
     /// execute has no average call time; printing "0 µs" would invent one.
     #[test]
@@ -5174,5 +5200,4 @@ mod tests {
              would fabricate a measurement"
         );
     }
-
 }

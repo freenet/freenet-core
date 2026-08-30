@@ -204,11 +204,6 @@ pub fn set_delegate_status_provider(provider: DelegateStatusProvider) {
     *DELEGATE_STATUS_PROVIDER.write() = Some(provider);
 }
 
-#[cfg(test)]
-pub(crate) fn clear_delegate_status_provider() {
-    *DELEGATE_STATUS_PROVIDER.write() = None;
-}
-
 /// Replaceable storage for the subscription provider. Wrapped in a
 /// `RwLock<Option<…>>` rather than `OnceLock` so multi-node in-process
 /// harnesses can re-wire the dashboard to the live node — and so a

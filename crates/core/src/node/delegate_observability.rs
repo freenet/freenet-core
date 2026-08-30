@@ -128,6 +128,46 @@
 //! the calling task. Such an error string appearing here means the node
 //! SURVIVED something that previously would have unwound.
 //!
+//! # Why attributed delegate CPU is NOT written to `topology::meter`
+//!
+//! The obvious implementation reports it as
+//! `AttributionSource::Delegate(key)` on the `ExecCpuMicros` axis, reusing the
+//! meter's cap, TTL sweep and `RunningAverage` — and that variant has existed
+//! for a long time. It is wrong, for a reason that is invisible at the call
+//! site and has nothing to do with the CPU axis:
+//!
+//! `TopologyManager::report_resource_usage` inserts the source into
+//! `source_creation_times` **regardless of which resource is being reported**.
+//! `extrapolated_usage` then iterates that map for every axis, keeping any
+//! source whose `AttributionSource::contributes_to` is true for that axis — and
+//! `(Delegate(_), InboundBandwidthBytes)` and `(Delegate(_),
+//! OutboundBandwidthBytes)` are both `true`. So a source created solely by a
+//! CPU report is treated as a bandwidth contributor, and for the first
+//! `SOURCE_RAMP_UP_DURATION` (5 minutes) of its life it takes the ramping-up
+//! branch, which synthesizes a rate from the network-wide P50 estimator rather
+//! than reading its (empty) samples. The result is phantom bandwidth usage for
+//! a source that has produced zero bandwidth samples, inflating `total_usage`
+//! and driving **spurious connection removals** — precisely the failure
+//! `contributes_to`'s own doc comment describes, and why
+//! `(Contract(_), InboundBandwidthBytes)` is `false`.
+//!
+//! Before this module nothing anywhere constructed an
+//! `AttributionSource::Delegate`, so those `true` rows were dormant. Reporting
+//! delegate CPU to the shared meter is what would wake them.
+//!
+//! The fix is NOT to flip those rows here. That is a change to topology's load
+//! signal, it needs topology-focused review, and it belongs in its own PR —
+//! Phase 0 is measurement and must not alter connection management. So the
+//! attributed CPU lives in this module's own entry instead, using the same
+//! `RunningAverage` type; only the map differs.
+//!
+//! Tracked as #5483, which proposes setting those two rows to `false` (a no-op
+//! today, since nothing reports delegate bandwidth) so the trap is disarmed
+//! rather than merely avoided here.
+//!
+//! Pinned by `exec_cpu_is_not_reported_to_the_shared_topology_meter`, which
+//! scans this file and `delegates.rs` for the forbidden construction.
+//!
 //! # This phase is measurement only
 //!
 //! Nothing here throttles, quarantines, evicts or rate-limits. Phase 4
@@ -170,46 +210,6 @@ pub(crate) const DELEGATE_STATS_TTL: Duration = Duration::from_secs(6 * 60 * 60)
 /// bounds what is STORED and not merely what is shown.
 pub(crate) const MAX_LAST_ERROR_BYTES: usize = 512;
 
-/// Why attributed delegate CPU is NOT written to `topology::meter`.
-///
-/// The obvious implementation reports it as
-/// `AttributionSource::Delegate(key)` on the `ExecCpuMicros` axis, reusing the
-/// meter's cap, TTL sweep and `RunningAverage` — and that variant has existed
-/// for a long time. It is wrong, for a reason that is invisible at the call
-/// site and has nothing to do with the CPU axis:
-///
-/// `TopologyManager::report_resource_usage` inserts the source into
-/// `source_creation_times` **regardless of which resource is being reported**.
-/// `extrapolated_usage` then iterates that map for every axis, keeping any
-/// source whose `AttributionSource::contributes_to` is true for that axis — and
-/// `(Delegate(_), InboundBandwidthBytes)` and `(Delegate(_),
-/// OutboundBandwidthBytes)` are both `true`. So a source created solely by a
-/// CPU report is treated as a bandwidth contributor, and for the first
-/// `SOURCE_RAMP_UP_DURATION` (5 minutes) of its life it takes the ramping-up
-/// branch, which synthesizes a rate from the network-wide P50 estimator rather
-/// than reading its (empty) samples. The result is phantom bandwidth usage for
-/// a source that has produced zero bandwidth samples, inflating `total_usage`
-/// and driving **spurious connection removals** — precisely the failure
-/// `contributes_to`'s own doc comment describes, and why
-/// `(Contract(_), InboundBandwidthBytes)` is `false`.
-///
-/// Before this module nothing anywhere constructed an
-/// `AttributionSource::Delegate`, so those `true` rows were dormant. Reporting
-/// delegate CPU to the shared meter is what would wake them.
-///
-/// The fix is NOT to flip those rows here. That is a change to topology's load
-/// signal, it needs topology-focused review, and it belongs in its own PR —
-/// Phase 0 is measurement and must not alter connection management. So the
-/// attributed CPU lives in this module's own entry instead, using the same
-/// `RunningAverage` type; only the map differs.
-///
-/// Tracked as #5483, which proposes setting those two rows to `false` (a no-op
-/// today, since nothing reports delegate bandwidth) so the trap is disarmed
-/// rather than merely avoided here.
-///
-/// Pinned by `exec_cpu_is_not_reported_to_the_shared_topology_meter`.
-pub(crate) const EXEC_CPU_IS_NOT_REPORTED_TO_THE_SHARED_METER: () = ();
-
 /// Number of samples retained for the invocation-rate window.
 ///
 /// Matches the production `Meter` window (`topology.rs`, `new_with_window_size(100)`).
@@ -249,6 +249,14 @@ struct DelegateExecEntry {
     total_inter_delegate_messages: u64,
     max_inter_delegate_messages: u32,
 
+    /// Subscribes that SUCCEEDED but registered no demand.
+    ///
+    /// Distinct from `subscriptions_without_demand` in the snapshot, which is a
+    /// live count of the current state. This is a cumulative count of the
+    /// EVENT, so a subscribe that failed to pin and was then torn down still
+    /// leaves a trace. Written by [`record_subscribe_without_demand`].
+    subscribes_without_demand: u64,
+
     /// Most recent activity of EITHER kind. Drives both the TTL sweep and the
     /// LRU victim choice.
     last_active_at: Instant,
@@ -276,6 +284,7 @@ impl DelegateExecEntry {
             iteration_cap_hits: 0,
             total_inter_delegate_messages: 0,
             max_inter_delegate_messages: 0,
+            subscribes_without_demand: 0,
             last_active_at: now,
         }
     }
@@ -403,6 +412,26 @@ pub(crate) fn record_invocation(
             entry.last_error = Some(truncate_error(msg));
             entry.last_error_at = Some(now);
         }
+    });
+}
+
+/// Record a delegate subscribe that SUCCEEDED but registered no demand.
+///
+/// This is the #5467 failure in its purest form: the call returns success, the
+/// delegate believes it is subscribed, and the contract is not pinned — so
+/// nothing keeps it hosted or renewed. Today the only trace is a `warn!` in
+/// `contract::delegate_demand::register_subscription`, which is invisible to
+/// anyone not reading logs at the moment it happens.
+///
+/// A free function rather than a [`RequestMeter`] method on purpose: the V2
+/// host-function path does not run inside
+/// `handle_delegate_with_contract_requests`, so a meter-scoped counter would
+/// silently miss it. Attribution is per DELEGATE, which is the right unit —
+/// the finding is about that delegate's subscription, not about the request
+/// that happened to carry it.
+pub(crate) fn record_subscribe_without_demand(key: &DelegateKey, now: Instant) {
+    with_entry(key, now, |entry, _now| {
+        entry.subscribes_without_demand = entry.subscribes_without_demand.saturating_add(1);
     });
 }
 
@@ -571,6 +600,12 @@ pub struct DelegateStatusEntry {
     pub iteration_cap_hits: u64,
     pub total_inter_delegate_messages: u64,
     pub max_inter_delegate_messages: u32,
+    /// Cumulative count of subscribes that succeeded but registered no demand.
+    ///
+    /// Unlike `subscriptions.registered_demand`, which reflects the CURRENT
+    /// state, this survives the subscription being torn down — so a pin that
+    /// never took still leaves evidence after the fact.
+    pub subscribes_without_demand: u64,
 }
 
 /// Node-wide per-delegate observability snapshot.
@@ -586,6 +621,10 @@ pub struct DelegateStatusSnapshot {
     pub subscriptions_without_demand: usize,
     /// Requests that exhausted the iteration cap, summed over all delegates.
     pub iteration_cap_hits_total: u64,
+    /// Subscribes that succeeded without registering demand, summed over all
+    /// delegates. Cumulative, so it is non-zero even after the subscriptions
+    /// involved have gone.
+    pub subscribes_without_demand_total: u64,
 
     /// Delegate module-cache gauges, read live from `Ring::module_cache_metrics`.
     /// These already existed but reached fleet telemetry only (`ring.rs`), never
@@ -626,6 +665,7 @@ struct ExecFields {
     iteration_cap_hits: u64,
     total_inter_delegate_messages: u64,
     max_inter_delegate_messages: u32,
+    subscribes_without_demand: u64,
 }
 
 fn exec_fields(stats: Option<&DelegateExecEntry>, now: Instant) -> ExecFields {
@@ -663,6 +703,7 @@ fn exec_fields(stats: Option<&DelegateExecEntry>, now: Instant) -> ExecFields {
         iteration_cap_hits: entry.iteration_cap_hits,
         total_inter_delegate_messages: entry.total_inter_delegate_messages,
         max_inter_delegate_messages: entry.max_inter_delegate_messages,
+        subscribes_without_demand: entry.subscribes_without_demand,
     }
 }
 
@@ -740,6 +781,7 @@ pub(crate) fn build_snapshot(ring: &crate::ring::Ring, now: Instant) -> Delegate
     let mut subscriptions_total = 0usize;
     let mut subscriptions_without_demand = 0usize;
     let mut iteration_cap_hits_total = 0u64;
+    let mut subscribes_without_demand_total = 0u64;
 
     for (key, instance_ids) in by_delegate {
         let (subscriptions, registering) = subscription_rows(instance_ids, &in_use);
@@ -753,6 +795,8 @@ pub(crate) fn build_snapshot(ring: &crate::ring::Ring, now: Instant) -> Delegate
         let f = exec_fields(stats.as_deref(), now);
         drop(stats);
         iteration_cap_hits_total = iteration_cap_hits_total.saturating_add(f.iteration_cap_hits);
+        subscribes_without_demand_total =
+            subscribes_without_demand_total.saturating_add(f.subscribes_without_demand);
 
         delegates.push(DelegateStatusEntry {
             key: key.to_string(),
@@ -774,6 +818,7 @@ pub(crate) fn build_snapshot(ring: &crate::ring::Ring, now: Instant) -> Delegate
             iteration_cap_hits: f.iteration_cap_hits,
             total_inter_delegate_messages: f.total_inter_delegate_messages,
             max_inter_delegate_messages: f.max_inter_delegate_messages,
+            subscribes_without_demand: f.subscribes_without_demand,
         });
     }
 
@@ -797,6 +842,7 @@ pub(crate) fn build_snapshot(ring: &crate::ring::Ring, now: Instant) -> Delegate
         subscriptions_total,
         subscriptions_without_demand,
         iteration_cap_hits_total,
+        subscribes_without_demand_total,
         module_cache_entries: mc.delegate_entries,
         module_cache_total_bytes: mc.delegate_total_bytes,
         module_cache_budget_bytes: mc.delegate_budget_bytes,
@@ -1193,8 +1239,7 @@ mod tests {
     fn registered_demand_tracks_the_in_use_set_rather_than_a_fixed_value() {
         let pinned = instance(1);
         let unpinned = instance(2);
-        let in_use: std::collections::HashSet<ContractInstanceId> =
-            [pinned].into_iter().collect();
+        let in_use: std::collections::HashSet<ContractInstanceId> = [pinned].into_iter().collect();
 
         let (rows, registering) = subscription_rows(vec![pinned, unpinned], &in_use);
 
@@ -1269,20 +1314,29 @@ mod tests {
     /// [`EXEC_CPU_IS_NOT_REPORTED_TO_THE_SHARED_METER`].
     #[test]
     fn exec_cpu_is_not_reported_to_the_shared_topology_meter() {
-        // Ties the documented rationale to the check that enforces it: deleting
-        // the constant breaks this test, so the explanation cannot silently
-        // outlive the guard (or vice versa).
-        let () = EXEC_CPU_IS_NOT_REPORTED_TO_THE_SHARED_METER;
+        // Scan CODE only. This module's own docs necessarily NAME the thing they
+        // forbid, so a raw substring search over the file reports itself — which
+        // is exactly what it did on the first run of this test.
+        fn code_only(src: &str) -> String {
+            src.split("#[cfg(test)]")
+                .next()
+                .unwrap_or(src)
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
         for (name, src) in [
             (
                 "delegates.rs",
                 include_str!("../contract/executor/runtime/delegates.rs"),
             ),
-            ("delegate_observability.rs", include_str!("delegate_observability.rs")),
+            (
+                "delegate_observability.rs",
+                include_str!("delegate_observability.rs"),
+            ),
         ] {
-            // Strip this module's own test section, which necessarily NAMES the
-            // thing it forbids.
-            let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+            let production = code_only(src);
             assert!(
                 !production.contains("report_delegate_resource_usage"),
                 "{name} must not report delegate cost to the shared topology \
@@ -1297,6 +1351,29 @@ mod tests {
                  EXEC_CPU_IS_NOT_REPORTED_TO_THE_SHARED_METER"
             );
         }
+    }
+
+    /// A subscribe that succeeded without registering demand must leave a
+    /// CUMULATIVE trace, so the evidence survives the subscription being torn
+    /// down. The live `registered_demand` flag cannot do that job: once the
+    /// subscription is gone there is no row left to be false.
+    #[test]
+    fn subscribe_without_demand_is_counted_cumulatively() {
+        let _guard = exclusive();
+        let k = key(11);
+        let t0 = Instant::now();
+        record_subscribe_without_demand(&k, t0);
+        record_subscribe_without_demand(&k, t0 + Duration::from_millis(1));
+
+        let entry = DELEGATE_EXEC_STATS.get(&k).expect("entry recorded");
+        assert_eq!(entry.subscribes_without_demand, 2);
+        assert_eq!(
+            entry.engine_invocations, 0,
+            "a failed pin is not an execution"
+        );
+        assert_eq!(entry.errors, 0, "a pin that did not take is not an error");
+        drop(entry);
+        clear_for_test();
     }
 
     /// Phase 2 is not built on this branch. The flag must say so rather than
