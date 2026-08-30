@@ -158,6 +158,52 @@ arms, the INFO-level checks on `MARKER_CHECK_COMPLETE` and
 canary still runs, and still runs before `--draft=false` — is pinned by
 `scripts/release_canary_wiring_test.sh`.
 
+## A completion predicate that is a proxy for the real termination condition
+
+**A cheap proxy that *usually* agrees with the real condition reads as
+equivalent, gets copied to each new consumer, and diverges in the one
+case nobody tests.** freenet-core has three implementations of "is this
+stream finished" over the same fragment buffer, and two of them shipped
+the same off-by-one.
+
+The proxy here is a FRAGMENT COUNT; the real condition is
+`bytes_delivered >= advertised_bytes`. Two properties make this genre
+expensive out of proportion to the bug:
+
+- **The failure is silent at the site that causes it.** The truncating
+  peer reports success. The victim is the *downstream* peer, which dies
+  on an inactivity timeout naming neither the cause nor the culprit — so
+  the error surfaces in a different process from the defect, and the
+  telemetry that would prompt an audit says everything was fine (#5445).
+- **Each copy looks locally reasonable**, so fixing one consumer leaves
+  the others and nothing flags the asymmetry.
+
+The buffer allocates `base + 1` fragment slots, where
+`base = ceil(total_bytes / FRAGMENT_PAYLOAD_SIZE)`, because embedding
+metadata in fragment #1 (#2757) reduces that fragment's payload and makes
+the sender emit one extra fragment. `is_complete()` is
+`contiguous >= base` — the BASE count — so it goes true **one fragment
+early** on exactly those streams.
+
+| Consumer | State |
+|---|---|
+| `streaming_buffer::assemble()` | Correct: discriminates on assembled length vs `total_size`, keeps waiting when `is_complete()` is true but bytes are short. |
+| `StreamingInboundStream::poll_next` | Was wrong; fixed in #5270. Ended on `is_complete()` alone, so `pipe_stream` forwarded short and the downstream peer sat in `assemble()` until its 5 s inactivity timeout. |
+| `PipedStream` | Still wrong, currently dead code — #5440. Computes `total_fragments` as the base count, so it declares completion early AND then rejects the genuine final fragment as out of range. |
+
+**The rule:** the discriminator is the BYTE total, never the fragment
+count. A fragment count is an estimate derived from an assumption about
+payload sizes; `total_bytes` is what the sender actually advertised.
+
+**And the transferable half:** when a predicate this load-bearing has more
+than one implementation, the bug is the duplication, not any one copy.
+Before adding a fourth, ask whether it can call the existing one. When
+auditing a fix to one, grep for the others — #5440 was found only because
+the #5270 review enumerated every `is_complete()` call site, and it had
+been wrong since it was written. A truncation that reports success is
+also invisible in telemetry (#5445), so nothing prompts the audit on its
+own.
+
 ## Cross-test interference through process-global state: CI cannot see it
 
 A guard whose two inputs rot from one cause. Every CI job runs `cargo
@@ -228,6 +274,49 @@ hand-rolling a `split_once`. It:
 **Prefer a cross-file scrape.** A pin that lives in `auto_update.rs` and
 scrapes `update.rs` cannot be satisfied by its own assertion literal at
 all — a structural guarantee rather than a check someone must remember.
+
+### The variant `fn_body()` does not catch: the anchor survives the deletion
+
+`fn_body()` fixes a *moved* anchor. It does nothing about an anchor that
+is still exactly where the pin expects because the call was **commented
+out**. `// interleave(&mut ops, seed);` contains the string
+`interleave(&mut ops, seed);`, so `split_once` finds it, the region
+splits where it always did, the before/after assertions still hold, and
+the pin stays green over a shuffle that no longer runs. Deleting the line
+outright fails loudly; disabling it does not — and disabling it is what a
+person actually does while debugging, which is precisely when the pin is
+the only thing left watching.
+
+Found in review of #5271, where the PR's own new pin AND the pre-existing
+one it was modelled on both survived commenting out the call they guard.
+Verified by doing it: both stayed green before the fix, both go red after.
+
+**The rule:** a pin that guards a *call* must require the call at
+statement position — the call text preceded on its line by nothing but
+whitespace — not merely present in the region. A few lines:
+
+```rust
+fn split_at_call<'a>(body: &'a str, call: &str) -> (&'a str, &'a str) {
+    let at = body
+        .match_indices(call)
+        .find(|(i, _)| {
+            let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
+            body[line_start..*i].trim().is_empty()
+        })
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| panic!("`{call}` is not called at statement position"));
+    (&body[..at], &body[at + call.len()..])
+}
+```
+
+**The generalisation, which is the part worth carrying:** a source-scrape
+pin asserts that *text exists*, while the property it is standing in for
+is that *code runs*. Every gap between those two is a way for the pin to
+pass vacuously — a moved anchor, a self-matched literal, a commented-out
+call, a call moved inside a branch that is never taken. When writing one,
+ask what the cheapest edit is that keeps the text and removes the
+behaviour, then make that edit fail. **And test the pin by performing that
+edit**, because a pin nobody mutated is a pin nobody has evidence about.
 
 ### The same class without `include_str!`: an expectation stored as a copy
 
