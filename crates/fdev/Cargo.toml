@@ -61,6 +61,7 @@ freenet-stdlib = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+wat = { workspace = true }
 
 [features]
 trace-ot = ["freenet/trace-ot"]
