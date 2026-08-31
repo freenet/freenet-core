@@ -68,6 +68,11 @@ updates:
       default-days: 7
     # Set explicitly: omitting this caps at 5 and silently withholds the rest.
     open-pull-requests-limit: 50
+    # This workspace reaches a contract/delegate crate: a bump here can move a
+    # contract address. Labelled so that shows on the PR, not just in this file.
+    labels:
+      - "dependencies"
+      - "contract-rekey-risk"
     groups:
       cargo-minor-and-patch:
         patterns:
