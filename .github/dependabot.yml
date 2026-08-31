@@ -1,36 +1,79 @@
 version: 2
 
-# Dependency bumps are grouped so routine churn arrives as ONE reviewable PR
-# per ecosystem instead of thirty.
+# Dependabot configuration.
 #
-# Measured 2026-08-24: 25 of the repo's 59 open PRs were dependabot's, 20 of
-# them fully green and simply never merged. That backlog is not free — open PRs
-# rot into conflicts, and a wall of them trains reviewers to skim past the whole
-# list, including the bumps that matter.
+# Shaped by GitHub's "Tame Dependabot: group your updates, slow the cadence,
+# keep security fast" guidance:
+# https://github.blog/security/supply-chain-security/tame-dependabot-group-your-updates-slow-the-cadence-keep-security-fast/
 #
-# TWO THINGS THIS GROUPING DOES NOT DO, stated because both would be bad and
-# both are one config key away:
+#   - GROUP routine churn, so a month of bumps arrives as ONE reviewable PR per
+#     ecosystem instead of thirty. Open PRs are not free: they rot into
+#     conflicts, and a wall of them trains reviewers to skim past the whole
+#     list, including the bumps that matter. Measured here 2026-08-24: 25 of
+#     the repo's 59 open PRs were Dependabot's, 20 of them fully green and
+#     simply never merged.
+#   - SLOW the cadence to monthly, so updates land on a rhythm you can plan
+#     around rather than "whenever anything upstream changes".
+#   - COOLDOWN of 7 days, so a release has been in the wild long enough for a
+#     bad one to be found and yanked before it is proposed here. Dependabot
+#     already applies 3 days by default; this raises it. Note the interaction
+#     with a monthly schedule: a release published just inside the window is
+#     skipped and waits for the NEXT monthly run, so the practical delay from
+#     publish to PR can approach five weeks, not seven days.
 #
-# 1. It does not group MAJOR bumps. A major bump is not matched by any group
-#    below, so it still arrives as its own PR with its own review. Keep it that
-#    way: `ed25519-dalek 2 -> 3` verifies RELEASE SIGNATURES, and a break there
-#    strands the fleet with no recovery path. It must never arrive buried in a
-#    30-crate diff that gets skimmed as routine.
+# ONE PLACE THIS DELIBERATELY DEPARTS FROM THE ARTICLE.
 #
-# 2. It does not group SECURITY updates. `applies-to` defaults to
-#    `version-updates`, so Dependabot's security PRs are untouched by anything
-#    here and keep arriving one per advisory. Do NOT "finish the job" by adding
-#    `applies-to: security-updates` — a security bump buried in a group PR is
-#    precisely the outcome this file exists to avoid.
+# The article says to delete `open-pull-requests-limit`. Do not. Omitting the
+# key does not mean "unlimited" -- the documented default is FIVE, and once five
+# version-update PRs are open Dependabot raises no more until some are closed.
+# That is silent withholding, the exact failure the article is arguing against,
+# so the limit is set EXPLICITLY and set high enough never to bind in practice.
+# Grouping, not the limit, is what controls the noise. (Security PRs are exempt
+# from the limit and do not count toward it.)
+#
+# TWO THINGS THIS DELIBERATELY DOES NOT DO. Both are one config key away, and
+# both would be worse than the noise this file exists to reduce:
+#
+# 1. It does not group MAJOR bumps. Every group below matches only `minor` and
+#    `patch`, so a major arrives as its own PR with its own review. A major can
+#    change behaviour, and must never land buried in a large diff that reads as
+#    routine. Concretely: `ed25519-dalek 2 -> 3` verifies RELEASE SIGNATURES,
+#    and a break there strands the fleet with no recovery path.
+#
+#    Know how Dependabot classifies, because it differs by ecosystem. For CARGO
+#    it applies Cargo's own semver rules, where for a 0.y.z crate a bump in y is
+#    BREAKING: `0.8 -> 0.9` is treated as a MAJOR, falls out of the group, and
+#    arrives as its own PR. That is right for Rust, and it is why the cargo
+#    limit below is generous -- a repo with many 0.x dependencies produces a
+#    real queue of individual PRs alongside the single grouped one. For every
+#    other ecosystem here (npm, pip, docker, gradle, github-actions) Dependabot
+#    compares raw version segments instead, so an npm `0.8 -> 0.9` is classified
+#    `minor` and WILL be grouped, even though npm convention treats 0.x minors
+#    as breaking. The "majors are always reviewed alone" guarantee is therefore
+#    strong for cargo and weaker for the rest.
+#
+# 2. It does not touch SECURITY updates. `applies-to` defaults to
+#    `version-updates`, so Dependabot's security PRs ignore the grouping, the
+#    monthly schedule, the cooldown and the PR limit entirely, and keep arriving
+#    one per advisory, immediately. Do NOT "finish the job" by adding
+#    `applies-to: security-updates` -- slowing security fixes down is precisely
+#    the outcome this configuration avoids.
+
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    # Set explicitly: omitting this caps at 5 and silently withholds the rest.
     open-pull-requests-limit: 50
+    # This workspace reaches a contract/delegate crate: a bump here can move a
+    # contract address. Labelled so that shows on the PR, not just in this file.
+    labels:
+      - "dependencies"
+      - "contract-rekey-risk"
     groups:
-      # Everything semver-safe rides in one PR. Anything NOT matched here —
-      # i.e. every major bump — still gets its own PR and its own review.
       cargo-minor-and-patch:
         patterns:
           - "*"
@@ -41,14 +84,91 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      # Check for updates to GitHub Actions every weekday
-      interval: "daily"
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    # Set explicitly: omitting this caps at 5 and silently withholds the rest.
+    open-pull-requests-limit: 20
     groups:
-      # Action bumps are near-always mechanical; majors (e.g. actions/checkout
-      # v7 -> v8) still land alone because they can change runner behaviour.
       github-actions-minor-and-patch:
         patterns:
           - "*"
         update-types:
           - "minor"
           - "patch"
+
+  # asset lint/test tooling for the server's JS/CSS
+  - package-ecosystem: "npm"
+    directory: "/crates/core/src/server"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    # Set explicitly: omitting this caps at 5 and silently withholds the rest.
+    open-pull-requests-limit: 20
+    groups:
+      npm-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Playwright shell smoke tests
+  - package-ecosystem: "npm"
+    directory: "/crates/core/tests/playwright"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    # Set explicitly: omitting this caps at 5 and silently withholds the rest.
+    open-pull-requests-limit: 20
+    groups:
+      npm-crates-core-tests-playwright-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "docker"
+    directory: "/docker/freenet-gateway"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    # Set explicitly: omitting this caps at 5 and silently withholds the rest.
+    open-pull-requests-limit: 20
+    groups:
+      docker-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "docker"
+    directory: "/docker/test-runner"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    # Set explicitly: omitting this caps at 5 and silently withholds the rest.
+    open-pull-requests-limit: 20
+    groups:
+      docker-docker-test-runner-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+# Test-fixture crates under tests/ that declare their OWN `[workspace]` are not
+# listed here: their compiled wasm IS the fixture, so bumping their dependencies
+# changes what the tests are testing.
+#
+# That cover is only partial, and deliberately so. tests/test-contract-integration,
+# tests/test-contract-mock-aligned and tests/test-contract-update-nochange ARE root
+# workspace members, so the cargo entry above does reach them through the shared
+# Cargo.lock. Likewise crates/website-contract and apps/freenet-ping/contracts/ping.
+# That predates this config and is not changed by it.
