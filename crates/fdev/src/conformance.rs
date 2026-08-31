@@ -526,10 +526,16 @@ async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::
     println!("evidence {}", evidence.id());
     println!("  contract : {}", evidence.contract);
     println!("  property : {}", evidence.property);
+    // `v.detail` is deserialized from an evidence file ANOTHER PEER produced, and
+    // this function's own stated contract is that `evidence.observed` is never
+    // trusted. It was nonetheless interpolated raw into the operator's terminal, so
+    // a sender could embed a newline and forge a `verdict  :` line in the exact
+    // format the real one uses - on the one command here built to consume hostile
+    // input. `v.property` is an enum and carries no free text.
     println!(
         "  claimed  : {}",
         match &evidence.observed {
-            Some(v) => format!("{} ({})", v.property, v.detail),
+            Some(v) => format!("{} ({})", v.property, present_detail(&v.detail)),
             None => "nothing recorded by the sender".to_string(),
         }
     );
@@ -562,7 +568,14 @@ async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::
             Ok(())
         }
         PropertyOutcome::Inconclusive(reason) => {
-            println!("  verdict  : INCONCLUSIVE \u{2014} {reason}");
+            // `Display for Inconclusive` interpolates the contract's own error text
+            // raw, so this is the same untrusted-text-to-terminal path the report
+            // side escapes. Escaping the rendered line whole is safe: the static
+            // prefixes it adds contain nothing escapable.
+            println!(
+                "  verdict  : INCONCLUSIVE \u{2014} {}",
+                present_detail(&reason.to_string())
+            );
             Ok(())
         }
     }
@@ -641,48 +654,6 @@ fn find_code_in_store(store: &Path, bundle: &ReplayBundle) -> anyhow::Result<Vec
     Ok(code.data().to_vec())
 }
 
-/// Read the operator's `--wasm`, accepting either raw WASM or a contract-store file.
-///
-/// A store entry is not raw WASM. It is a VERSIONED encoding, a version header
-/// followed by the code, and only the code is hashed — `find_code_in_store` documents
-/// the same trap on the lookup side. Handing one to `--wasm` therefore failed the
-/// bundle's identity check with "supplied code is blake3:...", which reads as *wrong
-/// contract* and sends the reader hunting for a problem they do not have: the file was
-/// the right one, in the wrong form.
-///
-/// Raw bytes are tried first, so any input that works today keeps working and behaves
-/// identically; the unwrapped form is only ever consulted after the raw form has
-/// already failed. The candidate is then offered to `resolve_code` rather than judged
-/// here, so that function remains the single place deciding whether code matches a
-/// bundle: this widens what is ACCEPTED without widening what is TRUSTED. When neither
-/// form matches, the raw bytes are returned so the caller reports exactly the
-/// mismatch it reports today — a genuinely wrong contract still says so.
-fn read_supplied_wasm(path: &PathBuf, bundle: &ReplayBundle) -> anyhow::Result<Vec<u8>> {
-    let raw = read_file(path)?;
-    if bundle.resolve_code(Some(raw.clone())).is_ok() {
-        return Ok(raw);
-    }
-    // Not a store file (or unreadable as one): hand back the raw bytes and let the
-    // caller produce its ordinary mismatch error.
-    let Ok((code, _version)) = ContractCode::load_versioned_from_path(path) else {
-        return Ok(raw);
-    };
-    let unwrapped = code.data().to_vec();
-    if unwrapped == raw || bundle.resolve_code(Some(unwrapped.clone())).is_err() {
-        return Ok(raw);
-    }
-    // STDERR, for the same reason as the bundle note below: `--json` puts one JSON
-    // document on stdout and a stray line ahead of it breaks every consumer parsing
-    // it. Said out loud rather than handled silently, because the bytes being verified
-    // are not the bytes the operator named on the command line.
-    eprintln!(
-        "note: {} is a contract-store file (a versioned encoding), not raw WASM; \
-         using the contract code inside it, which matches the bundle.",
-        path.display()
-    );
-    Ok(unwrapped)
-}
-
 /// Load the WASM, parameters and corpus, either from `--bundle` or from
 /// `--wasm` / `--params` / `--state`.
 fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<LoadedInputs> {
@@ -694,7 +665,7 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<LoadedInputs> {
         // replaying it: the run looks authoritative and means nothing, whether it
         // reports findings or a clean bill of health.
         let supplied = match (&config.wasm, &config.contract_store) {
-            (Some(path), _) => Some(read_supplied_wasm(path, &bundle)?),
+            (Some(path), _) => Some(read_file(path)?),
             (None, Some(store)) => Some(find_code_in_store(store, &bundle)?),
             (None, None) => None,
         };
@@ -1175,14 +1146,20 @@ struct Finding {
     right: String,
 }
 
-/// How many distinct detail texts to report per inconclusive reason.
+/// How many distinct detail texts the HUMAN report shows per inconclusive reason.
 ///
 /// The texts come from contract code, so their number is bounded only by the case
 /// count: a contract that embeds a state hash in its error message produces a
 /// distinct string per case, and listing 435 of those would bury the question the
 /// reader actually has ("is this one bug, or eight?") rather than answer it. Five
-/// separates those two cases comfortably; the rest is reported as a count so the
-/// truncation is visible instead of silent.
+/// separates those two cases comfortably.
+///
+/// This is a READABILITY bound and so it applies to the human report alone. `--json`
+/// carries every distinct message: a machine consumer has no width constraint, the
+/// tally already holds them all so nothing is saved by dropping them, and a capped
+/// machine format would hand a hostile contract a cheap way to bury its real failure
+/// behind five high-frequency decoys. The human report says how much it is not
+/// showing, in both messages and cases, and points at `--json` for the rest.
 const MAX_INCONCLUSIVE_EXAMPLES: usize = 5;
 
 /// Longest detail text reported, in characters after escaping.
@@ -1198,22 +1175,36 @@ const MAX_INCONCLUSIVE_EXAMPLE_CHARS: usize = 200;
 struct InconclusiveReason {
     reason: &'static str,
     occurrences: usize,
-    /// Distinct texts behind this reason, most frequent first. Empty for the
+    /// Every distinct text behind this reason, most frequent first. Empty for the
     /// reasons that carry no text at all (`RoundLimit`, `RelatedRequired`, ...).
-    examples: Vec<InconclusiveExample>,
-    /// Distinct texts not listed because [`MAX_INCONCLUSIVE_EXAMPLES`] was reached.
     ///
-    /// Reported rather than dropped, for the same reason `findings_too_large` is: a
-    /// reader has to be able to tell a complete list from a sample, and this whole
-    /// change exists because something was being dropped quietly.
-    distinct_messages_omitted: usize,
+    /// Complete here on purpose; only the human report trims it. See
+    /// [`MAX_INCONCLUSIVE_EXAMPLES`].
+    examples: Vec<InconclusiveExample>,
 }
 
 /// One distinct detail text and how many cases produced it.
+///
+/// The text is written by the CONTRACT, so it can carry real application state - a
+/// rejected value, a member key, a room id - and the corpora these runs replay are
+/// captured from live peers. `bundle.rs` and `capture.rs` both mark that material
+/// sensitive; this is the path that lifts it out of those files and onto a terminal,
+/// from which it is easily pasted into a bug report. The human report says so where
+/// it prints them; treat `--json` containing them the same way.
 #[derive(Serialize)]
 struct InconclusiveExample {
     text: String,
     occurrences: usize,
+}
+
+/// "1 case" / "N cases". The findings section already reads this way; the
+/// inconclusive examples printed "1 case(s)".
+fn case_count(n: usize) -> String {
+    if n == 1 {
+        "1 case".to_string()
+    } else {
+        format!("{n} cases")
+    }
 }
 
 /// Running tally for one inconclusive reason while a report is being built.
@@ -1287,9 +1278,6 @@ impl Report {
                 // the first line the representative case; the lexicographic tiebreak
                 // is what keeps the choice from depending on hash iteration order.
                 details.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                let distinct_messages_omitted =
-                    details.len().saturating_sub(MAX_INCONCLUSIVE_EXAMPLES);
-                details.truncate(MAX_INCONCLUSIVE_EXAMPLES);
                 InconclusiveReason {
                     reason,
                     occurrences: tally.occurrences,
@@ -1297,7 +1285,6 @@ impl Report {
                         .into_iter()
                         .map(|(text, occurrences)| InconclusiveExample { text, occurrences })
                         .collect(),
-                    distinct_messages_omitted,
                 }
             })
             .collect();
@@ -1385,23 +1372,55 @@ impl Report {
                 "\ninconclusive ({} total \u{2014} NOT passes: these cases reached no verdict, so they say nothing about the contract):",
                 self.inconclusive
             )?;
+            // Said once, above the messages rather than beside each one: these
+            // strings come from the contract, and a contract error routinely names
+            // what it rejected. The corpora replayed here are captured from live
+            // peers, and `bundle.rs` and `capture.rs` both mark that material
+            // sensitive - this is the path that brings it to a terminal.
+            if self
+                .inconclusive_reasons
+                .iter()
+                .any(|r| !r.examples.is_empty())
+            {
+                writeln!(
+                    out,
+                    "  (quoted messages are written by the contract and may contain \
+                     application state)"
+                )?;
+            }
             for r in &self.inconclusive_reasons {
                 writeln!(out, "  {}: {}", r.reason, r.occurrences)?;
                 // The text the contract actually produced. Without it the largest
                 // text-carrying bucket is a number and nothing else, and a reader
                 // cannot tell one recurring bug from many unrelated ones.
-                for example in &r.examples {
+                //
+                // Quoted because `escape_debug` escapes `"`, so the quotes mark the
+                // exact extent of contract-authored text. Without them a message of
+                // wide or combining characters can wrap past the terminal width and
+                // its tail reads like a line of the report.
+                for example in r.examples.iter().take(MAX_INCONCLUSIVE_EXAMPLES) {
                     writeln!(
                         out,
-                        "      {} case(s) \u{2014} {}",
-                        example.occurrences, example.text
+                        "      {} \u{2014} \"{}\"",
+                        case_count(example.occurrences),
+                        example.text
                     )?;
                 }
-                if r.distinct_messages_omitted > 0 {
+                let hidden = r.examples.len().saturating_sub(MAX_INCONCLUSIVE_EXAMPLES);
+                if hidden > 0 {
+                    // Both numbers, because "3 further messages" alone cannot
+                    // distinguish 3 stray cases from 300, and the reader needs to
+                    // know whether what is hidden is the bulk of the bucket.
+                    let hidden_cases: usize = r
+                        .examples
+                        .iter()
+                        .skip(MAX_INCONCLUSIVE_EXAMPLES)
+                        .map(|e| e.occurrences)
+                        .sum();
                     writeln!(
                         out,
-                        "      \u{2026} and {} further distinct message(s) not shown",
-                        r.distinct_messages_omitted
+                        "      \u{2026} and {hidden} further distinct message(s), \
+                         {hidden_cases} case(s), not shown \u{2014} --json has all of them"
                     )?;
                 }
             }
@@ -1556,14 +1575,34 @@ fn inconclusive_detail(reason: &Inconclusive) -> Option<&str> {
 /// before truncating also means the cap bounds what is actually printed rather than
 /// what was parsed.
 fn present_detail(text: &str) -> String {
-    let escaped: String = text.escape_debug().collect();
-    match escaped.char_indices().nth(MAX_INCONCLUSIVE_EXAMPLE_CHARS) {
-        // Slice at a `char_indices` boundary, never at a byte offset: a multi-byte
-        // character straddling the cap would panic the whole run on an input the
-        // contract chooses.
-        Some((byte_idx, _)) => format!("{}\u{2026}", &escaped[..byte_idx]),
-        None => escaped,
+    // `str::escape_debug`, not `char::escape_debug` in a loop: the former escapes a
+    // LEADING grapheme-extend character and leaves one mid-string alone, and driving
+    // it per character would silently lose that distinction.
+    //
+    // Bounded by [`take_presented`] BEFORE anything is collected, because the
+    // iterator is lazy: only as much of the message is read as the cap needs.
+    // Escaping the whole string and truncating afterwards bounds the OUTPUT while
+    // leaving the WORK unbounded - escaping expands a control character roughly
+    // sixfold, this runs once per inconclusive CASE (deduplication happens on the
+    // result, not before it), and the contract chooses both length and content. That
+    // is a wall-clock denial of service against the tool, not merely an allocation
+    // spike.
+    take_presented(text.escape_debug())
+}
+
+/// The bounded half of [`present_detail`], taken over an iterator rather than a
+/// `&str` so that the laziness above is testable: a test can hand this a source that
+/// panics the moment it is read past the cap, which is the only way to assert that
+/// the work is bounded rather than merely the output.
+fn take_presented(escaped: impl Iterator<Item = char>) -> String {
+    // One char past the cap is enough to know whether anything was dropped, and is
+    // all that is ever read.
+    let mut chars: Vec<char> = escaped.take(MAX_INCONCLUSIVE_EXAMPLE_CHARS + 1).collect();
+    if chars.len() > MAX_INCONCLUSIVE_EXAMPLE_CHARS {
+        chars.truncate(MAX_INCONCLUSIVE_EXAMPLE_CHARS);
+        chars.push('\u{2026}');
     }
+    chars.into_iter().collect()
 }
 
 /// Source pin on `load_inputs`' output stream.
@@ -2968,10 +3007,6 @@ mod tests {
         assert_eq!(code_diagnostics(&wasm), Vec::new());
     }
 
-    /// The whole point of the channel: a code diagnostic is DIAGNOSTIC. It must
-    /// not be counted as a violation, and it must not fail the command — a
-    /// deprecation notice that broke every affected author's build in release
-    /// *n* would make the two-release notice period meaningless.
     /// Build a report whose only outcomes are inconclusive contract errors.
     fn report_from_contract_errors(messages: &[&str]) -> Report {
         let outcomes: Vec<(ConformanceCase, PropertyOutcome)> = messages
@@ -2990,6 +3025,8 @@ mod tests {
             .collect();
         Report::build(&Corpus::default(), &outcomes, None, Vec::new())
     }
+
+    use super::stdout_purity_pin::code_only;
 
     fn contract_error_bucket(report: &Report) -> &InconclusiveReason {
         report
@@ -3029,7 +3066,6 @@ mod tests {
             "distinct messages must carry their own counts, most frequent first: \
              that breakdown is the whole answer to 'is this one bug or several'"
         );
-        assert_eq!(reason.distinct_messages_omitted, 0);
 
         let rendered = render_human(&report);
         assert!(
@@ -3061,34 +3097,57 @@ mod tests {
         let report = Report::build(&Corpus::default(), &outcomes, None, Vec::new());
         let reason = &report.inconclusive_reasons[0];
         assert!(reason.examples.is_empty());
-        assert_eq!(reason.distinct_messages_omitted, 0);
     }
 
-    /// Distinct messages past the cap are counted, never silently dropped.
+    /// The readability cap trims the HUMAN report only, and says what it hid.
     ///
     /// The cap exists because the count of distinct texts is bounded only by the
-    /// case count — a contract that embeds a state hash in its error produces one
-    /// per case. Capping without saying so would reintroduce this issue's own
-    /// defect in miniature: output that looks complete and is not.
+    /// case count: a contract that embeds a state hash in its error produces one per
+    /// case, and a wall of them buries the question the reader has. But that is a
+    /// terminal-width concern, so `--json` keeps everything - a machine consumer has
+    /// no width limit, the tally already holds them all, and a capped machine format
+    /// would let a hostile contract bury its real failure behind five high-frequency
+    /// decoys.
+    ///
+    /// Capping without saying so, in either format, would reintroduce this issue's
+    /// own defect in miniature: output that looks complete and is not.
     #[test]
-    fn distinct_messages_beyond_the_cap_are_counted_not_dropped() {
-        let messages: Vec<String> = (0..MAX_INCONCLUSIVE_EXAMPLES + 3)
-            .map(|i| format!("distinct failure {i}"))
-            .collect();
+    fn the_cap_trims_the_human_report_only_and_says_what_it_hid() {
+        // Frequencies chosen so the hidden tail is a KNOWN number of cases: the
+        // first five messages appear twice each, the last three once each.
+        let mut messages: Vec<String> = Vec::new();
+        for i in 0..MAX_INCONCLUSIVE_EXAMPLES {
+            messages.push(format!("frequent failure {i}"));
+            messages.push(format!("frequent failure {i}"));
+        }
+        for i in 0..3 {
+            messages.push(format!("rare failure {i}"));
+        }
         let refs: Vec<&str> = messages.iter().map(String::as_str).collect();
         let report = report_from_contract_errors(&refs);
 
         let reason = contract_error_bucket(&report);
-        assert_eq!(reason.examples.len(), MAX_INCONCLUSIVE_EXAMPLES);
         assert_eq!(
-            reason.distinct_messages_omitted, 3,
-            "the overflow count must say how many distinct messages were not shown"
+            reason.examples.len(),
+            MAX_INCONCLUSIVE_EXAMPLES + 3,
+            "--json must carry every distinct message; trimming it there loses data \
+             that no machine consumer needed trimmed"
         );
 
         let rendered = render_human(&report);
+        assert_eq!(
+            rendered.matches("frequent failure").count(),
+            MAX_INCONCLUSIVE_EXAMPLES,
+            "the human report must show exactly the cap:\n{rendered}"
+        );
         assert!(
-            rendered.contains("3 further distinct message(s) not shown"),
-            "the human report presented a truncated list as if it were complete:\n{rendered}"
+            !rendered.contains("rare failure"),
+            "the human report showed past its own cap:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("3 further distinct message(s), 3 case(s), not shown"),
+            "the hidden tail must be reported in BOTH messages and cases: '3 further \
+             messages' alone cannot distinguish 3 stray cases from 300:\n{rendered}"
         );
     }
 
@@ -3143,108 +3202,6 @@ mod tests {
         );
     }
 
-    /// The `--wasm` fallback must be reached through `load_inputs`, not merely exist.
-    ///
-    /// Written after the unit test below survived a mutation that removed the
-    /// fallback from `load_inputs` entirely: that test calls `read_supplied_wasm`
-    /// directly, so it proves the helper works and says nothing about whether the
-    /// command uses it. A guard on one layer is not a guard on the layer above it.
-    ///
-    /// This drives the real CLI surface (`ConformanceConfig` is the clap parser) so
-    /// the wiring itself is under test.
-    #[test]
-    fn load_inputs_uses_the_store_file_fallback_for_wasm() {
-        use clap::Parser;
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let code = b"\0asm-not-really-but-bytes-are-bytes".to_vec();
-
-        let mut bundle = ReplayBundle::new(code.clone(), Vec::new());
-        bundle.states.push(vec![1u8, 2, 3]);
-        let bundle_path = dir.path().join("corpus.bin");
-        bundle.write_to(&bundle_path).expect("write bundle");
-
-        // The contract, in the form a node's contract store holds it.
-        let store_path = dir.path().join("stored.wasm");
-        std::fs::write(
-            &store_path,
-            ContractCode::from(code.clone())
-                .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
-                .expect("encode versioned"),
-        )
-        .expect("write store form");
-
-        let config = ConformanceConfig::try_parse_from([
-            "verify-merge",
-            "--bundle",
-            bundle_path.to_str().expect("utf-8 path"),
-            "--wasm",
-            store_path.to_str().expect("utf-8 path"),
-        ])
-        .expect("the flags this test uses must stay parseable");
-
-        let loaded = load_inputs(&config).expect(
-            "--wasm given a contract-store file was rejected: before the fix this \
-             failed the bundle's identity check and reported it as the wrong contract",
-        );
-        assert_eq!(
-            loaded.wasm, code,
-            "the unwrapped contract code must be used"
-        );
-    }
-
-    /// `--wasm` must accept a contract-store file, not only raw WASM.
-    ///
-    /// A store entry is a versioned encoding, a header followed by the code, and
-    /// only the code is hashed. Passing one to `--wasm` therefore failed the
-    /// bundle's identity check with "supplied code is blake3:...", which reads as
-    /// WRONG CONTRACT and sends the reader hunting for a problem they do not have:
-    /// the file was the right one, in the wrong form (#5461).
-    #[test]
-    fn wasm_accepts_a_contract_store_file_as_well_as_raw_wasm() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        // Not valid WASM, and it does not need to be: nothing here compiles it.
-        let code = b"\0asm-not-really-but-bytes-are-bytes".to_vec();
-        let bundle = ReplayBundle::new(code.clone(), Vec::new());
-
-        // Raw WASM behaves exactly as before. This is the case the fallback must
-        // never be able to reinterpret, which is why the raw form is tried first.
-        let raw_path = dir.path().join("raw.wasm");
-        std::fs::write(&raw_path, &code).expect("write raw");
-        assert_eq!(read_supplied_wasm(&raw_path, &bundle).expect("raw"), code);
-
-        // The same contract, in the form a node's contract store holds it.
-        let encoded = ContractCode::from(code.clone())
-            .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
-            .expect("encode versioned");
-        assert_ne!(
-            encoded, code,
-            "the stored form must differ from the raw form, or this test proves \
-             nothing about unwrapping one"
-        );
-        let store_path = dir.path().join("stored.wasm");
-        std::fs::write(&store_path, &encoded).expect("write store form");
-        assert_eq!(
-            read_supplied_wasm(&store_path, &bundle).expect("store form"),
-            code,
-            "a contract-store file passed to --wasm was still rejected as though \
-             it were a different contract"
-        );
-
-        // Widening what is ACCEPTED must not widen what is TRUSTED: a genuinely
-        // different contract stays refused, in both forms.
-        let other = ReplayBundle::new(b"different code entirely".to_vec(), Vec::new());
-        for path in [&raw_path, &store_path] {
-            let supplied = read_supplied_wasm(path, &other).expect("reading succeeds");
-            assert!(
-                other.resolve_code(Some(supplied)).is_err(),
-                "code that does not belong to the bundle resolved against it \
-                 anyway, from {}",
-                path.display()
-            );
-        }
-    }
-
     /// A contract-authored message must not be able to forge report lines.
     ///
     /// This text is written by the contract under test, which is the thing we are
@@ -3264,6 +3221,133 @@ mod tests {
         assert!(
             rendered.contains("\\n"),
             "the newline was neither escaped nor stripped:\n{rendered}"
+        );
+    }
+
+    /// The work is bounded, not merely the output.
+    ///
+    /// `present_detail` originally collected the WHOLE escaped string and truncated
+    /// afterwards. Escaping expands a control character roughly sixfold and this runs
+    /// once per inconclusive CASE (deduplication happens on the result), so a hostile
+    /// multi-megabyte message meant gigabytes of escaping across a run for output
+    /// that was thrown away: a wall-clock denial of service against the tool.
+    ///
+    /// Asserted by handing the bounded half a source that panics the moment it is
+    /// read past the cap. That is the only way to test laziness - the finished string
+    /// looks identical either way, which is exactly why the original passed every
+    /// test while doing unbounded work.
+    #[test]
+    fn presenting_a_detail_reads_no_further_than_the_cap() {
+        let mut read = 0usize;
+        let watched = std::iter::from_fn(|| {
+            read += 1;
+            assert!(
+                read <= MAX_INCONCLUSIVE_EXAMPLE_CHARS + 1,
+                "read {read} characters for a {MAX_INCONCLUSIVE_EXAMPLE_CHARS}-character \
+                 cap; the escaping must stop at the cap, or an oversized contract \
+                 message is expanded in full before being discarded"
+            );
+            Some('x')
+        });
+
+        let presented = take_presented(watched);
+        assert_eq!(
+            presented.chars().count(),
+            MAX_INCONCLUSIVE_EXAMPLE_CHARS + 1
+        );
+        assert!(presented.ends_with('\u{2026}'));
+    }
+
+    /// Pin: `present_detail` hands `take_presented` a LAZY iterator.
+    ///
+    /// The test above proves `take_presented` reads no further than the cap. It says
+    /// nothing about its caller, and a mutation that restores
+    /// `text.escape_debug().collect::<Vec<char>>().into_iter()` survives it with
+    /// every test green - the finished string is identical, only the work differs.
+    /// That is the whole defect: unbounded work behind bounded-looking output.
+    ///
+    /// Sourced-scraped because laziness leaves no trace in the return value, and
+    /// timing or allocation assertions would be flaky. Any `collect` in this body
+    /// re-materialises the escaped string in full, so its absence is the property.
+    #[test]
+    fn present_detail_does_not_collect_before_bounding() {
+        let body = code_only("fn present_detail(");
+
+        assert!(
+            body.contains("take_presented(text.escape_debug())"),
+            "the scraped region is not present_detail's body any more:\n{body}"
+        );
+        assert!(
+            !body.contains("collect"),
+            "present_detail collects before bounding, so the whole escaped string is \
+             built and thrown away: escaping expands a control character roughly \
+             sixfold and this runs once per inconclusive CASE:\n{body}"
+        );
+    }
+
+    /// Escapes and direction overrides are neutralised, not just newlines.
+    ///
+    /// `a_contract_message_cannot_forge_report_lines` checks `\n` alone, so replacing
+    /// the escaping with `text.replace('\n', "\\n")` would keep it green while ESC
+    /// and RLO leaked. ESC lets a contract recolour or erase the report around it;
+    /// U+202E reverses the visual order of everything after it, which is enough to
+    /// make a message read as a different one.
+    #[test]
+    fn escapes_and_direction_overrides_are_neutralised() {
+        let presented = present_detail("red\u{1b}[31m and reversed \u{202e}drawrkcab");
+
+        assert!(
+            !presented.contains('\u{1b}'),
+            "a raw ESC survived into the report: {presented}"
+        );
+        assert!(
+            !presented.contains('\u{202e}'),
+            "a raw right-to-left override survived into the report: {presented}"
+        );
+        assert!(
+            presented.contains("\\u{1b}") && presented.contains("\\u{202e}"),
+            "both should appear in escaped form rather than be dropped: {presented}"
+        );
+    }
+
+    /// Pin: `verify_evidence` routes both untrusted strings through the escaper.
+    ///
+    /// This command exists to consume evidence ANOTHER PEER produced, and its own
+    /// rustdoc says `evidence.observed` is never trusted - yet it interpolated the
+    /// sender's `detail` straight into the terminal, and printed `Inconclusive`
+    /// through a `Display` impl that embeds the contract's raw error text. A newline
+    /// in either forges a `verdict  :` line in the exact format of the real one.
+    ///
+    /// A source pin rather than a behavioural test because reaching this function
+    /// needs a WASM runtime and a real evidence file, which is a large fixture for a
+    /// one-call property. It is scoped tightly and fails closed: if the function is
+    /// renamed or the prints move, the scrape stops matching and the test fails.
+    #[test]
+    fn verify_evidence_escapes_the_text_it_does_not_trust() {
+        let body = code_only("async fn verify_evidence(");
+
+        assert!(
+            body.contains("claimed  :") && body.contains("INCONCLUSIVE"),
+            "the scraped region is not verify_evidence's body any more:\n{body}"
+        );
+        assert!(
+            body.contains("present_detail(&v.detail)"),
+            "the SENDER's `detail` is interpolated raw again:\n{body}"
+        );
+        assert!(
+            body.contains("present_detail(&reason.to_string())"),
+            "the `Inconclusive` rendering embeds the contract's own error text and \
+             must be escaped too:\n{body}"
+        );
+        // The REPRODUCED branch deliberately does NOT escape: that `Violation` is
+        // built locally by `verify_case`, whose `detail` values are static strings
+        // plus lengths (`verifier.rs:329-482`), never contract-authored text.
+        // Asserting it stays raw keeps this pin honest about which of the two is
+        // trusted, so a future reader does not "fix" the wrong one.
+        assert!(
+            body.contains("v.property, v.detail"),
+            "the locally-computed REPRODUCED line changed shape; re-check whether \
+             its `detail` can now carry contract text:\n{body}"
         );
     }
 
@@ -3296,12 +3380,17 @@ mod tests {
     /// Pin: every `Inconclusive` variant carrying text is reported by
     /// [`inconclusive_detail`].
     ///
-    /// That match needs a wildcard arm, because `Inconclusive` is
-    /// `#[non_exhaustive]` and this crate cannot match it exhaustively. A wildcard
-    /// is precisely how the text was lost the first time, so a new text-carrying
-    /// variant would land in it and be silently undiagnosable again with every test
-    /// still green. Scraping the source is the only check available here, since the
-    /// compiler cannot be made to demand the coverage.
+    /// That match needs a wildcard arm, because `Inconclusive` is `#[non_exhaustive]`
+    /// and this crate cannot match it exhaustively. A wildcard is precisely how the
+    /// text was lost the first time, so a new text-carrying variant would land in it
+    /// and be silently undiagnosable again with every test still green. Scraping the
+    /// source is the only check available, since the compiler cannot be made to
+    /// demand the coverage.
+    ///
+    /// "Carries text" is deliberately matched on the whole variant declaration rather
+    /// than the literal `Name(String),` shape: `Foo(String, usize)`, `Foo(Box<str>)`
+    /// and `Foo { reason: String }` all carry text and all slip past a suffix match,
+    /// which would leave the pin guarding only the three variants that already exist.
     #[test]
     fn inconclusive_detail_covers_every_text_carrying_variant() {
         let enum_src = include_str!("../../core/src/conformance/property.rs");
@@ -3311,17 +3400,59 @@ mod tests {
         let body = &enum_src[start..];
         let body = &body[..body.find("\n}").expect("Inconclusive has no closing brace")];
 
-        let text_carrying: Vec<&str> = body
-            .lines()
-            .filter_map(|line| line.trim().strip_suffix("(String),"))
+        // Accumulate each variant's full declaration, so a multi-line struct variant
+        // is judged as one unit rather than line by line.
+        let mut variants: Vec<(String, String)> = Vec::new();
+        let mut pending = String::new();
+        for line in body.lines().skip(1) {
+            let trimmed = line.trim();
+            if trimmed.starts_with("///") || trimmed.starts_with("#[") || trimmed.is_empty() {
+                continue;
+            }
+            pending.push_str(trimmed);
+            pending.push(' ');
+            // A declaration ends at the comma that closes it, once brackets balance.
+            let balanced = pending.matches('(').count() == pending.matches(')').count()
+                && pending.matches('{').count() == pending.matches('}').count();
+            if !(trimmed.ends_with(',') && balanced) {
+                continue;
+            }
+            let declaration = std::mem::take(&mut pending);
+            let name: String = declaration
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                variants.push((name, declaration));
+            }
+        }
+
+        let text_carrying: Vec<&str> = variants
+            .iter()
+            .filter(|(_, declaration)| {
+                declaration.contains("String") || declaration.contains("str")
+            })
+            .map(|(name, _)| name.as_str())
             .collect();
-        // Fail closed. If the scrape silently matched nothing, every assertion below
-        // would pass vacuously and the pin would guard the wildcard it exists for
-        // by doing nothing at all.
+
+        // Fail closed, on both halves. If the scrape silently matched nothing, or
+        // matched only text-carrying variants, every assertion below would pass
+        // vacuously and the pin would guard the wildcard by doing nothing at all.
+        assert!(
+            variants.len() >= 8,
+            "the variant scrape broke: found {} declaration(s) in an enum that has \
+             far more: {variants:?}",
+            variants.len()
+        );
         assert!(
             text_carrying.len() >= 3,
-            "expected to find the known text-carrying variants (ContractError, \
+            "expected at least the known text-carrying variants (ContractError, \
              ResourceLimit, MalformedCase); the scrape found {text_carrying:?}"
+        );
+        assert!(
+            variants.len() > text_carrying.len(),
+            "every variant was judged text-carrying, so the filter is matching \
+             something other than what it claims: {variants:?}"
         );
 
         let detail_src = include_str!("conformance.rs");
@@ -3333,7 +3464,7 @@ mod tests {
 
         for variant in text_carrying {
             assert!(
-                fn_body.contains(&format!("Inconclusive::{variant}(")),
+                fn_body.contains(&format!("Inconclusive::{variant}")),
                 "Inconclusive::{variant} carries text but inconclusive_detail does \
                  not report it, so it would vanish into the wildcard arm and be \
                  undiagnosable from the tool's output - the exact defect #5461 fixed"
@@ -3341,6 +3472,10 @@ mod tests {
         }
     }
 
+    /// The whole point of the channel: a code diagnostic is DIAGNOSTIC. It must
+    /// not be counted as a violation, and it must not fail the command — a
+    /// deprecation notice that broke every affected author's build in release
+    /// *n* would make the two-release notice period meaningless.
     #[test]
     fn a_code_diagnostic_is_never_removal_eligible() {
         let outcomes = vec![(
