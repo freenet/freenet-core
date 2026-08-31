@@ -767,6 +767,38 @@ pub enum Inconclusive {
     NotReproducible,
 }
 
+impl Inconclusive {
+    /// The text this variant carries, where it carries one.
+    ///
+    /// Deliberately exhaustive, with NO wildcard arm, and deliberately HERE rather
+    /// than in the tool that formats it. `#[non_exhaustive]` stops other crates
+    /// matching exhaustively, so `fdev`'s report had to use a wildcard - and a
+    /// wildcard is how the contract's own error text came to be dropped for every
+    /// `ContractError`, hiding the second-largest inconclusive class behind a bare
+    /// count (#5461).
+    ///
+    /// Inside the defining crate the compiler CAN enforce the coverage, so it does:
+    /// adding a variant in any shape - `Foo(String)`, `Foo(Box<str>)`,
+    /// `Foo { reason: String }` - fails the build here until it says whether it
+    /// carries text. The `Display` impl below already depends on the same property,
+    /// so this is a demonstrated guarantee rather than a hopeful one, and it replaces
+    /// a source-scraping test that could only ever recognise one syntactic shape.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Inconclusive::ContractError(text)
+            | Inconclusive::ResourceLimit(text)
+            | Inconclusive::MalformedCase(text) => Some(text),
+            Inconclusive::InputNotValid
+            | Inconclusive::RelatedRequired
+            | Inconclusive::NoOutputState
+            | Inconclusive::RoundLimit
+            | Inconclusive::NoDeltaPath
+            | Inconclusive::StateNotSettled
+            | Inconclusive::NotReproducible => None,
+        }
+    }
+}
+
 impl std::fmt::Display for Inconclusive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

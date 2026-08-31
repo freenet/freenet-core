@@ -1551,17 +1551,13 @@ fn inconclusive_label(reason: &Inconclusive) -> &'static str {
 /// measured on a 64-bundle live corpus, 435 of 2,622 inconclusive cases were
 /// `contract error` and not one of them could be read (#5461).
 ///
-/// The wildcard arm is forced - `Inconclusive` is `#[non_exhaustive]` - and it is
-/// exactly how the text was lost in the first place, so a source pin
-/// (`inconclusive_detail_covers_every_text_carrying_variant`) fails the build if a
-/// new text-carrying variant is added without being listed here.
+/// Delegates to [`Inconclusive::detail`] rather than matching here. This crate
+/// cannot match `#[non_exhaustive]` exhaustively, so any match written at this end
+/// needs a wildcard arm - and the wildcard is exactly how the text was lost the
+/// first time. Owning the answer in the defining crate makes the compiler refuse a
+/// new variant that has not declared whether it carries text.
 fn inconclusive_detail(reason: &Inconclusive) -> Option<&str> {
-    match reason {
-        Inconclusive::ContractError(text)
-        | Inconclusive::ResourceLimit(text)
-        | Inconclusive::MalformedCase(text) => Some(text),
-        _ => None,
-    }
+    reason.detail()
 }
 
 /// Make a contract-authored string safe and bounded for the report.
@@ -3007,23 +3003,31 @@ mod tests {
         assert_eq!(code_diagnostics(&wasm), Vec::new());
     }
 
-    /// Build a report whose only outcomes are inconclusive contract errors.
-    fn report_from_contract_errors(messages: &[&str]) -> Report {
-        let outcomes: Vec<(ConformanceCase, PropertyOutcome)> = messages
-            .iter()
-            .map(|message| {
+    /// Build a report whose only outcomes are the given inconclusive reasons.
+    fn report_from_inconclusive(reasons: Vec<Inconclusive>) -> Report {
+        let outcomes: Vec<(ConformanceCase, PropertyOutcome)> = reasons
+            .into_iter()
+            .map(|reason| {
                 (
                     ConformanceCase::new(
                         ConformanceProperty::StateCommutativity,
                         vec![Bytes::from(vec![1u8]), Bytes::from(vec![2u8])],
                     ),
-                    PropertyOutcome::Inconclusive(Inconclusive::ContractError(
-                        (*message).to_string(),
-                    )),
+                    PropertyOutcome::Inconclusive(reason),
                 )
             })
             .collect();
         Report::build(&Corpus::default(), &outcomes, None, Vec::new())
+    }
+
+    /// Build a report whose only outcomes are inconclusive contract errors.
+    fn report_from_contract_errors(messages: &[&str]) -> Report {
+        report_from_inconclusive(
+            messages
+                .iter()
+                .map(|m| Inconclusive::ContractError((*m).to_string()))
+                .collect(),
+        )
     }
 
     use super::stdout_purity_pin::code_only;
@@ -3079,26 +3083,39 @@ mod tests {
         );
     }
 
-    /// A reason that carries no text must not grow an empty example list in the
-    /// human output.
+    /// A reason that carries no text is still counted, and grows no example lines.
     ///
-    /// Most inconclusive reasons carry nothing (`RoundLimit`, `RelatedRequired`),
-    /// and they are the majority of a real run. If the new lines fired for them too,
-    /// every clean-ish report would gain blank noise.
+    /// Two properties, because they fail in opposite directions. Most inconclusive
+    /// reasons carry nothing (`RoundLimit`, `RelatedRequired`) and are the bulk of a
+    /// real run: if the new example lines fired for them, every report would gain
+    /// blank noise; if the tally were moved inside the has-text branch, every one of
+    /// them would report `: 0` and the majority of the summary would read as empty.
     #[test]
-    fn a_textless_reason_reports_no_examples() {
-        let outcomes = vec![(
-            ConformanceCase::new(
-                ConformanceProperty::StateCommutativity,
-                vec![Bytes::from(vec![1u8])],
-            ),
-            PropertyOutcome::Inconclusive(Inconclusive::RoundLimit),
-        )];
-        let report = Report::build(&Corpus::default(), &outcomes, None, Vec::new());
-        let reason = &report.inconclusive_reasons[0];
-        assert!(reason.examples.is_empty());
-    }
+    fn a_textless_reason_is_counted_and_reports_no_examples() {
+        let report = report_from_inconclusive(vec![
+            Inconclusive::RoundLimit,
+            Inconclusive::RoundLimit,
+            Inconclusive::RoundLimit,
+        ]);
 
+        let reason = &report.inconclusive_reasons[0];
+        assert_eq!(
+            reason.occurrences, 3,
+            "a reason that carries no text must still be counted; counting only \
+             text-carrying cases empties the majority of a real run's summary"
+        );
+        assert!(reason.examples.is_empty());
+
+        let rendered = render_human(&report);
+        assert!(
+            !rendered.contains("further distinct message(s)"),
+            "the hidden-tail line fired for a reason with nothing to hide:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("may contain application state"),
+            "the sensitivity note fired for a report with no contract text in it:\n{rendered}"
+        );
+    }
     /// The readability cap trims the HUMAN report only, and says what it hid.
     ///
     /// The cap exists because the count of distinct texts is bounded only by the
@@ -3153,55 +3170,57 @@ mod tests {
 
     /// Equal counts must order deterministically, for messages and for reasons.
     ///
-    /// The reason tally is drained through a `HashMap`, whose iteration order is
-    /// randomly seeded per process, so two equally-frequent reasons came out in a
-    /// different order on each run over the same corpus. Comparing two runs is the
-    /// normal way to check whether a contract fix helped, and it is worthless
-    /// against a report that reshuffles itself.
+    /// The reason tally is drained through a `HashMap` whose iteration order is
+    /// randomly seeded, so equally-frequent reasons came out differently on each run
+    /// over the same corpus. Comparing two runs is the normal way to check whether a
+    /// contract fix helped, and it is worthless against a report that reshuffles
+    /// itself.
     ///
-    /// The message half below is belt-and-braces: those come from a `BTreeMap`
-    /// through a stable sort, so they were already ordered. The reason half is the
-    /// one that was genuinely unstable.
+    /// FOUR equal-count reasons, rebuilt twenty times, deliberately. An earlier
+    /// version used two, which a stable sort orders correctly by luck about half the
+    /// time - so on a single CI run a regression had even odds of merging. Four
+    /// reasons give twenty-four permutations, and each rebuild draws a fresh
+    /// `HashMap` seed, so an unordered implementation has no realistic chance of
+    /// passing.
+    ///
+    /// The message half is belt-and-braces: those come from a `BTreeMap` through a
+    /// stable sort, so they were already ordered. The reason half was the unstable
+    /// one.
     #[test]
     fn equal_counts_order_deterministically() {
-        let report = report_from_contract_errors(&["b failure", "a failure"]);
-        let texts: Vec<&str> = contract_error_bucket(&report)
+        let message_report = report_from_contract_errors(&["b failure", "a failure"]);
+        let texts: Vec<&str> = contract_error_bucket(&message_report)
             .examples
             .iter()
             .map(|e| e.text.as_str())
             .collect();
         assert_eq!(texts, vec!["a failure", "b failure"]);
 
-        let case = || {
-            ConformanceCase::new(
-                ConformanceProperty::StateCommutativity,
-                vec![Bytes::from(vec![1u8])],
-            )
-        };
-        let outcomes = vec![
-            (
-                case(),
-                PropertyOutcome::Inconclusive(Inconclusive::RoundLimit),
-            ),
-            (
-                case(),
-                PropertyOutcome::Inconclusive(Inconclusive::ContractError("boom".to_string())),
-            ),
+        let expected = vec![
+            "contract error",
+            "input not valid",
+            "reconciliation round budget exhausted",
+            "requires related contract state",
         ];
-        let report = Report::build(&Corpus::default(), &outcomes, None, Vec::new());
-        let reasons: Vec<&str> = report
-            .inconclusive_reasons
-            .iter()
-            .map(|r| r.reason)
-            .collect();
-        assert_eq!(
-            reasons,
-            vec!["contract error", "reconciliation round budget exhausted"],
-            "two reasons with equal counts must order by label, not by whatever \
-             the hash map happened to yield on this run"
-        );
+        for round in 0..20 {
+            let report = report_from_inconclusive(vec![
+                Inconclusive::RoundLimit,
+                Inconclusive::RelatedRequired,
+                Inconclusive::ContractError("boom".to_string()),
+                Inconclusive::InputNotValid,
+            ]);
+            let reasons: Vec<&str> = report
+                .inconclusive_reasons
+                .iter()
+                .map(|r| r.reason)
+                .collect();
+            assert_eq!(
+                reasons, expected,
+                "round {round}: reasons with equal counts must order by label, not \
+                 by whatever the hash map yielded this time"
+            );
+        }
     }
-
     /// A contract-authored message must not be able to forge report lines.
     ///
     /// This text is written by the contract under test, which is the thing we are
@@ -3256,6 +3275,146 @@ mod tests {
             MAX_INCONCLUSIVE_EXAMPLE_CHARS + 1
         );
         assert!(presented.ends_with('\u{2026}'));
+    }
+
+    /// Every text-carrying reason reaches the report, not just `ContractError`.
+    ///
+    /// `ResourceLimit` and `MalformedCase` carry text for the same reason and had no
+    /// behavioural coverage at all: dropping them from the accessor left every test
+    /// green. `ContractError` is merely the one that dominates a real corpus.
+    #[test]
+    fn resource_limit_and_malformed_case_text_reaches_the_report_too() {
+        for (reason, label, text) in [
+            (
+                Inconclusive::ResourceLimit("fuel exhausted".to_string()),
+                "resource limit hit",
+                "fuel exhausted",
+            ),
+            (
+                Inconclusive::MalformedCase("needs two states".to_string()),
+                "malformed case",
+                "needs two states",
+            ),
+        ] {
+            let report = report_from_inconclusive(vec![reason]);
+            let bucket = report
+                .inconclusive_reasons
+                .iter()
+                .find(|r| r.reason == label)
+                .unwrap_or_else(|| panic!("no {label} bucket in the report"));
+
+            assert_eq!(
+                bucket
+                    .examples
+                    .iter()
+                    .map(|e| e.text.as_str())
+                    .collect::<Vec<_>>(),
+                vec![text],
+                "{label} carries text that never reached the report"
+            );
+            assert!(render_human(&report).contains(text));
+        }
+    }
+
+    /// Each message is printed under the reason it belongs to.
+    ///
+    /// Every other rendering test builds a report with ONE inconclusive reason, so
+    /// the association between a bucket and its texts was never exercised - and that
+    /// association is the entire point of the change. Moving the example loop out of
+    /// the reason loop, so all messages print together at the end, passed the whole
+    /// suite.
+    #[test]
+    fn each_message_prints_under_its_own_reason() {
+        let report = report_from_inconclusive(vec![
+            Inconclusive::ContractError("rejected by contract".to_string()),
+            Inconclusive::ResourceLimit("fuel exhausted".to_string()),
+        ]);
+        let rendered = render_human(&report);
+
+        let position = |needle: &str| {
+            rendered
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing from:\n{rendered}"))
+        };
+        let contract_header = position("contract error:");
+        let resource_header = position("resource limit hit:");
+        let contract_text = position("rejected by contract");
+        let resource_text = position("fuel exhausted");
+
+        // Each message must sit between its own header and the next one, which is
+        // what "attributed to its bucket" means in a flat text report.
+        assert!(
+            contract_header < contract_text && contract_text < resource_header,
+            "the contract-error message is not under the contract-error \
+             heading:\n{rendered}"
+        );
+        assert!(
+            resource_header < resource_text,
+            "the resource-limit message is not under its heading:\n{rendered}"
+        );
+    }
+
+    /// `--json` must actually carry the examples.
+    ///
+    /// Only the human half was asserted, so a `#[serde(skip)]` on `examples` passed
+    /// the suite. That matters more now the two formats deliberately DIFFER - human
+    /// capped, JSON complete - because a reader cannot otherwise tell the design
+    /// from a bug.
+    #[test]
+    fn the_json_report_carries_the_examples() {
+        let report = report_from_contract_errors(&["signature check failed"]);
+        let json = serde_json::to_string(&report).expect("the report must serialize");
+
+        assert!(
+            json.contains("\"examples\""),
+            "the examples field never reached --json: {json}"
+        );
+        assert!(
+            json.contains("signature check failed"),
+            "--json carries the field but not the text: {json}"
+        );
+        assert!(
+            json.contains("\"occurrences\":1"),
+            "--json dropped the per-message count: {json}"
+        );
+    }
+
+    /// The human report prints the per-message case count, not just the text.
+    ///
+    /// The counts were asserted on the struct and only `contains(text)` on the
+    /// rendering, so the breakdown that answers "one bug or eight" could vanish from
+    /// what a human actually reads while the test protecting it stayed green.
+    #[test]
+    fn the_human_report_prints_each_messages_case_count() {
+        let report = report_from_contract_errors(&["twice", "twice", "once"]);
+        let rendered = render_human(&report);
+
+        assert!(
+            rendered.contains("2 cases \u{2014} \"twice\""),
+            "the per-message case count is missing from the rendering:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("1 case \u{2014} \"once\""),
+            "a single case must read \"1 case\", not \"1 case(s)\":\n{rendered}"
+        );
+    }
+
+    /// Escaping happens BEFORE truncation, so the cap bounds what is printed.
+    ///
+    /// Truncating the raw text first and escaping after leaves the cap describing
+    /// what was parsed rather than what appears: 200 control characters would print
+    /// as 1,200. The rustdoc claimed this ordering with nothing asserting it.
+    #[test]
+    fn the_cap_bounds_what_is_printed_not_what_was_parsed() {
+        let presented = present_detail(&"\u{7}".repeat(MAX_INCONCLUSIVE_EXAMPLE_CHARS));
+
+        assert_eq!(
+            presented.chars().count(),
+            MAX_INCONCLUSIVE_EXAMPLE_CHARS + 1,
+            "each bell character escapes to six, so truncating before escaping \
+             would print far past the cap: {presented}"
+        );
+        assert!(presented.starts_with("\\u{7}"));
     }
 
     /// Pin: `present_detail` hands `take_presented` a LAZY iterator.
@@ -3354,12 +3513,28 @@ mod tests {
     /// Truncation slices on a character boundary.
     ///
     /// Slicing a `String` at a byte offset panics when a multi-byte character
-    /// straddles it, and the bytes here are chosen by the contract under test — so a
+    /// straddles it, and the bytes here are chosen by the contract under test - so a
     /// byte-offset cap would be a contract-triggerable crash of the entire run,
     /// taking every other case's result with it.
+    ///
+    /// The fixture's sensitivity is load-bearing and non-obvious: `str::escape_debug`
+    /// escapes a grapheme-extending character only when it BEGINS the string, so
+    /// `"e\u{301}"` repeated stays multi-byte all the way through escaping and the
+    /// byte at the cap lands mid-character. Lead with the combining mark, or pick a
+    /// character that escaping turns into ASCII, and this silently becomes an
+    /// all-ASCII test that still passes while guarding nothing. The assertion below
+    /// pins that the escaped form really is still multi-byte.
     #[test]
     fn a_long_multibyte_message_is_truncated_without_panicking() {
-        let presented = present_detail(&"e\u{301}".repeat(MAX_INCONCLUSIVE_EXAMPLE_CHARS * 2));
+        let message = "e\u{301}".repeat(MAX_INCONCLUSIVE_EXAMPLE_CHARS * 2);
+        let escaped: String = message.escape_debug().collect();
+        assert!(
+            escaped.len() > escaped.chars().count(),
+            "the fixture stopped being multi-byte after escaping, so it no longer \
+             exercises a byte-offset slice at all"
+        );
+
+        let presented = present_detail(&message);
         assert_eq!(
             presented.chars().count(),
             MAX_INCONCLUSIVE_EXAMPLE_CHARS + 1,
@@ -3367,7 +3542,6 @@ mod tests {
         );
         assert!(presented.ends_with('\u{2026}'));
     }
-
     /// A message at or under the cap is reported whole, with no ellipsis.
     ///
     /// The counterpart to the test above: a cap that fired on everything would
@@ -3375,101 +3549,6 @@ mod tests {
     #[test]
     fn a_short_message_is_not_truncated() {
         assert_eq!(present_detail("stale nonce"), "stale nonce");
-    }
-
-    /// Pin: every `Inconclusive` variant carrying text is reported by
-    /// [`inconclusive_detail`].
-    ///
-    /// That match needs a wildcard arm, because `Inconclusive` is `#[non_exhaustive]`
-    /// and this crate cannot match it exhaustively. A wildcard is precisely how the
-    /// text was lost the first time, so a new text-carrying variant would land in it
-    /// and be silently undiagnosable again with every test still green. Scraping the
-    /// source is the only check available, since the compiler cannot be made to
-    /// demand the coverage.
-    ///
-    /// "Carries text" is deliberately matched on the whole variant declaration rather
-    /// than the literal `Name(String),` shape: `Foo(String, usize)`, `Foo(Box<str>)`
-    /// and `Foo { reason: String }` all carry text and all slip past a suffix match,
-    /// which would leave the pin guarding only the three variants that already exist.
-    #[test]
-    fn inconclusive_detail_covers_every_text_carrying_variant() {
-        let enum_src = include_str!("../../core/src/conformance/property.rs");
-        let start = enum_src
-            .find("pub enum Inconclusive {")
-            .expect("the Inconclusive enum moved; this pin can no longer find it");
-        let body = &enum_src[start..];
-        let body = &body[..body.find("\n}").expect("Inconclusive has no closing brace")];
-
-        // Accumulate each variant's full declaration, so a multi-line struct variant
-        // is judged as one unit rather than line by line.
-        let mut variants: Vec<(String, String)> = Vec::new();
-        let mut pending = String::new();
-        for line in body.lines().skip(1) {
-            let trimmed = line.trim();
-            if trimmed.starts_with("///") || trimmed.starts_with("#[") || trimmed.is_empty() {
-                continue;
-            }
-            pending.push_str(trimmed);
-            pending.push(' ');
-            // A declaration ends at the comma that closes it, once brackets balance.
-            let balanced = pending.matches('(').count() == pending.matches(')').count()
-                && pending.matches('{').count() == pending.matches('}').count();
-            if !(trimmed.ends_with(',') && balanced) {
-                continue;
-            }
-            let declaration = std::mem::take(&mut pending);
-            let name: String = declaration
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if !name.is_empty() {
-                variants.push((name, declaration));
-            }
-        }
-
-        let text_carrying: Vec<&str> = variants
-            .iter()
-            .filter(|(_, declaration)| {
-                declaration.contains("String") || declaration.contains("str")
-            })
-            .map(|(name, _)| name.as_str())
-            .collect();
-
-        // Fail closed, on both halves. If the scrape silently matched nothing, or
-        // matched only text-carrying variants, every assertion below would pass
-        // vacuously and the pin would guard the wildcard by doing nothing at all.
-        assert!(
-            variants.len() >= 8,
-            "the variant scrape broke: found {} declaration(s) in an enum that has \
-             far more: {variants:?}",
-            variants.len()
-        );
-        assert!(
-            text_carrying.len() >= 3,
-            "expected at least the known text-carrying variants (ContractError, \
-             ResourceLimit, MalformedCase); the scrape found {text_carrying:?}"
-        );
-        assert!(
-            variants.len() > text_carrying.len(),
-            "every variant was judged text-carrying, so the filter is matching \
-             something other than what it claims: {variants:?}"
-        );
-
-        let detail_src = include_str!("conformance.rs");
-        let fn_start = detail_src
-            .find("fn inconclusive_detail(")
-            .expect("inconclusive_detail moved; this pin can no longer find it");
-        let fn_body = &detail_src[fn_start..];
-        let fn_body = &fn_body[..fn_body.find("\n}").expect("inconclusive_detail has no end")];
-
-        for variant in text_carrying {
-            assert!(
-                fn_body.contains(&format!("Inconclusive::{variant}")),
-                "Inconclusive::{variant} carries text but inconclusive_detail does \
-                 not report it, so it would vanish into the wildcard arm and be \
-                 undiagnosable from the tool's output - the exact defect #5461 fixed"
-            );
-        }
     }
 
     /// The whole point of the channel: a code diagnostic is DIAGNOSTIC. It must
