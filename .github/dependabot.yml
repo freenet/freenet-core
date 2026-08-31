@@ -158,6 +158,12 @@ updates:
           - "minor"
           - "patch"
 
-# Test-fixture crates under tests/ (each its own detached workspace) are
-# deliberately NOT listed. Their compiled wasm is the fixture; bumping their
-# dependencies changes what the tests are testing.
+# Test-fixture crates under tests/ that declare their OWN `[workspace]` are not
+# listed here: their compiled wasm IS the fixture, so bumping their dependencies
+# changes what the tests are testing.
+#
+# That cover is only partial, and deliberately so. tests/test-contract-integration,
+# tests/test-contract-mock-aligned and tests/test-contract-update-nochange ARE root
+# workspace members, so the cargo entry above does reach them through the shared
+# Cargo.lock. Likewise crates/website-contract and apps/freenet-ping/contracts/ping.
+# That predates this config and is not changed by it.
