@@ -1243,18 +1243,64 @@ async fn drive_relay_request_update(
     Ok(())
 }
 
-/// On a queue-full broadcast drop, emit a RATE-LIMITED `ResyncRequest` to the
-/// sender so it clears its poisoned summary cache of us and re-sends the change
-/// it believes we already have (#4857).
+/// Why an inbound broadcast was dropped, for
+/// [`send_dropped_broadcast_resync_request`]'s telemetry.
 ///
-/// A `ContractQueueFull` drop is SILENT: the receiver never applied the delta /
-/// full state, but the SENDER cached its own summary as ours on send-Ok
+/// The repair is identical for both — the sender's summary cache is poisoned
+/// the same way either way — but the OPERATOR reading `resync_request_sent`
+/// needs to tell them apart: a queue-full drop means this node's executor is
+/// saturated, a rate-limited drop means the `(sender, contract)` pair exceeded
+/// the dispatch budget in `crate::ring::update_rate_limit`. Those call for
+/// different responses, so they must not share one label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DroppedBroadcastReason {
+    /// `ContractQueueFull` from the executor (#4857).
+    QueueFull,
+    /// Refused by the per-(sender, contract) UPDATE dispatch rate limiter
+    /// in `node.rs` before any driver ran (#5510).
+    RateLimited,
+}
+
+impl DroppedBroadcastReason {
+    /// Stable telemetry label. `"queue_full"` is preserved verbatim from the
+    /// pre-#5510 log line so existing operator greps keep working.
+    fn as_str(self) -> &'static str {
+        match self {
+            DroppedBroadcastReason::QueueFull => "queue_full",
+            DroppedBroadcastReason::RateLimited => "rate_limited",
+        }
+    }
+}
+
+/// On a DROPPED inbound broadcast, emit a RATE-LIMITED `ResyncRequest` to the
+/// sender so it clears its poisoned summary cache of us and re-sends the change
+/// it believes we already have (#4857, #5510).
+///
+/// Two distinct drops land here, and the reason they need the SAME repair is
+/// the reason they are handled by one helper:
+///
+/// - `ContractQueueFull` at the executor (#4857) — the delta / full state
+///   reached this node but was never applied.
+/// - Refusal by the dispatch rate limiter in `node.rs` (#5510) — the payload
+///   never even reached a driver. `reason` distinguishes the two in telemetry;
+///   see `DroppedBroadcastReason`.
+///
+/// Both are SILENT to the sender: it cached its own summary as ours on send-Ok
 /// (`broadcast_queue.rs::record_delivery_to_interest`), so it believes we are
-/// current and will never re-send the dropped change. Left unhealed, a
-/// rarely-changing field (member_info, a ban, a config) diverges permanently
-/// until the ~5-min InterestSync heartbeat happens to correct it. An inbound
-/// `ResyncRequest` makes the sender clear that cached summary (node.rs handler)
-/// and re-send full state.
+/// current and will never re-send the dropped change. Since #5464 the payload
+/// is a true difference against that belief, so once the belief is wrong the
+/// lost entries are excluded from every LATER delta too — the divergence is
+/// permanent, not just delayed. Left unhealed, a rarely-changing field
+/// (member_info, a ban, a config) diverges until the InterestSync heartbeat
+/// happens to correct it, which is 300s at minimum and 40-75 min at field
+/// shared-set sizes since #5238/#5346. An inbound `ResyncRequest` makes the
+/// sender clear that cached summary (node.rs handler) and re-send full state.
+///
+/// The `ResyncRequest` this emits, and the `ResyncResponse` it provokes, both
+/// ride `NetMessageV1::InterestSync` — NOT `NetMessageV1::Update` — so neither
+/// is subject to the UPDATE dispatch rate limiter that caused the #5510 drop.
+/// The repair therefore cannot be silenced by the condition it repairs. do NOT
+/// move this repair onto an `Update` wire variant.
 ///
 /// Issue #4251 suppressed this entirely because one request per dropped delta
 /// amplifies into a full-state storm onto the same saturated queue (~40
@@ -1263,16 +1309,18 @@ async fn drive_relay_request_update(
 /// request per (contract, sender) per `RESYNC_REQUEST_MIN_INTERVAL`.
 ///
 /// Shared by both broadcast drivers (`drive_relay_broadcast_to` and
-/// `drive_relay_broadcast_to_streaming`) so the two queue-full paths cannot
-/// drift. The caller keeps auto-fetch suppressed on queue-full (we already hold
-/// the contract; a GET onto the same saturated queue is pure amplification).
+/// `drive_relay_broadcast_to_streaming`) and by the `node.rs` rate-limiter drop
+/// arm, so the three drop paths cannot drift. The queue-full callers keep
+/// auto-fetch suppressed (we already hold the contract; a GET onto the same
+/// saturated queue is pure amplification).
 ///
 /// do NOT re-add an unthrottled emission — see #4251/#4857.
-async fn send_queue_full_resync_request(
+pub(crate) async fn send_dropped_broadcast_resync_request(
     op_manager: &OpManager,
     key: ContractKey,
     sender_addr: SocketAddr,
     incoming_tx: Transaction,
+    reason: DroppedBroadcastReason,
 ) {
     // Gate 1 — per-(contract, sender)/30s throttle (#4857/#4862 + #4864 round-6).
     // RESERVE the window atomically (`begin` checks AND records under the
@@ -1291,7 +1339,8 @@ async fn send_queue_full_resync_request(
             contract = %key,
             sender = %sender_addr,
             event = "queue_full_resync_throttled",
-            "UPDATE relay: queue-full ResyncRequest throttled (rate limit) to avoid amplification"
+            reason = reason.as_str(),
+            "UPDATE relay: dropped-broadcast ResyncRequest throttled (rate limit) to avoid amplification"
         );
         return;
     };
@@ -1319,7 +1368,8 @@ async fn send_queue_full_resync_request(
             contract = %key,
             sender = %sender_addr,
             event = "queue_full_resync_suppressed_global",
-            "UPDATE relay: queue-full ResyncRequest suppressed by global per-contract cap"
+            reason = reason.as_str(),
+            "UPDATE relay: dropped-broadcast ResyncRequest suppressed by global per-contract cap"
         );
         return;
     }
@@ -1330,8 +1380,9 @@ async fn send_queue_full_resync_request(
         contract = %key,
         target = %sender_addr,
         event = "resync_request_sent",
-        reason = "queue_full",
-        "UPDATE relay: sending rate-limited ResyncRequest after queue-full drop (#4857)"
+        reason = reason.as_str(),
+        "UPDATE relay: sending rate-limited ResyncRequest after a dropped inbound \
+         broadcast (#4857/#5510)"
     );
     // #4864 round-8: record the outstanding request so the matching ResyncResponse
     // from this peer is authorized ONCE at the receive arm; an unsolicited or
@@ -1386,7 +1437,7 @@ async fn send_queue_full_resync_request(
         let op_mgr = op_manager.clone();
         GlobalExecutor::spawn(async move {
             let _slot = slot; // frees the node-wide retry slot on task exit
-            resend_queue_full_resync_request(
+            resend_dropped_broadcast_resync_request(
                 &op_mgr,
                 key,
                 sender_addr,
@@ -1401,7 +1452,7 @@ async fn send_queue_full_resync_request(
     // Immediate (first) ResyncRequest — blocking best-effort enqueue. The
     // #4862 trailing retry above re-sends the SAME request and relies on the ONE
     // correlation record made before the spawn — see
-    // `resend_queue_full_resync_request`.
+    // `resend_dropped_broadcast_resync_request`.
     if let Err(e) = op_manager
         .notify_node_event(NodeEvent::SendInterestMessage {
             target: sender_addr,
@@ -1428,7 +1479,7 @@ const QUEUE_FULL_RESYNC_MAX_RETRIES: u32 = 2;
 /// Base inter-attempt delay for queue-full `ResyncRequest` retries (#4857 P2).
 ///
 /// Linear backoff: the `attempt`-th retry waits ~`attempt * BASE` (±20%
-/// jitter), MEASURED ON THE THROTTLE'S CLOCK (see `resend_queue_full_resync_request`).
+/// jitter), MEASURED ON THE THROTTLE'S CLOCK (see `resend_dropped_broadcast_resync_request`).
 /// The worst-case total span (`sum_{n=1..=MAX} n * BASE * 1.2` = 3 · 2s · 1.2 =
 /// 7.2s for the current constants) stays comfortably under
 /// `RESYNC_REQUEST_MIN_INTERVAL` (30s); the retry is ALSO hard-stopped at the
@@ -1439,7 +1490,7 @@ const QUEUE_FULL_RESYNC_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 /// Poll granularity for the injected-clock retry wait (#4857 P2).
 ///
 /// The util `TimeSource` the throttle uses exposes only `now()` — no sleep — so
-/// `resend_queue_full_resync_request` waits by polling `interest_manager.now()`
+/// `resend_dropped_broadcast_resync_request` waits by polling `interest_manager.now()`
 /// in bounded `tokio` increments until the injected clock reaches the attempt's
 /// target (or the reservation deadline). Small enough that a retry fires
 /// promptly once the clock reaches its target; large enough that wakeups stay
@@ -1466,7 +1517,7 @@ fn jittered_resync_retry_delay(attempt: u32) -> Duration {
 /// Trailing best-effort re-dispatch of a queue-full `ResyncRequest` (#4857 P2).
 ///
 /// Runs as a short-lived fire-and-forget task spawned by
-/// [`send_queue_full_resync_request`] AFTER its immediate ResyncRequest, and
+/// [`send_dropped_broadcast_resync_request`] AFTER its immediate ResyncRequest, and
 /// ONLY when the throttle reservation was granted. It re-dispatches the same
 /// ResyncRequest up to [`QUEUE_FULL_RESYNC_MAX_RETRIES`] times with jittered
 /// backoff so a resync dropped by the lossy event-loop → `P2pBridge::try_send`
@@ -1535,7 +1586,7 @@ fn jittered_resync_retry_delay(attempt: u32) -> Duration {
 /// do NOT add a `begin_resync_request`/`resync_emit_limiter` call here, do NOT
 /// switch to a blocking `notify_node_event`, and do NOT drive the delay/deadline
 /// off a clock other than `interest_manager.now()` — see #4251/#4857/#4864.
-async fn resend_queue_full_resync_request(
+async fn resend_dropped_broadcast_resync_request(
     op_manager: &OpManager,
     key: ContractKey,
     sender_addr: SocketAddr,
@@ -2153,7 +2204,14 @@ async fn drive_relay_broadcast_to(
                 // change. Emit a rate-limited ResyncRequest so it re-syncs. The
                 // auto-fetch branch stays suppressed on queue-full (we already
                 // hold the contract). Shared with the streaming driver.
-                send_queue_full_resync_request(op_manager, key, sender_addr, incoming_tx).await;
+                send_dropped_broadcast_resync_request(
+                    op_manager,
+                    key,
+                    sender_addr,
+                    incoming_tx,
+                    DroppedBroadcastReason::QueueFull,
+                )
+                .await;
             }
             return Err(err);
         }
@@ -2954,7 +3012,14 @@ async fn apply_streaming_broadcast(
                 // deltas merge onto a diverged base WITHOUT error — the
                 // delta-apply-failure heal never fires. Emit the same
                 // rate-limited ResyncRequest as the non-streaming path.
-                send_queue_full_resync_request(op_manager, key, sender_addr, incoming_tx).await;
+                send_dropped_broadcast_resync_request(
+                    op_manager,
+                    key,
+                    sender_addr,
+                    incoming_tx,
+                    DroppedBroadcastReason::QueueFull,
+                )
+                .await;
             }
             return Err(err);
         }
@@ -3903,7 +3968,7 @@ mod tests {
     /// broadcast drop, BOTH broadcast drivers must emit a RATE-LIMITED
     /// `ResyncRequest` — neither suppress it (permanent divergence, #4857) nor
     /// emit it unthrottled (full-state storm, #4251). Both route through the
-    /// shared `send_queue_full_resync_request` helper, which gates the
+    /// shared `send_dropped_broadcast_resync_request` helper, which gates the
     /// `InterestMessage::ResyncRequest` emit behind BOTH the per-(contract, sender)
     /// `begin_resync_request` throttle AND the global per-contract
     /// `resync_emit_limiter` cap (each a `!gate { return; }` guard before the
@@ -3949,9 +4014,9 @@ mod tests {
         );
         let ns_arm = queue_full_arm(ns, "} else if queue_full {");
         assert!(
-            ns_arm.contains("send_queue_full_resync_request("),
+            ns_arm.contains("send_dropped_broadcast_resync_request("),
             "drive_relay_broadcast_to queue-full arm MUST delegate to \
-             send_queue_full_resync_request (heals #4857)"
+             send_dropped_broadcast_resync_request (heals #4857)"
         );
         assert!(
             !ns_arm.contains("try_auto_fetch_contract"),
@@ -3982,9 +4047,9 @@ mod tests {
         );
         let st_arm = queue_full_arm(st, "} else if queue_full {");
         assert!(
-            st_arm.contains("send_queue_full_resync_request("),
+            st_arm.contains("send_dropped_broadcast_resync_request("),
             "apply_streaming_broadcast queue-full arm MUST delegate to \
-             send_queue_full_resync_request — otherwise #4857 stays OPEN on the \
+             send_dropped_broadcast_resync_request — otherwise #4857 stays OPEN on the \
              streaming full-state path"
         );
         assert!(
@@ -4000,7 +4065,7 @@ mod tests {
         // lock) then RELEASED (`cancel`) if the global cap rejects (#4864 round-6
         // item 2), so concurrent callbacks can't both pass and a globally
         // suppressed emit does not burn the window.
-        let helper = fn_body("async fn send_queue_full_resync_request(");
+        let helper = fn_body("async fn send_dropped_broadcast_resync_request(");
         let per_sender = helper.find(".begin_resync_request(").expect(
             "helper must RESERVE the per-sender throttle atomically via \
              begin_resync_request (#4864 round-6 item 2)",
@@ -4851,8 +4916,8 @@ mod tests {
     fn queue_full_resync_helper_goes_through_global_emit_cap() {
         let src = include_str!("op_ctx_task.rs");
         let start = src
-            .find("async fn send_queue_full_resync_request(")
-            .expect("send_queue_full_resync_request not found");
+            .find("async fn send_dropped_broadcast_resync_request(")
+            .expect("send_dropped_broadcast_resync_request not found");
         let after = &src[start + 1..];
         let end = after
             .find("\nasync fn ")
@@ -4884,9 +4949,9 @@ mod tests {
         let prod_end = src.find("\nmod tests {").unwrap_or(src.len());
         let prod = &src[..prod_end];
 
-        // EXEMPT the #4862 queue-full RETRY (`resend_queue_full_resync_request`).
+        // EXEMPT the #4862 queue-full RETRY (`resend_dropped_broadcast_resync_request`).
         // It RE-DELIVERS an emit whose `outstanding_resync_requests.record(...)`
-        // was ALREADY made by `send_queue_full_resync_request` (the initial). It
+        // was ALREADY made by `send_dropped_broadcast_resync_request` (the initial). It
         // deliberately does NOT re-record, because re-recording would re-authorize
         // a REDUNDANT `ResyncResponse` — the opposite of round-8's drop-the-
         // redundant intent (and would re-run the full-state WASM merge the record
@@ -4895,8 +4960,8 @@ mod tests {
         // once that record is consumed, a further retry's response is correctly
         // dropped. So the retry's re-send is legitimately un-recorded — skip it.
         let retry_start = prod
-            .find("async fn resend_queue_full_resync_request(")
-            .expect("resend_queue_full_resync_request (the #4862 retry) not found");
+            .find("async fn resend_dropped_broadcast_resync_request(")
+            .expect("resend_dropped_broadcast_resync_request (the #4862 retry) not found");
         let retry_end = retry_start
             + 1
             + prod[retry_start + 1..]
@@ -5533,7 +5598,7 @@ mod tests {
     /// path (event loop → `P2pBridge::try_send`) and can be dropped under the
     /// same backpressure that caused the queue-full drop. If it is, the sender
     /// never clears its poisoned summary and a one-off change diverges until the
-    /// ~5-min heartbeat. `send_queue_full_resync_request` therefore schedules a
+    /// ~5-min heartbeat. `send_dropped_broadcast_resync_request` therefore schedules a
     /// BOUNDED trailing retry that re-dispatches the ResyncRequest within the
     /// single reserved throttle window.
     ///
@@ -5883,7 +5948,7 @@ mod tests {
         let reservation_deadline = op_manager.interest_manager.now() + Duration::from_secs(30);
 
         // This test drives the retry DIRECTLY, so it does what the real caller
-        // (`send_queue_full_resync_request`) does and records the outstanding
+        // (`send_dropped_broadcast_resync_request`) does and records the outstanding
         // request first.
         //
         // Note this record is INERT here, and deliberately so: the injected clock
@@ -5900,7 +5965,7 @@ mod tests {
 
         let op_mgr = op_manager.clone();
         let handle = tokio::spawn(async move {
-            resend_queue_full_resync_request(
+            resend_dropped_broadcast_resync_request(
                 &op_mgr,
                 key,
                 sender_addr,
@@ -5934,7 +5999,7 @@ mod tests {
     /// Issue #4862 (P1): the node-wide retry-task cap bounds outstanding retry
     /// tasks even when the throttle LRU evicts active reservations under key
     /// churn. Reserving up to the cap succeeds; the next reservation is refused
-    /// (so `send_queue_full_resync_request` skips the spawn — the immediate
+    /// (so `send_dropped_broadcast_resync_request` skips the spawn — the immediate
     /// ResyncRequest still sends); freeing a slot re-admits exactly one. The
     /// outstanding count never exceeds the cap (hard CAS cap). Uses a per-node
     /// OpManager so the count is isolated from other tests.
@@ -6023,7 +6088,7 @@ mod tests {
         // (~1.6-2.4s), so a fixed first target would exceed it.
         let reservation_deadline = op_manager.interest_manager.now() + Duration::from_millis(500);
         // Driving the retry DIRECTLY, so record the outstanding request the way
-        // the real caller (`send_queue_full_resync_request`) does — otherwise the
+        // the real caller (`send_dropped_broadcast_resync_request`) does — otherwise the
         // #4863 landed-gate skips every attempt and this test would fail for a
         // reason unrelated to the clamp it is pinning. (Unlike the frozen-clock
         // test, the gate IS reachable here — the 500ms deadline clamps the first
@@ -6034,7 +6099,7 @@ mod tests {
             .record(*key.id(), sender_addr);
         let op_mgr = op_manager.clone();
         let handle = tokio::spawn(async move {
-            resend_queue_full_resync_request(
+            resend_dropped_broadcast_resync_request(
                 &op_mgr,
                 key,
                 sender_addr,
@@ -6094,7 +6159,7 @@ mod tests {
         // per-(contract, sender) throttle reservation (`begin_resync_request`) and
         // the global per-contract emit cap (`resync_emit_limiter`, #4864) — so it
         // never runs on a throttled or globally-suppressed drop.
-        let helper = fn_body("async fn send_queue_full_resync_request(");
+        let helper = fn_body("async fn send_dropped_broadcast_resync_request(");
         let gate = helper
             .find(".begin_resync_request(")
             .expect("helper must gate on begin_resync_request (per-sender throttle, #4251)");
@@ -6102,7 +6167,7 @@ mod tests {
             .find("resync_emit_limiter")
             .expect("helper must gate on the global per-contract emit cap (#4864)");
         let spawn = helper
-            .find("resend_queue_full_resync_request(")
+            .find("resend_dropped_broadcast_resync_request(")
             .expect("helper must schedule the trailing retry (heal #4857 P2)");
         assert!(
             gate < spawn && global_cap < spawn,
@@ -6178,13 +6243,13 @@ mod tests {
         // ResyncResponse look unsolicited). So the retry creates no new
         // reservation and consumes no extra global token (storm bound #4251 /
         // #4864 cap).
-        let retry = fn_body("async fn resend_queue_full_resync_request(");
+        let retry = fn_body("async fn resend_dropped_broadcast_resync_request(");
         assert!(
             !retry.contains("begin_resync_request")
                 && !retry.contains("resync_emit_limiter")
                 && !retry.contains(".record(")
                 && !retry.contains(".consume("),
-            "resend_queue_full_resync_request must NOT re-consult the throttle or \
+            "resend_dropped_broadcast_resync_request must NOT re-consult the throttle or \
              the global emit cap, and must neither re-record NOR consume the \
              outstanding-request entry — its sends belong to the caller's single \
              granted reservation, and the entry's consumption belongs to the \

@@ -1679,6 +1679,18 @@ where
                             );
                         }
                         RateLimitDecision::Rejected { .. } | RateLimitDecision::Allowed => {
+                            // Per-drop detail stays at `debug!` (a rejected pair
+                            // is rejected on every message, so a per-drop
+                            // `info!` here would be the log flood it is meant
+                            // to report). The RELEASE-VISIBLE signal is emitted
+                            // by the limiter itself, throttled to one line per
+                            // minute with the sender, the contract and the
+                            // running total — see
+                            // `update_rate_limit::UpdateRateLimiter::log_rejected`.
+                            // Before #5510 this drop had NO release-visible
+                            // record at all: `release_max_level_info` compiles
+                            // `debug!` out, so a field node dropped broadcasts
+                            // with nothing to grep.
                             tracing::debug!(
                                 tx = %op.id(),
                                 %key,
@@ -1688,6 +1700,51 @@ where
                                 "UPDATE dispatch: rejected by per-(sender, contract) rate limit"
                             );
                         }
+                    }
+
+                    // #5510: a dropped BROADCAST needs a repair; a dropped
+                    // REQUEST does not.
+                    //
+                    // For the four `BroadcastTo*` variants the sender has
+                    // ALREADY cached its own summary as ours
+                    // (`broadcast_queue.rs::record_delivery_to_interest`
+                    // refreshes on a local enqueue, not on a receiver ack), and
+                    // since #5464 every later delta is a true difference
+                    // against that belief — so the entries in this dropped
+                    // message are excluded from every subsequent broadcast and
+                    // the two peers stay diverged. Nothing else heals it: the
+                    // delta-apply-failure `ResyncRequest` needs an apply that
+                    // FAILED, and nothing was applied here; anti-entropy is
+                    // 300s at minimum and 40-75 min at field shared-set sizes
+                    // (#5238/#5346). So route the drop into the same throttled
+                    // repair the queue-full drop uses.
+                    //
+                    // `RequestUpdate*` is deliberately NOT repaired: it is a
+                    // routed request whose originator observes the failure and
+                    // retries, and it caches no summary of us — emitting a
+                    // resync for it would be pure amplification onto a node
+                    // that is already refusing this sender's traffic.
+                    //
+                    // The repair rides `NetMessageV1::InterestSync`, a
+                    // different wire variant from `NetMessageV1::Update`, so
+                    // neither the `ResyncRequest` nor the `ResyncResponse` it
+                    // provokes is subject to THIS limiter. The repair cannot be
+                    // silenced by the condition it repairs.
+                    if matches!(
+                        op,
+                        update::UpdateMsg::BroadcastTo { .. }
+                            | update::UpdateMsg::BroadcastToV2 { .. }
+                            | update::UpdateMsg::BroadcastToStreaming { .. }
+                            | update::UpdateMsg::BroadcastToStreamingV2 { .. }
+                    ) {
+                        update::op_ctx_task::send_dropped_broadcast_resync_request(
+                            &op_manager,
+                            key,
+                            sender_addr,
+                            *op.id(),
+                            update::op_ctx_task::DroppedBroadcastReason::RateLimited,
+                        )
+                        .await;
                     }
                     return Ok(());
                 }

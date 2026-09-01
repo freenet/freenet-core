@@ -400,6 +400,13 @@ const MIN_TRACKED_SENDERS: usize = 64;
 /// too or it becomes the log flood it is meant to report.
 const NEW_PAIR_LOG_INTERVAL: Duration = EVICTION_LOG_INTERVAL;
 
+/// How often the per-pair rejection signal may write a log line.
+///
+/// Same reasoning again: a `(sender, contract)` pair over
+/// [`MIN_UPDATE_INTERVAL`] is over it on every message, so an unthrottled
+/// line here would be a flood on exactly the node under load.
+const REJECTED_LOG_INTERVAL: Duration = EVICTION_LOG_INTERVAL;
+
 /// Outcome of an at-capacity eviction pass.
 ///
 /// This is an enum rather than a count of removed entries because
@@ -591,6 +598,9 @@ pub(crate) struct UpdateRateLimiter {
     /// When the last new-pair-budget log line was written, for
     /// [`NEW_PAIR_LOG_INTERVAL`] throttling.
     last_new_pair_log: Mutex<Option<Instant>>,
+    /// When the last per-pair rejection log line was written, for
+    /// [`REJECTED_LOG_INTERVAL`] throttling.
+    last_rejected_log: Mutex<Option<Instant>>,
 }
 
 impl UpdateRateLimiter {
@@ -653,6 +663,7 @@ impl UpdateRateLimiter {
             new_pair_budget_rejected_total: AtomicU64::new(0),
             new_pair_budget_untracked_total: AtomicU64::new(0),
             last_new_pair_log: Mutex::new(None),
+            last_rejected_log: Mutex::new(None),
             last_accepted: DashMap::new(),
             size: AtomicUsize::new(0),
             min_interval,
@@ -728,6 +739,15 @@ impl UpdateRateLimiter {
                     let elapsed = now.saturating_duration_since(last);
                     if elapsed < self.min_interval {
                         self.rejected_total.fetch_add(1, Ordering::Relaxed);
+                        // Release the shard guard BEFORE taking the log
+                        // throttle's mutex. `log_new_pair_budget` is the only
+                        // lock this module takes under a `last_accepted` guard,
+                        // and its ordering is documented as having no
+                        // counterpart to invert against; keeping that true
+                        // means every OTHER lock is taken with no shard guard
+                        // held.
+                        drop(entry);
+                        self.log_rejected(now, sender, contract);
                         return RateLimitDecision::Rejected {
                             elapsed,
                             min_interval: self.min_interval,
@@ -1025,6 +1045,38 @@ impl UpdateRateLimiter {
              are being dropped. Its traffic for tracked pairs is unaffected. If this \
              peer is not churning contract ids, the budget is set too low for this \
              node's working set. Throttled to one line per minute."
+        );
+    }
+
+    /// Emit the per-pair rejection log line, at most once per
+    /// [`REJECTED_LOG_INTERVAL`].
+    ///
+    /// `info!` rather than `debug!` for the #4981 reason, and because #5510
+    /// showed the cost of not having it: `release_max_level_info` compiles
+    /// `debug!` out, so on a production node a rate-limited UPDATE — including
+    /// a co-host BROADCAST, which diverges the two peers permanently until it
+    /// is repaired — left no greppable evidence at all. The drop is now
+    /// repaired (`node.rs` routes a dropped broadcast into
+    /// `send_dropped_broadcast_resync_request`), and this line is how an
+    /// operator sees that it is happening.
+    ///
+    /// Throttled for the same reason the other two signals are: a pair over
+    /// the interval is over it on every message.
+    fn log_rejected(&self, now: Instant, sender: SocketAddr, contract: ContractInstanceId) {
+        if !log_due(&self.last_rejected_log, now, REJECTED_LOG_INTERVAL) {
+            return;
+        }
+        tracing::info!(
+            %sender,
+            %contract,
+            rejected_total = self.rejected_total.load(Ordering::Relaxed),
+            min_interval_ms = self.min_interval.as_millis() as u64,
+            "UPDATE rate limiter: dropping UPDATEs from a (sender, contract) pair \
+             that is exceeding the minimum inter-update interval. A dropped \
+             BROADCAST is repaired by a throttled ResyncRequest (#5510); a \
+             dropped request is retried by its originator. Sustained counts here \
+             mean co-host fan-out for this contract is outrunning the per-pair \
+             budget. Throttled to one line per minute."
         );
     }
 
