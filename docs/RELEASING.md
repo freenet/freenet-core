@@ -1,5 +1,17 @@
 # Cutting a Freenet release
 
+> **The AWS gateway was retired in September 2026.** References to it below that
+> remain are historical incident records (notably the v0.2.71 half-applied
+> rollout that motivated the post-deploy verify) and are kept deliberately —
+> they explain why a check exists. It is no longer a rollout target: the release
+> matrix, the manual SSH driver in `release.sh`, and `RELEASE_AGENT_HMAC_VEGA`
+> have all been removed. nova now runs two gateway processes; the second,
+> `freenet-gateway-2`, has no release-agent of its own and is brought up by the
+> primary's stop/start cycle, with `gateway-auto-update.sh` verifying it via the
+> `.wants` symlinks so a companion that fails to start is not reported as a
+> successful update.
+
+
 The release pipeline is fully automated. Any maintainer with workflow-run access
 can cut a release by triggering one workflow; everything else cascades:
 crates.io publish, GitHub release with binaries, gateway updates, and the
@@ -47,7 +59,7 @@ Within ~30–60 minutes you should see:
    crates.io → undraft.
 6. The undraft fires `release.published` → `Gateway Update` and
    `Release Announcements` both auto-trigger.
-7. nova and vega gateways converge to the new version (verified by the
+7. nova's gateways converge to the new version (verified by the
    workflow polling `/version` after the update).
 8. A Matrix message lands in `#freenet-locutus:matrix.org`. A River chat
    announcement is sent via nova's release-agent.
@@ -66,7 +78,6 @@ a `::warning::` annotation telling you what to fix.
 | `MATRIX_HOMESERVER_URL` | release-announce.yml | Matrix job warns + skips (success, no post). |
 | `MATRIX_ACCESS_TOKEN` | release-announce.yml | Matrix job warns + skips. |
 | `RELEASE_AGENT_HMAC_NOVA` | gateway-update.yml, release-announce.yml | nova update + River announce fail (HTTP 401). |
-| `RELEASE_AGENT_HMAC_VEGA` | gateway-update.yml | vega update fails (HTTP 401). |
 | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | cross-compile.yml `build-x86_64-windows` (Authenticode signing) | **Does NOT degrade gracefully — this one fails the release.** See "Windows code signing" below. |
 | `FREENET_RELEASE_SIGNING_KEY` | cross-compile.yml (`Sign SHA256SUMS.txt`) | Releases are UNSIGNED (no `SHA256SUMS.txt.sig` attached). Clients accept unsigned releases during the transition window (`REQUIRE_RELEASE_SIGNATURE = false`), but once that flag is flipped to `true` in a future release, unsigned releases are REFUSED by the auto-updater. PEM-encoded ed25519 private key whose public half is baked into the updater (`update.rs` `FREENET_RELEASE_PUBKEY`). |
 
@@ -378,7 +389,6 @@ gh workflow run release.yml
                     └─→ fires release.published event
                             └─→ gateway-update.yml fires
                                     └─→ POST /update to nova (HTTPS)
-                                    └─→ POST /update to vega (HTTPS:8443)
                             └─→ release-announce.yml fires
                                     └─→ Matrix message
                                     └─→ POST /announce/river to nova
@@ -393,7 +403,6 @@ gh workflow run release.yml
   show up here in rough chronological order.
 - **Gateway versions**:
   - `curl https://nova.locut.us/release-agent/version`
-  - `curl https://vega.locut.us:8443/release-agent/version`
 - **Bump PR**:
   `gh pr list --repo freenet/freenet-core --search "build: release"` —
   there should be exactly one open per release, gone within a few minutes.
@@ -599,7 +608,7 @@ Recovery:
    --force'`.
 3. Re-run the gateway-update workflow against just the failed gateway:
    `gh workflow run gateway-update.yml --field version=X.Y.Z --field
-   gateways=vega`.
+   gateways=nova`.
 
 ### River announcement failed but Matrix worked
 
@@ -1018,7 +1027,7 @@ verification skill if you have it):
 2. <https://github.com/freenet/freenet-core/releases/tag/vX.Y.Z> is
    published (not draft) with 14 assets.
 3. `curl https://nova.locut.us/release-agent/version` and
-   `curl https://vega.locut.us:8443/release-agent/version` both return the
+   `systemctl is-active freenet-gateway freenet-gateway-2` on nova returns the
    new version.
 4. Matrix room shows the announcement.
 5. `sudo journalctl -u freenet-gateway --since "30 min ago"` on each

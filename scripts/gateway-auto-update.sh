@@ -435,8 +435,45 @@ deploy_update() {
 # a missing unit, or a non-systemd host returns non-zero. `systemctl is-active`
 # is a read-only query and needs no root. Mirrors the release-agent's
 # version.rs::query_service_active so the script-side and HTTP-side gates agree.
+# Verify the deployed unit AND every companion unit configured to start with it.
+#
+# `WantedBy=` pulls a companion up when the primary starts, but systemd does NOT
+# propagate the companion's START FAILURE back to the primary — so a companion
+# that fails to come up leaves the primary active and this check green while a
+# gateway is silently down. Same shape as the v0.2.71 incident this function
+# exists for.
+#
+# nova runs exactly that: freenet-gateway-2 is a second gateway process with
+# `WantedBy=freenet-gateway.service` and no release-agent of its own.
+#
+# Companions are read from the `.wants` SYMLINKS on disk, deliberately NOT from
+# `systemctl show -p ConsistsOf`. ConsistsOf reflects the LOADED unit graph and
+# comes back EMPTY once the companion is stopped — so a ConsistsOf-based check
+# finds nothing to verify at exactly the moment it is needed and passes. That
+# was measured, not assumed. The symlinks are static configuration and are
+# present whether or not the unit is running.
+#
+# Reading from disk also survives the release-agent's `sudo` call, which strips
+# the environment — the same reason SERVICE_NAME forwarding is still unsolved
+# (see the note at the top of this file).
 verify_service_active() {
     local service_arg="$1"
+
+    local wants_dir companion cstate cname
+    for wants_dir in "/etc/systemd/system/$service_arg.service.wants" \
+                     "/usr/lib/systemd/system/$service_arg.service.wants"; do
+        [[ -d "$wants_dir" ]] || continue
+        for companion in "$wants_dir"/*.service; do
+            [[ -e "$companion" ]] || continue
+            cname=$(basename "$companion")
+            cstate=$(systemctl is-active "$cname" 2>/dev/null || true)
+            if [[ "$cstate" != "active" ]]; then
+                log ERROR "Companion unit '$cname' of '$service_arg' is '$cstate', not active; treating the update as failed"
+                return 1
+            fi
+            log INFO "Companion unit '$cname' is active"
+        done
+    done
 
     # Only systemd is supported by the automated update path (nova/vega). On a
     # host without systemctl we cannot confirm liveness; fail closed so a
