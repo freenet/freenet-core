@@ -690,7 +690,14 @@ impl Ring {
             broken_invariants: BrokenInvariantsTracker::new(time_source.clone()),
             governance,
             update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
-                time_source.clone(),
+                // Production passes `None` and gets `time_source` (the real
+                // clock). The override exists so a test can decide the
+                // limiter's verdict instead of racing MIN_UPDATE_INTERVAL —
+                // see `NodeConfig::update_rate_limit_time_source_override`.
+                config
+                    .update_rate_limit_time_source_override
+                    .clone()
+                    .unwrap_or_else(|| time_source.clone()),
                 max_connections,
             )),
             merge_backoff: Arc::new(merge_backoff::MergeBackoff::new(time_source.clone())),

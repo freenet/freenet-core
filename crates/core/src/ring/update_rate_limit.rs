@@ -2830,6 +2830,33 @@ mod tests {
              of release builds by release_max_level_info (#4981)"
         );
 
+        // The per-pair rejection line, in this file. Same role as the
+        // fresh-id-churn line above and the same reason: the dispatch
+        // site logs it at `debug!` on purpose (a rejected pair is
+        // rejected on every message), so THIS is the only
+        // release-visible evidence that broadcasts are being dropped.
+        // #5510 is what a missing signal here costs: co-hosts diverged
+        // permanently and a production node had nothing to grep.
+        let rejected_fn = strip_ws(fn_body(
+            this_file_raw,
+            "fn log_rejected(&self, now: Instant, sender: SocketAddr, contract: ContractInstanceId) {",
+            "per-pair-rejection",
+        ));
+        assert_eq!(
+            level_of(
+                &rejected_fn,
+                &strip_ws(concat!(
+                    "UPDATE rate limiter: dropping UPDATEs from a ",
+                    "(sender, contract) pair"
+                )),
+                "per-pair-rejection",
+            ),
+            strip_ws("tracing::info"),
+            "the per-pair rejection log must be emitted at info! or higher; debug! is compiled \
+             out of release builds by release_max_level_info, which is how the #5510 broadcast \
+             drops left no evidence on a production node"
+        );
+
         // The residual capacity drop, in the UPDATE dispatch path.
         let node_rs = strip_ws(include_str!("../node.rs"));
         assert_eq!(

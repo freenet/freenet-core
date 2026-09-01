@@ -488,6 +488,25 @@ pub struct NodeConfig {
     /// outside tests.
     #[serde(skip)]
     pub(crate) hosting_time_source_override: Option<crate::util::time_source::DynTimeSource>,
+
+    /// Optional clock override for the UPDATE dispatch rate limiter
+    /// (`crate::ring::update_rate_limit::UpdateRateLimiter`).
+    ///
+    /// SEPARATE from [`Self::hosting_time_source_override`] on purpose: the
+    /// hosting override is already read by several sims to compress hosting
+    /// TTLs, and folding the rate limiter onto it would silently change what
+    /// those sims measure. `None` in production, where the `Ring`'s default
+    /// `Arc<InstantTimeSrc>` is used.
+    ///
+    /// Exists so a test can decide the limiter's verdict rather than racing a
+    /// 100 ms wall-clock window: priming a `(sender, contract)` pair and then
+    /// dispatching a message that must be REJECTED is only deterministic if the
+    /// clock cannot advance in between (#5510).
+    ///
+    /// Not cfg-gated, for the same reason as `hosting_time_source_override`.
+    #[serde(skip)]
+    pub(crate) update_rate_limit_time_source_override:
+        Option<crate::util::time_source::DynTimeSource>,
 }
 
 impl NodeConfig {
@@ -672,6 +691,7 @@ impl NodeConfig {
             broadcast_target_list_floor_override: None,
             advertise_seeded_hosts: false,
             hosting_time_source_override: None,
+            update_rate_limit_time_source_override: None,
         })
     }
 
@@ -7167,6 +7187,223 @@ mod tests {
             }
             other => panic!("expected Some(ResyncResponse) for a held contract, got {other:?}"),
         }
+    }
+
+    /// #5510 behavioral reproduction: an inbound `BroadcastTo` REFUSED by the
+    /// UPDATE dispatch rate limiter MUST emit exactly one throttled
+    /// `ResyncRequest` back to the sender, and a refused `RequestUpdate` MUST
+    /// NOT.
+    ///
+    /// Why the asymmetry is the whole point of the test. The sender of a
+    /// broadcast has already cached its own summary as ours
+    /// (`broadcast_queue.rs::record_delivery_to_interest` refreshes on a local
+    /// enqueue, not on a receiver ack), and since #5464 every later broadcast
+    /// is a true difference against that belief — so the entries in the refused
+    /// message are excluded from every subsequent delta and the two peers stay
+    /// diverged permanently. Nothing else heals it: the delta-apply-failure
+    /// `ResyncRequest` needs an apply that FAILED, and nothing was applied.
+    /// A refused `RequestUpdate` is a routed request whose originator observes
+    /// the failure and caches no summary of us, so a resync for it would be
+    /// pure amplification onto a node already refusing this sender.
+    ///
+    /// On `origin/main` this FAILS at the first assertion: the rate-limiter arm
+    /// logs at `debug!` (compiled out of release builds) and `return Ok(())`,
+    /// so no repair is emitted and `first` is empty.
+    ///
+    /// DETERMINISM: the limiter's verdict is decided by a frozen
+    /// `SharedMockTimeSource` injected through
+    /// `NodeConfig::update_rate_limit_time_source_override`, NOT by racing the
+    /// 100 ms `MIN_UPDATE_INTERVAL` against wall time. Priming the pair and
+    /// then dispatching would otherwise be a wall-clock race, and a stall past
+    /// 100 ms would let the message through to a driver — which, with a
+    /// queue-full stand-in handler, would emit a `ResyncRequest` for a
+    /// DIFFERENT reason and make this test pass vacuously.
+    ///
+    /// The `#[tokio::test]` is deliberately NOT `start_paused`: the emit spawns
+    /// a trailing retry task (#4862) whose first re-dispatch is ~1.6-2.4 s out
+    /// on the throttle's clock, far beyond this synchronous test's window, so
+    /// the counts below are unaffected. Auto-advancing time would let that
+    /// retry fire and pollute them.
+    #[tokio::test]
+    async fn rate_limited_broadcast_emits_throttled_resync_request() {
+        use crate::message::{DeltaOrFullState, NetMessageV1};
+        use crate::operations::test_utils::MockNetworkBridge;
+        use crate::operations::update::UpdateMsg;
+        use crate::util::time_source::SharedMockTimeSource;
+
+        // Frozen clock for the limiter only (see DETERMINISM above).
+        let clock = SharedMockTimeSource::new();
+        let config_args = crate::config::ConfigArgs {
+            id: Some("rate-limited-broadcast-resync-5510".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let mut node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        node_config.update_rate_limit_time_source_override =
+            Some(std::sync::Arc::new(clock.clone()));
+
+        let (mut notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14200".parse().unwrap());
+
+        let bridge = MockNetworkBridge::new();
+        let mut listener: Box<dyn NetEventRegister> =
+            Box::new(crate::tracing::DynamicRegister::new(vec![]));
+
+        let broadcast_key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([31u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([32u8; 32]),
+        );
+        let request_key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([33u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([34u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:15100".parse().unwrap();
+
+        // Drain the notification channel and return the targets of every
+        // ResyncRequest emitted for `key` since the last drain.
+        fn drain_resync_targets(
+            rx: &mut crate::node::EventLoopNotificationsReceiver,
+            key: freenet_stdlib::prelude::ContractKey,
+        ) -> Vec<SocketAddr> {
+            let mut targets = Vec::new();
+            while let Ok(ev) = rx.notifications_receiver.try_recv() {
+                if let either::Either::Right(NodeEvent::SendInterestMessage {
+                    target,
+                    message: crate::message::InterestMessage::ResyncRequest { key: k },
+                }) = ev
+                {
+                    if k == key {
+                        targets.push(target);
+                    }
+                }
+            }
+            targets
+        }
+
+        // Prime both pairs so the limiter is TRACKING them; on the frozen clock
+        // every subsequent check for the same pair is `Rejected` forever.
+        for key in [broadcast_key, request_key] {
+            assert!(
+                op_manager
+                    .ring
+                    .update_rate_limiter
+                    .check_and_record(sender_addr, *key.id())
+                    .is_allowed(),
+                "precondition: the first UPDATE for a fresh pair must be allowed"
+            );
+        }
+
+        let broadcast = |tx: Transaction, payload: Vec<u8>| {
+            NetMessageV1::Update(UpdateMsg::BroadcastTo {
+                id: tx,
+                key: broadcast_key,
+                payload: DeltaOrFullState::Delta(payload),
+                sender_summary_bytes: Vec::new(),
+            })
+        };
+
+        // 1. A refused BROADCAST emits exactly one ResyncRequest to the sender.
+        handle_pure_network_message_v1(
+            broadcast(Transaction::new::<UpdateMsg>(), vec![1, 2, 3]),
+            Some(sender_addr),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch must not error on a rate-limited drop");
+
+        assert_eq!(
+            op_manager.ring.update_rate_limiter.rejected_total(),
+            1,
+            "precondition: the frozen clock must make the second check for a \
+             tracked pair a per-pair rejection (not a capacity or new-pair-budget \
+             drop, which are different arms)"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, broadcast_key),
+            vec![sender_addr],
+            "#5510: a rate-limiter drop of a BroadcastTo MUST emit exactly one \
+             ResyncRequest so the sender clears its poisoned summary cache and \
+             re-sends — otherwise the lost entries are excluded from every later \
+             delta and the peers stay diverged permanently"
+        );
+
+        // 2. A second refused broadcast within the throttle window emits none
+        //    (bounds the #4251 amplification).
+        handle_pure_network_message_v1(
+            broadcast(Transaction::new::<UpdateMsg>(), vec![4, 5, 6]),
+            Some(sender_addr),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch must not error on a rate-limited drop");
+
+        assert!(
+            drain_resync_targets(&mut notification_rx, broadcast_key).is_empty(),
+            "a second rate-limiter drop within the throttle window MUST NOT emit \
+             another ResyncRequest (bounds #4251 amplification)"
+        );
+
+        // 3. A refused REQUEST emits none. Distinct contract key, so its own
+        //    (contract, sender) resync window is untouched by steps 1-2 — a
+        //    shared key would make this pass for the wrong reason.
+        handle_pure_network_message_v1(
+            NetMessageV1::Update(UpdateMsg::RequestUpdate {
+                id: Transaction::new::<UpdateMsg>(),
+                key: request_key,
+                related_contracts: freenet_stdlib::prelude::RelatedContracts::default(),
+                value: freenet_stdlib::prelude::WrappedState::new(vec![7, 8, 9]),
+            }),
+            Some(sender_addr),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch must not error on a rate-limited drop");
+
+        assert_eq!(
+            op_manager.ring.update_rate_limiter.rejected_total(),
+            3,
+            "precondition: all three dispatches must have been refused by the \
+             per-pair rate limit"
+        );
+        assert!(
+            drain_resync_targets(&mut notification_rx, request_key).is_empty(),
+            "#5510: a rate-limiter drop of a RequestUpdate MUST NOT emit a \
+             ResyncRequest — its originator observes the failure and it caches no \
+             summary of us, so a resync here is pure amplification onto a node \
+             already refusing this sender"
+        );
     }
 
     /// #4864 round-8 (Codex P1): an UNSOLICITED `ResyncResponse` — one with NO
