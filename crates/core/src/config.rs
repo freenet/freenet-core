@@ -3898,7 +3898,7 @@ impl std::hash::Hash for GatewayConfig {
 ///
 /// ```toml
 /// [gateways.address]
-/// host = "vega.locut.us"
+/// host = "gw2.freenet.org"
 /// port = 31337            # optional; defaults to 31337 when omitted
 /// ```
 ///
@@ -3906,7 +3906,7 @@ impl std::hash::Hash for GatewayConfig {
 ///
 /// ```toml
 /// [gateways.address]
-/// hostname = "vega.locut.us:31337"   # host[:port] packed into one string
+/// hostname = "gw2.freenet.org:31337"   # host[:port] packed into one string
 /// ```
 ///
 /// ```toml
@@ -6151,7 +6151,7 @@ shutdown-drain-secs = 42
                    location = 0.25\n\
                    \n\
                    [gateways.address]\n\
-                   host = \"vega.locut.us\"\n\
+                   host = \"gw2.freenet.org\"\n\
                    port = 31337\n";
         assert!(
             toml::from_str::<Gateways>(doc).is_err(),
@@ -6531,7 +6531,7 @@ shutdown-drain-secs = 42
     fn gateways_toml_public_key_is_accepted_in_both_spellings() {
         for key in ["public_key", "public-key"] {
             let doc = format!(
-                "[[gateways]]\naddress = {{ host = \"vega.locut.us\", port = 31337 }}\n\
+                "[[gateways]]\naddress = {{ host = \"gw2.freenet.org\", port = 31337 }}\n\
                  {key} = \"/tmp/freenet-5124/vega.pub\"\n"
             );
             let gateways: Gateways = toml::from_str(&doc)
@@ -8139,7 +8139,7 @@ shutdown-drain-secs = 42
                     location: None,
                 },
                 GatewayConfig {
-                    address: Address::Hostname("technic.locut.us".to_string()),
+                    address: Address::Hostname("gw1.freenet.org".to_string()),
                     public_key_path: PathBuf::from("path/to/key"),
                     location: None,
                 },
@@ -8152,8 +8152,12 @@ shutdown-drain-secs = 42
 
     // ---- Address deserialization: backward compat + new host/port form (#1388) ----
 
-    /// Legacy single-string form, exactly as it appears in the deployed
-    /// `https://freenet.org/keys/gateways.toml` today. MUST keep parsing.
+    /// Legacy single-string form, exactly as it appeared in the deployed
+    /// `https://freenet.org/keys/gateways.toml` for years (retired 2026-08-29,
+    /// replaced by role-based `gwN.freenet.org` names). MUST keep parsing —
+    /// peers holding a cached copy of the old file still need it. Deliberately
+    /// NOT updated to the new hostname: this pins the historical value real
+    /// deployments actually used, not an arbitrary example.
     #[test]
     fn test_address_deser_legacy_hostname_string() {
         let toml_str = r#"
@@ -8171,7 +8175,9 @@ shutdown-drain-secs = 42
     }
 
     /// Legacy single-string form without a port still parses (port is resolved
-    /// later by `parse_socket_addr`, which now defaults to 31337).
+    /// later by `parse_socket_addr`, which now defaults to 31337). Same
+    /// historical-value reasoning as the sibling test above: left as the real
+    /// pre-2026-08-29 deployed hostname on purpose.
     #[test]
     fn test_address_deser_legacy_hostname_string_no_port() {
         let toml_str = r#"
@@ -8210,14 +8216,14 @@ shutdown-drain-secs = 42
             [[gateways]]
             public_key = "keys/public.vega.gw.pem"
             [gateways.address]
-            host = "vega.locut.us"
+            host = "gw2.freenet.org"
             port = 31337
         "#;
         let gateways: Gateways = toml::from_str(toml_str).unwrap();
         assert_eq!(
             gateways.gateways[0].address,
             Address::Host {
-                host: "vega.locut.us".to_string(),
+                host: "gw2.freenet.org".to_string(),
                 port: 31337
             }
         );
@@ -8250,13 +8256,13 @@ shutdown-drain-secs = 42
             [[gateways]]
             public_key = "keys/public.vega.gw.pem"
             [gateways.address]
-            host = "vega.locut.us"
+            host = "gw2.freenet.org"
         "#;
         let gateways: Gateways = toml::from_str(toml_str).unwrap();
         assert_eq!(
             gateways.gateways[0].address,
             Address::Host {
-                host: "vega.locut.us".to_string(),
+                host: "gw2.freenet.org".to_string(),
                 port: DEFAULT_GATEWAY_PORT
             }
         );
@@ -8306,7 +8312,7 @@ shutdown-drain-secs = 42
         let gateways = Gateways {
             gateways: vec![GatewayConfig {
                 address: Address::Host {
-                    host: "vega.locut.us".to_string(),
+                    host: "gw2.freenet.org".to_string(),
                     port: 31337,
                 },
                 public_key_path: PathBuf::from("keys/k.pem"),
@@ -8318,7 +8324,8 @@ shutdown-drain-secs = 42
         // sibling keys), matching the new wire form in the issue — not nested
         // under a `[gateways.address.host]` sub-table (the derived enum form).
         assert!(
-            serialized.contains("host = \"vega.locut.us\"") && serialized.contains("port = 31337"),
+            serialized.contains("host = \"gw2.freenet.org\"")
+                && serialized.contains("port = 31337"),
             "unexpected serialized form:\n{serialized}"
         );
         assert!(
@@ -8339,14 +8346,14 @@ shutdown-drain-secs = 42
     fn test_address_legacy_variants_serialize_unchanged() {
         let hostname = Gateways {
             gateways: vec![GatewayConfig {
-                address: Address::Hostname("vega.locut.us:31337".to_string()),
+                address: Address::Hostname("gw2.freenet.org:31337".to_string()),
                 public_key_path: PathBuf::from("keys/k.pem"),
                 location: None,
             }],
         };
         let s = toml::to_string(&hostname).unwrap();
         assert!(
-            s.contains("hostname = \"vega.locut.us:31337\""),
+            s.contains("hostname = \"gw2.freenet.org:31337\""),
             "legacy hostname form changed:\n{s}"
         );
 
