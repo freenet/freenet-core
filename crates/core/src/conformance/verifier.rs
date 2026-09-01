@@ -892,12 +892,15 @@ fn apply_updates<O: ConformanceOracle + ?Sized>(
 fn inconclusive_from(err: OracleError) -> Inconclusive {
     match err.kind {
         OracleErrorKind::Resource => Inconclusive::ResourceLimit(err.message),
-        // A host or WASM failure is reported alongside a contract rejection because
+        // A contract rejection and a host/WASM failure are both non-enforceable —
         // neither is a merge-law proof, and treating a trap as a violation would
-        // mean removing a contract for a bug in the runtime executing it.
-        OracleErrorKind::Contract | OracleErrorKind::Runtime => {
-            Inconclusive::ContractError(err.message)
-        }
+        // mean removing a contract for a bug in the runtime executing it. That
+        // severity call is shared and stays shared. The LABEL is not: a trap in the
+        // host or the WASM module is not the contract's fault, and folding it into
+        // `ContractError` names the wrong culprit and hides the one signal that
+        // would tell us the harness itself has a bug (#5509).
+        OracleErrorKind::Contract => Inconclusive::ContractError(err.message),
+        OracleErrorKind::Runtime => Inconclusive::RuntimeError(err.message),
     }
 }
 

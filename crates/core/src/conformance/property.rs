@@ -732,6 +732,16 @@ pub enum Inconclusive {
     /// The contract returned an error. A single rejection is not a conformance
     /// failure — contracts are supposed to reject updates they consider illegitimate.
     ContractError(String),
+    /// The host or the WASM module itself failed (trap, missing export, store
+    /// error) — not the contract rejecting its input.
+    ///
+    /// Kept just as non-enforceable as [`Inconclusive::ContractError`]: a harness or
+    /// runtime bug is not a merge-law proof either, and removing a contract for a
+    /// defect in the code that executes it would be exactly backwards. What must not
+    /// be shared is the LABEL — see #5509. Naming a runtime trap "contract error"
+    /// accuses the wrong party for every case of this kind, and it is the only
+    /// signal that would ever tell us the harness itself has a bug.
+    RuntimeError(String),
     /// `update_state` returned neither a new state nor a related-contract request.
     NoOutputState,
     /// Execution hit a fuel, memory or time limit, so we never saw the real answer.
@@ -786,6 +796,7 @@ impl Inconclusive {
     pub fn detail(&self) -> Option<&str> {
         match self {
             Inconclusive::ContractError(text)
+            | Inconclusive::RuntimeError(text)
             | Inconclusive::ResourceLimit(text)
             | Inconclusive::MalformedCase(text) => Some(text),
             Inconclusive::InputNotValid
@@ -805,6 +816,7 @@ impl std::fmt::Display for Inconclusive {
             Inconclusive::InputNotValid => f.write_str("an input state is not valid"),
             Inconclusive::RelatedRequired => f.write_str("contract requires related state"),
             Inconclusive::ContractError(e) => write!(f, "contract error: {e}"),
+            Inconclusive::RuntimeError(e) => write!(f, "runtime/harness error: {e}"),
             Inconclusive::NoOutputState => f.write_str("update produced no state"),
             Inconclusive::ResourceLimit(e) => write!(f, "resource limit: {e}"),
             Inconclusive::RoundLimit => f.write_str("reconciliation round budget exhausted"),

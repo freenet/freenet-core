@@ -764,6 +764,35 @@ fn a_rejected_update_is_inconclusive_not_a_violation() {
     );
 }
 
+/// A host or WASM failure (a trap, a missing export, a store error) is not the
+/// contract rejecting anything — it is the runtime executing it that broke. #5509:
+/// this used to collapse into `ContractError`, accusing the contract for a defect
+/// that may well be ours.
+#[test]
+fn a_runtime_failure_is_inconclusive_not_a_contract_error() {
+    let mut fake = Fake::conforming().merging(|_a, _b| {
+        Err(OracleError::runtime(
+            "missing contract export: update_state",
+        ))
+    });
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[&[1, 2], &[2, 3]]),
+        ),
+        Inconclusive::RuntimeError("missing contract export: update_state".into()),
+    );
+}
+
+/// Neither culprit is removal-eligible, whatever the label says: `Inconclusive`
+/// never reaches `PropertyOutcome::Violated`, so the split label above cannot make a
+/// runtime bug more actionable against the contract than it already wasn't.
+#[test]
+fn a_runtime_failure_is_never_enforceable() {
+    let outcome = PropertyOutcome::Inconclusive(Inconclusive::RuntimeError("trap".into()));
+    assert!(!outcome.is_enforceable_violation());
+}
+
 /// A contract waiting on a related contract has not failed anything; it has told us
 /// we are missing context. Removing it for that would delete every contract that
 /// composes with another.

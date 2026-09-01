@@ -1532,6 +1532,11 @@ fn inconclusive_label(reason: &Inconclusive) -> &'static str {
         Inconclusive::InputNotValid => "input not valid",
         Inconclusive::RelatedRequired => "requires related contract state",
         Inconclusive::ContractError(_) => "contract error",
+        // Deliberately a distinct label from `ContractError`, not merely a distinct
+        // variant: the two mean opposite things about who is at fault (a contract
+        // rejecting its input vs. the host/WASM runtime itself failing), and sharing
+        // the label is what lost that distinction in the first place (#5509).
+        Inconclusive::RuntimeError(_) => "runtime/harness failure",
         Inconclusive::NoOutputState => "update produced no output state",
         Inconclusive::ResourceLimit(_) => "resource limit hit",
         Inconclusive::RoundLimit => "reconciliation round budget exhausted",
@@ -3080,6 +3085,59 @@ mod tests {
             rendered.contains("stale nonce"),
             "only the most common message survived, so a second distinct failure \
              stays invisible:\n{rendered}"
+        );
+    }
+
+    /// A host/WASM failure must land in its own bucket, under its own text, never
+    /// folded into `contract error` (#5509).
+    ///
+    /// `Inconclusive::ContractError` and `Inconclusive::RuntimeError` name opposite
+    /// culprits — the contract rejecting its input vs. the runtime executing it
+    /// failing — and sharing a label is the exact defect this test exists to catch:
+    /// a report that could not tell "many contracts misbehave" from "our own harness
+    /// has a bug" (#5461, answered for the text but not the taxonomy by #5506).
+    #[test]
+    fn runtime_failure_is_a_separate_bucket_from_contract_error() {
+        let report = report_from_inconclusive(vec![
+            Inconclusive::ContractError("signature does not chain to the owner".to_string()),
+            Inconclusive::RuntimeError("missing contract export: update_state".to_string()),
+            Inconclusive::RuntimeError("missing contract export: update_state".to_string()),
+        ]);
+
+        let contract_bucket = contract_error_bucket(&report);
+        assert_eq!(contract_bucket.occurrences, 1);
+        assert_eq!(
+            contract_bucket.examples[0].text,
+            "signature does not chain to the owner"
+        );
+
+        let runtime_bucket = report
+            .inconclusive_reasons
+            .iter()
+            .find(|r| r.reason == "runtime/harness failure")
+            .expect("the runtime/harness bucket is missing from the report");
+        assert_eq!(runtime_bucket.occurrences, 2);
+        assert_eq!(
+            runtime_bucket
+                .examples
+                .iter()
+                .map(|e| (e.text.as_str(), e.occurrences))
+                .collect::<Vec<_>>(),
+            vec![("missing contract export: update_state", 2)]
+        );
+
+        let rendered = render_human(&report);
+        assert!(
+            rendered.contains("runtime/harness failure"),
+            "the human report never names the runtime/harness bucket:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("missing contract export: update_state"),
+            "the runtime failure's own text never reaches the report:\n{rendered}"
+        );
+        assert_ne!(
+            contract_bucket.reason, runtime_bucket.reason,
+            "a contract rejection and a runtime trap must never share a label"
         );
     }
 
