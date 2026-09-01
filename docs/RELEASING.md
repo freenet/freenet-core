@@ -1026,9 +1026,12 @@ verification skill if you have it):
 1. <https://crates.io/crates/freenet> shows the new version.
 2. <https://github.com/freenet/freenet-core/releases/tag/vX.Y.Z> is
    published (not draft) with 14 assets.
-3. `curl https://nova.locut.us/release-agent/version` and
-   `systemctl is-active freenet-gateway freenet-gateway-2` on nova returns the
-   new version.
+3. `curl https://nova.locut.us/release-agent/version` returns the new version,
+   and `systemctl is-active freenet-gateway freenet-gateway-2` on nova reports
+   both units `active`. These are two separate checks: the first confirms the
+   binary was swapped, the second that BOTH gateway processes came back up —
+   the second gateway follows the first via `WantedBy=`, and a companion that
+   fails to start is the case `verify_service_active` now catches.
 4. Matrix room shows the announcement.
 5. `sudo journalctl -u freenet-gateway --since "30 min ago"` on each
    gateway shows no errors.

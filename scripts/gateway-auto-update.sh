@@ -459,9 +459,16 @@ deploy_update() {
 verify_service_active() {
     local service_arg="$1"
 
-    local wants_dir companion cstate cname
-    for wants_dir in "/etc/systemd/system/$service_arg.service.wants" \
-                     "/usr/lib/systemd/system/$service_arg.service.wants"; do
+    # Search roots are overridable ONLY so the test harness can point them at a
+    # fixture; production never sets this. Without it the companion branch is
+    # untestable and would ship unexercised, which is how the gap this function
+    # closes got in.
+    local -a unit_roots
+    IFS=: read -r -a unit_roots <<< "${SYSTEMD_UNIT_ROOTS:-/etc/systemd/system:/usr/lib/systemd/system}"
+
+    local root wants_dir companion cstate cname
+    for root in "${unit_roots[@]}"; do
+        wants_dir="$root/$service_arg.service.wants"
         [[ -d "$wants_dir" ]] || continue
         for companion in "$wants_dir"/*.service; do
             [[ -e "$companion" ]] || continue
@@ -475,7 +482,7 @@ verify_service_active() {
         done
     done
 
-    # Only systemd is supported by the automated update path (nova/vega). On a
+    # Only systemd is supported by the automated update path. On a
     # host without systemctl we cannot confirm liveness; fail closed so a
     # non-systemd gateway is never silently reported as a healthy update.
     if ! command -v systemctl &> /dev/null; then
