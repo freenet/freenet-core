@@ -3898,7 +3898,7 @@ impl std::hash::Hash for GatewayConfig {
 ///
 /// ```toml
 /// [gateways.address]
-/// host = "gw2.freenet.org"
+/// host = "gw1.freenet.org"
 /// port = 31337            # optional; defaults to 31337 when omitted
 /// ```
 ///
@@ -3906,7 +3906,7 @@ impl std::hash::Hash for GatewayConfig {
 ///
 /// ```toml
 /// [gateways.address]
-/// hostname = "gw2.freenet.org:31337"   # host[:port] packed into one string
+/// hostname = "gw1.freenet.org:31337"   # host[:port] packed into one string
 /// ```
 ///
 /// ```toml
@@ -6151,7 +6151,7 @@ shutdown-drain-secs = 42
                    location = 0.25\n\
                    \n\
                    [gateways.address]\n\
-                   host = \"gw2.freenet.org\"\n\
+                   host = \"gw1.freenet.org\"\n\
                    port = 31337\n";
         assert!(
             toml::from_str::<Gateways>(doc).is_err(),
@@ -6531,7 +6531,7 @@ shutdown-drain-secs = 42
     fn gateways_toml_public_key_is_accepted_in_both_spellings() {
         for key in ["public_key", "public-key"] {
             let doc = format!(
-                "[[gateways]]\naddress = {{ host = \"gw2.freenet.org\", port = 31337 }}\n\
+                "[[gateways]]\naddress = {{ host = \"gw1.freenet.org\", port = 31337 }}\n\
                  {key} = \"/tmp/freenet-5124/vega.pub\"\n"
             );
             let gateways: Gateways = toml::from_str(&doc)
@@ -8216,14 +8216,14 @@ shutdown-drain-secs = 42
             [[gateways]]
             public_key = "keys/public.vega.gw.pem"
             [gateways.address]
-            host = "gw2.freenet.org"
+            host = "gw1.freenet.org"
             port = 31337
         "#;
         let gateways: Gateways = toml::from_str(toml_str).unwrap();
         assert_eq!(
             gateways.gateways[0].address,
             Address::Host {
-                host: "gw2.freenet.org".to_string(),
+                host: "gw1.freenet.org".to_string(),
                 port: 31337
             }
         );
@@ -8256,13 +8256,13 @@ shutdown-drain-secs = 42
             [[gateways]]
             public_key = "keys/public.vega.gw.pem"
             [gateways.address]
-            host = "gw2.freenet.org"
+            host = "gw1.freenet.org"
         "#;
         let gateways: Gateways = toml::from_str(toml_str).unwrap();
         assert_eq!(
             gateways.gateways[0].address,
             Address::Host {
-                host: "gw2.freenet.org".to_string(),
+                host: "gw1.freenet.org".to_string(),
                 port: DEFAULT_GATEWAY_PORT
             }
         );
@@ -8312,7 +8312,7 @@ shutdown-drain-secs = 42
         let gateways = Gateways {
             gateways: vec![GatewayConfig {
                 address: Address::Host {
-                    host: "gw2.freenet.org".to_string(),
+                    host: "gw1.freenet.org".to_string(),
                     port: 31337,
                 },
                 public_key_path: PathBuf::from("keys/k.pem"),
@@ -8324,7 +8324,7 @@ shutdown-drain-secs = 42
         // sibling keys), matching the new wire form in the issue — not nested
         // under a `[gateways.address.host]` sub-table (the derived enum form).
         assert!(
-            serialized.contains("host = \"gw2.freenet.org\"")
+            serialized.contains("host = \"gw1.freenet.org\"")
                 && serialized.contains("port = 31337"),
             "unexpected serialized form:\n{serialized}"
         );
@@ -8346,14 +8346,14 @@ shutdown-drain-secs = 42
     fn test_address_legacy_variants_serialize_unchanged() {
         let hostname = Gateways {
             gateways: vec![GatewayConfig {
-                address: Address::Hostname("gw2.freenet.org:31337".to_string()),
+                address: Address::Hostname("gw1.freenet.org:31337".to_string()),
                 public_key_path: PathBuf::from("keys/k.pem"),
                 location: None,
             }],
         };
         let s = toml::to_string(&hostname).unwrap();
         assert!(
-            s.contains("hostname = \"gw2.freenet.org:31337\""),
+            s.contains("hostname = \"gw1.freenet.org:31337\""),
             "legacy hostname form changed:\n{s}"
         );
 
