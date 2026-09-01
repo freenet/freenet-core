@@ -1463,7 +1463,7 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
         tracing::warn!(
             tx = %incoming_tx,
             error = %e,
-            "UPDATE relay: failed to send queue-full ResyncRequest"
+            "UPDATE relay: failed to send dropped-broadcast ResyncRequest"
         );
     }
 }
@@ -1514,11 +1514,16 @@ fn jittered_resync_retry_delay(attempt: u32) -> Duration {
     QUEUE_FULL_RESYNC_RETRY_BASE_DELAY.mul_f64(attempt as f64 * factor)
 }
 
-/// Trailing best-effort re-dispatch of a queue-full `ResyncRequest` (#4857 P2).
+/// Trailing best-effort re-dispatch of a dropped-broadcast `ResyncRequest`
+/// (#4857 P2).
 ///
 /// Runs as a short-lived fire-and-forget task spawned by
-/// [`send_dropped_broadcast_resync_request`] AFTER its immediate ResyncRequest, and
-/// ONLY when the throttle reservation was granted. It re-dispatches the same
+/// [`send_dropped_broadcast_resync_request`] AFTER its immediate ResyncRequest,
+/// and ONLY when the throttle reservation was granted. It serves whichever drop
+/// caused that emit; the `queue_full_resync_retry_*` log events keep their
+/// pre-#5510 names (they are `debug!`, so they never reached a release build
+/// and no operator grep depends on them) rather than churning a mechanism this
+/// change does not alter. It re-dispatches the same
 /// ResyncRequest up to [`QUEUE_FULL_RESYNC_MAX_RETRIES`] times with jittered
 /// backoff so a resync dropped by the lossy event-loop → `P2pBridge::try_send`
 /// path still heals the divergence before the ~5-min heartbeat.
@@ -1712,8 +1717,8 @@ async fn resend_dropped_broadcast_resync_request(
                 target = %sender_addr,
                 attempt,
                 event = "queue_full_resync_retry_skipped_landed",
-                "UPDATE relay: queue-full ResyncRequest already landed (its \
-                 ResyncResponse was consumed), skipping the redundant \
+                "UPDATE relay: dropped-broadcast ResyncRequest already landed \
+                 (its ResyncResponse was consumed), skipping the redundant \
                  full-state re-dispatch (#4863)"
             );
             return;

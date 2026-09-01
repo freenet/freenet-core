@@ -7206,18 +7206,20 @@ mod tests {
     /// the failure and caches no summary of us, so a resync for it would be
     /// pure amplification onto a node already refusing this sender.
     ///
-    /// On `origin/main` this FAILS at the first assertion: the rate-limiter arm
-    /// logs at `debug!` (compiled out of release builds) and `return Ok(())`,
-    /// so no repair is emitted and `first` is empty.
+    /// Verified against the unfixed code by deleting the repair arm from the
+    /// dispatch path: the first assertion fails with `left: []`, `right:
+    /// [127.0.0.1:15100]`. On `origin/main` the arm logs at `debug!` (compiled
+    /// out of release builds) and `return Ok(())`, so nothing is emitted.
     ///
     /// DETERMINISM: the limiter's verdict is decided by a frozen
     /// `SharedMockTimeSource` injected through
     /// `NodeConfig::update_rate_limit_time_source_override`, NOT by racing the
-    /// 100 ms `MIN_UPDATE_INTERVAL` against wall time. Priming the pair and
-    /// then dispatching would otherwise be a wall-clock race, and a stall past
-    /// 100 ms would let the message through to a driver — which, with a
-    /// queue-full stand-in handler, would emit a `ResyncRequest` for a
-    /// DIFFERENT reason and make this test pass vacuously.
+    /// 100 ms `MIN_UPDATE_INTERVAL` against wall time. Priming a pair and then
+    /// dispatching would otherwise be a wall-clock race: a stall past 100 ms
+    /// would make the message ALLOWED, so it would reach a relay driver instead
+    /// of the arm under test, and the assertions below would be measuring
+    /// something else entirely. No contract handler services the channel here,
+    /// because on this path nothing should ever reach one.
     ///
     /// The `#[tokio::test]` is deliberately NOT `start_paused`: the emit spawns
     /// a trailing retry task (#4862) whose first re-dispatch is ~1.6-2.4 s out
