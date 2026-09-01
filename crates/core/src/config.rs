@@ -2753,9 +2753,18 @@ pub struct WebsocketApiArgs {
     pub per_user_export_min_interval_secs: Option<u64>,
 }
 
-/// Default telemetry endpoint (nova.locut.us OTLP collector).
-/// Using domain name for resilience to IP changes.
-pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "http://nova.locut.us:4318";
+/// Default telemetry endpoint (telemetry.freenet.org OTLP collector).
+/// Using domain name for resilience to IP changes. Deliberately the
+/// telemetry role name, not a gateway name (gw1/gw2.freenet.org) — coupling
+/// this to a gateway's name would drag the telemetry default along with any
+/// future gateway host move.
+///
+/// NOTE: every binary released before this change has the OLD default
+/// (`nova.locut.us:4318`) baked in and will keep sending telemetry there for
+/// as long as it runs. That DNS record must stay resolving to the collector
+/// indefinitely — changing this default does not retroactively update
+/// already-deployed peers, only builds made after this merges.
+pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "http://telemetry.freenet.org:4318";
 
 #[derive(clap::Parser, Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryArgs {
