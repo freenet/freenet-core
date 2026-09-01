@@ -963,7 +963,9 @@ impl ConfigArgs {
             if !cfg.telemetry.enabled {
                 self.telemetry.enabled = false;
             }
-            if self.telemetry.endpoint.is_none() {
+            if self.telemetry.endpoint.is_none()
+                && cfg.telemetry.endpoint != LEGACY_TELEMETRY_ENDPOINT
+            {
                 self.telemetry
                     .endpoint
                     .get_or_insert(cfg.telemetry.endpoint);
@@ -2765,6 +2767,21 @@ pub struct WebsocketApiArgs {
 /// indefinitely — changing this default does not retroactively update
 /// already-deployed peers, only builds made after this merges.
 pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "http://telemetry.freenet.org:4318";
+
+/// The endpoint `DEFAULT_TELEMETRY_ENDPOINT` used before 2026-09.
+///
+/// `build()` PERSISTS the resolved telemetry endpoint into `config.toml`, and
+/// the file value is merged back on every start — so without this sentinel an
+/// existing node keeps the old endpoint forever, even after auto-updating, and
+/// the change would reach FRESH INSTALLS ONLY. Same failure mode and same
+/// remedy as `LEGACY_FLAT_HOSTING_BUDGET_BYTES` above.
+///
+/// A FILE value equal to this exact string is treated as auto-derived rather
+/// than an operator choice, so it re-derives to the current default. An
+/// explicit `--telemetry-endpoint` or env var is parsed into `self` BEFORE the
+/// file merge and still wins, including if an operator genuinely wants this
+/// value.
+pub const LEGACY_TELEMETRY_ENDPOINT: &str = "http://nova.locut.us:4318";
 
 #[derive(clap::Parser, Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryArgs {
@@ -7020,6 +7037,51 @@ shutdown-drain-secs = 42
             rebuilt.max_hosting_storage,
             crate::ring::default_hosting_budget_bytes(),
             "a config.toml without the key must re-derive the budget from live RAM"
+        );
+    }
+    /// The telemetry endpoint is PERSISTED into config.toml by `build()`, so
+    /// changing `DEFAULT_TELEMETRY_ENDPOINT` alone reaches FRESH INSTALLS ONLY —
+    /// an existing node merges its stored value back on every start and keeps
+    /// the old endpoint forever, even after auto-updating. Same shape as the
+    /// hosting-budget sentinel above.
+    ///
+    /// (a) a stored value equal to the legacy default must RE-DERIVE, and
+    /// (b) a genuinely operator-chosen value must SURVIVE.
+    #[tokio::test]
+    async fn legacy_telemetry_endpoint_re_derives_but_explicit_survives() {
+        // (a) upgrade boot with the legacy endpoint persisted.
+        let legacy_dir = tempfile::tempdir().unwrap();
+        clap_bare_args(legacy_dir.path()).build().await.unwrap();
+        let cfg_path = legacy_dir.path().join("config.toml");
+        let existing = std::fs::read_to_string(&cfg_path).unwrap();
+        let legacy = existing.replace(DEFAULT_TELEMETRY_ENDPOINT, LEGACY_TELEMETRY_ENDPOINT);
+        assert!(
+            legacy.contains(LEGACY_TELEMETRY_ENDPOINT),
+            "fixture must actually contain the legacy endpoint, got:\n{legacy}"
+        );
+        std::fs::write(&cfg_path, legacy).unwrap();
+        let upgraded = clap_bare_args(legacy_dir.path()).build().await.unwrap();
+        assert_eq!(
+            upgraded.telemetry.endpoint, DEFAULT_TELEMETRY_ENDPOINT,
+            "a persisted LEGACY telemetry endpoint must re-derive on upgrade, \
+             otherwise this change reaches fresh installs only"
+        );
+
+        // (b) an operator's own endpoint must not be clobbered by the sentinel.
+        let custom_dir = tempfile::tempdir().unwrap();
+        clap_bare_args(custom_dir.path()).build().await.unwrap();
+        let custom_path = custom_dir.path().join("config.toml");
+        let base = std::fs::read_to_string(&custom_path).unwrap();
+        let chosen = "http://otel.example.invalid:4318";
+        std::fs::write(
+            &custom_path,
+            base.replace(DEFAULT_TELEMETRY_ENDPOINT, chosen),
+        )
+        .unwrap();
+        let kept = clap_bare_args(custom_dir.path()).build().await.unwrap();
+        assert_eq!(
+            kept.telemetry.endpoint, chosen,
+            "an operator-chosen endpoint must survive; only the legacy default re-derives"
         );
     }
 
