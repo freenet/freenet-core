@@ -1,13 +1,28 @@
-#!/bin/bash
+#!/bin/sh
+set -eu
 
-export RUST_BACKTRACE=1
-export RUST_LOG="info,freenet=debug,freenet-stdlib=debug,fdev=debug"
+config_dir="${FREENET_CONFIG_DIR:-/data/config}"
+data_dir="${FREENET_DATA_DIR:-/data/node}"
+node_id="${FREENET_NODE_ID:-docker-${HOSTNAME:-node}}"
 
-BASE_DIR="/root/.cache/freenet"
-NODE_DIR="${BASE_DIR}/node"
+if [ "$(id -u)" -eq 0 ]; then
+    # A freshly-created named volume is root-owned. Initialize it before
+    # dropping privileges so the node never runs with write access as root.
+    mkdir -p "$config_dir" "$data_dir"
+    chown -R --no-dereference freenet:freenet "$config_dir" "$data_dir"
+    exec gosu freenet freenet network \
+        --id "$node_id" \
+        --config-dir "$config_dir" \
+        --data-dir "$data_dir" \
+        --disable-auto-update \
+        "$@"
+fi
 
-freenet network \
-  --id "test-node-${HOSTNAME}" \
-  --config-dir "$BASE_DIR" \
-  --data-dir "$NODE_DIR" \
-  --ws-api-port "${WS_API_PORT:-7509}"
+# A caller using --user owns the mounted paths and is responsible for making
+# them writable. Do not attempt privileged ownership changes in that case.
+exec freenet network \
+    --id "$node_id" \
+    --config-dir "$config_dir" \
+    --data-dir "$data_dir" \
+    --disable-auto-update \
+    "$@"

@@ -1,24 +1,14 @@
 services:
   freenet-node:
     build:
-      context: .
-      dockerfile: Dockerfile.yml
-    image: freenet-node:latest
-    environment:
-      - WS_API_PORT=7509
-      # The client API binds loopback by default (of the host's network
-      # namespace, since `network_mode: host`), so it is reachable from this
-      # machine only. That API is fully privileged — it can read and modify
-      # contract state, identities and keys — so exposing it to the LAN is
-      # opt-in. Uncomment to serve clients on other machines, and put an
-      # authenticating reverse proxy in front of it if the network is not
-      # fully trusted.
-      # - FREENET_WS_API_ADDRESS=::
-    network_mode: host
+      context: ../..
+      dockerfile: docker/freenet-node/Dockerfile
+    image: ghcr.io/freenet/freenet-core:latest
+    ports:
+      - "31338:31338/udp"
     volumes:
-      - freenet-data:/root/.cache/freenet
+      - freenet-data:/data
     restart: unless-stopped
 
 volumes:
   freenet-data:
-    driver: local
