@@ -1355,11 +1355,22 @@ impl UpdateRateLimiter {
     /// Emit the fresh-id-churn log line, at most once per
     /// [`NEW_PAIR_LOG_INTERVAL`].
     ///
-    /// Throttled for the same reason the drop is worth logging at all: a
-    /// sender over its budget is over it on every message, so an
-    /// unthrottled line here would be a steady stream on exactly the
-    /// node under load. `info!` for the #4981 reason — `debug!` is
-    /// compiled out of release builds.
+    /// Throttled because a sender that has exhausted this budget is
+    /// exhausting it by introducing FRESH pairs, and it will keep
+    /// introducing them at whatever rate produced the exhaustion — so an
+    /// unthrottled line here would be a steady stream on exactly the node
+    /// under load.
+    ///
+    /// Note what that does NOT say. The budget is charged only for a pair
+    /// the map is not currently tracking, so a sender over it is not over
+    /// it on every message: its traffic on already-established pairs is
+    /// never charged and never refused here. This bounds the RATE OF
+    /// INTRODUCTION of new pairs, not a sender's sustained throughput, and
+    /// reading it as the latter overstates what a `SenderNewPairBudget`
+    /// refusal tells an operator about the sender.
+    ///
+    /// `info!` for the #4981 reason — `debug!` is compiled out of release
+    /// builds.
     fn log_new_pair_budget(&self, now: Instant, sender: SocketAddr) {
         if !log_due(&self.last_new_pair_log, now, NEW_PAIR_LOG_INTERVAL) {
             return;
