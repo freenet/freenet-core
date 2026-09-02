@@ -1645,6 +1645,26 @@ async fn reserve_resync_emit(
 /// fresh immediate reservation from each new real drop, so the trailing repair
 /// is marginal there; its value is concentrated in the case it exists for, where
 /// traffic STOPS right after a swallowed drop.
+///
+/// # The resulting bound, stated in one place
+///
+/// **One chain per `(contract, sender)` pair per window**, because gate 1 is per
+/// pair and a global-cap refusal now KEEPS the window rather than releasing it
+/// (X1) — so later drops on the pair are `WindowHeld` and hand their debt to the
+/// chain already carrying it, instead of each spawning one of their own.
+///
+/// Node-wide, chains are bounded by
+/// [`crate::ring::interest::MAX_OUTSTANDING_QUEUE_FULL_RESYNC_RETRIES`] (256)
+/// slots, shared with the #4862 re-delivery. Each chain lives at most
+/// `MAX_COALESCED_RESYNC_WINDOWS` served windows (3) or
+/// [`MAX_COALESCED_RESYNC_ATTEMPTS`] passes (6), whichever comes first, plus the
+/// tokio backstop inside the wait.
+///
+/// There is deliberately no SECOND pool for chains that start owing a repair. An
+/// earlier revision added one, to bound a case where a contract with N dropping
+/// senders spawned N such chains per window. X1 removed the cause of that rather
+/// than capping its effect, so a second pool would now bound something that
+/// cannot happen, at the cost of a limit nobody can reason about.
 const MAX_COALESCED_RESYNC_WINDOWS: u32 = 3;
 
 /// Maximum loop passes for one follow-up chain, however few are SERVED.
