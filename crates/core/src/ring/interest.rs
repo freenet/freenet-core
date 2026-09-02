@@ -307,6 +307,30 @@ const MISSING_SUMMARY_ACTIVE_SIZE: usize = 256;
 pub(crate) const FIRST_MISSING_SUMMARY_SEND_AGE_LABELS: [&str; 5] =
     ["lt_1s", "1_9s", "10_59s", "60_299s", "gte_300s"];
 
+/// One held `ResyncRequest` reservation for a `(contract, target)` pair.
+///
+/// The flag lives HERE, inside the throttle's own LRU value, rather than in a
+/// second map: the reservation is exactly the thing it qualifies, so it is
+/// bounded by [`RESYNC_THROTTLE_CACHE_SIZE`] for free, it is cleared for free
+/// whenever a fresh reservation overwrites the entry, and it cannot outlive the
+/// window it describes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResyncReservation {
+    /// When this reservation was granted, on the manager's `TimeSource`.
+    stamped: Instant,
+    /// A broadcast from `target` for `contract` was DROPPED while this
+    /// reservation was held, so the repair it needed was refused by the
+    /// throttle and nothing else will re-send it (#5510).
+    ///
+    /// Consumed at the window's close by
+    /// `operations::update::op_ctx_task::trailing_coalesced_resync_request`,
+    /// which emits ONE coalesced `ResyncRequest` covering every drop the window
+    /// swallowed. One flag rather than a count, because one full-state
+    /// `ResyncResponse` restores every lost entry at once: the repair does not
+    /// scale with the number of drops, so neither should the signal.
+    dropped_during_window: bool,
+}
+
 /// Node-wide cap on concurrently-outstanding queue-full-resync retry tasks
 /// (#4862 P1). The per-(contract, peer) throttle above is a bounded LRU; under
 /// saturation plus key churn (a peer cycling through more than
@@ -1229,7 +1253,7 @@ pub struct InterestManager<T: TimeSource> {
     /// (contract, target peer address). Bounded LRU so remote peers cannot grow
     /// it without bound. See [`InterestManager::begin_resync_request`] and
     /// issue #4857.
-    resync_request_throttle: Mutex<LruCache<(ContractKey, SocketAddr), Instant>>,
+    resync_request_throttle: Mutex<LruCache<(ContractKey, SocketAddr), ResyncReservation>>,
 
     /// Rotation cursor for the bounded periodic summary reply (#5155, extended
     /// to the digest form by #5238), keyed by the peer's stable transport
@@ -2332,13 +2356,67 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         let now = self.time_source.now();
         let key = (*contract, target);
         let mut throttle = self.resync_request_throttle.lock();
-        if let Some(&last) = throttle.get(&key) {
-            if now.duration_since(last) < RESYNC_REQUEST_MIN_INTERVAL {
+        if let Some(res) = throttle.get(&key) {
+            if now.duration_since(res.stamped) < RESYNC_REQUEST_MIN_INTERVAL {
                 return None;
             }
         }
-        throttle.put(key, now);
+        // Overwriting the entry clears `dropped_during_window` by construction.
+        // That is the ONLY thing keeping a stale flag from causing a spurious
+        // emit later: if the task that would have consumed it died (the
+        // node-wide retry-slot cap, a cancelled runtime), the next granted
+        // reservation drops it on the floor, and that drop is harmless because
+        // the very drop that would have set it again is about to emit anyway.
+        throttle.put(
+            key,
+            ResyncReservation {
+                stamped: now,
+                dropped_during_window: false,
+            },
+        );
         Some(now + RESYNC_REQUEST_MIN_INTERVAL)
+    }
+
+    /// Record that a broadcast repair was REFUSED because this `(contract,
+    /// target)` reservation window is already held (#5510).
+    ///
+    /// Called on the `begin_resync_request` -> `None` path. The flag is read
+    /// once at the window's close; see [`Self::take_resync_drop_during_window`].
+    /// A no-op when no reservation is held, which is correct: without one the
+    /// caller was not throttled and emitted its own request.
+    pub(crate) fn note_resync_drop_during_window(
+        &self,
+        contract: &ContractKey,
+        target: SocketAddr,
+    ) {
+        if let Some(res) = self
+            .resync_request_throttle
+            .lock()
+            .get_mut(&(*contract, target))
+        {
+            res.dropped_during_window = true;
+        }
+    }
+
+    /// Consume the "a drop was swallowed by this window" flag, returning whether
+    /// it was set (#5510).
+    ///
+    /// Consuming rather than peeking is what bounds the trailing emit to at most
+    /// one per window per pair even if two waiters somehow reach the deadline
+    /// for the same reservation.
+    pub(crate) fn take_resync_drop_during_window(
+        &self,
+        contract: &ContractKey,
+        target: SocketAddr,
+    ) -> bool {
+        let mut throttle = self.resync_request_throttle.lock();
+        match throttle.get_mut(&(*contract, target)) {
+            Some(res) => std::mem::replace(&mut res.dropped_during_window, false),
+            // The LRU evicted the reservation under key churn. Nothing to emit:
+            // an evicted reservation means the next drop takes a fresh one and
+            // repairs immediately, which is the stronger outcome anyway.
+            None => false,
+        }
     }
 
     /// Try to reserve a slot for a queue-full-resync retry task (#4862 P1).
@@ -4694,6 +4772,95 @@ mod tests {
     /// amplification); after the window elapses a fresh request is allowed
     /// again. The returned deadline is the reservation window close
     /// (`now + RESYNC_REQUEST_MIN_INTERVAL`) on the manager's clock (#4857 P2).
+    /// #5510: a fresh reservation CLEARS the "a drop was swallowed" flag.
+    ///
+    /// This is the invariant that makes a stale flag harmless, and it is the only
+    /// thing that does. The task that would consume the flag can fail to exist
+    /// (the node-wide retry-slot cap) or die (runtime shutdown, cancellation),
+    /// leaving the flag set with nobody to read it. Without this clearing, the
+    /// NEXT window's sweep would find that stale flag and emit a second, wholly
+    /// unmotivated `ResyncRequest` — one emit for the fresh drop, one for the
+    /// ghost. Overwriting the entry on every grant is what bounds it to one.
+    #[test]
+    fn a_fresh_reservation_clears_the_dropped_during_window_flag() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(7);
+        let addr: SocketAddr = "127.0.0.1:5101".parse().unwrap();
+
+        manager
+            .begin_resync_request(&contract, addr)
+            .expect("first reservation must be granted");
+
+        // A drop is swallowed by the held window, and nothing ever consumes the
+        // flag — the waiter was never spawned (slot cap) or did not survive.
+        manager.note_resync_drop_during_window(&contract, addr);
+
+        // The window closes and a later drop takes a FRESH reservation.
+        time.advance_time(RESYNC_REQUEST_MIN_INTERVAL);
+        manager
+            .begin_resync_request(&contract, addr)
+            .expect("a reservation after the window must be granted");
+
+        assert!(
+            !manager.take_resync_drop_during_window(&contract, addr),
+            "the fresh reservation must have cleared the stale flag: that drop is \
+             already repaired by the request this new reservation authorizes, so a \
+             sweep firing on the stale flag would be a SECOND emit for one drop"
+        );
+    }
+
+    /// #5510 companion: within ONE reservation the flag round-trips, and taking
+    /// it CONSUMES it.
+    ///
+    /// Consuming is what bounds the trailing emit to one per window even if two
+    /// waiters somehow reach the same deadline. Without it, the test above could
+    /// pass on an implementation that simply never sets the flag at all.
+    #[test]
+    fn taking_the_dropped_during_window_flag_consumes_it() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(8);
+        let addr: SocketAddr = "127.0.0.1:5102".parse().unwrap();
+
+        manager
+            .begin_resync_request(&contract, addr)
+            .expect("reservation must be granted");
+        assert!(
+            !manager.take_resync_drop_during_window(&contract, addr),
+            "no drop swallowed yet, so the flag must read false"
+        );
+
+        manager.note_resync_drop_during_window(&contract, addr);
+        assert!(
+            manager.take_resync_drop_during_window(&contract, addr),
+            "a swallowed drop must be recorded on the held reservation"
+        );
+        assert!(
+            !manager.take_resync_drop_during_window(&contract, addr),
+            "taking the flag must CONSUME it — two waiters at one deadline must \
+             not both emit"
+        );
+    }
+
+    /// #5510: with no reservation held, recording a swallowed drop is a no-op.
+    ///
+    /// The `None` arm is not defensive padding. `begin_resync_request` returning
+    /// `None` is the only path that records, so a caller that was NOT throttled
+    /// emitted its own request; and the LRU can evict a live reservation under key
+    /// churn. In both cases inventing an entry would resurrect a window that no
+    /// longer exists and hand out an emit nobody is owed.
+    #[test]
+    fn noting_a_swallowed_drop_without_a_reservation_is_a_no_op() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(9);
+        let addr: SocketAddr = "127.0.0.1:5103".parse().unwrap();
+
+        manager.note_resync_drop_during_window(&contract, addr);
+        assert!(
+            !manager.take_resync_drop_during_window(&contract, addr),
+            "with no reservation held there is nothing to flag, and nothing to emit"
+        );
+    }
+
     #[test]
     fn begin_resync_request_rate_limits_per_contract_peer() {
         let (manager, time) = make_manager();

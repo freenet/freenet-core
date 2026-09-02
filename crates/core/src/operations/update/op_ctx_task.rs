@@ -1259,6 +1259,12 @@ pub(crate) enum DroppedBroadcastReason {
     /// Refused by the per-(sender, contract) UPDATE dispatch rate limiter
     /// in `node.rs` before any driver ran (#5510).
     RateLimited,
+    /// The trailing-edge coalesced repair (#5510): one or more drops were
+    /// swallowed by a held throttle window, and this is the single request
+    /// emitted at that window's close to cover all of them. The original cause
+    /// of those drops is deliberately not carried — a window can swallow both
+    /// kinds, and one full-state response repairs either.
+    DroppedDuringThrottleWindow,
 }
 
 impl DroppedBroadcastReason {
@@ -1268,6 +1274,7 @@ impl DroppedBroadcastReason {
         match self {
             DroppedBroadcastReason::QueueFull => "queue_full",
             DroppedBroadcastReason::RateLimited => "rate_limited",
+            DroppedBroadcastReason::DroppedDuringThrottleWindow => "dropped_during_window",
         }
     }
 }
@@ -1322,6 +1329,45 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
     incoming_tx: Transaction,
     reason: DroppedBroadcastReason,
 ) {
+    let Some((reservation_deadline, correlated)) =
+        reserve_resync_emit(op_manager, key, sender_addr, incoming_tx, reason).await
+    else {
+        return;
+    };
+    // Spawn BEFORE the blocking dispatch below — that ordering is load-bearing;
+    // see `spawn_resync_followups` (#4862 P2).
+    spawn_resync_followups(
+        op_manager,
+        key,
+        sender_addr,
+        incoming_tx,
+        reservation_deadline,
+        correlated,
+    );
+    dispatch_resync_request(op_manager, key, sender_addr, incoming_tx).await;
+}
+
+/// Take the two gates and record the correlation entry for ONE `ResyncRequest`,
+/// returning the reservation deadline and whether the request is correlated.
+///
+/// Split out of [`send_dropped_broadcast_resync_request`] so the #5510
+/// trailing-edge sweep can emit a NEW request without re-entering that function.
+/// Calling it recursively is not an option: `send_...` spawns a task whose
+/// future would then have to prove itself `Send` in terms of itself, and rustc
+/// rejects that cycle outright. Sharing this function rather than hand-inlining
+/// the gates is what stops the two emit paths drifting — the failure shape
+/// `.claude/rules/bug-prevention-patterns.md` calls "manually-inlined originator
+/// side effects".
+///
+/// Returns `None` when either gate refused, in which case NOTHING was emitted
+/// and no correlation entry exists.
+async fn reserve_resync_emit(
+    op_manager: &OpManager,
+    key: ContractKey,
+    sender_addr: SocketAddr,
+    incoming_tx: Transaction,
+    reason: DroppedBroadcastReason,
+) -> Option<(Instant, bool)> {
     // Gate 1 — per-(contract, sender)/30s throttle (#4857/#4862 + #4864 round-6).
     // RESERVE the window atomically (`begin` checks AND records under the
     // throttle's own lock) and return the reservation deadline on the throttle's
@@ -1333,6 +1379,15 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
         .interest_manager
         .begin_resync_request(&key, sender_addr)
     else {
+        // #5510: this drop's repair is being refused, and BEFORE this change
+        // nothing ever re-sent it — the throttle simply returned. Mark the held
+        // reservation so the trailing-edge sweep emits ONE coalesced
+        // ResyncRequest when the window closes. One full-state ResyncResponse
+        // restores every entry the window swallowed, so one flag covers any
+        // number of drops and the #4251 amplification bound is untouched.
+        op_manager
+            .interest_manager
+            .note_resync_drop_during_window(&key, sender_addr);
         // Per-(contract, sender)/30s throttle (existing #4857 bound).
         tracing::debug!(
             tx = %incoming_tx,
@@ -1342,7 +1397,7 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
             reason = reason.as_str(),
             "UPDATE relay: dropped-broadcast ResyncRequest throttled (rate limit) to avoid amplification"
         );
-        return;
+        return None;
     };
 
     // ALSO subject to the GLOBAL per-contract emit cap (#4864 round-4 P1): the
@@ -1371,7 +1426,7 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
             reason = reason.as_str(),
             "UPDATE relay: dropped-broadcast ResyncRequest suppressed by global per-contract cap"
         );
-        return;
+        return None;
     }
 
     // Both gates passed → the reservation stands (already recorded by `begin`).
@@ -1407,52 +1462,177 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
         .outstanding_resync_requests
         .record(*key.id(), sender_addr);
 
-    // #4862 (P2): the immediate ResyncRequest below rides a LOSSY path
-    // (`notify_node_event` → event loop → `P2pBridge::try_send`), which can drop
-    // it under the SAME backpressure that caused the queue-full drop. If dropped,
-    // the sender never clears its poisoned summary and a one-off change diverges
-    // until the ~5-min heartbeat. Schedule a BOUNDED trailing re-dispatch so the
-    // resync gets more chances to land — well before the heartbeat.
-    //
-    // Spawn CONCURRENTLY, BEFORE the blocking immediate enqueue below (#4862 P2):
-    // `notify_node_event(...).await` can consume up to NOTIFICATION_SEND_TIMEOUT
-    // (30s) under backpressure; spawning after it would let the task start with
-    // the window already gone (`now >= reservation_deadline`) and do nothing. The
-    // first attempt is a jittered delay out (never t=0), so it does not duplicate
-    // the immediate send, and it stays anchored to `reservation_deadline` (the
-    // throttle's own clock) so it can NEVER spill into a new reservation. The
-    // retries re-deliver the ONE already-authorized emit, so they do NOT
-    // re-consult the per-sender throttle or the global emit cap and do NOT
-    // re-record the correlation entry recorded above.
-    //
-    // #4863: each attempt is CONDITIONAL on that correlation entry still being
-    // outstanding, so a retry fires only while the first request is NOT observed
-    // to have landed.
-    //
-    // #4862 P1: gate the spawn on a node-wide retry-task slot so the throttle LRU
-    // evicting active reservations under key churn cannot spawn unbounded
-    // overlapping tasks. At cap ONLY the retry is skipped; the immediate send
-    // below still fires. Fire-and-forget; the slot guard frees on completion.
-    if let Some(slot) = op_manager.interest_manager.try_reserve_resync_retry_slot() {
-        let op_mgr = op_manager.clone();
-        GlobalExecutor::spawn(async move {
-            let _slot = slot; // frees the node-wide retry slot on task exit
+    Some((reservation_deadline, correlated))
+}
+
+/// Spawn the follow-up task that owns everything this reservation still has to
+/// do: the #4862 re-delivery burst, then the #5510 trailing-edge sweep, then —
+/// if that sweep found a swallowed drop — the next reservation's burst and
+/// sweep, and so on.
+///
+/// # Why it is ONE looping task
+///
+/// The obvious shape is for the sweep to call
+/// [`send_dropped_broadcast_resync_request`] again. It does not compile, and the
+/// reason is worth recording so nobody re-tries it: that function spawns a task,
+/// so proving the spawned future `Send` would require already knowing whether it
+/// is `Send`, and rustc rejects the cycle rather than resolving it. Looping in
+/// one task removes the recursion entirely and is a better fit anyway — the loop
+/// exits the first time a window closes with nothing swallowed, so a quiet
+/// contract costs one task for one window.
+///
+/// # Ordering (#4862 P2), unchanged and still load-bearing
+///
+/// The caller spawns this BEFORE its blocking `notify_node_event`, which can
+/// consume up to `NOTIFICATION_SEND_TIMEOUT` (30s) under backpressure. Spawning
+/// after it would let the task start with the window already gone and do
+/// nothing. The correlation entry is recorded before this too (in
+/// `reserve_resync_emit`), so the #4863 gate can never read a not-yet-written
+/// record and mistake it for "landed".
+///
+/// # Bounds
+///
+/// One node-wide slot per chain ([`crate::ring::interest::
+/// MAX_OUTSTANDING_QUEUE_FULL_RESYNC_RETRIES`]), held for as long as the chain
+/// runs, and the chain only continues while drops keep being swallowed. Each
+/// iteration emits at most `1 + QUEUE_FULL_RESYNC_MAX_RETRIES` re-deliveries of
+/// one authorized request plus at most one NEW request, per (contract, sender)
+/// per window — the #4251 bound.
+fn spawn_resync_followups(
+    op_manager: &OpManager,
+    key: ContractKey,
+    sender_addr: SocketAddr,
+    incoming_tx: Transaction,
+    reservation_deadline: Instant,
+    correlated: bool,
+) {
+    let Some(slot) = op_manager.interest_manager.try_reserve_resync_retry_slot() else {
+        // #5510: at the node-wide cap NOTHING is spawned, so this reservation
+        // gets neither the #4862 re-delivery nor the trailing coalesced repair.
+        // A drop the window then swallows waits for the next drop after it
+        // closes. `info!` rather than `debug!` because `release_max_level_info`
+        // compiles `debug!` out — the very reason #5510 was invisible in the
+        // field — and because this is the one path where the repair silently
+        // does less than the code promises.
+        tracing::info!(
+            tx = %incoming_tx,
+            contract = %key,
+            target = %sender_addr,
+            cap = crate::ring::interest::MAX_OUTSTANDING_QUEUE_FULL_RESYNC_RETRIES,
+            event = "resync_retry_slot_cap_reached",
+            "UPDATE relay: at the node-wide resync-retry slot cap; the immediate \
+             ResyncRequest still sends, but this reservation gets no re-delivery \
+             and no trailing coalesced repair (#4862 P1/#5510)"
+        );
+        return;
+    };
+
+    let op_mgr = op_manager.clone();
+    GlobalExecutor::spawn(async move {
+        let _slot = slot; // frees the node-wide slot on task exit
+        let mut deadline = reservation_deadline;
+        let mut correlated = correlated;
+        loop {
             resend_dropped_broadcast_resync_request(
                 &op_mgr,
                 key,
                 sender_addr,
                 incoming_tx,
-                reservation_deadline,
+                deadline,
                 correlated,
             )
             .await;
-        });
-    }
 
-    // Immediate (first) ResyncRequest — blocking best-effort enqueue. The
-    // #4862 trailing retry above re-sends the SAME request and relies on the ONE
-    // correlation record made before the spawn — see
-    // `resend_dropped_broadcast_resync_request`.
+            // #5510. The re-delivery above can return EARLY (its #4863 gate
+            // stops it once the first response lands); this waits out the rest
+            // of the window regardless, because a drop swallowed AFTER that
+            // response is exactly the case this exists for.
+            if !wait_for_reservation_close(&op_mgr, key, sender_addr, incoming_tx, deadline).await {
+                return;
+            }
+
+            tracing::info!(
+                tx = %incoming_tx,
+                contract = %key,
+                target = %sender_addr,
+                event = "coalesced_resync_window_closed",
+                "UPDATE relay: a broadcast repair was swallowed by the throttle \
+                 window; emitting one coalesced ResyncRequest now that it has \
+                 closed (#5510)"
+            );
+
+            let Some((next_deadline, next_correlated)) = reserve_resync_emit(
+                &op_mgr,
+                key,
+                sender_addr,
+                incoming_tx,
+                DroppedBroadcastReason::DroppedDuringThrottleWindow,
+            )
+            .await
+            else {
+                // A gate refused the coalesced request (the global per-contract
+                // emit cap is the realistic one). Stop: the next real drop takes
+                // its own reservation, and looping here would spin on a cap.
+                return;
+            };
+            dispatch_resync_request(&op_mgr, key, sender_addr, incoming_tx).await;
+            deadline = next_deadline;
+            correlated = next_correlated;
+        }
+    });
+}
+
+/// Wait out the rest of a reservation window, then report whether a broadcast
+/// repair was swallowed by it (#5510).
+///
+/// Polls the throttle's OWN clock — the injected `hosting_time_source_override`
+/// in sims, the wall clock in prod — so sim pacing stays deterministic, with the
+/// same tokio-time liveness backstop the #4862 re-delivery uses: a decoupled
+/// injected clock that FREEZES before its deadline would otherwise spin this
+/// forever. The backstop is measured from the start of THIS wait, so under a
+/// frozen injected clock a chain iteration can burn up to two reservation
+/// intervals of tokio time rather than one. That is immaterial (the bound exists
+/// only to stop an unbounded spin) and is stated rather than left to be
+/// discovered.
+///
+/// Consuming the flag rather than peeking it is what bounds the trailing emit to
+/// one per window even if two waiters ever reach the same deadline.
+async fn wait_for_reservation_close(
+    op_manager: &OpManager,
+    key: ContractKey,
+    sender_addr: SocketAddr,
+    incoming_tx: Transaction,
+    reservation_deadline: Instant,
+) -> bool {
+    let started = tokio::time::Instant::now();
+    while op_manager.interest_manager.now() < reservation_deadline {
+        if started.elapsed() >= RESYNC_REQUEST_MIN_INTERVAL {
+            tracing::debug!(
+                tx = %incoming_tx,
+                contract = %key,
+                event = "coalesced_resync_backstop",
+                "UPDATE relay: tokio liveness backstop elapsed (injected clock \
+                 stalled), abandoning the trailing coalesced ResyncRequest (#5510)"
+            );
+            return false;
+        }
+        tokio::time::sleep(QUEUE_FULL_RESYNC_RETRY_POLL_INTERVAL).await;
+    }
+    op_manager
+        .interest_manager
+        .take_resync_drop_during_window(&key, sender_addr)
+}
+
+/// Enqueue one `ResyncRequest` to `sender_addr`.
+///
+/// Blocking best-effort: the path is lossy (`notify_node_event` -> event loop ->
+/// `P2pBridge::try_send`), which is what the #4862 re-delivery exists to cover.
+async fn dispatch_resync_request(
+    op_manager: &OpManager,
+    key: ContractKey,
+    sender_addr: SocketAddr,
+    incoming_tx: Transaction,
+) {
     if let Err(e) = op_manager
         .notify_node_event(NodeEvent::SendInterestMessage {
             target: sender_addr,
@@ -4106,7 +4286,15 @@ mod tests {
         // lock) then RELEASED (`cancel`) if the global cap rejects (#4864 round-6
         // item 2), so concurrent callbacks can't both pass and a globally
         // suppressed emit does not burn the window.
-        let helper = fn_body("async fn send_dropped_broadcast_resync_request(");
+        // #5510 re-anchor: the gates now live in `reserve_resync_emit`, which
+        // `send_dropped_broadcast_resync_request` calls before anything else.
+        // The property is unchanged — nothing is emitted until both gates pass —
+        // and it is now checked where the gates actually are. The `emit` anchor
+        // is the correlation record rather than the wire message, because the
+        // enqueue moved to `dispatch_resync_request`; the record is made at the
+        // same point in the sequence and is what authorizes the response, so it
+        // is the tighter anchor of the two.
+        let helper = fn_body("async fn reserve_resync_emit(");
         let per_sender = helper.find(".begin_resync_request(").expect(
             "helper must RESERVE the per-sender throttle atomically via \
              begin_resync_request (#4864 round-6 item 2)",
@@ -4118,16 +4306,16 @@ mod tests {
             "helper must ALSO gate on the global per-contract emit cap \
              (resync_emit_limiter.check_and_record, #4864 round-4)",
         );
-        let emit = helper
-            .find("InterestMessage::ResyncRequest")
-            .expect("helper must emit InterestMessage::ResyncRequest (heal, #4857)");
+        let emit = helper.find("outstanding_resync_requests").expect(
+            "helper must record the outstanding request that authorizes the heal (#4857/#4864)",
+        );
         let cancel = helper.find(".cancel_resync_request(").expect(
             "helper must CANCEL the reservation when the global cap rejects, so the \
              window is released (#4864 round-6 item 2)",
         );
         assert!(
             per_sender < emit && global_cap < emit,
-            "the ResyncRequest emit ({emit}) MUST come AFTER both the per-sender \
+            "the authorized emit ({emit}) MUST come AFTER both the per-sender \
              throttle reservation ({per_sender}) and the global emit cap ({global_cap}), \
              so an unthrottled emission cannot re-open the #4251 storm"
         );
@@ -4342,6 +4530,168 @@ mod tests {
             drain_resync_targets(&mut notification_rx, key).is_empty(),
             "a second queue-full drop within the throttle window MUST NOT emit \
              another ResyncRequest (bounds #4251 amplification)"
+        );
+    }
+
+    /// #5510 trailing edge, the case the throttle used to swallow silently.
+    ///
+    /// Sequence, all on one `(contract, sender)`:
+    ///
+    /// 1. a drop emits the immediate `ResyncRequest`;
+    /// 2. a SECOND drop inside the window emits nothing at the time — that is the
+    ///    #4251 bound working as designed, and before this change it was also the
+    ///    end of the story: nothing ever re-sent it;
+    /// 3. at the reservation deadline exactly ONE coalesced `ResyncRequest` fires.
+    ///
+    /// The count is taken in two windows rather than as a single total, and that
+    /// is what makes it a real test of the DEADLINE rather than of the emit. A
+    /// total-only assertion passes just as happily if the trailing emit fires
+    /// immediately. Verified against the mutation: deleting the
+    /// `while ... < reservation_deadline` wait makes this FAIL, because the sweep
+    /// then consumes the flag before step 2 has set it and no fourth request ever
+    /// appears.
+    ///
+    /// The 2 requests counted before the deadline are the #4862 retry's, which is
+    /// unrelated machinery: no `ResyncResponse` can arrive in this harness, so its
+    /// correlation gate never trips and it uses its full budget.
+    #[tokio::test(start_paused = true)]
+    async fn drop_swallowed_by_throttle_window_emits_one_coalesced_resync_at_the_deadline() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("coalesced-resync-5510-deadline").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([21u8; 32]),
+            CodeHash::new([22u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12400".parse().unwrap();
+
+        let drop_once = |bytes: Vec<u8>| {
+            drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                key,
+                DeltaOrFullState::Delta(bytes),
+                Vec::new(),
+                sender_addr,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
+            )
+        };
+
+        // (1) First drop → the immediate ResyncRequest.
+        let r1 = drop_once(vec![1, 2, 3]).await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![sender_addr],
+            "the first drop must emit its immediate ResyncRequest"
+        );
+
+        // (2) Second drop, different bytes so it is not a dedup hit, inside the
+        //     held window → refused by the throttle, nothing emitted NOW.
+        let r2 = drop_once(vec![4, 5, 6]).await;
+        assert!(
+            r2.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "second broadcast should still hit queue-full, got {r2:?}"
+        );
+        assert!(
+            drain_resync_targets(&mut notification_rx, key).is_empty(),
+            "a second drop inside the throttle window MUST NOT emit immediately — \
+             that is the #4251 amplification bound"
+        );
+
+        // Run to just BEFORE the reservation deadline. Only the #4862 retries
+        // may fire in here; the trailing sweep must not have run yet.
+        let mut before_deadline = Vec::new();
+        for _ in 0..58 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            before_deadline.extend(drain_resync_targets(&mut notification_rx, key));
+        }
+        assert_eq!(
+            before_deadline.len(),
+            QUEUE_FULL_RESYNC_MAX_RETRIES as usize,
+            "before the deadline only the #4862 retries may fire ({} of them); the \
+             coalesced repair must WAIT for the window to close, got {:?}",
+            QUEUE_FULL_RESYNC_MAX_RETRIES,
+            before_deadline
+        );
+
+        // (3) Cross the deadline. Stop 1s past it: a fresh reservation is taken
+        //     by the coalesced emit, and ITS first retry is >= 1.6s out, so it
+        //     cannot contaminate this count.
+        let mut at_deadline = Vec::new();
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            at_deadline.extend(drain_resync_targets(&mut notification_rx, key));
+        }
+        assert_eq!(
+            at_deadline,
+            vec![sender_addr],
+            "exactly ONE coalesced ResyncRequest must fire when the window closes \
+             — one full-state response repairs every drop the window swallowed, so \
+             one request covers any number of them (#5510)"
+        );
+    }
+
+    /// #5510 negative control for the test above: with NO drop swallowed by the
+    /// window, nothing extra fires when it closes.
+    ///
+    /// Without this, the deadline test would still pass if the sweep emitted
+    /// unconditionally — which would be a new unthrottled emission per window per
+    /// pair, exactly the #4251 shape the throttle exists to prevent.
+    #[tokio::test(start_paused = true)]
+    async fn no_drop_during_the_window_emits_nothing_when_it_closes() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("coalesced-resync-5510-control").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([23u8; 32]),
+            CodeHash::new([24u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12500".parse().unwrap();
+
+        // ONE drop only. No second broadcast, so the window swallows nothing.
+        let r1 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 2, 3]),
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![sender_addr],
+            "the drop must emit its immediate ResyncRequest"
+        );
+
+        // Run past the reservation deadline.
+        let mut emitted = Vec::new();
+        for _ in 0..64 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            emitted.extend(drain_resync_targets(&mut notification_rx, key));
+        }
+        assert_eq!(
+            emitted.len(),
+            QUEUE_FULL_RESYNC_MAX_RETRIES as usize,
+            "with nothing swallowed by the window, the ONLY additional requests \
+             may be the #4862 retries — a sweep that emits unconditionally would \
+             be a new per-window unthrottled emission (#4251), got {emitted:?}"
         );
     }
 
@@ -5042,9 +5392,13 @@ mod tests {
     #[test]
     fn queue_full_resync_helper_goes_through_global_emit_cap() {
         let src = include_str!("op_ctx_task.rs");
+        // #5510: the gates moved into `reserve_resync_emit`, the one function
+        // both emit paths (the initial drop and the trailing coalesced repair)
+        // go through. Pinning it there is what stops a second emit path being
+        // hand-inlined without the cap.
         let start = src
-            .find("async fn send_dropped_broadcast_resync_request(")
-            .expect("send_dropped_broadcast_resync_request not found");
+            .find("async fn reserve_resync_emit(")
+            .expect("reserve_resync_emit not found");
         let after = &src[start + 1..];
         let end = after
             .find("\nasync fn ")
@@ -5095,13 +5449,38 @@ mod tests {
                 .find("\nasync fn ")
                 .unwrap_or(prod.len() - retry_start - 1);
 
+        // ALSO exempt `dispatch_resync_request` (#5510). It is the shared
+        // enqueue, split out so the initial drop and the trailing coalesced
+        // repair send through one body instead of two hand-inlined copies. It
+        // holds no gate and makes no decision: every caller reaches it only
+        // after `reserve_resync_emit` has taken both gates AND made the
+        // `outstanding_resync_requests.record(...)` this pin is about. The
+        // guarantee is therefore intact — it has just moved one call up.
+        //
+        // The exemption is narrow ON PURPOSE: it is keyed to this function's
+        // name, so a NEW emit site elsewhere is still caught. Before adding
+        // another exemption, check that the record really is made on every path
+        // that reaches it — an emit whose response is dropped unapplied by the
+        // #4864 gate is a silently useless repair, which is the failure this
+        // pin exists to prevent.
+        let dispatch_start = prod
+            .find("async fn dispatch_resync_request(")
+            .expect("dispatch_resync_request (the #5510 shared enqueue) not found");
+        let dispatch_end = dispatch_start
+            + 1
+            + prod[dispatch_start + 1..]
+                .find("\nasync fn ")
+                .unwrap_or(prod.len() - dispatch_start - 1);
+
         let mut emits = 0usize;
         let mut cursor = 0usize;
         while let Some(rel) = prod[cursor..].find("message: InterestMessage::ResyncRequest") {
             let pos = cursor + rel;
             cursor = pos + 1;
-            // Skip the exempt retry re-delivery (see above).
-            if (retry_start..retry_end).contains(&pos) {
+            // Skip the exempt retry re-delivery and the shared enqueue (see above).
+            if (retry_start..retry_end).contains(&pos)
+                || (dispatch_start..dispatch_end).contains(&pos)
+            {
                 continue;
             }
             emits += 1;
@@ -5150,10 +5529,53 @@ mod tests {
                  receive arm would drop its response as unsolicited (#4864 round-8)"
             );
         }
+        // #5510: `dispatch_resync_request` is now the shared enqueue, so its CALL
+        // SITES are emit sites for this pin's purposes and must carry the same
+        // guarantee. Each must be preceded, in its own enclosing fn, by the
+        // `reserve_resync_emit(` that takes both gates AND makes the record.
+        //
+        // Without this the exemption above would be a hole: a new caller could
+        // enqueue a ResyncRequest with no record at all and the loop would never
+        // see it, because the only literal emit lives in the exempt function.
+        let mut dispatches = 0usize;
+        let mut cursor = 0usize;
+        while let Some(rel) = prod[cursor..].find("dispatch_resync_request(") {
+            let pos = cursor + rel;
+            cursor = pos + 1;
+            // Skip the definition itself.
+            if (dispatch_start..dispatch_end).contains(&pos) {
+                continue;
+            }
+            dispatches += 1;
+            let fn_start = [
+                "\nasync fn ",
+                "\nfn ",
+                "\npub async fn ",
+                "\npub fn ",
+                "\npub(",
+            ]
+            .iter()
+            .filter_map(|kw| prod[..pos].rfind(kw))
+            .max()
+            .unwrap_or(0);
+            let window: String = prod[fn_start..pos]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(
+                window.contains("reserve_resync_emit("),
+                "a dispatch_resync_request call at byte {pos} is NOT preceded by a \
+                 reserve_resync_emit(...) in the same fn — it would enqueue a \
+                 ResyncRequest with no gates and no correlation record, and the \
+                 receive arm would drop its response unapplied (#4864 round-8/#5510)"
+            );
+        }
+
         assert!(
-            emits >= 2,
-            "expected at least the queue-full-helper and delta-failure ResyncRequest \
-             emit sites in production ({emits} found) — has the emit path moved?"
+            emits + dispatches >= 2,
+            "expected at least the dropped-broadcast and delta-failure ResyncRequest \
+             emit sites in production ({emits} literal + {dispatches} via the shared \
+             enqueue) — has the emit path moved?"
         );
     }
 
@@ -5885,11 +6307,25 @@ mod tests {
              — each redundant request costs another full-state ResyncResponse \
              onto a just-saturated receiver (#4863). Got {retries:?}"
         );
+        // #5510 changed WHEN the slot is released, not whether. The task now also
+        // owns the trailing-edge sweep, so it holds the slot until the
+        // reservation window closes rather than returning as soon as the retry
+        // burst is skipped. Assert the property that actually matters — the slot
+        // is never LEAKED — by running past the deadline and requiring it back.
+        // Nothing was swallowed by this window, so the chain ends there.
+        for _ in 0..70 {
+            if op_manager.interest_manager.outstanding_resync_retries() == 0 {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             op_manager.interest_manager.outstanding_resync_retries(),
             0,
-            "skipping the retry must RELEASE the node-wide retry slot (the task \
-             returns and its RAII guard drops), never burn it (#4862 P1)"
+            "the follow-up task must free its node-wide slot once the reservation \
+             window closes with nothing swallowed — a slot held forever would \
+             starve the node-wide cap (#4862 P1/#5510)"
         );
     }
 
@@ -5971,10 +6407,21 @@ mod tests {
             "once the response lands mid-burst, every REMAINING attempt must be \
              skipped — the gate is re-evaluated per attempt (#4863). Got {retries:?}"
         );
+        // #5510: as above, the slot is now held until the window closes rather
+        // than until the retry burst ends. Run past the deadline and require it
+        // back; nothing was swallowed here, so the chain ends.
+        for _ in 0..70 {
+            if op_manager.interest_manager.outstanding_resync_retries() == 0 {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             op_manager.interest_manager.outstanding_resync_retries(),
             0,
-            "the retry task must exit and free its node-wide slot (#4862 P1)"
+            "the follow-up task must exit and free its node-wide slot once the \
+             reservation window closes (#4862 P1/#5510)"
         );
     }
 
@@ -6304,33 +6751,56 @@ mod tests {
         // per-(contract, sender) throttle reservation (`begin_resync_request`) and
         // the global per-contract emit cap (`resync_emit_limiter`, #4864) — so it
         // never runs on a throttled or globally-suppressed drop.
-        let helper = fn_body("async fn send_dropped_broadcast_resync_request(");
+        // #5510 re-anchor. The gates are in `reserve_resync_emit` and the spawn
+        // is in `spawn_resync_followups`, so the ordering is now checked in two
+        // steps: the entry point calls reserve BEFORE spawn, and reserve holds
+        // both gates. That is the same guarantee — nothing is scheduled on a
+        // throttled or globally-suppressed drop — expressed against the current
+        // shape.
+        let entry = fn_body("async fn send_dropped_broadcast_resync_request(");
+        let reserve = entry
+            .find("reserve_resync_emit(")
+            .expect("the entry point must take the gates via reserve_resync_emit (#4251/#4864)");
+        let followups = entry
+            .find("spawn_resync_followups(")
+            .expect("the entry point must schedule the follow-ups (heal #4857 P2 / #5510)");
+        assert!(
+            reserve < followups,
+            "the gates ({reserve}) MUST be taken before the follow-up task is \
+             spawned ({followups}), so a throttled or globally-suppressed drop \
+             schedules nothing"
+        );
+
+        let helper = fn_body("async fn reserve_resync_emit(");
         let gate = helper
             .find(".begin_resync_request(")
             .expect("helper must gate on begin_resync_request (per-sender throttle, #4251)");
         let global_cap = helper
             .find("resync_emit_limiter")
             .expect("helper must gate on the global per-contract emit cap (#4864)");
+        let record = helper
+            .find("outstanding_resync_requests")
+            .expect("helper must record the outstanding request the follow-ups rely on");
+        assert!(
+            gate < record && global_cap < record,
+            "the correlation record MUST come AFTER both the begin_resync_request \
+             reservation and the global emit-cap gate, so the follow-ups only run \
+             within a granted, globally-authorized reservation (never on a \
+             throttled or suppressed drop)"
+        );
+        // #5510: the spawn itself moved to `spawn_resync_followups`, which the
+        // entry point calls only after the gates (asserted above). The slot and
+        // Drop-guard assertions below therefore read that function.
+        let helper = fn_body("fn spawn_resync_followups(");
         let spawn = helper
-            .find("resend_dropped_broadcast_resync_request(")
-            .expect("helper must schedule the trailing retry (heal #4857 P2)");
-        assert!(
-            gate < spawn && global_cap < spawn,
-            "the trailing-retry spawn MUST come AFTER both the begin_resync_request \
-             reservation and the global emit-cap gate, so retries only run within a \
-             granted, globally-authorized reservation (never on a throttled or \
-             suppressed drop)"
-        );
-        assert!(
-            helper.contains("GlobalExecutor::spawn("),
-            "the trailing retry must be a spawned background task"
-        );
+            .find("GlobalExecutor::spawn(")
+            .expect("the follow-ups must be a spawned background task");
 
-        // (1a) The retry spawn is gated on a node-wide slot (#4862 P1) so LRU
-        // churn cannot spawn unbounded overlapping retry tasks, and the slot is
-        // moved INTO the task (freed on completion via its Drop guard).
+        // (1a) The spawn is gated on a node-wide slot (#4862 P1) so LRU churn
+        // cannot spawn unbounded overlapping tasks, and the slot is moved INTO
+        // the task (freed on completion via its Drop guard).
         let reserve = helper.find("try_reserve_resync_retry_slot(").expect(
-            "retry spawn must be gated on interest_manager.try_reserve_resync_retry_slot() (#4862 P1)",
+            "the spawn must be gated on interest_manager.try_reserve_resync_retry_slot() (#4862 P1)",
         );
         assert!(
             reserve < spawn,
@@ -6343,41 +6813,44 @@ mod tests {
              on task completion (#4862 P1)"
         );
 
-        // (1b) The retry is spawned CONCURRENTLY, BEFORE the blocking immediate
-        // enqueue (#4862 P2), so its timer runs DURING a backpressured send —
-        // otherwise a send that consumed the whole window would leave the task
-        // starting past the deadline with zero retries.
-        let immediate_send = helper
-            .find(".notify_node_event(")
-            .expect("helper must perform the immediate (blocking) ResyncRequest enqueue");
+        // (1b) The follow-ups are spawned CONCURRENTLY, BEFORE the blocking
+        // immediate enqueue (#4862 P2), so the retry timer runs DURING a
+        // backpressured send — otherwise a send that consumed the whole window
+        // would leave the task starting past the deadline with zero retries.
+        // #5510: the enqueue moved into `dispatch_resync_request`, so the
+        // ordering is now read off the entry point's call sequence, which is
+        // where it is actually decided.
+        let immediate_send = entry
+            .find("dispatch_resync_request(")
+            .expect("the entry point must perform the immediate (blocking) enqueue");
         assert!(
-            spawn < immediate_send,
-            "the retry spawn MUST come BEFORE the blocking .notify_node_event() \
-             immediate send (#4862 P2), so the retry timer runs during a \
-             backpressured enqueue"
+            followups < immediate_send,
+            "the follow-up spawn ({followups}) MUST come BEFORE the blocking \
+             dispatch_resync_request ({immediate_send}) (#4862 P2), so the retry \
+             timer runs during a backpressured enqueue"
         );
 
-        // The helper passes the reservation deadline into the retry so the burst
-        // is anchored to THIS reservation window (review P2-A).
+        // The deadline is threaded into the follow-ups so the burst is anchored
+        // to THIS reservation window (review P2-A).
         assert!(
             helper.contains("reservation_deadline"),
-            "the helper must thread the reservation deadline from \
+            "the follow-up spawn must thread the reservation deadline from \
              begin_resync_request into the retry (anchor to the window, P2-A)"
         );
 
-        // (1d) #4863: the correlation record MUST be written BEFORE the retry
-        // spawn. The retry's conditional gate READS that record to decide whether
-        // the first request already landed; a task spawned before the record
-        // exists could observe "absent", conclude "landed", and skip the heal.
-        let record = helper.find(".record(*key.id(), sender_addr)").expect(
-            "helper must record the outstanding request for receive-arm \
-             correlation (#4864 round-8)",
-        );
+        // (1d) #4863: the correlation record MUST be written BEFORE the spawn.
+        // The retry's conditional gate READS that record to decide whether the
+        // first request already landed; a task spawned before the record exists
+        // could observe "absent", conclude "landed", and skip the heal. #5510:
+        // the record is in `reserve_resync_emit` (asserted present above), and
+        // the entry point calls it before the spawn — asserted as
+        // `reserve < followups` at the top of this test. Re-state it here with
+        // the record's own anchor so deleting the record is caught too.
         assert!(
-            record < spawn,
-            "the outstanding-request record ({record}) MUST precede the retry \
-             spawn ({spawn}) — the retry's #4863 conditional gate reads it, and a \
-             task that could observe a not-yet-written record would skip the heal"
+            fn_body("async fn reserve_resync_emit(").contains(".record(*key.id(), sender_addr)"),
+            "reserve_resync_emit must record the outstanding request for \
+             receive-arm correlation (#4864 round-8), and it must do so there \
+             because the entry point calls it before spawning the follow-ups"
         );
 
         // (2) The retry body RE-DELIVERS the one already-authorized emit: it must
