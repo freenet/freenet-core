@@ -1531,8 +1531,11 @@ impl Report {
                 self.inconclusive
             )?;
             // Said once, above the messages rather than beside each one: these
-            // strings come from the contract, and a contract error routinely names
-            // what it rejected. The corpora replayed here are captured from live
+            // strings mostly come from the contract - a contract error routinely
+            // names what it rejected - but a runtime/harness failure's text comes
+            // from the WASM runtime executing an attacker-influenceable module
+            // instead, so it is untrusted for the same reason and gets the same
+            // treatment below. The corpora replayed here are captured from live
             // peers, and `bundle.rs` and `capture.rs` both mark that material
             // sensitive - this is the path that brings it to a terminal.
             if self
@@ -1542,8 +1545,8 @@ impl Report {
             {
                 writeln!(
                     out,
-                    "  (quoted messages are written by the contract and may contain \
-                     application state)"
+                    "  (quoted messages come from the contract or the WASM runtime \
+                     executing it, and may contain application state)"
                 )?;
             }
             for r in &self.inconclusive_reasons {
@@ -1690,6 +1693,11 @@ fn inconclusive_label(reason: &Inconclusive) -> &'static str {
         Inconclusive::InputNotValid => "input not valid",
         Inconclusive::RelatedRequired => "requires related contract state",
         Inconclusive::ContractError(_) => "contract error",
+        // Deliberately a distinct label from `ContractError`, not merely a distinct
+        // variant: the two mean opposite things about who is at fault (a contract
+        // rejecting its input vs. the host/WASM runtime itself failing), and sharing
+        // the label is what lost that distinction in the first place (#5509).
+        Inconclusive::RuntimeError(_) => "runtime/harness failure",
         Inconclusive::NoOutputState => "update produced no output state",
         Inconclusive::ResourceLimit(_) => "resource limit hit",
         Inconclusive::RoundLimit => "reconciliation round budget exhausted",
@@ -1718,10 +1726,12 @@ fn inconclusive_detail(reason: &Inconclusive) -> Option<&str> {
     reason.detail()
 }
 
-/// Make a contract-authored string safe and bounded for the report.
+/// Make an `Inconclusive` detail string safe and bounded for the report.
 ///
-/// Two hazards, both from one fact: this text is written by the contract under test,
-/// which is the thing we are least entitled to trust.
+/// Two hazards, both from one fact: this text comes from the contract under test or
+/// the WASM runtime executing it, neither of which we are entitled to trust — the
+/// runtime's own error text can embed detail (an export name, a trap message) drawn
+/// from the same attacker-influenceable module.
 ///
 /// Control characters are escaped first. A message containing a newline would
 /// otherwise forge report lines - a fabricated `violation:` line is one `\n` away -
@@ -3517,6 +3527,59 @@ mod tests {
             rendered.contains("stale nonce"),
             "only the most common message survived, so a second distinct failure \
              stays invisible:\n{rendered}"
+        );
+    }
+
+    /// A host/WASM failure must land in its own bucket, under its own text, never
+    /// folded into `contract error` (#5509).
+    ///
+    /// `Inconclusive::ContractError` and `Inconclusive::RuntimeError` name opposite
+    /// culprits — the contract rejecting its input vs. the runtime executing it
+    /// failing — and sharing a label is the exact defect this test exists to catch:
+    /// a report that could not tell "many contracts misbehave" from "our own harness
+    /// has a bug" (#5461, answered for the text but not the taxonomy by #5506).
+    #[test]
+    fn runtime_failure_is_a_separate_bucket_from_contract_error() {
+        let report = report_from_inconclusive(vec![
+            Inconclusive::ContractError("signature does not chain to the owner".to_string()),
+            Inconclusive::RuntimeError("missing contract export: update_state".to_string()),
+            Inconclusive::RuntimeError("missing contract export: update_state".to_string()),
+        ]);
+
+        let contract_bucket = contract_error_bucket(&report);
+        assert_eq!(contract_bucket.occurrences, 1);
+        assert_eq!(
+            contract_bucket.examples[0].text,
+            "signature does not chain to the owner"
+        );
+
+        let runtime_bucket = report
+            .inconclusive_reasons
+            .iter()
+            .find(|r| r.reason == "runtime/harness failure")
+            .expect("the runtime/harness bucket is missing from the report");
+        assert_eq!(runtime_bucket.occurrences, 2);
+        assert_eq!(
+            runtime_bucket
+                .examples
+                .iter()
+                .map(|e| (e.text.as_str(), e.occurrences))
+                .collect::<Vec<_>>(),
+            vec![("missing contract export: update_state", 2)]
+        );
+
+        let rendered = render_human(&report);
+        assert!(
+            rendered.contains("runtime/harness failure"),
+            "the human report never names the runtime/harness bucket:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("missing contract export: update_state"),
+            "the runtime failure's own text never reaches the report:\n{rendered}"
+        );
+        assert_ne!(
+            contract_bucket.reason, runtime_bucket.reason,
+            "a contract rejection and a runtime trap must never share a label"
         );
     }
 
