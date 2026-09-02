@@ -344,8 +344,16 @@ pub(crate) enum ResyncDebt {
     /// The reservation is GONE — evicted from the bounded LRU under pair churn
     /// — so whether a drop was swallowed cannot be known. Treat as owed: a
     /// redundant full state costs one response, a missed one costs a divergence
-    /// that persists to anti-entropy. Still bounded by the emit cap and the
-    /// chain bound, so conservatism here cannot amplify.
+    /// that persists to anti-entropy.
+    ///
+    /// The caller must LATCH this to ONE speculative repair per chain (#5510
+    /// N2). The emit cap and the chain bound hold the emit RATE at one per
+    /// window per pair, so conservatism cannot amplify traffic — but they do not
+    /// bound SLOT OCCUPANCY, and the LRU pressure that produces `Unknown`
+    /// persists, so an unlatched chain is re-told "unknown" every window and
+    /// runs to its full served-window bound holding a node-wide slot throughout.
+    /// An earlier version of this comment said "cannot amplify" without that
+    /// distinction, which was true of the one axis and false of the other.
     Unknown,
 }
 
@@ -2374,14 +2382,22 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// has elapsed since the last such request (or none was ever sent), or
     /// `None` when still throttled.
     ///
-    /// The `begin`/[`Self::cancel_resync_request`] reservation-commit pair
-    /// restores atomicity under the double-gate (#4864 round-6 item 2): recording
-    /// under the lock means two concurrent queue-full callbacks for the same
-    /// (contract, target) cannot both pass, so they cannot both consume the global
-    /// burst and emit duplicates inside the window. If a later gate (the global
-    /// per-contract emit cap) then rejects, the caller `cancel`s the reservation
-    /// so the window is released — preserving the round-5 improvement that a
-    /// globally-suppressed emit does not burn the 30s window.
+    /// Recording under the lock is what restores atomicity under the double-gate
+    /// (#4864 round-6 item 2): two concurrent queue-full callbacks for the same
+    /// (contract, target) cannot both pass, so they cannot both consume the
+    /// global burst and emit duplicates inside the window.
+    ///
+    /// When a later gate (the global per-contract emit cap) rejects, the caller
+    /// **keeps** the reservation and marks it as owing a repair
+    /// ([`Self::note_resync_debt_on_held_reservation`]), rather than cancelling
+    /// it (#5510 X1). Cancelling released the window, which read as considerate
+    /// — the sender could retry as soon as tokens refilled — and was, until a
+    /// follow-up chain existed: with the window released, every later drop on
+    /// the pair was refused afresh and spawned a chain of its own, draining the
+    /// node-wide slot pool. Keeping it throttles those later drops into the one
+    /// chain already carrying the debt. The window is not burned either way: the
+    /// chain that owns it serves the debt at its close, and the attempt after
+    /// that takes a FRESH window, because this one has expired by then.
     ///
     /// The returned deadline lets a caller that performs a bounded retry burst
     /// (the UPDATE queue-full path, #4857/#4862 P2) anchor every retry to THIS
@@ -2488,13 +2504,24 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         &self,
         contract: &ContractKey,
         target: SocketAddr,
-    ) {
-        if let Some(res) = self
-            .resync_request_throttle
-            .lock()
-            .get_mut(&(*contract, target))
-        {
-            res.dropped_during_window = true;
+        expected_deadline: Instant,
+    ) -> bool {
+        let now = self.time_source.now();
+        let mut throttle = self.resync_request_throttle.lock();
+        match throttle.get_mut(&(*contract, target)) {
+            // Only a LIVE reservation of the caller's own generation can carry a
+            // debt (review round 3, N1). An unconditional set looked right and
+            // was inert: on an EXPIRED reservation nothing can ever take the
+            // flag — the take requires a matching deadline, and the only holder
+            // of that deadline is the chain that just gave up — and the next
+            // grant `put`s a fresh entry with the flag cleared. So the debt was
+            // written to a slot that had already stopped being read, and the log
+            // beside it claimed the repair had been preserved.
+            Some(res) if res.deadline() == expected_deadline && now < res.deadline() => {
+                res.dropped_during_window = true;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -2576,12 +2603,23 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         self.resync_retry_slots.load(Ordering::Relaxed)
     }
 
-    /// Cancel a reservation made by [`Self::begin_resync_request`]: removes the
-    /// just-recorded throttle window for (contract, target) so the sender can
-    /// retry as soon as the OTHER gate (the global emit cap) refills, rather than
-    /// waiting out the full [`RESYNC_REQUEST_MIN_INTERVAL`] (#4864 round-6 item 2).
-    /// Call only after a `begin` that returned `true` whose send was then rejected
-    /// downstream.
+    /// Cancel a reservation: removes the just-recorded throttle window for
+    /// (contract, target) so the sender can retry immediately.
+    ///
+    /// **No production caller since #5510 X1.** The global-cap path used to call
+    /// this; it now keeps the reservation and marks it as owing a repair
+    /// instead, because releasing the window let every later drop on the pair
+    /// spawn its own follow-up chain. Kept, rather than deleted, only because
+    /// `begin_cancel_resync_request_reservation_semantics` pins the
+    /// reserve-then-release semantics of the throttle itself, which is worth
+    /// keeping testable independently of who calls it. If that test goes, this
+    /// goes with it — do NOT reintroduce a production caller without reading the
+    /// X1 note on `begin_resync_request` first.
+    /// Removes the just-recorded throttle window for (contract, target) so the
+    /// sender can retry as soon as the OTHER gate (the global emit cap) refills,
+    /// rather than waiting out the full [`RESYNC_REQUEST_MIN_INTERVAL`]
+    /// (#4864 round-6 item 2).
+    #[cfg(test)]
     pub fn cancel_resync_request(&self, contract: &ContractKey, target: SocketAddr) {
         self.resync_request_throttle
             .lock()
@@ -5003,6 +5041,58 @@ mod tests {
             ResyncDebt::None,
             "a granted reservation starts with no debt: the caller emits for \
              itself, so nothing is owed to a later sweep"
+        );
+    }
+
+    /// #5510 review round 3 (N1): the debt-note refuses an EXPIRED reservation.
+    ///
+    /// Without this, `note_resync_debt_on_held_reservation` was a set that
+    /// looked effective and was inert. A chain reaching its bound writes the
+    /// flag after `now >= deadline`, so the entry has expired: no take can match
+    /// its generation (the only holder is the chain now leaving), and the next
+    /// grant `put`s a fresh entry with the flag cleared. The debt went to a slot
+    /// that had stopped being read, while the log beside it claimed the repair
+    /// had been preserved.
+    ///
+    /// Refusing makes that visible to the caller, which is what lets the caller
+    /// do the right thing instead — emit.
+    #[test]
+    fn the_debt_note_refuses_an_expired_or_foreign_reservation() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(12);
+        let addr: SocketAddr = "127.0.0.1:5106".parse().unwrap();
+
+        let deadline = manager
+            .begin_resync_request(&contract, addr)
+            .expect("reservation must be granted");
+
+        assert!(
+            manager.note_resync_debt_on_held_reservation(&contract, addr, deadline),
+            "a LIVE reservation of the caller's own generation must accept the debt"
+        );
+        assert_eq!(
+            manager.take_resync_drop_during_window(&contract, addr, deadline),
+            ResyncDebt::Owed,
+            "and that debt must be takeable by the chain that owns the window"
+        );
+
+        // A deadline that is not this reservation's.
+        assert!(
+            !manager.note_resync_debt_on_held_reservation(
+                &contract,
+                addr,
+                deadline + Duration::from_secs(1),
+            ),
+            "a note against a different generation must be refused rather than \
+             land on someone else's reservation"
+        );
+
+        // Now let the window expire, which is the case that made this inert.
+        time.advance_time(RESYNC_REQUEST_MIN_INTERVAL);
+        assert!(
+            !manager.note_resync_debt_on_held_reservation(&contract, addr, deadline),
+            "an EXPIRED reservation must refuse the debt: nothing can take a flag \
+             set on it, so accepting would report a repair that will never happen"
         );
     }
 

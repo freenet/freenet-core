@@ -1366,7 +1366,7 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
                 return;
             }
         };
-    // Spawn BEFORE the blocking dispatch below — that ordering is load-bearing;
+    // Spawn BEFORE the blocking dispatch below; the order matters and is
     // see `spawn_resync_followups` (#4862 P2).
     spawn_resync_followups(
         op_manager,
@@ -1520,7 +1520,7 @@ async fn reserve_resync_emit(
     {
         op_manager
             .interest_manager
-            .note_resync_debt_on_held_reservation(&key, sender_addr);
+            .note_resync_debt_on_held_reservation(&key, sender_addr, reservation_deadline);
         // The COUNTER answers "how many repairs did the cap suppress" — one per
         // drop that wanted one — so a chain's own retries must not inflate it
         // (review round 3). One swallowed drop retried three times is ONE
@@ -1602,7 +1602,7 @@ async fn reserve_resync_emit(
 /// exits the first time a window closes with nothing swallowed, so a quiet
 /// contract costs one task for one window.
 ///
-/// # Ordering (#4862 P2), unchanged and still load-bearing
+/// # Ordering (#4862 P2), unchanged and still required
 ///
 /// The caller spawns this BEFORE its blocking `notify_node_event`, which can
 /// consume up to `NOTIFICATION_SEND_TIMEOUT` (30s) under backpressure. Spawning
@@ -1808,6 +1808,9 @@ fn spawn_resync_followups(
         };
         // Total loop passes, bounding a chain that only ever gets refused.
         let mut attempts: u32 = 0;
+        // Whether this chain has already spent its ONE speculative repair for an
+        // unknowable debt. See the `ResyncDebt::Unknown` arm below.
+        let mut repaired_unknown = false;
 
         loop {
             if deliver {
@@ -1869,13 +1872,44 @@ fn spawn_resync_followups(
             if !owed {
                 // `Unknown` (the reservation was evicted from the bounded LRU
                 // mid-window) counts as owed — see `ResyncDebt`. The chain
-                // cannot distinguish "nothing was swallowed" from "the record
-                // of what was swallowed is gone", and only one of those is safe
-                // to act on by exiting.
-                owed = op_mgr
-                    .interest_manager
-                    .take_resync_drop_during_window(&key, sender_addr, deadline)
-                    .is_owed();
+                // cannot distinguish "nothing was swallowed" from "the record of
+                // what was swallowed is gone", and only one of those is safe to
+                // act on by exiting.
+                //
+                // But it is LATCHED (review round 3, N2). The condition that
+                // produces `Unknown` is LRU pressure — more than
+                // RESYNC_THROTTLE_CACHE_SIZE pairs churning inside one window —
+                // and that condition persists, so an unlatched `Unknown` is
+                // reported again at every window close, so the chain runs to
+                // its served-window bound: 3 emits and ~90s of slot where one
+                // emit and ~30s was owed, on precisely the saturated node X1
+                // exists to protect. One speculative repair for an unknowable
+                // debt is proportionate; three is not.
+                //
+                // A genuine `Owed` is not latched and continues as before.
+                match op_mgr.interest_manager.take_resync_drop_during_window(
+                    &key,
+                    sender_addr,
+                    deadline,
+                ) {
+                    crate::ring::interest::ResyncDebt::Owed => owed = true,
+                    crate::ring::interest::ResyncDebt::Unknown if !repaired_unknown => {
+                        repaired_unknown = true;
+                        owed = true;
+                        tracing::debug!(
+                            tx = %incoming_tx,
+                            contract = %key,
+                            target = %sender_addr,
+                            event = "coalesced_resync_unknown_debt",
+                            "UPDATE relay: this pair's reservation was evicted \
+                             from the throttle LRU, so whether a drop was \
+                             swallowed is unknowable; repairing once \
+                             speculatively (#5510)"
+                        );
+                    }
+                    crate::ring::interest::ResyncDebt::Unknown
+                    | crate::ring::interest::ResyncDebt::None => {}
+                }
             }
             if !owed {
                 // Nothing was swallowed by this window. Usually that means the
@@ -1920,31 +1954,82 @@ fn spawn_resync_followups(
                 || attempts >= MAX_COALESCED_RESYNC_ATTEMPTS
             {
                 // The debt was CONSUMED into `owed` a few lines above, so
-                // returning here would abandon it silently (review round 3, X4):
-                // a drop swallowed late in the last served window would vanish
-                // at t=90 with nothing left holding the flag. Hand it back to
-                // the reservation instead, so the next drop on this pair — or a
-                // chain that later owns this window — still serves it.
+                // simply returning would abandon it silently: a drop swallowed
+                // late in the last served window would vanish at ~t=90.
                 //
-                // Handing back rather than emitting one more time keeps the
-                // bound meaning what it says. Emitting here would make the
-                // chain serve MAX+1 windows, and the bound exists to cap slot
-                // occupancy, not to cap repairs.
-                op_mgr
-                    .interest_manager
-                    .note_resync_debt_on_held_reservation(&key, sender_addr);
-                tracing::info!(
-                    tx = %incoming_tx,
-                    contract = %key,
-                    target = %sender_addr,
-                    windows_served,
-                    attempts,
-                    event = "coalesced_resync_chain_bound",
-                    "UPDATE relay: dropped-broadcast repair chain hit its bound \
-                     and is releasing its slot with a debt still owed; the debt \
-                     is left on the reservation, so a pair still dropping this \
-                     steadily repairs from its next reservation (#5510)"
-                );
+                // An earlier revision handed the debt back to the reservation
+                // instead of emitting. That was INERT (review round 3, N1), and
+                // instructively so: control only reaches here after
+                // `wait_until_reservation_close` returned true, i.e. `now >=
+                // deadline`, so the reservation being written to has ALREADY
+                // EXPIRED. Nothing can ever take that flag — the take requires a
+                // matching deadline and the only holder of it is this chain,
+                // which is leaving — and the next drop's grant `put`s a fresh
+                // entry with the flag cleared. The debt was written to a slot
+                // that had stopped being read, and the log beside it announced
+                // that the repair had been preserved.
+                //
+                // So EMIT, once, through the same gates as any other emit: gate
+                // B, the per-(contract, sender) throttle and the global
+                // per-contract cap all still apply, and `note_debt: true` hands
+                // the debt to a sibling if one now owns the window. The #4251
+                // bound is intact — still at most one request per window per
+                // pair — and the chain bound still does its real job, which is
+                // capping SLOT OCCUPANCY rather than capping repairs.
+                if op_mgr.ring.should_summarize_or_broadcast(&key) {
+                    match reserve_resync_emit(
+                        &op_mgr,
+                        key,
+                        sender_addr,
+                        incoming_tx,
+                        DroppedBroadcastReason::DroppedDuringThrottleWindow,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            dispatch_resync_request(&op_mgr, key, sender_addr, incoming_tx).await;
+                            tracing::info!(
+                                tx = %incoming_tx,
+                                contract = %key,
+                                target = %sender_addr,
+                                windows_served,
+                                attempts,
+                                event = "coalesced_resync_chain_bound",
+                                "UPDATE relay: dropped-broadcast repair chain hit \
+                                 its bound; emitted a final repair for the debt it \
+                                 was carrying and released its slot (#5510)"
+                            );
+                        }
+                        Err(refusal) => {
+                            tracing::info!(
+                                tx = %incoming_tx,
+                                contract = %key,
+                                target = %sender_addr,
+                                windows_served,
+                                attempts,
+                                refusal = ?refusal,
+                                event = "coalesced_resync_chain_bound_unrepaired",
+                                "UPDATE relay: dropped-broadcast repair chain hit \
+                                 its bound and its final repair was refused; the \
+                                 debt is handed to whichever reservation now holds \
+                                 this pair, or waits for the next drop (#5510)"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::info!(
+                        tx = %incoming_tx,
+                        contract = %key,
+                        target = %sender_addr,
+                        windows_served,
+                        attempts,
+                        event = "coalesced_resync_chain_bound_unheld",
+                        "UPDATE relay: dropped-broadcast repair chain hit its \
+                         bound for a contract this node no longer holds; nothing \
+                         to repair (#5510)"
+                    );
+                }
                 return;
             }
 
@@ -5415,28 +5500,6 @@ mod tests {
              releases the window (so retrying can win it back), a sibling holds \
              it (so retrying cannot)"
         );
-        // #5510 review round 3 (X4): the bound's return must hand the debt back.
-        //
-        // The debt is CONSUMED into `owed` before the bound is checked, so a
-        // bare return abandons it — a drop swallowed late in the last served
-        // window would vanish at t=90 with nothing holding the flag. Handing it
-        // back rather than emitting one more time keeps the bound meaning what
-        // it says: it caps slot occupancy, not repairs.
-        let bound = body
-            .find("if windows_served >= MAX_COALESCED_RESYNC_WINDOWS")
-            .expect("the chain bound must exist");
-        let bound_end = body[bound..]
-            .find("\n            }")
-            .map(|i| bound + i)
-            .unwrap_or(body.len());
-        assert!(
-            body[bound..bound_end].contains("note_resync_debt_on_held_reservation"),
-            "the chain-bound return must hand the consumed debt back to the \
-             reservation; it was taken into `owed` before this check, so \
-             returning without it drops a real repair on the floor at the exact \
-             moment the chain stops looking (#5510 X4)"
-        );
-
         assert!(
             !arm_body.contains("note_resync_drop_during_window"),
             "the hand-over happens inside begin_resync_request_or_note_drop, \
@@ -5525,6 +5588,189 @@ mod tests {
             "retrying an unanswered repair must stay bounded by windows_served \
              and attempts — otherwise X2's fix trades a lost repair for a leaked \
              slot"
+        );
+    }
+
+    /// #5510 review round 3 (N2): an unknowable debt causes at most ONE
+    /// speculative repair, not one per window.
+    ///
+    /// `ResyncDebt::Unknown` means the pair's reservation was evicted from the
+    /// bounded LRU mid-window, so whether a drop was swallowed cannot be known.
+    /// Treating it as owed is right — a redundant full state costs one response,
+    /// a missed one costs a divergence that lasts until anti-entropy.
+    ///
+    /// Treating it as owed EVERY window is not. The condition that produces
+    /// `Unknown` is LRU pressure, and that persists, so an unlatched chain is
+    /// told "unknown" again at each close and walks to its served-window bound:
+    /// three emits and ~90s of a node-wide slot where one emit and ~30s was
+    /// owed — on precisely the saturated node the slot pool exists to protect.
+    ///
+    /// Here the entry is evicted before every window close, so `Unknown` is the
+    /// answer every time.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknowable_debt_causes_one_speculative_repair_not_one_per_window() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("unknown-latch-5510").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([95u8; 32]),
+            CodeHash::new([96u8; 32]),
+        );
+        let _held = hold_contracts(&op_manager, &[key]).await;
+        let target: SocketAddr = "127.0.0.1:14200".parse().unwrap();
+
+        send_dropped_broadcast_resync_request(
+            &op_manager,
+            key,
+            target,
+            Transaction::new::<UpdateMsg>(),
+            DroppedBroadcastReason::RateLimited,
+        )
+        .await;
+        let _ = drain_resync_targets(&mut notification_rx, key);
+
+        // Discard the #4862 re-deliveries, which are not repairs and fire inside
+        // the first window regardless.
+        for _ in 0..56 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            let _ = drain_resync_targets(&mut notification_rx, key);
+        }
+
+        // From here, drop this pair's reservation before every window close, so
+        // the take can only ever answer `Unknown`.
+        //
+        // The correlation record is consumed on every tick, standing in for a
+        // responder that answers. Without that this test cannot see the latch at
+        // all: the X2 path keeps `owed` true while a request is unanswered, and
+        // in this harness nothing ever answers, so the chain runs to its bound
+        // for that reason instead — six emits, and not one of them attributable
+        // to `Unknown`. Consuming the record isolates the axis under test.
+        let mut emits = Vec::new();
+        for _ in 0..400 {
+            op_manager
+                .interest_manager
+                .cancel_resync_request(&key, target);
+            op_manager
+                .ring
+                .outstanding_resync_requests
+                .consume(*key.id(), target);
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            emits.extend(drain_resync_targets(&mut notification_rx, key));
+            if op_manager.interest_manager.outstanding_resync_retries() == 0 {
+                break;
+            }
+        }
+
+        assert!(
+            emits.len() <= 1,
+            "an unknowable debt must cause at most ONE speculative repair per \
+             chain. More means the latch is missing and sustained LRU pressure \
+             walks every chain to its full bound, holding node-wide slots on the \
+             busiest node. Got {emits:?}"
+        );
+        assert_eq!(
+            op_manager.interest_manager.outstanding_resync_retries(),
+            0,
+            "and the chain must exit rather than keep re-reading Unknown"
+        );
+    }
+
+    /// #5510 review round 3 (N1): a chain that reaches its bound while still
+    /// owing a repair EMITS one, rather than returning quietly.
+    ///
+    /// The bound is checked after the window's debt has been consumed into
+    /// `owed`, so whatever the chain does there decides the fate of a real
+    /// swallowed drop. An earlier revision handed the debt back to the
+    /// reservation; that was inert, because control only reaches the bound once
+    /// `now >= deadline`, so the entry being written to had already expired —
+    /// no take could match its generation, and the next grant cleared the flag.
+    /// The drop was lost at ~t=90 while the log announced it had been preserved.
+    ///
+    /// Construction: the emit bucket is kept empty so every re-reservation is
+    /// refused and the chain climbs to its ATTEMPTS bound still owing, then the
+    /// draining stops so the final emit can be granted. Exactly one emit must
+    /// follow, and the chain must then exit.
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_reaching_its_bound_while_owing_emits_a_final_repair() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("bound-final-emit-5510").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([93u8; 32]),
+            CodeHash::new([94u8; 32]),
+        );
+        let _held = hold_contracts(&op_manager, &[key]).await;
+        let target: SocketAddr = "127.0.0.1:14100".parse().unwrap();
+
+        for _ in 0..2 {
+            send_dropped_broadcast_resync_request(
+                &op_manager,
+                key,
+                target,
+                Transaction::new::<UpdateMsg>(),
+                DroppedBroadcastReason::RateLimited,
+            )
+            .await;
+        }
+        let _ = drain_resync_targets(&mut notification_rx, key);
+
+        // Phase 1: keep the bucket empty so every re-reservation is refused and
+        // the chain climbs toward its ATTEMPTS bound with the debt still owed.
+        // Stops at ~120s, comfortably before the attempts bound, so the bound
+        // itself is reached in phase 2 when tokens are available to serve it.
+        //
+        // Emissions here are discarded rather than asserted absent: the #4862
+        // re-deliveries re-send the already-authorized first request and do not
+        // consult the emit cap, so two of them fire inside the first window
+        // however empty the bucket is. They are not repairs.
+        for _ in 0..240 {
+            while op_manager
+                .ring
+                .resync_emit_limiter
+                .check_and_record(*key.id())
+            {}
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            let _ = drain_resync_targets(&mut notification_rx, key);
+        }
+        assert!(
+            op_manager.interest_manager.outstanding_resync_retries() > 0,
+            "precondition: the chain must still be alive and owing as it \
+             approaches its bound"
+        );
+
+        // Phase 2: stop draining. The chain's final act, at its bound, must be
+        // to emit the repair it has been carrying.
+        let mut after = Vec::new();
+        for _ in 0..400 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            after.extend(drain_resync_targets(&mut notification_rx, key));
+            if op_manager.interest_manager.outstanding_resync_retries() == 0 && !after.is_empty() {
+                break;
+            }
+        }
+
+        // Not an exact count, deliberately. How many of the remaining windows
+        // the chain SERVES before reaching its bound depends on when the emit
+        // bucket refills, which is not something this test should pin — and
+        // pinning it would make the test fail for reasons unrelated to N1. The
+        // defect N1 describes is the chain reaching its bound with a debt and
+        // emitting NOTHING, so zero is the failure this must catch. Termination
+        // is covered separately, by
+        // `a_chain_refused_on_every_attempt_terminates_and_frees_its_slot` and
+        // by the chain-bound pin.
+        assert!(
+            !after.is_empty(),
+            "the chain must emit the repair it carried to its bound rather than \
+             returning quietly: zero emits is the inert hand-back, where the debt \
+             was written to an already-expired reservation that nothing could \
+             read and the next grant then cleared"
+        );
+        assert_eq!(
+            op_manager.interest_manager.outstanding_resync_retries(),
+            0,
+            "and the chain must then exit, releasing its node-wide slot"
         );
     }
 
