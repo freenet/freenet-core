@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use freenet::conformance::ConformanceOracle;
+use freenet::conformance::bundle::BundleError;
 use freenet::conformance::generator::Corpus;
 use freenet::conformance::host_clock;
 use freenet::conformance::verifier::Bytes;
@@ -50,6 +51,14 @@ use serde::Serialize;
 pub struct ConformanceConfig {
     /// Path to the compiled contract WASM. Required unless `--bundle` supplies
     /// its own code; when both are given, this overrides the bundle's code.
+    ///
+    /// Also accepts a node's contract-store entry (a version header ahead of
+    /// the code, not raw WASM) when paired with `--bundle` or `--evidence`:
+    /// if the raw bytes do not already match what the bundle or evidence
+    /// names, unwrapping it as a store entry is tried automatically before
+    /// giving up. Without either of those there is nothing to check an
+    /// unwrapped candidate against, so a bare `--wasm --state` invocation is
+    /// read as raw WASM only.
     #[arg(long)]
     pub(crate) wasm: Option<PathBuf>,
 
@@ -496,27 +505,74 @@ async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::
         ),
     };
 
+    // Build the runtime and confirm the contract is the one the evidence
+    // names. Checking this is what stops a finding being replayed against a
+    // different contract and appearing to confirm or clear it. Nested so this
+    // one definition serves both attempts below: a bare `--wasm` file may
+    // need it run once against the raw bytes and once against a
+    // contract-store form of the same bytes.
+    async fn oracle_matching_evidence(
+        code: Vec<u8>,
+        evidence: &ConformanceEvidence,
+    ) -> anyhow::Result<RuntimeOracle> {
+        let oracle = RuntimeOracle::standalone(code, evidence.parameters.clone())
+            .await
+            .map_err(describe_oracle_build_error)?;
+        if oracle.instance_id() != evidence.contract {
+            anyhow::bail!(
+                "the contract supplied is {} but the evidence is about {}",
+                oracle.instance_id(),
+                evidence.contract
+            );
+        }
+        Ok(oracle)
+    }
+
+    let raw_result = oracle_matching_evidence(code.clone(), &evidence).await;
+    // Only a bare `--wasm` file is worth retrying as a contract-store entry:
+    // `--contract-store` already unwraps inside `find_code_for_instance`, and
+    // there is nothing left to retry when neither was given (caught above).
+    // The unwrapped candidate goes through the exact same identity check the
+    // raw bytes did — this widens what `--wasm` ACCEPTS, never what is
+    // TRUSTED. Matched by value (rather than `.is_err()` / `.unwrap_err()`)
+    // because `RuntimeOracle` carries a live wasmtime instance and does not
+    // implement `Debug`.
+    let (code, oracle_result) = match raw_result {
+        Ok(oracle) => (code, Ok(oracle)),
+        Err(raw_err) if config.wasm.is_some() => match try_unwrap_store_form(&code) {
+            Some(unwrapped) => {
+                match oracle_matching_evidence(unwrapped.clone(), &evidence).await {
+                    Ok(oracle) => (unwrapped, Ok(oracle)),
+                    Err(store_err) => {
+                        // Evidence identifies contracts by INSTANCE, which
+                        // `store_err` already names — but a node's contract
+                        // store is addressed by CODE hash, so an operator
+                        // comparing an instance id against store filenames
+                        // finds no match anywhere. Name the code hash too.
+                        let inner_hash = ContractCode::from(unwrapped.clone()).hash_str();
+                        (
+                            unwrapped,
+                            Err(anyhow::anyhow!(
+                                "{raw_err}\n(read as a contract-store entry instead: \
+                                 {store_err}; its code hash is {inner_hash})"
+                            )),
+                        )
+                    }
+                }
+            }
+            None => (code, Err(raw_err)),
+        },
+        Err(raw_err) => (code, Err(raw_err)),
+    };
+
     // Same reasoning as in `conformance()`: this is a fact about the code, it is
     // free, and this path has the code in hand. It is reported BEFORE the
-    // instance-id check below, because a contract that reads the clock is worth
-    // saying so about even when it turns out not to be the one the evidence
-    // accuses.
+    // result of the identity check above, because a contract that reads the
+    // clock is worth saying so about even when it turns out not to be the one
+    // the evidence accuses.
     report_code_diagnostics_standalone(&code_diagnostics(&code));
 
-    let mut oracle = RuntimeOracle::standalone(code, evidence.parameters.clone())
-        .await
-        .map_err(describe_oracle_build_error)?;
-
-    // The contract must be the one the evidence names. Checking this is what stops
-    // a finding being replayed against a different contract and appearing to
-    // confirm or clear it.
-    if oracle.instance_id() != evidence.contract {
-        anyhow::bail!(
-            "the contract supplied is {} but the evidence is about {}",
-            oracle.instance_id(),
-            evidence.contract
-        );
-    }
+    let mut oracle = oracle_result?;
 
     let case = evidence
         .to_case()
@@ -654,6 +710,35 @@ fn find_code_in_store(store: &Path, bundle: &ReplayBundle) -> anyhow::Result<Vec
     Ok(code.data().to_vec())
 }
 
+/// Try `raw` as a node's contract-store entry rather than raw WASM.
+///
+/// Same versioned encoding as `find_code_in_store` reads from disk — a version
+/// header ahead of the code, not raw WASM — except here the bytes already came
+/// from `--wasm` and failed to match as-is. Call this only AFTER that identity
+/// check has already failed: the unwrapped candidate must be handed back to the
+/// SAME check the caller just ran, so this widens what `--wasm` ACCEPTS and
+/// never what is TRUSTED. `None` means the bytes are not a store entry either,
+/// in which case the original failure is the whole story.
+///
+/// Prints an explanatory note to stderr on success, never stdout: `--json`
+/// puts exactly one document on stdout and a stray line ahead of it corrupts
+/// the stream for anything parsing it. `load_inputs_never_writes_to_stdout` is
+/// scoped to `load_inputs`'s own body and cannot see inside a separate
+/// function it merely calls — the exact gap that once let
+/// `report_code_diagnostics_standalone` ship a stdout regression that left
+/// every fdev test green (see `the_standalone_report_writes_to_stderr_only`).
+/// `helper_functions_never_write_to_stdout` below is this function's own copy
+/// of that same guard.
+fn try_unwrap_store_form(raw: &[u8]) -> Option<Vec<u8>> {
+    let (code, _version) = ContractCode::load_versioned_from_bytes(raw.to_vec()).ok()?;
+    eprintln!(
+        "note: --wasm did not match as supplied; it matched after unwrapping it as \
+         a contract-store entry (version header + code), which is how a node's own \
+         contract store saves it"
+    );
+    Some(code.data().to_vec())
+}
+
 /// Load the WASM, parameters and corpus, either from `--bundle` or from
 /// `--wasm` / `--params` / `--state`.
 fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<LoadedInputs> {
@@ -665,7 +750,33 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<LoadedInputs> {
         // replaying it: the run looks authoritative and means nothing, whether it
         // reports findings or a clean bill of health.
         let supplied = match (&config.wasm, &config.contract_store) {
-            (Some(path), _) => Some(read_file(path)?),
+            (Some(path), _) => {
+                let raw = read_file(path)?;
+                // Try the raw bytes first, so nothing that already matches
+                // changes meaning. Only on a MISMATCH — never on some other
+                // failure, like the bundle naming no contract at all — is it
+                // worth asking whether the file is a contract-store entry
+                // instead of raw WASM, and the unwrapped candidate goes
+                // through the exact same `resolve_code` the raw bytes did.
+                let code = match bundle.resolve_code(Some(raw.clone())) {
+                    Ok(code) => code,
+                    Err(raw_err @ BundleError::CodeMismatch { .. }) => {
+                        match try_unwrap_store_form(&raw) {
+                            Some(unwrapped) => {
+                                bundle.resolve_code(Some(unwrapped)).map_err(|store_err| {
+                                    anyhow::anyhow!(
+                                        "{raw_err}\n(read as a contract-store entry \
+                                         instead: {store_err})"
+                                    )
+                                })?
+                            }
+                            None => return Err(raw_err.into()),
+                        }
+                    }
+                    Err(raw_err) => return Err(raw_err.into()),
+                };
+                Some(code)
+            }
             (None, Some(store)) => Some(find_code_in_store(store, &bundle)?),
             (None, None) => None,
         };
@@ -712,6 +823,13 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<LoadedInputs> {
             .wasm
             .as_ref()
             .context("--wasm is required unless --bundle is given")?;
+        // Read as raw WASM ONLY — no `try_unwrap_store_form` retry here, unlike
+        // the `--bundle` and `--evidence` branches. Both of those hold an
+        // unwrapped candidate to an identity check they already have (the
+        // bundle's code hash, the evidence's instance id); this plain
+        // invocation has no hash to check one against, so silently accepting
+        // a contract-store entry here would widen what is TRUSTED, not just
+        // what is accepted, and a mismatched contract would run undetected.
         let wasm = read_file(wasm_path)?;
         let parameters = match &config.params {
             Some(path) => read_file(path)?,
@@ -1987,19 +2105,38 @@ mod stdout_purity_pin {
     /// never pass while the correct `eprintln!` call was present. It failed on correct
     /// code, which is the harmless direction; the same trap the other way is how a pin
     /// passes vacuously forever.
-    fn stdout_macros_only() -> String {
-        code_only("fn load_inputs(")
+    fn stdout_macros_only(signature: &str) -> String {
+        code_only(signature)
             .replace("eprintln!", "")
             .replace("eprint!", "")
     }
 
     #[test]
     fn load_inputs_never_writes_to_stdout() {
-        let body = stdout_macros_only();
+        let body = stdout_macros_only("fn load_inputs(");
         assert!(
             !body.contains("println!") && !body.contains("print!("),
             "load_inputs writes to stdout, which lands ahead of the --json document \
              and corrupts it for every consumer that parses stdout"
+        );
+    }
+
+    /// `load_inputs_never_writes_to_stdout` is scoped to `load_inputs`'s OWN
+    /// body and cannot see inside a function it merely calls.
+    /// `try_unwrap_store_form` is exactly that: a separate function both
+    /// `load_inputs` and `verify_evidence` call to retry a `--wasm` file as a
+    /// contract-store entry, with its own new stderr note. This is the same
+    /// gap `the_standalone_report_writes_to_stderr_only` exists to close for
+    /// `report_code_diagnostics_standalone` — a scoped pin proved nothing
+    /// about code outside its own scrape once already.
+    #[test]
+    fn helper_functions_never_write_to_stdout() {
+        let body = stdout_macros_only("fn try_unwrap_store_form(");
+        assert!(
+            !body.contains("println!") && !body.contains("print!("),
+            "try_unwrap_store_form writes to stdout, which lands ahead of the \
+             --json document and corrupts it for every consumer that parses \
+             stdout"
         );
     }
 
@@ -2785,6 +2922,138 @@ mod tests {
         );
     }
 
+    /// The smallest module `RuntimeOracle::standalone` will accept as a contract:
+    /// a memory export plus the four entry points `missing_contract_exports_for`
+    /// checks for (`validate_state`, `update_state`, `summarize_state`,
+    /// `get_state_delta`). The bodies are never meaningfully exercised — every
+    /// test using this stops at the identity check, before `verify_case` would
+    /// call into them for real — so each just returns a constant. `seed` varies
+    /// the memory size so two calls produce genuinely different code (and
+    /// therefore different instance ids).
+    fn minimal_contract_wasm(seed: u32) -> Vec<u8> {
+        // Deliberately NOT a raw string: `blank_literals` (see `stdout_purity_pin`)
+        // masks every literal from here to the end of the file for every source
+        // scrape earlier in it, and cannot mask raw-string syntax. A plain,
+        // escaped string is what `module_importing` in `wasm_tests` already uses
+        // for the same reason.
+        let wat = format!(
+            "(module\n  \
+               (memory (export \"memory\") {seed})\n  \
+               (func (export \"validate_state\") (result i32) i32.const 0)\n  \
+               (func (export \"update_state\") (result i32) i32.const 0)\n  \
+               (func (export \"summarize_state\") (result i32) i32.const 0)\n  \
+               (func (export \"get_state_delta\") (result i32) i32.const 0)\n\
+             )\n"
+        );
+        wat::parse_str(&wat).expect("minimal contract fixture is valid wat")
+    }
+
+    /// `--wasm` accepts a node's contract-store entry for `--evidence`, not just
+    /// raw WASM, when the unwrapped form is the contract the evidence names.
+    ///
+    /// Regression for #5508. Site 2 (`verify_evidence`) is the one the issue
+    /// calls out as mattering most: its own `--help` text says the contract
+    /// comes "via `--wasm` or `--contract-store`", so it is exactly where an
+    /// operator thinking in store paths hands over a store file — and it used
+    /// to fail more opaquely than the bundle case, because the versioned blob
+    /// reached `RuntimeOracle::standalone` and failed to load as WASM at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evidence_wasm_accepts_a_contract_store_file_for_the_right_contract() {
+        let code = minimal_contract_wasm(1);
+        let params = Vec::new();
+        let instance = ContractInstanceId::from_params_and_code(
+            freenet_stdlib::prelude::Parameters::from(params.clone()),
+            ContractCode::from(code.clone()),
+        );
+        let case = ConformanceCase::new(
+            ConformanceProperty::StateIdempotence,
+            vec![Bytes::from(vec![1u8, 2, 3])],
+        );
+        let evidence = ConformanceEvidence::new(instance, params, &case, None);
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let evidence_path = dir.path().join("evidence.bin");
+        std::fs::write(
+            &evidence_path,
+            bincode::serialize(&evidence).expect("encode evidence"),
+        )
+        .expect("write evidence");
+
+        let store_file = dir.path().join("contract.wasm");
+        let encoded = ContractCode::from(code.clone())
+            .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
+            .expect("encode versioned");
+        assert!(
+            encoded != code,
+            "the fixture must actually wrap the code, or this test cannot tell \
+             the fix apart from doing nothing"
+        );
+        std::fs::write(&store_file, &encoded).expect("write store file");
+
+        let config = wasm_only_config(Some(store_file));
+        let result = verify_evidence(&config, &evidence_path).await;
+        assert!(
+            result.is_ok(),
+            "a contract-store file for the RIGHT contract must be accepted, not \
+             rejected as a mismatch: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+    }
+
+    /// The store-file retry widens what `--wasm` ACCEPTS, never what the
+    /// evidence's identity check TRUSTS: a store file for a DIFFERENT contract
+    /// than the evidence names must still be rejected, in either form.
+    ///
+    /// The error must also name the inner CODE hash, not just the instance id
+    /// the identity check itself compares: evidence identifies contracts by
+    /// instance, but a node's contract store is addressed by code hash, so an
+    /// operator comparing an instance id against store filenames finds no
+    /// match anywhere (#5506's review, finding M4, generalized past the bundle
+    /// case this issue splits out).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evidence_wasm_still_rejects_a_contract_store_file_for_the_wrong_contract() {
+        let right_code = minimal_contract_wasm(1);
+        let wrong_code = minimal_contract_wasm(2);
+        assert_ne!(right_code, wrong_code, "fixtures must actually differ");
+
+        let params = Vec::new();
+        let instance = ContractInstanceId::from_params_and_code(
+            freenet_stdlib::prelude::Parameters::from(params.clone()),
+            ContractCode::from(right_code),
+        );
+        let case = ConformanceCase::new(
+            ConformanceProperty::StateIdempotence,
+            vec![Bytes::from(vec![1u8, 2, 3])],
+        );
+        let evidence = ConformanceEvidence::new(instance, params, &case, None);
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let evidence_path = dir.path().join("evidence.bin");
+        std::fs::write(
+            &evidence_path,
+            bincode::serialize(&evidence).expect("encode evidence"),
+        )
+        .expect("write evidence");
+
+        let store_file = dir.path().join("contract.wasm");
+        let encoded = ContractCode::from(wrong_code.clone())
+            .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
+            .expect("encode versioned");
+        std::fs::write(&store_file, &encoded).expect("write store file");
+
+        let config = wasm_only_config(Some(store_file));
+        let err = verify_evidence(&config, &evidence_path)
+            .await
+            .expect_err("a store file for the WRONG contract must stay rejected");
+
+        let inner_hash = ContractCode::from(wrong_code).hash_str();
+        assert!(
+            err.to_string().contains(&inner_hash),
+            "the error must name the INNER code hash so an operator can compare \
+             it against store filenames; got: {err}"
+        );
+    }
+
     /// A contract store holds a VERSIONED encoding, not raw WASM: a header
     /// precedes the code. Resolving a bundle against it therefore has two ways to
     /// fail quietly — addressing the file by the wrong name, and reading its bytes
@@ -2829,6 +3098,118 @@ mod tests {
             err.to_string()
                 .contains("no code for the bundle's contract"),
             "error should name the miss, got: {err}"
+        );
+    }
+
+    /// A `ConformanceConfig` with only `--wasm` set (plus whatever the caller
+    /// overrides via struct-update syntax). Every other field is the same
+    /// "not given" value `an_odd_number_of_transition_paths_is_an_error_not_a_panic`
+    /// spells out by hand; collected here so the `--wasm`-as-store-file tests below
+    /// do not each repeat the whole struct for the one or two fields they vary.
+    fn wasm_only_config(wasm: Option<PathBuf>) -> ConformanceConfig {
+        ConformanceConfig {
+            wasm,
+            params: None,
+            states: Vec::new(),
+            transitions: Vec::new(),
+            bundle: None,
+            contract_store: None,
+            max_cases: None,
+            properties: Vec::new(),
+            json: false,
+            evidence_out: None,
+            evidence_in: None,
+            bundle_out: None,
+        }
+    }
+
+    /// `--wasm` accepts a node's contract-store entry for `--bundle`, not just raw
+    /// WASM, when the unwrapped form is the contract the bundle actually names.
+    ///
+    /// Regression for #5508: `find_code_in_store`'s own rustdoc already explained
+    /// that a store file is a versioned encoding and reading it raw "can never
+    /// match, and that failure is quiet" — but that knowledge was never applied to
+    /// `--wasm` itself, so an operator handing over the right contract in the form
+    /// their own node stores it got "contract code does not match the bundle" and
+    /// went looking for the wrong problem.
+    #[test]
+    fn bundle_wasm_accepts_a_contract_store_file_for_the_right_contract() {
+        let code = b"stand-in wasm for the right contract".to_vec();
+        let bundle = ReplayBundle::new(code.clone(), Vec::new());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bundle_path = dir.path().join("bundle.bin");
+        bundle.write_to(&bundle_path).expect("write bundle");
+
+        // The store-file form: a version header ahead of the code, exactly what
+        // `ContractStore::store_contract` writes to disk — NOT raw WASM.
+        let store_file = dir.path().join("contract.wasm");
+        let encoded = ContractCode::from(code.clone())
+            .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
+            .expect("encode versioned");
+        assert!(
+            encoded != code,
+            "the fixture must actually wrap the code, or this test cannot tell \
+             the fix apart from doing nothing"
+        );
+        std::fs::write(&store_file, &encoded).expect("write store file");
+
+        let config = ConformanceConfig {
+            bundle: Some(bundle_path.clone()),
+            ..wasm_only_config(Some(store_file))
+        };
+        let loaded = load_inputs(&config).unwrap_or_else(|e| {
+            panic!(
+                "a contract-store file for the RIGHT contract must be accepted, \
+                 not rejected as a mismatch: {e}"
+            )
+        });
+        assert_eq!(
+            loaded.wasm, code,
+            "the code returned must be the unwrapped, raw form"
+        );
+    }
+
+    /// The store-file retry widens what `--wasm` ACCEPTS, never what the bundle's
+    /// identity check TRUSTS: a store file for a DIFFERENT contract than the
+    /// bundle names must still be rejected, in either form.
+    ///
+    /// The error must name the INNER code hash — the one a store file is actually
+    /// named by on disk — not just the wrapper bytes' hash, or an operator
+    /// comparing the reported hash against store filenames finds no match
+    /// anywhere, which is the same "hunting for the wrong problem" failure #5508
+    /// is about, displaced one case over (see #5506's review, finding M4).
+    #[test]
+    fn bundle_wasm_still_rejects_a_contract_store_file_for_the_wrong_contract() {
+        let right_code = b"stand-in wasm for the right contract".to_vec();
+        let wrong_code = b"stand-in wasm for a DIFFERENT contract entirely".to_vec();
+        let bundle = ReplayBundle::new(right_code, Vec::new());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bundle_path = dir.path().join("bundle.bin");
+        bundle.write_to(&bundle_path).expect("write bundle");
+
+        let store_file = dir.path().join("contract.wasm");
+        let encoded = ContractCode::from(wrong_code.clone())
+            .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
+            .expect("encode versioned");
+        std::fs::write(&store_file, &encoded).expect("write store file");
+
+        let config = ConformanceConfig {
+            bundle: Some(bundle_path),
+            ..wasm_only_config(Some(store_file))
+        };
+        let err = load_inputs(&config)
+            .expect_err("a store file for the WRONG contract must stay rejected");
+
+        // The inner mismatch (the SAME check the production code runs on the
+        // unwrapped bytes) names the hash the error must surface.
+        let inner_mismatch = match bundle.resolve_code(Some(wrong_code)) {
+            Err(BundleError::CodeMismatch { actual, .. }) => actual,
+            other => panic!("fixture must mismatch by code, got {other:?}"),
+        };
+        assert!(
+            err.to_string().contains(&inner_mismatch),
+            "the error must name the INNER code hash so an operator can compare \
+             it against store filenames; got: {err}"
         );
     }
 
