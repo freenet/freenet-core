@@ -2186,9 +2186,10 @@ fn test_full_state_send_no_incorrect_caching() {
     // #5510 made this assertion specific rather than total. It used to assert
     // `resync_requests() == 0`, using "no resyncs at all" as a proxy for "no
     // delta failed". That proxy held only while a delta failure was the ONLY
-    // thing that emitted a ResyncRequest. It no longer is: a queue-full drop,
-    // a rate-limited broadcast drop, and the trailing coalesced repair all emit
-    // one too, and all three are healthy behaviour. This test began failing on
+    // thing that emitted a ResyncRequest. It no longer is: a queue-full drop
+    // and a rate-limited broadcast drop both emit one too (and #5525 adds a
+    // third, the trailing coalesced repair), all of them healthy behaviour.
+    // This test began failing on
     // exactly that — `delta_sends: 0, full_state_sends: 11, resync_requests: 1`
     // with everything converged — where the single resync was a broadcast
     // repair and no delta had failed at all.
@@ -2196,7 +2197,7 @@ fn test_full_state_send_no_incorrect_caching() {
     // `delta_failure_resyncs()` is counted at the branch that makes the
     // decision (the `is_delta && !queue_full` arm of the broadcast driver),
     // not derived by subtracting other causes from the total, so it cannot
-    // silently absorb a future fourth cause the way the old proxy did.
+    // silently absorb a future cause the way the old proxy did.
     let resync_count = GlobalTestMetrics::resync_requests();
     let delta_failure_resyncs = GlobalTestMetrics::delta_failure_resyncs();
     let delta_sends = GlobalTestMetrics::delta_sends();

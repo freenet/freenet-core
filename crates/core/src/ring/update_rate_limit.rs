@@ -298,8 +298,16 @@ pub(crate) const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 /// from ~10 to ~50 broadcasts/s. That is a real 5x, and it is the cost
 /// of the change. What still bounds it, unchanged:
 ///
-/// - the per-sender new-pair budget (#4997) is untouched, so a sender's
-///   AGGREGATE ceiling across contracts is still ~210 UPDATE/s;
+/// - the per-pair ceiling above is the honest statement of the bound, and
+///   there is NO aggregate one. Do not read the #4997 per-sender budget as
+///   supplying it: that budget charges a token only for a pair the limiter
+///   is not currently TRACKING, so it bounds the rate of INTRODUCING pairs
+///   (~200/s) and does nothing to a sender's traffic on pairs it has
+///   already established. A peer holding N established pairs sustains
+///   ~50/s on each of them, so the aggregate scales with N. An earlier
+///   version of this doc claimed a ~210 UPDATE/s aggregate ceiling here
+///   and was wrong, in the direction that matters — it made the budget
+///   look like a bound on volume when it bounds only novelty;
 /// - cost-pressure eviction (#4861/#4903) sheds a zero-demand contract
 ///   whose attributed CPU, fan-out bytes, or broadcast MESSAGE rate is
 ///   sustained above the floor — it measures the work actually done
@@ -381,24 +389,24 @@ pub(crate) const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// # Tuning this back toward 100ms is not free
 ///
-/// The obvious "safer" move is the wrong one, and the coupling is not
-/// visible from this constant alone. Raising the interval raises drop
-/// pressure; each drop that lands in a held throttle window arms a
-/// trailing repair; each repair chain holds one of the
-/// [`crate::ring::interest::MAX_OUTSTANDING_QUEUE_FULL_RESYNC_RETRIES`]
-/// (256) node-wide follow-up slots for up to a reservation window. So a
-/// higher interval thins the very backstop that is meant to catch the
-/// extra drops it creates, and it does so exactly when the node is
-/// busiest. Widening and narrowing this number are NOT symmetric.
+/// The obvious "safer" move is the wrong one. Raising the interval raises
+/// drop pressure, and the repair cannot absorb the extra drops: it allows
+/// one `ResyncRequest` per `(contract, sender)` per 30s, so the SECOND and
+/// later drops inside a window are refused and, on this branch, nothing
+/// re-sends them — they wait for the next drop after the window closes, or
+/// for the ~5-minute anti-entropy heartbeat. A higher interval therefore
+/// buys drops that land squarely in the repair's blind spot. #5525 closes
+/// that spot with a trailing coalesced repair; until it lands, treat every
+/// drop beyond the first per window as unrepaired.
 ///
 /// On the adversarial side, do not lean on the #4997 per-sender budget
 /// here: it charges a token only for a pair the limiter is not currently
 /// TRACKING, so it bounds the rate of introducing new pairs (~200/s) and
-/// not sustained traffic on established ones. What bounds a hostile peer
-/// reaching many follow-up slots is the held-contract gate above — a
-/// slot is only ever taken for a contract this node holds — together
-/// with the one-repair-per-(contract, sender)-per-30s throttle and the
-/// global per-contract emit cap.
+/// not sustained traffic on established ones. What bounds a hostile peer's
+/// repair traffic is the held-contract gate above — a repair is only ever
+/// emitted for a contract this node holds — together with the
+/// one-repair-per-(contract, sender)-per-30s throttle and the global
+/// per-contract emit cap.
 ///
 /// Do NOT set this to zero. An unbounded broadcast class re-opens the
 /// May 21 flood shape on the one message type that fans out.
@@ -799,9 +807,11 @@ impl RateLimitDecision {
 
 /// Per-(sender_addr, contract_instance_id) UPDATE rate limiter.
 ///
-/// All state lives in a single [`DashMap`] keyed by the pair. Each
-/// entry stores only the `Instant` of the most recent accepted UPDATE,
-/// so per-entry memory is tiny.
+/// All state lives in a single [`DashMap`] keyed by the pair. Each entry
+/// stores a [`PairStamps`] — one accepted-UPDATE `Instant` per
+/// [`UpdateClass`], so the two classes cannot starve each other — plus the
+/// most recent of them for sweeping and eviction. Two `Instant`s and a
+/// copy, so per-entry memory is still tiny.
 pub(crate) struct UpdateRateLimiter {
     last_accepted: DashMap<(SocketAddr, ContractInstanceId), PairStamps>,
     /// Authoritative size counter for capacity enforcement. Held
@@ -1908,12 +1918,49 @@ mod tests {
             );
         }
 
+        // A `_ =>` is only the most obvious way to smuggle in a catch-all.
+        // `other => UpdateClass::Broadcast` and `_ if cond =>` both defeat a
+        // bare `!contains("_=>")` while doing exactly the damage this pin
+        // exists to prevent: a new UPDATE wire variant silently inheriting a
+        // class instead of failing to COMPILE. So assert the SHAPE of every
+        // arm rather than blacklisting one spelling of the bad one.
         assert!(
             !body.contains("_=>"),
             "the classifier must stay an exhaustive match with NO catch-all: a new \
              UPDATE wire variant must fail to COMPILE rather than silently inherit \
              whichever class the wildcard names"
         );
+
+        let variants = body.matches("UpdateMsg::").count();
+        assert_eq!(
+            variants, 6,
+            "the classifier must name all six UpdateMsg variants explicitly, found \
+             {variants}. Fewer means a variant is being matched by something other \
+             than its own name — which is a catch-all however it is spelled"
+        );
+
+        // Every `=>` must be preceded by the `}` that closes a `{..}` struct
+        // pattern. A binding arm (`other =>`) or a guard (`_ if cond =>`) ends
+        // in an identifier or a paren instead, so this rejects both without
+        // needing to enumerate them.
+        let arms = body.matches("=>").count();
+        assert_eq!(
+            arms, 2,
+            "expected exactly two arms (Request and Broadcast), found {arms}; a \
+             third arm is a catch-all or an unintended reclassification"
+        );
+        for (i, _) in body.match_indices("=>") {
+            let preceding = &body[..i];
+            assert!(
+                preceding.ends_with("}"),
+                "every classifier arm must match a named variant with a `{{..}}` \
+                 pattern, but one arm's pattern ends with {:?} — a bare identifier \
+                 binds EVERY variant (`other => ...`) and a guard leaves the \
+                 remainder unmatched, either of which lets a new wire variant \
+                 inherit a class silently",
+                preceding.chars().rev().take(12).collect::<String>()
+            );
+        }
     }
 
     #[test]

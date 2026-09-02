@@ -2117,6 +2117,24 @@ async fn drive_relay_broadcast_to(
             let queue_full = err.is_contract_queue_full() || err.is_scheduler_timeout();
 
             if is_delta && !queue_full {
+                // #5510: count THIS cause at the branch that DECIDES it, which
+                // is here — above the emit cap, not inside it.
+                //
+                // `GlobalTestMetrics::resync_requests()` is the total across
+                // every cause, and since this PR there are several, so a test
+                // asserting "no delta failed" cannot use the total without
+                // mistaking a rate-limited broadcast repair for the #2763
+                // summary-caching regression. But the counter must describe the
+                // FAILURE, not the emission: `simulation_integration.rs` reads
+                // it as "no delta failed to apply", and a delta that failed
+                // while the global cap happened to be exhausted failed just the
+                // same. Counting inside the `if` would have made the assertion
+                // quietly weaker exactly when the node is busy enough for the
+                // cap to bind — which is when a real regression is most likely.
+                // Same rule as `.claude/rules/bug-prevention-patterns.md`: the
+                // metric is produced by the code that makes the decision.
+                crate::config::GlobalTestMetrics::record_delta_failure_resync();
+
                 // Delta application failed → send ResyncRequest. Mirrors
                 // update.rs:710-758. Rate-limited per-contract (#4861): a poison
                 // contract that fails deltas from many senders must not drive a
@@ -2129,13 +2147,6 @@ async fn drive_relay_broadcast_to(
                     .resync_emit_limiter
                     .check_and_record(*key.id())
                 {
-                    // #5510: count THIS cause at the branch that decides it.
-                    // `GlobalTestMetrics::resync_requests()` is the total across
-                    // every cause, and since this PR there are several, so a
-                    // test asserting "no delta failed" cannot use the total
-                    // without mistaking a rate-limited broadcast repair for the
-                    // #2763 summary-caching regression.
-                    crate::config::GlobalTestMetrics::record_delta_failure_resync();
                     tracing::warn!(
                         tx = %incoming_tx,
                         contract = %key,

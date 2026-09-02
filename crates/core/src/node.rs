@@ -1839,8 +1839,44 @@ where
                             //    interested. Hosting is different: an attacker
                             //    cannot make this node hold a contract by sending
                             //    it a `BroadcastTo`.
+                            //
+                            // KNOWN LIMITATION, deliberate and pre-existing:
+                            // this `ResyncRequest` is indistinguishable at the
+                            // SENDER from evidence that a delta we sent it
+                            // FAILED TO APPLY. Its handler passes every inbound
+                            // request to `delta_incompat.note_resync_request`,
+                            // which counts a strike whenever it delivered a
+                            // delta to us for this contract inside
+                            // `DELTA_ATTRIBUTION_WINDOW` (60s) — which is
+                            // exactly the case here, since the dropped
+                            // broadcast IS that delta. Three such strikes from
+                            // >= 2 distinct peers reach `INCOMPAT_TRIP_THRESHOLD`
+                            // and force a perfectly delta-capable contract into
+                            // full-state-only fan-out for `DELTA_INCOMPAT_TTL`
+                            // (10 min).
+                            //
+                            // The pre-existing queue-full repair (#4857) has
+                            // the identical attribution, so this is not a new
+                            // defect, and it self-heals on the TTL. Fixing it
+                            // needs a reason on the wire, which means a
+                            // version-gated APPEND of a new variant (never a
+                            // field added to an existing one — see the repo's
+                            // wire-append lesson), and that is out of scope
+                            // here. Tracked separately; do NOT "fix" this by
+                            // changing the wire format in a bugfix PR.
                             if update_class
                                 == crate::ring::update_rate_limit::UpdateClass::Broadcast
+                                // Gate B. NOTE on non-redb builds:
+                                // `contract_state_present` returns true
+                                // unconditionally there, so this degrades to
+                                // `is_hosting || in_use`. That arm is
+                                // unreachable in any build that COMPILES — the
+                                // crate has no working SQLite-only feature
+                                // combination (see the TODO(#4869) in this
+                                // file's tests; ci.yml always passes `redb`).
+                                // If that ever changes, switch this to the
+                                // backend-aware `contract_state_present_async`
+                                // rather than leaving the weaker gate in place.
                                 && op_manager.ring.should_summarize_or_broadcast(&key)
                             {
                                 update::op_ctx_task::send_dropped_broadcast_resync_request(
@@ -7323,6 +7359,9 @@ mod tests {
     /// on the throttle's clock, far beyond this synchronous test's window, so
     /// the counts below are unaffected. Auto-advancing time would let that
     /// retry fire and pollute them.
+    // Gated like its siblings above: the harness seeds state with
+    // `store_state_sync`, which exists only on the redb backend.
+    #[cfg(feature = "redb")]
     #[tokio::test]
     async fn rate_limited_broadcast_emits_throttled_resync_request() {
         use crate::message::{DeltaOrFullState, NetMessageV1};
@@ -7569,6 +7608,9 @@ mod tests {
     /// primes the pair first, so it only ever exercises `Rejected`; this is the
     /// arm it cannot reach. Verified against the mutation: moving the emit back
     /// out of the `Rejected` arm (where it sat before review) makes this FAIL.
+    // Gated like its siblings above: the harness seeds state with
+    // `store_state_sync`, which exists only on the redb backend.
+    #[cfg(feature = "redb")]
     #[tokio::test]
     async fn sender_new_pair_budget_refusal_emits_no_repair() {
         use crate::message::{DeltaOrFullState, NetMessageV1};
@@ -7740,6 +7782,9 @@ mod tests {
     /// Same harness as `rate_limited_broadcast_emits_throttled_resync_request`
     /// with one difference — no stored state and no subscription — so a failure
     /// here is specifically the missing hosting gate.
+    // Gated like its siblings above: the harness seeds state with
+    // `store_state_sync`, which exists only on the redb backend.
+    #[cfg(feature = "redb")]
     #[tokio::test]
     async fn rate_limited_broadcast_for_an_unheld_contract_emits_no_repair() {
         use crate::message::{DeltaOrFullState, NetMessageV1};
