@@ -2129,6 +2129,13 @@ async fn drive_relay_broadcast_to(
                     .resync_emit_limiter
                     .check_and_record(*key.id())
                 {
+                    // #5510: count THIS cause at the branch that decides it.
+                    // `GlobalTestMetrics::resync_requests()` is the total across
+                    // every cause, and since this PR there are several, so a
+                    // test asserting "no delta failed" cannot use the total
+                    // without mistaking a rate-limited broadcast repair for the
+                    // #2763 summary-caching regression.
+                    crate::config::GlobalTestMetrics::record_delta_failure_resync();
                     tracing::warn!(
                         tx = %incoming_tx,
                         contract = %key,
@@ -4556,6 +4563,92 @@ mod tests {
         Box<dyn std::any::Any>,
     ) {
         build_broadcast_test_node(id, DeltaOutcome::ExecReject).await
+    }
+
+    /// #5510: a delta that FAILS TO APPLY increments the delta-failure resync
+    /// counter, and a queue-full drop does NOT.
+    ///
+    /// This is what stops `test_full_state_send_no_incorrect_caching`'s new
+    /// assertion from being vacuous. That test asserts
+    /// `delta_failure_resyncs() == 0`, having previously asserted on the TOTAL
+    /// resync count; if the counter were never incremented the assertion would
+    /// pass forever and the #2763 summary-caching regression it guards would
+    /// walk straight through it. So: prove the counter FIRES on the cause it
+    /// names, and prove it does NOT fire on a different cause that also emits a
+    /// ResyncRequest — otherwise it would be the same over-broad proxy under a
+    /// new name.
+    #[tokio::test]
+    async fn a_failed_delta_is_counted_separately_from_a_queue_full_drop() {
+        // (a) FIRES on a delta-apply failure.
+        crate::config::GlobalTestMetrics::reset();
+        let (op_manager, mut notification_rx, _queries, _guard) =
+            build_broadcast_test_node("delta-failure-metric-5510", DeltaOutcome::ExecReject).await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([81u8; 32]),
+            CodeHash::new([82u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:13300".parse().unwrap();
+
+        let r = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 2, 3]),
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(r.is_err(), "the stand-in handler must reject the delta");
+        assert_eq!(
+            crate::config::GlobalTestMetrics::delta_failure_resyncs(),
+            1,
+            "a delta that failed to apply MUST be counted as a delta-failure \
+             resync — this is the #2763 signal, and a counter that never fires \
+             turns its assertion into a no-op"
+        );
+        drain_resync_targets(&mut notification_rx, key);
+
+        // (b) does NOT fire on a queue-full drop, which also emits a
+        //     ResyncRequest but is a different cause entirely.
+        crate::config::GlobalTestMetrics::reset();
+        let (qf_manager, mut qf_rx, _qf_guard) =
+            build_queue_full_test_node("delta-failure-metric-5510-qf").await;
+        let qf_key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([83u8; 32]),
+            CodeHash::new([84u8; 32]),
+        );
+        let qf_sender: SocketAddr = "127.0.0.1:13400".parse().unwrap();
+
+        let qf = drive_relay_broadcast_to(
+            &qf_manager,
+            Transaction::new::<UpdateMsg>(),
+            qf_key,
+            DeltaOrFullState::Delta(vec![4, 5, 6]),
+            Vec::new(),
+            qf_sender,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(
+            qf.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error, got {qf:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut qf_rx, qf_key),
+            vec![qf_sender],
+            "precondition: the queue-full drop DID emit a ResyncRequest, so this \
+             is a real discrimination test rather than a scenario with no resync"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::delta_failure_resyncs(),
+            0,
+            "a queue-full drop emits a ResyncRequest but NO delta failed, so it \
+             must not be counted as one — counting it would rebuild the same \
+             over-broad proxy #5510 replaced"
+        );
     }
 
     /// #4864 review (testing H1): the load-bearing #4861 behavior — the backoff

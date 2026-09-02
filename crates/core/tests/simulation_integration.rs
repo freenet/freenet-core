@@ -2179,29 +2179,44 @@ fn test_full_state_send_no_incorrect_caching() {
         convergence.diverged.len()
     );
 
-    // SECONDARY ASSERTION: No ResyncRequests should be needed
-    // With correct summary caching (PR #2763), deltas should work correctly
-    // Without the fix, peers would fail to apply deltas and send ResyncRequests
+    // SECONDARY ASSERTION: no delta may FAIL TO APPLY.
+    // With correct summary caching (PR #2763), deltas apply cleanly; without
+    // it, peers fail to apply them and send ResyncRequests.
+    //
+    // #5510 made this assertion specific rather than total. It used to assert
+    // `resync_requests() == 0`, using "no resyncs at all" as a proxy for "no
+    // delta failed". That proxy held only while a delta failure was the ONLY
+    // thing that emitted a ResyncRequest. It no longer is: a queue-full drop,
+    // a rate-limited broadcast drop, and the trailing coalesced repair all emit
+    // one too, and all three are healthy behaviour. This test began failing on
+    // exactly that — `delta_sends: 0, full_state_sends: 11, resync_requests: 1`
+    // with everything converged — where the single resync was a broadcast
+    // repair and no delta had failed at all.
+    //
+    // `delta_failure_resyncs()` is counted at the branch that makes the
+    // decision (the `is_delta && !queue_full` arm of the broadcast driver),
+    // not derived by subtracting other causes from the total, so it cannot
+    // silently absorb a future fourth cause the way the old proxy did.
     let resync_count = GlobalTestMetrics::resync_requests();
+    let delta_failure_resyncs = GlobalTestMetrics::delta_failure_resyncs();
     let delta_sends = GlobalTestMetrics::delta_sends();
     let full_state_sends = GlobalTestMetrics::full_state_sends();
 
     tracing::info!(
-        "Broadcast stats - delta_sends: {}, full_state_sends: {}, resync_requests: {}",
+        "Broadcast stats - delta_sends: {}, full_state_sends: {}, \
+         resync_requests: {} (of which delta-failure: {})",
         delta_sends,
         full_state_sends,
-        resync_count
+        resync_count,
+        delta_failure_resyncs
     );
 
-    // Note: Some resyncs may occur during normal operation (e.g., initial state sync),
-    // but excessive resyncs indicate the caching bug. We check for zero resyncs in this
-    // controlled scenario where all peers start fresh and updates flow correctly.
     assert_eq!(
-        resync_count, 0,
-        "PR #2763 REGRESSION: {} ResyncRequests detected! \
-         This indicates deltas are failing due to incorrect summary caching. \
-         With the fix, no resyncs should be needed in this scenario.",
-        resync_count
+        delta_failure_resyncs, 0,
+        "PR #2763 REGRESSION: {delta_failure_resyncs} ResyncRequest(s) were \
+         emitted because a DELTA FAILED TO APPLY, which is what incorrect \
+         summary caching looks like. ({resync_count} resyncs in total; the \
+         others, if any, are broadcast-drop repairs and are not this bug.)"
     );
 
     // TERTIARY ASSERTION: Verify broadcast activity
