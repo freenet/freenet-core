@@ -234,6 +234,144 @@ use crate::util::time_source::TimeSource;
 /// flood pattern instantly.
 pub(crate) const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Minimum interval between accepted co-host BROADCASTs for the same
+/// `(sender, contract)` pair. Default 20 ms (≈50/s).
+///
+/// # Why this is not [`MIN_UPDATE_INTERVAL`] (#5510)
+///
+/// [`MIN_UPDATE_INTERVAL`]'s rationale is about a HUMAN writing to a
+/// contract, and it is right about that. It is the wrong reference class
+/// for a broadcast, because a broadcast is not a write: it is the
+/// DERIVED fan-out of a write that some peer already committed. One
+/// commit produces one broadcast per co-host neighbour, so the broadcast
+/// rate on a single `(sender, contract)` pair is the contract's
+/// AGGREGATE commit rate summed over every writer reachable through that
+/// neighbour — not one writer's cadence. A room with a few dozen people
+/// typing exceeds 10/s on one pair routinely, with no attacker involved.
+///
+/// Applying the write-cadence number to fan-out is what made #5510 a
+/// correctness bug rather than a throttle: honest co-host traffic was
+/// refused, the sender recorded it as delivered, and the two peers
+/// diverged permanently.
+///
+/// # What 20 ms is calibrated against
+///
+/// Measured on `test_ping_multi_node` (3 nodes, 3 rounds, the workload
+/// that surfaced #5510): 28 refusals in one run, 7-12 per pair, with the
+/// elapsed-since-last-accepted spread across the whole 100 ms window
+/// (p50 35 ms, p90 77 ms). At 20 ms that falls to 4 refusals in the run,
+/// roughly one per pair, which is what the throttled `ResyncRequest`
+/// repair can actually heal (it allows one per `(contract, sender)` per
+/// 30 s, so several refusals per pair per window is precisely the case
+/// the repair cannot cover).
+///
+/// # The DoS trade-off, stated plainly
+///
+/// This raises what ONE peer can force this node to do for ONE contract
+/// from ~10 to ~50 broadcasts/s. That is a real 5x, and it is the cost
+/// of the change. What still bounds it, unchanged:
+///
+/// - the per-sender new-pair budget (#4997) is untouched, so a sender's
+///   AGGREGATE ceiling across contracts is still ~210 UPDATE/s;
+/// - cost-pressure eviction (#4861/#4903) sheds a zero-demand contract
+///   whose attributed CPU, fan-out bytes, or broadcast MESSAGE rate is
+///   sustained above the floor — it measures the work actually done
+///   rather than a fixed rate, which is the control that fits a storm;
+/// - the broadcast queue already coalesces: a per-(contract, peer)
+///   keep-latest replace-on-dedup queue drained by a bounded worker, so
+///   a saturated uplink folds updates instead of accumulating them;
+/// - the contract ban list still applies ahead of this gate.
+///
+/// Do NOT set this to zero. An unbounded broadcast class re-opens the
+/// May 21 flood shape on the one message type that fans out.
+pub(crate) const MIN_BROADCAST_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Which budget an inbound UPDATE is charged against.
+///
+/// The two classes have SEPARATE stamps inside one map entry, so neither
+/// starves the other. That is deliberate: with a single shared stamp, a
+/// pair busy with fan-out would advance it every ~20 ms and a routed
+/// `RequestUpdate` from the same neighbour for the same contract would
+/// essentially never see its 100 ms of quiet — a client write silently
+/// refused because someone else's room was busy.
+///
+/// Separate stamps, one map entry: the key space, the cap, the eviction
+/// path and the per-sender new-pair budget (#4997) are all exactly as
+/// they were. A flooder that alternates classes gains only the sum of
+/// two bounded budgets, which the broadcast one dominates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateClass {
+    /// `RequestUpdate` / `RequestUpdateStreaming`: a routed client write.
+    /// Charged against [`MIN_UPDATE_INTERVAL`].
+    Request,
+    /// `BroadcastTo` / `BroadcastToV2` / `BroadcastToStreaming` /
+    /// `BroadcastToStreamingV2`: co-host mesh fan-out. Charged against
+    /// [`MIN_BROADCAST_INTERVAL`], UNIFORMLY across all four so switching
+    /// broadcast opcode gains nothing.
+    Broadcast,
+}
+
+/// The last accepted timestamp per [`UpdateClass`] for one
+/// `(sender, contract)` pair.
+///
+/// `None` means "no message of that class has been accepted for this
+/// pair", which must be ALLOWED — otherwise a pair created by a
+/// broadcast would refuse the sender's first request for 100 ms for no
+/// reason. Rejections never write here: the window is measured from the
+/// last ACCEPTED message, so a flood cannot extend its own window (see
+/// `rejected_attempts_do_not_extend_window`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PairStamps {
+    request: Option<Instant>,
+    broadcast: Option<Instant>,
+    /// The most recent accepted stamp of EITHER class — the entry's
+    /// recency for LRU eviction and for the TTL sweep.
+    ///
+    /// Carried rather than computed as `max(request, broadcast)` so it is
+    /// TOTAL: every constructor and every `set` writes it, so there is no
+    /// all-`None` case for a caller to invent a fallback for, and no
+    /// arithmetic on `Instant` that could overflow on the UPDATE receive
+    /// path. It must track the max and not one class's stamp: evicting or
+    /// expiring an entry whose OTHER class is actively in use would reset
+    /// that class's window and hand a flooder a free message.
+    latest: Instant,
+}
+
+impl PairStamps {
+    /// A fresh entry whose only accepted message so far is of `class`.
+    fn new_at(class: UpdateClass, now: Instant) -> Self {
+        let mut stamps = Self {
+            request: None,
+            broadcast: None,
+            latest: now,
+        };
+        stamps.set(class, now);
+        stamps
+    }
+
+    fn get(&self, class: UpdateClass) -> Option<Instant> {
+        match class {
+            UpdateClass::Request => self.request,
+            UpdateClass::Broadcast => self.broadcast,
+        }
+    }
+
+    /// Stamp `class` as accepted at `now`. `now` is monotonic and every
+    /// caller is under the entry's shard guard, so it is never older than
+    /// `latest`.
+    fn set(&mut self, class: UpdateClass, now: Instant) {
+        match class {
+            UpdateClass::Request => self.request = Some(now),
+            UpdateClass::Broadcast => self.broadcast = Some(now),
+        }
+        self.latest = self.latest.max(now);
+    }
+
+    fn latest(&self) -> Instant {
+        self.latest
+    }
+}
+
 /// How long an idle `(sender, contract)` entry stays in the map before
 /// being cleared by the periodic cleanup pass. Bounds memory while
 /// preserving the rate-limit signal across short-term retries.
@@ -529,7 +667,7 @@ impl RateLimitDecision {
 /// entry stores only the `Instant` of the most recent accepted UPDATE,
 /// so per-entry memory is tiny.
 pub(crate) struct UpdateRateLimiter {
-    last_accepted: DashMap<(SocketAddr, ContractInstanceId), Instant>,
+    last_accepted: DashMap<(SocketAddr, ContractInstanceId), PairStamps>,
     /// Authoritative size counter for capacity enforcement. Held
     /// in sync with `last_accepted.len()` at every stable point
     /// (incremented by successful new-pair inserts in
@@ -546,6 +684,9 @@ pub(crate) struct UpdateRateLimiter {
     /// which can be hundreds.
     size: AtomicUsize,
     min_interval: Duration,
+    /// The [`UpdateClass::Broadcast`] counterpart of `min_interval` — see
+    /// [`MIN_BROADCAST_INTERVAL`] for why fan-out needs its own number.
+    broadcast_interval: Duration,
     max_tracked_pairs: usize,
     time_source: Arc<dyn TimeSource + Send + Sync>,
     /// Total accepted UPDATEs since limiter creation. Surfaced on the
@@ -611,6 +752,7 @@ impl UpdateRateLimiter {
         Self::with_new_pair_budget(
             time_source,
             MIN_UPDATE_INTERVAL,
+            MIN_BROADCAST_INTERVAL,
             MAX_TRACKED_PAIRS,
             NEW_PAIR_BURST,
             // Floored: `max_connections` is operator-settable, and a
@@ -633,9 +775,25 @@ impl UpdateRateLimiter {
         min_interval: Duration,
         max_tracked_pairs: usize,
     ) -> Self {
+        // Both classes get `min_interval`, so a test written before the
+        // #5510 class split still means exactly what it meant. A test that
+        // wants the two apart says so via `with_class_intervals`.
+        Self::with_class_intervals(time_source, min_interval, min_interval, max_tracked_pairs)
+    }
+
+    /// [`Self::with_config`] with the two [`UpdateClass`] intervals set
+    /// independently, for the tests that exercise the split itself.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_class_intervals(
+        time_source: Arc<dyn TimeSource + Send + Sync>,
+        min_interval: Duration,
+        broadcast_interval: Duration,
+        max_tracked_pairs: usize,
+    ) -> Self {
         Self::with_new_pair_budget(
             time_source,
             min_interval,
+            broadcast_interval,
             max_tracked_pairs,
             NEW_PAIR_BURST,
             Ring::DEFAULT_MAX_CONNECTIONS * SENDER_TRACKING_HEADROOM,
@@ -649,6 +807,7 @@ impl UpdateRateLimiter {
     pub fn with_new_pair_budget(
         time_source: Arc<dyn TimeSource + Send + Sync>,
         min_interval: Duration,
+        broadcast_interval: Duration,
         max_tracked_pairs: usize,
         new_pair_burst: f64,
         max_tracked_senders: usize,
@@ -667,6 +826,7 @@ impl UpdateRateLimiter {
             last_accepted: DashMap::new(),
             size: AtomicUsize::new(0),
             min_interval,
+            broadcast_interval,
             max_tracked_pairs,
             time_source,
             accepted_total: AtomicU64::new(0),
@@ -707,8 +867,13 @@ impl UpdateRateLimiter {
         &self,
         sender: SocketAddr,
         contract: ContractInstanceId,
+        class: UpdateClass,
     ) -> RateLimitDecision {
         let now = self.time_source.now();
+        // The window this message is measured against. Uniform across the
+        // four broadcast opcodes, so switching opcode gains nothing — see
+        // [`UpdateClass`].
+        let min_interval = self.interval_for(class);
         let key = (sender, contract);
 
         use dashmap::mapref::entry::Entry;
@@ -734,10 +899,18 @@ impl UpdateRateLimiter {
                         self.size.fetch_sub(1, Ordering::Relaxed);
                     }
                     // Existing pair: atomic compare-and-stamp under
-                    // shard guard.
-                    let last = *entry.get();
+                    // shard guard, against THIS class's own stamp. A
+                    // `None` here means the pair exists but has never had
+                    // a message of this class accepted, which is allowed —
+                    // a pair created by fan-out must not refuse the
+                    // sender's first routed request.
+                    let Some(last) = entry.get().get(class) else {
+                        entry.get_mut().set(class, now);
+                        self.accepted_total.fetch_add(1, Ordering::Relaxed);
+                        return RateLimitDecision::Allowed;
+                    };
                     let elapsed = now.saturating_duration_since(last);
-                    if elapsed < self.min_interval {
+                    if elapsed < min_interval {
                         self.rejected_total.fetch_add(1, Ordering::Relaxed);
                         // Release the shard guard BEFORE taking the log
                         // throttle's mutex. `log_new_pair_budget` is the only
@@ -750,10 +923,10 @@ impl UpdateRateLimiter {
                         self.log_rejected(now, sender, contract);
                         return RateLimitDecision::Rejected {
                             elapsed,
-                            min_interval: self.min_interval,
+                            min_interval,
                         };
                     }
-                    *entry.get_mut() = now;
+                    entry.get_mut().set(class, now);
                     self.accepted_total.fetch_add(1, Ordering::Relaxed);
                     return RateLimitDecision::Allowed;
                 }
@@ -837,7 +1010,7 @@ impl UpdateRateLimiter {
                             }
                         }
                     }
-                    entry.insert(now);
+                    entry.insert(PairStamps::new_at(class, now));
                     self.accepted_total.fetch_add(1, Ordering::Relaxed);
                     return RateLimitDecision::Allowed;
                 }
@@ -856,6 +1029,14 @@ impl UpdateRateLimiter {
         // Every attempt lost its freed slot to a concurrent caller.
         self.capacity_rejected_total.fetch_add(1, Ordering::Relaxed);
         RateLimitDecision::CapacityExceeded
+    }
+
+    /// The minimum inter-message interval charged to `class`.
+    fn interval_for(&self, class: UpdateClass) -> Duration {
+        match class {
+            UpdateClass::Request => self.min_interval,
+            UpdateClass::Broadcast => self.broadcast_interval,
+        }
     }
 
     /// Evict the oldest tracked pairs to make room for a new one.
@@ -943,10 +1124,13 @@ impl UpdateRateLimiter {
         }
 
         let batch = (self.max_tracked_pairs / EVICTION_BATCH_DIVISOR).max(1);
+        // Ordered by the entry's MOST RECENT stamp of either class — see
+        // `PairStamps::latest`. Ordering on one class alone would evict a
+        // pair that is busy on the other, resetting its window.
         let mut entries: Vec<(Instant, (SocketAddr, ContractInstanceId))> = self
             .last_accepted
             .iter()
-            .map(|e| (*e.value(), *e.key()))
+            .map(|e| (e.value().latest(), *e.key()))
             .collect();
         if entries.is_empty() {
             // Not terminal: `size` reads at the cap while the map does
@@ -1096,8 +1280,8 @@ impl UpdateRateLimiter {
             Some(t) => t,
             None => return, // clock not advanced enough to bother
         };
-        self.last_accepted.retain(|_, last| {
-            let keep = *last >= cutoff;
+        self.last_accepted.retain(|_, stamps| {
+            let keep = stamps.latest() >= cutoff;
             if !keep {
                 self.size.fetch_sub(1, Ordering::Relaxed);
             }
@@ -1217,7 +1401,7 @@ mod tests {
     #[test]
     fn first_update_for_pair_is_allowed() {
         let (l, _ts) = mk_limiter();
-        let d = l.check_and_record(mk_sender(1), mk_contract(1));
+        let d = l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request);
         assert_eq!(d, RateLimitDecision::Allowed);
         assert_eq!(l.accepted_total(), 1);
         assert_eq!(l.rejected_total(), 0);
@@ -1227,12 +1411,12 @@ mod tests {
     fn second_update_within_min_interval_is_rejected() {
         let (l, ts) = mk_limiter();
         assert!(
-            l.check_and_record(mk_sender(1), mk_contract(1))
+            l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request)
                 .is_allowed()
         );
         // Only 10ms later — well under 100ms default.
         ts.advance(Duration::from_millis(10));
-        let d = l.check_and_record(mk_sender(1), mk_contract(1));
+        let d = l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request);
         assert!(
             matches!(d, RateLimitDecision::Rejected { .. }),
             "second UPDATE 10ms after first must be rejected, got {d:?}"
@@ -1241,16 +1425,240 @@ mod tests {
         assert_eq!(l.rejected_total(), 1);
     }
 
+    /// #5510: the BROADCAST class is charged against its own, wider window.
+    ///
+    /// The pair is the same and the elapsed time is the same; only the class
+    /// differs. If the two ever collapse back onto one interval this fails, and
+    /// collapsing them is precisely how honest co-host fan-out came to be
+    /// refused and the peers came to diverge.
+    #[test]
+    fn broadcast_class_is_charged_against_its_own_interval() {
+        let (l, ts) = mk_limiter();
+        assert!(
+            l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Broadcast)
+                .is_allowed()
+        );
+        assert!(
+            l.check_and_record(mk_sender(2), mk_contract(1), UpdateClass::Request)
+                .is_allowed()
+        );
+
+        // 30ms: past MIN_BROADCAST_INTERVAL (20ms), well under
+        // MIN_UPDATE_INTERVAL (100ms).
+        ts.advance(Duration::from_millis(30));
+
+        assert!(
+            l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Broadcast)
+                .is_allowed(),
+            "a broadcast 30ms after the last one must be ALLOWED — co-host fan-out \
+             carries the contract's AGGREGATE commit rate, not one writer's cadence \
+             (#5510)"
+        );
+        let d = l.check_and_record(mk_sender(2), mk_contract(1), UpdateClass::Request);
+        assert!(
+            matches!(d, RateLimitDecision::Rejected { .. }),
+            "a routed request 30ms after the last one must still be REJECTED — the \
+             write-cadence budget is unchanged by #5510, got {d:?}"
+        );
+    }
+
+    /// #5510: the two classes hold SEPARATE stamps, so busy fan-out on a pair
+    /// cannot starve a routed client write on the same pair.
+    ///
+    /// This is the property that made the two-stamp design worth its extra
+    /// field over a single shared stamp read against two thresholds. With one
+    /// shared stamp, the broadcasts below would advance it every 25ms and the
+    /// final request would never see its 100ms of quiet — a client's write
+    /// silently refused because someone else's room was busy. The assertion is
+    /// written so that the shared-stamp implementation FAILS it.
+    #[test]
+    fn broadcast_traffic_does_not_starve_routed_requests_on_the_same_pair() {
+        let (l, ts) = mk_limiter();
+        let (sender, contract) = (mk_sender(1), mk_contract(1));
+
+        assert!(
+            l.check_and_record(sender, contract, UpdateClass::Request)
+                .is_allowed(),
+            "precondition: the pair's first request is allowed and stamps the \
+             request class"
+        );
+
+        // 200ms of fan-out at 25ms intervals: every broadcast is allowed and
+        // each one advances the BROADCAST stamp.
+        for i in 0..8 {
+            ts.advance(Duration::from_millis(25));
+            assert!(
+                l.check_and_record(sender, contract, UpdateClass::Broadcast)
+                    .is_allowed(),
+                "broadcast {i} at 25ms spacing must be allowed"
+            );
+        }
+
+        // 200ms have passed since the request stamp, which is more than
+        // MIN_UPDATE_INTERVAL, so the request is due regardless of how much
+        // broadcast traffic ran in between.
+        assert!(
+            l.check_and_record(sender, contract, UpdateClass::Request)
+                .is_allowed(),
+            "a routed request must be judged against the REQUEST stamp alone — \
+             sharing one stamp with fan-out would starve client writes on every \
+             busy contract (#5510)"
+        );
+    }
+
+    /// #5510: on a pair that exists but has never carried this class, the first
+    /// message of the class is ALLOWED.
+    ///
+    /// The `None` case is easy to get wrong in the direction that silently
+    /// refuses: a pair created by fan-out would otherwise refuse the sender's
+    /// first routed request for a full `MIN_UPDATE_INTERVAL` for no reason.
+    #[test]
+    fn first_message_of_a_class_on_an_existing_pair_is_allowed() {
+        let (l, _ts) = mk_limiter();
+        let (sender, contract) = (mk_sender(1), mk_contract(1));
+
+        assert!(
+            l.check_and_record(sender, contract, UpdateClass::Broadcast)
+                .is_allowed(),
+            "precondition: the broadcast creates the entry"
+        );
+        // No time advance at all: the strictest possible case.
+        assert!(
+            l.check_and_record(sender, contract, UpdateClass::Request)
+                .is_allowed(),
+            "the pair's FIRST request must be allowed even with zero elapsed time — \
+             it has no request stamp to be measured against"
+        );
+        // ...and it is now stamped, so the next one is refused.
+        assert!(
+            !l.check_and_record(sender, contract, UpdateClass::Request)
+                .is_allowed(),
+            "the second request must be refused — the first must have stamped"
+        );
+    }
+
+    /// #5510: the TTL sweep and the LRU eviction order read the entry's
+    /// most-recent stamp of EITHER class.
+    ///
+    /// A pair whose request stamp is ancient but whose fan-out is live must not
+    /// be swept: dropping it would reset the broadcast window and hand back a
+    /// free message, which is the bound the sweep exists to preserve.
+    #[test]
+    fn ttl_sweep_reads_the_most_recent_stamp_of_either_class() {
+        let (l, ts) = mk_limiter();
+        let (sender, contract) = (mk_sender(1), mk_contract(1));
+
+        assert!(
+            l.check_and_record(sender, contract, UpdateClass::Request)
+                .is_allowed()
+        );
+        // Let the REQUEST stamp go stale, keeping the broadcast side fresh.
+        ts.advance(CLEANUP_AGE + Duration::from_secs(1));
+        assert!(
+            l.check_and_record(sender, contract, UpdateClass::Broadcast)
+                .is_allowed()
+        );
+
+        l.cleanup();
+        assert_eq!(
+            l.len(),
+            1,
+            "an entry whose broadcast stamp is fresh must survive the sweep even \
+             when its request stamp is older than CLEANUP_AGE"
+        );
+
+        // And once BOTH are stale it goes.
+        ts.advance(CLEANUP_AGE + Duration::from_secs(1));
+        l.cleanup();
+        assert_eq!(l.len(), 0, "an entry stale in both classes must be swept");
+    }
+
+    /// #5510 anti-bypass pin: the dispatch in `node.rs` maps ALL FOUR broadcast
+    /// wire opcodes to one class and both request opcodes to the other.
+    ///
+    /// The budget split is only safe because switching broadcast opcode gains
+    /// nothing. `update_dispatch_gates_all_four_wire_variants` proves every
+    /// variant reaches the limiter; this proves each reaches it in the right
+    /// class. The classifier is an exhaustive `match` with no catch-all, so a
+    /// NEW variant fails to compile rather than defaulting into the wider
+    /// budget — that is deliberate, and this pin fails if someone replaces it
+    /// with a wildcard.
+    #[test]
+    fn every_broadcast_opcode_is_charged_to_the_broadcast_class() {
+        const NODE_SRC: &str = include_str!("../node.rs");
+
+        let start = NODE_SRC.find("let update_class = match op {").expect(
+            "the UPDATE dispatch must classify the message before the rate-limit \
+                 check; if the classifier moved or was renamed, update this pin rather \
+                 than deleting it",
+        );
+        let body = &NODE_SRC[start..];
+        let end = body
+            .find("\n                };")
+            .expect("could not find the end of the update_class match");
+        let body: String = body[..end].chars().filter(|c| !c.is_whitespace()).collect();
+
+        let request_arm = body
+            .find("UpdateClass::Request")
+            .expect("no Request arm in the classifier");
+        let broadcast_arm = body
+            .find("UpdateClass::Broadcast")
+            .expect("no Broadcast arm in the classifier");
+
+        for variant in [
+            "UpdateMsg::BroadcastTo{..}",
+            "UpdateMsg::BroadcastToV2{..}",
+            "UpdateMsg::BroadcastToStreaming{..}",
+            "UpdateMsg::BroadcastToStreamingV2{..}",
+        ] {
+            let at = body.split(variant).next().map(str::len).unwrap_or(0);
+            assert!(
+                body.contains(variant),
+                "broadcast opcode `{variant}` is not classified in node.rs — an \
+                 unclassified broadcast opcode is a budget bypass"
+            );
+            assert!(
+                at > request_arm,
+                "broadcast opcode `{variant}` must sit in the Broadcast arm, not the \
+                 Request arm — the four broadcast opcodes MUST share one budget so \
+                 switching between them gains nothing (#5510)"
+            );
+        }
+
+        for variant in [
+            "UpdateMsg::RequestUpdate{..}",
+            "UpdateMsg::RequestUpdateStreaming{..}",
+        ] {
+            let at = body.split(variant).next().map(str::len).unwrap_or(0);
+            assert!(
+                body.contains(variant),
+                "request opcode `{variant}` is not classified in node.rs"
+            );
+            assert!(
+                at < broadcast_arm,
+                "request opcode `{variant}` must sit in the Request arm — a routed \
+                 client write must not be charged the wider fan-out budget (#5510)"
+            );
+        }
+
+        assert!(
+            !body.contains("_=>"),
+            "the classifier must stay an exhaustive match with NO catch-all: a new \
+             UPDATE wire variant must fail to COMPILE rather than silently inherit \
+             whichever class the wildcard names"
+        );
+    }
+
     #[test]
     fn update_after_min_interval_is_allowed() {
         let (l, ts) = mk_limiter();
         assert!(
-            l.check_and_record(mk_sender(1), mk_contract(1))
+            l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request)
                 .is_allowed()
         );
         // 200ms later — past the 100ms default.
         ts.advance(Duration::from_millis(200));
-        let d = l.check_and_record(mk_sender(1), mk_contract(1));
+        let d = l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request);
         assert_eq!(d, RateLimitDecision::Allowed);
         assert_eq!(l.accepted_total(), 2);
         assert_eq!(l.rejected_total(), 0);
@@ -1261,17 +1669,17 @@ mod tests {
         let (l, ts) = mk_limiter();
         // Sender 1 accepts.
         assert!(
-            l.check_and_record(mk_sender(1), mk_contract(1))
+            l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request)
                 .is_allowed()
         );
         // Sender 2 immediately also accepts — different key.
         ts.advance(Duration::from_millis(1));
         assert!(
-            l.check_and_record(mk_sender(2), mk_contract(1))
+            l.check_and_record(mk_sender(2), mk_contract(1), UpdateClass::Request)
                 .is_allowed()
         );
         // Sender 1 retry 1ms later still rejected.
-        let d = l.check_and_record(mk_sender(1), mk_contract(1));
+        let d = l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request);
         assert!(matches!(d, RateLimitDecision::Rejected { .. }));
     }
 
@@ -1279,12 +1687,12 @@ mod tests {
     fn same_sender_different_contracts_independent() {
         let (l, _ts) = mk_limiter();
         assert!(
-            l.check_and_record(mk_sender(1), mk_contract(1))
+            l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request)
                 .is_allowed()
         );
         // Same sender, different contract — independent rate limit.
         assert!(
-            l.check_and_record(mk_sender(1), mk_contract(2))
+            l.check_and_record(mk_sender(1), mk_contract(2), UpdateClass::Request)
                 .is_allowed()
         );
         assert_eq!(l.accepted_total(), 2);
@@ -1299,27 +1707,27 @@ mod tests {
         // indefinitely (the existing peer would never recover).
         let (l, ts) = mk_limiter();
         assert!(
-            l.check_and_record(mk_sender(1), mk_contract(1))
+            l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request)
                 .is_allowed()
         );
         // 9 sub-100ms attempts, all rejected.
         for _ in 0..9 {
             ts.advance(Duration::from_millis(10));
             assert!(
-                !l.check_and_record(mk_sender(1), mk_contract(1))
+                !l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request)
                     .is_allowed()
             );
         }
         // Now we're at 90ms — still rejected.
         ts.advance(Duration::from_millis(5));
         assert!(
-            !l.check_and_record(mk_sender(1), mk_contract(1))
+            !l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request)
                 .is_allowed()
         );
         // One more advance puts us past 100ms from the FIRST accept.
         ts.advance(Duration::from_millis(10));
         assert!(
-            l.check_and_record(mk_sender(1), mk_contract(1))
+            l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request)
                 .is_allowed(),
             "after 105ms+ from original accept, next attempt MUST be allowed — \
              rejected attempts must not have moved the window forward"
@@ -1329,8 +1737,8 @@ mod tests {
     #[test]
     fn cleanup_removes_stale_entries() {
         let (l, ts) = mk_limiter();
-        l.check_and_record(mk_sender(1), mk_contract(1));
-        l.check_and_record(mk_sender(2), mk_contract(2));
+        l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request);
+        l.check_and_record(mk_sender(2), mk_contract(2), UpdateClass::Request);
         assert_eq!(l.len(), 2);
 
         // Advance past CLEANUP_AGE.
@@ -1342,7 +1750,7 @@ mod tests {
     #[test]
     fn cleanup_preserves_fresh_entries() {
         let (l, ts) = mk_limiter();
-        l.check_and_record(mk_sender(1), mk_contract(1));
+        l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request);
         // Advance partway through the cleanup age.
         ts.advance(CLEANUP_AGE / 2);
         l.cleanup();
@@ -1356,7 +1764,7 @@ mod tests {
             // Five accepts: stagger by min_interval.
             ts.advance(MIN_UPDATE_INTERVAL + Duration::from_millis(1));
             assert!(
-                l.check_and_record(mk_sender(1), mk_contract(1))
+                l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request)
                     .is_allowed(),
                 "iter {i}"
             );
@@ -1364,7 +1772,7 @@ mod tests {
         // Three rejects: hammer with no advance.
         for _ in 0..3 {
             assert!(
-                !l.check_and_record(mk_sender(1), mk_contract(1))
+                !l.check_and_record(mk_sender(1), mk_contract(1), UpdateClass::Request)
                     .is_allowed()
             );
         }
@@ -1386,7 +1794,7 @@ mod tests {
         // Simulate 1 second of flooding at 1ms per attempt (1000
         // attempts/s — 100× over the 10/s ceiling).
         for _ in 0..1000 {
-            l.check_and_record(sender, contract);
+            l.check_and_record(sender, contract, UpdateClass::Request);
             ts.advance(Duration::from_millis(1));
         }
         // Expected admits: floor(1000ms / 100ms) + 1 (first one is
@@ -1431,14 +1839,18 @@ mod tests {
 
         // Fill the map with 8 distinct pairs — all should be Allowed.
         for i in 0..8 {
-            let d = limiter.check_and_record(mk_sender(i + 1), mk_contract(i + 1));
+            let d = limiter.check_and_record(
+                mk_sender(i + 1),
+                mk_contract(i + 1),
+                UpdateClass::Request,
+            );
             assert_eq!(d, RateLimitDecision::Allowed, "pair {i} should be allowed");
             ts.advance(Duration::from_millis(1));
         }
         assert_eq!(limiter.len(), 8);
 
         // Pair #9 is a new key at capacity: admitted, by evicting.
-        let d = limiter.check_and_record(mk_sender(99), mk_contract(99));
+        let d = limiter.check_and_record(mk_sender(99), mk_contract(99), UpdateClass::Request);
         assert_eq!(
             d,
             RateLimitDecision::Allowed,
@@ -1458,7 +1870,7 @@ mod tests {
 
         // An already-tracked pair keeps working after min_interval.
         ts.advance(MIN_UPDATE_INTERVAL + Duration::from_millis(1));
-        let d = limiter.check_and_record(mk_sender(8), mk_contract(8));
+        let d = limiter.check_and_record(mk_sender(8), mk_contract(8), UpdateClass::Request);
         assert_eq!(
             d,
             RateLimitDecision::Allowed,
@@ -1492,7 +1904,11 @@ mod tests {
 
         for i in 0..CAP {
             assert_eq!(
-                limiter.check_and_record(mk_sender(i as u8 + 1), mk_contract(i as u8 + 1)),
+                limiter.check_and_record(
+                    mk_sender(i as u8 + 1),
+                    mk_contract(i as u8 + 1),
+                    UpdateClass::Request
+                ),
                 RateLimitDecision::Allowed
             );
             // Stagger the stamps so the entries are distinguishable.
@@ -1560,6 +1976,9 @@ mod tests {
         let limiter = UpdateRateLimiter::with_new_pair_budget(
             Arc::new(ts.clone()),
             MIN_UPDATE_INTERVAL,
+            // Both classes at the same interval: these fixtures predate the
+            // #5510 class split and are not about it.
+            MIN_UPDATE_INTERVAL,
             CAP,
             BURST as f64,
             Ring::DEFAULT_MAX_CONNECTIONS * SENDER_TRACKING_HEADROOM,
@@ -1570,7 +1989,7 @@ mod tests {
         let incumbent = mk_sender(200);
         for i in 0..CAP {
             assert_eq!(
-                limiter.check_and_record(incumbent, mk_contract(i as u8 + 1)),
+                limiter.check_and_record(incumbent, mk_contract(i as u8 + 1), UpdateClass::Request),
                 RateLimitDecision::Allowed
             );
         }
@@ -1582,7 +2001,11 @@ mod tests {
         let attacker = mk_sender(1);
         for i in 0..BURST {
             assert_eq!(
-                limiter.check_and_record(attacker, mk_contract(100 + i as u8)),
+                limiter.check_and_record(
+                    attacker,
+                    mk_contract(100 + i as u8),
+                    UpdateClass::Request
+                ),
                 RateLimitDecision::Allowed
             );
         }
@@ -1597,7 +2020,11 @@ mod tests {
         // without reserving a slot or evicting anything.
         for i in BURST..(BURST + 32) {
             assert_eq!(
-                limiter.check_and_record(attacker, mk_contract(100 + i as u8)),
+                limiter.check_and_record(
+                    attacker,
+                    mk_contract(100 + i as u8),
+                    UpdateClass::Request
+                ),
                 RateLimitDecision::SenderNewPairBudget
             );
         }
@@ -1659,6 +2086,9 @@ mod tests {
         let limiter = UpdateRateLimiter::with_new_pair_budget(
             Arc::new(ts.clone()),
             MIN_UPDATE_INTERVAL,
+            // Both classes at the same interval: these fixtures predate the
+            // #5510 class split and are not about it.
+            MIN_UPDATE_INTERVAL,
             MAX_TRACKED_PAIRS,
             BURST as f64,
             Ring::DEFAULT_MAX_CONNECTIONS * SENDER_TRACKING_HEADROOM,
@@ -1670,7 +2100,7 @@ mod tests {
         // contracts.
         for i in 0..BURST {
             assert_eq!(
-                limiter.check_and_record(attacker, mk_contract(i as u8)),
+                limiter.check_and_record(attacker, mk_contract(i as u8), UpdateClass::Request),
                 RateLimitDecision::Allowed,
                 "fresh id {i} is within the burst"
             );
@@ -1680,7 +2110,7 @@ mod tests {
         // says so, not as a capacity drop.
         for i in BURST..(BURST + 32) {
             assert_eq!(
-                limiter.check_and_record(attacker, mk_contract(i as u8)),
+                limiter.check_and_record(attacker, mk_contract(i as u8), UpdateClass::Request),
                 RateLimitDecision::SenderNewPairBudget,
                 "fresh id {i} is past the burst and must be refused"
             );
@@ -1702,12 +2132,12 @@ mod tests {
         // one interval the sender may introduce one more pair.
         ts.advance(NEW_PAIR_REFILL_INTERVAL);
         assert_eq!(
-            limiter.check_and_record(attacker, mk_contract(200)),
+            limiter.check_and_record(attacker, mk_contract(200), UpdateClass::Request),
             RateLimitDecision::Allowed,
             "one refill interval must buy exactly one more fresh pair"
         );
         assert_eq!(
-            limiter.check_and_record(attacker, mk_contract(201)),
+            limiter.check_and_record(attacker, mk_contract(201), UpdateClass::Request),
             RateLimitDecision::SenderNewPairBudget,
             "and only one"
         );
@@ -1725,6 +2155,9 @@ mod tests {
         let limiter = UpdateRateLimiter::with_new_pair_budget(
             Arc::new(ts.clone()),
             MIN_UPDATE_INTERVAL,
+            // Both classes at the same interval: these fixtures predate the
+            // #5510 class split and are not about it.
+            MIN_UPDATE_INTERVAL,
             MAX_TRACKED_PAIRS,
             BURST as f64,
             Ring::DEFAULT_MAX_CONNECTIONS * SENDER_TRACKING_HEADROOM,
@@ -1733,13 +2166,13 @@ mod tests {
 
         for i in 0..BURST {
             assert_eq!(
-                limiter.check_and_record(peer, mk_contract(i as u8)),
+                limiter.check_and_record(peer, mk_contract(i as u8), UpdateClass::Request),
                 RateLimitDecision::Allowed
             );
         }
         // Budget fully spent: a fresh pair is refused from here on.
         assert_eq!(
-            limiter.check_and_record(peer, mk_contract(99)),
+            limiter.check_and_record(peer, mk_contract(99), UpdateClass::Request),
             RateLimitDecision::SenderNewPairBudget
         );
 
@@ -1749,7 +2182,7 @@ mod tests {
             ts.advance(MIN_UPDATE_INTERVAL + Duration::from_millis(1));
             for i in 0..BURST {
                 assert_eq!(
-                    limiter.check_and_record(peer, mk_contract(i as u8)),
+                    limiter.check_and_record(peer, mk_contract(i as u8), UpdateClass::Request),
                     RateLimitDecision::Allowed,
                     "round {round}, established pair {i} must be unaffected by the \
                      new-pair budget"
@@ -1796,7 +2229,7 @@ mod tests {
         for cycle in 0..CYCLES {
             for c in 0..CONTRACTS {
                 assert_eq!(
-                    limiter.check_and_record(peer, mk_contract(c)),
+                    limiter.check_and_record(peer, mk_contract(c), UpdateClass::Request),
                     RateLimitDecision::Allowed,
                     "cycle {cycle}, contract {c}: a peer relaying at the sustained rate \
                      must not be throttled, even though eviction keeps making its pairs \
@@ -1826,7 +2259,7 @@ mod tests {
             let mut id = [0u8; 32];
             id[..8].copy_from_slice(&(c as u64).to_be_bytes());
             id[8] = 0xEE; // disjoint from mk_contract's key space
-            if limiter.check_and_record(peer, ContractInstanceId::new(id))
+            if limiter.check_and_record(peer, ContractInstanceId::new(id), UpdateClass::Request)
                 == RateLimitDecision::SenderNewPairBudget
             {
                 refused += 1;
@@ -1853,6 +2286,9 @@ mod tests {
         let limiter = UpdateRateLimiter::with_new_pair_budget(
             Arc::new(ts.clone()),
             MIN_UPDATE_INTERVAL,
+            // Both classes at the same interval: these fixtures predate the
+            // #5510 class split and are not about it.
+            MIN_UPDATE_INTERVAL,
             MAX_TRACKED_PAIRS,
             BURST as f64,
             Ring::DEFAULT_MAX_CONNECTIONS * SENDER_TRACKING_HEADROOM,
@@ -1862,18 +2298,18 @@ mod tests {
 
         for i in 0..BURST {
             assert_eq!(
-                limiter.check_and_record(noisy, mk_contract(i as u8)),
+                limiter.check_and_record(noisy, mk_contract(i as u8), UpdateClass::Request),
                 RateLimitDecision::Allowed
             );
         }
         assert_eq!(
-            limiter.check_and_record(noisy, mk_contract(50)),
+            limiter.check_and_record(noisy, mk_contract(50), UpdateClass::Request),
             RateLimitDecision::SenderNewPairBudget
         );
 
         for i in 0..BURST {
             assert_eq!(
-                limiter.check_and_record(quiet, mk_contract(i as u8)),
+                limiter.check_and_record(quiet, mk_contract(i as u8), UpdateClass::Request),
                 RateLimitDecision::Allowed,
                 "a second sender has its own budget, untouched by the first"
             );
@@ -1902,13 +2338,17 @@ mod tests {
         let limiter = UpdateRateLimiter::with_new_pair_budget(
             Arc::new(ts.clone()),
             MIN_UPDATE_INTERVAL,
+            // Both classes at the same interval: these fixtures predate the
+            // #5510 class split and are not about it.
+            MIN_UPDATE_INTERVAL,
             MAX_TRACKED_PAIRS,
             NEW_PAIR_BURST,
             MAX_SENDERS,
         );
 
         for i in 0..(MAX_SENDERS * 4) {
-            let d = limiter.check_and_record(mk_sender(i as u8), mk_contract(1));
+            let d =
+                limiter.check_and_record(mk_sender(i as u8), mk_contract(1), UpdateClass::Request);
             assert_eq!(
                 d,
                 RateLimitDecision::Allowed,
@@ -2052,7 +2492,7 @@ mod tests {
         for i in 1..=8u8 {
             assert!(
                 limiter
-                    .check_and_record(mk_sender(i), mk_contract(i))
+                    .check_and_record(mk_sender(i), mk_contract(i), UpdateClass::Request)
                     .is_allowed()
             );
         }
@@ -2061,7 +2501,7 @@ mod tests {
         for i in 1..=4u8 {
             assert!(
                 limiter
-                    .check_and_record(mk_sender(i), mk_contract(i))
+                    .check_and_record(mk_sender(i), mk_contract(i), UpdateClass::Request)
                     .is_allowed()
             );
         }
@@ -2090,7 +2530,7 @@ mod tests {
 
         for i in 1..=4u8 {
             assert_eq!(
-                limiter.check_and_record(mk_sender(i), mk_contract(i)),
+                limiter.check_and_record(mk_sender(i), mk_contract(i), UpdateClass::Request),
                 RateLimitDecision::CapacityExceeded,
                 "with a zero cap there is no slot for pair {i} and nothing to evict"
             );
@@ -2141,7 +2581,7 @@ mod tests {
         while limiter.capacity_evicted_total() < ORDER_TEST_EVICTED as u64 {
             let (s, c) = mk_pair(i);
             assert_eq!(
-                limiter.check_and_record(s, c),
+                limiter.check_and_record(s, c, UpdateClass::Request),
                 RateLimitDecision::Allowed,
                 "newcomer {i} must be admitted"
             );
@@ -2195,7 +2635,7 @@ mod tests {
         for i in 0..ORDER_TEST_CAP {
             let (s, c) = mk_pair(i);
             assert_eq!(
-                limiter.check_and_record(s, c),
+                limiter.check_and_record(s, c, UpdateClass::Request),
                 RateLimitDecision::Allowed,
                 "fill {i}"
             );
@@ -2217,7 +2657,7 @@ mod tests {
             let (s, c) = mk_pair(i);
             assert!(
                 matches!(
-                    limiter.check_and_record(s, c),
+                    limiter.check_and_record(s, c, UpdateClass::Request),
                     RateLimitDecision::Rejected { .. }
                 ),
                 "pair {i} is newer than the {ORDER_TEST_EVICTED} oldest and must have survived"
@@ -2226,7 +2666,7 @@ mod tests {
         for i in 0..ORDER_TEST_EVICTED {
             let (s, c) = mk_pair(i);
             assert_eq!(
-                limiter.check_and_record(s, c),
+                limiter.check_and_record(s, c, UpdateClass::Request),
                 RateLimitDecision::Allowed,
                 "pair {i} is among the {ORDER_TEST_EVICTED} oldest and must have been evicted"
             );
@@ -2261,7 +2701,7 @@ mod tests {
         for i in 0..ORDER_TEST_CAP {
             let (s, c) = mk_pair(i);
             assert_eq!(
-                limiter.check_and_record(s, c),
+                limiter.check_and_record(s, c, UpdateClass::Request),
                 RateLimitDecision::Allowed,
                 "fill {i}"
             );
@@ -2278,7 +2718,7 @@ mod tests {
         for i in (0..ORDER_TEST_CAP).filter(|i| !victims.contains(i)) {
             let (s, c) = mk_pair(i);
             assert_eq!(
-                limiter.check_and_record(s, c),
+                limiter.check_and_record(s, c, UpdateClass::Request),
                 RateLimitDecision::Allowed,
                 "refresh {i} must be accepted a full min_interval after the fill"
             );
@@ -2305,7 +2745,7 @@ mod tests {
             let (s, c) = mk_pair(i);
             assert!(
                 matches!(
-                    limiter.check_and_record(s, c),
+                    limiter.check_and_record(s, c, UpdateClass::Request),
                     RateLimitDecision::Rejected { .. }
                 ),
                 "pair {i} was refreshed, so it must be at the back of the eviction \
@@ -2332,7 +2772,7 @@ mod tests {
         for i in 1..=8u8 {
             assert!(
                 limiter
-                    .check_and_record(mk_sender(i), mk_contract(i))
+                    .check_and_record(mk_sender(i), mk_contract(i), UpdateClass::Request)
                     .is_allowed()
             );
             ts.advance(Duration::from_millis(1));
@@ -2344,10 +2784,14 @@ mod tests {
             // The incumbents stay busy, restamping themselves.
             ts.advance(MIN_UPDATE_INTERVAL + Duration::from_millis(1));
             for i in 1..=8u8 {
-                limiter.check_and_record(mk_sender(i), mk_contract(i));
+                limiter.check_and_record(mk_sender(i), mk_contract(i), UpdateClass::Request);
             }
 
-            let newcomer = limiter.check_and_record(mk_sender(100 + round), mk_contract(200));
+            let newcomer = limiter.check_and_record(
+                mk_sender(100 + round),
+                mk_contract(200),
+                UpdateClass::Request,
+            );
             assert_eq!(
                 newcomer,
                 RateLimitDecision::Allowed,
@@ -2390,7 +2834,7 @@ mod tests {
             let sender = SocketAddr::from(([10, 1, (i / 256) as u8, (i % 256) as u8], 30000));
             assert!(
                 limiter
-                    .check_and_record(sender, mk_contract(1))
+                    .check_and_record(sender, mk_contract(1), UpdateClass::Request)
                     .is_allowed()
             );
             ts.advance(Duration::from_millis(1));
@@ -2399,7 +2843,7 @@ mod tests {
 
         assert!(
             limiter
-                .check_and_record(mk_sender(99), mk_contract(99))
+                .check_and_record(mk_sender(99), mk_contract(99), UpdateClass::Request)
                 .is_allowed()
         );
         assert_eq!(
@@ -2417,7 +2861,7 @@ mod tests {
         // again.
         assert!(
             limiter
-                .check_and_record(mk_sender(98), mk_contract(98))
+                .check_and_record(mk_sender(98), mk_contract(98), UpdateClass::Request)
                 .is_allowed()
         );
         assert_eq!(
@@ -2457,7 +2901,7 @@ mod tests {
             let b = barrier.clone();
             handles.push(thread::spawn(move || {
                 b.wait();
-                l.check_and_record(sender, contract)
+                l.check_and_record(sender, contract, UpdateClass::Request)
             }));
         }
 
@@ -2609,7 +3053,11 @@ mod tests {
                 b.wait();
                 // Each thread tries a DISTINCT key, so they all
                 // exercise the new-pair (Vacant) path concurrently.
-                l.check_and_record(mk_sender((i + 1) as u8), mk_contract((i + 1) as u8))
+                l.check_and_record(
+                    mk_sender((i + 1) as u8),
+                    mk_contract((i + 1) as u8),
+                    UpdateClass::Request,
+                )
             }));
         }
 
@@ -2887,7 +3335,11 @@ mod tests {
         // Fill to cap.
         for i in 0..4 {
             assert_eq!(
-                limiter.check_and_record(mk_sender(i + 1), mk_contract(i + 1)),
+                limiter.check_and_record(
+                    mk_sender(i + 1),
+                    mk_contract(i + 1),
+                    UpdateClass::Request
+                ),
                 RateLimitDecision::Allowed
             );
         }
@@ -2895,7 +3347,7 @@ mod tests {
         // CapacityExceeded); the map stays at the cap either way, which
         // is what this test is really about.
         assert_eq!(
-            limiter.check_and_record(mk_sender(5), mk_contract(5)),
+            limiter.check_and_record(mk_sender(5), mk_contract(5), UpdateClass::Request),
             RateLimitDecision::Allowed
         );
         assert_eq!(limiter.len(), 4, "eviction keeps the map at the cap");
@@ -2906,7 +3358,7 @@ mod tests {
         // Now we should be able to add 4 more without hitting the cap.
         for i in 10..14 {
             assert_eq!(
-                limiter.check_and_record(mk_sender(i), mk_contract(i)),
+                limiter.check_and_record(mk_sender(i), mk_contract(i), UpdateClass::Request),
                 RateLimitDecision::Allowed,
                 "after cleanup, new pair (sender={i}) should be admitted"
             );
@@ -2971,6 +3423,9 @@ mod tests {
         let limiter = StdArc::new(UpdateRateLimiter::with_new_pair_budget(
             Arc::new(ts.clone()),
             MIN_UPDATE_INTERVAL,
+            // Both classes at the same interval: these fixtures predate the
+            // #5510 class split and are not about it.
+            MIN_UPDATE_INTERVAL,
             CAP,
             // The new-pair budget is not what this test is about, and a
             // synthetic flood of fresh pairs would otherwise be stopped
@@ -2992,7 +3447,7 @@ mod tests {
                     let sender = mk_sender(t as u8);
                     let mut id = [0u8; 32];
                     id[..8].copy_from_slice(&(i as u64).to_be_bytes());
-                    l.check_and_record(sender, ContractInstanceId::new(id));
+                    l.check_and_record(sender, ContractInstanceId::new(id), UpdateClass::Request);
                 }
             }));
         }

@@ -1639,6 +1639,27 @@ where
                     | update::UpdateMsg::BroadcastToStreamingV2 { key, .. } => *key,
                 };
 
+                // Which budget this message is charged against (#5510).
+                // Matched exhaustively, and the four broadcast opcodes map
+                // to ONE class so switching between them gains nothing —
+                // see `crate::ring::update_rate_limit::UpdateClass`. A new
+                // UPDATE wire variant will fail to compile here, which is
+                // the point: it must be classified deliberately rather
+                // than fall into whichever class a catch-all named.
+                // Pinned by `every_broadcast_opcode_is_charged_to_the_broadcast_class`.
+                let update_class = match op {
+                    update::UpdateMsg::RequestUpdate { .. }
+                    | update::UpdateMsg::RequestUpdateStreaming { .. } => {
+                        crate::ring::update_rate_limit::UpdateClass::Request
+                    }
+                    update::UpdateMsg::BroadcastTo { .. }
+                    | update::UpdateMsg::BroadcastToV2 { .. }
+                    | update::UpdateMsg::BroadcastToStreaming { .. }
+                    | update::UpdateMsg::BroadcastToStreamingV2 { .. } => {
+                        crate::ring::update_rate_limit::UpdateClass::Broadcast
+                    }
+                };
+
                 // Phase 7 ban-list gate. Runs BEFORE the rate limiter
                 // so a banned contract's traffic doesn't even count
                 // against the per-(sender, contract) window — keeps
@@ -1654,10 +1675,11 @@ where
                     return Ok(());
                 }
 
-                let rate_decision = op_manager
-                    .ring
-                    .update_rate_limiter
-                    .check_and_record(sender_addr, *key.id());
+                let rate_decision = op_manager.ring.update_rate_limiter.check_and_record(
+                    sender_addr,
+                    *key.id(),
+                    update_class,
+                );
                 if !rate_decision.is_allowed() {
                     use crate::ring::update_rate_limit::RateLimitDecision;
                     // Matched exhaustively on purpose: a new drop reason
@@ -1750,13 +1772,7 @@ where
                     // neither the `ResyncRequest` nor the `ResyncResponse` it
                     // provokes is subject to THIS limiter. The repair cannot be
                     // silenced by the condition it repairs.
-                    if matches!(
-                        op,
-                        update::UpdateMsg::BroadcastTo { .. }
-                            | update::UpdateMsg::BroadcastToV2 { .. }
-                            | update::UpdateMsg::BroadcastToStreaming { .. }
-                            | update::UpdateMsg::BroadcastToStreamingV2 { .. }
-                    ) {
+                    if update_class == crate::ring::update_rate_limit::UpdateClass::Broadcast {
                         update::op_ctx_task::send_dropped_broadcast_resync_request(
                             &op_manager,
                             key,
@@ -7305,16 +7321,28 @@ mod tests {
             targets
         }
 
-        // Prime both pairs so the limiter is TRACKING them; on the frozen clock
-        // every subsequent check for the same pair is `Rejected` forever.
-        for key in [broadcast_key, request_key] {
+        // Prime each pair so the limiter is TRACKING it, in the SAME class the
+        // dispatch will later charge. Since #5510 the two classes hold separate
+        // stamps in one entry, so priming the wrong class would leave the other
+        // at `None` and the message under test would be ALLOWED. On the frozen
+        // clock every subsequent check of a primed class is `Rejected` forever.
+        for (key, class) in [
+            (
+                broadcast_key,
+                crate::ring::update_rate_limit::UpdateClass::Broadcast,
+            ),
+            (
+                request_key,
+                crate::ring::update_rate_limit::UpdateClass::Request,
+            ),
+        ] {
             assert!(
                 op_manager
                     .ring
                     .update_rate_limiter
-                    .check_and_record(sender_addr, *key.id())
+                    .check_and_record(sender_addr, *key.id(), class)
                     .is_allowed(),
-                "precondition: the first UPDATE for a fresh pair must be allowed"
+                "precondition: the first UPDATE of a class for a fresh pair must be allowed"
             );
         }
 
