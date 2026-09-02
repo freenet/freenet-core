@@ -75,6 +75,16 @@ To validate `FREENET_RELEASE_SIGNING_KEY` without cutting a release, run the
 `verify-signing-key` job derives the public key from the secret, asserts it
 matches the key baked into the binary, and does a sign/verify round-trip.
 
+### One-time setup: GHCR package visibility
+
+`docker-publish.yml` pushes `ghcr.io/freenet/freenet-core`. GitHub creates a new
+package as **private**, so until its visibility is set to public once, every
+`docker pull` in the Docker README fails for everyone except maintainers, and
+the error reads as a missing image rather than a permissions problem.
+
+After the first successful publish, check it under the repository's Packages
+settings and make it public. This is needed once, not per release.
+
 ### Windows code signing (Authenticode)
 
 `freenet.exe` and `fdev.exe` are Authenticode-signed in
@@ -380,6 +390,10 @@ gh workflow run release.yml
                                     └─→ POST /update to nova (HTTPS)
                                     └─→ POST /update to vega (HTTPS:8443)
                             └─→ release-announce.yml fires
+                            └─→ docker-publish.yml fires
+                                (builds and pushes the multi-arch node image
+                                 to ghcr.io/freenet/freenet-core, then smoke-
+                                 tests both architectures)
                                     └─→ Matrix message
                                     └─→ POST /announce/river to nova
                                             └─→ nova runs riverctl locally
@@ -389,7 +403,8 @@ gh workflow run release.yml
 
 - **All in one place**:
   <https://github.com/freenet/freenet-core/actions> — release.yml,
-  cross-compile.yml, gateway-update.yml, and release-announce.yml runs all
+  cross-compile.yml, gateway-update.yml, release-announce.yml, and
+  docker-publish.yml runs all
   show up here in rough chronological order.
 - **Gateway versions**:
   - `curl https://nova.locut.us/release-agent/version`
@@ -560,6 +575,7 @@ using `GITHUB_TOKEN`, which suppresses `release.published`. Update
 
 ```bash
 gh workflow run gateway-update.yml --field version=X.Y.Z --field gateways=all
+gh workflow run docker-publish.yml --field tag=vX.Y.Z
 gh workflow run release-announce.yml --field version=X.Y.Z
 ```
 
