@@ -18,7 +18,8 @@ use freenet_stdlib::prelude::{RelatedContracts, State, StateDelta, UpdateData, V
 
 use super::oracle::{ConformanceOracle, OracleError, OracleErrorKind};
 use super::property::{
-    ConformanceProperty, Inconclusive, OutputDigest, PropertyOutcome, Violation,
+    ConformanceProperty, IdempotenceSettling, Inconclusive, OutputDigest, PropertyOutcome,
+    Violation,
 };
 
 /// Shared, cheaply-clonable input bytes.
@@ -149,10 +150,48 @@ pub fn verify_case<O: ConformanceOracle + ?Sized>(
             {
                 second
             }
-            // Disagreed with itself. The contract is nondeterministic, which is its
-            // own defect with its own property, and is emphatically not proof of the
-            // law this case was checking. Say so under the right name if we can:
-            // reporting nothing at all would turn a real defect into a silent miss.
+            // The violation reproduced; only its CLASSIFICATION did not.
+            //
+            // Same inputs, same outputs, both runs — `merge(A, A) != A` was
+            // established twice. What flapped is the settling class, which this
+            // change insists is DATA about the finding and not the finding itself.
+            // Discarding the violation because the data was unstable would throw
+            // away a reproduced defect, which is the exact failure this whole
+            // change exists to remove.
+            //
+            // Marked `Indeterminate` rather than reported as either class, because
+            // asserting a classification observed once is the other half of the
+            // same mistake. That is the identical treatment an ERRORING
+            // classification already gets a few lines up in `run`: "we could not
+            // determine the class" is one situation and it must not be handled two
+            // ways in one file.
+            //
+            // A clock-reading contract straddling a TTL boundary between the two
+            // runs is the ordinary way to reach here, not a contrived one.
+            (PropertyOutcome::Violated(a), PropertyOutcome::Violated(b))
+                if a.property == b.property
+                    && a.left == b.left
+                    && a.right == b.right
+                    && a.settling != b.settling =>
+            {
+                let PropertyOutcome::Violated(mut v) = second else {
+                    unreachable!("matched on Violated above")
+                };
+                v.settling = Some(IdempotenceSettling::Indeterminate);
+                PropertyOutcome::Violated(v)
+            }
+            // Disagreed with itself on the OUTPUTS. The contract is
+            // nondeterministic, which is its own defect with its own property, and
+            // is emphatically not proof of the law this case was checking. Say so
+            // under the right name if we can: reporting nothing at all would turn a
+            // real defect into a silent miss.
+            //
+            // Note for `StateIdempotence` specifically: this escalation cannot
+            // name it. `escalate_to_determinism` returns early unless the case has
+            // enough states for `UpdateDeterminism` (arity 2), and an idempotence
+            // case carries one. So the outcome here is always `NotReproducible` for
+            // that property, which is why the settling-flap arm above must keep the
+            // violation rather than fall through to this.
             _ => escalate_to_determinism(oracle, case),
         };
     }
@@ -204,8 +243,18 @@ fn reproduced_identically(first: &Violation, second: &Violation) -> bool {
         ConformanceProperty::UpdateDeterminism
         | ConformanceProperty::SummaryDeterminism
         | ConformanceProperty::DeltaDeterminism => true,
-        ConformanceProperty::StateIdempotence
-        | ConformanceProperty::StateCommutativity
+        // `settling` too, not just the digests. It is decision-relevant data — the
+        // whole point of carrying it is that an enforcement policy branches on it —
+        // so a classification that differs between runs must not be reported as
+        // though it had reproduced. A contract whose settling varies IS
+        // non-deterministic, and falling through to `escalate_to_determinism` names
+        // that under the property which describes it.
+        ConformanceProperty::StateIdempotence => {
+            first.left == second.left
+                && first.right == second.right
+                && first.settling == second.settling
+        }
+        ConformanceProperty::StateCommutativity
         | ConformanceProperty::StateAssociativity
         | ConformanceProperty::EmittedStateValidity
         | ConformanceProperty::DeltaIdempotence
@@ -235,38 +284,151 @@ fn run<O: ConformanceOracle + ?Sized>(
 
     match case.property {
         ConformanceProperty::StateIdempotence => {
-            // Iterate to a fixpoint rather than demanding `merge(A, A) == A` on the
-            // first try.
+            // `merge(A, A) != A` is reported. The fixpoint iteration below
+            // CLASSIFIES the finding; it does not decide whether there is one.
             //
-            // A correct CANONICALIZING contract fails a single-apply check for a
-            // reason that is not a defect: the PUT install path stores the client's
-            // raw bytes without ever running `update_state`, so the state a peer
-            // holds may not be canonical yet, and the first merge rewrites it into
-            // canonical form. That first change is real. What matters is whether it
-            // then STABILIZES. The in-tree probe already learned this the hard way
-            // and iterates for exactly this reason — see the rustdoc on
-            // `executor_impl::probe_identical_input_idempotency`, which says
+            // It used to decide. The loop returned `Holds` if the state settled
+            // within `MAX_CANONICALIZATION_APPLIES`, which silently merged two very
+            // different outcomes into a pass. The reasoning was that a correct
+            // CANONICALIZING contract fails a single-apply check for a reason that
+            // is not its fault: the PUT install path stores the client's raw bytes
+            // without ever running `update_state`, so a peer can hold a
+            // non-canonical state and the first merge legitimately rewrites it.
+            //
+            // That reasoning is true and it does not license a pass. Two peers
+            // handed the same updates then hold different bytes — permanently, not
+            // until some deadline, but until unrelated traffic happens to arrive —
+            // and their summaries differ, so anti-entropy fires over a difference
+            // carrying no information. That is idempotence broken on any honest
+            // reading, and the loop was suppressing a true finding.
+            //
+            // The choice looked binary — flag every canonicalizing contract as
+            // removal-eligible, or suppress — and it is not. The distinction is
+            // kept as DATA on the finding ([`IdempotenceSettling`]) rather than as
+            // a severity fork, so an eventual removal policy can branch on it
+            // without the verifier having pre-decided the answer. Bending the
+            // classification to soften an enforcement consequence is the specific
+            // mistake this replaced (#5462).
+            //
+            // DELIBERATE DIVERGENCE from the executor's in-tree probe — do NOT
+            // "reconcile" them without reading both. `probe_identical_input_idempotency`
+            // (contract/executor/runtime/executor_impl.rs) still returns WITHOUT
+            // flagging when the state settles after a rewrite, and its rustdoc says
             // flagging on the first change alone "would false-flag every such
-            // contract".
+            // contract". That is correct FOR THAT MECHANISM and must stay: it has
+            // teeth today, suppressing commit, broadcast and full-state egress, so a
+            // false flag there degrades a live node. This is a REPORT, acted on by
+            // nobody, so it can afford to be honest and carry the distinction as
+            // data. The two answer the same question differently on purpose, and the
+            // direction a future reader picks decides whether a live egress
+            // suppression starts firing on canonicalizing contracts (#5462).
             //
-            // So a violation here means the state never settles: every re-apply
-            // changes it again, which is genuine non-idempotence and does diverge
-            // under at-least-once delivery.
-            let a = &case.states[0];
-            let mut current = a.to_vec();
-            for _ in 0..MAX_CANONICALIZATION_APPLIES {
-                let merged = merge(oracle, &current, &current)?;
+            // Sequencing note: canonicalising at install removes the benign class
+            // entirely, and is what makes this honest report safe to enforce on
+            // later. Until then, expect `SettledAfter(1)` findings against correct
+            // contracts and read them as "the install path has not been fixed yet",
+            // not as "this contract is broken".
+            let a: &[u8] = &case.states[0];
+            let once = merge(oracle, a, a)?;
+            if once == a {
+                return Ok(PropertyOutcome::Holds);
+            }
+
+            // Idempotence is already broken. Everything below only decides WHICH
+            // kind, and must never turn the finding back into a pass.
+            let mut current = once.clone();
+            let mut rewrites: u32 = 1;
+            let mut settling = IdempotenceSettling::NeverSettled;
+            let mut classification_failure: Option<Inconclusive> = None;
+            // One merge is already spent above, so the remaining budget is
+            // `MAX_CANONICALIZATION_APPLIES - 1` and the total is unchanged.
+            for _ in 1..MAX_CANONICALIZATION_APPLIES {
+                // Deliberately NOT `?`. Propagating here would return
+                // `Inconclusive` from the whole check and DISCARD the violation
+                // established above — reporting "we could not tell" about a
+                // contract already caught. The never-settling class grows its
+                // state on every apply, so it is the likeliest to hit a fuel or
+                // size ceiling on exactly these follow-up merges: the class
+                // enforcement can act on would be the one that silently
+                // disappeared, and a contract could arrange that in one line by
+                // trapping on the second identical merge.
+                let merged = match merge(oracle, &current, &current) {
+                    Ok(merged) => merged,
+                    Err(reason) => {
+                        // BIND the reason; do not discard it. A `let`-else here threw
+                        // the `Inconclusive` away unread, collapsing a RUNTIME trap
+                        // and a CONTRACT rejection into one indistinguishable
+                        // outcome — destroying the only signal that would tell us the
+                        // harness has a bug rather than the contract. That
+                        // distinction is the whole point of #5509/#5517, whose own
+                        // rustdoc says a runtime failure must never wear a contract
+                        // error's label.
+                        settling = IdempotenceSettling::Indeterminate;
+                        classification_failure = Some(reason);
+                        break;
+                    }
+                };
                 if merged == current {
-                    return Ok(PropertyOutcome::Holds);
+                    settling = IdempotenceSettling::SettledAfter(rewrites);
+                    break;
                 }
                 current = merged;
+                rewrites += 1;
             }
-            Ok(violation(
+
+            let mut detail = match settling {
+                IdempotenceSettling::SettledAfter(n) => format!(
+                    "merge(A, A) != A: the state was rewritten {n} time(s) and then \
+                     stopped changing. Idempotence is broken either way; a \
+                     canonicalizing contract lands here because the install path \
+                     stores raw client bytes without running update_state"
+                ),
+                IdempotenceSettling::NeverSettled => format!(
+                    "merge(A, A) != A and no fixpoint within \
+                     {MAX_CANONICALIZATION_APPLIES} applies: the state changes on \
+                     every re-apply, so redelivery of the same state keeps mutating it"
+                ),
+                IdempotenceSettling::Indeterminate => {
+                    // Name WHICH side failed. Saying "the contract errored" when the
+                    // cause was a runtime trap accuses the wrong party, and this
+                    // report is the one that would otherwise carry the harness-bug
+                    // signal (#5509).
+                    let cause = classification_failure
+                        .as_ref()
+                        .map_or_else(|| "cause not recorded".to_string(), |r| format!("{r}"));
+                    format!(
+                        "merge(A, A) != A; classification could not complete \
+                         ({cause}), so whether it settles is unknown. The violation \
+                         stands on the merge that succeeded. If that cause is a \
+                         runtime or harness failure rather than the contract's own \
+                         rejection, the unknown classification is OURS, not the \
+                         contract's"
+                    )
+                }
+            };
+            // Name a reordering as an ENCODING problem, the way every
+            // `compare`-based property does. Without this the detail above sends the
+            // author to the PUT install path when the real fix is a deterministic
+            // encoding — and a merge that only permutes bytes (a HashMap serialized
+            // in iteration order, the #4295 shape) settles after one apply, so it
+            // lands squarely in the `SettledAfter` arm. The commutativity path
+            // already carries a test against exactly this misdiagnosis.
+            if is_reordering(&once, a) {
+                detail.push_str(
+                    ". NOTE: the rewritten state holds exactly the same bytes in a \
+                     different order, so the merge agreed on content and the ENCODING \
+                     is not canonical (e.g. a HashMap serialized in iteration order). \
+                     Peers compare state by hash, so this still prevents convergence, \
+                     but the fix is a deterministic encoding rather than a change to \
+                     the merge",
+                );
+            }
+            Ok(idempotence_violation(
                 case.property,
-                &current,
+                &once,
                 a,
-                "merge(A, A) never reached a fixpoint: the state changes on every \
-                 re-apply, so redelivery of the same state keeps mutating it",
+                &detail,
+                settling,
             ))
         }
 
@@ -328,6 +490,7 @@ fn run<O: ConformanceOracle + ?Sized>(
                     right: OutputDigest::of(a),
                     detail: "update_state emitted a state the contract rejects as invalid"
                         .to_string(),
+                    settling: None,
                 })),
             }
         }
@@ -346,6 +509,7 @@ fn run<O: ConformanceOracle + ?Sized>(
                         right: OutputDigest::of(&again),
                         detail: "merge(A, B) returned different bytes on repeated identical calls"
                             .to_string(),
+                        settling: None,
                     }));
                 }
             }
@@ -366,6 +530,7 @@ fn run<O: ConformanceOracle + ?Sized>(
                         right: OutputDigest::of(&again),
                         detail: "summarize_state returned different bytes for the same state"
                             .to_string(),
+                        settling: None,
                     }));
                 }
             }
@@ -394,6 +559,7 @@ fn run<O: ConformanceOracle + ?Sized>(
                         right: OutputDigest::of(&again),
                         detail: "get_state_delta returned different bytes for the same inputs"
                             .to_string(),
+                        settling: None,
                     }));
                 }
             }
@@ -454,6 +620,7 @@ fn run<O: ConformanceOracle + ?Sized>(
                         "delta against an exact summary of the same state is {} bytes, not empty",
                         delta.len()
                     ),
+                    settling: None,
                 }))
             }
         }
@@ -484,6 +651,7 @@ fn run<O: ConformanceOracle + ?Sized>(
                         delta.len(),
                         a.len()
                     ),
+                    settling: None,
                 }))
             }
         }
@@ -530,7 +698,13 @@ fn run<O: ConformanceOracle + ?Sized>(
             // first time it is merged — the PUT install path stores the client's raw
             // bytes without ever running `update_state` — so the state a peer holds
             // may not be canonical yet. Comparing against the raw bytes would report
-            // that rewrite as a merge-law break. `StateIdempotence` iterates for the
+            // that rewrite as a merge-law break. NOTE: `StateIdempotence` no longer
+            // iterates for this reason — since #5462 it reports the break and uses the
+            // iteration only to CLASSIFY it. This arm still normalizes, which leaves
+            // issue #5462's item 4 ("apply canonicalization uniformly or not at all")
+            // open; the decision recorded on that issue covers `StateIdempotence`
+            // only. Kept as-is here deliberately rather than changed in passing.
+            // Historically both iterated for the
             // same reason and to the same budget.
             let mut settled = result.to_vec();
             let mut reached_fixpoint = false;
@@ -778,6 +952,7 @@ fn reconciliation_cycle<O: ConformanceOracle + ?Sized>(
                 detail: "two valid states revisited an exact state pair while still divergent: \
                      reconciliation cannot converge"
                     .to_string(),
+                settling: None,
             }));
         }
     }
@@ -971,5 +1146,30 @@ fn violation(
         left: OutputDigest::of(left),
         right: OutputDigest::of(right),
         detail: detail.to_string(),
+        settling: None,
+    })
+}
+
+/// [`violation`] plus the settling classification, for
+/// [`ConformanceProperty::StateIdempotence`].
+///
+/// Separate constructor rather than an extra parameter on `violation`, so the
+/// other six properties cannot accidentally acquire a field that means nothing
+/// for them, and so the severity stays `property.severity()` for both — the
+/// settling data must not reach into the severity.
+fn idempotence_violation(
+    property: ConformanceProperty,
+    left: &[u8],
+    right: &[u8],
+    detail: &str,
+    settling: IdempotenceSettling,
+) -> PropertyOutcome {
+    PropertyOutcome::Violated(Violation {
+        property,
+        severity: property.severity(),
+        left: OutputDigest::of(left),
+        right: OutputDigest::of(right),
+        detail: detail.to_string(),
+        settling: Some(settling),
     })
 }

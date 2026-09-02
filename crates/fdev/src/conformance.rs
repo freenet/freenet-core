@@ -1,6 +1,6 @@
 //! `fdev verify-merge`: check a contract's merge laws offline (RFC #5320).
 //!
-//! A contract that breaks them cannot converge — peers given the same updates
+//! A contract that breaks them usually cannot converge — peers given the same updates
 //! in different orders end up with different state and never agree.
 //!
 //! This is a thin CLI wrapper around `freenet::conformance` and does not
@@ -33,9 +33,9 @@ use freenet::conformance::host_clock;
 use freenet::conformance::verifier::Bytes;
 use freenet::conformance::{
     ConformanceCase, ConformanceEvidence, ConformanceProperty, EVIDENCE_SCHEMA_VERSION,
-    EvidenceRejected, GeneratorConfig, Inconclusive, MinimizeConfig, OracleBuildError,
-    PropertyOutcome, ReplayBundle, RuntimeOracle, Severity, Transition, generate_cases, minimize,
-    verify_case,
+    EvidenceRejected, GeneratorConfig, IdempotenceSettling, Inconclusive, MinimizeConfig,
+    OracleBuildError, PropertyOutcome, ReplayBundle, RuntimeOracle, Severity, Transition,
+    generate_cases, minimize, verify_case,
 };
 use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId, State, UpdateData};
 use serde::Serialize;
@@ -412,8 +412,11 @@ fn write_bundle(
 /// distinction CI needs and a single exit code cannot express.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "{count} merge-law violation(s) found: this contract cannot converge, so peers \
-     holding it will disagree and keep retrying"
+    "{count} merge-law violation(s) found. A violation is removal-eligible under \
+     enforcement; see each finding for what it means. NOTE: `state_idempotence` \
+     reporting `settled_after` is a real break whose harm is redundant anti-entropy \
+     rather than divergence \u{2014} expected against correct canonicalizing \
+     contracts until the PUT install path canonicalizes"
 )]
 pub struct ConformanceViolations {
     pub count: usize,
@@ -1302,6 +1305,15 @@ struct Finding {
     detail: String,
     left: String,
     right: String,
+    /// Machine-readable settling classification for `state_idempotence`; `null`
+    /// for every other property.
+    ///
+    /// `detail` states it in prose, but `Violation::detail` is documented as
+    /// diagnostic and never parsed, and this distinction is exactly what an
+    /// eventual removal policy branches on (#5462). Carrying it only as text
+    /// would leave the tool discarding structure it was handed — the defect
+    /// #5461 fixed, one field over.
+    settling: Option<IdempotenceSettling>,
 }
 
 /// How many distinct detail texts the HUMAN report shows per inconclusive reason.
@@ -1413,6 +1425,7 @@ impl Report {
                         detail: v.detail.clone(),
                         left: v.left.to_string(),
                         right: v.right.to_string(),
+                        settling: v.settling,
                     });
                 }
                 PropertyOutcome::Inconclusive(reason) => {
@@ -3318,6 +3331,7 @@ mod tests {
             left: digest(),
             right: digest(),
             detail: "test".to_string(),
+            settling: None,
         }
     }
 
@@ -3353,6 +3367,7 @@ mod tests {
             detail: detail.to_string(),
             left: left.to_string(),
             right: right.to_string(),
+            settling: None,
         }
     }
 
@@ -3851,6 +3866,75 @@ mod tests {
         assert!(
             resource_header < resource_text,
             "the resource-limit message is not under its heading:\n{rendered}"
+        );
+    }
+
+    /// `--json` must carry the settling classification, not just its prose.
+    ///
+    /// `Violation::detail` says the same thing in words, but it is documented as
+    /// diagnostic and never parsed, and this distinction is what an eventual
+    /// removal policy branches on (#5462): a contract that normalises once is a
+    /// different animal from one that mutates on every redelivery. Dropping the
+    /// structured field here would leave the tool discarding information it was
+    /// handed, which is the defect #5461 fixed one field over.
+    #[test]
+    fn the_json_report_carries_the_settling_classification() {
+        let outcomes = vec![
+            (
+                ConformanceCase::new(
+                    ConformanceProperty::StateIdempotence,
+                    vec![Bytes::from(vec![1u8])],
+                ),
+                PropertyOutcome::Violated(Violation {
+                    property: ConformanceProperty::StateIdempotence,
+                    severity: Severity::Violation,
+                    left: digest(),
+                    right: digest(),
+                    detail: "merge(A, A) != A".to_string(),
+                    settling: Some(IdempotenceSettling::NeverSettled),
+                }),
+            ),
+            (
+                ConformanceCase::new(
+                    ConformanceProperty::StateIdempotence,
+                    vec![Bytes::from(vec![2u8])],
+                ),
+                PropertyOutcome::Violated(Violation {
+                    property: ConformanceProperty::StateIdempotence,
+                    severity: Severity::Violation,
+                    left: digest(),
+                    right: digest(),
+                    detail: "merge(A, A) != A, settles".to_string(),
+                    // A SECOND finding with a DIFFERENT class. One fixture value can
+                    // always be satisfied by hardcoding that value: this test used
+                    // `SettledAfter` until a mutation hardcoded `SettledAfter`, and
+                    // switching to `NeverSettled` only moved which constant passed.
+                    // Two classes in one report mean no constant can.
+                    settling: Some(IdempotenceSettling::SettledAfter(1)),
+                }),
+            ),
+        ];
+        let report = Report::build(&Corpus::default(), &outcomes, None, Vec::new());
+        let json = serde_json::to_string(&report).expect("the report must serialize");
+
+        assert!(
+            json.contains("\"settling\""),
+            "the settling field never reached --json: {json}"
+        );
+        // `NeverSettled` deliberately, and asserting the OTHER variant is absent.
+        // Found by mutation: with a `SettledAfter` fixture, hardcoding the forwarded
+        // value to `SettledAfter(1)` passed — the test proved the field was present,
+        // not that it carried what the verifier decided. `NeverSettled` is also the
+        // classification an enforcement policy can act on, so silently substituting
+        // the benign one is the direction that matters.
+        assert!(
+            json.contains("NeverSettled"),
+            "--json must forward the classification the verifier made: {json}"
+        );
+        assert!(
+            json.contains("SettledAfter"),
+            "the second finding's class must be forwarded too — with a single \
+             class in the fixture, hardcoding that class passes: {json}"
         );
     }
 

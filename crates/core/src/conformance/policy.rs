@@ -110,6 +110,7 @@ mod tests {
             left: OutputDigest::of(b"left"),
             right: OutputDigest::of(b"right"),
             detail: "test".to_string(),
+            settling: None,
         })
     }
 
@@ -131,6 +132,7 @@ mod tests {
             left: OutputDigest::of(b"left"),
             right: OutputDigest::of(b"right"),
             detail: "claims to be enforceable".to_string(),
+            settling: None,
         });
 
         assert!(

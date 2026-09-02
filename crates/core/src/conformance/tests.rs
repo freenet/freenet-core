@@ -24,7 +24,8 @@ use super::evidence::{
 use super::generator::{Corpus, GeneratorConfig, generate_cases};
 use super::oracle::{ConformanceOracle, OracleError};
 use super::property::{
-    ConformanceProperty, Inconclusive, PremiseSource, PropertyOutcome, Severity,
+    ConformanceProperty, IdempotenceSettling, Inconclusive, OutputDigest, PremiseSource,
+    PropertyOutcome, Severity,
 };
 use super::verifier::{Bytes, ConformanceCase, verify_case};
 
@@ -174,7 +175,24 @@ fn case(property: ConformanceProperty, states: &[&[u8]]) -> ConformanceCase {
 #[track_caller]
 fn assert_violates(outcome: PropertyOutcome, property: ConformanceProperty) {
     match outcome {
-        PropertyOutcome::Violated(v) => assert_eq!(v.property, property, "wrong property flagged"),
+        PropertyOutcome::Violated(v) => {
+            assert_eq!(v.property, property, "wrong property flagged");
+            // Every property EXCEPT idempotence must carry no settling data.
+            //
+            // Asserted in the shared helper rather than per test: eight sites build
+            // a `Violation` by hand and each sets `settling: None` on its own, so a
+            // per-site test would cover one and leave the copy-paste hazard on the
+            // rest. A stray classification here reads to an enforcement policy as a
+            // judgement the verifier never made.
+            if property != ConformanceProperty::StateIdempotence {
+                assert!(
+                    v.settling.is_none(),
+                    "{property} carried settling data ({:?}); only state_idempotence \
+                     classifies settling",
+                    v.settling
+                );
+            }
+        }
         other @ (PropertyOutcome::Holds | PropertyOutcome::Inconclusive(_)) => {
             panic!("expected a {property} violation, got {other:?}")
         }
@@ -615,17 +633,23 @@ fn multi_round_convergence_is_not_a_cycle() {
     ));
 }
 
-/// A canonicalizing contract rewrites a non-canonical stored state once and then
-/// settles. That first change is real and is NOT a defect.
+/// A canonicalizing contract IS flagged, and is distinguishable from one that
+/// never settles.
 ///
-/// This is the shape the repo already documents on
-/// `executor_impl::probe_identical_input_idempotency`: the PUT install path stores
-/// the client's raw bytes without running `update_state`, so a peer can be holding a
-/// state its own contract has never normalized. A single-apply idempotence check
-/// flags every such contract, which is why that probe iterates to a fixpoint and why
-/// this one does too.
+/// This reverses the earlier behaviour deliberately (#5462). The old test asserted
+/// that a contract which rewrites a non-canonical stored state once and then
+/// settles is not flagged, on the reasoning that the first change is not the
+/// contract's fault: the PUT install path stores the client's raw bytes without
+/// running `update_state`, so a peer can hold a state its own contract has never
+/// normalized.
+///
+/// That reasoning is true and it does not license a pass. Two peers handed the same
+/// updates then hold different bytes until unrelated traffic happens to arrive, and
+/// their summaries differ, so anti-entropy fires over a difference carrying no
+/// information. Suppressing the finding bent the classification to soften an
+/// enforcement consequence; the distinction is kept as DATA instead.
 #[test]
-fn a_canonicalizing_contract_is_not_flagged() {
+fn a_canonicalizing_contract_is_flagged_and_says_it_settled() {
     // Sorts and dedups whatever it is given, then is stable forever after.
     let mut fake = Fake::conforming()
         .merging(|a, b| Ok(union(a, b)))
@@ -633,9 +657,459 @@ fn a_canonicalizing_contract_is_not_flagged() {
 
     // A raw, non-canonical stored state: unsorted with a duplicate.
     let raw: &[u8] = &[3, 1, 3, 2];
-    assert_holds(verify_case(
+    let outcome = verify_case(
         &mut fake,
         &case(ConformanceProperty::StateIdempotence, &[raw]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!("merge(A, A) != A must be reported, not suppressed: {outcome:?}");
+    };
+    assert_eq!(
+        v.severity,
+        Severity::Violation,
+        "the settling behaviour must not soften the severity: that is the severity \
+         fork the decision on #5462 rejected"
+    );
+    assert_eq!(
+        v.settling,
+        Some(IdempotenceSettling::SettledAfter(1)),
+        "a canonicalizing contract rewrites exactly once and then holds still; \
+         losing that distinction is what made this indistinguishable from a \
+         contract that never converges"
+    );
+
+    // The digests are not decoration. `reproduced_identically` uses exactly these
+    // two to decide whether an idempotence violation reproduced, and both halves
+    // of the fdev report publish them as the example. This PR CHANGED which state
+    // `left` carries — main reported the final non-settling state, this reports the
+    // first merge's output — and nothing asserted it until the testing lens
+    // mutated both and watched the suite pass.
+    assert_eq!(
+        v.left,
+        OutputDigest::of(&[1u8, 2, 3]),
+        "`left` must be the output of merge(A, A), the value that demonstrates the \
+         break"
+    );
+    assert_eq!(
+        v.right,
+        OutputDigest::of(raw),
+        "`right` must be the original state it was compared against"
+    );
+}
+
+/// The evidence schema version tracks `Violation`'s shape.
+///
+/// Added after mutation: reverting `EVIDENCE_SCHEMA_VERSION` to 1 passed the entire
+/// suite, even though `Violation` gained a field that travels inside
+/// `ConformanceEvidence.observed` and is written to disk by `fdev`. A stale version
+/// means a v2 writer and a v1 reader disagree about the bytes with nothing saying so.
+///
+/// A bare equality assertion on purpose: it is meant to FAIL the next time the
+/// struct changes, so the author has to decide whether the schema moves with it
+/// rather than discovering later that it did not.
+#[test]
+fn the_evidence_schema_version_moved_with_the_violation_shape() {
+    assert_eq!(
+        super::evidence::EVIDENCE_SCHEMA_VERSION,
+        2,
+        "`Violation` gained `settling` in #5462, so the schema had to move to 2. If \
+         you are changing that struct again, bump this deliberately rather than \
+         editing the assertion to match"
+    );
+}
+
+/// The budget is 3 merges, and a contract that would settle on the 4th is
+/// `NeverSettled`.
+///
+/// Added after mutation: widening the loop to `1..=MAX` (4 merges) passed the whole
+/// suite. The settling fixtures were budget-insensitive above the floor — the
+/// countdown from `[2]` pins the LOWER bound and the appending fake never settles at
+/// any budget — so nothing drew the boundary the property actually turns on.
+#[test]
+fn a_contract_that_would_settle_one_apply_late_is_never_settled() {
+    // [3] -> [2] -> [1] -> [0], so it needs FOUR merges to reach a fixpoint.
+    let mut fake = Fake::conforming()
+        .merging(|a, _b| {
+            let mut out = a.to_vec();
+            if let Some(first) = out.first_mut() {
+                *first = first.saturating_sub(1);
+            }
+            Ok(out)
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[3u8]]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!("still a violation regardless of where it settles: {outcome:?}");
+    };
+    assert_eq!(
+        v.settling,
+        Some(IdempotenceSettling::NeverSettled),
+        "settling beyond the budget is NOT observed settling: within the 3 merges \
+         this check spends, the state changed every time"
+    );
+}
+
+/// The classification loop merges a state with ITSELF, not with the original.
+///
+/// Added after mutation: `merge(&current, &current)` -> `merge(&current, a)` passed
+/// the whole suite, because every settling fixture either ignored its second operand
+/// or was a union where the two are equal for the states used. The loop could have
+/// been iterating a different function entirely.
+#[test]
+fn the_classification_loop_re_merges_the_state_with_itself() {
+    // Reads BOTH operands: a self-merge canonicalizes and settles, while merging
+    // against anything else concatenates and grows without end.
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            if a == b {
+                Ok(union(a, a))
+            } else {
+                Ok(a.iter().chain(b.iter()).copied().collect())
+            }
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    let raw: &[u8] = &[3, 1, 3, 2];
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[raw]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!("a canonicalizing contract is still reported: {outcome:?}");
+    };
+    assert_eq!(
+        v.settling,
+        Some(IdempotenceSettling::SettledAfter(1)),
+        "re-merging the rewritten state with ITSELF settles at once; merging it \
+         against the original would grow forever and report NeverSettled"
+    );
+}
+
+/// `settling` is `None` for every property that is not `state_idempotence`.
+///
+/// Added after mutation: making the generic `violation()` constructor stamp
+/// `Some(NeverSettled)` onto every property passed the whole suite, even though the
+/// field's own rustdoc promises `None` for all of them. A stray value here would be
+/// read by an enforcement policy as a classification the verifier never made.
+#[test]
+fn other_properties_carry_no_settling_data() {
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            // Order-dependent: breaks commutativity without touching idempotence.
+            let mut out = a.to_vec();
+            out.extend_from_slice(b);
+            Ok(out)
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateCommutativity, &[&[1u8], &[2u8]]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!("the fixture must break commutativity for this to test anything: {outcome:?}");
+    };
+    assert_eq!(v.property, ConformanceProperty::StateCommutativity);
+    assert_eq!(
+        v.settling, None,
+        "only state_idempotence classifies settling; a value here is a \
+         classification the verifier never made"
+    );
+}
+
+/// The rewrite count is the real number of rewrites, not a constant.
+///
+/// Added after mutation testing: changing `rewrites += 1` to `rewrites += 0`
+/// survived every other test here, because they all use contracts that stabilise
+/// after exactly one rewrite — where a stuck counter and a correct one are
+/// indistinguishable. A contract needing two rewrites separates them.
+///
+/// The count matters because it is the part an enforcement policy would threshold
+/// on: "normalises once at install" and "keeps churning for several rounds" are
+/// different claims about a contract, and both are `SettledAfter`.
+#[test]
+fn the_settled_after_count_reports_the_actual_number_of_rewrites() {
+    // Counts down to zero, one step per merge, then holds still.
+    let mut fake = Fake::conforming()
+        .merging(|a, _b| {
+            let mut out = a.to_vec();
+            if let Some(first) = out.first_mut() {
+                *first = first.saturating_sub(1);
+            }
+            Ok(out)
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    // [2] -> [1] -> [0] -> [0]: two rewrites before it settles.
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[2u8]]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!("a state that is rewritten twice must still be reported: {outcome:?}");
+    };
+    assert_eq!(
+        v.settling,
+        Some(IdempotenceSettling::SettledAfter(2)),
+        "the count must be the number of rewrites actually observed"
+    );
+    // `left` must be the FIRST merge's output, not the state the classification
+    // loop walked to. The canonicalizing test cannot see the difference — it
+    // settles after one rewrite, so the two are the same value there — which is
+    // why reporting `current` instead of `once` survived until this fixture, where
+    // they differ ([2] -> once [1] -> current [0]).
+    assert_eq!(
+        v.left,
+        OutputDigest::of(&[1u8]),
+        "`left` is the output of merge(A, A), the value that demonstrates the \
+         break, not wherever the classification loop happened to stop"
+    );
+}
+
+/// A contract that mutates on every re-apply is flagged the same way, and is
+/// distinguished by its settling data rather than by its severity.
+///
+/// The counterpart to the test above, and the reason the distinction is worth
+/// carrying: these two are operationally very different — one is waiting on the
+/// install-path fix, the other is unambiguously non-convergent — and before #5462
+/// the verifier reported them identically (both `Holds` if they settled within the
+/// budget, both a bare violation otherwise).
+#[test]
+fn a_never_settling_contract_is_flagged_as_never_settling() {
+    // Appends a byte every time it is merged, so it never reaches a fixpoint.
+    let mut fake = Fake::conforming()
+        .merging(|a, _b| {
+            let mut out = a.to_vec();
+            out.push(0);
+            Ok(out)
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[1u8]]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!("a state that mutates on every re-apply must be reported: {outcome:?}");
+    };
+    assert_eq!(v.severity, Severity::Violation);
+    assert_eq!(
+        v.settling,
+        Some(IdempotenceSettling::NeverSettled),
+        "never reaching a fixpoint must be recorded as such, since it is the case \
+         an enforcement policy can act on without waiting for the install path"
+    );
+}
+
+/// A classification that flaps between runs keeps the violation and reports
+/// `Indeterminate`.
+///
+/// The violation itself DID reproduce: same inputs, same outputs, both runs.
+/// Only the settling class differed, and that class is data about the finding
+/// rather than the finding. Discarding the violation because the data was
+/// unstable would throw away a reproduced defect — the exact failure this
+/// change exists to remove.
+///
+/// This test used to assert the opposite, and that is worth recording. It
+/// checked only `!matches!(outcome, Violated(_))`, which was satisfied equally
+/// by "named under `UpdateDeterminism`" and by "dropped on the floor", so it
+/// could not tell the intended behaviour from the bug — and its doc claimed an
+/// escalation that cannot fire here at all, since `escalate_to_determinism`
+/// needs two states and an idempotence case carries one.
+///
+/// The deeper point, which two reviewers reached independently: an ERRORING
+/// classification and a FLAPPING one are the same epistemic situation. Handling
+/// them in opposite directions in one file was the defect.
+#[test]
+fn a_flapping_classification_keeps_the_violation_as_indeterminate() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let b_merges = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&b_merges);
+
+    // `merge(A, A)` is stable across runs, so the DIGESTS reproduce. Re-applying
+    // the rewritten state settles the first time it is asked and not the second,
+    // so only the CLASSIFICATION differs between the two runs.
+    let mut fake = Fake::conforming()
+        .merging(move |a, _b| {
+            if a == [1u8] {
+                return Ok(vec![1, 9]);
+            }
+            if a == [1u8, 9] {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Ok(vec![1, 9]);
+                }
+                return Ok(vec![1, 9, 9]);
+            }
+            Ok(a.to_vec())
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[1u8]]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!(
+            "the violation reproduced — same inputs, same outputs, twice — and \
+                 must not be discarded because its classification was unstable: \
+                 {outcome:?}"
+        );
+    };
+    assert_eq!(v.severity, Severity::Violation);
+    assert_eq!(
+        v.settling,
+        Some(IdempotenceSettling::Indeterminate),
+        "a class observed differently on each run is unknown, not whichever \
+             the second run happened to produce"
+    );
+}
+
+/// A contract that fails DURING classification still gets its violation reported.
+///
+/// The classification merges must not `?` their error out of the check: the
+/// violation was already established by the merge that succeeded, and propagating
+/// would turn a contract we caught into "we could not tell". The never-settling
+/// class grows its state on every apply, so it is the likeliest to hit a fuel or
+/// size ceiling on exactly these follow-up merges — the class an enforcement
+/// policy can act on would be the one that vanished. A contract could arrange
+/// that deliberately by trapping on the second identical merge.
+#[test]
+fn a_contract_that_errors_during_classification_still_reports_the_violation() {
+    // The first merge succeeds and changes the state; re-applying the CHANGED
+    // state traps. Keyed on the INPUT rather than a call counter deliberately:
+    // `verify_case` re-runs the whole check to test reproducibility, so a counter
+    // makes the re-run's first merge fail too, and the test then proves nothing
+    // about the classification path it exists for.
+    let mut fake = Fake::conforming()
+        .merging(|a, _b| {
+            if a == [1u8] {
+                Ok(vec![1, 9])
+            } else {
+                Err(OracleError::contract("trapped on re-apply"))
+            }
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[1u8]]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!(
+            "the violation was established by the first merge and must survive a \
+             failure in the follow-ups that only classify it: {outcome:?}"
+        );
+    };
+    assert_eq!(v.severity, Severity::Violation);
+    assert_eq!(
+        v.settling,
+        Some(IdempotenceSettling::Indeterminate),
+        "an unknown classification must say so, not borrow NeverSettled's harsher \
+         label without evidence"
+    );
+}
+
+/// A merge that only PERMUTES bytes is named as an encoding problem here too.
+///
+/// Every `compare`-based property routes through `is_reordering` and says so,
+/// because the two cases call for opposite fixes: make the encoding canonical
+/// versus fix the merge. Idempotence bypassed `compare`, so without this it told a
+/// byte-permuting contract to go and look at the PUT install path — confidently,
+/// and wrongly. `a_merge_that_only_reorders_bytes_is_named_as_an_encoding_problem`
+/// is the equivalent guard on the commutativity path.
+#[test]
+fn an_idempotence_reordering_is_named_as_an_encoding_problem() {
+    // Reverses on the first apply, then holds still.
+    let mut fake = Fake::conforming()
+        .merging(|a, _b| {
+            let mut out = a.to_vec();
+            if !out.windows(2).all(|w| w[0] >= w[1]) {
+                out.reverse();
+            }
+            Ok(out)
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[1u8, 2, 3]]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!("a permuting merge still breaks idempotence and must be reported: {outcome:?}");
+    };
+    assert!(
+        v.detail.contains("ENCODING is not canonical"),
+        "a reordering must be named as an encoding problem, or the author is sent \
+         to the install path when the fix is a deterministic encoding: {}",
+        v.detail
+    );
+}
+
+/// The encoding note is ABSENT when the rewrite genuinely changed content.
+///
+/// Added after mutation: appending the note unconditionally survived, because the
+/// only test asserted it IS present when it should be. A note saying "the merge
+/// agreed on content, only the byte order differs", attached to a merge that
+/// changed content, sends the author to the encoding when the defect is in the
+/// merge — the same misdirection the note exists to prevent, pointed the other way.
+#[test]
+fn the_encoding_note_is_absent_when_content_actually_changed() {
+    // Adds a byte the original does not contain, so the two are not permutations.
+    let mut fake = Fake::conforming()
+        .merging(|a, _b| {
+            let mut out = a.to_vec();
+            if !out.contains(&9) {
+                out.push(9);
+            }
+            Ok(out)
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[1u8, 2, 3]]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!("still a violation: {outcome:?}");
+    };
+    assert!(
+        !v.detail.contains("ENCODING is not canonical"),
+        "the merge changed CONTENT, not just byte order; claiming otherwise sends \
+         the author to the encoding when the defect is in the merge: {}",
+        v.detail
+    );
+}
+
+/// An idempotent contract still passes, with no finding at all.
+///
+/// The floor under both tests above: if removing the fixpoint gate had made
+/// `StateIdempotence` report on everything, they would both still pass while the
+/// property became worthless.
+#[test]
+fn an_idempotent_contract_still_holds() {
+    let mut fake = Fake::conforming()
+        .merging(|a, b| Ok(union(a, b)))
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    // Already canonical: sorted, no duplicates, so merge(A, A) == A on the first try.
+    let canonical: &[u8] = &[1, 2, 3];
+    assert_holds(verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[canonical]),
     ));
 }
 
