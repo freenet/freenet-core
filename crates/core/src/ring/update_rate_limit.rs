@@ -282,6 +282,41 @@ pub(crate) const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 ///   a saturated uplink folds updates instead of accumulating them;
 /// - the contract ban list still applies ahead of this gate.
 ///
+/// # Message zero, and why the wider class is safe to hand out on it
+///
+/// The class is chosen from the wire opcode, which the SENDER picks, so a peer
+/// is on this budget from its FIRST message — there is no reputation to earn.
+/// The uniform-across-opcodes rule above stops a flooder gaining anything by
+/// SWITCHING opcode; it does not stop it simply choosing `BroadcastTo`. So what
+/// bounds the first message is what an unsolicited broadcast actually costs,
+/// traced rather than assumed:
+///
+/// - **The sender must already be a connected, authenticated peer.** The
+///   dispatch has no `source_addr` otherwise, and
+///   `op_ctx_task::seed_sender_summary_from_broadcast` (`op_ctx_task.rs:1995`,
+///   the driver's first step) returns immediately when
+///   `get_peer_by_addr` finds no connection. This is the load-bearing bound:
+///   the budget is per `(sender, contract)`, and a sender is a live connection
+///   against `max_connections`, not an arbitrary address.
+/// - **For a contract this node does not host and nothing depends on, no GET is
+///   spawned.** The full-state error arm reaches `try_auto_fetch_contract`,
+///   which returns early on `!contract_in_use` (`operations/update.rs:245`;
+///   `contract_in_use` is a live local client subscription or a downstream
+///   subscriber, `ring/hosting.rs:1725`). So an unsolicited broadcast for a
+///   stranger contract cannot make this node fetch it.
+/// - **The contract's WASM does not execute for a contract we lack.** The merge
+///   fails as missing-contract, which `is_contract_exec_rejection` explicitly
+///   excludes — that is why the arm above can tell "code missing" from "the
+///   contract rejected it".
+///
+/// What it DOES cost, stated plainly rather than glossed: for a contract this
+/// node **does** host, every accepted broadcast is a real WASM merge, and this
+/// constant raises the per-`(sender, contract)` ceiling on that from ~10/s to
+/// ~50/s. The dedup cache (`broadcast_dedup_cache`, step 3 of the driver) only
+/// helps against a REPEATED payload; a sender varying the bytes pays the merge
+/// every time. That 5x is the actual price of this change, and the
+/// compensating bounds are the ones listed above plus those below.
+///
 /// Do NOT set this to zero. An unbounded broadcast class re-opens the
 /// May 21 flood shape on the one message type that fans out.
 pub(crate) const MIN_BROADCAST_INTERVAL: Duration = Duration::from_millis(20);
@@ -335,6 +370,24 @@ pub(crate) struct PairStamps {
     /// expiring an entry whose OTHER class is actively in use would reset
     /// that class's window and hand a flooder a free message.
     latest: Instant,
+}
+
+impl UpdateClass {
+    /// Stable index for per-class arrays (the rejection-log throttles).
+    fn index(self) -> usize {
+        match self {
+            UpdateClass::Request => 0,
+            UpdateClass::Broadcast => 1,
+        }
+    }
+
+    /// Stable telemetry label.
+    fn as_str(self) -> &'static str {
+        match self {
+            UpdateClass::Request => "request",
+            UpdateClass::Broadcast => "broadcast",
+        }
+    }
 }
 
 impl PairStamps {
@@ -740,8 +793,13 @@ pub(crate) struct UpdateRateLimiter {
     /// [`NEW_PAIR_LOG_INTERVAL`] throttling.
     last_new_pair_log: Mutex<Option<Instant>>,
     /// When the last per-pair rejection log line was written, for
-    /// [`REJECTED_LOG_INTERVAL`] throttling.
-    last_rejected_log: Mutex<Option<Instant>>,
+    /// [`REJECTED_LOG_INTERVAL`] throttling — one slot PER [`UpdateClass`].
+    ///
+    /// Per class rather than one shared slot because the two classes are now
+    /// the diagnosis: a shared slot lets a busy broadcast pair suppress the
+    /// line that would have told the operator a client's routed writes are
+    /// being refused, which is the more alarming of the two and the rarer.
+    last_rejected_log: [Mutex<Option<Instant>>; 2],
 }
 
 impl UpdateRateLimiter {
@@ -822,7 +880,7 @@ impl UpdateRateLimiter {
             new_pair_budget_rejected_total: AtomicU64::new(0),
             new_pair_budget_untracked_total: AtomicU64::new(0),
             last_new_pair_log: Mutex::new(None),
-            last_rejected_log: Mutex::new(None),
+            last_rejected_log: [Mutex::new(None), Mutex::new(None)],
             last_accepted: DashMap::new(),
             size: AtomicUsize::new(0),
             min_interval,
@@ -920,7 +978,7 @@ impl UpdateRateLimiter {
                         // means every OTHER lock is taken with no shard guard
                         // held.
                         drop(entry);
-                        self.log_rejected(now, sender, contract);
+                        self.log_rejected(now, sender, contract, class);
                         return RateLimitDecision::Rejected {
                             elapsed,
                             min_interval,
@@ -1246,21 +1304,34 @@ impl UpdateRateLimiter {
     ///
     /// Throttled for the same reason the other two signals are: a pair over
     /// the interval is over it on every message.
-    fn log_rejected(&self, now: Instant, sender: SocketAddr, contract: ContractInstanceId) {
-        if !log_due(&self.last_rejected_log, now, REJECTED_LOG_INTERVAL) {
+    fn log_rejected(
+        &self,
+        now: Instant,
+        sender: SocketAddr,
+        contract: ContractInstanceId,
+        class: UpdateClass,
+    ) {
+        if !log_due(
+            &self.last_rejected_log[class.index()],
+            now,
+            REJECTED_LOG_INTERVAL,
+        ) {
             return;
         }
         tracing::info!(
             %sender,
             %contract,
+            class = class.as_str(),
             rejected_total = self.rejected_total.load(Ordering::Relaxed),
-            min_interval_ms = self.min_interval.as_millis() as u64,
+            min_interval_ms = self.interval_for(class).as_millis() as u64,
             "UPDATE rate limiter: dropping UPDATEs from a (sender, contract) pair \
-             that is exceeding the minimum inter-update interval. A dropped \
-             BROADCAST is repaired by a throttled ResyncRequest (#5510); a \
-             dropped request is retried by its originator. Sustained counts here \
-             mean co-host fan-out for this contract is outrunning the per-pair \
-             budget. Throttled to one line per minute."
+             that is exceeding its class's minimum inter-update interval. \
+             class=broadcast means co-host fan-out for this contract is \
+             outrunning the per-pair budget, and each dropped broadcast is \
+             repaired by a throttled ResyncRequest (#5510). class=request means \
+             a peer's ROUTED CLIENT WRITES are being refused, which is the \
+             rarer and more alarming of the two; its originator observes the \
+             failure and retries. Throttled to one line per minute PER CLASS."
         );
     }
 
@@ -3287,7 +3358,7 @@ mod tests {
         // permanently and a production node had nothing to grep.
         let rejected_fn = strip_ws(fn_body(
             this_file_raw,
-            "fn log_rejected(&self, now: Instant, sender: SocketAddr, contract: ContractInstanceId) {",
+            "    fn log_rejected(",
             "per-pair-rejection",
         ));
         assert_eq!(
