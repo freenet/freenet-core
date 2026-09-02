@@ -1354,7 +1354,7 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
                 // early to find nothing or waking late and holding the slot past
                 // the window.
                 let retry_deadline = deadline;
-                spawn_resync_followups(
+                if !spawn_resync_followups(
                     op_manager,
                     key,
                     sender_addr,
@@ -1362,13 +1362,33 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
                     FollowupStart::OwedOnly {
                         retry_at: retry_deadline,
                     },
-                );
+                ) {
+                    // No slot, so no chain will ever serve the debt just
+                    // recorded — and the window is held with the flag set
+                    // (#5510 N4). Left alone, every drop for the next 30s is
+                    // WindowHeld and emits nothing, and the first drop after the
+                    // window clears the flag on its way past, so the repair is
+                    // stranded for a full window and then forgotten.
+                    //
+                    // Release the reservation so a later drop inside this same
+                    // window can take a fresh one and win a refilled emit token.
+                    // This is the ONE branch where cancelling is right: nothing
+                    // was emitted, so releasing cannot produce a second request
+                    // for one window, and no chain exists to be confused by it.
+                    op_manager
+                        .interest_manager
+                        .cancel_resync_request(&key, sender_addr);
+                }
                 return;
             }
         };
     // Spawn BEFORE the blocking dispatch below; the order matters and is
     // see `spawn_resync_followups` (#4862 P2).
-    spawn_resync_followups(
+    // Deliberately ignored here, unlike the owing path above. A request WAS
+    // emitted for this reservation, so the window must stay held whether or not
+    // a chain got a slot — releasing it would let a second request go out inside
+    // one window, which is the #4251 bound.
+    let _spawned = spawn_resync_followups(
         op_manager,
         key,
         sender_addr,
@@ -1395,9 +1415,13 @@ enum FollowupStart {
     Reserved {
         /// The granted reservation's close, on the throttle's own clock.
         deadline: Instant,
-        /// Whether the correlation record was taken (#4864 round-8). Drives the
-        /// re-delivery's #4863 "did the first request already land" gate.
-        correlated: bool,
+        /// The correlation record's GENERATION (#4864 round-8, #5510 N7), or
+        /// `None` when the strict cap refused it. Drives the re-delivery's
+        /// #4863 "did the first request already land" gate, and the chain's X2
+        /// "was mine answered" check — which asks about THIS generation, not
+        /// about the pair, so a late response to an earlier window cannot be
+        /// mistaken for an answer to this one.
+        correlated: Option<u64>,
     },
     /// The caller was refused by the global emit cap, so nothing was emitted
     /// and nothing is authorized. The chain owes a repair from the outset: it
@@ -1448,7 +1472,7 @@ async fn reserve_resync_emit(
     incoming_tx: Transaction,
     reason: DroppedBroadcastReason,
     note_debt: bool,
-) -> Result<(Instant, bool), ReserveRefusal> {
+) -> Result<(Instant, Option<u64>), ReserveRefusal> {
     // Gate 1 — per-(contract, sender)/30s throttle (#4857/#4862 + #4864 round-6).
     // RESERVE the window atomically (`begin` checks AND records under the
     // throttle's own lock) and return the reservation deadline on the throttle's
@@ -1578,12 +1602,12 @@ async fn reserve_resync_emit(
     // full. A re-dispatch still heals when uncorrelated — the responder clears
     // its cached summary on the ResyncRequest itself (#4857), independently of
     // our correlation record; only the full-state ResyncResponse needs it.
-    let correlated = op_manager
+    let generation = op_manager
         .ring
         .outstanding_resync_requests
-        .record(*key.id(), sender_addr);
+        .record_generation(*key.id(), sender_addr);
 
-    Ok((reservation_deadline, correlated))
+    Ok((reservation_deadline, generation))
 }
 
 /// Spawn the follow-up task that owns everything this reservation still has to
@@ -1731,7 +1755,7 @@ fn spawn_resync_followups(
     sender_addr: SocketAddr,
     incoming_tx: Transaction,
     start: FollowupStart,
-) {
+) -> bool {
     // ONE pool, because X1 removed the reason for two. An earlier round gave
     // owing chains their own smaller pool, on the grounds that a contract with
     // N dropping senders could spawn N of them per window and starve the #4862
@@ -1765,7 +1789,7 @@ fn spawn_resync_followups(
                  (#4862 P1/#5510)"
             );
         }
-        return;
+        return false;
     };
 
     let op_mgr = op_manager.clone();
@@ -1776,7 +1800,7 @@ fn spawn_resync_followups(
                 deadline,
                 correlated,
             } => (deadline, correlated),
-            FollowupStart::OwedOnly { retry_at } => (retry_at, false),
+            FollowupStart::OwedOnly { retry_at } => (retry_at, None),
         };
         // The caller dispatches ITS window's request itself, concurrently with
         // this spawn (#4862 P2), so the first pass only re-delivers.
@@ -1931,11 +1955,19 @@ fn spawn_resync_followups(
                 // served window retries after the responder's window has passed.
                 // Bounded exactly as before by `windows_served` and `attempts`,
                 // so this cannot become a spin.
-                let unanswered = correlated
-                    && op_mgr
+                // OUR generation, not the pair's (#5510 N7). A response carries
+                // no request id, so `is_outstanding` for the pair can be
+                // answered `false` by a LATE reply to a previous window's
+                // request — generated before the drop being repaired, arriving
+                // after this request was recorded. The chain would then exit as
+                // though its own request had landed, and if that request was
+                // responder-throttled or lost the update waits for anti-entropy.
+                let unanswered = correlated.is_some_and(|generation| {
+                    op_mgr
                         .ring
                         .outstanding_resync_requests
-                        .is_outstanding(*key.id(), sender_addr);
+                        .is_generation_outstanding(*key.id(), sender_addr, generation)
+                });
                 if !unanswered {
                     return;
                 }
@@ -2126,6 +2158,7 @@ fn spawn_resync_followups(
             }
         }
     });
+    true
 }
 
 /// Wait out the rest of a reservation window (#5510).
@@ -2323,7 +2356,7 @@ async fn resend_dropped_broadcast_resync_request(
     sender_addr: SocketAddr,
     incoming_tx: Transaction,
     reservation_deadline: Instant,
-    correlated: bool,
+    correlated: Option<u64>,
 ) {
     // Tokio-clock liveness backstop (DST safety). The injected `reservation_deadline`
     // below is the PRIMARY stop, but if the injected clock is a DECOUPLED
@@ -2427,12 +2460,15 @@ async fn resend_dropped_broadcast_resync_request(
         // case this cannot cover is a request that landed but whose response is
         // still in flight — bounded by the same `1 + MAX` cap as before, never
         // worse than the blind retry it replaces.
-        if correlated
-            && !op_manager
+        // Asks about THIS request's generation, not the pair's (#5510 N7): a
+        // late response to a previous window's request would otherwise read as
+        // "ours landed" and cancel a re-delivery that was still needed.
+        if correlated.is_some_and(|generation| {
+            !op_manager
                 .ring
                 .outstanding_resync_requests
-                .is_outstanding(*key.id(), sender_addr)
-        {
+                .is_generation_outstanding(*key.id(), sender_addr, generation)
+        }) {
             // info!, not debug!: `release_max_level_info` compiles debug out of
             // release builds, and this is the ONLY field-visible signal of the
             // gate's decision. Both the benefit (fewer redundant full-state
@@ -4762,6 +4798,21 @@ mod tests {
                 "\nstatic ",
                 "\npub(crate) const ",
                 "\npub(crate) static ",
+                // Type and impl openers too (review round 3, N5). Measured
+                // overruns before this: the `send_dropped_broadcast_resync_request`
+                // slice ran 1325-1428 for a fn ending at 1381, and
+                // `reserve_resync_emit` ran 1444-1647 for one ending at 1587 —
+                // straight through the enum and impl blocks between them, so a
+                // pin could be satisfied by an identifier appearing in a type's
+                // doc comment rather than in the function under test.
+                "\nenum ",
+                "\nstruct ",
+                "\nimpl ",
+                "\n#[derive",
+                "\npub enum ",
+                "\npub struct ",
+                "\npub(crate) enum ",
+                "\npub(crate) struct ",
             ]
             .iter()
             .filter_map(|kw| after.find(kw))
@@ -5469,6 +5520,15 @@ mod tests {
             "\nstatic ",
             "\npub(crate) const ",
             "\npub(crate) static ",
+            // Type and impl openers too (review round 3, N5).
+            "\nenum ",
+            "\nstruct ",
+            "\nimpl ",
+            "\n#[derive",
+            "\npub enum ",
+            "\npub struct ",
+            "\npub(crate) enum ",
+            "\npub(crate) struct ",
         ]
         .iter()
         .filter_map(|kw| rest.find(kw))
@@ -5673,6 +5733,157 @@ mod tests {
             op_manager.interest_manager.outstanding_resync_retries(),
             0,
             "and the chain must exit rather than keep re-reading Unknown"
+        );
+    }
+
+    /// #5510 review round 3 (N4): at the node-wide slot cap, the owing path
+    /// RELEASES its reservation instead of holding a window nothing will serve.
+    ///
+    /// The cap-refused path notes the debt and keeps the window before it knows
+    /// whether a chain can be spawned. If no slot is free, the pair is left
+    /// holding a 30s window with the flag set and nothing watching it: every
+    /// drop inside that window is `WindowHeld` and emits nothing, and the first
+    /// drop after it clears the flag on its way past. The repair is stranded for
+    /// a window and then forgotten.
+    ///
+    /// Releasing lets a later drop inside the same window take a fresh
+    /// reservation and win a refilled token. Nothing was emitted, so releasing
+    /// cannot produce two requests for one window.
+    #[tokio::test(start_paused = true)]
+    async fn at_the_slot_cap_the_owing_path_releases_its_window() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("slot-cap-release-5510").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([97u8; 32]),
+            CodeHash::new([98u8; 32]),
+        );
+        let _held = hold_contracts(&op_manager, &[key]).await;
+        let target: SocketAddr = "127.0.0.1:14300".parse().unwrap();
+
+        // Hold every node-wide slot so no chain can be spawned.
+        let mut slots = Vec::new();
+        while let Some(slot) = op_manager.interest_manager.try_reserve_resync_retry_slot() {
+            slots.push(slot);
+        }
+        assert!(!slots.is_empty(), "precondition: slots must be reservable");
+
+        // Empty the emit bucket so the first drop takes the cap-refused path.
+        while op_manager
+            .ring
+            .resync_emit_limiter
+            .check_and_record(*key.id())
+        {}
+        send_dropped_broadcast_resync_request(
+            &op_manager,
+            key,
+            target,
+            Transaction::new::<UpdateMsg>(),
+            DroppedBroadcastReason::RateLimited,
+        )
+        .await;
+        assert!(
+            drain_resync_targets(&mut notification_rx, key).is_empty(),
+            "the cap refused, so nothing may be emitted"
+        );
+
+        // Probe the throttle directly, still INSIDE what would have been the
+        // first reservation's 30s window. This is the assertion that matters and
+        // it has to be made here: waiting for the window to expire would let a
+        // held reservation pass, since it would have lapsed on its own.
+        //
+        // A token cannot be made available inside the window either (the bucket
+        // refills once per 60s), so "can a later drop emit" is not directly
+        // observable. Whether the WINDOW is free is, and that is precisely what
+        // N4 is about.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            op_manager
+                .interest_manager
+                .begin_resync_request(&key, target)
+                .is_some(),
+            "the reservation must have been RELEASED when no slot was available \
+             to spawn a chain: held, it would swallow every drop for the rest of \
+             the window while nothing anywhere was watching the flag, and the \
+             first drop after the window would clear it (#5510 N4)"
+        );
+
+        drop(slots);
+    }
+
+    /// #5510 review round 3 (N6): a chain retry refused by the global cap does
+    /// not inflate the suppression counter; an immediate refusal does.
+    ///
+    /// The counter answers "how many repairs did the cap suppress", one per drop
+    /// that wanted one. Counting a chain's retries would make it drift with
+    /// chain length rather than with the thing an operator is asking about, and
+    /// it would drift upward exactly when the cap is busiest.
+    #[tokio::test(start_paused = true)]
+    async fn the_suppression_metric_counts_drops_not_chain_retries() {
+        let (op_manager, _notification_rx, _guard) =
+            build_queue_full_test_node("suppression-metric-5510").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([99u8; 32]),
+            CodeHash::new([100u8; 32]),
+        );
+        let _held = hold_contracts(&op_manager, &[key]).await;
+        let target: SocketAddr = "127.0.0.1:14400".parse().unwrap();
+
+        while op_manager
+            .ring
+            .resync_emit_limiter
+            .check_and_record(*key.id())
+        {}
+
+        let before = crate::config::GlobalTestMetrics::resync_requests_suppressed();
+        send_dropped_broadcast_resync_request(
+            &op_manager,
+            key,
+            target,
+            Transaction::new::<UpdateMsg>(),
+            DroppedBroadcastReason::RateLimited,
+        )
+        .await;
+        let after_immediate = crate::config::GlobalTestMetrics::resync_requests_suppressed();
+        assert_eq!(
+            after_immediate,
+            before + 1,
+            "an IMMEDIATE repair refused by the cap is one suppressed repair and \
+             must be counted"
+        );
+
+        // Past the window, so gate 1 grants and the retry actually REACHES the
+        // cap. Without this the call is refused by the throttle first and never
+        // touches the counter, and the test passes whatever the guard does — it
+        // did, until the mutation showed it.
+        tokio::time::advance(RESYNC_REQUEST_MIN_INTERVAL + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !op_manager
+                .ring
+                .resync_emit_limiter
+                .check_and_record(*key.id()),
+            "precondition: the emit bucket must still be empty, or the retry is \
+             granted instead of refused and the guard is never consulted"
+        );
+
+        // The chain's own retry carries DroppedDuringThrottleWindow, and must
+        // not count again: one swallowed drop retried is still one suppressed
+        // repair.
+        send_dropped_broadcast_resync_request(
+            &op_manager,
+            key,
+            target,
+            Transaction::new::<UpdateMsg>(),
+            DroppedBroadcastReason::DroppedDuringThrottleWindow,
+        )
+        .await;
+        assert_eq!(
+            crate::config::GlobalTestMetrics::resync_requests_suppressed(),
+            after_immediate,
+            "a CHAIN RETRY refused by the cap must not increment the counter: \
+             one swallowed drop retried three times is one suppressed repair, \
+             not three"
         );
     }
 
@@ -6157,6 +6368,15 @@ mod tests {
             "\nstatic ",
             "\npub(crate) const ",
             "\npub(crate) static ",
+            // Type and impl openers too (review round 3, N5).
+            "\nenum ",
+            "\nstruct ",
+            "\nimpl ",
+            "\n#[derive",
+            "\npub enum ",
+            "\npub struct ",
+            "\npub(crate) enum ",
+            "\npub(crate) struct ",
         ]
         .iter()
         .filter_map(|kw| rest.find(kw))
@@ -7381,6 +7601,21 @@ mod tests {
                 "\nstatic ",
                 "\npub(crate) const ",
                 "\npub(crate) static ",
+                // Type and impl openers too (review round 3, N5). Measured
+                // overruns before this: the `send_dropped_broadcast_resync_request`
+                // slice ran 1325-1428 for a fn ending at 1381, and
+                // `reserve_resync_emit` ran 1444-1647 for one ending at 1587 —
+                // straight through the enum and impl blocks between them, so a
+                // pin could be satisfied by an identifier appearing in a type's
+                // doc comment rather than in the function under test.
+                "\nenum ",
+                "\nstruct ",
+                "\nimpl ",
+                "\n#[derive",
+                "\npub enum ",
+                "\npub struct ",
+                "\npub(crate) enum ",
+                "\npub(crate) struct ",
             ]
             .iter()
             .filter_map(|kw| prod[..pos].rfind(kw))
@@ -7443,6 +7678,21 @@ mod tests {
                 "\nstatic ",
                 "\npub(crate) const ",
                 "\npub(crate) static ",
+                // Type and impl openers too (review round 3, N5). Measured
+                // overruns before this: the `send_dropped_broadcast_resync_request`
+                // slice ran 1325-1428 for a fn ending at 1381, and
+                // `reserve_resync_emit` ran 1444-1647 for one ending at 1587 —
+                // straight through the enum and impl blocks between them, so a
+                // pin could be satisfied by an identifier appearing in a type's
+                // doc comment rather than in the function under test.
+                "\nenum ",
+                "\nstruct ",
+                "\nimpl ",
+                "\n#[derive",
+                "\npub enum ",
+                "\npub struct ",
+                "\npub(crate) enum ",
+                "\npub(crate) struct ",
             ]
             .iter()
             .filter_map(|kw| rest.find(kw))
@@ -7514,6 +7764,21 @@ mod tests {
                 "\nstatic ",
                 "\npub(crate) const ",
                 "\npub(crate) static ",
+                // Type and impl openers too (review round 3, N5). Measured
+                // overruns before this: the `send_dropped_broadcast_resync_request`
+                // slice ran 1325-1428 for a fn ending at 1381, and
+                // `reserve_resync_emit` ran 1444-1647 for one ending at 1587 —
+                // straight through the enum and impl blocks between them, so a
+                // pin could be satisfied by an identifier appearing in a type's
+                // doc comment rather than in the function under test.
+                "\nenum ",
+                "\nstruct ",
+                "\nimpl ",
+                "\n#[derive",
+                "\npub enum ",
+                "\npub struct ",
+                "\npub(crate) enum ",
+                "\npub(crate) struct ",
             ]
             .iter()
             .filter_map(|kw| prod[..pos].rfind(kw))
@@ -8506,7 +8771,9 @@ mod tests {
                 sender_addr,
                 Transaction::new::<UpdateMsg>(),
                 reservation_deadline,
-                true,
+                // A correlated request, generation 0 — these tests drive the
+                // retry directly rather than through `reserve_resync_emit`.
+                Some(0),
             )
             .await;
         });
@@ -8640,7 +8907,9 @@ mod tests {
                 sender_addr,
                 Transaction::new::<UpdateMsg>(),
                 reservation_deadline,
-                true,
+                // A correlated request, generation 0 — these tests drive the
+                // retry directly rather than through `reserve_resync_emit`.
+                Some(0),
             )
             .await;
         });
@@ -8711,6 +8980,21 @@ mod tests {
                 "\nstatic ",
                 "\npub(crate) const ",
                 "\npub(crate) static ",
+                // Type and impl openers too (review round 3, N5). Measured
+                // overruns before this: the `send_dropped_broadcast_resync_request`
+                // slice ran 1325-1428 for a fn ending at 1381, and
+                // `reserve_resync_emit` ran 1444-1647 for one ending at 1587 —
+                // straight through the enum and impl blocks between them, so a
+                // pin could be satisfied by an identifier appearing in a type's
+                // doc comment rather than in the function under test.
+                "\nenum ",
+                "\nstruct ",
+                "\nimpl ",
+                "\n#[derive",
+                "\npub enum ",
+                "\npub struct ",
+                "\npub(crate) enum ",
+                "\npub(crate) struct ",
             ]
             .iter()
             .filter_map(|kw| after.find(kw))
@@ -8855,7 +9139,8 @@ mod tests {
         // `reserve < followups` at the top of this test. Re-state it here with
         // the record's own anchor so deleting the record is caught too.
         assert!(
-            fn_body("async fn reserve_resync_emit(").contains(".record(*key.id(), sender_addr)"),
+            fn_body("async fn reserve_resync_emit(")
+                .contains(".record_generation(*key.id(), sender_addr)"),
             "reserve_resync_emit must record the outstanding request for \
              receive-arm correlation (#4864 round-8), and it must do so there \
              because the entry point calls it before spawning the follow-ups"
@@ -8886,9 +9171,12 @@ mod tests {
         // still being present (read-only). A blind retry re-sends a request that
         // already landed, which makes the sender clear its summary and ship FULL
         // STATE again onto a receiver whose queue was just full.
-        let landed_gate = retry.find("is_outstanding(").expect(
+        let landed_gate = retry.find("is_generation_outstanding(").expect(
             "the retry must gate each re-dispatch on \
-             outstanding_resync_requests.is_outstanding(...) (#4863)",
+             outstanding_resync_requests.is_generation_outstanding(...) — its OWN \
+             generation, so a late response to an earlier window cannot read as \
+             \"ours landed\" and cancel a re-delivery still needed (#4863, \
+             #5510 N7)",
         );
         let retry_emit = retry
             .find("try_notify_node_event(")

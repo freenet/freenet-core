@@ -44,6 +44,7 @@
 //! not a correctness bug. This matches the `UpdateRateLimiter` precedent, which
 //! also relies on the TTL sweep rather than disconnect hooks.
 
+use std::collections::VecDeque;
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -292,6 +293,22 @@ pub(crate) fn new_response_global_limiter(
 /// anti-entropy heartbeat instead of executing a full-state WASM merge.
 pub(crate) const OUTSTANDING_RESYNC_TTL: Duration = Duration::from_secs(60);
 
+/// One outstanding `ResyncRequest` we emitted (#5510 N7).
+#[derive(Debug, Clone, Copy)]
+struct OutstandingRequest {
+    /// Identifies THIS request among the pair's outstanding ones.
+    generation: u64,
+    /// When it was emitted, for the TTL.
+    emitted: Instant,
+}
+
+/// Per-pair cap on concurrently-outstanding requests.
+///
+/// The chain bound already keeps a well-behaved pair far below this. The cap is
+/// here because a pair is not obliged to be well-behaved, and without it one
+/// pair could occupy the whole map's budget and push every other pair out.
+const MAX_OUTSTANDING_PER_PAIR: usize = 8;
+
 /// Correlation map for outstanding `ResyncRequest`s (#4864 round-8, Codex P1).
 ///
 /// A received `ResyncResponse` triggers a full-state WASM merge on the resync
@@ -315,9 +332,26 @@ pub(crate) const OUTSTANDING_RESYNC_TTL: Duration = Duration::from_secs(60);
 /// cap + reaper TTL sweep) so a request storm can't grow the map without bound.
 pub(crate) struct OutstandingResyncRequests {
     /// `(contract, peer)` → the time we emitted the request.
-    entries: DashMap<(ContractInstanceId, SocketAddr), Instant>,
+    /// One entry per PAIR, holding every outstanding request for that pair
+    /// oldest-first (#5510 N7).
+    ///
+    /// A single `Instant` per pair was wrong in a narrow but real way. A
+    /// `ResyncResponse` carries no request id, so the only thing that can match
+    /// it to a request is arrival order. With one slot, a late response to the
+    /// PREVIOUS window's request — generated before the drop that is now being
+    /// repaired, arriving after the next request was recorded — overwrote or
+    /// consumed the record for the CURRENT request, and the chain's "did mine
+    /// land?" check then read false and exited as though answered. If the
+    /// current request had in fact been throttled by the responder or lost, the
+    /// update waited for anti-entropy.
+    entries: DashMap<(ContractInstanceId, SocketAddr), VecDeque<OutstandingRequest>>,
+    /// Total outstanding REQUESTS, not pairs, so the cap bounds memory.
     size: AtomicUsize,
     max_tracked: usize,
+    /// Source of generation ids. A counter rather than the emit `Instant`,
+    /// because two records can share an instant under an injected clock and two
+    /// generations must never be confused for one.
+    next_generation: AtomicU64,
     ttl: Duration,
     time_source: Arc<dyn TimeSource + Send + Sync>,
 }
@@ -326,6 +360,7 @@ impl OutstandingResyncRequests {
     pub fn new(time_source: Arc<dyn TimeSource + Send + Sync>) -> Self {
         Self {
             entries: DashMap::new(),
+            next_generation: AtomicU64::new(0),
             size: AtomicUsize::new(0),
             max_tracked: MAX_TRACKED_KEYS,
             ttl: OUTSTANDING_RESYNC_TTL,
@@ -346,23 +381,42 @@ impl OutstandingResyncRequests {
     /// "did it land?" signal MUST NOT treat that absence as "landed" (#4863).
     #[must_use]
     pub fn record(&self, contract: ContractInstanceId, target: SocketAddr) -> bool {
+        self.record_generation(contract, target).is_some()
+    }
+
+    /// As [`Self::record`], but returns the GENERATION of the request recorded,
+    /// so a caller can later ask whether ITS OWN request is still outstanding
+    /// rather than whether any request for the pair is (#5510 N7).
+    ///
+    /// `None` means the strict cap rejected it and nothing was stored; the
+    /// request is UNCORRELATED and [`Self::is_outstanding`] will read `false`
+    /// for it forever, which must not be taken as "landed" (#4863).
+    #[must_use]
+    pub fn record_generation(
+        &self,
+        contract: ContractInstanceId,
+        target: SocketAddr,
+    ) -> Option<u64> {
         let now = self.time_source.now();
-        use dashmap::mapref::entry::Entry;
-        match self.entries.entry((contract, target)) {
-            Entry::Occupied(mut occ) => {
-                *occ.get_mut() = now;
-                true
-            }
-            Entry::Vacant(vac) => {
-                let prev = self.size.fetch_add(1, Ordering::Relaxed);
-                if prev >= self.max_tracked {
-                    self.size.fetch_sub(1, Ordering::Relaxed);
-                    return false;
-                }
-                vac.insert(now);
-                true
-            }
+        let prev = self.size.fetch_add(1, Ordering::Relaxed);
+        if prev >= self.max_tracked {
+            self.size.fetch_sub(1, Ordering::Relaxed);
+            return None;
         }
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let mut queue = self.entries.entry((contract, target)).or_default();
+        // Per-pair cap. The chain bound already keeps this small, but a pair is
+        // not obliged to be well-behaved: without a cap one pair could hold the
+        // whole map's budget.
+        if queue.len() >= MAX_OUTSTANDING_PER_PAIR {
+            queue.pop_front();
+            self.size.fetch_sub(1, Ordering::Relaxed);
+        }
+        queue.push_back(OutstandingRequest {
+            generation,
+            emitted: now,
+        });
+        Some(generation)
     }
 
     /// Require-and-consume a matching outstanding entry for a received
@@ -372,13 +426,32 @@ impl OutstandingResyncRequests {
     /// finds nothing and is rejected.
     pub fn consume(&self, contract: ContractInstanceId, source: SocketAddr) -> bool {
         let now = self.time_source.now();
-        match self.entries.remove(&(contract, source)) {
-            Some((_, emitted)) => {
-                self.size.fetch_sub(1, Ordering::Relaxed);
-                now.saturating_duration_since(emitted) <= self.ttl
+        let mut empty = false;
+        let matched = match self.entries.get_mut(&(contract, source)) {
+            Some(mut queue) => {
+                // OLDEST first. A response carries no request id, so arrival
+                // order is the only correspondence available, and the oldest
+                // outstanding request is the one a response most plausibly
+                // answers. Consuming the newest instead would let a late reply
+                // to an old request cancel the correlation of the request
+                // currently being retried.
+                let front = queue.pop_front();
+                empty = queue.is_empty();
+                match front {
+                    Some(req) => {
+                        self.size.fetch_sub(1, Ordering::Relaxed);
+                        now.saturating_duration_since(req.emitted) <= self.ttl
+                    }
+                    None => false,
+                }
             }
             None => false,
+        };
+        if empty {
+            self.entries
+                .remove_if(&(contract, source), |_, q| q.is_empty());
         }
+        matched
     }
 
     /// Read-only: is there a NON-EXPIRED outstanding request for
@@ -418,11 +491,44 @@ impl OutstandingResyncRequests {
     /// fail (including with another `ContractQueueFull`). Absence therefore
     /// means "the response arrived and we authorized it", not "the state
     /// merged".
+    ///
+    /// **No production caller since #5510 N7**, which moved both the chain's X2
+    /// check and the #4863 re-delivery gate onto
+    /// [`Self::is_generation_outstanding`]. Kept because the pair-level question
+    /// is still the right one for a test to ask — "is anything outstanding for
+    /// this pair" — and because a future caller that genuinely wants the
+    /// aggregate should find it here rather than reinvent it. Anything asking
+    /// "did MY request land" must use the generation form: this one answers
+    /// `false` as soon as any response retires any generation.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_outstanding(&self, contract: ContractInstanceId, peer: SocketAddr) -> bool {
         let now = self.time_source.now();
-        self.entries
-            .get(&(contract, peer))
-            .is_some_and(|emitted| now.saturating_duration_since(*emitted) <= self.ttl)
+        self.entries.get(&(contract, peer)).is_some_and(|queue| {
+            queue
+                .iter()
+                .any(|req| now.saturating_duration_since(req.emitted) <= self.ttl)
+        })
+    }
+
+    /// Is the request with THIS generation still outstanding (#5510 N7)?
+    ///
+    /// The distinction from [`Self::is_outstanding`] is the whole point: a
+    /// chain asking "did any request for this pair go unanswered" gets the
+    /// wrong answer when a late response to an earlier window consumed an
+    /// entry. Asking about its own generation cannot be confused that way.
+    pub fn is_generation_outstanding(
+        &self,
+        contract: ContractInstanceId,
+        peer: SocketAddr,
+        generation: u64,
+    ) -> bool {
+        let now = self.time_source.now();
+        self.entries.get(&(contract, peer)).is_some_and(|queue| {
+            queue.iter().any(|req| {
+                req.generation == generation
+                    && now.saturating_duration_since(req.emitted) <= self.ttl
+            })
+        })
     }
 
     /// Drop entries older than the TTL. Call from the Ring reaper so a burst of
@@ -431,13 +537,11 @@ impl OutstandingResyncRequests {
         let now = self.time_source.now();
         let ttl = self.ttl;
         let mut removed = 0usize;
-        self.entries.retain(|_, emitted| {
-            if now.saturating_duration_since(*emitted) > ttl {
-                removed += 1;
-                false
-            } else {
-                true
-            }
+        self.entries.retain(|_, queue| {
+            let before = queue.len();
+            queue.retain(|req| now.saturating_duration_since(req.emitted) <= ttl);
+            removed += before - queue.len();
+            !queue.is_empty()
         });
         if removed > 0 {
             self.size.fetch_sub(removed, Ordering::Relaxed);
@@ -497,6 +601,76 @@ mod tests {
         assert!(
             !m.consume(c, peer),
             "a replayed/duplicate response must be rejected after the first consume"
+        );
+    }
+
+    /// #5510 N7: a LATE response to an earlier window must not cancel the
+    /// correlation of the request currently outstanding.
+    ///
+    /// A `ResyncResponse` carries no request id, so nothing in the message says
+    /// which request it answers. With one slot per pair, a response generated
+    /// before the swallowed broadcast and arriving after the next request was
+    /// recorded consumed that next request's record. The chain's "did mine
+    /// land?" check then read false and it exited as though answered — and if
+    /// its request had in fact been throttled by the responder or lost, the
+    /// update waited for anti-entropy.
+    ///
+    /// Generations make the question answerable: consumption is oldest-first,
+    /// so a late reply retires the request it plausibly answers, and the chain
+    /// asks about ITS OWN generation rather than about the pair.
+    ///
+    /// This is the out-of-order case `.claude/rules/testing.md` asks to cover.
+    #[test]
+    fn a_late_response_to_an_earlier_window_does_not_retire_the_current_request() {
+        let ts = SharedMockTimeSource::new();
+        let m = new_outstanding_resync_requests(Arc::new(ts.clone()));
+        let c = mk_contract(7);
+        let peer = mk_peer(7);
+
+        // Window 1's request.
+        let first = m
+            .record_generation(c, peer)
+            .expect("first record must correlate under the cap");
+
+        // The window closes and the chain records window 2's request. Both are
+        // now outstanding; the responder has answered neither.
+        ts.advance_time(Duration::from_secs(30));
+        let second = m
+            .record_generation(c, peer)
+            .expect("second record must correlate");
+        assert_ne!(
+            first, second,
+            "each record must take a distinct generation, or the two requests \
+             cannot be told apart at all"
+        );
+
+        // NOW window 1's response arrives, late. It retires window 1's request,
+        // oldest-first, and must leave window 2's alone.
+        assert!(
+            m.consume(c, peer),
+            "the late response is still within the TTL, so it authorizes"
+        );
+        assert!(
+            !m.is_generation_outstanding(c, peer, first),
+            "the response must retire the OLDEST outstanding request, which is \
+             the one it plausibly answers"
+        );
+        assert!(
+            m.is_generation_outstanding(c, peer, second),
+            "and the CURRENT request must remain outstanding: nothing has \
+             answered it. Retiring it here is what made a chain exit believing \
+             its own repair had landed (#5510 N7)"
+        );
+
+        // A second response retires window 2's request in turn.
+        assert!(m.consume(c, peer), "the second response authorizes too");
+        assert!(
+            !m.is_generation_outstanding(c, peer, second),
+            "and now nothing is outstanding for the pair"
+        );
+        assert!(
+            !m.is_outstanding(c, peer),
+            "the pair-level view must agree once every generation is retired"
         );
     }
 

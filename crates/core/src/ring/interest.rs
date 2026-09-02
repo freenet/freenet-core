@@ -2606,20 +2606,19 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Cancel a reservation: removes the just-recorded throttle window for
     /// (contract, target) so the sender can retry immediately.
     ///
-    /// **No production caller since #5510 X1.** The global-cap path used to call
-    /// this; it now keeps the reservation and marks it as owing a repair
-    /// instead, because releasing the window let every later drop on the pair
-    /// spawn its own follow-up chain. Kept, rather than deleted, only because
-    /// `begin_cancel_resync_request_reservation_semantics` pins the
-    /// reserve-then-release semantics of the throttle itself, which is worth
-    /// keeping testable independently of who calls it. If that test goes, this
-    /// goes with it — do NOT reintroduce a production caller without reading the
-    /// X1 note on `begin_resync_request` first.
+    /// **Exactly one production caller** (#5510 N4): the owing path, when no
+    /// node-wide slot was available to spawn a chain. Nothing was emitted there,
+    /// so releasing the window cannot produce a second request inside one
+    /// window, and leaving it held would strand the debt for a full window and
+    /// then lose it.
+    ///
+    /// Do NOT restore the pre-X1 caller on the global-cap path: releasing the
+    /// window there let every later drop on the pair spawn a chain of its own.
+    /// Read the X1 note on `begin_resync_request` before adding any caller.
     /// Removes the just-recorded throttle window for (contract, target) so the
     /// sender can retry as soon as the OTHER gate (the global emit cap) refills,
     /// rather than waiting out the full [`RESYNC_REQUEST_MIN_INTERVAL`]
     /// (#4864 round-6 item 2).
-    #[cfg(test)]
     pub fn cancel_resync_request(&self, contract: &ContractKey, target: SocketAddr) {
         self.resync_request_throttle
             .lock()
