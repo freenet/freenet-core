@@ -322,10 +322,13 @@ pub(crate) struct ResyncReservation {
     /// reservation was held, so the repair it needed was refused by the
     /// throttle and nothing else will re-send it (#5510).
     ///
-    /// Consumed at the window's close by
-    /// `operations::update::op_ctx_task::trailing_coalesced_resync_request`,
-    /// which emits ONE coalesced `ResyncRequest` covering every drop the window
-    /// swallowed. One flag rather than a count, because one full-state
+    /// The window's close is detected by
+    /// `operations::update::op_ctx_task::wait_until_reservation_close`, and the
+    /// flag is consumed by that function's caller — the follow-up chain in
+    /// `spawn_resync_followups`, which then emits ONE coalesced `ResyncRequest`
+    /// covering every drop the window swallowed. The chain takes it rather than
+    /// the wait helper so the debt survives a gate refusal that happens after
+    /// the window has closed. One flag rather than a count, because one full-state
     /// `ResyncResponse` restores every lost entry at once: the repair does not
     /// scale with the number of drops, so neither should the signal.
     dropped_during_window: bool,
@@ -4765,13 +4768,6 @@ mod tests {
         );
     }
 
-    /// Issue #4857: `begin_resync_request` must emit at most one
-    /// `ResyncRequest` per (contract, peer) per `RESYNC_REQUEST_MIN_INTERVAL`.
-    /// The first drop heals immediately (returning `Some(deadline)`); a burst of
-    /// further drops within the window is throttled (`None`, bounding the #4251
-    /// amplification); after the window elapses a fresh request is allowed
-    /// again. The returned deadline is the reservation window close
-    /// (`now + RESYNC_REQUEST_MIN_INTERVAL`) on the manager's clock (#4857 P2).
     /// #5510: a fresh reservation CLEARS the "a drop was swallowed" flag.
     ///
     /// This is the invariant that makes a stale flag harmless, and it is the only
@@ -4861,6 +4857,13 @@ mod tests {
         );
     }
 
+    /// Issue #4857: `begin_resync_request` must emit at most one
+    /// `ResyncRequest` per (contract, peer) per `RESYNC_REQUEST_MIN_INTERVAL`.
+    /// The first drop heals immediately (returning `Some(deadline)`); a burst of
+    /// further drops within the window is throttled (`None`, bounding the #4251
+    /// amplification); after the window elapses a fresh request is allowed
+    /// again. The returned deadline is the reservation window close
+    /// (`now + RESYNC_REQUEST_MIN_INTERVAL`) on the manager's clock (#4857 P2).
     #[test]
     fn begin_resync_request_rate_limits_per_contract_peer() {
         let (manager, time) = make_manager();
