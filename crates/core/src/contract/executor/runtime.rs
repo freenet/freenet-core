@@ -2194,6 +2194,13 @@ mod remove_contract_tests {
     /// origin-record write on demand.
     #[cfg(feature = "redb")]
     #[tokio::test(flavor = "multi_thread")]
+    // Shares the process-global `POISON_RECOVERY_TRIGGERED` counter with the
+    // poison-recovery tests in `contract::storages::redb`, because driving the
+    // fault injector trips it through `route_txn_error`/`route_redb_error`/
+    // `commit_guarded` whether or not this test looks at it. The key is
+    // cross-module by design: `serial_test` serializes on the key, not the
+    // module. Pinned by `every_test_using_the_failure_injector_is_serialized`.
+    #[serial_test::serial(redb_poison_recovery)]
     async fn register_aborts_when_origin_record_fails_then_recovers() {
         use crate::contract::storages::redb::{FailingBackend, open_redb_with_backend};
         use crate::wasm_runtime::SecretScope;
