@@ -4,10 +4,21 @@
 //!
 //! ## What this does
 //!
-//! Maintains a `(sender_addr, contract_instance_id) → last_accepted_at`
+//! Maintains a `(sender_addr, contract_instance_id) → `[`PairStamps`]
 //! map. When a new UPDATE arrives, check the time since the last
-//! accepted UPDATE for the same pair. If under [`MIN_UPDATE_INTERVAL`],
-//! reject; otherwise stamp the new time and accept.
+//! accepted UPDATE of the SAME [`UpdateClass`] for that pair. If under
+//! that class's interval, reject; otherwise stamp the new time and
+//! accept.
+//!
+//! The two classes — routed client writes and co-host broadcast fan-out
+//! — carry SEPARATE stamps inside one map entry, and are charged against
+//! separate intervals ([`MIN_UPDATE_INTERVAL`] and
+//! [`MIN_BROADCAST_INTERVAL`]). One entry rather than two keys keeps the
+//! key space, the cap, the eviction path and the per-sender new-pair
+//! budget exactly as they were; separate stamps stop busy fan-out
+//! starving a client write on the same pair. See [`UpdateClass`] for why
+//! a broadcast is not a write, and [`MIN_BROADCAST_INTERVAL`] for the
+//! calibration and its DoS trade-off (#5510).
 //!
 //! ## What this is NOT
 //!
@@ -22,13 +33,20 @@
 //!   the rate is a flat statistical threshold, and we choose it
 //!   generously enough that legitimate traffic doesn't hit it.
 //!
-//! ## Default rate
+//! ## Default rates
 //!
 //! [`MIN_UPDATE_INTERVAL`] defaults to 100ms (≈10 UPDATEs/sec from a
 //! single peer for a single contract). Realistic human-driven contract
 //! updates (chat, settings change, post) are orders of magnitude slower
 //! than this. The 4PjqN5… incident was producing many UPDATEs per
 //! second sustained — well above this ceiling.
+//!
+//! [`MIN_BROADCAST_INTERVAL`] defaults to 20ms (≈50/sec) and applies to
+//! the four `BroadcastTo*` opcodes. A broadcast is not a write, it is
+//! the derived fan-out of a write some peer already committed, so its
+//! rate on one pair is a contract's AGGREGATE commit rate rather than
+//! one writer's cadence — see that constant's own doc, which carries the
+//! measurement, the message-zero cost and the trade-off.
 //!
 //! ## Bounded growth
 //!
@@ -209,6 +227,15 @@
 //! - **No typed wire-level error.** Rejected UPDATEs are dropped
 //!   silently. The sender's own retry / governance scoring will
 //!   detect the flood pattern from its end.
+//! - **Two rate classes, not one flat ceiling (#5510).** The doc assumes
+//!   a single per-pair rate. Applying the write-cadence number to
+//!   co-host fan-out turned out to be a correctness bug rather than a
+//!   throttle: honest broadcasts were refused, the sender recorded them
+//!   as delivered, and the two peers diverged permanently. Broadcasts
+//!   therefore get their own, still-bounded interval, uniform across the
+//!   four broadcast opcodes so switching opcode gains nothing. The
+//!   sender-side half of the doc's design is still unbuilt, and pacing
+//!   there would reduce these refusals rather than widen the allowance.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -293,21 +320,32 @@ pub(crate) const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// - **The sender must already be a connected, authenticated peer.** The
 ///   dispatch has no `source_addr` otherwise, and
-///   `op_ctx_task::seed_sender_summary_from_broadcast` (`op_ctx_task.rs:1995`,
-///   the driver's first step) returns immediately when
+///   `op_ctx_task::seed_sender_summary_from_broadcast`, the driver's first
+///   step, returns immediately when
 ///   `get_peer_by_addr` finds no connection. This is the load-bearing bound:
 ///   the budget is per `(sender, contract)`, and a sender is a live connection
 ///   against `max_connections`, not an arbitrary address.
 /// - **For a contract this node does not host and nothing depends on, no GET is
 ///   spawned.** The full-state error arm reaches `try_auto_fetch_contract`,
-///   which returns early on `!contract_in_use` (`operations/update.rs:245`;
-///   `contract_in_use` is a live local client subscription or a downstream
-///   subscriber, `ring/hosting.rs:1725`). So an unsolicited broadcast for a
+///   which returns early on `!contract_in_use` (`operations::update::OpManager::
+///   try_auto_fetch_contract`; `contract_in_use` is a live local client
+///   subscription or a downstream subscriber). So an unsolicited broadcast for a
 ///   stranger contract cannot make this node fetch it.
 /// - **The contract's WASM does not execute for a contract we lack.** The merge
 ///   fails as missing-contract, which `is_contract_exec_rejection` explicitly
 ///   excludes — that is why the arm above can tell "code missing" from "the
 ///   contract rejected it".
+/// - **What it does touch first** is the interest map:
+///   `op_ctx_task::seed_sender_summary_from_broadcast` runs as step 1 of the
+///   driver, ahead of the dedup cache and the merge, and upserts the sender's
+///   self-reported summary. Three properties bound it, and all three predate
+///   this change: it is connected-peer only (no connection, immediate return);
+///   an EMPTY summary refreshes an existing entry's TTL and never creates one;
+///   and at `MAX_INTERESTED_PEERS_PER_CONTRACT` the map REFUSES rather than
+///   evicting, so an established co-host cannot be displaced. What this constant
+///   changes is only how fast that path can be reached for one contract. At
+///   saturation the cost is degraded efficiency rather than lost correctness:
+///   an unseeded co-host is sent full states instead of deltas.
 ///
 /// What it DOES cost, stated plainly rather than glossed: for a contract this
 /// node **does** host, every accepted broadcast is a real WASM merge, and this
@@ -316,6 +354,51 @@ pub(crate) const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 /// helps against a REPEATED payload; a sender varying the bytes pays the merge
 /// every time. That 5x is the actual price of this change, and the
 /// compensating bounds are the ones listed above plus those below.
+///
+/// # What a hosted-contract merge actually costs, and who meters it
+///
+/// The merge above is not unmetered work. Cost-pressure eviction
+/// (#4861/#4903) attributes per-contract WASM CPU, fan-out bytes and
+/// broadcast MESSAGE rate, and sheds a zero-demand contract whose
+/// attributed cost is sustained above the floor — it measures the work
+/// actually done rather than a fixed rate, which is the control that
+/// fits a storm. Governance meters the same traffic. So the 5x lands on
+/// an axis that is already watched, rather than on an unwatched one.
+///
+/// # The repair-side amplification, and why it is not part of this
+///
+/// A dropped broadcast provokes a `ResyncRequest`, and that emit — not
+/// the merge — was the part an attacker could have ridden on the looser
+/// class. Two gates in `node.rs` remove it, and they are why this
+/// constant can be widened at all:
+///
+/// - the repair fires ONLY on `RateLimitDecision::Rejected`, never on
+///   `SenderNewPairBudget` (where every downstream gate is vacant for a
+///   fresh contract id) or `CapacityExceeded`;
+/// - the repair fires ONLY for a contract this node actually holds, so
+///   an attacker cannot pick unlimited fresh keys to get unlimited fresh
+///   throttle entries and emit-limiter buckets.
+///
+/// # Tuning this back toward 100ms is not free
+///
+/// The obvious "safer" move is the wrong one, and the coupling is not
+/// visible from this constant alone. Raising the interval raises drop
+/// pressure; each drop that lands in a held throttle window arms a
+/// trailing repair; each repair chain holds one of the
+/// [`crate::ring::interest::MAX_OUTSTANDING_QUEUE_FULL_RESYNC_RETRIES`]
+/// (256) node-wide follow-up slots for up to a reservation window. So a
+/// higher interval thins the very backstop that is meant to catch the
+/// extra drops it creates, and it does so exactly when the node is
+/// busiest. Widening and narrowing this number are NOT symmetric.
+///
+/// On the adversarial side, do not lean on the #4997 per-sender budget
+/// here: it charges a token only for a pair the limiter is not currently
+/// TRACKING, so it bounds the rate of introducing new pairs (~200/s) and
+/// not sustained traffic on established ones. What bounds a hostile peer
+/// reaching many follow-up slots is the held-contract gate above — a
+/// slot is only ever taken for a contract this node holds — together
+/// with the one-repair-per-(contract, sender)-per-30s throttle and the
+/// global per-contract emit cap.
 ///
 /// Do NOT set this to zero. An unbounded broadcast class re-opens the
 /// May 21 flood shape on the one message type that fans out.
@@ -971,12 +1054,17 @@ impl UpdateRateLimiter {
                     if elapsed < min_interval {
                         self.rejected_total.fetch_add(1, Ordering::Relaxed);
                         // Release the shard guard BEFORE taking the log
-                        // throttle's mutex. `log_new_pair_budget` is the only
-                        // lock this module takes under a `last_accepted` guard,
-                        // and its ordering is documented as having no
-                        // counterpart to invert against; keeping that true
-                        // means every OTHER lock is taken with no shard guard
-                        // held.
+                        // throttle's mutex, matching what the new-pair branch
+                        // does: it too calls `drop(entry)` before
+                        // `log_new_pair_budget`. The ONE lock this module takes
+                        // while holding a `last_accepted` guard is
+                        // `new_pair_budget` (see its field doc, which explains
+                        // why that ordering has no counterpart to invert
+                        // against); every other lock, these log throttles
+                        // included, is taken with no shard guard held. Keeping
+                        // that true is what makes the field doc's claim a
+                        // complete account of the lock order rather than one
+                        // case of several.
                         drop(entry);
                         self.log_rejected(now, sender, contract, class);
                         return RateLimitDecision::Rejected {
@@ -1290,8 +1378,15 @@ impl UpdateRateLimiter {
         );
     }
 
-    /// Emit the per-pair rejection log line, at most once per
-    /// [`REJECTED_LOG_INTERVAL`].
+    /// Emit the rejection log line, at most once per
+    /// [`REJECTED_LOG_INTERVAL`] PER [`UpdateClass`].
+    ///
+    /// Read the line carefully when operating: the throttle slot is per class
+    /// and NODE-WIDE, not per pair. So this is one line a minute per class,
+    /// naming whichever `(sender, contract)` pair happened to trip it first —
+    /// a sample, not a census. `rejected_total` on the same line is the count
+    /// that is complete, and `RingStatsSnapshot::updates_rate_limited` carries
+    /// it to the dashboard.
     ///
     /// `info!` rather than `debug!` for the #4981 reason, and because #5510
     /// showed the cost of not having it: `release_max_level_info` compiles
@@ -1608,6 +1703,72 @@ mod tests {
         );
     }
 
+    /// #5510 review finding 12: CAPACITY eviction orders on the entry's most
+    /// recent stamp across BOTH classes, not on one class's.
+    ///
+    /// The TTL twin below covers the sweep; this covers the LRU, which is the
+    /// path that runs under load. A pair whose request stamp is ancient but
+    /// whose fan-out is live must survive: evicting it would reset the broadcast
+    /// window and hand the sender a free message, and at a busy node that is
+    /// precisely the pair being evicted.
+    ///
+    /// Discriminating by construction — the survivor is the pair with the OLDEST
+    /// request stamp, so an implementation ordering on the request stamp alone
+    /// evicts exactly it and fails here.
+    #[test]
+    fn capacity_eviction_orders_on_the_most_recent_stamp_of_either_class() {
+        let ts = SharedMockTimeSource::new();
+        // Cap 2 so a third pair must evict exactly one, with the batch = 1.
+        let l = UpdateRateLimiter::with_config(Arc::new(ts.clone()), MIN_UPDATE_INTERVAL, 2);
+
+        let (busy, quiet, newcomer) = (mk_contract(1), mk_contract(2), mk_contract(3));
+        let sender = mk_sender(1);
+
+        // `busy` is stamped FIRST on the request class, so on a request-only
+        // ordering it is the oldest and would be the victim.
+        assert!(
+            l.check_and_record(sender, busy, UpdateClass::Request)
+                .is_allowed()
+        );
+        ts.advance(Duration::from_secs(10));
+        assert!(
+            l.check_and_record(sender, quiet, UpdateClass::Request)
+                .is_allowed()
+        );
+
+        // ...but `busy` is live on the BROADCAST class, which makes it the most
+        // recently used entry overall.
+        ts.advance(Duration::from_secs(10));
+        assert!(
+            l.check_and_record(sender, busy, UpdateClass::Broadcast)
+                .is_allowed()
+        );
+
+        // A third pair at the cap forces one eviction.
+        ts.advance(Duration::from_secs(10));
+        assert!(
+            l.check_and_record(sender, newcomer, UpdateClass::Request)
+                .is_allowed()
+        );
+        assert_eq!(l.len(), 2, "the cap must still hold after the admission");
+
+        // The victim must be `quiet` (least recently used across both classes),
+        // NOT `busy` (oldest on the request class alone). Asserted against the
+        // map directly: a `check_and_record` probe cannot tell survival from
+        // eviction here, because enough time has passed that a surviving entry
+        // would be allowed too.
+        assert!(
+            l.last_accepted.contains_key(&(sender, busy)),
+            "the pair kept live by BROADCAST traffic must have SURVIVED — ordering \
+             eviction on the request stamp alone would evict it, resetting its \
+             broadcast window and handing the sender a free message (#5510)"
+        );
+        assert!(
+            !l.last_accepted.contains_key(&(sender, quiet)),
+            "the genuinely least-recently-used pair must be the one evicted"
+        );
+    }
+
     /// #5510: the TTL sweep and the LRU eviction order read the entry's
     /// most-recent stamp of EITHER class.
     ///
@@ -1669,46 +1830,70 @@ mod tests {
             .expect("could not find the end of the update_class match");
         let body: String = body[..end].chars().filter(|c| !c.is_whitespace()).collect();
 
-        let request_arm = body
-            .find("UpdateClass::Request")
-            .expect("no Request arm in the classifier");
-        let broadcast_arm = body
-            .find("UpdateClass::Broadcast")
-            .expect("no Broadcast arm in the classifier");
+        // Map each opcode to the arm it actually sits in, INDEPENDENT of arm
+        // order (review finding 15). An opcode's class is the class named by the
+        // FIRST class marker that follows it: in a match, an arm's patterns
+        // precede its body.
+        //
+        // The previous form compared each opcode's position against
+        // `find("UpdateClass::Request")` and `find("UpdateClass::Broadcast")`,
+        // which was one-directional and order-sensitive. With Request first,
+        // moving `RequestUpdateStreaming` INTO the Broadcast arm left its index
+        // between the two markers, so `at < broadcast_arm` still held and the pin
+        // passed while a routed client write silently gained the 5x budget —
+        // the exact regression this test exists to prevent, in the direction it
+        // could not see.
+        let class_at = |opcode: &str| -> &'static str {
+            let at = body.find(opcode).unwrap_or_else(|| {
+                panic!(
+                    "opcode `{opcode}` is not classified in node.rs — an \
+                     unclassified UPDATE opcode is a budget bypass"
+                )
+            });
+            let next_request = body[at..].find("UpdateClass::Request");
+            let next_broadcast = body[at..].find("UpdateClass::Broadcast");
+            match (next_request, next_broadcast) {
+                (Some(r), Some(b)) => {
+                    if r < b {
+                        "Request"
+                    } else {
+                        "Broadcast"
+                    }
+                }
+                (Some(_), None) => "Request",
+                (None, Some(_)) => "Broadcast",
+                (None, None) => panic!(
+                    "opcode `{opcode}` is followed by no UpdateClass at all — the \
+                     classifier is not a match over the two classes any more"
+                ),
+            }
+        };
 
-        for variant in [
+        for opcode in [
             "UpdateMsg::BroadcastTo{..}",
             "UpdateMsg::BroadcastToV2{..}",
             "UpdateMsg::BroadcastToStreaming{..}",
             "UpdateMsg::BroadcastToStreamingV2{..}",
         ] {
-            let at = body.split(variant).next().map(str::len).unwrap_or(0);
-            assert!(
-                body.contains(variant),
-                "broadcast opcode `{variant}` is not classified in node.rs — an \
-                 unclassified broadcast opcode is a budget bypass"
-            );
-            assert!(
-                at > request_arm,
-                "broadcast opcode `{variant}` must sit in the Broadcast arm, not the \
-                 Request arm — the four broadcast opcodes MUST share one budget so \
+            assert_eq!(
+                class_at(opcode),
+                "Broadcast",
+                "broadcast opcode `{opcode}` must be charged to the Broadcast \
+                 class — the four broadcast opcodes MUST share one budget so \
                  switching between them gains nothing (#5510)"
             );
         }
 
-        for variant in [
+        for opcode in [
             "UpdateMsg::RequestUpdate{..}",
             "UpdateMsg::RequestUpdateStreaming{..}",
         ] {
-            let at = body.split(variant).next().map(str::len).unwrap_or(0);
-            assert!(
-                body.contains(variant),
-                "request opcode `{variant}` is not classified in node.rs"
-            );
-            assert!(
-                at < broadcast_arm,
-                "request opcode `{variant}` must sit in the Request arm — a routed \
-                 client write must not be charged the wider fan-out budget (#5510)"
+            assert_eq!(
+                class_at(opcode),
+                "Request",
+                "request opcode `{opcode}` must be charged to the Request class — \
+                 a routed client write must not gain the wider fan-out budget \
+                 (#5510)"
             );
         }
 

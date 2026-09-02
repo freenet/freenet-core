@@ -3994,10 +3994,28 @@ mod tests {
         let fn_body = |name: &str| -> &str {
             let start = src.find(name).unwrap_or_else(|| panic!("{name} not found"));
             let after = &src[start + 1..];
-            let end = after
-                .find("\nasync fn ")
-                .or_else(|| after.find("\n#[cfg(test)]"))
-                .unwrap_or(after.len());
+            // Terminate on ANY fn opener, not just `async fn` (review finding
+            // 19). Plain `fn`s sit between the async ones this pin slices —
+            // `jittered_resync_retry_delay` between the two resync fns,
+            // `seed_sender_summary_from_broadcast` before the broadcast driver
+            // — so an `async fn`-only terminator ran a slice straight through
+            // them into the NEXT async fn, and a gate deleted from the sliced
+            // function would still satisfy the pin as long as the same
+            // identifier appeared anywhere downstream. Taking the MINIMUM
+            // rather than the first match matters: the openers are not in
+            // source order.
+            let end = [
+                "\nasync fn ",
+                "\nfn ",
+                "\npub async fn ",
+                "\npub fn ",
+                "\npub(",
+            ]
+            .iter()
+            .filter_map(|kw| after.find(kw))
+            .chain(after.find("\n#[cfg(test)]"))
+            .min()
+            .unwrap_or(after.len());
             &src[start..start + 1 + end]
         };
         // Slice the queue-full match arm (from `marker` up to its closing
@@ -6246,10 +6264,28 @@ mod tests {
         let fn_body = |name: &str| -> &str {
             let start = src.find(name).unwrap_or_else(|| panic!("{name} not found"));
             let after = &src[start + 1..];
-            let end = after
-                .find("\nasync fn ")
-                .or_else(|| after.find("\n#[cfg(test)]"))
-                .unwrap_or(after.len());
+            // Terminate on ANY fn opener, not just `async fn` (review finding
+            // 19). Plain `fn`s sit between the async ones this pin slices —
+            // `jittered_resync_retry_delay` between the two resync fns,
+            // `seed_sender_summary_from_broadcast` before the broadcast driver
+            // — so an `async fn`-only terminator ran a slice straight through
+            // them into the NEXT async fn, and a gate deleted from the sliced
+            // function would still satisfy the pin as long as the same
+            // identifier appeared anywhere downstream. Taking the MINIMUM
+            // rather than the first match matters: the openers are not in
+            // source order.
+            let end = [
+                "\nasync fn ",
+                "\nfn ",
+                "\npub async fn ",
+                "\npub fn ",
+                "\npub(",
+            ]
+            .iter()
+            .filter_map(|kw| after.find(kw))
+            .chain(after.find("\n#[cfg(test)]"))
+            .min()
+            .unwrap_or(after.len());
             &src[start..start + 1 + end]
         };
 

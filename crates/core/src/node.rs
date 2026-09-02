@@ -1619,11 +1619,18 @@ where
             // mean an internal caller; there are none, so the else
             // branch logs and drops.
             if let Some(sender_addr) = source_addr {
-                // Phase 2 front-line rate limit. Apply UNIFORMLY across
-                // all four UPDATE wire variants so a flooder can't
-                // bypass by switching opcode (RequestUpdate /
-                // BroadcastTo / RequestUpdateStreaming /
-                // BroadcastToStreaming). The check happens BEFORE the
+                // Phase 2 front-line rate limit. Applied uniformly WITHIN
+                // each `UpdateClass`, not across all six wire variants —
+                // the pre-#5510 wording said the latter and is no longer
+                // true. The anti-bypass property it protected survives:
+                // the four `BroadcastTo*` opcodes share ONE budget and
+                // the two `RequestUpdate*` opcodes share the other, so
+                // switching opcode gains at most the broadcast class,
+                // which is itself bounded and whose trade-off is written
+                // out on `MIN_BROADCAST_INTERVAL`. What changed is that
+                // charging co-host fan-out at the client-write cadence
+                // was refusing honest traffic and diverging peers, not
+                // throttling a flood. The check happens BEFORE the
                 // dedup gate inside the relay drivers — that ordering
                 // is what made the previous PR-MVP iteration race-
                 // free per Codex review: rejected attempts never enter
@@ -1647,6 +1654,12 @@ where
                 // the point: it must be classified deliberately rather
                 // than fall into whichever class a catch-all named.
                 // Pinned by `every_broadcast_opcode_is_charged_to_the_broadcast_class`.
+                // That pin reads this match as text, strips whitespace, and
+                // decides each opcode's class from the first `UpdateClass::`
+                // token that FOLLOWS it — so do NOT write `UpdateClass::Request`
+                // or `UpdateClass::Broadcast` in a comment inside this match. A
+                // mention in a comment is indistinguishable from the arm body to
+                // the pin and would silently mis-attribute the opcode above it.
                 let update_class = match op {
                     update::UpdateMsg::RequestUpdate { .. }
                     | update::UpdateMsg::RequestUpdateStreaming { .. } => {
