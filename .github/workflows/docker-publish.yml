@@ -40,7 +40,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}},value=${{ github.event.release.tag_name || inputs.tag }}
+            type=raw,value=${{ github.event.release.tag_name || inputs.tag }}
             type=raw,value=latest,enable=${{ !github.event.release.prerelease }}
 
       - uses: docker/build-push-action@v6
