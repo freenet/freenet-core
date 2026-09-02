@@ -436,7 +436,7 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
         let mut rows = String::new();
         for f in record.findings() {
             let (pill_class, label) = match f.severity {
-                Severity::Violation => ("fresh-stale", "Violation — cannot converge"),
+                Severity::Violation => ("fresh-stale", "Violation — removal-eligible"),
                 Severity::Diagnostic => ("use-idle", "Diagnostic — legal but wasteful"),
             };
             rows.push_str(&format!(
@@ -538,6 +538,7 @@ mod tests {
             contract: checked,
             property: PROPERTY,
             severity: Severity::Violation,
+            settling: None,
             would_remove: false,
         });
         status::publish([record], 1, 0, tokio::time::Instant::now());

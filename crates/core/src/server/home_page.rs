@@ -4026,11 +4026,16 @@ mod tests {
     /// State 4: checked, with findings — the state the whole card exists for.
     ///
     /// Each finding must show its property, and a `Violation` must read as
-    /// visibly more serious than a `Diagnostic`: the former means the
-    /// contract cannot converge (peers disagree and retry indefinitely), the
-    /// latter is legal but wasteful. A panel that only printed the bare enum
-    /// name would satisfy "shows severity" without making the distinction an
-    /// operator actually needs.
+    /// visibly more serious than a `Diagnostic`: the former is removal-eligible
+    /// under enforcement, the latter is legal but wasteful. A panel that only
+    /// printed the bare enum name would satisfy "shows severity" without making
+    /// the distinction an operator actually needs.
+    ///
+    /// This asserted the panel said "cannot converge" until #5462. That stopped
+    /// being true of every `Violation`: `state_idempotence` now reports a
+    /// canonicalizing contract, which breaks idempotence and still converges. The
+    /// assertion is retargeted rather than dropped, because the property it
+    /// guards — an explanation rather than a bare enum name — is unchanged.
     #[test]
     fn merge_card_lists_findings_with_severity_and_removal_distinguished() {
         use freenet_stdlib::prelude::ContractInstanceId;
@@ -4048,12 +4053,14 @@ mod tests {
                         contract: key_id,
                         property: "state_commutativity",
                         severity: Severity::Violation,
+                        settling: None,
                         would_remove: true,
                     },
                     MergeFinding {
                         contract: key_id,
                         property: "self_delta_empty",
                         severity: Severity::Diagnostic,
+                        settling: None,
                         would_remove: false,
                     },
                 ],
@@ -4072,7 +4079,7 @@ mod tests {
             "both findings for this contract must be listed — got:\n{panel}"
         );
         assert!(
-            panel.contains("cannot converge"),
+            panel.contains("removal-eligible"),
             "a Violation must be explained, not just labelled with the bare \
              enum name — got:\n{panel}"
         );
@@ -4155,6 +4162,7 @@ mod tests {
                     contract: key_id,
                     property: "state_commutativity",
                     severity: Severity::Violation,
+                    settling: None,
                     would_remove: true,
                 }],
             )],
@@ -4173,6 +4181,7 @@ mod tests {
                         contract: other,
                         property: "state_idempotence",
                         severity: Severity::Violation,
+                        settling: None,
                         would_remove: true,
                     }],
                 )],
@@ -4341,6 +4350,7 @@ mod tests {
                     contract: key_id,
                     property: "state_commutativity",
                     severity: Severity::Violation,
+                    settling: None,
                     would_remove: true,
                 }],
             )],

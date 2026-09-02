@@ -740,6 +740,27 @@ pub enum IdempotenceSettling {
     /// non-convergent, and the case an enforcement policy can act on without
     /// waiting for the install path to be fixed.
     NeverSettled,
+    /// The contract errored, trapped, hit a resource ceiling or asked for related
+    /// state during CLASSIFICATION, so whether it settles is unknown.
+    ///
+    /// The violation still stands: `merge(A, A) != A` was already established by a
+    /// merge that succeeded. Only the follow-up applies failed, and they exist
+    /// solely to say which KIND of break it is.
+    ///
+    /// This variant exists because the alternative was losing the finding. The
+    /// classification merges used to propagate their error out of the whole check,
+    /// which turned an established violation into "we could not tell" — and the
+    /// never-settling class GROWS its state on every apply, so it is the most
+    /// likely to trip a fuel or size ceiling on the second or third one. The class
+    /// an enforcement policy can act on was the class that vanished, and a hostile
+    /// contract could arrange it in one line by trapping on the second identical
+    /// merge.
+    ///
+    /// Deliberately not folded into `NeverSettled` (that is the harsher label and
+    /// asserting it without evidence is exactly the sin this issue is about) nor
+    /// into `settling: None` (ambiguous with "this property carries no settling
+    /// data at all").
+    Indeterminate,
 }
 
 impl std::fmt::Display for Violation {

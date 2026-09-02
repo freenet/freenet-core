@@ -738,6 +738,138 @@ fn a_never_settling_contract_is_flagged_as_never_settling() {
     );
 }
 
+/// A settling classification that differs between runs is NOT reported as
+/// reproduced.
+///
+/// The verifier re-runs a failing case and requires the same failure before
+/// asserting it. That check compared only the digests, so a contract could produce
+/// identical `merge(A, A)` bytes on both runs — reproducing by that measure —
+/// while its settling classification differed. The field the whole change exists
+/// to carry, and the one an enforcement policy branches on, would then be reported
+/// as though it had reproduced when it had not.
+///
+/// A contract whose settling varies IS non-deterministic, and the existing
+/// escalation names that under the property which describes it rather than
+/// asserting a classification we did not observe twice.
+#[test]
+fn settling_must_reproduce_or_the_finding_is_not_reproducible() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let b_merges = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&b_merges);
+
+    // `merge(A, A)` is stable across runs, so the DIGESTS reproduce. Re-applying
+    // the rewritten state settles the first time it is asked and not the second,
+    // so only the CLASSIFICATION differs between the two runs.
+    let mut fake = Fake::conforming()
+        .merging(move |a, _b| {
+            if a == [1u8] {
+                return Ok(vec![1, 9]);
+            }
+            if a == [1u8, 9] {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Ok(vec![1, 9]);
+                }
+                return Ok(vec![1, 9, 9]);
+            }
+            Ok(a.to_vec())
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[1u8]]),
+    );
+
+    assert!(
+        !matches!(outcome, PropertyOutcome::Violated(_)),
+        "the digests reproduced but the settling classification did not, so the \
+         finding must not be asserted as reproduced: {outcome:?}"
+    );
+}
+
+/// A contract that fails DURING classification still gets its violation reported.
+///
+/// The classification merges must not `?` their error out of the check: the
+/// violation was already established by the merge that succeeded, and propagating
+/// would turn a contract we caught into "we could not tell". The never-settling
+/// class grows its state on every apply, so it is the likeliest to hit a fuel or
+/// size ceiling on exactly these follow-up merges — the class an enforcement
+/// policy can act on would be the one that vanished. A contract could arrange
+/// that deliberately by trapping on the second identical merge.
+#[test]
+fn a_contract_that_errors_during_classification_still_reports_the_violation() {
+    // The first merge succeeds and changes the state; re-applying the CHANGED
+    // state traps. Keyed on the INPUT rather than a call counter deliberately:
+    // `verify_case` re-runs the whole check to test reproducibility, so a counter
+    // makes the re-run's first merge fail too, and the test then proves nothing
+    // about the classification path it exists for.
+    let mut fake = Fake::conforming()
+        .merging(|a, _b| {
+            if a == [1u8] {
+                Ok(vec![1, 9])
+            } else {
+                Err(OracleError::contract("trapped on re-apply"))
+            }
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[1u8]]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!(
+            "the violation was established by the first merge and must survive a \
+             failure in the follow-ups that only classify it: {outcome:?}"
+        );
+    };
+    assert_eq!(v.severity, Severity::Violation);
+    assert_eq!(
+        v.settling,
+        Some(IdempotenceSettling::Indeterminate),
+        "an unknown classification must say so, not borrow NeverSettled's harsher \
+         label without evidence"
+    );
+}
+
+/// A merge that only PERMUTES bytes is named as an encoding problem here too.
+///
+/// Every `compare`-based property routes through `is_reordering` and says so,
+/// because the two cases call for opposite fixes: make the encoding canonical
+/// versus fix the merge. Idempotence bypassed `compare`, so without this it told a
+/// byte-permuting contract to go and look at the PUT install path — confidently,
+/// and wrongly. `a_merge_that_only_reorders_bytes_is_named_as_an_encoding_problem`
+/// is the equivalent guard on the commutativity path.
+#[test]
+fn an_idempotence_reordering_is_named_as_an_encoding_problem() {
+    // Reverses on the first apply, then holds still.
+    let mut fake = Fake::conforming()
+        .merging(|a, _b| {
+            let mut out = a.to_vec();
+            if !out.windows(2).all(|w| w[0] >= w[1]) {
+                out.reverse();
+            }
+            Ok(out)
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[1u8, 2, 3]]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!("a permuting merge still breaks idempotence and must be reported: {outcome:?}");
+    };
+    assert!(
+        v.detail.contains("ENCODING is not canonical"),
+        "a reordering must be named as an encoding problem, or the author is sent \
+         to the install path when the fix is a deterministic encoding: {}",
+        v.detail
+    );
+}
+
 /// An idempotent contract still passes, with no finding at all.
 ///
 /// The floor under both tests above: if removing the fixpoint gate had made

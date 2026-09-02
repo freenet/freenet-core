@@ -79,7 +79,7 @@ pub enum SubCommand {
     /// merging is order-independent, groups the same way whichever pairing is used,
     /// and applying the same change twice does nothing the second time.
     ///
-    /// A contract that breaks these cannot converge — two peers given the same
+    /// A contract that breaks these usually cannot converge — two peers given the same
     /// updates in different orders end up with different state, never agree, and
     /// retry indefinitely. That is what this looks for.
     ///

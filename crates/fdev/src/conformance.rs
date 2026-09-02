@@ -412,8 +412,11 @@ fn write_bundle(
 /// distinction CI needs and a single exit code cannot express.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "{count} merge-law violation(s) found: this contract cannot converge, so peers \
-     holding it will disagree and keep retrying"
+    "{count} merge-law violation(s) found. A violation is removal-eligible under \
+     enforcement; see each finding for what it means. NOTE: `state_idempotence` \
+     reporting `settled_after` is a real break whose harm is redundant anti-entropy \
+     rather than divergence \u{2014} expected against correct canonicalizing \
+     contracts until the PUT install path canonicalizes"
 )]
 pub struct ConformanceViolations {
     pub count: usize,

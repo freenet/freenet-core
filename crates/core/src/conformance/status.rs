@@ -78,7 +78,7 @@ use freenet_stdlib::prelude::ContractInstanceId;
 use parking_lot::RwLock;
 use tokio::time::Instant;
 
-use super::property::Severity;
+use super::property::{IdempotenceSettling, Severity};
 use super::shadow::{Finding, JudgedContract};
 
 /// How many recently-checked contracts to remember.
@@ -120,10 +120,23 @@ pub struct MergeFinding {
     pub contract: ContractInstanceId,
     /// The law that was broken, e.g. `state_commutativity`.
     pub property: &'static str,
-    /// `Violation` means the contract cannot converge. `Diagnostic` means it is legal
-    /// but wasteful — the distinction an operator most needs, because only the first
-    /// would ever justify removal.
+    /// `Diagnostic` means the contract is legal but wasteful. `Violation` means it
+    /// broke an algebraic law and would be removal-eligible under enforcement.
+    ///
+    /// It does NOT mean "cannot converge". That was true when every `Violation` was
+    /// a divergence, and `state_idempotence` now reports a class that converges: a
+    /// canonicalizing contract normalises a state once and then holds still, which
+    /// breaks idempotence while still agreeing with its peers in the end. Read
+    /// `settling` before telling an operator what a `state_idempotence` row means.
     pub severity: Severity,
+    /// For `state_idempotence`, which KIND of break this is; `None` for every other
+    /// property.
+    ///
+    /// Carried here and not only in `fdev` because this is the path that generates
+    /// the shadow corpus, and `ConformanceAction::WouldRemove` is documented as the
+    /// number the enforcement gate is judged on. A distinction that exists only in
+    /// the offline tool is a distinction the policy it was collected for never sees.
+    pub settling: Option<IdempotenceSettling>,
     /// Whether enforcement, were it enabled, would have removed the contract for this.
     pub would_remove: bool,
 }
@@ -477,6 +490,7 @@ pub(crate) fn checked_contracts(
             contract: finding.contract,
             property: finding.violation.property.as_str(),
             severity: finding.violation.property.severity(),
+            settling: finding.violation.settling,
             would_remove: finding.would_remove,
         };
         match out.iter_mut().find(|c| c.contract == finding.contract) {
@@ -574,6 +588,7 @@ mod tests {
             contract: instance(n),
             property,
             severity: Severity::Violation,
+            settling: None,
             would_remove: true,
         }
     }
