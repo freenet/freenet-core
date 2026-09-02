@@ -334,6 +334,18 @@ pub(crate) struct ResyncReservation {
     dropped_during_window: bool,
 }
 
+impl ResyncReservation {
+    /// When this reservation's window closes, on the manager's `TimeSource`.
+    ///
+    /// This doubles as the reservation's GENERATION: every grant stamps a
+    /// distinct `stamped`, so two reservations for the same pair never share a
+    /// deadline. `take_resync_drop_during_window` compares it so a chain cannot
+    /// consume a debt recorded against a reservation it does not own.
+    fn deadline(&self) -> Instant {
+        self.stamped + RESYNC_REQUEST_MIN_INTERVAL
+    }
+}
+
 /// Node-wide cap on concurrently-outstanding queue-full-resync retry tasks
 /// (#4862 P1). The per-(contract, peer) throttle above is a bounded LRU; under
 /// saturation plus key churn (a peer cycling through more than
@@ -2411,10 +2423,23 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         &self,
         contract: &ContractKey,
         target: SocketAddr,
+        expected_deadline: Instant,
     ) -> bool {
         let mut throttle = self.resync_request_throttle.lock();
         match throttle.get_mut(&(*contract, target)) {
-            Some(res) => std::mem::replace(&mut res.dropped_during_window, false),
+            Some(res) if res.deadline() == expected_deadline => {
+                std::mem::replace(&mut res.dropped_during_window, false)
+            }
+            // A DIFFERENT reservation than the caller's now occupies this key
+            // (review round 2). The map is keyed by pair alone, so without this
+            // check a chain whose own reservation was LRU-evicted — or that
+            // simply outlived it — would reach its deadline and consume a
+            // SIBLING's freshly-recorded debt, emitting the sibling's repair on
+            // the sibling's behalf and leaving the sibling to find nothing.
+            // Comparing the reservation deadline makes the take generational:
+            // each grant stamps a distinct instant, so only the chain that owns
+            // the current reservation can consume its debt.
+            Some(_) => false,
             // The LRU evicted the reservation under key churn. Nothing to emit:
             // an evicted reservation means the next drop takes a fresh one and
             // repairs immediately, which is the stronger outcome anyway.
@@ -4793,12 +4818,12 @@ mod tests {
 
         // The window closes and a later drop takes a FRESH reservation.
         time.advance_time(RESYNC_REQUEST_MIN_INTERVAL);
-        manager
+        let fresh = manager
             .begin_resync_request(&contract, addr)
             .expect("a reservation after the window must be granted");
 
         assert!(
-            !manager.take_resync_drop_during_window(&contract, addr),
+            !manager.take_resync_drop_during_window(&contract, addr, fresh),
             "the fresh reservation must have cleared the stale flag: that drop is \
              already repaired by the request this new reservation authorizes, so a \
              sweep firing on the stale flag would be a SECOND emit for one drop"
@@ -4817,21 +4842,21 @@ mod tests {
         let contract = make_contract_key(8);
         let addr: SocketAddr = "127.0.0.1:5102".parse().unwrap();
 
-        manager
+        let deadline = manager
             .begin_resync_request(&contract, addr)
             .expect("reservation must be granted");
         assert!(
-            !manager.take_resync_drop_during_window(&contract, addr),
+            !manager.take_resync_drop_during_window(&contract, addr, deadline),
             "no drop swallowed yet, so the flag must read false"
         );
 
         manager.note_resync_drop_during_window(&contract, addr);
         assert!(
-            manager.take_resync_drop_during_window(&contract, addr),
+            manager.take_resync_drop_during_window(&contract, addr, deadline),
             "a swallowed drop must be recorded on the held reservation"
         );
         assert!(
-            !manager.take_resync_drop_during_window(&contract, addr),
+            !manager.take_resync_drop_during_window(&contract, addr, deadline),
             "taking the flag must CONSUME it — two waiters at one deadline must \
              not both emit"
         );
@@ -4852,8 +4877,54 @@ mod tests {
 
         manager.note_resync_drop_during_window(&contract, addr);
         assert!(
-            !manager.take_resync_drop_during_window(&contract, addr),
+            !manager.take_resync_drop_during_window(
+                &contract,
+                addr,
+                manager.now() + RESYNC_REQUEST_MIN_INTERVAL,
+            ),
             "with no reservation held there is nothing to flag, and nothing to emit"
+        );
+    }
+
+    /// #5510 review round 2: the take is GENERATIONAL — a chain must not consume
+    /// a debt recorded against a DIFFERENT reservation for the same pair.
+    ///
+    /// The throttle map is keyed by `(contract, target)` alone, so a chain that
+    /// outlives its own reservation (its window closed and a sibling took a fresh
+    /// one) would otherwise reach its deadline, find the sibling's freshly-noted
+    /// drop, and emit the sibling's repair on the sibling's behalf. The sibling
+    /// then finds nothing and its own drop goes unrepaired — the exact silent
+    /// loss #5510 exists to close, reintroduced one layer up. Comparing the
+    /// reservation's deadline is what makes the take belong to one generation.
+    #[test]
+    fn a_stale_chain_cannot_consume_a_newer_reservations_swallowed_drop() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(10);
+        let addr: SocketAddr = "127.0.0.1:5104".parse().unwrap();
+
+        let stale = manager
+            .begin_resync_request(&contract, addr)
+            .expect("first reservation must be granted");
+
+        // The first window closes; a sibling takes a fresh reservation and a
+        // drop is swallowed by THAT window.
+        time.advance_time(RESYNC_REQUEST_MIN_INTERVAL);
+        let fresh = manager
+            .begin_resync_request(&contract, addr)
+            .expect("a reservation after the window must be granted");
+        assert_ne!(
+            stale, fresh,
+            "each grant must stamp a distinct deadline, or the generation check              cannot tell two reservations apart"
+        );
+        manager.note_resync_drop_during_window(&contract, addr);
+
+        assert!(
+            !manager.take_resync_drop_during_window(&contract, addr, stale),
+            "the STALE chain must not consume a debt owed to the newer              reservation; doing so emits the sibling's repair for it and leaves              the sibling's own drop unrepaired"
+        );
+        assert!(
+            manager.take_resync_drop_during_window(&contract, addr, fresh),
+            "and the debt must still be there for the reservation that owns it"
         );
     }
 

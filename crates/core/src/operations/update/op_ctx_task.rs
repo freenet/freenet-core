@@ -1277,6 +1277,30 @@ impl DroppedBroadcastReason {
             DroppedBroadcastReason::DroppedDuringThrottleWindow => "dropped_during_window",
         }
     }
+
+    /// Whether repairs originating from this drop are gated on the node still
+    /// holding the contract (#5510, review round 2).
+    ///
+    /// TRUE for the rate-limiter drop only, and that asymmetry is deliberate:
+    /// `node.rs` gates the rate-limited emit on
+    /// `should_summarize_or_broadcast`, so a chain descended from one must
+    /// re-check the same condition before each coalesced emit — it can live tens
+    /// of seconds and the contract may be evicted underneath it. The
+    /// pre-existing queue-full path (#4857) has NEVER been gated on hosting, and
+    /// adding the gate here would silently narrow it: a queue-full drop means
+    /// the executor was already applying the update locally, so the repair is
+    /// warranted whatever a later hosting read says. Widening #4857's gate is
+    /// out of scope for #5510 and would be a behaviour change with no evidence
+    /// behind it.
+    fn repair_is_hosting_gated(self) -> bool {
+        match self {
+            DroppedBroadcastReason::RateLimited => true,
+            DroppedBroadcastReason::QueueFull => false,
+            // The chain's own reason. Never the ORIGIN, so it is never the value
+            // asked here — the origin is threaded through separately.
+            DroppedBroadcastReason::DroppedDuringThrottleWindow => false,
+        }
+    }
 }
 
 /// On a DROPPED inbound broadcast, emit a RATE-LIMITED `ResyncRequest` to the
@@ -1329,11 +1353,42 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
     incoming_tx: Transaction,
     reason: DroppedBroadcastReason,
 ) {
-    let Some((reservation_deadline, correlated)) =
-        reserve_resync_emit(op_manager, key, sender_addr, incoming_tx, reason).await
-    else {
-        return;
-    };
+    // `note_debt: true` — this IS a genuine new drop, so if gate 1 refuses
+    // (a reservation is already held) the debt belongs on that reservation.
+    let (reservation_deadline, correlated) =
+        match reserve_resync_emit(op_manager, key, sender_addr, incoming_tx, reason, true).await {
+            Ok(reserved) => reserved,
+            Err(ReserveRefusal::WindowHeld) => {
+                // The held reservation's chain now owes this drop's repair and
+                // will emit it at the window's close. Nothing more to do.
+                return;
+            }
+            Err(ReserveRefusal::GlobalCap) => {
+                // Review round 2: this path used to simply return. The global
+                // cap `cancel`s the reservation, so NOTHING recorded the debt
+                // and NO follow-up existed to retry it — a one-off drop that
+                // happened to arrive as a contract's third repair in a minute
+                // was lost until anti-entropy, which is the very failure #5510
+                // exists to close. Spawn a follow-up that carries the debt and
+                // retries once the cap refills. It delivers nothing first
+                // (no request was authorized) and starts its wait from a fresh
+                // interval, since the reservation it would have anchored to was
+                // released.
+                let retry_deadline =
+                    op_manager.interest_manager.now() + RESYNC_REQUEST_MIN_INTERVAL;
+                spawn_resync_followups(
+                    op_manager,
+                    key,
+                    sender_addr,
+                    incoming_tx,
+                    FollowupStart::OwedOnly {
+                        retry_at: retry_deadline,
+                    },
+                    reason,
+                );
+                return;
+            }
+        };
     // Spawn BEFORE the blocking dispatch below — that ordering is load-bearing;
     // see `spawn_resync_followups` (#4862 P2).
     spawn_resync_followups(
@@ -1341,10 +1396,42 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
         key,
         sender_addr,
         incoming_tx,
-        reservation_deadline,
-        correlated,
+        FollowupStart::Reserved {
+            deadline: reservation_deadline,
+            correlated,
+        },
+        reason,
     );
     dispatch_resync_request(op_manager, key, sender_addr, incoming_tx).await;
+}
+
+/// How a follow-up chain begins, and the reservation state that goes with it.
+///
+/// The deadline and the correlation flag are carried IN the variant rather than
+/// passed alongside it, so `OwedOnly` cannot be handed a correlation flag it has
+/// no request to correlate — the illegal pairing is unrepresentable instead of
+/// merely unwritten. Same remedy as `.claude/rules/bug-prevention-patterns.md`
+/// prescribes for paired `Option` fields that must co-occur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowupStart {
+    /// The caller holds a granted reservation and has dispatched its request.
+    /// The chain re-delivers that request, then sweeps at the window's close.
+    Reserved {
+        /// The granted reservation's close, on the throttle's own clock.
+        deadline: Instant,
+        /// Whether the correlation record was taken (#4864 round-8). Drives the
+        /// re-delivery's #4863 "did the first request already land" gate.
+        correlated: bool,
+    },
+    /// The caller was refused by the global emit cap, so nothing was emitted
+    /// and nothing is authorized. The chain owes a repair from the outset: it
+    /// delivers nothing, waits out an interval, and then tries to reserve.
+    /// There is no reservation to anchor to, hence a fresh interval and no
+    /// correlation flag.
+    OwedOnly {
+        /// When to make the first re-reservation attempt.
+        retry_at: Instant,
+    },
 }
 
 /// Take the two gates and record the correlation entry for ONE `ResyncRequest`,
@@ -1361,13 +1448,27 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
 ///
 /// Returns `None` when either gate refused, in which case NOTHING was emitted
 /// and no correlation entry exists.
+/// Which gate refused a reservation, for callers that must react differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReserveRefusal {
+    /// Gate 1: a reservation for this `(contract, sender)` is already held.
+    /// For the follow-up chain this means a SIBLING owns the window, so the
+    /// chain must stop rather than keep retrying against a reservation it does
+    /// not hold (review round 2).
+    WindowHeld,
+    /// Gate 2: the global per-contract emit cap. The window was released, so a
+    /// later attempt can take a fresh one — the debt is worth keeping.
+    GlobalCap,
+}
+
 async fn reserve_resync_emit(
     op_manager: &OpManager,
     key: ContractKey,
     sender_addr: SocketAddr,
     incoming_tx: Transaction,
     reason: DroppedBroadcastReason,
-) -> Option<(Instant, bool)> {
+    note_debt: bool,
+) -> Result<(Instant, bool), ReserveRefusal> {
     // Gate 1 — per-(contract, sender)/30s throttle (#4857/#4862 + #4864 round-6).
     // RESERVE the window atomically (`begin` checks AND records under the
     // throttle's own lock) and return the reservation deadline on the throttle's
@@ -1385,9 +1486,16 @@ async fn reserve_resync_emit(
         // ResyncRequest when the window closes. One full-state ResyncResponse
         // restores every entry the window swallowed, so one flag covers any
         // number of drops and the #4251 amplification bound is untouched.
-        op_manager
-            .interest_manager
-            .note_resync_drop_during_window(&key, sender_addr);
+        // `note_debt` is false for the chain's own coalesced retry (review
+        // round 2). Without it the retry records debt against the reservation
+        // it is ALSO tracking in `owed`, so one swallowed drop is counted
+        // twice and the pair pays an extra full-state response per window.
+        // Only a genuine NEW drop may record debt.
+        if note_debt {
+            op_manager
+                .interest_manager
+                .note_resync_drop_during_window(&key, sender_addr);
+        }
         // Per-(contract, sender)/30s throttle (existing #4857 bound).
         tracing::debug!(
             tx = %incoming_tx,
@@ -1397,7 +1505,7 @@ async fn reserve_resync_emit(
             reason = reason.as_str(),
             "UPDATE relay: dropped-broadcast ResyncRequest throttled (rate limit) to avoid amplification"
         );
-        return None;
+        return Err(ReserveRefusal::WindowHeld);
     };
 
     // ALSO subject to the GLOBAL per-contract emit cap (#4864 round-4 P1): the
@@ -1426,7 +1534,7 @@ async fn reserve_resync_emit(
             reason = reason.as_str(),
             "UPDATE relay: dropped-broadcast ResyncRequest suppressed by global per-contract cap"
         );
-        return None;
+        return Err(ReserveRefusal::GlobalCap);
     }
 
     // Both gates passed → the reservation stands (already recorded by `begin`).
@@ -1462,7 +1570,7 @@ async fn reserve_resync_emit(
         .outstanding_resync_requests
         .record(*key.id(), sender_addr);
 
-    Some((reservation_deadline, correlated))
+    Ok((reservation_deadline, correlated))
 }
 
 /// Spawn the follow-up task that owns everything this reservation still has to
@@ -1526,6 +1634,16 @@ async fn reserve_resync_emit(
 /// traffic STOPS right after a swallowed drop.
 const MAX_COALESCED_RESYNC_WINDOWS: u32 = 3;
 
+/// Maximum loop passes for one follow-up chain, however few are SERVED.
+///
+/// [`MAX_COALESCED_RESYNC_WINDOWS`] counts windows actually served, so a chain
+/// that is only ever refused would never reach it — the counters measure
+/// different things on purpose (review round 2: counting attempts as windows
+/// dropped the debt at t=90 after two refusals, having served none). This is the
+/// separate bound on attempts, so a pair whose contract is permanently over the
+/// global emit cap cannot hold its node-wide slot indefinitely.
+const MAX_COALESCED_RESYNC_ATTEMPTS: u32 = 6;
+
 /// Poll granularity for the trailing-edge wait (#5510).
 ///
 /// Deliberately coarser than [`QUEUE_FULL_RESYNC_RETRY_POLL_INTERVAL`]: the
@@ -1538,6 +1656,14 @@ const MAX_COALESCED_RESYNC_WINDOWS: u32 = 3;
 const COALESCED_RESYNC_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Throttle slot for the slot-cap log line (#5510, review finding 14).
+///
+/// Process-global, and stamped with `tokio::time::Instant`, so under
+/// `start_paused` it carries whichever test runtime touched it first. That is
+/// harmless for a log throttle — the worst case is one suppressed or one extra
+/// line — but do NOT write a test that asserts on this line's presence or
+/// absence without first moving the slot per-node. A test that did would be
+/// order-dependent in exactly the way `.claude/rules/testing.md` describes, and
+/// invisible under nextest.
 ///
 /// The condition fires once per repair attempt on a node that is by definition
 /// loaded enough to have exhausted 256 slots, so an unthrottled line there is a
@@ -1571,8 +1697,8 @@ fn spawn_resync_followups(
     key: ContractKey,
     sender_addr: SocketAddr,
     incoming_tx: Transaction,
-    reservation_deadline: Instant,
-    correlated: bool,
+    start: FollowupStart,
+    origin: DroppedBroadcastReason,
 ) {
     let Some(slot) = op_manager.interest_manager.try_reserve_resync_retry_slot() else {
         // #5510: at the node-wide cap NOTHING is spawned, so this reservation
@@ -1601,24 +1727,43 @@ fn spawn_resync_followups(
     let op_mgr = op_manager.clone();
     GlobalExecutor::spawn(async move {
         let _slot = slot; // frees the node-wide slot on task exit
-        let mut deadline = reservation_deadline;
-        let mut correlated = correlated;
+        let (mut deadline, mut correlated) = match start {
+            FollowupStart::Reserved {
+                deadline,
+                correlated,
+            } => (deadline, correlated),
+            FollowupStart::OwedOnly { retry_at } => (retry_at, false),
+        };
         // The caller dispatches ITS window's request itself, concurrently with
         // this spawn (#4862 P2), so the first pass only re-delivers.
         let mut dispatch_pending = false;
-        // Whether this pass should re-deliver at all. False only after a gate
-        // refused a coalesced emit: there is then no newly-authorized request to
+        // Whether this pass should re-deliver at all. False after a gate refused
+        // a coalesced emit — there is then no newly-authorized request to
         // re-deliver, and re-delivering the previous window's would be an emit
-        // outside any reservation — the #4251 bound.
-        let mut deliver = true;
+        // outside any reservation, the #4251 bound — and false from the outset
+        // for a chain that starts owing (the caller was capped and emitted
+        // nothing).
+        let mut deliver = matches!(start, FollowupStart::Reserved { .. });
         // A repair is owed but not yet authorized. Held ACROSS iterations
         // because the flag is consumed at the window's close, before the gates
         // run: a refusal after that point would otherwise drop the repair
         // silently, and if that was the last message on the pair the divergence
         // would persist to anti-entropy (review finding 16).
-        let mut owed = false;
-        // Windows this chain has served, INCLUDING the caller's.
-        let mut windows_used: u32 = 1;
+        let mut owed = matches!(start, FollowupStart::OwedOnly { .. });
+        // Windows this chain has SERVED — reservations actually granted and
+        // emitted on, including the caller's when it had one. Deliberately NOT
+        // a count of attempts (review round 2): incrementing on a refusal meant
+        // that with the emit cap refilling once per 60s against a 30s
+        // re-reservation, two refused attempts exhausted the bound and the debt
+        // was dropped at t=90 having never been served once. Attempts are
+        // bounded separately, by `attempts` below and by the tokio backstop
+        // inside the wait.
+        let mut windows_served: u32 = match start {
+            FollowupStart::Reserved { .. } => 1,
+            FollowupStart::OwedOnly { .. } => 0,
+        };
+        // Total loop passes, bounding a chain that only ever gets refused.
+        let mut attempts: u32 = 0;
 
         loop {
             if deliver {
@@ -1661,26 +1806,56 @@ fn spawn_resync_followups(
             if !wait_until_reservation_close(&op_mgr, key, incoming_tx, deadline).await {
                 return;
             }
+            attempts += 1;
             if !owed {
-                owed = op_mgr
-                    .interest_manager
-                    .take_resync_drop_during_window(&key, sender_addr);
+                owed = op_mgr.interest_manager.take_resync_drop_during_window(
+                    &key,
+                    sender_addr,
+                    deadline,
+                );
             }
             if !owed {
                 // The window closed with nothing swallowed: the chain has done
                 // its job and the slot goes back.
                 return;
             }
-            if windows_used >= MAX_COALESCED_RESYNC_WINDOWS {
+            if windows_served >= MAX_COALESCED_RESYNC_WINDOWS
+                || attempts >= MAX_COALESCED_RESYNC_ATTEMPTS
+            {
                 tracing::info!(
                     tx = %incoming_tx,
                     contract = %key,
                     target = %sender_addr,
-                    windows = windows_used,
+                    windows_served,
+                    attempts,
                     event = "coalesced_resync_chain_bound",
-                    "UPDATE relay: dropped-broadcast repair chain hit its window \
-                     bound and is releasing its slot; a pair still dropping this \
+                    "UPDATE relay: dropped-broadcast repair chain hit its bound \
+                     and is releasing its slot; a pair still dropping this \
                      steadily repairs from its next immediate reservation (#5510)"
+                );
+                return;
+            }
+
+            // Re-check the hosting gate before EACH coalesced emit (review
+            // round 2). A chain can live for tens of seconds, and the contract
+            // may have been evicted underneath it; without this the chain would
+            // keep asking a peer to full-state us a contract we no longer hold.
+            // Cheap: `should_summarize_or_broadcast` is in-memory plus a redb
+            // point lookup, and it short-circuits for an unheld key.
+            //
+            // Scoped to the ORIGIN, not applied unconditionally: only the
+            // rate-limiter emit is gated on hosting at its source, so gating a
+            // queue-full chain here would narrow #4857's pre-existing behaviour
+            // as a side effect of #5510. See `repair_is_hosting_gated`.
+            if origin.repair_is_hosting_gated() && !op_mgr.ring.should_summarize_or_broadcast(&key)
+            {
+                tracing::debug!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    target = %sender_addr,
+                    event = "coalesced_resync_no_longer_held",
+                    "UPDATE relay: contract no longer held; abandoning the \
+                     trailing coalesced repair (#5510)"
                 );
                 return;
             }
@@ -1691,30 +1866,56 @@ fn spawn_resync_followups(
                 sender_addr,
                 incoming_tx,
                 DroppedBroadcastReason::DroppedDuringThrottleWindow,
+                // NOT a genuine new drop: this chain already tracks the debt in
+                // `owed`, so recording it again would double-count one drop and
+                // buy the pair a second full-state response (review round 2).
+                false,
             )
             .await
             {
-                Some((next_deadline, next_correlated)) => {
+                Ok((next_deadline, next_correlated)) => {
                     owed = false;
                     deadline = next_deadline;
                     correlated = next_correlated;
                     dispatch_pending = true;
                     deliver = true;
+                    windows_served += 1;
                 }
-                None => {
-                    // A gate refused, realistically the global per-contract emit
-                    // cap: it refills 1/60s while re-reservation runs 1/30s, so
-                    // this is the common case rather than a corner. KEEP `owed`
-                    // and wait one more interval — the cap's `cancel` released
-                    // the window, so the next attempt can take a fresh one.
-                    // Do NOT re-deliver in the meantime (nothing new is
-                    // authorized), and stay under the chain bound.
+                Err(ReserveRefusal::WindowHeld) => {
+                    // A SIBLING took the reservation for this pair (review
+                    // round 2). Its chain now owns the window and will serve the
+                    // debt we just recorded on it; continuing would mean
+                    // retrying against a reservation this chain does not hold,
+                    // burning its slot to do nothing. Hand the debt over and
+                    // exit. `note_debt` was false above, so re-record it here —
+                    // deliberately, because ownership is moving.
+                    op_mgr
+                        .interest_manager
+                        .note_resync_drop_during_window(&key, sender_addr);
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        contract = %key,
+                        target = %sender_addr,
+                        event = "coalesced_resync_handed_to_sibling",
+                        "UPDATE relay: another reservation now holds this pair's \
+                         window; handing the debt to it and releasing this slot \
+                         (#5510)"
+                    );
+                    return;
+                }
+                Err(ReserveRefusal::GlobalCap) => {
+                    // The global per-contract cap refused; it refills 1/60s
+                    // against a 1/30s re-reservation, so this is the common case
+                    // rather than a corner. KEEP `owed` and wait one more
+                    // interval — the cap's `cancel` released the window, so the
+                    // next attempt can take a fresh one. Do NOT re-deliver in
+                    // the meantime (nothing new is authorized), and do NOT count
+                    // this as a served window.
                     deadline = op_mgr.interest_manager.now() + RESYNC_REQUEST_MIN_INTERVAL;
                     dispatch_pending = false;
                     deliver = false;
                 }
             }
-            windows_used += 1;
         }
     });
 }
@@ -4474,19 +4675,33 @@ mod tests {
         rx: &mut crate::node::EventLoopNotificationsReceiver,
         key: ContractKey,
     ) -> Vec<SocketAddr> {
-        let mut targets = Vec::new();
+        drain_resync_events(rx)
+            .into_iter()
+            .filter_map(|(k, target)| (k == key).then_some(target))
+            .collect()
+    }
+
+    /// Drain every emitted `ResyncRequest`, KEEPING its contract key.
+    ///
+    /// [`drain_resync_targets`] filters to one key and discards the rest, which
+    /// is fine for a single-contract test and a trap for any test watching two:
+    /// draining the first key silently eats the second key's events, and the
+    /// second assertion then reads an empty vector as "it did not emit". Use
+    /// this whenever more than one contract is in play.
+    fn drain_resync_events(
+        rx: &mut crate::node::EventLoopNotificationsReceiver,
+    ) -> Vec<(ContractKey, SocketAddr)> {
+        let mut events = Vec::new();
         while let Ok(ev) = rx.notifications_receiver.try_recv() {
             if let Either::Right(NodeEvent::SendInterestMessage {
                 target,
-                message: InterestMessage::ResyncRequest { key: k },
+                message: InterestMessage::ResyncRequest { key },
             }) = ev
             {
-                if k == key {
-                    targets.push(target);
-                }
+                events.push((key, target));
             }
         }
-        targets
+        events
     }
 
     /// Build a minimal real OpManager wired to a contract-handler stand-in that
@@ -4920,33 +5135,71 @@ mod tests {
             .collect();
 
         assert!(
-            body.contains("letmutwindows_used:u32=1;"),
-            "the chain must COUNT the windows it has served, starting at 1 for the \
-             caller's own window — starting at 0 would silently grant one extra"
+            body.contains(
+                "letmutwindows_served:u32=matchstart{FollowupStart::Reserved{..}=>1,\
+                 FollowupStart::OwedOnly{..}=>0,};"
+                    .replace(' ', "")
+                    .as_str()
+            ),
+            "the chain must COUNT the windows it has SERVED, starting at 1 only \
+             when the caller holds a granted reservation — a chain that starts \
+             owing has served none, and starting it at 1 would spend a window it \
+             never got"
         );
         let compare = body
-            .find("ifwindows_used>=MAX_COALESCED_RESYNC_WINDOWS{")
+            .find(
+                "ifwindows_served>=MAX_COALESCED_RESYNC_WINDOWS||\
+                 attempts>=MAX_COALESCED_RESYNC_ATTEMPTS{"
+                    .replace(' ', "")
+                    .as_str(),
+            )
             .expect(
-                "the chain must compare its window count against \
-                 MAX_COALESCED_RESYNC_WINDOWS — without it the chain re-reserves \
-                 without limit and holds its node-wide slot forever (#5510 \
-                 finding 1)",
+                "the chain must bound BOTH its served windows and its total \
+                 attempts — without the first it re-reserves without limit and \
+                 holds its node-wide slot forever (#5510 finding 1); without the \
+                 second a chain that is only ever refused never reaches the \
+                 window bound at all, and holds the slot just as long (review \
+                 round 2)",
             );
         assert!(
             body[compare..].contains("return;"),
-            "reaching the window bound must RETURN, so the slot guard drops and \
-             the slot goes back to the node-wide pool"
+            "reaching a bound must RETURN, so the slot guard drops and the slot \
+             goes back to the node-wide pool"
         );
-        let increment = body.find("windows_used+=1;").expect(
-            "the window count must be incremented, or the comparison above can \
-             never fire",
+
+        let grant = body
+            .find("Ok((next_deadline,next_correlated))=>{")
+            .expect("the coalesced re-reservation must match on its Result");
+        let window_held = body
+            .find("Err(ReserveRefusal::WindowHeld)=>{")
+            .expect("a sibling-held window must be a distinct arm");
+        let increment = body
+            .find("windows_served+=1;")
+            .expect("the window count must be incremented, or the bound can never fire");
+        assert!(
+            increment > grant && increment < window_held,
+            "the increment ({increment}) must sit INSIDE the granted arm \
+             ({grant}..{window_held}) — counting a REFUSAL as a served window is \
+             the review-round-2 defect: the global emit cap refills once per 60s \
+             against a 30s re-reservation, so two refusals exhausted a bound of 3 \
+             and the debt was dropped at t=90 having never been served once"
+        );
+        assert_eq!(
+            body.matches("windows_served+=1;").count(),
+            1,
+            "exactly one increment: a second one on a refusal path would \
+             reintroduce the same defect"
         );
         assert!(
             increment > compare,
             "the increment ({increment}) must come AFTER the bound check \
              ({compare}) — incrementing first would let the chain serve one fewer \
-             window than the constant names, which is a quieter bug than the one \
-             this pin is for but still a mismatch between code and doc"
+             window than the constant names"
+        );
+        assert!(
+            body.contains("attempts+=1;"),
+            "the attempt count must be incremented every pass, or its bound can \
+             never fire on a chain that is only ever refused"
         );
     }
 
@@ -4956,6 +5209,148 @@ mod tests {
     ///
     /// This is the path finding 16 made non-trivial. The flag is consumed at the
     /// window's close, BEFORE the gates run, so a naive implementation that
+    /// #5510 review round 2: the trailing coalesced emit re-checks the HOSTING
+    /// gate, and does so only for chains descended from a rate-limiter drop.
+    ///
+    /// `node.rs` emits the rate-limited repair only when
+    /// `should_summarize_or_broadcast` holds, because asking a peer to
+    /// full-state us a contract we do not hold is pure waste — it costs the
+    /// peer a WASM summarize and us the transfer, and we discard the result.
+    /// A chain lives for tens of seconds across several windows, so a contract
+    /// evicted after the first emit would otherwise keep being requested by a
+    /// gate that ran once, long ago.
+    ///
+    /// The pre-existing queue-full path (#4857) has never carried that gate, and
+    /// this test is written as a DISCRIMINATING pair for exactly that reason: two
+    /// senders on one node, one driven with each origin, identical in every other
+    /// respect. If the re-check were applied unconditionally both would fall
+    /// silent and #5510 would have quietly narrowed #4857; if it were absent
+    /// both would emit and the gate would be doing nothing. Only the intended
+    /// behaviour produces one of each.
+    #[tokio::test(start_paused = true)]
+    async fn the_coalesced_emit_rechecks_hosting_for_a_rate_limited_origin_only() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("coalesced-hosting-recheck-5510").await;
+        // A contract EACH, not two senders on one: the global per-contract emit
+        // cap is `EMIT_BURST` 2, which one immediate plus one coalesced emit
+        // exactly exhausts. Sharing a contract between the two arms starves the
+        // second coalesced emit on the cap, and the test then reads that as the
+        // hosting gate — passing for entirely the wrong reason on the arm that
+        // is supposed to stay silent.
+        let key_gated = ContractKey::from_id_and_code(
+            ContractInstanceId::new([71u8; 32]),
+            CodeHash::new([72u8; 32]),
+        );
+        let key_ungated = ContractKey::from_id_and_code(
+            ContractInstanceId::new([73u8; 32]),
+            CodeHash::new([74u8; 32]),
+        );
+        let target: SocketAddr = "127.0.0.1:13400".parse().unwrap();
+
+        // The premise, asserted rather than assumed: this node holds NEITHER
+        // contract. Without these the test would pass just as happily on a node
+        // that does, having exercised nothing.
+        for key in [key_gated, key_ungated] {
+            assert!(
+                !op_manager.ring.should_summarize_or_broadcast(&key),
+                "fixture premise: the node must not hold {key}, or the re-check \
+                 under test never fires"
+            );
+        }
+
+        // First drop on each pair: both reserve and emit immediately. The entry
+        // point is deliberately NOT gated — `node.rs` already decided.
+        // Two drops on each pair. The first reserves and emits immediately — the
+        // entry point is deliberately NOT gated, because `node.rs` already
+        // decided. The second is refused by the held window and records the debt
+        // the chain serves at its close.
+        for _ in 0..2 {
+            for (key, reason) in [
+                (key_gated, DroppedBroadcastReason::RateLimited),
+                (key_ungated, DroppedBroadcastReason::QueueFull),
+            ] {
+                send_dropped_broadcast_resync_request(
+                    &op_manager,
+                    key,
+                    target,
+                    Transaction::new::<UpdateMsg>(),
+                    reason,
+                )
+                .await;
+            }
+        }
+        let immediate = drain_resync_events(&mut notification_rx);
+        assert_eq!(
+            immediate,
+            vec![(key_gated, target), (key_ungated, target)],
+            "each pair must emit exactly its immediate request, in call order: \
+             the hosting re-check belongs to the trailing emit, not the entry \
+             point, and the second drop is inside the held window"
+        );
+
+        // Cross the reservation deadline, discarding the #4862 re-deliveries
+        // that fire before it — those are unrelated machinery and fire for both
+        // pairs alike.
+        for _ in 0..58 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            let _ = drain_resync_events(&mut notification_rx);
+        }
+        let mut at_deadline = Vec::new();
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            at_deadline.extend(drain_resync_events(&mut notification_rx));
+        }
+        let gated_emits: Vec<_> = at_deadline
+            .iter()
+            .filter(|(k, _)| *k == key_gated)
+            .collect();
+        let ungated_emits: Vec<_> = at_deadline
+            .iter()
+            .filter_map(|(k, t)| (*k == key_ungated).then_some(*t))
+            .collect();
+
+        assert!(
+            gated_emits.is_empty(),
+            "the rate-limiter-origin chain must re-check hosting and abandon its \
+             coalesced emit for a contract this node no longer holds, got \
+             {gated_emits:?}"
+        );
+        assert_eq!(
+            ungated_emits,
+            vec![target],
+            "the queue-full chain must STILL emit: #4857 has never been gated on \
+             hosting, and narrowing it here would be a behaviour change #5510 has \
+             no evidence for"
+        );
+    }
+
+    /// #5510 review round 2 companion: the gating decision lives on the ORIGIN
+    /// reason, and the chain's own reason must never be the one consulted.
+    ///
+    /// `DroppedDuringThrottleWindow` is what every coalesced emit carries, so if
+    /// the re-check ever read the chain's current reason instead of the reason it
+    /// descended from, the gate would evaluate to `false` for every chain and the
+    /// test above would keep passing on its queue-full half alone. This pins the
+    /// mapping directly.
+    #[test]
+    fn only_the_rate_limited_origin_gates_its_repair_on_hosting() {
+        assert!(
+            DroppedBroadcastReason::RateLimited.repair_is_hosting_gated(),
+            "node.rs gates the rate-limited emit on hosting, so its chain must too"
+        );
+        assert!(
+            !DroppedBroadcastReason::QueueFull.repair_is_hosting_gated(),
+            "#4857 has never been hosting-gated; gating it here would narrow it"
+        );
+        assert!(
+            !DroppedBroadcastReason::DroppedDuringThrottleWindow.repair_is_hosting_gated(),
+            "the chain's own reason is never an ORIGIN, so it must not be the \
+             value that decides gating"
+        );
+    }
+
     /// returned on refusal would drop the repair silently — and it is not a
     /// corner: the emit cap refills once per 60s while re-reservation runs once
     /// per 30s, so refusal is the common case. The chain therefore keeps the
@@ -7349,11 +7744,23 @@ mod tests {
         );
 
         // The deadline is threaded into the follow-ups so the burst is anchored
-        // to THIS reservation window (review P2-A).
+        // to THIS reservation window (review P2-A). It rides INSIDE
+        // `FollowupStart::Reserved` (review round 2, so a chain that owes a
+        // repair cannot be handed a reservation it does not hold), so the pin
+        // reads the threading at the entry point where it is decided rather than
+        // looking for a bare parameter name in the helper.
         assert!(
-            helper.contains("reservation_deadline"),
-            "the follow-up spawn must thread the reservation deadline from \
-             begin_resync_request into the retry (anchor to the window, P2-A)"
+            entry.contains("deadline: reservation_deadline"),
+            "the entry point must thread the reservation deadline from \
+             begin_resync_request into FollowupStart::Reserved (anchor to the \
+             window, P2-A)"
+        );
+        assert!(
+            helper.contains("FollowupStart::Reserved {")
+                && helper.contains("FollowupStart::OwedOnly {"),
+            "the follow-up chain must take its starting deadline from the \
+             variant it was given — reading a deadline from anywhere else would \
+             detach the burst from the reservation window it is bounded by"
         );
 
         // (1d) #4863: the correlation record MUST be written BEFORE the spawn.
