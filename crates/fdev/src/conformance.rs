@@ -542,7 +542,13 @@ async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::
         Err(raw_err) if config.wasm.is_some() => match try_unwrap_store_form(&code) {
             Some(unwrapped) => {
                 match oracle_matching_evidence(unwrapped.clone(), &evidence).await {
-                    Ok(oracle) => (unwrapped, Ok(oracle)),
+                    Ok(oracle) => {
+                        // Only NOW: the unwrapped candidate has actually
+                        // passed the identity check, not merely parsed as a
+                        // store entry.
+                        note_accepted_as_store_form();
+                        (unwrapped, Ok(oracle))
+                    }
                     Err(store_err) => {
                         // Evidence identifies contracts by INSTANCE, which
                         // `store_err` already names — but a node's contract
@@ -720,23 +726,38 @@ fn find_code_in_store(store: &Path, bundle: &ReplayBundle) -> anyhow::Result<Vec
 /// never what is TRUSTED. `None` means the bytes are not a store entry either,
 /// in which case the original failure is the whole story.
 ///
-/// Prints an explanatory note to stderr on success, never stdout: `--json`
-/// puts exactly one document on stdout and a stray line ahead of it corrupts
-/// the stream for anything parsing it. `load_inputs_never_writes_to_stdout` is
-/// scoped to `load_inputs`'s own body and cannot see inside a separate
-/// function it merely calls — the exact gap that once let
-/// `report_code_diagnostics_standalone` ship a stdout regression that left
-/// every fdev test green (see `the_standalone_report_writes_to_stderr_only`).
-/// `helper_functions_never_write_to_stdout` below is this function's own copy
-/// of that same guard.
+/// Deliberately silent. Parsing successfully only says the bytes LOOK like a
+/// store entry, not that they are the RIGHT contract — printing here told an
+/// operator handing over the WRONG contract in store form "it matched"
+/// moments before reporting a mismatch. The caller prints
+/// [`note_accepted_as_store_form`] itself, and only once the unwrapped
+/// candidate has actually passed its own identity check.
 fn try_unwrap_store_form(raw: &[u8]) -> Option<Vec<u8>> {
     let (code, _version) = ContractCode::load_versioned_from_bytes(raw.to_vec()).ok()?;
+    Some(code.data().to_vec())
+}
+
+/// Tell the operator their `--wasm` file was accepted as a contract-store
+/// entry, not raw WASM. Call only once the unwrapped candidate from
+/// [`try_unwrap_store_form`] has actually passed the caller's own identity
+/// check — never on a successful PARSE alone, which says nothing about
+/// whether the code is the right one.
+///
+/// Prints to stderr, never stdout: `--json` puts exactly one document on
+/// stdout and a stray line ahead of it corrupts the stream for anything
+/// parsing it. `load_inputs_never_writes_to_stdout` is scoped to
+/// `load_inputs`'s own body and cannot see inside a separate function it
+/// merely calls — the exact gap that once let `report_code_diagnostics_standalone`
+/// ship a stdout regression that left every fdev test green (see
+/// `the_standalone_report_writes_to_stderr_only`).
+/// `helper_functions_never_write_to_stdout` below is this function's own copy
+/// of that same guard.
+fn note_accepted_as_store_form() {
     eprintln!(
         "note: --wasm did not match as supplied; it matched after unwrapping it as \
          a contract-store entry (version header + code), which is how a node's own \
          contract store saves it"
     );
-    Some(code.data().to_vec())
 }
 
 /// Load the WASM, parameters and corpus, either from `--bundle` or from
@@ -763,12 +784,31 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<LoadedInputs> {
                     Err(raw_err @ BundleError::CodeMismatch { .. }) => {
                         match try_unwrap_store_form(&raw) {
                             Some(unwrapped) => {
-                                bundle.resolve_code(Some(unwrapped)).map_err(|store_err| {
-                                    anyhow::anyhow!(
-                                        "{raw_err}\n(read as a contract-store entry \
-                                         instead: {store_err})"
-                                    )
-                                })?
+                                match bundle.resolve_code(Some(unwrapped.clone())) {
+                                    Ok(code) => {
+                                        // Only NOW: the unwrapped candidate
+                                        // has actually passed the identity
+                                        // check, not merely parsed as a
+                                        // store entry.
+                                        note_accepted_as_store_form();
+                                        code
+                                    }
+                                    Err(store_err) => {
+                                        // `store_err`'s own hash comes from
+                                        // `BundleError::CodeMismatch`, which
+                                        // is truncated hex — not the base58
+                                        // `CodeHash` encoding a store file is
+                                        // actually named by on disk. Report
+                                        // that explicitly, same as the
+                                        // evidence site.
+                                        let inner_hash = ContractCode::from(unwrapped).hash_str();
+                                        return Err(anyhow::anyhow!(
+                                            "{raw_err}\n(read as a contract-store \
+                                             entry instead: {store_err}; its code \
+                                             hash is {inner_hash})"
+                                        ));
+                                    }
+                                }
                             }
                             None => return Err(raw_err.into()),
                         }
@@ -2123,20 +2163,30 @@ mod stdout_purity_pin {
 
     /// `load_inputs_never_writes_to_stdout` is scoped to `load_inputs`'s OWN
     /// body and cannot see inside a function it merely calls.
-    /// `try_unwrap_store_form` is exactly that: a separate function both
-    /// `load_inputs` and `verify_evidence` call to retry a `--wasm` file as a
-    /// contract-store entry, with its own new stderr note. This is the same
-    /// gap `the_standalone_report_writes_to_stderr_only` exists to close for
-    /// `report_code_diagnostics_standalone` — a scoped pin proved nothing
-    /// about code outside its own scrape once already.
+    /// `note_accepted_as_store_form` is exactly that: a separate function both
+    /// `load_inputs` and `verify_evidence` call to explain a `--wasm` file
+    /// accepted as a contract-store entry, with its own new stderr note. This
+    /// is the same gap `the_standalone_report_writes_to_stderr_only` exists
+    /// to close for `report_code_diagnostics_standalone` — a scoped pin
+    /// proved nothing about code outside its own scrape once already.
+    ///
+    /// Both halves matter, same reasoning as that pin: the negative half
+    /// alone would pass if the note were deleted outright, which silences it
+    /// instead of misplacing it.
     #[test]
     fn helper_functions_never_write_to_stdout() {
-        let body = stdout_macros_only("fn try_unwrap_store_form(");
+        let raw = code_only("fn note_accepted_as_store_form(");
+        assert!(
+            raw.contains("eprintln!"),
+            "note_accepted_as_store_form no longer writes anything, so a \
+             `--wasm` file accepted in store form is accepted silently:\n{raw}"
+        );
+        let body = stdout_macros_only("fn note_accepted_as_store_form(");
         assert!(
             !body.contains("println!") && !body.contains("print!("),
-            "try_unwrap_store_form writes to stdout, which lands ahead of the \
-             --json document and corrupts it for every consumer that parses \
-             stdout"
+            "note_accepted_as_store_form writes to stdout, which lands ahead \
+             of the --json document and corrupts it for every consumer that \
+             parses stdout"
         );
     }
 
@@ -2925,11 +2975,15 @@ mod tests {
     /// The smallest module `RuntimeOracle::standalone` will accept as a contract:
     /// a memory export plus the four entry points `missing_contract_exports_for`
     /// checks for (`validate_state`, `update_state`, `summarize_state`,
-    /// `get_state_delta`). The bodies are never meaningfully exercised — every
-    /// test using this stops at the identity check, before `verify_case` would
-    /// call into them for real — so each just returns a constant. `seed` varies
-    /// the memory size so two calls produce genuinely different code (and
-    /// therefore different instance ids).
+    /// `get_state_delta`). The tests using this DO reach `verify_case`, which
+    /// calls into these — but each export's signature doesn't match what the
+    /// real ABI expects, so the typed-function lookup fails before the body
+    /// would ever run, and that failure classifies as `Inconclusive` rather
+    /// than panicking. The bodies (`i32.const 0`) are consequently never
+    /// meaningfully exercised; they only need to exist and export the right
+    /// names for identity resolution. `seed` varies the memory size so two
+    /// calls produce genuinely different code (and therefore different
+    /// instance ids).
     fn minimal_contract_wasm(seed: u32) -> Vec<u8> {
         // Deliberately NOT a raw string: `blank_literals` (see `stdout_purity_pin`)
         // masks every literal from here to the end of the file for every source
@@ -3200,16 +3254,18 @@ mod tests {
         let err = load_inputs(&config)
             .expect_err("a store file for the WRONG contract must stay rejected");
 
-        // The inner mismatch (the SAME check the production code runs on the
-        // unwrapped bytes) names the hash the error must surface.
-        let inner_mismatch = match bundle.resolve_code(Some(wrong_code)) {
-            Err(BundleError::CodeMismatch { actual, .. }) => actual,
-            other => panic!("fixture must mismatch by code, got {other:?}"),
-        };
+        // Computed straight from the fixture, in the exact form a store file
+        // is actually named by on disk (base58 `CodeHash::encode()`) — NOT
+        // derived from `resolve_code`'s own error, whose `actual` field is
+        // truncated hex from a different comparison and would let this
+        // assertion pass even if the production code reported the wrong
+        // hash entirely.
+        let inner_hash = ContractCode::from(wrong_code).hash_str();
         assert!(
-            err.to_string().contains(&inner_mismatch),
-            "the error must name the INNER code hash so an operator can compare \
-             it against store filenames; got: {err}"
+            err.to_string().contains(&inner_hash),
+            "the error must name the INNER code hash, in the form store \
+             filenames actually use, so an operator can compare it against \
+             them; got: {err}"
         );
     }
 
