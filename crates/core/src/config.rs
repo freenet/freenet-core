@@ -4521,6 +4521,10 @@ impl SimulationIdleTimeout {
 // Thread-local test metrics: allows parallel simulation tests without interference.
 std::thread_local! {
     static GLOBAL_RESYNC_REQUESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// ResyncRequests emitted specifically because a DELTA FAILED TO APPLY —
+    /// the #2763 summary-caching signal, counted at the decision that makes it
+    /// rather than inferred from the total (#5510).
+    static GLOBAL_DELTA_FAILURE_RESYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_DELTA_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Fan-out legs skipped because the peer's cached summary already matched
     /// ours (the pre-existing mechanism, counted for #5147 diagnosis).
@@ -4642,6 +4646,7 @@ impl GlobalTestMetrics {
     /// Resets all test metrics to zero (thread-local). Call at the start of each test.
     pub fn reset() {
         GLOBAL_RESYNC_REQUESTS.with(|c| c.set(0));
+        GLOBAL_DELTA_FAILURE_RESYNCS.with(|c| c.set(0));
         GLOBAL_DELTA_SENDS.with(|c| c.set(0));
         GLOBAL_FANOUT_SUMMARY_SKIPS.with(|c| c.set(0));
         GLOBAL_BROADCAST_TARGETS_SUPPRESSED.with(|c| c.set(0));
@@ -4689,8 +4694,34 @@ impl GlobalTestMetrics {
     }
 
     /// Returns the total number of ResyncRequests received since last reset.
+    ///
+    /// This is the TOTAL across every cause. Since #5510 there are several — a
+    /// delta that failed to apply, a queue-full broadcast drop, and a
+    /// rate-limited broadcast drop (with a fourth, the trailing coalesced
+    /// repair, once #5525 lands) — so a test that means "no delta failed" must
+    /// use [`Self::delta_failure_resyncs`] instead.
+    /// Asserting zero on this total makes any new, legitimate resync source
+    /// look like the #2763 regression.
     pub fn resync_requests() -> u64 {
         GLOBAL_RESYNC_REQUESTS.with(|c| c.get())
+    }
+
+    /// Records a ResyncRequest emitted because a DELTA FAILED TO APPLY.
+    ///
+    /// Recorded at the branch that makes that decision (the `is_delta &&
+    /// !queue_full` arm of the broadcast driver), never derived by subtracting
+    /// other causes from the total — the shape
+    /// `.claude/rules/bug-prevention-patterns.md` warns about, where a
+    /// subtraction silently absorbs every other cause and keeps reporting a
+    /// plausible number after the thing it claims to measure is gone.
+    pub fn record_delta_failure_resync() {
+        GLOBAL_DELTA_FAILURE_RESYNCS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// ResyncRequests emitted because a delta failed to apply — the precise
+    /// #2763 summary-caching signal.
+    pub fn delta_failure_resyncs() -> u64 {
+        GLOBAL_DELTA_FAILURE_RESYNCS.with(|c| c.get())
     }
 
     /// Records that an UPDATE broadcast merge was skipped by the per-contract
