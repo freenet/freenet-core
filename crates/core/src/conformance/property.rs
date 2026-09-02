@@ -740,8 +740,14 @@ pub enum IdempotenceSettling {
     /// non-convergent, and the case an enforcement policy can act on without
     /// waiting for the install path to be fixed.
     NeverSettled,
-    /// The contract errored, trapped, hit a resource ceiling or asked for related
-    /// state during CLASSIFICATION, so whether it settles is unknown.
+    /// Classification could not complete, so whether the state settles is unknown.
+    ///
+    /// The cause may be the CONTRACT (it rejected the re-applied state) or OURS
+    /// (the runtime trapped, a resource ceiling was hit, a related contract was
+    /// wanted). The finding's `detail` names which, because collapsing those two
+    /// into one indistinguishable outcome destroys the only signal that would tell
+    /// us the harness has a bug — see #5509, and #5517's rule that a runtime
+    /// failure must never wear a contract error's label.
     ///
     /// The violation still stands: `merge(A, A) != A` was already established by a
     /// merge that succeeded. Only the follow-up applies failed, and they exist

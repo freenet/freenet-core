@@ -1004,18 +1004,38 @@ mod settled_counter_tests {
             &mut report,
             &violation_with(Some(IdempotenceSettling::NeverSettled)),
         );
+        count_would_remove(
+            &mut report,
+            &violation_with(Some(IdempotenceSettling::Indeterminate)),
+        );
         count_would_remove(&mut report, &violation_with(None));
 
         assert_eq!(
-            report.would_remove, 3,
-            "every removal-proposing decision counts toward the total, including \
-             the settled ones: they are removal-eligible findings"
+            report.would_remove, 4,
+            "every removal-proposing decision counts toward the total exactly ONCE, \
+             including the settled ones: they are removal-eligible findings"
         );
         assert_eq!(
             report.would_remove_settled, 1,
-            "only the settled class is in the subset — NeverSettled and the \
-             properties that carry no settling data are not"
+            "only the SETTLED class is in the subset. `Indeterminate` must not be: \
+             it is an unknown class, and counting an unknown as benign asserts the \
+             very thing that variant exists to refuse. `NeverSettled` and the \
+             properties carrying no settling data are excluded too"
         );
+    }
+
+    /// Each decision increments the total exactly once.
+    ///
+    /// Added after mutation: incrementing `would_remove` again alongside the shared
+    /// helper survived, because the test above asserted a total that happened to
+    /// match the doubled count. A drifting total is the specific thing the shared
+    /// helper exists to prevent.
+    #[test]
+    fn a_single_decision_increments_the_total_exactly_once() {
+        let mut report = ShadowReport::default();
+        count_would_remove(&mut report, &violation_with(None));
+        assert_eq!(report.would_remove, 1);
+        assert_eq!(report.would_remove_settled, 0);
     }
 
     /// Pin: BOTH removal-proposing arms route through the one counter.

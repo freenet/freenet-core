@@ -4139,6 +4139,18 @@ mod tests {
             "a Violation must be explained, not just labelled with the bare \
              enum name — got:\n{panel}"
         );
+        // The negative half, and the reason it is needed: `merge_panel` slices the
+        // WHOLE card, so the legend explaining the pill is inside the string this
+        // assertion inspects. Checking only that the new wording is present passed
+        // happily while the legend two lines below still explained it with the old
+        // claim — the page contradicting itself, in a commit titled "stop the
+        // strings lying".
+        assert!(
+            !panel.contains("cannot converge"),
+            "the card still claims every Violation cannot converge; since #5462 a \
+             settling idempotence finding converges and is still a Violation — \
+             got:\n{panel}"
+        );
         assert!(
             panel.contains("legal but wasteful"),
             "a Diagnostic must be visibly distinguished from a Violation, \

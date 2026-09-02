@@ -175,7 +175,24 @@ fn case(property: ConformanceProperty, states: &[&[u8]]) -> ConformanceCase {
 #[track_caller]
 fn assert_violates(outcome: PropertyOutcome, property: ConformanceProperty) {
     match outcome {
-        PropertyOutcome::Violated(v) => assert_eq!(v.property, property, "wrong property flagged"),
+        PropertyOutcome::Violated(v) => {
+            assert_eq!(v.property, property, "wrong property flagged");
+            // Every property EXCEPT idempotence must carry no settling data.
+            //
+            // Asserted in the shared helper rather than per test: eight sites build
+            // a `Violation` by hand and each sets `settling: None` on its own, so a
+            // per-site test would cover one and leave the copy-paste hazard on the
+            // rest. A stray classification here reads to an enforcement policy as a
+            // judgement the verifier never made.
+            if property != ConformanceProperty::StateIdempotence {
+                assert!(
+                    v.settling.is_none(),
+                    "{property} carried settling data ({:?}); only state_idempotence \
+                     classifies settling",
+                    v.settling
+                );
+            }
+        }
         other @ (PropertyOutcome::Holds | PropertyOutcome::Inconclusive(_)) => {
             panic!("expected a {property} violation, got {other:?}")
         }
@@ -1037,6 +1054,42 @@ fn an_idempotence_reordering_is_named_as_an_encoding_problem() {
         v.detail.contains("ENCODING is not canonical"),
         "a reordering must be named as an encoding problem, or the author is sent \
          to the install path when the fix is a deterministic encoding: {}",
+        v.detail
+    );
+}
+
+/// The encoding note is ABSENT when the rewrite genuinely changed content.
+///
+/// Added after mutation: appending the note unconditionally survived, because the
+/// only test asserted it IS present when it should be. A note saying "the merge
+/// agreed on content, only the byte order differs", attached to a merge that
+/// changed content, sends the author to the encoding when the defect is in the
+/// merge — the same misdirection the note exists to prevent, pointed the other way.
+#[test]
+fn the_encoding_note_is_absent_when_content_actually_changed() {
+    // Adds a byte the original does not contain, so the two are not permutations.
+    let mut fake = Fake::conforming()
+        .merging(|a, _b| {
+            let mut out = a.to_vec();
+            if !out.contains(&9) {
+                out.push(9);
+            }
+            Ok(out)
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[1u8, 2, 3]]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!("still a violation: {outcome:?}");
+    };
+    assert!(
+        !v.detail.contains("ENCODING is not canonical"),
+        "the merge changed CONTENT, not just byte order; claiming otherwise sends \
+         the author to the encoding when the defect is in the merge: {}",
         v.detail
     );
 }

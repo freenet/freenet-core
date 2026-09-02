@@ -339,6 +339,7 @@ fn run<O: ConformanceOracle + ?Sized>(
             let mut current = once.clone();
             let mut rewrites: u32 = 1;
             let mut settling = IdempotenceSettling::NeverSettled;
+            let mut classification_failure: Option<Inconclusive> = None;
             // One merge is already spent above, so the remaining budget is
             // `MAX_CANONICALIZATION_APPLIES - 1` and the total is unchanged.
             for _ in 1..MAX_CANONICALIZATION_APPLIES {
@@ -351,9 +352,21 @@ fn run<O: ConformanceOracle + ?Sized>(
                 // enforcement can act on would be the one that silently
                 // disappeared, and a contract could arrange that in one line by
                 // trapping on the second identical merge.
-                let Ok(merged) = merge(oracle, &current, &current) else {
-                    settling = IdempotenceSettling::Indeterminate;
-                    break;
+                let merged = match merge(oracle, &current, &current) {
+                    Ok(merged) => merged,
+                    Err(reason) => {
+                        // BIND the reason; do not discard it. A `let`-else here threw
+                        // the `Inconclusive` away unread, collapsing a RUNTIME trap
+                        // and a CONTRACT rejection into one indistinguishable
+                        // outcome — destroying the only signal that would tell us the
+                        // harness has a bug rather than the contract. That
+                        // distinction is the whole point of #5509/#5517, whose own
+                        // rustdoc says a runtime failure must never wear a contract
+                        // error's label.
+                        settling = IdempotenceSettling::Indeterminate;
+                        classification_failure = Some(reason);
+                        break;
+                    }
                 };
                 if merged == current {
                     settling = IdempotenceSettling::SettledAfter(rewrites);
@@ -376,10 +389,21 @@ fn run<O: ConformanceOracle + ?Sized>(
                      every re-apply, so redelivery of the same state keeps mutating it"
                 ),
                 IdempotenceSettling::Indeterminate => {
-                    "merge(A, A) != A; the contract then errored or was refused \
-                     during classification, so whether it settles is unknown. The \
-                     violation stands on the merge that succeeded"
-                        .to_string()
+                    // Name WHICH side failed. Saying "the contract errored" when the
+                    // cause was a runtime trap accuses the wrong party, and this
+                    // report is the one that would otherwise carry the harness-bug
+                    // signal (#5509).
+                    let cause = classification_failure
+                        .as_ref()
+                        .map_or_else(|| "cause not recorded".to_string(), |r| format!("{r}"));
+                    format!(
+                        "merge(A, A) != A; classification could not complete \
+                         ({cause}), so whether it settles is unknown. The violation \
+                         stands on the merge that succeeded. If that cause is a \
+                         runtime or harness failure rather than the contract's own \
+                         rejection, the unknown classification is OURS, not the \
+                         contract's"
+                    )
                 }
             };
             // Name a reordering as an ENCODING problem, the way every

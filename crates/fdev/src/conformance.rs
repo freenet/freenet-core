@@ -1,6 +1,6 @@
 //! `fdev verify-merge`: check a contract's merge laws offline (RFC #5320).
 //!
-//! A contract that breaks them cannot converge — peers given the same updates
+//! A contract that breaks them usually cannot converge — peers given the same updates
 //! in different orders end up with different state and never agree.
 //!
 //! This is a thin CLI wrapper around `freenet::conformance` and does not
@@ -3879,20 +3879,41 @@ mod tests {
     /// handed, which is the defect #5461 fixed one field over.
     #[test]
     fn the_json_report_carries_the_settling_classification() {
-        let outcomes = vec![(
-            ConformanceCase::new(
-                ConformanceProperty::StateIdempotence,
-                vec![Bytes::from(vec![1u8])],
+        let outcomes = vec![
+            (
+                ConformanceCase::new(
+                    ConformanceProperty::StateIdempotence,
+                    vec![Bytes::from(vec![1u8])],
+                ),
+                PropertyOutcome::Violated(Violation {
+                    property: ConformanceProperty::StateIdempotence,
+                    severity: Severity::Violation,
+                    left: digest(),
+                    right: digest(),
+                    detail: "merge(A, A) != A".to_string(),
+                    settling: Some(IdempotenceSettling::NeverSettled),
+                }),
             ),
-            PropertyOutcome::Violated(Violation {
-                property: ConformanceProperty::StateIdempotence,
-                severity: Severity::Violation,
-                left: digest(),
-                right: digest(),
-                detail: "merge(A, A) != A".to_string(),
-                settling: Some(IdempotenceSettling::NeverSettled),
-            }),
-        )];
+            (
+                ConformanceCase::new(
+                    ConformanceProperty::StateIdempotence,
+                    vec![Bytes::from(vec![2u8])],
+                ),
+                PropertyOutcome::Violated(Violation {
+                    property: ConformanceProperty::StateIdempotence,
+                    severity: Severity::Violation,
+                    left: digest(),
+                    right: digest(),
+                    detail: "merge(A, A) != A, settles".to_string(),
+                    // A SECOND finding with a DIFFERENT class. One fixture value can
+                    // always be satisfied by hardcoding that value: this test used
+                    // `SettledAfter` until a mutation hardcoded `SettledAfter`, and
+                    // switching to `NeverSettled` only moved which constant passed.
+                    // Two classes in one report mean no constant can.
+                    settling: Some(IdempotenceSettling::SettledAfter(1)),
+                }),
+            ),
+        ];
         let report = Report::build(&Corpus::default(), &outcomes, None, Vec::new());
         let json = serde_json::to_string(&report).expect("the report must serialize");
 
@@ -3911,8 +3932,9 @@ mod tests {
             "--json must forward the classification the verifier made: {json}"
         );
         assert!(
-            !json.contains("SettledAfter"),
-            "a classification the verifier did not make must not appear: {json}"
+            json.contains("SettledAfter"),
+            "the second finding's class must be forwarded too — with a single \
+             class in the fixture, hardcoding that class passes: {json}"
         );
     }
 

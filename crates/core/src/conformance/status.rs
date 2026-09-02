@@ -629,6 +629,47 @@ mod tests {
         }
     }
 
+    /// The node path carries the classification from the finding to the record.
+    ///
+    /// Added after mutation: replacing `settling: finding.violation.settling` with
+    /// `None` in `checked_contracts` passed both suites. The panel test constructs
+    /// a `MergeFinding` directly, so it proves the panel RENDERS a class it is
+    /// handed and says nothing about whether the node ever hands it one — the same
+    /// layering gap that let the field sit write-only for a whole round.
+    #[test]
+    fn the_node_path_carries_settling_from_the_violation() {
+        use crate::conformance::property::{ConformanceProperty, OutputDigest, Violation};
+
+        let contract = instance(3);
+        let findings = vec![super::super::shadow::Finding {
+            contract,
+            violation: Violation {
+                property: ConformanceProperty::StateIdempotence,
+                severity: Severity::Violation,
+                left: OutputDigest::of(&[1u8]),
+                right: OutputDigest::of(&[2u8]),
+                detail: "merge(A, A) != A".to_string(),
+                settling: Some(IdempotenceSettling::NeverSettled),
+            },
+            would_remove: true,
+        }];
+
+        let out = checked_contracts(&[], &findings);
+        let kept = out
+            .iter()
+            .flat_map(|c| c.findings())
+            .find(|f| f.property == "state_idempotence")
+            .expect("the finding must reach the record");
+
+        assert_eq!(
+            kept.settling,
+            Some(IdempotenceSettling::NeverSettled),
+            "the classification must survive the trip from Violation to \
+             MergeFinding; dropping it here is invisible to any test that builds \
+             a MergeFinding by hand"
+        );
+    }
+
     /// Deduplication keeps the classification a reader most needs to see.
     ///
     /// One property gets one slot per contract, so when two `state_idempotence`

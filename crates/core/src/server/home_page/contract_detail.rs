@@ -469,7 +469,7 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
                 <div class="info-grid" style="margin-top:0.75rem">
                     {cases_row}
                 </div>
-                <p class="empty" style="margin-top:0.75rem"><strong>Violation</strong> means the contract cannot converge: peers holding it disagree and retry indefinitely. <strong>Diagnostic</strong> is legal but wasteful — it never justifies removal on its own.</p>
+                <p class="empty" style="margin-top:0.75rem"><strong>Violation</strong> means the contract broke an algebraic law and is removal-eligible under enforcement. Most do not converge, but not all: a contract that normalises a stored state once and then holds still breaks idempotence and still agrees with its peers — those rows say <em>settles after a rewrite</em>. <strong>Diagnostic</strong> is legal but wasteful — it never justifies removal on its own.</p>
                 {note}
             </div>"#,
             rows = rows,
