@@ -1088,6 +1088,16 @@ mod settled_counter_tests {
                 "{arm} must count through the shared helper, or the two counters \
                  drift while the comment beside them claims they cannot"
             );
+            // And ONLY through it. Calling the helper does not stop an arm also
+            // incrementing on its own, which double-counts the number Phase 5 is
+            // judged on — and a test that calls the helper directly cannot see a
+            // second increment at the call site.
+            assert!(
+                !window.contains("report.would_remove"),
+                "{arm} touches the counters directly as well as through the shared \
+                 helper; that double-counts `would_remove` and no helper-level test \
+                 can observe it"
+            );
         }
     }
 }
