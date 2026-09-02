@@ -818,6 +818,7 @@ mod tests {
                 left: OutputDigest::of(b"a"),
                 right: OutputDigest::of(b"b"),
                 detail: "synthesised for the unreachable branch".to_string(),
+                settling: None,
             },
             would_remove: true,
         };

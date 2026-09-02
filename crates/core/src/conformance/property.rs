@@ -703,6 +703,43 @@ pub struct Violation {
     pub right: OutputDigest,
     /// Human-readable statement of what was compared. Diagnostics only; never parsed.
     pub detail: String,
+    /// Extra structure for [`ConformanceProperty::StateIdempotence`]; `None` for
+    /// every other property. See [`IdempotenceSettling`].
+    pub settling: Option<IdempotenceSettling>,
+}
+
+/// How a contract's state behaved when `merge(A, A)` was re-applied after the
+/// first application changed it.
+///
+/// Carried structurally rather than folded into [`Violation::detail`], which is
+/// documented as diagnostic and never parsed. This distinction is the one an
+/// eventual removal policy has to branch on: a contract that normalises once and
+/// then holds still is a materially different animal from one that mutates on
+/// every redelivery, and only the second is unambiguously non-convergent.
+///
+/// It is deliberately NOT a severity fork. Both are `Severity::Violation`, because
+/// `merge(A, A) != A` breaks idempotence either way. Letting the settling
+/// behaviour choose the severity would repeat the move that produced the defect
+/// this replaced: bending the *classification* to soften an *enforcement*
+/// consequence (#5462).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum IdempotenceSettling {
+    /// The state changed this many times and then stopped changing.
+    ///
+    /// A correct CANONICALIZING contract lands here with a count of 1: the PUT
+    /// install path stores the client's raw bytes without ever running
+    /// `update_state`, so a peer can hold a non-canonical state and the first
+    /// merge legitimately rewrites it. The finding is still real — two peers
+    /// delivered the same updates hold different bytes until unrelated traffic
+    /// arrives — but the harm is phantom anti-entropy rather than divergence.
+    /// Canonicalising at install removes this class entirely.
+    SettledAfter(u32),
+    /// No fixpoint within the budget: the state changes on every re-apply, so
+    /// redelivery of the same state keeps mutating it. Unambiguously
+    /// non-convergent, and the case an enforcement policy can act on without
+    /// waiting for the install path to be fixed.
+    NeverSettled,
 }
 
 impl std::fmt::Display for Violation {

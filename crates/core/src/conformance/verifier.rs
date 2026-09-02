@@ -18,7 +18,8 @@ use freenet_stdlib::prelude::{RelatedContracts, State, StateDelta, UpdateData, V
 
 use super::oracle::{ConformanceOracle, OracleError, OracleErrorKind};
 use super::property::{
-    ConformanceProperty, Inconclusive, OutputDigest, PropertyOutcome, Violation,
+    ConformanceProperty, IdempotenceSettling, Inconclusive, OutputDigest, PropertyOutcome,
+    Violation,
 };
 
 /// Shared, cheaply-clonable input bytes.
@@ -235,38 +236,79 @@ fn run<O: ConformanceOracle + ?Sized>(
 
     match case.property {
         ConformanceProperty::StateIdempotence => {
-            // Iterate to a fixpoint rather than demanding `merge(A, A) == A` on the
-            // first try.
+            // `merge(A, A) != A` is reported. The fixpoint iteration below
+            // CLASSIFIES the finding; it does not decide whether there is one.
             //
-            // A correct CANONICALIZING contract fails a single-apply check for a
-            // reason that is not a defect: the PUT install path stores the client's
-            // raw bytes without ever running `update_state`, so the state a peer
-            // holds may not be canonical yet, and the first merge rewrites it into
-            // canonical form. That first change is real. What matters is whether it
-            // then STABILIZES. The in-tree probe already learned this the hard way
-            // and iterates for exactly this reason — see the rustdoc on
-            // `executor_impl::probe_identical_input_idempotency`, which says
-            // flagging on the first change alone "would false-flag every such
-            // contract".
+            // It used to decide. The loop returned `Holds` if the state settled
+            // within `MAX_CANONICALIZATION_APPLIES`, which silently merged two very
+            // different outcomes into a pass. The reasoning was that a correct
+            // CANONICALIZING contract fails a single-apply check for a reason that
+            // is not its fault: the PUT install path stores the client's raw bytes
+            // without ever running `update_state`, so a peer can hold a
+            // non-canonical state and the first merge legitimately rewrites it.
             //
-            // So a violation here means the state never settles: every re-apply
-            // changes it again, which is genuine non-idempotence and does diverge
-            // under at-least-once delivery.
-            let a = &case.states[0];
-            let mut current = a.to_vec();
-            for _ in 0..MAX_CANONICALIZATION_APPLIES {
+            // That reasoning is true and it does not license a pass. Two peers
+            // handed the same updates then hold different bytes — permanently, not
+            // until some deadline, but until unrelated traffic happens to arrive —
+            // and their summaries differ, so anti-entropy fires over a difference
+            // carrying no information. That is idempotence broken on any honest
+            // reading, and the loop was suppressing a true finding.
+            //
+            // The choice looked binary — flag every canonicalizing contract as
+            // removal-eligible, or suppress — and it is not. The distinction is
+            // kept as DATA on the finding ([`IdempotenceSettling`]) rather than as
+            // a severity fork, so an eventual removal policy can branch on it
+            // without the verifier having pre-decided the answer. Bending the
+            // classification to soften an enforcement consequence is the specific
+            // mistake this replaced (#5462).
+            //
+            // Sequencing note: canonicalising at install removes the benign class
+            // entirely, and is what makes this honest report safe to enforce on
+            // later. Until then, expect `SettledAfter(1)` findings against correct
+            // contracts and read them as "the install path has not been fixed yet",
+            // not as "this contract is broken".
+            let a: &[u8] = &case.states[0];
+            let once = merge(oracle, a, a)?;
+            if once == a {
+                return Ok(PropertyOutcome::Holds);
+            }
+
+            // Idempotence is already broken. Everything below only decides WHICH
+            // kind, and must never turn the finding back into a pass.
+            let mut current = once.clone();
+            let mut rewrites: u32 = 1;
+            let mut settling = IdempotenceSettling::NeverSettled;
+            // One merge is already spent above, so the remaining budget is
+            // `MAX_CANONICALIZATION_APPLIES - 1` and the total is unchanged.
+            for _ in 1..MAX_CANONICALIZATION_APPLIES {
                 let merged = merge(oracle, &current, &current)?;
                 if merged == current {
-                    return Ok(PropertyOutcome::Holds);
+                    settling = IdempotenceSettling::SettledAfter(rewrites);
+                    break;
                 }
                 current = merged;
+                rewrites += 1;
             }
-            Ok(violation(
+
+            let detail = match settling {
+                IdempotenceSettling::SettledAfter(n) => format!(
+                    "merge(A, A) != A: the state was rewritten {n} time(s) and then \
+                     stopped changing. Idempotence is broken either way; a \
+                     canonicalizing contract lands here because the install path \
+                     stores raw client bytes without running update_state"
+                ),
+                IdempotenceSettling::NeverSettled => format!(
+                    "merge(A, A) != A and no fixpoint within \
+                     {MAX_CANONICALIZATION_APPLIES} applies: the state changes on \
+                     every re-apply, so redelivery of the same state keeps mutating it"
+                ),
+            };
+            Ok(idempotence_violation(
                 case.property,
-                &current,
+                &once,
                 a,
-                "merge(A, A) never reached a fixpoint: the state changes on every \
-                 re-apply, so redelivery of the same state keeps mutating it",
+                &detail,
+                settling,
             ))
         }
 
@@ -328,6 +370,7 @@ fn run<O: ConformanceOracle + ?Sized>(
                     right: OutputDigest::of(a),
                     detail: "update_state emitted a state the contract rejects as invalid"
                         .to_string(),
+                    settling: None,
                 })),
             }
         }
@@ -346,6 +389,7 @@ fn run<O: ConformanceOracle + ?Sized>(
                         right: OutputDigest::of(&again),
                         detail: "merge(A, B) returned different bytes on repeated identical calls"
                             .to_string(),
+                        settling: None,
                     }));
                 }
             }
@@ -366,6 +410,7 @@ fn run<O: ConformanceOracle + ?Sized>(
                         right: OutputDigest::of(&again),
                         detail: "summarize_state returned different bytes for the same state"
                             .to_string(),
+                        settling: None,
                     }));
                 }
             }
@@ -394,6 +439,7 @@ fn run<O: ConformanceOracle + ?Sized>(
                         right: OutputDigest::of(&again),
                         detail: "get_state_delta returned different bytes for the same inputs"
                             .to_string(),
+                        settling: None,
                     }));
                 }
             }
@@ -454,6 +500,7 @@ fn run<O: ConformanceOracle + ?Sized>(
                         "delta against an exact summary of the same state is {} bytes, not empty",
                         delta.len()
                     ),
+                    settling: None,
                 }))
             }
         }
@@ -484,6 +531,7 @@ fn run<O: ConformanceOracle + ?Sized>(
                         delta.len(),
                         a.len()
                     ),
+                    settling: None,
                 }))
             }
         }
@@ -778,6 +826,7 @@ fn reconciliation_cycle<O: ConformanceOracle + ?Sized>(
                 detail: "two valid states revisited an exact state pair while still divergent: \
                      reconciliation cannot converge"
                     .to_string(),
+                settling: None,
             }));
         }
     }
@@ -971,5 +1020,30 @@ fn violation(
         left: OutputDigest::of(left),
         right: OutputDigest::of(right),
         detail: detail.to_string(),
+        settling: None,
+    })
+}
+
+/// [`violation`] plus the settling classification, for
+/// [`ConformanceProperty::StateIdempotence`].
+///
+/// Separate constructor rather than an extra parameter on `violation`, so the
+/// other six properties cannot accidentally acquire a field that means nothing
+/// for them, and so the severity stays `property.severity()` for both — the
+/// settling data must not reach into the severity.
+fn idempotence_violation(
+    property: ConformanceProperty,
+    left: &[u8],
+    right: &[u8],
+    detail: &str,
+    settling: IdempotenceSettling,
+) -> PropertyOutcome {
+    PropertyOutcome::Violated(Violation {
+        property,
+        severity: property.severity(),
+        left: OutputDigest::of(left),
+        right: OutputDigest::of(right),
+        detail: detail.to_string(),
+        settling: Some(settling),
     })
 }

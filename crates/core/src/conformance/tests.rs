@@ -24,7 +24,8 @@ use super::evidence::{
 use super::generator::{Corpus, GeneratorConfig, generate_cases};
 use super::oracle::{ConformanceOracle, OracleError};
 use super::property::{
-    ConformanceProperty, Inconclusive, PremiseSource, PropertyOutcome, Severity,
+    ConformanceProperty, IdempotenceSettling, Inconclusive, PremiseSource, PropertyOutcome,
+    Severity,
 };
 use super::verifier::{Bytes, ConformanceCase, verify_case};
 
@@ -615,17 +616,23 @@ fn multi_round_convergence_is_not_a_cycle() {
     ));
 }
 
-/// A canonicalizing contract rewrites a non-canonical stored state once and then
-/// settles. That first change is real and is NOT a defect.
+/// A canonicalizing contract IS flagged, and is distinguishable from one that
+/// never settles.
 ///
-/// This is the shape the repo already documents on
-/// `executor_impl::probe_identical_input_idempotency`: the PUT install path stores
-/// the client's raw bytes without running `update_state`, so a peer can be holding a
-/// state its own contract has never normalized. A single-apply idempotence check
-/// flags every such contract, which is why that probe iterates to a fixpoint and why
-/// this one does too.
+/// This reverses the earlier behaviour deliberately (#5462). The old test asserted
+/// that a contract which rewrites a non-canonical stored state once and then
+/// settles is not flagged, on the reasoning that the first change is not the
+/// contract's fault: the PUT install path stores the client's raw bytes without
+/// running `update_state`, so a peer can hold a state its own contract has never
+/// normalized.
+///
+/// That reasoning is true and it does not license a pass. Two peers handed the same
+/// updates then hold different bytes until unrelated traffic happens to arrive, and
+/// their summaries differ, so anti-entropy fires over a difference carrying no
+/// information. Suppressing the finding bent the classification to soften an
+/// enforcement consequence; the distinction is kept as DATA instead.
 #[test]
-fn a_canonicalizing_contract_is_not_flagged() {
+fn a_canonicalizing_contract_is_flagged_and_says_it_settled() {
     // Sorts and dedups whatever it is given, then is stable forever after.
     let mut fake = Fake::conforming()
         .merging(|a, b| Ok(union(a, b)))
@@ -633,9 +640,120 @@ fn a_canonicalizing_contract_is_not_flagged() {
 
     // A raw, non-canonical stored state: unsorted with a duplicate.
     let raw: &[u8] = &[3, 1, 3, 2];
-    assert_holds(verify_case(
+    let outcome = verify_case(
         &mut fake,
         &case(ConformanceProperty::StateIdempotence, &[raw]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!("merge(A, A) != A must be reported, not suppressed: {outcome:?}");
+    };
+    assert_eq!(
+        v.severity,
+        Severity::Violation,
+        "the settling behaviour must not soften the severity: that is the severity \
+         fork the decision on #5462 rejected"
+    );
+    assert_eq!(
+        v.settling,
+        Some(IdempotenceSettling::SettledAfter(1)),
+        "a canonicalizing contract rewrites exactly once and then holds still; \
+         losing that distinction is what made this indistinguishable from a \
+         contract that never converges"
+    );
+}
+
+/// The rewrite count is the real number of rewrites, not a constant.
+///
+/// Added after mutation testing: changing `rewrites += 1` to `rewrites += 0`
+/// survived every other test here, because they all use contracts that stabilise
+/// after exactly one rewrite — where a stuck counter and a correct one are
+/// indistinguishable. A contract needing two rewrites separates them.
+///
+/// The count matters because it is the part an enforcement policy would threshold
+/// on: "normalises once at install" and "keeps churning for several rounds" are
+/// different claims about a contract, and both are `SettledAfter`.
+#[test]
+fn the_settled_after_count_reports_the_actual_number_of_rewrites() {
+    // Counts down to zero, one step per merge, then holds still.
+    let mut fake = Fake::conforming()
+        .merging(|a, _b| {
+            let mut out = a.to_vec();
+            if let Some(first) = out.first_mut() {
+                *first = first.saturating_sub(1);
+            }
+            Ok(out)
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    // [2] -> [1] -> [0] -> [0]: two rewrites before it settles.
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[2u8]]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!("a state that is rewritten twice must still be reported: {outcome:?}");
+    };
+    assert_eq!(
+        v.settling,
+        Some(IdempotenceSettling::SettledAfter(2)),
+        "the count must be the number of rewrites actually observed"
+    );
+}
+
+/// A contract that mutates on every re-apply is flagged the same way, and is
+/// distinguished by its settling data rather than by its severity.
+///
+/// The counterpart to the test above, and the reason the distinction is worth
+/// carrying: these two are operationally very different — one is waiting on the
+/// install-path fix, the other is unambiguously non-convergent — and before #5462
+/// the verifier reported them identically (both `Holds` if they settled within the
+/// budget, both a bare violation otherwise).
+#[test]
+fn a_never_settling_contract_is_flagged_as_never_settling() {
+    // Appends a byte every time it is merged, so it never reaches a fixpoint.
+    let mut fake = Fake::conforming()
+        .merging(|a, _b| {
+            let mut out = a.to_vec();
+            out.push(0);
+            Ok(out)
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[1u8]]),
+    );
+
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!("a state that mutates on every re-apply must be reported: {outcome:?}");
+    };
+    assert_eq!(v.severity, Severity::Violation);
+    assert_eq!(
+        v.settling,
+        Some(IdempotenceSettling::NeverSettled),
+        "never reaching a fixpoint must be recorded as such, since it is the case \
+         an enforcement policy can act on without waiting for the install path"
+    );
+}
+
+/// An idempotent contract still passes, with no finding at all.
+///
+/// The floor under both tests above: if removing the fixpoint gate had made
+/// `StateIdempotence` report on everything, they would both still pass while the
+/// property became worthless.
+#[test]
+fn an_idempotent_contract_still_holds() {
+    let mut fake = Fake::conforming()
+        .merging(|a, b| Ok(union(a, b)))
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    // Already canonical: sorted, no duplicates, so merge(A, A) == A on the first try.
+    let canonical: &[u8] = &[1, 2, 3];
+    assert_holds(verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[canonical]),
     ));
 }
 

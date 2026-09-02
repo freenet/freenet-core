@@ -36,7 +36,7 @@ use super::verifier::ConformanceCase;
 /// Bump when the meaning of a field changes. A peer that does not understand a
 /// schema version rejects the evidence rather than guessing: misinterpreting a
 /// reproducer is exactly how a false positive would spread.
-pub const EVIDENCE_SCHEMA_VERSION: u16 = 1;
+pub const EVIDENCE_SCHEMA_VERSION: u16 = 2;
 
 /// Hard ceiling on one evidence object's input bytes.
 ///

@@ -133,8 +133,8 @@ pub use minimize::{MinimizeConfig, MinimizeReport, minimize};
 pub use oracle::{ConformanceOracle, OracleError, OracleErrorKind};
 pub use policy::{ConformanceAction, EnforcementMode, decide};
 pub use property::{
-    ConformanceProperty, Inconclusive, OutputDigest, PremiseSource, PropertyOutcome, Severity,
-    Violation,
+    ConformanceProperty, IdempotenceSettling, Inconclusive, OutputDigest, PremiseSource,
+    PropertyOutcome, Severity, Violation,
 };
 pub use runtime_oracle::{OracleBuildError, RuntimeOracle};
 pub use sampler::{Admission, ContractSampler, SamplerConfig, Stratum};

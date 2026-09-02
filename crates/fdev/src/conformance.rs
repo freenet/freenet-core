@@ -33,9 +33,9 @@ use freenet::conformance::host_clock;
 use freenet::conformance::verifier::Bytes;
 use freenet::conformance::{
     ConformanceCase, ConformanceEvidence, ConformanceProperty, EVIDENCE_SCHEMA_VERSION,
-    EvidenceRejected, GeneratorConfig, Inconclusive, MinimizeConfig, OracleBuildError,
-    PropertyOutcome, ReplayBundle, RuntimeOracle, Severity, Transition, generate_cases, minimize,
-    verify_case,
+    EvidenceRejected, GeneratorConfig, IdempotenceSettling, Inconclusive, MinimizeConfig,
+    OracleBuildError, PropertyOutcome, ReplayBundle, RuntimeOracle, Severity, Transition,
+    generate_cases, minimize, verify_case,
 };
 use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId, State, UpdateData};
 use serde::Serialize;
@@ -1302,6 +1302,15 @@ struct Finding {
     detail: String,
     left: String,
     right: String,
+    /// Machine-readable settling classification for `state_idempotence`; `null`
+    /// for every other property.
+    ///
+    /// `detail` states it in prose, but `Violation::detail` is documented as
+    /// diagnostic and never parsed, and this distinction is exactly what an
+    /// eventual removal policy branches on (#5462). Carrying it only as text
+    /// would leave the tool discarding structure it was handed — the defect
+    /// #5461 fixed, one field over.
+    settling: Option<IdempotenceSettling>,
 }
 
 /// How many distinct detail texts the HUMAN report shows per inconclusive reason.
@@ -1413,6 +1422,7 @@ impl Report {
                         detail: v.detail.clone(),
                         left: v.left.to_string(),
                         right: v.right.to_string(),
+                        settling: v.settling,
                     });
                 }
                 PropertyOutcome::Inconclusive(reason) => {
@@ -3318,6 +3328,7 @@ mod tests {
             left: digest(),
             right: digest(),
             detail: "test".to_string(),
+            settling: None,
         }
     }
 
@@ -3353,6 +3364,7 @@ mod tests {
             detail: detail.to_string(),
             left: left.to_string(),
             right: right.to_string(),
+            settling: None,
         }
     }
 
@@ -3851,6 +3863,43 @@ mod tests {
         assert!(
             resource_header < resource_text,
             "the resource-limit message is not under its heading:\n{rendered}"
+        );
+    }
+
+    /// `--json` must carry the settling classification, not just its prose.
+    ///
+    /// `Violation::detail` says the same thing in words, but it is documented as
+    /// diagnostic and never parsed, and this distinction is what an eventual
+    /// removal policy branches on (#5462): a contract that normalises once is a
+    /// different animal from one that mutates on every redelivery. Dropping the
+    /// structured field here would leave the tool discarding information it was
+    /// handed, which is the defect #5461 fixed one field over.
+    #[test]
+    fn the_json_report_carries_the_settling_classification() {
+        let outcomes = vec![(
+            ConformanceCase::new(
+                ConformanceProperty::StateIdempotence,
+                vec![Bytes::from(vec![1u8])],
+            ),
+            PropertyOutcome::Violated(Violation {
+                property: ConformanceProperty::StateIdempotence,
+                severity: Severity::Violation,
+                left: digest(),
+                right: digest(),
+                detail: "merge(A, A) != A".to_string(),
+                settling: Some(IdempotenceSettling::SettledAfter(1)),
+            }),
+        )];
+        let report = Report::build(&Corpus::default(), &outcomes, None, Vec::new());
+        let json = serde_json::to_string(&report).expect("the report must serialize");
+
+        assert!(
+            json.contains("\"settling\""),
+            "the settling field never reached --json: {json}"
+        );
+        assert!(
+            json.contains("SettledAfter"),
+            "--json carries the field but not which classification: {json}"
         );
     }
 
