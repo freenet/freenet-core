@@ -1720,14 +1720,14 @@ where
                                 "UPDATE dispatch: dropped, sender over its new-pair budget"
                             );
                         }
-                        RateLimitDecision::Rejected { .. } | RateLimitDecision::Allowed => {
+                        RateLimitDecision::Rejected { .. } => {
                             // Per-drop detail stays at `debug!` (a rejected pair
                             // is rejected on every message, so a per-drop
                             // `info!` here would be the log flood it is meant
                             // to report). The RELEASE-VISIBLE signal is emitted
                             // by the limiter itself, throttled to one line per
-                            // minute with the sender, the contract and the
-                            // running total — see
+                            // minute PER CLASS with the sender, the contract,
+                            // the class and the running total — see
                             // `update_rate_limit::UpdateRateLimiter::log_rejected`.
                             // Before #5510 this drop had NO release-visible
                             // record at all: `release_max_level_info` compiles
@@ -1741,46 +1741,114 @@ where
                                 phase = "update_dispatch_rate_limited",
                                 "UPDATE dispatch: rejected by per-(sender, contract) rate limit"
                             );
-                        }
-                    }
 
-                    // #5510: a dropped BROADCAST needs a repair; a dropped
-                    // REQUEST does not.
-                    //
-                    // For the four `BroadcastTo*` variants the sender has
-                    // ALREADY cached its own summary as ours
-                    // (`broadcast_queue.rs::record_delivery_to_interest`
-                    // refreshes on a local enqueue, not on a receiver ack), and
-                    // since #5464 every later delta is a true difference
-                    // against that belief — so the entries in this dropped
-                    // message are excluded from every subsequent broadcast and
-                    // the two peers stay diverged. Nothing else heals it: the
-                    // delta-apply-failure `ResyncRequest` needs an apply that
-                    // FAILED, and nothing was applied here; anti-entropy is
-                    // 300s at minimum and 40-75 min at field shared-set sizes
-                    // (#5238/#5346). So route the drop into the same throttled
-                    // repair the queue-full drop uses.
-                    //
-                    // `RequestUpdate*` is deliberately NOT repaired: it is a
-                    // routed request whose originator observes the failure and
-                    // retries, and it caches no summary of us — emitting a
-                    // resync for it would be pure amplification onto a node
-                    // that is already refusing this sender's traffic.
-                    //
-                    // The repair rides `NetMessageV1::InterestSync`, a
-                    // different wire variant from `NetMessageV1::Update`, so
-                    // neither the `ResyncRequest` nor the `ResyncResponse` it
-                    // provokes is subject to THIS limiter. The repair cannot be
-                    // silenced by the condition it repairs.
-                    if update_class == crate::ring::update_rate_limit::UpdateClass::Broadcast {
-                        update::op_ctx_task::send_dropped_broadcast_resync_request(
-                            &op_manager,
-                            key,
-                            sender_addr,
-                            *op.id(),
-                            update::op_ctx_task::DroppedBroadcastReason::RateLimited,
-                        )
-                        .await;
+                            // #5510: a dropped BROADCAST needs a repair; a
+                            // dropped REQUEST does not.
+                            //
+                            // For the four `BroadcastTo*` variants the sender
+                            // has ALREADY cached its own summary as ours
+                            // (`broadcast_queue.rs::record_delivery_to_interest`
+                            // refreshes on a local enqueue, not on a receiver
+                            // ack), and since #5464 every later delta is a true
+                            // difference against that belief — so the entries in
+                            // this dropped message are excluded from every
+                            // subsequent broadcast and the two peers stay
+                            // diverged. Nothing else heals it: the
+                            // delta-apply-failure `ResyncRequest` needs an apply
+                            // that FAILED, and nothing was applied here;
+                            // anti-entropy is 300s at minimum and 40-75 min at
+                            // field shared-set sizes (#5238/#5346). So route the
+                            // drop into the same throttled repair the queue-full
+                            // drop uses.
+                            //
+                            // `RequestUpdate*` is deliberately NOT repaired: it
+                            // is a routed request whose originator observes the
+                            // failure and retries, and it caches no summary of
+                            // us — emitting a resync for it would be pure
+                            // amplification onto a node already refusing this
+                            // sender's traffic.
+                            //
+                            // The repair rides `NetMessageV1::InterestSync`, a
+                            // different wire variant from `NetMessageV1::Update`,
+                            // so neither the `ResyncRequest` nor the
+                            // `ResyncResponse` it provokes is subject to THIS
+                            // limiter. The repair cannot be silenced by the
+                            // condition it repairs.
+                            //
+                            // TWO GATES, both required, and both learned the
+                            // hard way in review:
+                            //
+                            // 1. This arm ONLY. The emit used to sit after the
+                            //    match and therefore ran for EVERY non-allowed
+                            //    decision. `SenderNewPairBudget` was the bad
+                            //    one: that decision means a sender is churning
+                            //    FRESH contract ids past its #4997 burst, so
+                            //    every gate downstream is vacant by
+                            //    construction — a fresh (contract, sender) key
+                            //    means `begin_resync_request` grants, a fresh
+                            //    contract means `resync_emit_limiter` grants —
+                            //    and we would emit roughly one ResyncRequest per
+                            //    refused message straight back at the flooder,
+                            //    each one inviting a full-state ResyncResponse
+                            //    that the correlation record authorizes into a
+                            //    WASM merge. The #4997 budget exists precisely
+                            //    so that traffic is FREE to refuse; a repair
+                            //    hung off it hands the refusal a cost.
+                            //
+                            // 2. We must actually HOLD the contract. `key` is
+                            //    attacker-supplied and nothing above this point
+                            //    checks it. The queue-full call sites in
+                            //    `op_ctx_task` are reached only AFTER
+                            //    `update_contract` returned `ContractQueueFull`,
+                            //    which proves the executor holds it; this arm
+                            //    proves nothing. Without the gate an attacker
+                            //    picks unlimited fresh keys and each one is a
+                            //    fresh (contract, sender) throttle entry and a
+                            //    fresh emit-limiter bucket, so the per-key
+                            //    bounds never bind.
+                            //
+                            //    `should_summarize_or_broadcast` is
+                            //    `(is_hosting_contract || contract_in_use) &&
+                            //    contract_state_present` (#4610). It is
+                            //    SYNCHRONOUS — no store await on a refusal path
+                            //    — and strictly stronger than the state-presence
+                            //    check the `ResyncRequest` HANDLER uses on the
+                            //    responder side, because it also requires that
+                            //    something here actually wants the contract.
+                            //    There is nothing to repair for a contract we do
+                            //    not hold: the sender's cached summary of us for
+                            //    it is meaningless to us.
+                            //
+                            //    This does NOT contradict the argument against
+                            //    keying the BUDGET on interest relationship. That
+                            //    would be self-granting, because receiving a
+                            //    broadcast is itself what registers the sender as
+                            //    interested. Hosting is different: an attacker
+                            //    cannot make this node hold a contract by sending
+                            //    it a `BroadcastTo`.
+                            if update_class
+                                == crate::ring::update_rate_limit::UpdateClass::Broadcast
+                                && op_manager.ring.should_summarize_or_broadcast(&key)
+                            {
+                                update::op_ctx_task::send_dropped_broadcast_resync_request(
+                                    &op_manager,
+                                    key,
+                                    sender_addr,
+                                    *op.id(),
+                                    update::op_ctx_task::DroppedBroadcastReason::RateLimited,
+                                )
+                                .await;
+                            }
+                        }
+                        RateLimitDecision::Allowed => {
+                            // Unreachable: this whole block is inside
+                            // `!rate_decision.is_allowed()`. Kept as its own arm
+                            // rather than folded into another so the match stays
+                            // exhaustive with NO catch-all — a new decision
+                            // variant must be classified deliberately, including
+                            // deciding whether it deserves a repair, instead of
+                            // inheriting one silently (#4981/#5510).
+                        }
                     }
                     return Ok(());
                 }
@@ -7286,6 +7354,17 @@ mod tests {
             .connection_manager
             .set_own_addr_local_for_test("127.0.0.1:14200".parse().unwrap());
 
+        // #5510 gate B: the repair only fires for a contract we actually HOLD.
+        // Satisfy `should_summarize_or_broadcast` = `(is_hosting_contract ||
+        // contract_in_use) && contract_state_present` for the broadcast key:
+        // a local client subscription supplies `contract_in_use`, and stored
+        // state supplies `contract_state_present`. Without BOTH this test would
+        // pass vacuously against the gate rather than the repair.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = crate::contract::storages::Storage::new(dir.path())
+            .await
+            .expect("storage");
+
         let bridge = MockNetworkBridge::new();
         let mut listener: Box<dyn NetEventRegister> =
             Box::new(crate::tracing::DynamicRegister::new(vec![]));
@@ -7299,6 +7378,30 @@ mod tests {
             freenet_stdlib::prelude::CodeHash::new([34u8; 32]),
         );
         let sender_addr: SocketAddr = "127.0.0.1:15100".parse().unwrap();
+
+        storage
+            .store_state_sync(
+                &broadcast_key,
+                freenet_stdlib::prelude::WrappedState::new(vec![1u8, 2, 3]),
+            )
+            .expect("store broadcast-key state");
+        storage
+            .store_state_sync(
+                &request_key,
+                freenet_stdlib::prelude::WrappedState::new(vec![4u8, 5, 6]),
+            )
+            .expect("store request-key state");
+        op_manager.ring.set_hosting_storage(storage);
+        for key in [broadcast_key, request_key] {
+            op_manager
+                .ring
+                .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+            assert!(
+                op_manager.ring.should_summarize_or_broadcast(&key),
+                "precondition: the node must HOLD {key} — otherwise gate B would \
+                 suppress the repair and this test would pass for the wrong reason"
+            );
+        }
 
         // Drain the notification channel and return the targets of every
         // ResyncRequest emitted for `key` since the last drain.
@@ -7433,6 +7536,319 @@ mod tests {
              ResyncRequest — its originator observes the failure and it caches no \
              summary of us, so a resync here is pure amplification onto a node \
              already refusing this sender"
+        );
+    }
+
+    /// #5510 gate A: a refusal that is NOT `Rejected` must emit NO repair.
+    ///
+    /// `SenderNewPairBudget` is the dangerous one and the reason this test
+    /// exists. That decision means a sender is churning FRESH contract ids past
+    /// its #4997 burst, so every downstream gate is vacant BY CONSTRUCTION: a
+    /// fresh `(contract, sender)` key means `begin_resync_request` grants, and a
+    /// fresh contract means `resync_emit_limiter` grants. An emit hung off this
+    /// decision would therefore fire at roughly one ResyncRequest per refused
+    /// message, straight back at the flooder, each one inviting a full-state
+    /// `ResyncResponse` that the correlation record authorizes into a WASM
+    /// merge. The whole point of the #4997 budget is that traffic over it is
+    /// FREE to refuse.
+    ///
+    /// The `rate_limited_broadcast_emits_throttled_resync_request` sibling
+    /// primes the pair first, so it only ever exercises `Rejected`; this is the
+    /// arm it cannot reach. Verified against the mutation: moving the emit back
+    /// out of the `Rejected` arm (where it sat before review) makes this FAIL.
+    #[tokio::test]
+    async fn sender_new_pair_budget_refusal_emits_no_repair() {
+        use crate::message::{DeltaOrFullState, NetMessageV1};
+        use crate::operations::test_utils::MockNetworkBridge;
+        use crate::operations::update::UpdateMsg;
+        use crate::ring::update_rate_limit::UpdateClass;
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let clock = SharedMockTimeSource::new();
+        let config_args = crate::config::ConfigArgs {
+            id: Some("new-pair-budget-no-repair-5510".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let mut node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        node_config.update_rate_limit_time_source_override =
+            Some(std::sync::Arc::new(clock.clone()));
+
+        let (mut notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14300".parse().unwrap());
+
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([41u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([42u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:15200".parse().unwrap();
+
+        // HOLD the contract, so gate B is satisfied and cannot be what makes
+        // this pass — the assertion must be about gate A alone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = crate::contract::storages::Storage::new(dir.path())
+            .await
+            .expect("storage");
+        storage
+            .store_state_sync(&key, freenet_stdlib::prelude::WrappedState::new(vec![7u8]))
+            .expect("store state");
+        op_manager.ring.set_hosting_storage(storage);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+        assert!(
+            op_manager.ring.should_summarize_or_broadcast(&key),
+            "precondition: gate B must PASS, so only gate A can suppress the repair"
+        );
+
+        // Drive the NODE's OWN limiter into the state under test rather than a
+        // stand-in: spend this sender's whole #4997 fresh-pair burst on distinct
+        // contract ids. The clock is frozen, so the bucket cannot refill and the
+        // next fresh pair — `key` — is refused with `SenderNewPairBudget`. This
+        // is exactly the flooder shape the decision exists for.
+        for i in 0..2048u32 {
+            let churn = freenet_stdlib::prelude::ContractInstanceId::new({
+                let mut id = [0u8; 32];
+                id[..4].copy_from_slice(&i.to_le_bytes());
+                id[4] = 0xAB;
+                id
+            });
+            op_manager.ring.update_rate_limiter.check_and_record(
+                sender_addr,
+                churn,
+                UpdateClass::Broadcast,
+            );
+        }
+        assert!(
+            matches!(
+                op_manager.ring.update_rate_limiter.check_and_record(
+                    sender_addr,
+                    *key.id(),
+                    UpdateClass::Broadcast
+                ),
+                crate::ring::update_rate_limit::RateLimitDecision::SenderNewPairBudget
+            ),
+            "precondition: after spending the whole fresh-pair burst on a frozen \
+             clock, the next fresh pair must be refused with SenderNewPairBudget"
+        );
+        let budget_refusals_before = op_manager
+            .ring
+            .update_rate_limiter
+            .new_pair_budget_rejected_total();
+
+        let bridge = MockNetworkBridge::new();
+        let mut listener: Box<dyn NetEventRegister> =
+            Box::new(crate::tracing::DynamicRegister::new(vec![]));
+
+        handle_pure_network_message_v1(
+            NetMessageV1::Update(UpdateMsg::BroadcastTo {
+                id: Transaction::new::<UpdateMsg>(),
+                key,
+                payload: DeltaOrFullState::Delta(vec![1, 2, 3]),
+                sender_summary_bytes: Vec::new(),
+            }),
+            Some(sender_addr),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch must not error on a new-pair-budget drop");
+
+        assert_eq!(
+            op_manager
+                .ring
+                .update_rate_limiter
+                .new_pair_budget_rejected_total(),
+            budget_refusals_before + 1,
+            "precondition: the dispatch must have been refused by the new-pair \
+             budget, not by the per-pair interval"
+        );
+
+        let mut emitted = Vec::new();
+        while let Ok(ev) = notification_rx.notifications_receiver.try_recv() {
+            if let either::Either::Right(NodeEvent::SendInterestMessage {
+                message: crate::message::InterestMessage::ResyncRequest { key: k },
+                ..
+            }) = ev
+            {
+                emitted.push(k);
+            }
+        }
+        assert!(
+            emitted.is_empty(),
+            "#5510 gate A: a SenderNewPairBudget refusal MUST emit no repair — \
+             every gate downstream is vacant for a fresh contract id, so this \
+             would be ~1 ResyncRequest per refused message back at a flooder, \
+             each inviting a full-state response into a WASM merge. Got {emitted:?}"
+        );
+        assert_eq!(
+            op_manager.interest_manager.outstanding_resync_retries(),
+            0,
+            "and it must take no node-wide follow-up slot"
+        );
+    }
+
+    /// #5510 gate B: a `Rejected` broadcast for a contract this node does NOT
+    /// hold must emit no repair.
+    ///
+    /// `key` is attacker-supplied and nothing before this point validates it.
+    /// The queue-full call sites in `op_ctx_task` are reached only after
+    /// `update_contract` returned `ContractQueueFull`, which proves the executor
+    /// holds the contract; the dispatch arm proves nothing. Without the gate an
+    /// attacker picks unlimited fresh keys, and because every key is a fresh
+    /// throttle entry AND a fresh emit-limiter bucket, none of the per-key
+    /// bounds bind.
+    ///
+    /// Same harness as `rate_limited_broadcast_emits_throttled_resync_request`
+    /// with one difference — no stored state and no subscription — so a failure
+    /// here is specifically the missing hosting gate.
+    #[tokio::test]
+    async fn rate_limited_broadcast_for_an_unheld_contract_emits_no_repair() {
+        use crate::message::{DeltaOrFullState, NetMessageV1};
+        use crate::operations::test_utils::MockNetworkBridge;
+        use crate::operations::update::UpdateMsg;
+        use crate::ring::update_rate_limit::UpdateClass;
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let clock = SharedMockTimeSource::new();
+        let config_args = crate::config::ConfigArgs {
+            id: Some("unheld-contract-no-repair-5510".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let mut node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        node_config.update_rate_limit_time_source_override =
+            Some(std::sync::Arc::new(clock.clone()));
+
+        let (mut notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14400".parse().unwrap());
+
+        // An EMPTY store: the key below is not held, and with a store attached
+        // `contract_state_present` answers honestly rather than conservatively.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = crate::contract::storages::Storage::new(dir.path())
+            .await
+            .expect("storage");
+        op_manager.ring.set_hosting_storage(storage);
+
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([51u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([52u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:15300".parse().unwrap();
+
+        assert!(
+            !op_manager.ring.should_summarize_or_broadcast(&key),
+            "precondition: this node must NOT hold the contract"
+        );
+
+        // Prime the pair so the dispatch below is a `Rejected` refusal — the one
+        // decision that DOES carry a repair. Only gate B can suppress it.
+        assert!(
+            op_manager
+                .ring
+                .update_rate_limiter
+                .check_and_record(sender_addr, *key.id(), UpdateClass::Broadcast)
+                .is_allowed(),
+            "precondition: the first broadcast for a fresh pair must be allowed"
+        );
+
+        let bridge = MockNetworkBridge::new();
+        let mut listener: Box<dyn NetEventRegister> =
+            Box::new(crate::tracing::DynamicRegister::new(vec![]));
+
+        handle_pure_network_message_v1(
+            NetMessageV1::Update(UpdateMsg::BroadcastTo {
+                id: Transaction::new::<UpdateMsg>(),
+                key,
+                payload: DeltaOrFullState::Delta(vec![1, 2, 3]),
+                sender_summary_bytes: Vec::new(),
+            }),
+            Some(sender_addr),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch must not error on a rate-limited drop");
+
+        assert_eq!(
+            op_manager.ring.update_rate_limiter.rejected_total(),
+            1,
+            "precondition: the dispatch must have been refused as `Rejected`, the \
+             decision that carries a repair"
+        );
+
+        let mut emitted = Vec::new();
+        while let Ok(ev) = notification_rx.notifications_receiver.try_recv() {
+            if let either::Either::Right(NodeEvent::SendInterestMessage {
+                message: crate::message::InterestMessage::ResyncRequest { key: k },
+                ..
+            }) = ev
+            {
+                emitted.push(k);
+            }
+        }
+        assert!(
+            emitted.is_empty(),
+            "#5510 gate B: a rate-limited broadcast for a contract we do NOT hold \
+             MUST emit no repair — `key` is attacker-supplied, and without this \
+             gate unlimited fresh keys each get a fresh throttle entry and a fresh \
+             emit-limiter bucket, so no per-key bound binds. Got {emitted:?}"
+        );
+        assert_eq!(
+            op_manager.interest_manager.outstanding_resync_retries(),
+            0,
+            "and it must take no node-wide follow-up slot"
         );
     }
 
