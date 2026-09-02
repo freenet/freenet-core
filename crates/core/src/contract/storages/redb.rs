@@ -2921,7 +2921,12 @@ mod tests {
     /// rule that a failed origin record must ABORT the whole registration (a
     /// registered-but-recordless delegate has a claimable first-writer slot).
     /// Uses the fault-injecting backend to produce a REAL redb I/O failure.
+    /// `#[serial(redb_poison_recovery)]`: poisons a backend, which increments
+    /// the process-global `POISON_RECOVERY_TRIGGERED`. Overlapping
+    /// `poisoned_redb_takes_recovery_path_benign_does_not`'s
+    /// store-zero/assert-zero window makes that test fail. See its doc.
     #[test]
+    #[serial_test::serial(redb_poison_recovery)]
     fn record_delegate_origin_first_writer_surfaces_backend_failure() {
         let backend = FailingBackend::new();
         let db = open_redb_with_backend(backend.clone());
@@ -3176,7 +3181,12 @@ mod tests {
     /// the real underlying-I/O / poison errors and NOT on benign app-level errors.
     /// Uses REAL redb errors produced via the fault-injecting backend, so it is
     /// resilient to redb wording changes (we match variants, not strings).
+    /// `#[serial(redb_poison_recovery)]`: poisons a backend, which increments
+    /// the process-global `POISON_RECOVERY_TRIGGERED`. Overlapping
+    /// `poisoned_redb_takes_recovery_path_benign_does_not`'s
+    /// store-zero/assert-zero window makes that test fail. See its doc.
     #[test]
+    #[serial_test::serial(redb_poison_recovery)]
     fn redb_poison_classifier_is_precise() {
         let backend = FailingBackend::new();
         let db = Database::builder()
@@ -3263,13 +3273,262 @@ mod tests {
         );
     }
 
+    /// Every TEST that drives the redb fault injector must carry the
+    /// `redb_poison_recovery` serial key — enforced across the whole crate, not
+    /// just this module.
+    ///
+    /// The tag on any one test is worth nothing on its own. The counter these
+    /// tests contend over, `POISON_RECOVERY_TRIGGERED`, is process-global, and
+    /// `serial_test` serializes on the KEY rather than the module — so a single
+    /// untagged user anywhere in the crate can still land inside the benign
+    /// test's store-zero/assert-zero window and make it fail. That is exactly
+    /// what happened: three tests in this module were tagged and a fourth,
+    /// `register_aborts_when_origin_record_fails_then_recovers` over in
+    /// `contract::executor::runtime`, was missed, which NARROWED the race
+    /// instead of closing it. A reviewer caught it; nothing in the tree would
+    /// have.
+    ///
+    /// So this pin walks `src/` from disk rather than using `include_str!`. A
+    /// fixed list of files is the same defect one level up: the next user of the
+    /// injector will be in a file nobody thought to add. Any test that so much
+    /// as mentions `FailingBackend` or `start_failing(` must be tagged, and
+    /// over-inclusion is the deliberate bias — a spurious tag costs a little
+    /// serialization, a missing one costs an intermittent failure that CI
+    /// cannot see (`cargo nextest` gives each test its own process; see
+    /// `.claude/rules/testing.md`).
+    #[test]
+    fn every_test_using_the_failure_injector_is_serialized() {
+        const INJECTOR_MARKERS: [&str; 2] = ["FailingBackend", "start_failing("];
+        const SERIAL_KEY: &str = "serial(redb_poison_recovery)";
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src, &mut files);
+        assert!(
+            files.len() > 50,
+            "the walk found only {} files under {}; if the layout moved, FIX THE \
+             WALK rather than letting this pin pass vacuously",
+            files.len(),
+            src.display()
+        );
+
+        let mut untagged = Vec::new();
+        let mut checked = 0usize;
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("read source file");
+            for (attrs, name, body) in functions_with_attributes(&text) {
+                let is_test = attrs.contains("test]") || attrs.contains("test(");
+                if !is_test {
+                    continue;
+                }
+                // This pin names the markers in its own source, so it matches
+                // itself. Excluded by name rather than by weakening the search.
+                if name == "every_test_using_the_failure_injector_is_serialized" {
+                    continue;
+                }
+                if !INJECTOR_MARKERS.iter().any(|m| body.contains(m)) {
+                    continue;
+                }
+                checked += 1;
+                if !attrs.contains(SERIAL_KEY) {
+                    untagged.push(format!("{}::{name}", path.display()));
+                }
+            }
+        }
+
+        // The pin must not pass because it found nothing to look at.
+        assert!(
+            checked >= 4,
+            "expected at least the four known injector tests, found {checked}; a \
+             parser that matches nothing would report success forever"
+        );
+        assert!(
+            untagged.is_empty(),
+            "these tests drive the redb fault injector without \
+             `#[serial_test::serial(redb_poison_recovery)]`, so they can run \
+             concurrently with the poison-recovery tests and corrupt the \
+             process-global POISON_RECOVERY_TRIGGERED counter they share: {untagged:#?}"
+        );
+    }
+
+    /// Blank out string literals and `//` comments so brace counting sees only
+    /// code. Handles escapes and raw strings (`r"..."`, `r#"..."#`).
+    fn strip_strings_and_comments(line: &str) -> String {
+        let bytes: Vec<char> = line.chars().collect();
+        let mut out = String::with_capacity(line.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            // Raw string: r, then any number of #, then a quote.
+            if c == 'r' {
+                let mut j = i + 1;
+                let mut hashes = 0;
+                while j < bytes.len() && bytes[j] == '#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == '"' {
+                    let close: String = std::iter::once('"')
+                        .chain(std::iter::repeat_n('#', hashes))
+                        .collect();
+                    let rest: String = bytes[j + 1..].iter().collect();
+                    match rest.find(&close) {
+                        Some(end) => {
+                            i = j + 1 + end + close.len();
+                            continue;
+                        }
+                        // Unterminated on this line: the rest is string.
+                        None => break,
+                    }
+                }
+            }
+            if c == '"' {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == '"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '\'' {
+                // Char literal or a lifetime. Only skip when it looks like a
+                // literal, so `'static` does not swallow the rest of the line.
+                if i + 2 < bytes.len() && bytes[i + 1] == '\\' {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != '\'' {
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if i + 2 < bytes.len() && bytes[i + 2] == '\'' {
+                    i += 3;
+                    continue;
+                }
+            }
+            if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == '/' {
+                break;
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Split Rust source into `(attributes, name, body)` for every `fn`.
+    ///
+    /// Braces are counted only on text with string literals and line comments
+    /// removed, which is not cosmetic: `export_dispatch_arm_defers_off_loop` in
+    /// `contract::executor::runtime` embeds an unbalanced `{` inside a string
+    /// literal, so a naive counter never closes that function and runs its
+    /// "body" to end of file — reporting it, and everything after it, as an
+    /// injector user. The first version of this pin did exactly that.
+    ///
+    /// Where it is still crude the bias is deliberately toward over-matching: a
+    /// spurious hit costs a serial tag on a test that did not need one, and is
+    /// visible. Under-matching would silently drop a function from the sweep,
+    /// which is the failure this pin exists to prevent.
+    fn functions_with_attributes(text: &str) -> Vec<(String, String, String)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = Vec::new();
+        let mut attrs = String::new();
+        for (i, raw) in lines.iter().enumerate() {
+            let line = raw.trim_start();
+            if line.starts_with("#[") || line.starts_with("///") || line.starts_with("//!") {
+                attrs.push_str(line);
+                attrs.push('\n');
+                continue;
+            }
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            if line.contains("fn ") {
+                let after_fn = line
+                    .strip_prefix("pub ")
+                    .unwrap_or(line)
+                    .strip_prefix("async ")
+                    .map(|rest| rest.strip_prefix("fn ").unwrap_or(rest))
+                    .or_else(|| line.split_once("fn ").map(|(_, rest)| rest));
+                if let Some(rest) = after_fn {
+                    let name = rest
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    if !name.is_empty() {
+                        let mut depth = 0i32;
+                        let mut body = String::new();
+                        let mut started = false;
+                        for l in &lines[i..] {
+                            body.push_str(l);
+                            body.push('\n');
+                            let code = strip_strings_and_comments(l);
+                            depth += code.matches('{').count() as i32;
+                            depth -= code.matches('}').count() as i32;
+                            if code.contains('{') {
+                                started = true;
+                            }
+                            if started && depth <= 0 {
+                                break;
+                            }
+                        }
+                        out.push((std::mem::take(&mut attrs), name, body));
+                        continue;
+                    }
+                }
+            }
+            attrs.clear();
+        }
+        out
+    }
+
     /// End-to-end (issue #4604, requirement 3): a poisoned database routes contract
     /// ops to the recovery path (process-exit-for-restart in production) rather than
     /// failing forever, while a benign not-found does NOT. The recovery handler is
     /// opt-in and OFF in tests, so it returns instead of exiting; the test-only
     /// counter proves the `begin_*` wrapper recognised the poison and would have
     /// exited under the real node binary.
+    /// `#[serial(redb_poison_recovery)]` because this test asserts on
+    /// `POISON_RECOVERY_TRIGGERED`, a PROCESS-GLOBAL counter that the `begin_*`
+    /// choke points increment for ANY poisoned handle in the process. Three
+    /// tests in this module poison a backend
+    /// (`record_delegate_origin_first_writer_surfaces_backend_failure`,
+    /// `redb_poison_classifier_is_precise`, and this one), so under the default
+    /// multi-threaded runner a sibling's increment lands inside another's
+    /// store-zero/assert-zero window and fails it.
+    ///
+    /// Measured, not theorised: 1 failure in 15 full-suite runs of
+    /// `cargo test --lib`, as
+    /// `assertion left == right failed: benign not-found / normal ops must NOT
+    /// take the poison-recovery path, left: 1, right: 0`. It is invisible under
+    /// `cargo nextest` at any repeat count, because nextest gives every test its
+    /// own process and the interference needs two tests in ONE — the exact
+    /// blindness `.claude/rules/testing.md` describes, and the reason CI never
+    /// caught it. Same shape and same fix as the version-discovery statics in
+    /// `transport.rs`.
     #[test]
+    #[serial_test::serial(redb_poison_recovery)]
     fn poisoned_redb_takes_recovery_path_benign_does_not() {
         use std::sync::atomic::Ordering;
 
