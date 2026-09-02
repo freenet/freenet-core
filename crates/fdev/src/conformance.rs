@@ -1373,8 +1373,11 @@ impl Report {
                 self.inconclusive
             )?;
             // Said once, above the messages rather than beside each one: these
-            // strings come from the contract, and a contract error routinely names
-            // what it rejected. The corpora replayed here are captured from live
+            // strings mostly come from the contract - a contract error routinely
+            // names what it rejected - but a runtime/harness failure's text comes
+            // from the WASM runtime executing an attacker-influenceable module
+            // instead, so it is untrusted for the same reason and gets the same
+            // treatment below. The corpora replayed here are captured from live
             // peers, and `bundle.rs` and `capture.rs` both mark that material
             // sensitive - this is the path that brings it to a terminal.
             if self
@@ -1384,8 +1387,8 @@ impl Report {
             {
                 writeln!(
                     out,
-                    "  (quoted messages are written by the contract and may contain \
-                     application state)"
+                    "  (quoted messages come from the contract or the WASM runtime \
+                     executing it, and may contain application state)"
                 )?;
             }
             for r in &self.inconclusive_reasons {
@@ -1565,10 +1568,12 @@ fn inconclusive_detail(reason: &Inconclusive) -> Option<&str> {
     reason.detail()
 }
 
-/// Make a contract-authored string safe and bounded for the report.
+/// Make an `Inconclusive` detail string safe and bounded for the report.
 ///
-/// Two hazards, both from one fact: this text is written by the contract under test,
-/// which is the thing we are least entitled to trust.
+/// Two hazards, both from one fact: this text comes from the contract under test or
+/// the WASM runtime executing it, neither of which we are entitled to trust — the
+/// runtime's own error text can embed detail (an export name, a trap message) drawn
+/// from the same attacker-influenceable module.
 ///
 /// Control characters are escaped first. A message containing a newline would
 /// otherwise forge report lines - a fabricated `violation:` line is one `\n` away -

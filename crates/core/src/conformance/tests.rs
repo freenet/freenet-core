@@ -793,6 +793,53 @@ fn a_runtime_failure_is_never_enforceable() {
     assert!(!outcome.is_enforceable_violation());
 }
 
+/// `Inconclusive` derives `Serialize`/`Deserialize`, and bincode's default config
+/// encodes an enum's variant as a little-endian `u32` index ahead of its payload —
+/// so inserting a variant anywhere but the end silently renumbers every variant
+/// declared after it. Nothing persists or ships a bare `Inconclusive` today (it
+/// travels only inside an in-process `PropertyOutcome`, never serialized to disk or
+/// wire), so this is not yet an observable break — but the type is `pub`,
+/// non-exhaustive, and explicitly Serialize/Deserialize, which is exactly the shape
+/// that acquires a wire consumer without every future editor noticing. Pinned the
+/// same way as `InterestMessage` (`message.rs`,
+/// `interest_message_wire_variant_indices_are_frozen`): freeze the index of every
+/// variant that exists today, so a future insertion in the middle is caught here.
+#[test]
+fn inconclusive_wire_variant_indices_are_frozen() {
+    fn variant_index(v: &Inconclusive) -> u32 {
+        let bytes = bincode::serialize(v).expect("serialize Inconclusive");
+        u32::from_le_bytes(bytes[..4].try_into().expect("variant index prefix"))
+    }
+
+    assert_eq!(variant_index(&Inconclusive::InputNotValid), 0);
+    assert_eq!(variant_index(&Inconclusive::RelatedRequired), 1);
+    assert_eq!(
+        variant_index(&Inconclusive::ContractError(String::new())),
+        2
+    );
+    assert_eq!(variant_index(&Inconclusive::NoOutputState), 3);
+    assert_eq!(
+        variant_index(&Inconclusive::ResourceLimit(String::new())),
+        4
+    );
+    assert_eq!(variant_index(&Inconclusive::RoundLimit), 5);
+    assert_eq!(
+        variant_index(&Inconclusive::MalformedCase(String::new())),
+        6
+    );
+    assert_eq!(variant_index(&Inconclusive::NoDeltaPath), 7);
+    assert_eq!(variant_index(&Inconclusive::StateNotSettled), 8);
+    assert_eq!(variant_index(&Inconclusive::NotReproducible), 9);
+    // Appended (#5509): must stay LAST. A future variant goes after this one, not
+    // before it.
+    assert_eq!(
+        variant_index(&Inconclusive::RuntimeError(String::new())),
+        10,
+        "RuntimeError must stay the last variant — insert new variants after it, \
+         never before"
+    );
+}
+
 /// A contract waiting on a related contract has not failed anything; it has told us
 /// we are missing context. Removing it for that would delete every contract that
 /// composes with another.
