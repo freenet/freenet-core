@@ -334,6 +334,40 @@ pub(crate) struct ResyncReservation {
     dropped_during_window: bool,
 }
 
+/// What a window's close says about whether a repair is owed (#5510, X3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResyncDebt {
+    /// A drop was swallowed by this window and is owed a repair.
+    Owed,
+    /// The reservation is present and nothing was swallowed.
+    None,
+    /// The reservation is GONE — evicted from the bounded LRU under pair churn
+    /// — so whether a drop was swallowed cannot be known. Treat as owed: a
+    /// redundant full state costs one response, a missed one costs a divergence
+    /// that persists to anti-entropy. Still bounded by the emit cap and the
+    /// chain bound, so conservatism here cannot amplify.
+    Unknown,
+}
+
+impl ResyncDebt {
+    /// Whether the chain should emit. `Unknown` counts as owed; see the variant.
+    pub(crate) fn is_owed(self) -> bool {
+        matches!(self, ResyncDebt::Owed | ResyncDebt::Unknown)
+    }
+}
+
+/// Outcome of [`InterestManager::begin_resync_request_or_note_drop`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResyncGrant {
+    /// A fresh reservation was taken; its window closes at `deadline`.
+    Granted { deadline: Instant },
+    /// A reservation for this pair is already held, so no request is
+    /// authorized. When the caller passed `note_debt`, the swallowed drop was
+    /// recorded on the held reservation in the SAME critical section, so the
+    /// chain owning that window will serve it at the window's close.
+    WindowHeld,
+}
+
 impl ResyncReservation {
     /// When this reservation's window closes, on the manager's `TimeSource`.
     ///
@@ -2368,12 +2402,54 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         contract: &ContractKey,
         target: SocketAddr,
     ) -> Option<Instant> {
+        match self.begin_resync_request_or_note_drop(contract, target, false) {
+            ResyncGrant::Granted { deadline } => Some(deadline),
+            ResyncGrant::WindowHeld => None,
+        }
+    }
+
+    /// Take the per-`(contract, target)` reservation, or — if the window is
+    /// already held and `note_debt` is set — record the swallowed drop, ALL
+    /// under one acquisition of the throttle lock (#5510, review round 3).
+    ///
+    /// # Why this must be one critical section
+    ///
+    /// The obvious two-step (`begin_resync_request` returning `None`, then a
+    /// separate `note_resync_drop_during_window`) has a TOCTOU window, and the
+    /// generation check does not close it — that check guards against consuming
+    /// the WRONG generation's debt, not against consuming before the debt is
+    /// written. Between the two locks, on a multi-thread runtime, the owning
+    /// chain can observe `now >= deadline`, take the flag (reading `false`),
+    /// conclude nothing is owed, exit and free its node-wide slot. The refused
+    /// caller's note then lands on an entry no chain is watching, and the drop
+    /// it recorded is never repaired — silently, which is the exact failure
+    /// #5510 exists to close.
+    ///
+    /// Holding one lock across both makes the set and the take MUTUALLY
+    /// EXCLUSIVE by construction: the note happens only while
+    /// `now < deadline`, [`Self::take_resync_drop_during_window`] runs only
+    /// when the caller has reached `now >= deadline`, and both read the same
+    /// clock under the same lock. There is no interleaving in which a flag is
+    /// written after the only reader has decided to stop looking.
+    ///
+    /// Do NOT reintroduce the two-step by calling `begin_resync_request` and
+    /// then noting separately; pinned by
+    /// `reserve_resync_emit_takes_the_window_and_the_debt_atomically`.
+    pub(crate) fn begin_resync_request_or_note_drop(
+        &self,
+        contract: &ContractKey,
+        target: SocketAddr,
+        note_debt: bool,
+    ) -> ResyncGrant {
         let now = self.time_source.now();
         let key = (*contract, target);
         let mut throttle = self.resync_request_throttle.lock();
-        if let Some(res) = throttle.get(&key) {
+        if let Some(res) = throttle.get_mut(&key) {
             if now.duration_since(res.stamped) < RESYNC_REQUEST_MIN_INTERVAL {
-                return None;
+                if note_debt {
+                    res.dropped_during_window = true;
+                }
+                return ResyncGrant::WindowHeld;
             }
         }
         // Overwriting the entry clears `dropped_during_window` by construction.
@@ -2389,17 +2465,26 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 dropped_during_window: false,
             },
         );
-        Some(now + RESYNC_REQUEST_MIN_INTERVAL)
+        ResyncGrant::Granted {
+            deadline: now + RESYNC_REQUEST_MIN_INTERVAL,
+        }
     }
 
-    /// Record that a broadcast repair was REFUSED because this `(contract,
-    /// target)` reservation window is already held (#5510).
+    /// Mark the reservation this caller JUST took as owing a repair (#5510,
+    /// review round 3, X1).
     ///
-    /// Called on the `begin_resync_request` -> `None` path. The flag is read
-    /// once at the window's close; see [`Self::take_resync_drop_during_window`].
-    /// A no-op when no reservation is held, which is correct: without one the
-    /// caller was not throttled and emitted its own request.
-    pub(crate) fn note_resync_drop_during_window(
+    /// Used on the global-emit-cap refusal, where the per-pair window was
+    /// granted but no request is authorized. The reservation is deliberately
+    /// KEPT rather than cancelled — see the call site — so later drops on the
+    /// pair are throttled into the same chain instead of each spawning one of
+    /// their own. Setting the flag here is what stops that retention from
+    /// swallowing the drop: the chain owning the window serves it at the close.
+    ///
+    /// Distinct from the note inside
+    /// [`Self::begin_resync_request_or_note_drop`], which records a drop
+    /// REFUSED by someone else's window. This records one against a window the
+    /// caller holds.
+    pub(crate) fn note_resync_debt_on_held_reservation(
         &self,
         contract: &ContractKey,
         target: SocketAddr,
@@ -2424,12 +2509,26 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         contract: &ContractKey,
         target: SocketAddr,
         expected_deadline: Instant,
-    ) -> bool {
+    ) -> ResyncDebt {
         let mut throttle = self.resync_request_throttle.lock();
         match throttle.get_mut(&(*contract, target)) {
             Some(res) if res.deadline() == expected_deadline => {
-                std::mem::replace(&mut res.dropped_during_window, false)
+                if std::mem::replace(&mut res.dropped_during_window, false) {
+                    ResyncDebt::Owed
+                } else {
+                    ResyncDebt::None
+                }
             }
+            // The chain's OWN reservation is gone from the map (review round 3,
+            // X3). The throttle is a bounded LRU, so under pair churn an entry
+            // can be evicted mid-window — taking any flag set on it with it. The
+            // chain cannot tell "no drop was swallowed" from "a drop was
+            // swallowed and the record was evicted", and those need opposite
+            // responses. Reporting it as `Unknown` lets the caller repair
+            // conservatively rather than exit on an absence it cannot interpret,
+            // which is the difference between one redundant full state and a
+            // silently unrepaired divergence.
+            None => ResyncDebt::Unknown,
             // A DIFFERENT reservation than the caller's now occupies this key
             // (review round 2). The map is keyed by pair alone, so without this
             // check a chain whose own reservation was LRU-evicted — or that
@@ -2439,11 +2538,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             // Comparing the reservation deadline makes the take generational:
             // each grant stamps a distinct instant, so only the chain that owns
             // the current reservation can consume its debt.
-            Some(_) => false,
-            // The LRU evicted the reservation under key churn. Nothing to emit:
-            // an evicted reservation means the next drop takes a fresh one and
-            // repairs immediately, which is the stronger outcome anyway.
-            None => false,
+            Some(_) => ResyncDebt::None,
         }
     }
 
@@ -4814,7 +4909,11 @@ mod tests {
 
         // A drop is swallowed by the held window, and nothing ever consumes the
         // flag — the waiter was never spawned (slot cap) or did not survive.
-        manager.note_resync_drop_during_window(&contract, addr);
+        assert_eq!(
+            manager.begin_resync_request_or_note_drop(&contract, addr, true),
+            ResyncGrant::WindowHeld,
+            "a second drop inside the window must be refused"
+        );
 
         // The window closes and a later drop takes a FRESH reservation.
         time.advance_time(RESYNC_REQUEST_MIN_INTERVAL);
@@ -4822,8 +4921,9 @@ mod tests {
             .begin_resync_request(&contract, addr)
             .expect("a reservation after the window must be granted");
 
-        assert!(
-            !manager.take_resync_drop_during_window(&contract, addr, fresh),
+        assert_eq!(
+            manager.take_resync_drop_during_window(&contract, addr, fresh),
+            ResyncDebt::None,
             "the fresh reservation must have cleared the stale flag: that drop is \
              already repaired by the request this new reservation authorizes, so a \
              sweep firing on the stale flag would be a SECOND emit for one drop"
@@ -4845,18 +4945,26 @@ mod tests {
         let deadline = manager
             .begin_resync_request(&contract, addr)
             .expect("reservation must be granted");
-        assert!(
-            !manager.take_resync_drop_during_window(&contract, addr, deadline),
+        assert_eq!(
+            manager.take_resync_drop_during_window(&contract, addr, deadline),
+            ResyncDebt::None,
             "no drop swallowed yet, so the flag must read false"
         );
 
-        manager.note_resync_drop_during_window(&contract, addr);
-        assert!(
-            manager.take_resync_drop_during_window(&contract, addr, deadline),
-            "a swallowed drop must be recorded on the held reservation"
+        assert_eq!(
+            manager.begin_resync_request_or_note_drop(&contract, addr, true),
+            ResyncGrant::WindowHeld,
+            "the window is held, so this drop must be refused"
         );
-        assert!(
-            !manager.take_resync_drop_during_window(&contract, addr, deadline),
+        assert_eq!(
+            manager.take_resync_drop_during_window(&contract, addr, deadline),
+            ResyncDebt::Owed,
+            "a swallowed drop must be recorded on the held reservation, and it \
+             must be recorded by the SAME call that refused it"
+        );
+        assert_eq!(
+            manager.take_resync_drop_during_window(&contract, addr, deadline),
+            ResyncDebt::None,
             "taking the flag must CONSUME it — two waiters at one deadline must \
              not both emit"
         );
@@ -4875,14 +4983,72 @@ mod tests {
         let contract = make_contract_key(9);
         let addr: SocketAddr = "127.0.0.1:5103".parse().unwrap();
 
-        manager.note_resync_drop_during_window(&contract, addr);
+        // No reservation held, so this GRANTS rather than refusing — there is
+        // no window to record a debt against, and inventing one would hand out
+        // an emit nobody is owed.
         assert!(
-            !manager.take_resync_drop_during_window(
+            matches!(
+                manager.begin_resync_request_or_note_drop(&contract, addr, true),
+                ResyncGrant::Granted { .. }
+            ),
+            "with no reservation held the caller is not throttled, so it takes \
+             the window and emits its own request"
+        );
+        assert_eq!(
+            manager.take_resync_drop_during_window(
                 &contract,
                 addr,
                 manager.now() + RESYNC_REQUEST_MIN_INTERVAL,
             ),
-            "with no reservation held there is nothing to flag, and nothing to emit"
+            ResyncDebt::None,
+            "a granted reservation starts with no debt: the caller emits for \
+             itself, so nothing is owed to a later sweep"
+        );
+    }
+
+    /// #5510 review round 3 (X3): an evicted reservation reads as UNKNOWN, not
+    /// as "nothing owed".
+    ///
+    /// The throttle is a bounded LRU. Under pair churn it can evict a live
+    /// reservation mid-window, taking any dropped-during-window flag with it.
+    /// The chain then cannot distinguish "no drop was swallowed" from "a drop
+    /// was swallowed and the record is gone" — and those need opposite
+    /// responses. Reporting a bare `false` made the chain exit, so the drop went
+    /// unrepaired until anti-entropy, silently.
+    ///
+    /// The conservative reading costs at most one redundant full state, and is
+    /// still bounded by the emit cap and the chain bound. The other error is
+    /// unbounded in time.
+    #[test]
+    fn an_evicted_reservation_reads_as_unknown_rather_than_unowed() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(11);
+        let addr: SocketAddr = "127.0.0.1:5105".parse().unwrap();
+
+        let deadline = manager
+            .begin_resync_request(&contract, addr)
+            .expect("first reservation must be granted");
+        manager.begin_resync_request_or_note_drop(&contract, addr, true);
+
+        // Churn the LRU past its capacity so this pair's entry is evicted.
+        for i in 0..(RESYNC_THROTTLE_CACHE_SIZE + 16) {
+            let other = make_contract_key((i % 200) as u8);
+            let other_addr: SocketAddr =
+                format!("127.0.0.2:{}", 1024 + (i % 60000)).parse().unwrap();
+            manager.begin_resync_request(&other, other_addr);
+        }
+
+        assert_eq!(
+            manager.take_resync_drop_during_window(&contract, addr, deadline),
+            ResyncDebt::Unknown,
+            "an evicted reservation must read as Unknown: the debt it carried is \
+             unknowable, and reporting it as 'nothing owed' loses a real drop \
+             silently — the exact failure #5510 exists to close"
+        );
+        assert!(
+            ResyncDebt::Unknown.is_owed(),
+            "and Unknown must be treated as owed, or distinguishing it changes \
+             nothing"
         );
     }
 
@@ -4916,14 +5082,21 @@ mod tests {
             stale, fresh,
             "each grant must stamp a distinct deadline, or the generation check              cannot tell two reservations apart"
         );
-        manager.note_resync_drop_during_window(&contract, addr);
+        assert_eq!(
+            manager.begin_resync_request_or_note_drop(&contract, addr, true),
+            ResyncGrant::WindowHeld,
+            "the sibling's window is held, so this drop is refused and its debt \
+             lands on the sibling's reservation"
+        );
 
-        assert!(
-            !manager.take_resync_drop_during_window(&contract, addr, stale),
+        assert_eq!(
+            manager.take_resync_drop_during_window(&contract, addr, stale),
+            ResyncDebt::None,
             "the STALE chain must not consume a debt owed to the newer              reservation; doing so emits the sibling's repair for it and leaves              the sibling's own drop unrepaired"
         );
-        assert!(
+        assert_eq!(
             manager.take_resync_drop_during_window(&contract, addr, fresh),
+            ResyncDebt::Owed,
             "and the debt must still be there for the reservation that owns it"
         );
     }

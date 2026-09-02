@@ -4695,11 +4695,10 @@ impl GlobalTestMetrics {
 
     /// Returns the total number of ResyncRequests received since last reset.
     ///
-    /// This is the TOTAL across every cause. Since #5510 there are several — a
-    /// delta that failed to apply, a queue-full broadcast drop, and a
-    /// rate-limited broadcast drop (with a fourth, the trailing coalesced
-    /// repair, once #5525 lands) — so a test that means "no delta failed" must
-    /// use [`Self::delta_failure_resyncs`] instead.
+    /// This is the TOTAL across every cause. Since #5510 there are four — a
+    /// delta that failed to apply, a queue-full broadcast drop, a rate-limited
+    /// broadcast drop, and the trailing coalesced repair — so a test that means
+    /// "no delta failed" must use [`Self::delta_failure_resyncs`] instead.
     /// Asserting zero on this total makes any new, legitimate resync source
     /// look like the #2763 regression.
     pub fn resync_requests() -> u64 {

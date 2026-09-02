@@ -389,15 +389,24 @@ pub(crate) const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// # Tuning this back toward 100ms is not free
 ///
-/// The obvious "safer" move is the wrong one. Raising the interval raises
-/// drop pressure, and the repair cannot absorb the extra drops: it allows
-/// one `ResyncRequest` per `(contract, sender)` per 30s, so the SECOND and
-/// later drops inside a window are refused and, on this branch, nothing
-/// re-sends them — they wait for the next drop after the window closes, or
-/// for the ~5-minute anti-entropy heartbeat. A higher interval therefore
-/// buys drops that land squarely in the repair's blind spot. #5525 closes
-/// that spot with a trailing coalesced repair; until it lands, treat every
-/// drop beyond the first per window as unrepaired.
+/// The obvious "safer" move is the wrong one, and the coupling is not
+/// visible from this constant alone. Raising the interval raises drop
+/// pressure. Every drop is repaired — a drop that takes a fresh
+/// reservation emits its own `ResyncRequest`, and a drop swallowed by a
+/// held window is repaired by the trailing coalesced request at that
+/// window's close — but the repair's COST scales with drop pressure while
+/// its rate does not: still at most one extra request per window per pair,
+/// and one full-state `ResyncResponse` per request.
+///
+/// What actually binds is slots. Each repair chain holds one of the
+/// [`crate::ring::interest::MAX_OUTSTANDING_QUEUE_FULL_RESYNC_RETRIES`]
+/// (256) node-wide follow-up slots for up to
+/// `MAX_COALESCED_RESYNC_WINDOWS` served windows (3 x 30s) plus its
+/// attempts bound, and gate 1 is per `(contract, sender)`, so a contract
+/// with N dropping senders can want N chains per window. A higher interval
+/// therefore thins the very backstop meant to catch the extra drops it
+/// creates, and does so exactly when the node is busiest. Widening and
+/// narrowing this number are NOT symmetric.
 ///
 /// On the adversarial side, do not lean on the #4997 per-sender budget
 /// here: it charges a token only for a pair the limiter is not currently

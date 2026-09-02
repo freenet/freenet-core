@@ -1277,30 +1277,6 @@ impl DroppedBroadcastReason {
             DroppedBroadcastReason::DroppedDuringThrottleWindow => "dropped_during_window",
         }
     }
-
-    /// Whether repairs originating from this drop are gated on the node still
-    /// holding the contract (#5510, review round 2).
-    ///
-    /// TRUE for the rate-limiter drop only, and that asymmetry is deliberate:
-    /// `node.rs` gates the rate-limited emit on
-    /// `should_summarize_or_broadcast`, so a chain descended from one must
-    /// re-check the same condition before each coalesced emit — it can live tens
-    /// of seconds and the contract may be evicted underneath it. The
-    /// pre-existing queue-full path (#4857) has NEVER been gated on hosting, and
-    /// adding the gate here would silently narrow it: a queue-full drop means
-    /// the executor was already applying the update locally, so the repair is
-    /// warranted whatever a later hosting read says. Widening #4857's gate is
-    /// out of scope for #5510 and would be a behaviour change with no evidence
-    /// behind it.
-    fn repair_is_hosting_gated(self) -> bool {
-        match self {
-            DroppedBroadcastReason::RateLimited => true,
-            DroppedBroadcastReason::QueueFull => false,
-            // The chain's own reason. Never the ORIGIN, so it is never the value
-            // asked here — the origin is threaded through separately.
-            DroppedBroadcastReason::DroppedDuringThrottleWindow => false,
-        }
-    }
 }
 
 /// On a DROPPED inbound broadcast, emit a RATE-LIMITED `ResyncRequest` to the
@@ -1363,7 +1339,7 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
                 // will emit it at the window's close. Nothing more to do.
                 return;
             }
-            Err(ReserveRefusal::GlobalCap) => {
+            Err(ReserveRefusal::GlobalCap { deadline }) => {
                 // Review round 2: this path used to simply return. The global
                 // cap `cancel`s the reservation, so NOTHING recorded the debt
                 // and NO follow-up existed to retry it — a one-off drop that
@@ -1371,11 +1347,13 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
                 // was lost until anti-entropy, which is the very failure #5510
                 // exists to close. Spawn a follow-up that carries the debt and
                 // retries once the cap refills. It delivers nothing first
-                // (no request was authorized) and starts its wait from a fresh
-                // interval, since the reservation it would have anchored to was
-                // released.
-                let retry_deadline =
-                    op_manager.interest_manager.now() + RESYNC_REQUEST_MIN_INTERVAL;
+                // (no request was authorized) and anchors on the reservation
+                // it actually holds (X1) rather than an approximation of it: the
+                // window is what bounds the chain, and waiting on a different
+                // instant than the one the flag lives on means either waking
+                // early to find nothing or waking late and holding the slot past
+                // the window.
+                let retry_deadline = deadline;
                 spawn_resync_followups(
                     op_manager,
                     key,
@@ -1384,7 +1362,6 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
                     FollowupStart::OwedOnly {
                         retry_at: retry_deadline,
                     },
-                    reason,
                 );
                 return;
             }
@@ -1400,7 +1377,6 @@ pub(crate) async fn send_dropped_broadcast_resync_request(
             deadline: reservation_deadline,
             correlated,
         },
-        reason,
     );
     dispatch_resync_request(op_manager, key, sender_addr, incoming_tx).await;
 }
@@ -1456,9 +1432,13 @@ pub(crate) enum ReserveRefusal {
     /// chain must stop rather than keep retrying against a reservation it does
     /// not hold (review round 2).
     WindowHeld,
-    /// Gate 2: the global per-contract emit cap. The window was released, so a
-    /// later attempt can take a fresh one — the debt is worth keeping.
-    GlobalCap,
+    /// Gate 2: the global per-contract emit cap. The window is KEPT and its
+    /// dropped-during-window flag set (review round 3, X1), so the chain that
+    /// owns it serves the debt at the close and later drops on the pair are
+    /// throttled into that same chain rather than each spawning one. Carries
+    /// the held reservation's deadline so the chain anchors on the real window
+    /// rather than an approximation of it.
+    GlobalCap { deadline: Instant },
 }
 
 async fn reserve_resync_emit(
@@ -1476,9 +1456,11 @@ async fn reserve_resync_emit(
     // callbacks for the same (contract, sender) cannot both pass. If the global
     // cap below then rejects, we `cancel` the reservation so the window is
     // released (not burned).
-    let Some(reservation_deadline) = op_manager
+    let crate::ring::interest::ResyncGrant::Granted {
+        deadline: reservation_deadline,
+    } = op_manager
         .interest_manager
-        .begin_resync_request(&key, sender_addr)
+        .begin_resync_request_or_note_drop(&key, sender_addr, note_debt)
     else {
         // #5510: this drop's repair is being refused, and BEFORE this change
         // nothing ever re-sent it — the throttle simply returned. Mark the held
@@ -1486,16 +1468,17 @@ async fn reserve_resync_emit(
         // ResyncRequest when the window closes. One full-state ResyncResponse
         // restores every entry the window swallowed, so one flag covers any
         // number of drops and the #4251 amplification bound is untouched.
+        // The debt was recorded INSIDE the call above, under the throttle's own
+        // lock, when `note_debt` is set — never as a second lock acquisition
+        // here. See `begin_resync_request_or_note_drop` for why the two-step
+        // has a TOCTOU hole the generation check does not close.
+        //
         // `note_debt` is false for the chain's own coalesced retry (review
         // round 2). Without it the retry records debt against the reservation
         // it is ALSO tracking in `owed`, so one swallowed drop is counted
         // twice and the pair pays an extra full-state response per window.
         // Only a genuine NEW drop may record debt.
-        if note_debt {
-            op_manager
-                .interest_manager
-                .note_resync_drop_during_window(&key, sender_addr);
-        }
+        //
         // Per-(contract, sender)/30s throttle (existing #4857 bound).
         tracing::debug!(
             tx = %incoming_tx,
@@ -1515,8 +1498,21 @@ async fn reserve_resync_emit(
     // emission. (This is NOT a mirror of the delta-failure path — that path is
     // global-cap-only, with no per-sender throttle. The global suppression records
     // the same `record_resync_request_suppressed` metric node.rs does.) On
-    // suppression, CANCEL the reservation so the per-sender window is released and
-    // the sender retries as soon as global tokens refill.
+    // suppression, KEEP the reservation and mark it as owing a repair.
+    //
+    // This used to `cancel`, releasing the window so the sender could retry as
+    // soon as tokens refilled. That was wrong once a follow-up chain existed
+    // (#5510 review round 3, X1): with the window released, EVERY later drop on
+    // the pair also reaches the cap, also gets refused, and also spawns its own
+    // chain — so one hot pair could take slot after slot, in seconds, all of
+    // them waiting on the same empty per-contract bucket. Keeping the window
+    // makes those later drops `WindowHeld` instead, so they hand their debt to
+    // the one chain already carrying it. One chain per pair per window, the
+    // same bound gate 1 already gives every other path.
+    //
+    // Note this is not a lost repair: the reservation is retained WITH its
+    // dropped-during-window flag set, so the chain that owns it serves the debt
+    // at the window's close, once tokens have refilled.
     if !op_manager
         .ring
         .resync_emit_limiter
@@ -1524,17 +1520,34 @@ async fn reserve_resync_emit(
     {
         op_manager
             .interest_manager
-            .cancel_resync_request(&key, sender_addr);
-        crate::config::GlobalTestMetrics::record_resync_request_suppressed();
+            .note_resync_debt_on_held_reservation(&key, sender_addr);
+        // The COUNTER answers "how many repairs did the cap suppress" — one per
+        // drop that wanted one — so a chain's own retries must not inflate it
+        // (review round 3). One swallowed drop retried three times is ONE
+        // suppressed repair, not three; counting each attempt would make the
+        // metric drift with chain length rather than with the thing an operator
+        // is asking about, and it would grow precisely when the cap is busiest.
+        let is_chain_retry = matches!(reason, DroppedBroadcastReason::DroppedDuringThrottleWindow);
+        if !is_chain_retry {
+            crate::config::GlobalTestMetrics::record_resync_request_suppressed();
+        }
         tracing::debug!(
             tx = %incoming_tx,
             contract = %key,
             sender = %sender_addr,
-            event = "queue_full_resync_suppressed_global",
+            // Distinct event for a chain retry, so the log and the counter
+            // agree about what each is describing.
+            event = if is_chain_retry {
+                "coalesced_resync_suppressed_global"
+            } else {
+                "queue_full_resync_suppressed_global"
+            },
             reason = reason.as_str(),
             "UPDATE relay: dropped-broadcast ResyncRequest suppressed by global per-contract cap"
         );
-        return Err(ReserveRefusal::GlobalCap);
+        return Err(ReserveRefusal::GlobalCap {
+            deadline: reservation_deadline,
+        });
     }
 
     // Both gates passed → the reservation stands (already recorded by `begin`).
@@ -1698,8 +1711,17 @@ fn spawn_resync_followups(
     sender_addr: SocketAddr,
     incoming_tx: Transaction,
     start: FollowupStart,
-    origin: DroppedBroadcastReason,
 ) {
+    // ONE pool, because X1 removed the reason for two. An earlier round gave
+    // owing chains their own smaller pool, on the grounds that a contract with
+    // N dropping senders could spawn N of them per window and starve the #4862
+    // re-delivery. That explosion was real, but its cause was the cap path
+    // CANCELLING the reservation: with the window released, every later drop on
+    // the pair was refused afresh and spawned a chain of its own. X1 keeps the
+    // window, so those drops are `WindowHeld` and hand their debt to the chain
+    // already carrying it — one chain per pair per window, the same bound gate 1
+    // gives every other path. A second pool would now cap a symptom that no
+    // longer occurs, at the cost of a bound nobody can reason about.
     let Some(slot) = op_manager.interest_manager.try_reserve_resync_retry_slot() else {
         // #5510: at the node-wide cap NOTHING is spawned, so this reservation
         // gets neither the #4862 re-delivery nor the trailing coalesced repair.
@@ -1717,8 +1739,10 @@ fn spawn_resync_followups(
                 event = "resync_retry_slot_cap_reached",
                 "UPDATE relay: at the node-wide resync-retry slot cap; immediate \
                  ResyncRequests still send, but reservations are getting no \
-                 re-delivery and no trailing coalesced repair. Throttled to one \
-                 line per minute (#4862 P1/#5510)"
+                 re-delivery and no trailing coalesced repair. A repair already \
+                 owed on a held window waits for the next drop on that pair or \
+                 for anti-entropy. Throttled to one line per minute \
+                 (#4862 P1/#5510)"
             );
         }
         return;
@@ -1804,24 +1828,91 @@ fn spawn_resync_followups(
             // window regardless, because a drop swallowed AFTER that response is
             // exactly the case this exists for.
             if !wait_until_reservation_close(&op_mgr, key, incoming_tx, deadline).await {
+                // The backstop fired or the wait was cancelled. If a repair was
+                // owed, it dies here — name it (review round 3), because a
+                // silent exit makes an unrepaired drop indistinguishable from a
+                // chain that simply had nothing to do.
+                if owed {
+                    tracing::info!(
+                        tx = %incoming_tx,
+                        contract = %key,
+                        target = %sender_addr,
+                        event = "coalesced_resync_abandoned_at_backstop",
+                        "UPDATE relay: dropped-broadcast repair abandoned with a \
+                         debt still owed; that drop now waits for the next drop \
+                         on this pair or for anti-entropy (#5510)"
+                    );
+                }
                 return;
             }
             attempts += 1;
             if !owed {
-                owed = op_mgr.interest_manager.take_resync_drop_during_window(
-                    &key,
-                    sender_addr,
-                    deadline,
-                );
+                // `Unknown` (the reservation was evicted from the bounded LRU
+                // mid-window) counts as owed — see `ResyncDebt`. The chain
+                // cannot distinguish "nothing was swallowed" from "the record
+                // of what was swallowed is gone", and only one of those is safe
+                // to act on by exiting.
+                owed = op_mgr
+                    .interest_manager
+                    .take_resync_drop_during_window(&key, sender_addr, deadline)
+                    .is_owed();
             }
             if !owed {
-                // The window closed with nothing swallowed: the chain has done
-                // its job and the slot goes back.
-                return;
+                // Nothing was swallowed by this window. Usually that means the
+                // chain is done — but not if the request it emitted was never
+                // ANSWERED (review round 3, X2).
+                //
+                // The responder runs its own 30s `resync_response_limiter` per
+                // (contract, peer). If the initial request was delayed by the
+                // blocking `notify_node_event` and landed late, the coalesced
+                // request and its short retries can all arrive inside that one
+                // responder window and be rejected before the responder clears
+                // its cached summary of us. Nothing is swallowed here, because
+                // nothing new was dropped — and yet the divergence this chain
+                // exists to repair is still there.
+                //
+                // Our correlation record is consumed when a matching
+                // ResyncResponse arrives, so a record still outstanding means no
+                // response has landed. Keep going in that case, so the next
+                // served window retries after the responder's window has passed.
+                // Bounded exactly as before by `windows_served` and `attempts`,
+                // so this cannot become a spin.
+                let unanswered = correlated
+                    && op_mgr
+                        .ring
+                        .outstanding_resync_requests
+                        .is_outstanding(*key.id(), sender_addr);
+                if !unanswered {
+                    return;
+                }
+                owed = true;
+                tracing::debug!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    target = %sender_addr,
+                    event = "coalesced_resync_unanswered_retry",
+                    "UPDATE relay: the emitted repair has had no ResyncResponse, \
+                     so the responder's own throttle may have rejected it; \
+                     retrying in the next window (#5510)"
+                );
             }
             if windows_served >= MAX_COALESCED_RESYNC_WINDOWS
                 || attempts >= MAX_COALESCED_RESYNC_ATTEMPTS
             {
+                // The debt was CONSUMED into `owed` a few lines above, so
+                // returning here would abandon it silently (review round 3, X4):
+                // a drop swallowed late in the last served window would vanish
+                // at t=90 with nothing left holding the flag. Hand it back to
+                // the reservation instead, so the next drop on this pair — or a
+                // chain that later owns this window — still serves it.
+                //
+                // Handing back rather than emitting one more time keeps the
+                // bound meaning what it says. Emitting here would make the
+                // chain serve MAX+1 windows, and the bound exists to cap slot
+                // occupancy, not to cap repairs.
+                op_mgr
+                    .interest_manager
+                    .note_resync_debt_on_held_reservation(&key, sender_addr);
                 tracing::info!(
                     tx = %incoming_tx,
                     contract = %key,
@@ -1830,8 +1921,9 @@ fn spawn_resync_followups(
                     attempts,
                     event = "coalesced_resync_chain_bound",
                     "UPDATE relay: dropped-broadcast repair chain hit its bound \
-                     and is releasing its slot; a pair still dropping this \
-                     steadily repairs from its next immediate reservation (#5510)"
+                     and is releasing its slot with a debt still owed; the debt \
+                     is left on the reservation, so a pair still dropping this \
+                     steadily repairs from its next reservation (#5510)"
                 );
                 return;
             }
@@ -1843,12 +1935,16 @@ fn spawn_resync_followups(
             // Cheap: `should_summarize_or_broadcast` is in-memory plus a redb
             // point lookup, and it short-circuits for an unheld key.
             //
-            // Scoped to the ORIGIN, not applied unconditionally: only the
-            // rate-limiter emit is gated on hosting at its source, so gating a
-            // queue-full chain here would narrow #4857's pre-existing behaviour
-            // as a side effect of #5510. See `repair_is_hosting_gated`.
-            if origin.repair_is_hosting_gated() && !op_mgr.ring.should_summarize_or_broadcast(&key)
-            {
+            // Applied to EVERY coalesced emit, whatever the origin (review
+            // round 3, correcting round 2). The "#4857 has never been
+            // hosting-gated" argument is true of the IMMEDIATE queue-full emit
+            // and does not extend to this chain, which is NEW code: it can
+            // re-emit across up to MAX_COALESCED_RESYNC_WINDOWS served windows,
+            // roughly 180s, for a contract that may have been evicted in the
+            // meantime. Carrying a pre-existing exemption into new code that
+            // spans three minutes is not preserving behaviour, it is inventing
+            // a new one. The immediate queue-full emit stays ungated.
+            if !op_mgr.ring.should_summarize_or_broadcast(&key) {
                 tracing::debug!(
                     tx = %incoming_tx,
                     contract = %key,
@@ -1866,10 +1962,15 @@ fn spawn_resync_followups(
                 sender_addr,
                 incoming_tx,
                 DroppedBroadcastReason::DroppedDuringThrottleWindow,
-                // NOT a genuine new drop: this chain already tracks the debt in
-                // `owed`, so recording it again would double-count one drop and
-                // buy the pair a second full-state response (review round 2).
-                false,
+                // TRUE, and the reason is subtle. This chain holds a debt in
+                // `owed`. If its re-reservation is refused because a SIBLING
+                // now owns the window, that debt must move to the sibling's
+                // reservation or it dies with this chain — and the only
+                // TOCTOU-free moment to move it is inside that same locked
+                // check. On the granted path nothing is recorded (there is no
+                // held window to record against), so this cannot double-count:
+                // the flag is set only on the refusal this chain exits on.
+                true,
             )
             .await
             {
@@ -1882,16 +1983,18 @@ fn spawn_resync_followups(
                     windows_served += 1;
                 }
                 Err(ReserveRefusal::WindowHeld) => {
-                    // A SIBLING took the reservation for this pair (review
-                    // round 2). Its chain now owns the window and will serve the
-                    // debt we just recorded on it; continuing would mean
-                    // retrying against a reservation this chain does not hold,
-                    // burning its slot to do nothing. Hand the debt over and
-                    // exit. `note_debt` was false above, so re-record it here —
-                    // deliberately, because ownership is moving.
-                    op_mgr
-                        .interest_manager
-                        .note_resync_drop_during_window(&key, sender_addr);
+                    // A SIBLING took the reservation for this pair. Its chain
+                    // now owns the window and will serve the debt; continuing
+                    // would mean retrying against a reservation this chain does
+                    // not hold, burning its slot to do nothing.
+                    //
+                    // The hand-over happens INSIDE the call above, because this
+                    // arm passes `note_debt: true` — that is the whole reason
+                    // the chain's retry sets it. An earlier version passed
+                    // `false` and re-noted here on a second lock acquisition,
+                    // which made `note_debt` unobservable (both values behaved
+                    // identically) and reopened the TOCTOU hole the atomic
+                    // method exists to close. Do not re-add a note here.
                     tracing::debug!(
                         tx = %incoming_tx,
                         contract = %key,
@@ -1903,7 +2006,7 @@ fn spawn_resync_followups(
                     );
                     return;
                 }
-                Err(ReserveRefusal::GlobalCap) => {
+                Err(ReserveRefusal::GlobalCap { deadline: held }) => {
                     // The global per-contract cap refused; it refills 1/60s
                     // against a 1/30s re-reservation, so this is the common case
                     // rather than a corner. KEEP `owed` and wait one more
@@ -1911,7 +2014,7 @@ fn spawn_resync_followups(
                     // next attempt can take a fresh one. Do NOT re-deliver in
                     // the meantime (nothing new is authorized), and do NOT count
                     // this as a served window.
-                    deadline = op_mgr.interest_manager.now() + RESYNC_REQUEST_MIN_INTERVAL;
+                    deadline = held;
                     dispatch_pending = false;
                     deliver = false;
                 }
@@ -4543,6 +4646,17 @@ mod tests {
                 "\npub async fn ",
                 "\npub fn ",
                 "\npub(",
+                // Item openers, not just fn openers (review round 3, C4).
+                // `reserve_resync_emit` is followed by `const
+                // MAX_COALESCED_RESYNC_*` and `static SLOT_CAP_LOG` before the
+                // next `fn`, so a fn-only terminator ran the slice straight
+                // through their DOC COMMENTS — and a pin asserting on a
+                // mechanism could then be satisfied by prose describing it
+                // rather than by the code.
+                "\nconst ",
+                "\nstatic ",
+                "\npub(crate) const ",
+                "\npub(crate) static ",
             ]
             .iter()
             .filter_map(|kw| after.find(kw))
@@ -4637,9 +4751,11 @@ mod tests {
         // same point in the sequence and is what authorizes the response, so it
         // is the tighter anchor of the two.
         let helper = fn_body("async fn reserve_resync_emit(");
-        let per_sender = helper.find(".begin_resync_request(").expect(
+        let per_sender = helper.find(".begin_resync_request_or_note_drop(").expect(
             "helper must RESERVE the per-sender throttle atomically via \
-             begin_resync_request (#4864 round-6 item 2)",
+             begin_resync_request_or_note_drop (#4864 round-6 item 2; renamed in \
+             #5510 round 3 when the refusal and the debt-note became one \
+             critical section)",
         );
         // Anchor on the CALL, not the bare identifier — a comment earlier in the
         // helper mentions `resync_emit_limiter` before the real gate (#4864 round-6
@@ -4651,9 +4767,25 @@ mod tests {
         let emit = helper.find("outstanding_resync_requests").expect(
             "helper must record the outstanding request that authorizes the heal (#4857/#4864)",
         );
-        let cancel = helper.find(".cancel_resync_request(").expect(
-            "helper must CANCEL the reservation when the global cap rejects, so the \
-             window is released (#4864 round-6 item 2)",
+        // #5510 review round 3 (X1) REVERSED this. The helper used to `cancel`
+        // the reservation on a global-cap rejection, releasing the window so the
+        // sender could retry once tokens refilled. Correct before a follow-up
+        // chain existed; wrong after. With the window released, every later drop
+        // on the pair is refused afresh and spawns a chain of its own, so a hot
+        // pair drains the node-wide slot pool in seconds. The reservation is now
+        // KEPT with its dropped-during-window flag set, which throttles those
+        // later drops into the one chain already carrying the debt.
+        let keep = helper
+            .find(".note_resync_debt_on_held_reservation(")
+            .expect(
+                "helper must KEEP the reservation on a global-cap rejection and mark \
+             it as owing a repair — releasing the window lets every later drop \
+             on the pair spawn its own chain (#5510 X1)",
+            );
+        assert!(
+            !helper.contains(".cancel_resync_request("),
+            "helper must NOT cancel the reservation on a global-cap rejection; \
+             that is the pre-X1 behaviour whose slot-drain this replaced"
         );
         assert!(
             per_sender < emit && global_cap < emit,
@@ -4662,15 +4794,51 @@ mod tests {
              so an unthrottled emission cannot re-open the #4251 storm"
         );
         assert!(
-            per_sender < global_cap && global_cap < cancel && cancel < emit,
-            "the cancel ({cancel}) MUST be in the global-cap reject branch — after the \
-             reservation ({per_sender}) and the global cap ({global_cap}), before the \
-             emit ({emit}) — so a global-cap suppression releases the window (#4864 round-6)"
+            per_sender < global_cap && global_cap < keep && keep < emit,
+            "the debt-mark ({keep}) MUST be in the global-cap reject branch — after \
+             the reservation ({per_sender}) and the global cap ({global_cap}), before \
+             the emit ({emit}) — so a suppressed repair is remembered on the window \
+             it is owed against rather than dropped (#4864 round-6, #5510 X1)"
         );
     }
 
     /// Drain the event-loop notification channel (non-blocking) and return the
     /// targets of every `ResyncRequest(key)` emitted since the last drain.
+    /// Make `op_manager` genuinely HOLD `keys`, so gate B does not suppress the
+    /// chain's coalesced emit (#5510, review round 3).
+    ///
+    /// `should_summarize_or_broadcast` is `(is_hosting_contract ||
+    /// contract_in_use) && contract_state_present`: a local client subscription
+    /// supplies the first, stored state the second. Both are needed, and the
+    /// caller asserts the predicate afterwards — a test of the repair that runs
+    /// on a node holding nothing passes against the GATE rather than against the
+    /// repair, which is a vacuous pass in the direction that looks like success.
+    ///
+    /// Returns the tempdir guard; keep it alive for the test's duration.
+    async fn hold_contracts(op_manager: &OpManager, keys: &[ContractKey]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = crate::contract::storages::Storage::new(dir.path())
+            .await
+            .expect("storage");
+        for key in keys {
+            storage
+                .store_state_sync(key, WrappedState::new(vec![1u8, 2, 3]))
+                .expect("store state");
+        }
+        op_manager.ring.set_hosting_storage(storage);
+        for key in keys {
+            op_manager
+                .ring
+                .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+            assert!(
+                op_manager.ring.should_summarize_or_broadcast(key),
+                "precondition: the node must HOLD {key}, or gate B suppresses the \
+                 coalesced emit and the test passes for the wrong reason"
+            );
+        }
+        dir
+    }
+
     fn drain_resync_targets(
         rx: &mut crate::node::EventLoopNotificationsReceiver,
         key: ContractKey,
@@ -4889,6 +5057,595 @@ mod tests {
         );
     }
 
+    /// #5510 review round 3 (S1): a chain that starts OWING a repair — because
+    /// the global emit cap refused the immediate one — actually retries and
+    /// emits once the cap refills.
+    ///
+    /// This path had no behavioural test, and the gap was not benign: reverting
+    /// the `Err(ReserveRefusal::GlobalCap)` spawn to a bare `return` left the
+    /// whole suite green, because the existing pins anchor on
+    /// `spawn_resync_followups`'s own match arm, which survives deleting the
+    /// CALL SITE. A pin on the callee cannot see a caller that stopped calling.
+    ///
+    /// Before this path existed, a drop whose repair the cap refused recorded
+    /// nothing and retried never: the cap `cancel`s the reservation, so there
+    /// was not even a window to hang the debt on. With `EMIT_BURST` 2 against a
+    /// 30s re-reservation, that is a routine case, not a corner.
+    #[tokio::test(start_paused = true)]
+    async fn a_cap_refused_immediate_repair_still_emits_once_the_cap_refills() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("owed-only-chain-5510").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([81u8; 32]),
+            CodeHash::new([82u8; 32]),
+        );
+        let _held = hold_contracts(&op_manager, &[key]).await;
+        let target: SocketAddr = "127.0.0.1:13600".parse().unwrap();
+
+        // Drain this contract's emit tokens BEFORE any drop, so the very first
+        // repair attempt is refused by the global cap rather than granted.
+        for _ in 0..(crate::ring::resync_rate_limit::EMIT_BURST as usize) {
+            assert!(
+                op_manager
+                    .ring
+                    .resync_emit_limiter
+                    .check_and_record(*key.id()),
+                "draining the burst must succeed while tokens remain"
+            );
+        }
+        assert!(
+            !op_manager
+                .ring
+                .resync_emit_limiter
+                .check_and_record(*key.id()),
+            "precondition: the contract's emit bucket must be empty, or this \
+             test exercises the granted path instead of the refused one"
+        );
+
+        let before = op_manager.interest_manager.outstanding_resync_retries();
+        send_dropped_broadcast_resync_request(
+            &op_manager,
+            key,
+            target,
+            Transaction::new::<UpdateMsg>(),
+            DroppedBroadcastReason::RateLimited,
+        )
+        .await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            drain_resync_targets(&mut notification_rx, key).is_empty(),
+            "the cap refused the emit, so nothing may go out now"
+        );
+        assert!(
+            op_manager.interest_manager.outstanding_resync_retries() > before,
+            "an owing chain must have been spawned to carry the debt; without it \
+             this drop is simply lost, which is the #5510 failure"
+        );
+
+        // Advance past the cap's refill. The chain re-reserves and emits ONE
+        // coalesced request for the drop it has been carrying.
+        let mut emitted = Vec::new();
+        for _ in 0..200 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            emitted.extend(drain_resync_targets(&mut notification_rx, key));
+            if !emitted.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            emitted,
+            vec![target],
+            "once the cap refills, the owing chain must emit exactly one repair \
+             for the drop it carried"
+        );
+    }
+
+    /// #5510 review round 3 (T1): when a SIBLING takes the window at the
+    /// boundary, the old chain hands its debt over and exits rather than
+    /// retrying against a reservation it does not hold.
+    ///
+    /// The map is keyed by `(contract, target)` alone, so at a window boundary
+    /// two chains can briefly both believe they are the owner. Exactly one
+    /// repair must result: the sibling's. Without the hand-over the debt dies
+    /// with the departing chain and the drop is never repaired — the silent
+    /// loss #5510 exists to close, reintroduced one layer up.
+    ///
+    /// The hand-over happens inside `begin_resync_request_or_note_drop` under
+    /// one lock, which is what makes it safe; a second note here would be both
+    /// redundant and a TOCTOU hole.
+    ///
+    /// # What this test does and does not establish
+    ///
+    /// It covers the OBSERVABLE requirement at a window boundary: exactly one
+    /// repair crosses it, and no chain keeps a node-wide slot afterwards. It
+    /// does NOT force the A-vs-B race itself. I tried, and measured that it
+    /// does not: with `start_paused`, a drop issued before the boundary is
+    /// refused (A still owns the window) and one issued after finds A has
+    /// already re-reserved, so the `WindowHeld` arm is never entered — I
+    /// confirmed that by collapsing that arm into a plain retry, which this
+    /// test still passed. Winning the race needs the sibling to reserve in the
+    /// instant between A's timer firing and A's task being polled, which the
+    /// runtime does not let a test schedule.
+    ///
+    /// So the arm's own behaviour is pinned by
+    /// `the_window_held_arm_exits_rather_than_retrying`, and the generational
+    /// half by
+    /// `a_stale_chain_cannot_consume_a_newer_reservations_swallowed_drop` in
+    /// `ring::interest`. Recording this rather than leaving the mutation gap
+    /// silent, because a behavioural test that cannot fail for the reason it
+    /// names is worse than an honest pin.
+    #[tokio::test(start_paused = true)]
+    async fn a_sibling_taking_the_window_inherits_the_debt_and_the_old_chain_exits() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("sibling-takeover-5510").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([85u8; 32]),
+            CodeHash::new([86u8; 32]),
+        );
+        let _held = hold_contracts(&op_manager, &[key]).await;
+        let target: SocketAddr = "127.0.0.1:13800".parse().unwrap();
+
+        // Chain A: granted, holds a slot, then a second drop inside its window
+        // leaves it owing a repair.
+        for _ in 0..2 {
+            send_dropped_broadcast_resync_request(
+                &op_manager,
+                key,
+                target,
+                Transaction::new::<UpdateMsg>(),
+                DroppedBroadcastReason::RateLimited,
+            )
+            .await;
+        }
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![target],
+            "only the FIRST drop may emit; the second is inside A's window"
+        );
+        let slots_with_a = op_manager.interest_manager.outstanding_resync_retries();
+        assert!(slots_with_a > 0, "precondition: chain A must hold a slot");
+
+        // Run to just BEFORE A's window closes, discarding the #4862
+        // re-deliveries. Those re-send the request A already emitted, so they
+        // are not repairs and counting them would drown the signal.
+        for _ in 0..58 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            let _ = drain_resync_targets(&mut notification_rx, key);
+        }
+
+        // A genuine new drop right at the boundary. Whether it is refused (A
+        // still owns the window and inherits this drop too) or granted (it
+        // becomes sibling B and A must hand its debt over and exit), the
+        // observable requirement is the same and is what this asserts.
+        send_dropped_broadcast_resync_request(
+            &op_manager,
+            key,
+            target,
+            Transaction::new::<UpdateMsg>(),
+            DroppedBroadcastReason::RateLimited,
+        )
+        .await;
+
+        // Cross the boundary. Stop 1s past it: a fresh reservation taken here
+        // has its first #4862 retry >= 1.6s out, so it cannot contaminate the
+        // count — the same narrow window the deadline test relies on.
+        let mut emitted = Vec::new();
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            emitted.extend(drain_resync_targets(&mut notification_rx, key));
+        }
+
+        assert_eq!(
+            emitted.len(),
+            1,
+            "exactly ONE repair may cross the window boundary, whichever chain \
+             ends up owning the reservation. Two would be the #4251 \
+             amplification the throttle exists to bound — the shape a hand-over \
+             that ALSO left the old chain emitting would produce. Zero would be \
+             the silent loss #5510 exists to close, which is what a hand-over \
+             that dropped the debt would produce. Got {emitted:?}"
+        );
+
+        // And the chains must drain: nothing may hold a node-wide slot forever
+        // because it lost a race for a reservation.
+        let mut ticks = 0;
+        while op_manager.interest_manager.outstanding_resync_retries() > 0 && ticks < 2000 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            let _ = drain_resync_targets(&mut notification_rx, key);
+            ticks += 1;
+        }
+        assert_eq!(
+            op_manager.interest_manager.outstanding_resync_retries(),
+            0,
+            "every chain must eventually release its slot; a chain that lost the \
+             window to a sibling must exit rather than retry against a \
+             reservation it does not hold"
+        );
+    }
+
+    /// #5510 review round 3 (T3): the tokio liveness backstop fires when the
+    /// injected clock never advances.
+    ///
+    /// `wait_until_reservation_close` loops on the THROTTLE's clock, which a
+    /// node can be configured to drive from an injected `TimeSource`. If that
+    /// clock stalls — a frozen mock, a suspended host, a DST discontinuity —
+    /// the loop's own condition can never become true, and without a second
+    /// clock to bound it the task would poll forever while holding one of the
+    /// 256 node-wide slots. The backstop measures `tokio::time::Instant`
+    /// instead, which is a different clock on purpose.
+    ///
+    /// Frozen throttle clock, advancing tokio clock: the wait must give up
+    /// within the backstop rather than spin.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_gives_up_when_the_injected_clock_never_advances() {
+        let (op_manager, _notification_rx, _guard) = build_queue_full_test_node_with_clock(
+            "coalesced-backstop-5510",
+            Some(
+                Arc::new(crate::util::time_source::SharedMockTimeSource::new())
+                    as crate::util::time_source::DynTimeSource,
+            ),
+        )
+        .await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([87u8; 32]),
+            CodeHash::new([88u8; 32]),
+        );
+
+        // A deadline the frozen clock can never reach.
+        let unreachable = op_manager.interest_manager.now() + Duration::from_secs(3600);
+        let waiter = tokio::spawn({
+            let op_manager = op_manager.clone();
+            async move {
+                wait_until_reservation_close(
+                    &op_manager,
+                    key,
+                    Transaction::new::<UpdateMsg>(),
+                    unreachable,
+                )
+                .await
+            }
+        });
+
+        // Advance tokio's clock only. The throttle's clock stays frozen, so the
+        // loop condition never clears and only the backstop can end this.
+        for _ in 0..80 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            if waiter.is_finished() {
+                break;
+            }
+        }
+
+        assert!(
+            waiter.is_finished(),
+            "the wait must give up on the tokio backstop rather than poll \
+             forever against a stalled injected clock — otherwise a frozen \
+             clock leaks node-wide slots one chain at a time"
+        );
+        assert!(
+            !waiter.await.expect("waiter must not panic"),
+            "giving up must report FALSE, so the caller abandons the coalesced \
+             emit instead of emitting against a window it never observed close"
+        );
+    }
+
+    /// #5510 review round 3 (T1, pin): the `WindowHeld` arm must EXIT, not
+    /// retry.
+    ///
+    /// A chain whose re-reservation is refused because a sibling now owns the
+    /// window holds nothing. Retrying would burn one of the 256 node-wide slots
+    /// waiting on a reservation it does not own, and the sibling — which does
+    /// own it, and has the debt — is the one that will serve the repair. So the
+    /// arm must return.
+    ///
+    /// This is a source pin because the race it describes cannot be scheduled
+    /// from a test; see
+    /// `a_sibling_taking_the_window_inherits_the_debt_and_the_old_chain_exits`
+    /// for the measurement behind that claim.
+    #[test]
+    fn the_window_held_arm_exits_rather_than_retrying() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("fn spawn_resync_followups(")
+            .expect("spawn_resync_followups not found");
+        let rest = &src[start + 1..];
+        let end = [
+            "\nasync fn ",
+            "\nfn ",
+            "\npub async fn ",
+            "\npub fn ",
+            "\npub(",
+            "\nconst ",
+            "\nstatic ",
+            "\npub(crate) const ",
+            "\npub(crate) static ",
+        ]
+        .iter()
+        .filter_map(|kw| rest.find(kw))
+        .min()
+        .unwrap_or(rest.len());
+        let body = &src[start..start + 1 + end];
+
+        let arm = body
+            .find("Err(ReserveRefusal::WindowHeld) => {")
+            .expect("the sibling-held refusal must be its own arm, so it can be handled");
+        // No closing paren: the variant carries a field now, so the old exact
+        // match silently failed and ran `arm_body` to the end of the function.
+        let arm_end = body[arm..]
+            .find("Err(ReserveRefusal::GlobalCap")
+            .map(|i| arm + i)
+            .unwrap_or(body.len());
+        let arm_body = &body[arm..arm_end];
+
+        assert!(
+            arm_body.contains("return;"),
+            "the WindowHeld arm must RETURN: a sibling owns the window and holds \
+             the debt, so retrying only burns a node-wide slot waiting on a \
+             reservation this chain does not own"
+        );
+        assert!(
+            !arm_body.contains("deliver = false;") && !arm_body.contains("dispatch_pending"),
+            "the WindowHeld arm must not fall through into the retry shape used \
+             by the GlobalCap arm — those are different situations: the cap \
+             releases the window (so retrying can win it back), a sibling holds \
+             it (so retrying cannot)"
+        );
+        // #5510 review round 3 (X4): the bound's return must hand the debt back.
+        //
+        // The debt is CONSUMED into `owed` before the bound is checked, so a
+        // bare return abandons it — a drop swallowed late in the last served
+        // window would vanish at t=90 with nothing holding the flag. Handing it
+        // back rather than emitting one more time keeps the bound meaning what
+        // it says: it caps slot occupancy, not repairs.
+        let bound = body
+            .find("if windows_served >= MAX_COALESCED_RESYNC_WINDOWS")
+            .expect("the chain bound must exist");
+        let bound_end = body[bound..]
+            .find("\n            }")
+            .map(|i| bound + i)
+            .unwrap_or(body.len());
+        assert!(
+            body[bound..bound_end].contains("note_resync_debt_on_held_reservation"),
+            "the chain-bound return must hand the consumed debt back to the \
+             reservation; it was taken into `owed` before this check, so \
+             returning without it drops a real repair on the floor at the exact \
+             moment the chain stops looking (#5510 X4)"
+        );
+
+        assert!(
+            !arm_body.contains("note_resync_drop_during_window"),
+            "the hand-over happens inside begin_resync_request_or_note_drop, \
+             under the same lock as the refusal. A second note here would be a \
+             TOCTOU hole AND would make `note_debt` unobservable, which is how \
+             the round-2 version hid this arm from testing entirely"
+        );
+    }
+
+    /// #5510 review round 3 (X2): a chain whose request went unanswered keeps
+    /// trying rather than exiting on "nothing swallowed".
+    ///
+    /// The responder runs its own 30s `resync_response_limiter` per (contract,
+    /// peer). If our request lands late — the enqueue is a blocking
+    /// `notify_node_event` — the coalesced request and its short retries can all
+    /// fall inside ONE responder window and be rejected before the responder
+    /// clears its cached summary of us. From this side nothing new is swallowed,
+    /// so the old code exited satisfied while the divergence remained.
+    ///
+    /// The correlation record is consumed when a matching ResyncResponse
+    /// arrives, so a record still outstanding means nothing came back. This
+    /// harness never answers, so the record stays outstanding throughout, and
+    /// the chain must keep going to its bound rather than stopping at the first
+    /// window that swallowed nothing.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_repair_keeps_retrying_instead_of_exiting_satisfied() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("unanswered-retry-5510").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([91u8; 32]),
+            CodeHash::new([92u8; 32]),
+        );
+        let _held = hold_contracts(&op_manager, &[key]).await;
+        let target: SocketAddr = "127.0.0.1:14000".parse().unwrap();
+
+        // One drop only. Nothing further is swallowed, so a chain that judged
+        // solely on the flag would exit at the first window close.
+        send_dropped_broadcast_resync_request(
+            &op_manager,
+            key,
+            target,
+            Transaction::new::<UpdateMsg>(),
+            DroppedBroadcastReason::RateLimited,
+        )
+        .await;
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![target],
+            "the drop must emit its immediate request"
+        );
+        assert!(
+            op_manager
+                .ring
+                .outstanding_resync_requests
+                .is_outstanding(*key.id(), target),
+            "precondition: the correlation record must be outstanding, or there \
+             is no 'unanswered' signal for the chain to read"
+        );
+
+        // Past the first window close. The chain must still be alive: no
+        // response has arrived, so its repair has not landed.
+        for _ in 0..64 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            let _ = drain_resync_targets(&mut notification_rx, key);
+        }
+        assert!(
+            op_manager.interest_manager.outstanding_resync_retries() > 0,
+            "the chain must NOT have exited at the first window close: its \
+             request was never answered, so the divergence it exists to repair \
+             is still there and the responder's own 30s throttle is the likely \
+             reason (#5510 X2)"
+        );
+
+        // And it must still terminate — retrying is bounded, not indefinite.
+        let mut ticks = 0;
+        while op_manager.interest_manager.outstanding_resync_retries() > 0 && ticks < 4000 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            let _ = drain_resync_targets(&mut notification_rx, key);
+            ticks += 1;
+        }
+        assert_eq!(
+            op_manager.interest_manager.outstanding_resync_retries(),
+            0,
+            "retrying an unanswered repair must stay bounded by windows_served \
+             and attempts — otherwise X2's fix trades a lost repair for a leaked \
+             slot"
+        );
+    }
+
+    /// #5510 review round 3 (X1): a pair whose contract is over the global emit
+    /// cap spawns ONE chain, not one per drop.
+    ///
+    /// The cap path used to `cancel` the per-pair reservation, releasing the
+    /// window. That looked like the considerate thing to do — the sender could
+    /// then retry as soon as tokens refilled — and it was, right up until a
+    /// follow-up chain existed. With the window released, every later drop on
+    /// the pair reaches the cap afresh, is refused afresh, and spawns a chain of
+    /// its own, so one hot pair drains the 256 node-wide slots in seconds while
+    /// all of them wait on the same empty bucket.
+    ///
+    /// Keeping the reservation makes those later drops `WindowHeld`, so they
+    /// hand their debt to the chain already carrying it. This asserts the slot
+    /// count, because that is the resource the old shape exhausted.
+    #[tokio::test(start_paused = true)]
+    async fn a_capped_pair_spawns_one_chain_however_many_drops_arrive() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("capped-pair-one-chain-5510").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([89u8; 32]),
+            CodeHash::new([90u8; 32]),
+        );
+        let _held = hold_contracts(&op_manager, &[key]).await;
+        let target: SocketAddr = "127.0.0.1:13900".parse().unwrap();
+
+        // Empty the contract's emit bucket so every repair attempt is refused.
+        while op_manager
+            .ring
+            .resync_emit_limiter
+            .check_and_record(*key.id())
+        {}
+
+        let before = op_manager.interest_manager.outstanding_resync_retries();
+        for _ in 0..12 {
+            send_dropped_broadcast_resync_request(
+                &op_manager,
+                key,
+                target,
+                Transaction::new::<UpdateMsg>(),
+                DroppedBroadcastReason::RateLimited,
+            )
+            .await;
+            tokio::task::yield_now().await;
+        }
+
+        let spawned = op_manager.interest_manager.outstanding_resync_retries() - before;
+        assert_eq!(
+            spawned, 1,
+            "twelve drops on one capped pair must produce ONE chain, not one \
+             each: gate 1 is per (contract, sender), and keeping the reservation \
+             on a cap refusal is what makes the later drops hit it. Got \
+             {spawned} chains, which is the slot-drain shape X1 removed"
+        );
+        assert!(
+            drain_resync_targets(&mut notification_rx, key).is_empty(),
+            "and nothing may be emitted while the cap refuses"
+        );
+    }
+
+    /// #5510 review round 3 (T2): a chain that is refused on every attempt
+    /// still terminates and gives its slot back.
+    ///
+    /// [`MAX_COALESCED_RESYNC_WINDOWS`] counts SERVED windows, so a chain that
+    /// never serves one would never reach it — that is exactly why
+    /// [`MAX_COALESCED_RESYNC_ATTEMPTS`] exists as a separate bound. Without it
+    /// a pair whose contract sits permanently over the global emit cap holds one
+    /// of the 256 node-wide slots indefinitely, which is the refreshable-cap
+    /// shape `.claude/rules/code-style.md` forbids.
+    ///
+    /// The cap is kept drained for the whole run, so every re-reservation is
+    /// refused and `windows_served` never advances past its starting value.
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_refused_on_every_attempt_terminates_and_frees_its_slot() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("attempts-bound-5510").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([83u8; 32]),
+            CodeHash::new([84u8; 32]),
+        );
+        let _held = hold_contracts(&op_manager, &[key]).await;
+        let target: SocketAddr = "127.0.0.1:13700".parse().unwrap();
+
+        // First drop: granted, spawns a chain holding a #4862 slot.
+        send_dropped_broadcast_resync_request(
+            &op_manager,
+            key,
+            target,
+            Transaction::new::<UpdateMsg>(),
+            DroppedBroadcastReason::RateLimited,
+        )
+        .await;
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![target],
+            "the first drop must emit immediately"
+        );
+        assert!(
+            op_manager.interest_manager.outstanding_resync_retries() > 0,
+            "precondition: a chain must be holding a slot"
+        );
+
+        // A second drop inside the window records the debt the chain will try,
+        // and keep trying, to serve.
+        send_dropped_broadcast_resync_request(
+            &op_manager,
+            key,
+            target,
+            Transaction::new::<UpdateMsg>(),
+            DroppedBroadcastReason::RateLimited,
+        )
+        .await;
+
+        // Keep the bucket empty for the whole run so every re-reservation is
+        // refused. Draining on each tick is what makes this a test of the
+        // ATTEMPTS bound rather than of the window bound.
+        let mut ticks = 0;
+        while op_manager.interest_manager.outstanding_resync_retries() > 0 && ticks < 4000 {
+            while op_manager
+                .ring
+                .resync_emit_limiter
+                .check_and_record(*key.id())
+            {}
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            let _ = drain_resync_targets(&mut notification_rx, key);
+            ticks += 1;
+        }
+
+        assert_eq!(
+            op_manager.interest_manager.outstanding_resync_retries(),
+            0,
+            "a chain refused on every attempt MUST still terminate and return its \
+             node-wide slot; without the attempts bound it re-reserves forever, \
+             and 256 such pairs starve every later pair of both the #4862 \
+             re-delivery and the trailing repair"
+        );
+    }
+
     /// #5510 trailing edge, the case the throttle used to swallow silently.
     ///
     /// Sequence, all on one `(contract, sender)`:
@@ -4918,6 +5675,9 @@ mod tests {
             ContractInstanceId::new([21u8; 32]),
             CodeHash::new([22u8; 32]),
         );
+        // The chain's coalesced emit is gated on holding the contract, so the
+        // node must actually hold it or this measures the gate, not the repair.
+        let _held = hold_contracts(&op_manager, &[key]).await;
         let sender_addr: SocketAddr = "127.0.0.1:12400".parse().unwrap();
 
         let drop_once = |bytes: Vec<u8>| {
@@ -5124,6 +5884,13 @@ mod tests {
             "\npub async fn ",
             "\npub fn ",
             "\npub(",
+            // Item openers too (review round 3, C4): consts and statics sit
+            // between these fns, and their doc comments would otherwise fall
+            // inside the slice.
+            "\nconst ",
+            "\nstatic ",
+            "\npub(crate) const ",
+            "\npub(crate) static ",
         ]
         .iter()
         .filter_map(|kw| rest.find(kw))
@@ -5220,15 +5987,21 @@ mod tests {
     /// evicted after the first emit would otherwise keep being requested by a
     /// gate that ran once, long ago.
     ///
-    /// The pre-existing queue-full path (#4857) has never carried that gate, and
-    /// this test is written as a DISCRIMINATING pair for exactly that reason: two
-    /// senders on one node, one driven with each origin, identical in every other
-    /// respect. If the re-check were applied unconditionally both would fall
-    /// silent and #5510 would have quietly narrowed #4857; if it were absent
-    /// both would emit and the gate would be doing nothing. Only the intended
-    /// behaviour produces one of each.
+    /// The split under test is IMMEDIATE vs CHAIN, not one origin vs the other
+    /// (review round 3, correcting round 2). The immediate queue-full emit
+    /// (#4857) has never been hosting-gated and still is not — that argument is
+    /// about a path that predates this PR. It does not extend to the chain,
+    /// which is new code with a ~180s lifetime, so EVERY coalesced emit is
+    /// gated whatever it descended from.
+    ///
+    /// Written as a discriminating pair for that reason: two contracts, one
+    /// driven with each origin, identical otherwise, on a node that holds
+    /// neither. Both must emit immediately and neither must emit at the
+    /// window's close. If the gate were absent, both would emit twice; if it
+    /// were (wrongly) moved onto the immediate emit as well, neither would emit
+    /// at all. Only the intended split produces one emit each.
     #[tokio::test(start_paused = true)]
-    async fn the_coalesced_emit_rechecks_hosting_for_a_rate_limited_origin_only() {
+    async fn the_coalesced_emit_rechecks_hosting_for_every_origin() {
         let (op_manager, mut notification_rx, _guard) =
             build_queue_full_test_node("coalesced-hosting-recheck-5510").await;
         // A contract EACH, not two senders on one: the global per-contract emit
@@ -5304,7 +6077,7 @@ mod tests {
         }
         let gated_emits: Vec<_> = at_deadline
             .iter()
-            .filter(|(k, _)| *k == key_gated)
+            .filter_map(|(k, t)| (*k == key_gated).then_some(*t))
             .collect();
         let ungated_emits: Vec<_> = at_deadline
             .iter()
@@ -5314,40 +6087,16 @@ mod tests {
         assert!(
             gated_emits.is_empty(),
             "the rate-limiter-origin chain must re-check hosting and abandon its \
-             coalesced emit for a contract this node no longer holds, got \
+             coalesced emit for a contract this node does not hold, got \
              {gated_emits:?}"
         );
-        assert_eq!(
-            ungated_emits,
-            vec![target],
-            "the queue-full chain must STILL emit: #4857 has never been gated on \
-             hosting, and narrowing it here would be a behaviour change #5510 has \
-             no evidence for"
-        );
-    }
-
-    /// #5510 review round 2 companion: the gating decision lives on the ORIGIN
-    /// reason, and the chain's own reason must never be the one consulted.
-    ///
-    /// `DroppedDuringThrottleWindow` is what every coalesced emit carries, so if
-    /// the re-check ever read the chain's current reason instead of the reason it
-    /// descended from, the gate would evaluate to `false` for every chain and the
-    /// test above would keep passing on its queue-full half alone. This pins the
-    /// mapping directly.
-    #[test]
-    fn only_the_rate_limited_origin_gates_its_repair_on_hosting() {
         assert!(
-            DroppedBroadcastReason::RateLimited.repair_is_hosting_gated(),
-            "node.rs gates the rate-limited emit on hosting, so its chain must too"
-        );
-        assert!(
-            !DroppedBroadcastReason::QueueFull.repair_is_hosting_gated(),
-            "#4857 has never been hosting-gated; gating it here would narrow it"
-        );
-        assert!(
-            !DroppedBroadcastReason::DroppedDuringThrottleWindow.repair_is_hosting_gated(),
-            "the chain's own reason is never an ORIGIN, so it must not be the \
-             value that decides gating"
+            ungated_emits.is_empty(),
+            "the QUEUE-FULL chain must abandon its coalesced emit too. #4857's \
+             hosting exemption covers its IMMEDIATE emit, which this test already \
+             observed firing; extending that exemption to a chain that re-emits \
+             for ~180s would be inventing a new behaviour, not preserving an old \
+             one. Got {ungated_emits:?}"
         );
     }
 
@@ -5366,6 +6115,7 @@ mod tests {
             ContractInstanceId::new([63u8; 32]),
             CodeHash::new([64u8; 32]),
         );
+        let _held = hold_contracts(&op_manager, &[key]).await;
         let sender_addr: SocketAddr = "127.0.0.1:13100".parse().unwrap();
 
         // Drop 1: takes the reservation, spends one of the contract's two emit
@@ -6354,6 +7104,17 @@ mod tests {
                 "\npub async fn ",
                 "\npub fn ",
                 "\npub(",
+                // Item openers, not just fn openers (review round 3, C4).
+                // `reserve_resync_emit` is followed by `const
+                // MAX_COALESCED_RESYNC_*` and `static SLOT_CAP_LOG` before the
+                // next `fn`, so a fn-only terminator ran the slice straight
+                // through their DOC COMMENTS — and a pin asserting on a
+                // mechanism could then be satisfied by prose describing it
+                // rather than by the code.
+                "\nconst ",
+                "\nstatic ",
+                "\npub(crate) const ",
+                "\npub(crate) static ",
             ]
             .iter()
             .filter_map(|kw| prod[..pos].rfind(kw))
@@ -6405,6 +7166,17 @@ mod tests {
                 "\npub async fn ",
                 "\npub fn ",
                 "\npub(",
+                // Item openers, not just fn openers (review round 3, C4).
+                // `reserve_resync_emit` is followed by `const
+                // MAX_COALESCED_RESYNC_*` and `static SLOT_CAP_LOG` before the
+                // next `fn`, so a fn-only terminator ran the slice straight
+                // through their DOC COMMENTS — and a pin asserting on a
+                // mechanism could then be satisfied by prose describing it
+                // rather than by the code.
+                "\nconst ",
+                "\nstatic ",
+                "\npub(crate) const ",
+                "\npub(crate) static ",
             ]
             .iter()
             .filter_map(|kw| rest.find(kw))
@@ -6465,6 +7237,17 @@ mod tests {
                 "\npub async fn ",
                 "\npub fn ",
                 "\npub(",
+                // Item openers, not just fn openers (review round 3, C4).
+                // `reserve_resync_emit` is followed by `const
+                // MAX_COALESCED_RESYNC_*` and `static SLOT_CAP_LOG` before the
+                // next `fn`, so a fn-only terminator ran the slice straight
+                // through their DOC COMMENTS — and a pin asserting on a
+                // mechanism could then be satisfied by prose describing it
+                // rather than by the code.
+                "\nconst ",
+                "\nstatic ",
+                "\npub(crate) const ",
+                "\npub(crate) static ",
             ]
             .iter()
             .filter_map(|kw| prod[..pos].rfind(kw))
@@ -7651,6 +8434,17 @@ mod tests {
                 "\npub async fn ",
                 "\npub fn ",
                 "\npub(",
+                // Item openers, not just fn openers (review round 3, C4).
+                // `reserve_resync_emit` is followed by `const
+                // MAX_COALESCED_RESYNC_*` and `static SLOT_CAP_LOG` before the
+                // next `fn`, so a fn-only terminator ran the slice straight
+                // through their DOC COMMENTS — and a pin asserting on a
+                // mechanism could then be satisfied by prose describing it
+                // rather than by the code.
+                "\nconst ",
+                "\nstatic ",
+                "\npub(crate) const ",
+                "\npub(crate) static ",
             ]
             .iter()
             .filter_map(|kw| after.find(kw))
@@ -7685,9 +8479,32 @@ mod tests {
         );
 
         let helper = fn_body("async fn reserve_resync_emit(");
-        let gate = helper
-            .find(".begin_resync_request(")
-            .expect("helper must gate on begin_resync_request (per-sender throttle, #4251)");
+        let gate = helper.find(".begin_resync_request_or_note_drop(").expect(
+            "helper must gate on begin_resync_request_or_note_drop (per-sender \
+             throttle, #4251)",
+        );
+
+        // #5510 round 3: the refusal and the debt-note must be ONE call.
+        //
+        // The two-step (`begin_resync_request` -> `None`, then a separate
+        // `note_resync_drop_during_window`) has a TOCTOU hole that the
+        // generation check does NOT close: between the two lock acquisitions
+        // the owning chain can reach its deadline, take the flag, read false,
+        // conclude nothing is owed, and free its slot — after which the note
+        // lands on an entry nobody is watching and the drop is never repaired.
+        // Silently, which is the exact failure #5510 exists to close.
+        assert!(
+            !helper.contains(".begin_resync_request("),
+            "reserve_resync_emit must NOT call the two-step begin_resync_request; \
+             the atomic begin_resync_request_or_note_drop exists because the \
+             two-step loses a swallowed drop under a multi-thread runtime"
+        );
+        assert!(
+            !helper.contains("note_resync_drop_during_window"),
+            "reserve_resync_emit must NOT note the debt as a separate lock \
+             acquisition — the note belongs inside the same critical section as \
+             the refusal that caused it"
+        );
         let global_cap = helper
             .find("resync_emit_limiter")
             .expect("helper must gate on the global per-contract emit cap (#4864)");
