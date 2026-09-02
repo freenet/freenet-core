@@ -243,7 +243,7 @@ docs/architecture/    # Design docs
 
 The release pipeline (`.github/workflows/release.yml` →
 `.github/workflows/cross-compile.yml` → downstream `gateway-update.yml` /
-`release-announce.yml`) relies on a `RELEASE_PAT` repo secret to fire
+`release-announce.yml` / `docker-publish.yml`) relies on a `RELEASE_PAT` repo secret to fire
 all the workflow events that make releases zero-touch.
 
 ### Why a PAT is required
@@ -268,8 +268,9 @@ another workflow has to authenticate with a personal access token
 2. **`release.published` doesn't fire downstream workflows.**
    `cross-compile.yml`'s `attach-to-release` job ends with
    `gh release edit --draft=false`. With `GITHUB_TOKEN`, the
-   `release.published` event is suppressed, so `gateway-update.yml`
-   and `release-announce.yml` don't auto-fire. v0.2.57 had to trigger
+   `release.published` event is suppressed, so `gateway-update.yml`,
+   `release-announce.yml` and `docker-publish.yml` don't auto-fire.
+   v0.2.57 had to trigger
    them manually via `workflow_dispatch`.
 
 ### Configuring the secret

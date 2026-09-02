@@ -5,19 +5,15 @@ target/
 # Ignore git directory
 .git/
 
-# Ignore CI and IDE files
-.github/
+# Ignore IDE files
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# Ignore test and local artifacts
+# Ignore test artifacts
 *.log
 *.tmp
-release-artifacts/
-.worktrees/
-worktrees/
 
 # Ignore OS files
 .DS_Store

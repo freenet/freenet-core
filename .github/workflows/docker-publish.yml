@@ -1,5 +1,14 @@
 name: Publish Docker Image
 
+# Fires when the release pipeline un-drafts the GitHub release.
+#
+# That un-draft happens in cross-compile.yml's "Publish release" step, which
+# coalesces on RELEASE_PAT specifically so a `release.published` event is
+# emitted: GitHub suppresses workflow-triggering events for actions
+# authenticated with GITHUB_TOKEN (issue #4118). gateway-update.yml and
+# release-announce.yml already ride that same event. If RELEASE_PAT is ever
+# removed or that step is "simplified" back to GITHUB_TOKEN, this workflow
+# silently stops running and the published image quietly goes stale.
 on:
   release:
     types: [published]
@@ -9,24 +18,299 @@ on:
         description: 'Release tag to publish (for example, v0.2.132)'
         required: true
         type: string
+  # The image content is entirely in this directory, so verify it on any change
+  # to it rather than discovering a broken Dockerfile at release time.
+  pull_request:
+    paths:
+      - 'docker/freenet-node/**'
+      - '.github/workflows/docker-publish.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'docker/freenet-node/**'
+      - '.github/workflows/docker-publish.yml'
 
 permissions:
   contents: read
   packages: write
 
 concurrency:
-  group: docker-publish-${{ github.event.release.tag_name || inputs.tag }}
+  group: docker-publish-${{ github.event.release.tag_name || inputs.tag || github.ref }}
   cancel-in-progress: false
 
 jobs:
+  verify:
+    name: Verify entrypoint and image build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Same ref the publish job builds from. Without this a workflow_dispatch
+      # for an older tag verifies main's entrypoint and then ships the tag's.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
+
+      - name: Shellcheck the entrypoint and its tests
+        run: |
+          set -euo pipefail
+          shellcheck -s sh docker/freenet-node/freenet-node-startup.sh
+          shellcheck -s sh docker/freenet-node/test-entrypoint.sh
+          shellcheck -s sh docker/freenet-node/healthcheck.sh
+
+      # The supervisor is what keeps a containerized node current. A regression
+      # in it does not fail a build; it surfaces months later as a fleet of
+      # stale containers refused by every peer. These tests run it against a
+      # fake node binary and cover clean exit, exit 42 (update), exit 43,
+      # crash restarts and SIGTERM forwarding.
+      - name: Test the update supervisor
+        run: docker/freenet-node/test-entrypoint.sh
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build both architectures without pushing
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/freenet-node
+          file: docker/freenet-node/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: |
+            FREENET_VERSION=${{ github.event.release.tag_name || inputs.tag || 'latest' }}
+
+      # Loads the amd64 image locally so the shipped binary can actually be run.
+      # This is what catches a download that verified but produced a binary that
+      # will not execute.
+      - name: Build amd64 image for local checks
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/freenet-node
+          file: docker/freenet-node/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: freenet-node:verify
+          build-args: |
+            FREENET_VERSION=${{ github.event.release.tag_name || inputs.tag || 'latest' }}
+
+      # QEMU is already set up above, so running the arm64 binary here costs
+      # little and moves the arm64 check to BEFORE publish. Without it the only
+      # arm64 execution happens in the smoke job, after the manifest is public.
+      - name: Build arm64 image for local checks
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/freenet-node
+          file: docker/freenet-node/Dockerfile
+          platforms: linux/arm64
+          push: false
+          load: true
+          tags: freenet-node:verify-arm64
+          build-args: |
+            FREENET_VERSION=${{ github.event.release.tag_name || inputs.tag || 'latest' }}
+
+      - name: The arm64 binary runs under emulation
+        run: |
+          set -euo pipefail
+          out=$(docker run --rm --platform linux/arm64 \
+            --entrypoint /usr/local/lib/freenet/freenet \
+            freenet-node:verify-arm64 --version)
+          echo "$out"
+          echo "$out" | grep -qE '^Freenet version: [0-9]+\.[0-9]+\.[0-9]+'
+
+      - name: The shipped binary runs and reports a version
+        run: |
+          set -euo pipefail
+          version_output=$(docker run --rm \
+            --entrypoint /usr/local/lib/freenet/freenet \
+            freenet-node:verify --version)
+          echo "$version_output"
+          echo "$version_output" | grep -qE '^Freenet version: [0-9]+\.[0-9]+\.[0-9]+'
+
+      # A release build must ship exactly the version being released. Without
+      # this, a Dockerfile that silently fell back to `latest` would publish an
+      # image tagged v0.2.132 containing some other build.
+      - name: The shipped version matches the release tag
+        if: ${{ github.event.release.tag_name || inputs.tag }}
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          expected="${RELEASE_TAG#v}"
+          actual=$(docker run --rm \
+            --entrypoint /usr/local/lib/freenet/freenet \
+            freenet-node:verify --version \
+            | sed -n 's/^Freenet version: \([^ ]*\).*/\1/p')
+          echo "expected ${expected}, image ships ${actual}"
+          test "$expected" = "$actual"
+
+      # The entrypoint must not have been built with auto-update disabled. This
+      # is the one property the whole image exists to preserve, so assert it on
+      # the shipped artifact rather than trusting the source file.
+      # Asserts on the SHIPPED entrypoint, matching executable statements rather
+      # than any occurrence of the text. The entrypoint's header comment
+      # documents the systemd contract and mentions both
+      # "Environment=FREENET_SUPERVISED=1" and "--disable-auto-update", so a
+      # loose grep is satisfied by the comment alone and would still pass with
+      # the real code deleted.
+      - name: The shipped entrypoint keeps its update guarantees
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint cat freenet-node:verify \
+            /usr/local/bin/freenet-node-startup > entrypoint.sh
+
+          require() {
+            grep -qE "$1" entrypoint.sh \
+              || { echo "::error::$2"; exit 1; }
+          }
+
+          require '^export FREENET_SUPERVISED=1$' \
+            'entrypoint does not export FREENET_SUPERVISED=1, so the node treats itself as unsupervised and exits 42 without ever updating'
+
+          require '^export FREENET_SYSTEMD_FAST_CRASH=1$' \
+            'entrypoint does not opt in to the fast-crash exit code, so a boot wedge is indistinguishable from an available update'
+
+          # The node must be told explicitly where config and data live. Its own
+          # clap env names are CONFIG_DIR/DATA_DIR, not the FREENET_-prefixed
+          # ones this image sets, so without these flags every bit of node state
+          # lands in the container writable layer and is destroyed on recreate.
+          require '^ +--config-dir "\$CONFIG_DIR" ' \
+            'entrypoint does not pass --config-dir; node state would land in the image layer and be lost on upgrade'
+          require '^ +--data-dir "\$DATA_DIR" ' \
+            'entrypoint does not pass --data-dir; node state would land in the image layer and be lost on upgrade'
+
+          # --disable-auto-update may appear ONLY inside the operator opt-out
+          # branch, never on the node invocation itself.
+          if grep -qE '^ *"\$RUN_BIN" network.*--disable-auto-update' entrypoint.sh; then
+            echo "::error::entrypoint disables auto-update unconditionally"
+            exit 1
+          fi
+
+          echo "entrypoint assertions passed"
+
+      # Runs the REAL entrypoint in the REAL image against a volume.
+      #
+      # Every other check here uses `--entrypoint`, which bypasses
+      # freenet-node-startup entirely, so the gosu privilege drop, the volume
+      # seeding and where the node actually puts its state were all unexercised.
+      # That gap shipped a defect once already: the node was started without
+      # --config-dir/--data-dir, so its contracts, delegates, secrets and peer
+      # identity went into the container writable layer and would have been
+      # destroyed by the documented `docker compose pull && docker compose up -d`.
+      # The volume looked fine from outside: correct directories, correct owner,
+      # simply empty.
+      #
+      # Deliberately does NOT wait for network health, which would make this
+      # depend on reaching gateways from a CI runner. The node writes its config
+      # and opens its stores during startup, which is enough to prove placement.
+      - name: The running container puts node state on the volume
+        run: |
+          set -euo pipefail
+          docker volume create freenet-verify-data >/dev/null
+          docker run -d --name freenet-verify \
+            -v freenet-verify-data:/data freenet-node:verify >/dev/null
+
+          # Bounded wait for the node to write its config.
+          for _ in $(seq 1 60); do
+            if docker exec freenet-verify test -f /data/config/config.toml 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+
+          echo "--- entrypoint output ---"
+          docker logs freenet-verify 2>&1 | tail -30
+
+          fail() { echo "::error::$1"; docker rm -f freenet-verify >/dev/null; exit 1; }
+
+          docker exec freenet-verify test -f /data/config/config.toml \
+            || fail "node config is not on the volume; state would be lost on every container recreate"
+
+          docker exec freenet-verify test -d /data/node/contracts \
+            || fail "node data directory is not on the volume; contracts and secrets would be lost on recreate"
+
+          docker exec freenet-verify test -x /data/bin/freenet \
+            || fail "entrypoint did not seed the runnable binary onto the volume"
+
+          # Nothing belonging to the node may be left in the image layer.
+          if docker exec freenet-verify test -d /home/freenet/.local/share/freenet; then
+            fail "node wrote state into the image layer at /home/freenet; it would be lost on recreate"
+          fi
+
+          # The properties below are asserted on the RUNNING container, not on
+          # the entrypoint's source text. A grep over the source cannot cover
+          # them: `--disable-auto-update` is applied via a variable set many
+          # lines from the invocation, so flipping that variable's default
+          # disables auto-update for every container while every source-level
+          # check still passes. The node's own argv is the only place the
+          # result is unambiguous.
+          docker exec freenet-verify test -f /data/node.pid \
+            || fail "no node pid recorded; the node is not running (see the entrypoint output above)"
+          node_pid=$(docker exec freenet-verify cat /data/node.pid)
+          argv=$(docker exec freenet-verify sh -c "tr '\0' ' ' < /proc/${node_pid}/cmdline")
+          echo "node argv: ${argv}"
+
+          case "$argv" in
+            *--disable-auto-update*)
+              fail "the running node was started with --disable-auto-update; every container would stop updating and fall below min-compatible-version" ;;
+          esac
+
+          case "$argv" in
+            *"--config-dir /data/config"*) ;;
+            *) fail "the running node was not given --config-dir /data/config" ;;
+          esac
+
+          case "$argv" in
+            *"--data-dir /data/node"*) ;;
+            *) fail "the running node was not given --data-dir /data/node" ;;
+          esac
+
+          # The volume is initialized as root and then dropped; the node itself
+          # must not be running as root.
+          node_uid=$(docker exec freenet-verify sh -c "awk '/^Uid:/ {print \$2}' /proc/${node_pid}/status")
+          echo "node uid: ${node_uid}"
+          test "$node_uid" != 0 || fail "the node is running as root; the privilege drop did not happen"
+
+          # A mis-parsed multi-line ENV, or one moved into the discarded build
+          # stage, silently breaks console logging in the shipped image while
+          # every source-level check still passes. Read it back from the image.
+          for var in FREENET_LOG_TO_CONSOLE LOG_DIR NETWORK_PORT WS_API_PORT \
+                     FREENET_CONFIG_DIR FREENET_DATA_DIR FREENET_BIN_DIR; do
+            value=$(docker run --rm --entrypoint printenv freenet-node:verify "$var" || true)
+            if [ -z "$value" ]; then
+              fail "the shipped image does not set ${var}"
+            fi
+            echo "${var}=${value}"
+          done
+
+          echo "state placement verified"
+          docker rm -f freenet-verify >/dev/null
+          docker volume rm freenet-verify-data >/dev/null
+
+      # Verification must be a POSITIVE signal, not the absence of a warning in
+      # a build log nobody reads. The build records whether the release manifest
+      # signature was verified or genuinely absent; a release image must never
+      # ship unverified.
+      - name: The release manifest signature was verified
+        if: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          status=$(docker run --rm --entrypoint cat freenet-node:verify \
+            /etc/freenet/signature-status)
+          echo "signature status: ${status}"
+          test "$status" = verified
+
   publish:
     name: Build and publish image
+    needs: verify
+    if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
 
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -35,18 +319,116 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      - name: Derive version tags
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          minor="${version%.*}"
+          echo "tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "minor=${minor}" >> "$GITHUB_OUTPUT"
+
+          # `latest` and the minor tag must move only for a stable release.
+          # `!github.event.release.prerelease` is TRUE on a workflow_dispatch,
+          # where that field is empty, so a dispatched prerelease tag would
+          # otherwise take over `latest`. Decide from the version string too.
+          if [ "${{ github.event.release.prerelease }}" = "true" ]; then
+            is_stable=false
+          elif printf '%s' "$version" | grep -q -- '-'; then
+            is_stable=false
+          else
+            is_stable=true
+          fi
+          echo "is_stable=${is_stable}" >> "$GITHUB_OUTPUT"
+          echo "stable release: ${is_stable}"
+
       - uses: docker/metadata-action@v5
         id: metadata
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=${{ github.event.release.tag_name || inputs.tag }}
-            type=raw,value=latest,enable=${{ !github.event.release.prerelease }}
+            type=raw,value=${{ steps.version.outputs.tag }}
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ steps.version.outputs.minor }},enable=${{ steps.version.outputs.is_stable == 'true' }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_stable == 'true' }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
 
+      # NOTE for the first successful run: GHCR creates the package PRIVATE by
+      # default, so `docker pull ghcr.io/freenet/freenet-core` fails for
+      # everyone until its visibility is set to public once, under the
+      # repository's Packages settings. Nothing in this workflow can do that,
+      # and the failure looks like a missing image rather than a permissions
+      # problem.
       - uses: docker/build-push-action@v6
         with:
-          context: .
+          context: docker/freenet-node
           file: docker/freenet-node/Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: true
+          provenance: true
+          sbom: true
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
+          build-args: |
+            FREENET_VERSION=${{ steps.version.outputs.tag }}
+
+  smoke:
+    name: Smoke-test the published image
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: docker/setup-qemu-action@v3
+
+      # Pulls what was actually published, per architecture, and runs the
+      # binary. Publishing an arm64 manifest that cannot execute is otherwise
+      # invisible until a user on a Raspberry Pi reports it.
+      - name: Both published architectures run and report the released version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          expected="${RELEASE_TAG#v}"
+          for platform in linux/amd64 linux/arm64; do
+            echo "--- ${platform} ---"
+            actual=$(docker run --rm --platform "$platform" \
+              --entrypoint /usr/local/lib/freenet/freenet \
+              "${IMAGE}:${RELEASE_TAG}" --version \
+              | sed -n 's/^Freenet version: \([^ ]*\).*/\1/p')
+            echo "expected ${expected}, image ships ${actual}"
+            test "$expected" = "$actual"
+          done
+
+  # Without this a failed publish leaves `latest` stale and says so nowhere but
+  # a red tick in the Actions tab. Existing containers keep self-updating, so
+  # the blast radius is bounded, but the image is meant to be the front door for
+  # new operators and a silently stale front door is the failure this whole
+  # change is trying to avoid. Mirrors the release cascade's own pre-flight
+  # alert (cross-compile.yml, notify-auto-update-canary-failure).
+  notify-publish-failure:
+    name: Notify dev room if the image publish failed
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [verify, publish, smoke]
+    if: |
+      always() &&
+      (github.event_name == 'release' || github.event_name == 'workflow_dispatch') &&
+      (needs.verify.result == 'failure' || needs.verify.result == 'cancelled' ||
+       needs.publish.result == 'failure' || needs.publish.result == 'cancelled' ||
+       needs.smoke.result == 'failure' || needs.smoke.result == 'cancelled')
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: notify-docker-publish-failure
+        uses: ./.github/actions/river-dev-notify
+        with:
+          message: "🐳 The Docker image publish for ${{ github.event.release.tag_name || inputs.tag }} FAILED. `ghcr.io/freenet/freenet-core:latest` is now stale, so anyone starting a new container gets the previous release. Containers already running are unaffected: they self-update and do not depend on the image being current. Re-run with `gh workflow run docker-publish.yml --field tag=${{ github.event.release.tag_name || inputs.tag }}`. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
