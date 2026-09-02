@@ -894,21 +894,27 @@ fn a_never_settling_contract_is_flagged_as_never_settling() {
     );
 }
 
-/// A settling classification that differs between runs is NOT reported as
-/// reproduced.
+/// A classification that flaps between runs keeps the violation and reports
+/// `Indeterminate`.
 ///
-/// The verifier re-runs a failing case and requires the same failure before
-/// asserting it. That check compared only the digests, so a contract could produce
-/// identical `merge(A, A)` bytes on both runs — reproducing by that measure —
-/// while its settling classification differed. The field the whole change exists
-/// to carry, and the one an enforcement policy branches on, would then be reported
-/// as though it had reproduced when it had not.
+/// The violation itself DID reproduce: same inputs, same outputs, both runs.
+/// Only the settling class differed, and that class is data about the finding
+/// rather than the finding. Discarding the violation because the data was
+/// unstable would throw away a reproduced defect — the exact failure this
+/// change exists to remove.
 ///
-/// A contract whose settling varies IS non-deterministic, and the existing
-/// escalation names that under the property which describes it rather than
-/// asserting a classification we did not observe twice.
+/// This test used to assert the opposite, and that is worth recording. It
+/// checked only `!matches!(outcome, Violated(_))`, which was satisfied equally
+/// by "named under `UpdateDeterminism`" and by "dropped on the floor", so it
+/// could not tell the intended behaviour from the bug — and its doc claimed an
+/// escalation that cannot fire here at all, since `escalate_to_determinism`
+/// needs two states and an idempotence case carries one.
+///
+/// The deeper point, which two reviewers reached independently: an ERRORING
+/// classification and a FLAPPING one are the same epistemic situation. Handling
+/// them in opposite directions in one file was the defect.
 #[test]
-fn settling_must_reproduce_or_the_finding_is_not_reproducible() {
+fn a_flapping_classification_keeps_the_violation_as_indeterminate() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let b_merges = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&b_merges);
@@ -936,10 +942,19 @@ fn settling_must_reproduce_or_the_finding_is_not_reproducible() {
         &case(ConformanceProperty::StateIdempotence, &[&[1u8]]),
     );
 
-    assert!(
-        !matches!(outcome, PropertyOutcome::Violated(_)),
-        "the digests reproduced but the settling classification did not, so the \
-         finding must not be asserted as reproduced: {outcome:?}"
+    let PropertyOutcome::Violated(v) = outcome else {
+        panic!(
+            "the violation reproduced — same inputs, same outputs, twice — and \
+                 must not be discarded because its classification was unstable: \
+                 {outcome:?}"
+        );
+    };
+    assert_eq!(v.severity, Severity::Violation);
+    assert_eq!(
+        v.settling,
+        Some(IdempotenceSettling::Indeterminate),
+        "a class observed differently on each run is unknown, not whichever \
+             the second run happened to produce"
     );
 }
 

@@ -242,10 +242,46 @@ impl CheckedContract {
     /// absence, and forgetting a confirmed violation because the next sample missed
     /// it is the green-pill failure in a slower form.
     pub(crate) fn note_finding(&mut self, finding: MergeFinding) {
-        if self.findings.iter().any(|f| f.property == finding.property) {
+        if let Some(existing) = self
+            .findings
+            .iter_mut()
+            .find(|f| f.property == finding.property)
+        {
+            // Deduplicating on the property alone would silently pick whichever
+            // classification arrived first. Since #5462 two `state_idempotence`
+            // findings on one contract can carry DIFFERENT settling classes, and
+            // they are not equally important: `NeverSettled` is the one an
+            // enforcement policy can act on, while `SettledAfter` is waiting on the
+            // install-path fix. Keeping the first would let a benign case mask a
+            // non-convergent one on the same contract — the operator would read
+            // "settles after a rewrite" for a contract that also never settles.
+            //
+            // So the SERIOUS classification wins the slot, and an unknown one
+            // outranks a benign one because it has not been shown to be benign.
+            if settling_rank(finding.settling) > settling_rank(existing.settling) {
+                existing.settling = finding.settling;
+            }
             return;
         }
         self.findings.insert(0, finding);
+    }
+}
+
+/// How much a settling classification should outrank another for the one slot a
+/// property gets per contract.
+///
+/// Not a severity — every one of these is `Severity::Violation` and #5462 exists
+/// partly to keep it that way. This orders how much a reader NEEDS to see it when
+/// two findings for one property must collapse to one: an unknown class outranks a
+/// benign one because it has not been shown benign, and a never-settling class
+/// outranks both because it is the case enforcement can act on without waiting for
+/// the install path.
+fn settling_rank(settling: Option<IdempotenceSettling>) -> u8 {
+    match settling {
+        Some(IdempotenceSettling::NeverSettled) => 3,
+        Some(IdempotenceSettling::Indeterminate) => 2,
+        Some(IdempotenceSettling::SettledAfter(_)) => 1,
+        None => 0,
     }
 }
 
@@ -590,6 +626,55 @@ mod tests {
             severity: Severity::Violation,
             settling: None,
             would_remove: true,
+        }
+    }
+
+    /// Deduplication keeps the classification a reader most needs to see.
+    ///
+    /// One property gets one slot per contract, so when two `state_idempotence`
+    /// findings arrive with different settling classes, one is discarded. Keeping
+    /// whichever arrived first would let a benign case mask a non-convergent one on
+    /// the same contract: the operator would read "settles after a rewrite" for a
+    /// contract that also never settles.
+    ///
+    /// This is NOT a severity ordering — all of these are `Severity::Violation` and
+    /// #5462 exists partly to keep it that way. It orders how badly a reader needs
+    /// to see it.
+    #[test]
+    fn deduplication_keeps_the_more_serious_settling_class() {
+        for (first, second, expected) in [
+            (
+                Some(IdempotenceSettling::SettledAfter(1)),
+                Some(IdempotenceSettling::NeverSettled),
+                Some(IdempotenceSettling::NeverSettled),
+            ),
+            // Order must not decide it.
+            (
+                Some(IdempotenceSettling::NeverSettled),
+                Some(IdempotenceSettling::SettledAfter(1)),
+                Some(IdempotenceSettling::NeverSettled),
+            ),
+            // Unknown outranks benign: it has not been SHOWN benign.
+            (
+                Some(IdempotenceSettling::SettledAfter(1)),
+                Some(IdempotenceSettling::Indeterminate),
+                Some(IdempotenceSettling::Indeterminate),
+            ),
+        ] {
+            let mut record = CheckedContract::new(instance(1), 1, 0, Instant::now());
+            let mut a = finding(1, "state_idempotence");
+            a.settling = first;
+            let mut b = finding(1, "state_idempotence");
+            b.settling = second;
+            record.note_finding(a);
+            record.note_finding(b);
+
+            let kept = record.findings();
+            assert_eq!(kept.len(), 1, "one property still gets one slot");
+            assert_eq!(
+                kept[0].settling, expected,
+                "arrived {first:?} then {second:?}; the slot must hold {expected:?}"
+            );
         }
     }
 

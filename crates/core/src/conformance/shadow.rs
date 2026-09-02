@@ -146,6 +146,21 @@ pub struct ShadowReport {
     /// Deliberately additive rather than subtracted from `would_remove`: the
     /// finding IS removal-eligible, and netting it off would be the severity fork
     /// the #5462 decision rejected, hidden in a metric.
+    ///
+    /// Read it as a CASE count, not a contract count, and do not read the ratio
+    /// against `would_remove` as "the benign fraction of contracts". Idempotence
+    /// draws a fixed handful of cases per probe while a contract breaking several
+    /// properties feeds the total from each, so the multiplier is not equal across
+    /// the two populations and the ratio systematically misstates the fraction. It
+    /// tells you the class is present and roughly how loud, which is what it is
+    /// for.
+    ///
+    /// `Indeterminate` findings are in `would_remove` and in NEITHER subset. That
+    /// is the conservative default — an unknown class must not be counted benign —
+    /// but it means a residual exists that this pair of numbers cannot show, and
+    /// `Indeterminate` is adversarially reachable (see its rustdoc), so a nonzero
+    /// gap between the total and the sum of what you can classify is itself worth
+    /// looking at.
     pub would_remove_settled: usize,
     /// Diagnostic-severity findings, which never propose removal in any mode.
     pub reported: usize,
@@ -1011,11 +1026,34 @@ mod settled_counter_tests {
     /// silently start under-counting the moment enforcement became reachable.
     #[test]
     fn both_removal_arms_route_through_the_counter() {
+        // Bounded by brace-counting to `probe_one`'s OWN body, not by splitting on
+        // its signature and reading to end-of-file. An unbounded region silently
+        // widens to swallow unrelated code — including this test module — and then
+        // passes for the wrong reason. That is the trap the repo documents on its
+        // other scrapes, and my first version of this pin walked into it.
         let src = include_str!("shadow.rs");
-        let body = src
-            .split("async fn probe_one(")
-            .nth(1)
+        let start = src
+            .find("async fn probe_one(")
             .expect("probe_one not found");
+        let after = &src[start..];
+        let open = after.find('{').expect("probe_one has no body");
+        let mut depth = 0usize;
+        let mut end = open;
+        for (i, c) in after[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(end > open, "could not bound probe_one's body");
+        let body = &after[open..end];
 
         for arm in [
             "ConformanceAction::WouldRemove(violation) => {",

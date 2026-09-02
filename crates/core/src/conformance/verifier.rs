@@ -150,10 +150,48 @@ pub fn verify_case<O: ConformanceOracle + ?Sized>(
             {
                 second
             }
-            // Disagreed with itself. The contract is nondeterministic, which is its
-            // own defect with its own property, and is emphatically not proof of the
-            // law this case was checking. Say so under the right name if we can:
-            // reporting nothing at all would turn a real defect into a silent miss.
+            // The violation reproduced; only its CLASSIFICATION did not.
+            //
+            // Same inputs, same outputs, both runs — `merge(A, A) != A` was
+            // established twice. What flapped is the settling class, which this
+            // change insists is DATA about the finding and not the finding itself.
+            // Discarding the violation because the data was unstable would throw
+            // away a reproduced defect, which is the exact failure this whole
+            // change exists to remove.
+            //
+            // Marked `Indeterminate` rather than reported as either class, because
+            // asserting a classification observed once is the other half of the
+            // same mistake. That is the identical treatment an ERRORING
+            // classification already gets a few lines up in `run`: "we could not
+            // determine the class" is one situation and it must not be handled two
+            // ways in one file.
+            //
+            // A clock-reading contract straddling a TTL boundary between the two
+            // runs is the ordinary way to reach here, not a contrived one.
+            (PropertyOutcome::Violated(a), PropertyOutcome::Violated(b))
+                if a.property == b.property
+                    && a.left == b.left
+                    && a.right == b.right
+                    && a.settling != b.settling =>
+            {
+                let PropertyOutcome::Violated(mut v) = second else {
+                    unreachable!("matched on Violated above")
+                };
+                v.settling = Some(IdempotenceSettling::Indeterminate);
+                PropertyOutcome::Violated(v)
+            }
+            // Disagreed with itself on the OUTPUTS. The contract is
+            // nondeterministic, which is its own defect with its own property, and
+            // is emphatically not proof of the law this case was checking. Say so
+            // under the right name if we can: reporting nothing at all would turn a
+            // real defect into a silent miss.
+            //
+            // Note for `StateIdempotence` specifically: this escalation cannot
+            // name it. `escalate_to_determinism` returns early unless the case has
+            // enough states for `UpdateDeterminism` (arity 2), and an idempotence
+            // case carries one. So the outcome here is always `NotReproducible` for
+            // that property, which is why the settling-flap arm above must keep the
+            // violation rather than fall through to this.
             _ => escalate_to_determinism(oracle, case),
         };
     }
