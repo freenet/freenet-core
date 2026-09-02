@@ -3890,7 +3890,7 @@ mod tests {
                 left: digest(),
                 right: digest(),
                 detail: "merge(A, A) != A".to_string(),
-                settling: Some(IdempotenceSettling::SettledAfter(1)),
+                settling: Some(IdempotenceSettling::NeverSettled),
             }),
         )];
         let report = Report::build(&Corpus::default(), &outcomes, None, Vec::new());
@@ -3900,9 +3900,19 @@ mod tests {
             json.contains("\"settling\""),
             "the settling field never reached --json: {json}"
         );
+        // `NeverSettled` deliberately, and asserting the OTHER variant is absent.
+        // Found by mutation: with a `SettledAfter` fixture, hardcoding the forwarded
+        // value to `SettledAfter(1)` passed — the test proved the field was present,
+        // not that it carried what the verifier decided. `NeverSettled` is also the
+        // classification an enforcement policy can act on, so silently substituting
+        // the benign one is the direction that matters.
         assert!(
-            json.contains("SettledAfter"),
-            "--json carries the field but not which classification: {json}"
+            json.contains("NeverSettled"),
+            "--json must forward the classification the verifier made: {json}"
+        );
+        assert!(
+            !json.contains("SettledAfter"),
+            "a classification the verifier did not make must not appear: {json}"
         );
     }
 
