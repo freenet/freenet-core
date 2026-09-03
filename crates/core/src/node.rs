@@ -879,6 +879,18 @@ impl NodeConfig {
                 registers.push(Box::new(telemetry));
             }
 
+            // Independent of the TelemetryReporter above: a separate opt-in
+            // (`otel-telemetry-enabled`), a separate endpoint, and a separate
+            // collector. It is not a NetEventRegister — it installs a global
+            // meter provider that instrumentation reaches via
+            // `opentelemetry::global::meter`.
+            // The transport keypair, NOT a `PeerId`: it yields both identity
+            // resource attributes and, in `freenet` auth mode, the token
+            // signing key. A PeerId renders as `{pub_key}@{addr}`, which would
+            // put this node's socket address on every exported batch and
+            // re-identify the node on every address change.
+            crate::tracing::otel::init(&self.config.otel, &self.key_pair);
+
             (DynamicRegister::new(registers), flush_handle)
         };
         let cfg = self.config.clone();

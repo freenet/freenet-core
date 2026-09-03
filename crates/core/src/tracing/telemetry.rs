@@ -612,7 +612,7 @@ fn try_enqueue_event(
 ///
 /// Best-effort: if `current_exe()` fails we return `false` and fall back to the
 /// compile-time guards, which already cover unit tests and CI.
-fn running_under_cargo_test() -> bool {
+pub(crate) fn running_under_cargo_test() -> bool {
     std::env::current_exe()
         .ok()
         .and_then(|exe| {
