@@ -86,6 +86,33 @@ An `Authorization` header set that way is never overwritten by the node — so
 static header auth, the usual way OTLP endpoints are authenticated, already
 works in the default mode without any freenet-specific configuration.
 
+### Credentials are never sent in cleartext
+
+This applies to both kinds — the node's own bearer token and anything you put
+in `OTEL_EXPORTER_OTLP_HEADERS`:
+
+- **A credential requires `https://`, unless the collector is on loopback.**
+  If the endpoint is plaintext `http://` to anything other than
+  `localhost`/`127.0.0.0/8`/`::1`, every export fails with a `WARN` naming the
+  reason rather than putting the credential on the wire, where anyone on the
+  path could take it. The node also says so at startup rather than leaving you
+  to notice one warning an export interval later. The loopback exemption is for
+  the common deployment, a collector sidecar on the same host.
+- **Redirects are not followed.** An `https` endpoint answering `30x` with an
+  `http` location would otherwise carry the header there. A redirect surfaces
+  as an export failure.
+- **`HTTP_PROXY` / `HTTPS_PROXY` are ignored**, and this one is easy to trip
+  over: without it a proxy set in the environment would receive an export aimed
+  at `http://localhost:4318` — passing the loopback exemption and leaving the
+  machine anyway, credential included. Exports go to the endpoint you name and
+  nowhere else. If your collector is only reachable through a proxy, point
+  `otel-endpoint` at the proxy.
+- **Credentials are redacted from logs.** Collectors echo request headers back
+  in error bodies, and `freenet service report` uploads node logs wholesale, so
+  an echoed token — or a key a collector names in prose — is stripped before
+  the body is logged. Userinfo in `otel-endpoint` (`http://user:pass@...`) is
+  stripped from every log line too.
+
 `otel-auth-mode = "freenet"` is for collectors that verify freenet node
 identities. It adds
 
@@ -93,13 +120,45 @@ identities. It adds
 Authorization: Bearer freenet/<pubkey>/<audience>/<timestamp>/<signature>
 ```
 
-to each export, where `<signature>` is an XEdDSA signature over the preceding
-fields made with the node's transport key, `<pubkey>` is that key in base58,
-and `<audience>` identifies the exact URL the export was sent to. It proves the
-metrics came from the node they claim to, and the audience field means a token
-sent to one collector cannot be replayed at another. Do not enable it for a
-collector that does not check these tokens — it ships a signed assertion of
-your node's identity to whatever it is pointed at.
+to each export, where `<signature>` is an XEdDSA signature made with the
+node's transport key, `<pubkey>` is that key in base58, and `<audience>`
+identifies the exact URL the export was sent to. It proves the metrics came
+from the node they claim to, and the audience field means a token sent to one
+collector cannot be replayed at another. Do not enable it for a collector that
+does not check these tokens — it ships a signed assertion of your node's
+identity to whatever it is pointed at.
+
+### What a collector must enforce
+
+All five, in this order. The node can enforce none of them — it mints the
+token, you decide what it is worth — so a collector that implements only some
+of this list is not doing what the scheme claims. Skipping any one of the
+first three makes the other two decorative.
+
+1. **Verify the signature.** XEdDSA, made with the node's x25519 transport
+   key. No exotic library needed: convert the Montgomery public key to Edwards
+   with sign bit 0, then run stock Ed25519 verification.
+2. **Verify the body hash.** The signing input is NOT the token you received.
+   It is the token prefix (everything before `<signature>`) plus
+   `/<base58 SHA-256 of the request body>`. You have the body; recompute the
+   hash and verify against that. **This is the check that binds the token to
+   the metrics.** A collector that does timestamp and replay but skips this
+   accepts any body at all from anyone holding a fresh token, which is exactly
+   the spoofing the scheme exists to prevent.
+3. **Verify `<audience>` matches a URL you answer at** (computed as below).
+   Without it, any collector a node exports to can present that node's token
+   at a different collector and impersonate it.
+4. **Reject** a token whose `<timestamp>` is more than **300 seconds** from
+   your own clock. Wide enough for ordinary NTP drift and a slow export,
+   narrow enough that a captured token is not usefully replayable.
+5. **Refuse** a `(pubkey, timestamp, body hash)` triple you have already
+   accepted inside that window.
+
+What check 5 buys, so you can judge the cost of skipping it: because the body
+is bound, a replayed token can only resubmit the *identical* batch. An
+attacker gains duplicate datapoints, not forged ones — so a cache is worth
+having, but its absence is a data-quality problem rather than an
+authentication hole. Checks 1 to 3 are not like that.
 
 `<audience>` is base58 of the first 16 bytes of `SHA-256` over the canonical
 target, which is `{host}:{port}{path}` — host lowercased, port always explicit

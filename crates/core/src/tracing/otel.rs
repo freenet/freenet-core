@@ -105,6 +105,146 @@ fn env_endpoint() -> Option<String> {
     })
 }
 
+/// The raw `OTEL_EXPORTER_OTLP_*HEADERS` value, in SDK precedence order.
+fn env_otlp_headers() -> Option<String> {
+    [
+        "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+    ]
+    .iter()
+    .find_map(|var| {
+        let value = std::env::var(var).ok()?;
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+/// `(lowercased name, value)` for every header the operator declared through
+/// `OTEL_EXPORTER_OTLP_HEADERS`.
+///
+/// Every one is treated as a credential. That variable exists to carry them,
+/// and `Authorization` is only the most common spelling: `x-honeycomb-team`,
+/// `api-key` and `dd-api-key` are all header-credential schemes in ordinary
+/// use with OTLP. Keying the cleartext guard on `Authorization` alone would
+/// protect one spelling and quietly leak the others.
+///
+/// Parsed loosely on purpose — the SDK owns the authoritative parse, and this
+/// only decides what to guard and what to redact. Over-inclusion costs a
+/// refused export on a plaintext remote endpoint, which is the safe direction.
+fn parse_otlp_headers(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+        .filter(|(name, value)| !name.is_empty() && !value.is_empty())
+        .collect()
+}
+
+/// Whether a credential may ride a request to this URI without going over the
+/// wire in cleartext.
+///
+/// `https` always qualifies. Plaintext `http` qualifies only for loopback,
+/// which is the overwhelmingly common OTLP deployment — a collector sidecar on
+/// the same host — where there is no network path to intercept.
+///
+/// This inspects the URI the exporter AIMED at, which is only the real
+/// destination because [`export_http_client`] disables redirects and ambient
+/// proxies. Re-enable either and this check stops meaning anything.
+///
+/// One divergence is knowingly accepted: `localhost` is a NAME, resolved by
+/// the system resolver, so on a host whose `/etc/hosts` lacks the loopback
+/// entry it could resolve off-machine while this returns `true`. Requiring a
+/// literal loopback IP would close it and would also break the sidecar
+/// configuration the exemption exists for — `http://localhost:4318` is the
+/// SDK's own default. Judged the better trade, and recorded rather than
+/// silently relied upon.
+fn credential_safe(uri: &http::Uri) -> bool {
+    if uri.scheme_str() == Some("https") {
+        return true;
+    }
+    // Bracketed IPv6 authority: `http::Uri::host` keeps the brackets.
+    let Some(host) = uri
+        .host()
+        .map(|h| h.trim_start_matches('[').trim_end_matches(']'))
+    else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// An endpoint STRING with any `user:password@` removed, for logging.
+///
+/// The `Uri`-typed [`redact_uri`] does not cover the startup and validation
+/// log lines: those carry the operator's raw config or env value, before it is
+/// ever parsed. `otel-endpoint = "http://u:p@collector:4318"` would otherwise
+/// put the password in the node log at INFO on every start, and
+/// `freenet service report` uploads node logs wholesale.
+fn redact_endpoint(endpoint: &str) -> std::borrow::Cow<'_, str> {
+    // A missing scheme is NOT a case to skip: it is precisely what the
+    // "endpoint is unusable" WARN fires on, so `u:secret@collector:4318`
+    // would otherwise be logged verbatim by the one line most likely to see
+    // a malformed endpoint.
+    let (prefix, rest) = match endpoint.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), endpoint),
+    };
+    // Only an `@` before the first `/` is userinfo; one in a path is not.
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        None => std::borrow::Cow::Borrowed(endpoint),
+        Some(at) => std::borrow::Cow::Owned(format!("{prefix}[redacted]@{}", &rest[at + 1..])),
+    }
+}
+
+/// `uri` with any `user:password@` removed, for logging.
+///
+/// `http::Uri`'s `Display` renders the authority verbatim, userinfo included,
+/// and both the startup line and every export failure log the endpoint — so
+/// `otel-endpoint = "http://u:p@collector:4318"` would otherwise put the
+/// password in the node log, which `freenet service report` uploads wholesale.
+fn redact_uri(uri: &http::Uri) -> String {
+    let Some(authority) = uri.authority() else {
+        return uri.to_string();
+    };
+    let Some((_, host_port)) = authority.as_str().split_once('@') else {
+        return uri.to_string();
+    };
+    let scheme = uri
+        .scheme_str()
+        .map(|s| format!("{s}://"))
+        .unwrap_or_default();
+    format!("{scheme}[redacted]@{host_port}{}", uri.path())
+}
+
+/// Which credential will be refused at export time for `endpoint`, or `None`.
+///
+/// Covers both sources: `otel-auth-mode = "freenet"` mints our own signed
+/// token, and `OTEL_EXPORTER_OTLP_HEADERS` may carry the operator's. `None`
+/// for `endpoint` means the SDK default, `http://localhost:4318`, which is
+/// loopback and therefore fine.
+fn credential_that_would_be_refused(
+    auth_mode: crate::config::OtelAuthMode,
+    headers: Option<&str>,
+    endpoint: Option<&str>,
+) -> Option<String> {
+    let endpoint = endpoint?;
+    let unsafe_endpoint = endpoint
+        .parse::<http::Uri>()
+        .is_ok_and(|uri| !credential_safe(&uri));
+    if !unsafe_endpoint {
+        return None;
+    }
+    if matches!(auth_mode, crate::config::OtelAuthMode::Freenet) {
+        return Some("the freenet bearer token (otel-auth-mode)".to_owned());
+    }
+    headers
+        .map(parse_otlp_headers)
+        .and_then(|declared| declared.into_iter().next())
+        .map(|(name, _)| format!("the `{name}` header from OTEL_EXPORTER_OTLP_HEADERS"))
+}
+
 /// Why an OTLP endpoint will not work, or `None` when it is usable.
 ///
 /// Both failure modes are otherwise near-invisible. `http::Uri` accepts
@@ -116,8 +256,10 @@ fn env_endpoint() -> Option<String> {
 fn endpoint_problem(endpoint: &str) -> Option<&'static str> {
     match endpoint.parse::<http::Uri>() {
         Err(_) => Some(
-            "not a valid URL; the SDK will silently fall back to http://localhost:4318. \
-             Include the scheme, e.g. http://collector:4318",
+            "not a valid URL; include the scheme, e.g. http://collector:4318. \
+             From the config file this fails the exporter build; from \
+             OTEL_EXPORTER_OTLP_* the SDK swallows it and exports to \
+             http://localhost:4318 instead",
         ),
         Ok(uri) if !matches!(uri.scheme_str(), Some("http" | "https")) => {
             Some("missing an http:// or https:// scheme; every export will fail to build a request")
@@ -125,6 +267,15 @@ fn endpoint_problem(endpoint: &str) -> Option<&'static str> {
         Ok(_) => None,
     }
 }
+
+/// How far a `freenet` bearer token's `<timestamp>` may sit from the
+/// collector's clock before the collector must reject it.
+///
+/// Five minutes: wide enough for ordinary NTP drift and a slow export, narrow
+/// enough that a captured token is not usefully replayable. Declared here
+/// because it is a wire contract — the node stamps the timestamp, the
+/// collector enforces the window, and the two have to agree on the number.
+pub(crate) const REPLAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Build one `freenet`-mode bearer token:
 /// `freenet/<pubkey>/<audience>/<timestamp>/<signature>`, where `<signature>`
@@ -144,11 +295,35 @@ fn endpoint_problem(endpoint: &str) -> Option<&'static str> {
 /// see `node_pubkey_is_verifiable_with_stock_ed25519` below. The collector
 /// must additionally check `<audience>` against the hash of each URL it
 /// answers at (see [`audience_of`]) and `<timestamp>` against its own clock.
+///
+/// # The signature covers the body, which is not on the wire
+///
+/// The signing input is the token prefix PLUS `/<base58 SHA-256 of the request
+/// body>`, while the transmitted token stops at the prefix. The collector has
+/// the body, so it recomputes that hash and verifies against it.
+///
+/// Without this a token authenticates only "this node addressed this
+/// collector at this second" — anyone who obtained one could attach it to a
+/// body of their own invention and have it accepted as this node's metrics,
+/// which is precisely the spoofing the scheme exists to stop. Keeping the hash
+/// off the wire costs nothing and leaves the token format at five fields.
+///
+/// # Replay window (a collector obligation)
+///
+/// The node cannot enforce this; the collector must. `<timestamp>` is epoch
+/// seconds, and a collector MUST reject a token whose timestamp is outside
+/// [`REPLAY_WINDOW`] of its own clock, and SHOULD refuse a
+/// `(pubkey, timestamp, body hash)` triple it has already accepted inside that
+/// window. Without both, a token captured in flight is replayable for as long
+/// as the collector will take it. `docs/otel-metrics.md` states the same rules
+/// so a collector implementer has them without reading this.
 pub(crate) fn bearer_token(
     signer: &xeddsa::xed25519::PrivateKey,
     pubkey_b58: &str,
     audience: &str,
+    body: &[u8],
 ) -> String {
+    use sha2::{Digest, Sha256};
     use xeddsa::xeddsa::Sign;
     // Wall-clock epoch seconds on purpose: the collector checks it against
     // ITS clock, so simulation time would be meaningless here.
@@ -157,12 +332,14 @@ pub(crate) fn bearer_token(
         .map(|d| d.as_secs())
         .unwrap_or_default();
     let signed_payload = format!("freenet/{pubkey_b58}/{audience}/{timestamp}");
+    let body_hash = bs58::encode(Sha256::digest(body)).into_string();
+    let signed_payload_with_body = format!("{signed_payload}/{body_hash}");
     // OS entropy (SysRng), not GlobalRng: XEdDSA's Z randomness hedges the
     // signature nonce, which is cryptographic material — the same exception
     // documented in .claude/rules/code-style.md for keys/nonces. UnwrapErr is
     // required because xeddsa's bound is the infallible rand 0.10 CryptoRng.
     let signature: [u8; 64] = signer.sign(
-        signed_payload.as_bytes(),
+        signed_payload_with_body.as_bytes(),
         rand_core10::UnwrapErr(rand10::rngs::SysRng),
     );
     let signature = bs58::encode(signature).into_string();
@@ -233,6 +410,87 @@ struct OtlpHttpClient {
     /// `None` in `disabled` auth mode.
     signer: Option<xeddsa::xed25519::PrivateKey>,
     pubkey_b58: String,
+    /// Every header the operator declared through `OTEL_EXPORTER_OTLP_HEADERS`,
+    /// lowercased name and value. Held for two jobs: deciding whether a
+    /// request carries a credential at all (the guard below is not
+    /// `Authorization`-only), and redacting those values out of anything a
+    /// collector echoes back into the log. See [`parse_otlp_headers`].
+    operator_credentials: Vec<(String, String)>,
+}
+
+impl OtlpHttpClient {
+    /// The name of a credential header on this request, if any.
+    ///
+    /// `Authorization` always counts — ours or the operator's. Beyond it,
+    /// every header the operator declared through `OTEL_EXPORTER_OTLP_HEADERS`
+    /// counts too, because that is where OTLP credentials live and
+    /// `Authorization` is only the most common spelling of one.
+    fn credential_header_name(&self, headers: &http::HeaderMap) -> Option<String> {
+        if headers.contains_key(http::header::AUTHORIZATION) {
+            return Some("Authorization".to_owned());
+        }
+        self.operator_credentials
+            .iter()
+            .map(|(name, _)| name)
+            .find(|name| headers.keys().any(|h| h.as_str() == name.as_str()))
+            .cloned()
+    }
+
+    /// Values worth searching an error body for.
+    ///
+    /// Each declared header contributes its whole value AND, when that value
+    /// carries a scheme prefix, the token after it. A collector rejecting a
+    /// request names the token alone far more often than the header value —
+    /// `unauthorized: key 'sk-abc123' rejected` — so registering only
+    /// `Bearer sk-abc123` would miss the commonest spelling of the leak this
+    /// exists to stop.
+    ///
+    /// Matching is exact and case-sensitive. A collector that percent-encodes,
+    /// base64s or JSON-escapes the value defeats it; that is a known limit,
+    /// not an oversight. The keyword pass in [`redact_keyword_lines`] is the
+    /// backstop for anything named alongside a scheme or header word.
+    fn redaction_needles(&self) -> Vec<&str> {
+        let mut needles = Vec::new();
+        for (_, value) in &self.operator_credentials {
+            for candidate in [
+                value.as_str(),
+                value
+                    .split_once(' ')
+                    .filter(|(scheme, _)| {
+                        scheme.eq_ignore_ascii_case("bearer")
+                            || scheme.eq_ignore_ascii_case("basic")
+                    })
+                    .map(|(_, token)| token)
+                    .unwrap_or_default(),
+            ] {
+                if candidate.len() >= MIN_REDACTION_NEEDLE {
+                    needles.push(candidate);
+                }
+            }
+        }
+        // Longest first, so redacting a token does not leave the surrounding
+        // header value unmatched.
+        needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
+        needles
+    }
+
+    /// An error body, safe to log: credentials removed, then truncated.
+    ///
+    /// The order matters and was wrong once. Truncating first cuts a
+    /// credential that straddles the boundary, so the value no longer matches
+    /// and its surviving prefix is logged — a body of 240 bytes of prose
+    /// followed by `key sk-LIVE-abc123` would put the first characters of a
+    /// live key at WARN.
+    fn safe_body(&self, body: &[u8]) -> String {
+        let text = String::from_utf8_lossy(body);
+        let mut text = redact_keyword_lines(&text);
+        for needle in self.redaction_needles() {
+            if text.contains(needle) {
+                text = text.replace(needle, "[redacted]");
+            }
+        }
+        truncate_for_log(&text)
+    }
 }
 
 // Manual impl: never print the signing key.
@@ -261,7 +519,7 @@ static EXPORT_FAILING: AtomicBool = AtomicBool::new(false);
 fn report_export_failure(uri: &http::Uri, detail: &str) {
     if !EXPORT_FAILING.swap(true, Ordering::Relaxed) {
         tracing::warn!(
-            %uri,
+            uri = redact_uri(uri),
             detail,
             "OTel metrics export is failing; metrics are not reaching the collector"
         );
@@ -275,11 +533,69 @@ fn report_export_success() {
     }
 }
 
-/// First 256 bytes of an error body — OTLP puts rejection detail there, but a
-/// collector may echo back headers (including our bearer token), so it is
-/// truncated rather than logged whole.
-fn truncated_body(body: &[u8]) -> String {
-    String::from_utf8_lossy(&body[..body.len().min(256)]).into_owned()
+/// Shortest credential value worth searching an error body for.
+///
+/// `OTEL_EXPORTER_OTLP_HEADERS` carries things that are not secret —
+/// `x-scope-orgid=prod` is a Mimir/Loki tenant id — and replacing every
+/// occurrence of a four-character value would corrupt the very diagnostics
+/// this log exists for. Over-inclusion is still right for the cleartext GUARD,
+/// where the cost of a false positive is a refused export; it is wrong here,
+/// where the cost is an unreadable log.
+const MIN_REDACTION_NEEDLE: usize = 8;
+
+/// Largest response body read from a collector.
+///
+/// A bound is wanted: a collector answering an OTLP POST with an endless body
+/// would otherwise be read until the export timeout. But it must not truncate
+/// a LEGITIMATE response — a 200 carries an `ExportMetricsServiceResponse`,
+/// normally empty, whose one large field is a `partial_success.error_message`
+/// naming rejected datapoints, and the SDK needs the whole protobuf to decode
+/// it. Truncating that would leave the SDK unable to report a partial failure
+/// while this client called the export a success. Hence a cap far above any
+/// plausible real response rather than at the 256 bytes we log.
+const MAX_RESPONSE_BODY: u64 = 1024 * 1024;
+
+/// Whether the response-body cap has already been reported, so an oversized
+/// collector warns once rather than every 60s forever.
+static BODY_CAP_REPORTED: std::sync::Once = std::sync::Once::new();
+
+/// Cut a redacted body down to what is worth logging.
+///
+/// By CHARACTERS, not bytes, so a multi-byte sequence is never split. Applied
+/// AFTER redaction on purpose — see [`OtlpHttpClient::safe_body`].
+fn truncate_for_log(text: &str) -> String {
+    match text.char_indices().nth(256) {
+        None => text.to_owned(),
+        Some((at, _)) => text[..at].to_owned(),
+    }
+}
+
+/// Redact any line naming a credential scheme or header.
+fn redact_keyword_lines(text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            match ["authorization", "bearer ", "freenet/"]
+                .iter()
+                .filter_map(|needle| lower.find(needle))
+                .min()
+            {
+                None => line.to_owned(),
+                // The WHOLE line, not from the marker onwards: a collector
+                // answering `invalid token abc123 in authorization header`
+                // puts the credential BEFORE the keyword, and redacting
+                // forwards would leave it in the log. Losing one line of
+                // rejection detail is the cheaper mistake.
+                Some(_) => {
+                    let mut redacted = String::from("[redacted]");
+                    if line.ends_with('\n') {
+                        redacted.push('\n');
+                    }
+                    redacted
+                }
+            }
+        })
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -291,11 +607,70 @@ impl HttpClient for OtlpHttpClient {
         // bearer token is one auth scheme among several, not the only one.
         if let Some(signer) = self.signer.as_ref() {
             if !request.headers().contains_key(http::header::AUTHORIZATION) {
-                let token = bearer_token(signer, &self.pubkey_b58, &audience_of(request.uri()));
+                // An audience is only empty when the URI has no host, which
+                // cannot reach the wire anyway. Refuse rather than mint
+                // `freenet/<pubkey>//<ts>/<sig>`: a collector splitting on
+                // '/' with empty-filtering instead of `splitn(5, '/')` would
+                // misparse it, and signing an empty audience binds the token
+                // to nothing.
+                let audience = audience_of(request.uri());
+                if audience.is_empty() {
+                    report_export_failure(
+                        request.uri(),
+                        "endpoint has no host, so no collector audience can be \
+                         derived; check otel-endpoint",
+                    );
+                    return Err(
+                        "cannot derive a collector audience from an endpoint with no host".into(),
+                    );
+                }
+                let token = bearer_token(
+                    signer,
+                    &self.pubkey_b58,
+                    &audience,
+                    // Binds the signature to THIS batch; see `bearer_token`.
+                    request.body(),
+                );
                 request.headers_mut().insert(
                     http::header::AUTHORIZATION,
                     http::HeaderValue::from_str(&format!("Bearer {token}"))?,
                 );
+            }
+        }
+        // Whoever the credential belongs to — our signed token or the
+        // operator's own header — it does not go out in cleartext to anything
+        // but loopback. A stolen static token is reusable until it is rotated;
+        // a stolen `freenet` token is replayable at that same collector for
+        // `REPLAY_WINDOW`. Failing the export is deliberate: stripping the
+        // header silently would surface as a collector-side auth error and
+        // send the operator hunting in the wrong place, and sending it anyway
+        // is the thing being prevented.
+        // Userinfo counts too. NOT because reqwest promotes it to a Basic
+        // header — it does that only on the `RequestBuilder` path, and this
+        // goes through `TryFrom<http::Request>`, which does not. The reason is
+        // simpler: `http://user:secret@collector/` puts a credential in the
+        // request line itself, `Uri::host()` strips it so `credential_safe`
+        // never sees it, and sending that to a plaintext remote endpoint hands
+        // the password to anyone on the path.
+        let credential = self.credential_header_name(request.headers()).or_else(|| {
+            request
+                .uri()
+                .authority()
+                .filter(|a| a.as_str().contains('@'))
+                .map(|_| "endpoint userinfo".to_owned())
+        });
+        if let Some(name) = credential {
+            if !credential_safe(request.uri()) {
+                let uri = redact_uri(request.uri());
+                report_export_failure(
+                    request.uri(),
+                    &format!(
+                        "refusing to send the `{name}` credential over plaintext http to a \
+                         non-loopback collector; use an https:// endpoint or a collector on \
+                         loopback (see docs/otel-metrics.md)"
+                    ),
+                );
+                return Err(format!("refusing to send a credential in cleartext to {uri}").into());
             }
         }
         let uri = request.uri().clone();
@@ -327,18 +702,72 @@ impl HttpClient for OtlpHttpClient {
             .inspect_err(|error| report_export_failure(&uri, &format!("{error}")))?;
         let status = response.status();
         let headers = std::mem::take(response.headers_mut());
-        let body = response
-            .bytes()
-            .inspect_err(|error| report_export_failure(&uri, &format!("{error}")))?;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(&mut response, MAX_RESPONSE_BODY),
+            &mut buf,
+        )
+        .inspect_err(|error| report_export_failure(&uri, &format!("{error}")))?;
+        if buf.len() as u64 > MAX_RESPONSE_BODY {
+            // Unreachable via `take`, but the cap is the invariant, not the
+            // reader: assert it rather than assume it.
+            buf.truncate(MAX_RESPONSE_BODY as usize);
+        }
+        if buf.len() as u64 == MAX_RESPONSE_BODY {
+            // Warned once, not per export: a consistently oversized collector
+            // would otherwise emit this every interval forever. Reaching the
+            // cap means the SDK may be unable to decode a partial-success
+            // message, so it is worth saying at all.
+            BODY_CAP_REPORTED.call_once(|| {
+                tracing::warn!(
+                    uri = redact_uri(&uri),
+                    cap = MAX_RESPONSE_BODY,
+                    "collector response reached the read cap; if it was larger, \
+                     partial-success detail for this batch is incomplete"
+                );
+            });
+        }
+        let body = Bytes::from(buf);
         if status.is_success() {
             report_export_success();
         } else {
-            report_export_failure(&uri, &format!("HTTP {status}: {}", truncated_body(&body)));
+            report_export_failure(&uri, &format!("HTTP {status}: {}", self.safe_body(&body)));
         }
         let mut http_response = Response::builder().status(status).body(body)?;
         *http_response.headers_mut() = headers;
         Ok(http_response)
     }
+}
+
+/// The HTTP client every export goes through.
+///
+/// A named function rather than inline builder calls so the tests exercise the
+/// SAME construction production uses. Both policies below are credential
+/// safety controls, and a test that built its own client would let either be
+/// deleted in silence — which is how a security control rots.
+///
+/// - **No redirects.** reqwest's default policy replays the request at the new
+///   location with the original headers attached, so an https endpoint
+///   answering 30x with an http `Location` would carry the credential there in
+///   cleartext, past [`credential_safe`], which only ever sees the endpoint
+///   the exporter aimed at. A collector has no business redirecting an OTLP
+///   POST; a 30x now surfaces as an export failure.
+/// - **No ambient proxy.** reqwest defaults to `auto_sys_proxy` and neither it
+///   nor hyper-util's matcher has a loopback exemption, so an `HTTP_PROXY` in
+///   the environment — routine on corporate networks — would send an export
+///   aimed at `http://localhost:4318` to that proxy instead: straight through
+///   the loopback exemption, credential attached, off the machine. Same defeat
+///   as the redirect and easier to hit, since it is ambient environment rather
+///   than something the collector does.
+///
+/// The timeout is the one the SDK would have applied to its own client, which
+/// it does not apply to a supplied one.
+fn export_http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
+    reqwest::blocking::Client::builder()
+        .timeout(export_timeout())
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
 }
 
 /// Instrumentation scope name for every instrument this crate registers.
@@ -405,8 +834,8 @@ pub(crate) fn init(
         (env_endpoint.as_deref(), config.endpoint.as_deref())
     {
         tracing::warn!(
-            %env_endpoint,
-            %cfg_endpoint,
+            env_endpoint = %redact_endpoint(env_endpoint),
+            cfg_endpoint = %redact_endpoint(cfg_endpoint),
             "OTEL_EXPORTER_OTLP_* overrides the configured otel-endpoint"
         );
     }
@@ -414,10 +843,33 @@ pub(crate) fn init(
     // not produces a per-export failure rather than a build error, and an
     // unparseable env value is swallowed by the SDK, which then silently
     // exports to localhost while the log line below names the operator's URL.
-    if let Some(effective) = endpoint.as_deref().or(env_endpoint.as_deref()) {
+    let effective_endpoint = endpoint.as_deref().or(env_endpoint.as_deref());
+    if let Some(effective) = effective_endpoint {
         if let Some(problem) = endpoint_problem(effective) {
-            tracing::warn!(endpoint = effective, problem, "OTLP endpoint is unusable");
+            tracing::warn!(
+                endpoint = %redact_endpoint(effective),
+                problem,
+                "OTLP endpoint is unusable"
+            );
         }
+    }
+    // Say it at startup, where an operator is looking. The refusal itself
+    // happens per export and latches, so otherwise a plain `http://` typo
+    // produces a cheerful "exporter started" line and then, an interval later,
+    // one WARN that is easy to miss. This is a configuration error.
+    if let Some(credential) = credential_that_would_be_refused(
+        config.auth_mode,
+        env_otlp_headers().as_deref(),
+        effective_endpoint,
+    ) {
+        tracing::warn!(
+            endpoint = %redact_endpoint(effective_endpoint.unwrap_or_default()),
+            credential,
+            "the collector endpoint is plaintext http and not loopback, so every \
+             export will be refused rather than send this credential in cleartext; \
+             use an https:// endpoint or a collector on loopback (see \
+             docs/otel-metrics.md)"
+        );
     }
 
     let (pubkey, fingerprint) = identity_attributes(keypair);
@@ -443,11 +895,22 @@ pub(crate) fn init(
             global::set_meter_provider(provider);
             register_metrics();
             tracing::info!(
-                endpoint = endpoint
-                    .as_deref()
-                    .or(env_endpoint.as_deref())
-                    .unwrap_or("http://localhost:4318 (SDK default)"),
+                endpoint = %redact_endpoint(
+                    endpoint
+                        .as_deref()
+                        .or(env_endpoint.as_deref())
+                        .unwrap_or("http://localhost:4318 (SDK default)")
+                ),
                 auth_mode = ?config.auth_mode,
+                // Named at startup only when it applies. A collector verifying
+                // our tokens has to enforce this window, and an operator
+                // standing one up should not have to read the source for the
+                // number.
+                replay_window_secs = matches!(
+                    config.auth_mode,
+                    crate::config::OtelAuthMode::Freenet
+                )
+                .then(|| REPLAY_WINDOW.as_secs()),
                 "OTel metrics exporter started"
             );
         }
@@ -657,16 +1120,17 @@ fn build_provider_blocking(
     // `Client::new()`: that fallback has NO timeout, so a collector that
     // accepts the connection and never answers would block the PeriodicReader
     // thread indefinitely and stop all metric collection.
-    let http_client = reqwest::blocking::Client::builder()
-        .timeout(export_timeout())
-        .build()
-        .map_err(|error| {
-            ExporterBuildError::InternalFailure(format!("otel http client build failed: {error}"))
-        })?;
+    let http_client = export_http_client().map_err(|error| {
+        ExporterBuildError::InternalFailure(format!("otel http client build failed: {error}"))
+    })?;
     builder = builder.with_http_client(OtlpHttpClient {
         inner: http_client,
         signer: auth_signer,
         pubkey_b58: pubkey.clone(),
+        operator_credentials: env_otlp_headers()
+            .as_deref()
+            .map(parse_otlp_headers)
+            .unwrap_or_default(),
     });
     let exporter = builder.build()?;
 
@@ -756,7 +1220,7 @@ fn register_metrics() {
         // than silently half-migrated.
         tracing::warn!("OTel instruments already registered; keeping the first set");
     }
-    register_observables(&meter);
+    register_observables(&meter, RingSources::live());
 }
 
 /// The synchronous instruments, built against `meter`.
@@ -792,7 +1256,7 @@ fn build_instruments(meter: &opentelemetry::metrics::Meter) -> Instruments {
 /// an in-memory exporter. A panic in any callback kills the `PeriodicReader`
 /// thread and stops ALL metrics permanently, and no export-side signal reports
 /// it, so "the callbacks run at all" needs a test.
-fn register_observables(meter: &opentelemetry::metrics::Meter) {
+fn register_observables(meter: &opentelemetry::metrics::Meter, sources: RingSources) {
     let _rss = meter
         .u64_observable_gauge("freenet.process.memory.rss")
         .with_unit("By")
@@ -805,7 +1269,7 @@ fn register_observables(meter: &opentelemetry::metrics::Meter) {
         .build();
 
     register_transport_metrics(meter);
-    register_ring_metrics(meter);
+    register_ring_metrics(meter, sources);
     register_queue_metrics(meter);
 }
 
@@ -878,15 +1342,46 @@ fn register_transport_metrics(meter: &opentelemetry::metrics::Meter) {
 }
 
 /// Ring / topology state, mirroring the dashboard's connection-status tiles.
-fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
-    use crate::node::network_status::{otel_hosting_reasons, otel_ring_stats, otel_status_scalars};
+/// The three accessors every ring- and status-sourced callback reads, behind
+/// function pointers so a test can drive them.
+///
+/// Not indirection for its own sake. Each of those callback bodies is guarded
+/// by `if let Some(x) = <source>()`, and in a fresh test process no provider is
+/// registered, so the guarded body — which is where the bucket indexing and
+/// the `as u64` casts live — never executes. Half the instruments were
+/// consequently unasserted by the export test: renaming one, or dropping a
+/// `reason=` / `op=` / `result=` attribute, failed nothing, even though
+/// `HostingReason::as_str`'s own rustdoc calls those values "a metrics
+/// contract" where "renaming one silently empties a panel".
+#[derive(Clone, Copy)]
+struct RingSources {
+    ring_stats: fn() -> Option<crate::node::network_status::RingStatsSnapshot>,
+    hosting_reasons: fn() -> Option<crate::ring::HostingReasonStats>,
+    status_scalars: fn() -> Option<crate::node::network_status::OtelStatusScalars>,
+}
+
+impl RingSources {
+    /// What production reads: the live provider-backed accessors.
+    fn live() -> Self {
+        use crate::node::network_status::{
+            otel_hosting_reasons, otel_ring_stats, otel_status_scalars,
+        };
+        Self {
+            ring_stats: otel_ring_stats,
+            hosting_reasons: otel_hosting_reasons,
+            status_scalars: otel_status_scalars,
+        }
+    }
+}
+
+fn register_ring_metrics(meter: &opentelemetry::metrics::Meter, sources: RingSources) {
     use crate::ring::HostingReason;
 
     let _connections = meter
         .u64_observable_gauge("freenet.ring.connections")
         .with_description("Active ring connections")
-        .with_callback(|observer| {
-            if let Some(ring) = otel_ring_stats() {
+        .with_callback(move |observer| {
+            if let Some(ring) = (sources.ring_stats)() {
                 observer.observe(ring.connection_count as u64, &[]);
             }
         })
@@ -901,8 +1396,8 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
         .with_description(
             "Contracts currently hosted by this node, partitioned by why each one is held",
         )
-        .with_callback(|observer| {
-            if let Some(reasons) = otel_hosting_reasons() {
+        .with_callback(move |observer| {
+            if let Some(reasons) = (sources.hosting_reasons)() {
                 for reason in HostingReason::ALL {
                     observer.observe(
                         reasons.count(reason),
@@ -921,8 +1416,8 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
              held. State only — WASM code blobs and database overhead are excluded, matching \
              what the hosting cache's byte budget measures.",
         )
-        .with_callback(|observer| {
-            if let Some(reasons) = otel_hosting_reasons() {
+        .with_callback(move |observer| {
+            if let Some(reasons) = (sources.hosting_reasons)() {
                 for reason in HostingReason::ALL {
                     observer.observe(
                         reasons.bytes(reason),
@@ -933,11 +1428,18 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
         })
         .build();
 
-    let _attempts = meter
-        .u64_observable_counter("freenet.connect.attempts")
-        .with_description("Connection attempts made since startup")
-        .with_callback(|observer| {
-            if let Some(status) = otel_status_scalars() {
+    // Named for what it counts, not for the field it reads.
+    // `NetworkStatus::connection_attempts` has exactly one writer in the tree,
+    // inside `record_gateway_failure`, so nothing increments it on an
+    // initiated or successful connection. The local dashboard inherits the
+    // same mislabel; an instrument name is an external contract operators
+    // alert on, and "attempts near zero" reads as the opposite of "failures
+    // near zero".
+    let _gateway_failures = meter
+        .u64_observable_counter("freenet.connect.gateway_failures")
+        .with_description("Gateway connection failures since startup")
+        .with_callback(move |observer| {
+            if let Some(status) = (sources.status_scalars)() {
                 observer.observe(status.connection_attempts as u64, &[]);
             }
         })
@@ -951,8 +1453,8 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
     let _operations = meter
         .u64_observable_counter("freenet.operation.results")
         .with_description("Completed operations by type and outcome")
-        .with_callback(|observer| {
-            let Some(status) = otel_status_scalars() else {
+        .with_callback(move |observer| {
+            let Some(status) = (sources.status_scalars)() else {
                 return;
             };
             for (op, (success, failure)) in [
@@ -979,8 +1481,8 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
             "1 when this node holds its closest connected ring neighbor on that side. \
              Held does not mean tight — compare distances across nodes.",
         )
-        .with_callback(|observer| {
-            if let Some(ring) = otel_ring_stats() {
+        .with_callback(move |observer| {
+            if let Some(ring) = (sources.ring_stats)() {
                 observer.observe(
                     ring.lattice_has_successor as u64,
                     &[KeyValue::new("position", "successor")],
@@ -996,8 +1498,8 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
     let _distance = meter
         .f64_observable_gauge("freenet.ring.lattice.neighbor.distance")
         .with_description("Ring distance to each held lattice edge; absent when unheld")
-        .with_callback(|observer| {
-            if let Some(ring) = otel_ring_stats() {
+        .with_callback(move |observer| {
+            if let Some(ring) = (sources.ring_stats)() {
                 if let Some(d) = ring.lattice_successor_distance {
                     observer.observe(d, &[KeyValue::new("position", "successor")]);
                 }
@@ -1015,8 +1517,8 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
              independently — an improvement lands some ticks after the probe that caused \
              it, so the ratio is a convergence gauge, not a success rate.",
         )
-        .with_callback(|observer| {
-            if let Some(ring) = otel_ring_stats() {
+        .with_callback(move |observer| {
+            if let Some(ring) = (sources.ring_stats)() {
                 observer.observe(
                     ring.lattice_probes_issued,
                     &[KeyValue::new("result", "issued")],
@@ -1032,8 +1534,8 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
     let _updates = meter
         .u64_observable_counter("freenet.contract.updates")
         .with_description("Relayed UPDATEs by admission outcome")
-        .with_callback(|observer| {
-            if let Some(ring) = otel_ring_stats() {
+        .with_callback(move |observer| {
+            if let Some(ring) = (sources.ring_stats)() {
                 observer.observe(
                     ring.updates_accepted,
                     &[KeyValue::new("result", "accepted")],
@@ -1138,11 +1640,31 @@ mod tests {
         }
     }
 
+    /// The body every token in these tests is signed over. The signature
+    /// covers it (see `bearer_token`), so verification must use the same bytes.
+    const TEST_BODY: &[u8] = b"export-payload";
+
+    /// What a collector verifies the signature over: the transmitted token
+    /// prefix plus the hash of the body it received. The hash is deliberately
+    /// NOT on the wire — see [`bearer_token`].
+    fn signing_input(payload: &str, body: &[u8]) -> String {
+        use sha2::Digest;
+        format!(
+            "{payload}/{}",
+            bs58::encode(sha2::Sha256::digest(body)).into_string()
+        )
+    }
+
     /// One keypair plus its token, pre-split, for the verification tests.
     fn token_fixture() -> (crate::transport::TransportKeypair, String) {
         let keypair = crate::transport::TransportKeypair::new();
         let pubkey_b58 = bs58::encode(keypair.public_key_bytes()).into_string();
-        let token = bearer_token(&keypair.auth_token_signer(), &pubkey_b58, &test_audience());
+        let token = bearer_token(
+            &keypair.auth_token_signer(),
+            &pubkey_b58,
+            &test_audience(),
+            TEST_BODY,
+        );
         (keypair, token)
     }
 
@@ -1173,9 +1695,12 @@ mod tests {
             ts > 1_700_000_000,
             "timestamp must be current epoch seconds"
         );
-        // The signature covers everything before its own slash, and verifies
-        // against the token's OWN pubkey — the transport key itself.
-        let signed_payload = format!("freenet/{pubkey}/{audience}/{timestamp}");
+        // The signature covers everything before its own slash PLUS the body
+        // hash, and verifies against the token's OWN pubkey — the transport
+        // key itself.
+        use sha2::Digest as _;
+        let body_hash = bs58::encode(sha2::Sha256::digest(TEST_BODY)).into_string();
+        let signed_payload = format!("freenet/{pubkey}/{audience}/{timestamp}/{body_hash}");
         let sig_bytes: [u8; 64] = bs58::decode(signature)
             .into_vec()
             .unwrap()
@@ -1215,7 +1740,10 @@ mod tests {
             .to_bytes();
         VerifyingKey::from_bytes(&edwards)
             .unwrap()
-            .verify(payload.as_bytes(), &Signature::from_bytes(&sig_bytes))
+            .verify(
+                signing_input(payload, TEST_BODY).as_bytes(),
+                &Signature::from_bytes(&sig_bytes),
+            )
             .expect("stock ed25519 verify after Montgomery->Edwards conversion");
     }
 
@@ -1269,9 +1797,42 @@ mod tests {
 
     fn test_client(keypair: &crate::transport::TransportKeypair, signed: bool) -> OtlpHttpClient {
         OtlpHttpClient {
-            inner: reqwest::blocking::Client::new(),
+            // Production's client, not a bare one: the redirect and proxy
+            // policies it carries are credential-safety controls, and a
+            // hand-built client here would let either be deleted in silence.
+            inner: export_http_client().expect("export client must build"),
             signer: signed.then(|| keypair.auth_token_signer()),
             pubkey_b58: bs58::encode(keypair.public_key_bytes()).into_string(),
+            operator_credentials: Vec::new(),
+        }
+    }
+
+    /// Ring/status sources that always answer, so every guarded callback body
+    /// actually executes. With the live accessors no provider is registered in
+    /// a fresh test process, every one of those bodies is skipped, and half the
+    /// instrument names below assert nothing at all.
+    fn fixture_sources() -> RingSources {
+        use crate::node::network_status::{OtelStatusScalars, RingStatsSnapshot};
+        fn ring() -> Option<RingStatsSnapshot> {
+            Some(RingStatsSnapshot {
+                connection_count: 3,
+                // `Some`, or the distance gauge emits no datapoint at all and
+                // both its name and its `position=` attributes go unasserted.
+                lattice_successor_distance: Some(0.25),
+                lattice_predecessor_distance: Some(0.5),
+                ..Default::default()
+            })
+        }
+        fn reasons() -> Option<crate::ring::HostingReasonStats> {
+            Some(crate::ring::HostingReasonStats::default())
+        }
+        fn scalars() -> Option<OtelStatusScalars> {
+            Some(OtelStatusScalars::default())
+        }
+        RingSources {
+            ring_stats: ring,
+            hosting_reasons: reasons,
+            status_scalars: scalars,
         }
     }
 
@@ -1320,7 +1881,10 @@ mod tests {
             .to_bytes();
         VerifyingKey::from_bytes(&edwards)
             .unwrap()
-            .verify(payload.as_bytes(), &Signature::from_bytes(&sig_bytes))
+            .verify(
+                signing_input(payload, b"export-payload").as_bytes(),
+                &Signature::from_bytes(&sig_bytes),
+            )
             .expect("wire bearer token must verify with stock ed25519");
         assert!(
             raw.contains("export-payload"),
@@ -1389,8 +1953,8 @@ mod tests {
         let pubkey = bs58::encode(keypair.public_key_bytes()).into_string();
         let signer = keypair.auth_token_signer();
         assert_ne!(
-            bearer_token(&signer, &pubkey, &test_audience()),
-            bearer_token(&signer, &pubkey, &test_audience())
+            bearer_token(&signer, &pubkey, &test_audience(), TEST_BODY),
+            bearer_token(&signer, &pubkey, &test_audience(), TEST_BODY)
         );
     }
 
@@ -1402,7 +1966,12 @@ mod tests {
 
         let keypair = crate::transport::TransportKeypair::new();
         let (pubkey, _) = identity_attributes(&keypair);
-        let token = bearer_token(&keypair.auth_token_signer(), &pubkey, &test_audience());
+        let token = bearer_token(
+            &keypair.auth_token_signer(),
+            &pubkey,
+            &test_audience(),
+            TEST_BODY,
+        );
         let (payload, sig_b58) = token.rsplit_once('/').unwrap();
         let sig_bytes: [u8; 64] = bs58::decode(sig_b58)
             .into_vec()
@@ -1418,7 +1987,7 @@ mod tests {
         assert_ne!(replayed, payload, "audience must appear in the payload");
         assert!(
             xeddsa::xed25519::PublicKey(keypair.public_key_bytes())
-                .verify(replayed.as_bytes(), &sig_bytes)
+                .verify(signing_input(&replayed, TEST_BODY).as_bytes(), &sig_bytes)
                 .is_err(),
             "a token re-aimed at another collector must fail verification"
         );
@@ -1501,6 +2070,344 @@ mod tests {
     }
 
     #[test]
+    fn a_token_does_not_verify_against_a_different_body() {
+        // The point of binding the signature to the body. Without it a token
+        // authenticates only "this node addressed this collector at this
+        // second", so anyone holding one could attach it to metrics of their
+        // own invention and have them accepted as this node's — the exact
+        // spoofing the scheme exists to stop.
+        use xeddsa::xeddsa::Verify;
+
+        let (keypair, token) = token_fixture();
+        let (payload, sig_b58) = token.rsplit_once('/').unwrap();
+        let sig_bytes: [u8; 64] = bs58::decode(sig_b58)
+            .into_vec()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let pubkey = xeddsa::xed25519::PublicKey(keypair.public_key_bytes());
+
+        assert!(
+            pubkey
+                .verify(signing_input(payload, TEST_BODY).as_bytes(), &sig_bytes)
+                .is_ok(),
+            "the token must verify against the body it was minted for"
+        );
+        assert!(
+            pubkey
+                .verify(
+                    signing_input(payload, b"substituted-metrics").as_bytes(),
+                    &sig_bytes
+                )
+                .is_err(),
+            "the same token must NOT verify against a substituted body"
+        );
+    }
+
+    #[test]
+    fn credential_safe_permits_https_and_loopback_only() {
+        let of = |u: &str| credential_safe(&u.parse::<http::Uri>().unwrap());
+        assert!(of("https://collector.example:4318/v1/metrics"), "https");
+        assert!(of("https://collector.example/v1/metrics"), "https, no port");
+        // The sidecar deployment, which is the common one and must keep working.
+        assert!(of("http://localhost:4318/v1/metrics"), "loopback by name");
+        assert!(of("http://127.0.0.1:4318/v1/metrics"), "loopback v4");
+        assert!(
+            of("http://127.9.9.9:4318/v1/metrics"),
+            "all of 127/8 is loopback"
+        );
+        assert!(of("http://[::1]:4318/v1/metrics"), "loopback v6, bracketed");
+        // The cases the guard exists for.
+        assert!(
+            !of("http://collector.example:4318/v1/metrics"),
+            "plaintext remote"
+        );
+        assert!(
+            !of("http://10.0.0.5:4318/v1/metrics"),
+            "a LAN address is not loopback"
+        );
+        assert!(!of("http://[2001:db8::1]:4318/v1/metrics"), "remote v6");
+    }
+
+    /// A client whose only credential is the operator's, under a header name
+    /// that is not `Authorization`.
+    fn client_with_operator_header(name: &str, value: &str) -> OtlpHttpClient {
+        OtlpHttpClient {
+            inner: export_http_client().expect("export client must build"),
+            signer: None,
+            pubkey_b58: String::new(),
+            operator_credentials: vec![(name.to_ascii_lowercase(), value.to_owned())],
+        }
+    }
+
+    fn post_to(client: &OtlpHttpClient, uri: &str, header: Option<(&str, &str)>) -> String {
+        let mut request = Request::builder().method("POST").uri(uri);
+        if let Some((name, value)) = header {
+            request = request.header(name, value);
+        }
+        let request = request.body(Bytes::from_static(TEST_BODY)).unwrap();
+        futures::executor::block_on(client.send_bytes(request))
+            .expect_err("a credential over plaintext http must not be sent")
+            .to_string()
+    }
+
+    #[test]
+    fn a_credential_is_refused_over_plaintext_http_to_a_remote_collector() {
+        // A stolen static token is reusable until rotated and a stolen freenet
+        // token is replayable at that collector for REPLAY_WINDOW, so the
+        // export fails rather than putting either on the wire. Bound to a host
+        // that does not resolve: the assertion is that we never connect.
+        let keypair = crate::transport::TransportKeypair::new();
+        let signed = test_client(&keypair, true);
+        let error = post_to(
+            &signed,
+            "http://collector.example:4318/v1/metrics",
+            Some(("authorization", "Bearer operator-secret")),
+        );
+        assert!(
+            error.contains("cleartext"),
+            "the error must say why it refused, got: {error}"
+        );
+    }
+
+    #[test]
+    fn an_operator_credential_that_is_not_authorization_is_still_guarded() {
+        // Honeycomb (`x-honeycomb-team`), New Relic (`api-key`) and Datadog
+        // (`dd-api-key`) all carry their keys in custom headers through the
+        // same OTEL_EXPORTER_OTLP_HEADERS variable. Guarding `Authorization`
+        // alone would protect one spelling and leak every other.
+        let client = client_with_operator_header("x-honeycomb-team", "hcaik_secret");
+        let error = post_to(
+            &client,
+            "http://collector.example:4318/v1/metrics",
+            Some(("x-honeycomb-team", "hcaik_secret")),
+        );
+        assert!(
+            error.contains("cleartext"),
+            "a non-Authorization credential must be guarded too, got: {error}"
+        );
+    }
+
+    #[test]
+    fn safe_body_redacts_a_credential_the_collector_names_without_a_keyword() {
+        // Keyword matching alone misses this: `unauthorized: key '...'` holds
+        // neither `authorization` nor `bearer `, so the key would reach the
+        // node log verbatim — and `freenet service report` uploads logs whole.
+        let client = client_with_operator_header("x-api-key", "sk-abc123");
+        let redacted =
+            client.safe_body(b"{\"message\":\"unauthorized: key 'sk-abc123' rejected\"}");
+        assert!(
+            !redacted.contains("sk-abc123"),
+            "the credential value must not reach the log: {redacted}"
+        );
+        assert!(
+            redacted.contains("unauthorized"),
+            "the rejection detail this body exists for must survive: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redact_keyword_lines_removes_echoed_credentials() {
+        let redacted = redact_keyword_lines(
+            "rejected\nauthorization: Bearer operator-secret\ntrailing detail\n",
+        );
+        assert!(
+            !redacted.contains("operator-secret"),
+            "an echoed credential must not reach the log: {redacted}"
+        );
+        assert!(
+            redacted.contains("rejected") && redacted.contains("trailing detail"),
+            "the rejection detail must survive: {redacted}"
+        );
+        // Our own token, echoed back without a header name in front of it.
+        // Our own token, echoed back without a header name in front of it.
+        assert!(!redact_keyword_lines("bad token freenet/aaa/bbb/1/ccc").contains("ccc"));
+        assert_eq!(
+            redact_keyword_lines("quota exceeded"),
+            "quota exceeded",
+            "an ordinary body must pass through untouched"
+        );
+        // Truncation is by CHARACTER, so a multi-byte sequence at the
+        // boundary cannot split and panic.
+        let wide = "é".repeat(400);
+        assert_eq!(truncate_for_log(&wide).chars().count(), 256);
+    }
+
+    #[test]
+    fn safe_body_redacts_a_credential_that_straddles_the_truncation_boundary() {
+        // Ordering bug, found in review: truncating BEFORE redacting cuts the
+        // value, so `contains` no longer matches and the surviving prefix is
+        // logged. 240 characters of prose then a live key put its first
+        // characters at WARN.
+        let client = client_with_operator_header("x-api-key", "sk-LIVE-abcdefghijklmnop");
+        let mut body = "x".repeat(240).into_bytes();
+        body.extend_from_slice(b" key sk-LIVE-abcdefghijklmnop rejected");
+        let redacted = client.safe_body(&body);
+        assert!(
+            !redacted.contains("sk-LIVE"),
+            "no part of the credential may survive truncation: {redacted}"
+        );
+    }
+
+    #[test]
+    fn safe_body_redacts_the_token_inside_a_scheme_prefixed_header_value() {
+        // `OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer sk-abc12345` stores
+        // `Bearer sk-abc12345`, but a collector rejecting it names the token
+        // alone. Registering only the whole value would miss the commonest
+        // spelling of exactly the leak this exists to stop.
+        let client = client_with_operator_header("authorization", "Bearer sk-abc12345");
+        let redacted = client.safe_body(b"{\"message\":\"rejected key 'sk-abc12345'\"}");
+        assert!(
+            !redacted.contains("sk-abc12345"),
+            "the token alone must be redacted, not just the whole header value: {redacted}"
+        );
+    }
+
+    #[test]
+    fn safe_body_leaves_short_non_secret_values_alone() {
+        // `x-scope-orgid=prod` is a Mimir/Loki tenant id, not a secret.
+        // Replacing every "prod" would corrupt the diagnostics this log
+        // exists for, so the redaction pass has a minimum needle length even
+        // though the cleartext GUARD still treats the header as a credential.
+        let client = client_with_operator_header("x-scope-orgid", "prod");
+        let body = client.safe_body(b"tenant prod rejected: bad timestamp");
+        assert!(
+            body.contains("prod rejected"),
+            "a short, non-secret value must not be scrubbed out of the detail: {body}"
+        );
+    }
+
+    #[test]
+    fn redact_uri_strips_userinfo() {
+        // Both the startup line and every export failure log the endpoint, and
+        // `http::Uri`'s Display renders the authority verbatim.
+        let of = |u: &str| redact_uri(&u.parse::<http::Uri>().unwrap());
+        assert_eq!(
+            of("http://user:pass@collector.example:4318/v1/metrics"),
+            "http://[redacted]@collector.example:4318/v1/metrics"
+        );
+        assert!(!of("http://user:pass@c.example/x").contains("pass"));
+        assert_eq!(
+            of("https://collector.example:4318/v1/metrics"),
+            "https://collector.example:4318/v1/metrics",
+            "a URL with no userinfo must be unchanged"
+        );
+
+        // The startup INFO line and the endpoint-validation WARN log the
+        // operator's RAW config string, before it is ever parsed into a Uri,
+        // so the string form has to redact too.
+        let of = |e: &str| redact_endpoint(e).into_owned();
+        assert_eq!(
+            of("http://user:pass@collector.example:4318"),
+            "http://[redacted]@collector.example:4318"
+        );
+        assert!(!of("https://user:hunter2@c.example/v1/metrics").contains("hunter2"));
+        assert_eq!(
+            of("http://collector.example:4318"),
+            "http://collector.example:4318",
+            "no userinfo, unchanged"
+        );
+        assert_eq!(
+            of("http://localhost:4318 (SDK default)"),
+            "http://localhost:4318 (SDK default)",
+            "the default placeholder must survive verbatim"
+        );
+        // An `@` in the PATH is not userinfo and must not trigger redaction.
+        assert_eq!(
+            of("http://collector.example/v1/a@b"),
+            "http://collector.example/v1/a@b"
+        );
+        // A MISSING scheme is exactly what the "endpoint is unusable" WARN
+        // fires on, so it is the line most likely to see a malformed endpoint
+        // — and must still redact.
+        assert_eq!(of("u:secret@collector:4318"), "[redacted]@collector:4318");
+        assert!(!of("user:hunter2@collector:4318/v1/metrics").contains("hunter2"));
+    }
+
+    #[test]
+    fn nothing_is_exported_anywhere_until_an_operator_asks() {
+        // Freenet is a privacy-focused network: shipping node telemetry to a
+        // third party by default would be unacceptable. Three independent
+        // defaults carry that promise and each is one careless line from being
+        // reversed, so pin all three rather than trusting review to notice.
+        let cfg = OtelConfig::default();
+        assert!(!cfg.enabled, "the exporter must be OFF unless enabled");
+        assert_eq!(cfg.endpoint, None, "no endpoint may be baked in");
+        assert_eq!(
+            cfg.auth_mode,
+            crate::config::OtelAuthMode::Disabled,
+            "a node must not assert a signed identity to a collector unasked"
+        );
+        // With nothing configured the SDK default applies, and it is loopback.
+        assert_eq!(resolve_metrics_endpoint(None, None, None), None);
+    }
+
+    #[test]
+    fn a_credential_bound_for_a_plaintext_remote_endpoint_is_diagnosed_at_startup() {
+        use crate::config::OtelAuthMode;
+        let remote = Some("http://collector.example:4318");
+        // Our own token.
+        assert!(
+            credential_that_would_be_refused(OtelAuthMode::Freenet, None, remote).is_some(),
+            "auth-mode=freenet over plaintext remote must be diagnosed"
+        );
+        // The operator's, under any header name.
+        assert!(
+            credential_that_would_be_refused(
+                OtelAuthMode::Disabled,
+                Some("x-api-key=secret"),
+                remote
+            )
+            .is_some()
+        );
+        // Not diagnosed: safe endpoint, loopback, or no credential at all.
+        assert!(
+            credential_that_would_be_refused(
+                OtelAuthMode::Freenet,
+                None,
+                Some("https://collector.example:4318")
+            )
+            .is_none()
+        );
+        assert!(
+            credential_that_would_be_refused(
+                OtelAuthMode::Freenet,
+                None,
+                Some("http://127.0.0.1:4318")
+            )
+            .is_none()
+        );
+        assert!(credential_that_would_be_refused(OtelAuthMode::Disabled, None, remote).is_none());
+        // No endpoint means the SDK default, http://localhost:4318 — loopback.
+        assert!(credential_that_would_be_refused(OtelAuthMode::Freenet, None, None).is_none());
+    }
+
+    #[test]
+    fn the_export_client_keeps_its_credential_safety_policies() {
+        // Both lines are security controls with no observable behaviour in a
+        // unit test — no redirect is followed and no proxy is consulted when
+        // neither is configured — so deleting either passes every other test
+        // in this file. `credential_safe` can only inspect the URI we aimed
+        // at, and each of these is what makes that the real destination.
+        let body = top_level_fn_body(include_str!("otel.rs"), "fn export_http_client()");
+        assert!(
+            body.contains("Client::builder()"),
+            "the pin must have scoped to the builder, or it proves nothing: {body}"
+        );
+        assert!(
+            body.contains("redirect(reqwest::redirect::Policy::none())"),
+            "redirects must stay disabled: reqwest replays a 30x with the \
+             original headers, carrying a credential to an http Location"
+        );
+        assert!(
+            body.contains(".no_proxy()"),
+            "ambient proxies must stay disabled: reqwest defaults to \
+             auto_sys_proxy with no loopback exemption, so HTTP_PROXY would \
+             take an export aimed at localhost off the machine"
+        );
+    }
+
+    #[test]
     fn init_refuses_to_start_from_a_test_process() {
         // The suppression check lives in `init`, and `init` is unreachable
         // under cfg(test) — so without this, deleting the whole block leaves
@@ -1533,6 +2440,31 @@ mod tests {
     /// `source.contains(call)` does not fail when the call MOVES — it matches
     /// a later occurrence, typically the pin's own assertion string, and
     /// passes vacuously (AGENTS.md, #5103).
+    /// [`method_body`]'s sibling for a TOP-LEVEL fn, which closes on an
+    /// unindented `}`. Using `method_body` here would run past the end of the
+    /// function to the next indented closer it found, so the region pinned
+    /// would not be the one named — a pin that is wrong in the direction of
+    /// passing.
+    fn top_level_fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let at = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("definition not found: {signature}"));
+        let tests_at = src
+            .find("\n#[cfg(test)]\nmod ")
+            .map(|i| i + 1)
+            .expect("test module not located — this guard cannot verify anything");
+        assert!(
+            at < tests_at,
+            "`{signature}` matched inside the test module — this pin is \
+             scraping its own source and would pass vacuously"
+        );
+        let after = &src[at + signature.len()..];
+        let (body, _) = after
+            .split_once("\n}\n")
+            .unwrap_or_else(|| panic!("could not locate end of: {signature}"));
+        body
+    }
+
     fn method_body<'a>(src: &'a str, signature: &str) -> &'a str {
         let at = src
             .find(signature)
@@ -1808,7 +2740,7 @@ mod tests {
     ///
     /// This is the only test that executes an instrument at all: `init` returns
     /// early under `cfg(test)` (see `init_refuses_to_start_from_a_test_process`),
-    /// so without this the twelve callbacks, every instrument name, every unit
+    /// so without this the eighteen callbacks, every instrument name, every unit
     /// and every attribute are unexecuted in CI. That matters beyond naming — a
     /// panic in one callback kills the `PeriodicReader` thread and silently
     /// stops ALL metrics, and `report_export_failure` cannot see it because it
@@ -1832,7 +2764,7 @@ mod tests {
 
         // Same two calls `register_metrics` makes, minus the global bindings.
         let instruments = build_instruments(&meter);
-        register_observables(&meter);
+        register_observables(&meter, fixture_sources());
         instruments.rtt.record(12.5, &[]);
         instruments.cwnd.record(4096, &[]);
 
@@ -1863,6 +2795,16 @@ mod tests {
                             .flat_map(|p| p.attributes())
                             .map(render)
                             .collect(),
+                        // `freenet.ring.lattice.neighbor.distance` is the one
+                        // f64 observable. Without this arm its attribute
+                        // vector is always empty, so every assertion on its
+                        // `position=` values passes vacuously no matter what
+                        // the callback emits.
+                        AggregatedMetrics::F64(MetricData::Gauge(gauge)) => gauge
+                            .data_points()
+                            .flat_map(|p| p.attributes())
+                            .map(render)
+                            .collect(),
                         _ => Vec::new(),
                     };
                     seen.push((metric.name().to_string(), attributes));
@@ -1884,6 +2826,17 @@ mod tests {
             "freenet.contract.queue.depth.high_water",
             "freenet.contract.queue.rejected",
             "freenet.contract.queue.background_shed",
+            // Ring- and status-sourced: unasserted before `RingSources` made
+            // their sources injectable, because the guarded bodies never ran.
+            "freenet.ring.connections",
+            "freenet.node.contracts.hosted",
+            "freenet.node.contracts.hosted.bytes",
+            "freenet.connect.gateway_failures",
+            "freenet.operation.results",
+            "freenet.ring.lattice.neighbor",
+            "freenet.ring.lattice.neighbor.distance",
+            "freenet.ring.lattice.probes",
+            "freenet.contract.updates",
         ] {
             assert!(
                 names.contains(&expected),
@@ -1906,8 +2859,52 @@ mod tests {
             ("freenet.transport.transfers", "result=failed"),
             ("freenet.transport.nat_traversal", "result=attempt"),
             ("freenet.transport.nat_traversal", "result=failed_version"),
+            ("freenet.contract.queue.depth", "queue=client_local"),
+            ("freenet.contract.queue.depth", "queue=network_relay"),
             ("freenet.contract.queue.depth", "queue=background"),
             ("freenet.contract.queue.rejected", "reason=per_contract"),
+            ("freenet.contract.queue.rejected", "reason=global_capacity"),
+            ("freenet.transport.packets", "direction=sent"),
+            ("freenet.transport.packets", "direction=received"),
+            ("freenet.transport.nat_traversal", "result=established"),
+            ("freenet.transport.nat_traversal", "result=failed_error"),
+            // Every `HostingReason::as_str` value: its own rustdoc calls these
+            // a metrics contract where renaming one empties a panel.
+            ("freenet.node.contracts.hosted", "reason=local_client"),
+            ("freenet.node.contracts.hosted", "reason=downstream"),
+            ("freenet.node.contracts.hosted", "reason=subscribed"),
+            ("freenet.node.contracts.hosted", "reason=local_access"),
+            ("freenet.node.contracts.hosted", "reason=abandoned"),
+            ("freenet.node.contracts.hosted", "reason=restored"),
+            ("freenet.node.contracts.hosted", "reason=routed"),
+            ("freenet.node.contracts.hosted.bytes", "reason=local_client"),
+            ("freenet.node.contracts.hosted.bytes", "reason=downstream"),
+            ("freenet.node.contracts.hosted.bytes", "reason=subscribed"),
+            ("freenet.node.contracts.hosted.bytes", "reason=local_access"),
+            ("freenet.node.contracts.hosted.bytes", "reason=abandoned"),
+            ("freenet.node.contracts.hosted.bytes", "reason=restored"),
+            ("freenet.node.contracts.hosted.bytes", "reason=routed"),
+            ("freenet.operation.results", "op=get"),
+            ("freenet.operation.results", "op=put"),
+            ("freenet.operation.results", "op=update"),
+            ("freenet.operation.results", "op=subscribe"),
+            ("freenet.operation.results", "result=success"),
+            ("freenet.operation.results", "result=failure"),
+            ("freenet.ring.lattice.neighbor", "position=successor"),
+            ("freenet.ring.lattice.neighbor", "position=predecessor"),
+            (
+                "freenet.ring.lattice.neighbor.distance",
+                "position=successor",
+            ),
+            (
+                "freenet.ring.lattice.neighbor.distance",
+                "position=predecessor",
+            ),
+            ("freenet.ring.lattice.probes", "result=issued"),
+            ("freenet.ring.lattice.probes", "result=improvement"),
+            ("freenet.contract.updates", "result=accepted"),
+            ("freenet.contract.updates", "result=rate_limited"),
+            ("freenet.contract.updates", "result=capacity_dropped"),
         ] {
             assert!(
                 attributes_of(name).iter().any(|a| a == attribute),

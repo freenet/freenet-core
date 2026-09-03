@@ -429,10 +429,11 @@ impl FairEventQueue {
         gauge::DEPTH_CLIENT_LOCAL.store(s.depth_client_local, Ordering::Relaxed);
         gauge::DEPTH_NETWORK_RELAY.store(s.depth_network_relay, Ordering::Relaxed);
         gauge::DEPTH_BACKGROUND.store(s.depth_background, Ordering::Relaxed);
-        // `fetch_max`, not `store`, for the same reason as HIGH_WATER: these
-        // four are exported as OTel observable *counters*
-        // (`tracing::otel::register_queue_metrics`), where a value that ever
-        // decreases is read as a counter reset. `self.counters` only grows, so
+        // `fetch_max`, not `store`, for the same reason as HIGH_WATER: of
+        // these four, the three `REJECTED_*`/`BACKGROUND_SHED` are exported as
+        // OTel observable *counters* and HIGH_WATER as a gauge
+        // (`tracing::otel::register_queue_metrics`); for the counters a value
+        // that ever decreases is read as a counter reset. `self.counters` only grows, so
         // this is equivalent today — there is one `FairEventQueue` per process
         // — but a second queue, or a respawned `contract_handling` loop, would
         // publish its own counters from zero and drag the global series

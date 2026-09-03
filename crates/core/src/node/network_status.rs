@@ -192,8 +192,8 @@ pub(crate) fn otel_ring_stats() -> Option<RingStatsSnapshot> {
 ///
 /// Its own accessor, read by exactly the two gauges that need it: this is an
 /// O(hosted) walk under the hosting-cache read lock, and folding it into a
-/// shared snapshot ran it once per observable callback — twelve times a cycle
-/// to serve two of them.
+/// shared snapshot ran it once per observable callback — eighteen times a
+/// cycle to serve two of them.
 pub(crate) fn otel_hosting_reasons() -> Option<crate::ring::HostingReasonStats> {
     HOSTING_REASON_PROVIDER
         .read()
@@ -202,7 +202,7 @@ pub(crate) fn otel_hosting_reasons() -> Option<crate::ring::HostingReasonStats> 
 }
 
 /// Source of the per-reason hosted-contract breakdown
-/// (`Ring::hosted_by_reason`). OTel-only; see [`OtelMetricsSnapshot`].
+/// (`Ring::hosted_by_reason`). OTel-only; see [`otel_hosting_reasons`].
 pub type HostingReasonProvider =
     Arc<dyn Fn() -> crate::ring::HostingReasonStats + Send + Sync + 'static>;
 

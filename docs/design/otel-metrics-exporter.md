@@ -54,7 +54,7 @@ Registered in `tracing/otel.rs::register_metrics`.
 | `freenet.ring.connections` | gauge | — | `RingStatsSnapshot` |
 | `freenet.node.contracts.hosted` | gauge | `reason` | `HostingReasonStats` |
 | `freenet.node.contracts.hosted.bytes` | gauge | `reason` | `HostingReasonStats` |
-| `freenet.connect.attempts` | counter | — | `NetworkStatus` |
+| `freenet.connect.gateway_failures` | counter | — | `NetworkStatus` |
 | `freenet.ring.lattice.neighbor` | gauge | `position` | `RingStatsSnapshot` |
 | `freenet.ring.lattice.neighbor.distance` | gauge | `position` | `RingStatsSnapshot` |
 | `freenet.ring.lattice.probes` | counter | `result` | `RingStatsSnapshot` |
@@ -101,7 +101,7 @@ emits an un-attributed total — that would double-count under `sum`.
 | `subscribed` | unexpired network subscription, no local or downstream reader |
 | `local_access` | no subscription, but a local client GET/PUT touched it *recently* |
 | `abandoned` | was in use and no longer is — the eviction-candidate pool |
-| `restored` | reloaded from persisted metadata at startup, untouched since |
+| `restored` | reloaded from persisted metadata at startup, unread since |
 | `routed` | residual: arrived via a routed GET/PUT, no demand signal |
 
 The strings are a metrics contract — collector-side dashboards filter on them,
@@ -238,6 +238,43 @@ A collector verifies with a stock Ed25519 library after converting the
 Montgomery public key to Edwards with sign bit 0, then checks `<audience>`
 against the hash of each URL it answers at and `<timestamp>` against its own
 clock.
+
+**The signature covers the request body, which is not transmitted.** The
+signing input is the token prefix plus `/<base58 SHA-256 of the body>`; the
+token on the wire stops at the prefix, and the collector recomputes the hash
+from the body it received. Without it a token authenticates only "this node
+addressed this collector at this second", so anyone holding one could attach it
+to a body of their own and have it accepted as this node's metrics — the exact
+spoofing the scheme exists to stop. Keeping the hash off the wire leaves the
+token at five fields and costs the collector one hash it was already able to
+compute.
+
+**Replay is bounded by the collector, and the bound is `REPLAY_WINDOW` (300s).**
+The node cannot enforce it: it stamps `<timestamp>` and the collector checks it
+against its own clock, rejecting anything outside the window and refusing a
+`(pubkey, timestamp, body hash)` triple already accepted inside it. The
+constant is declared in `tracing/otel.rs` and restated in `docs/otel-metrics.md`
+because it is a wire contract — both sides have to agree on the number. This
+was previously deferred as "specify a replay bound"; it is specified here.
+
+**No credential goes out in cleartext, ours or the operator's.** A request
+carrying either fails rather than being sent when the endpoint is plaintext
+`http` to a non-loopback host, and this is also diagnosed at startup instead of
+one latched WARN an export interval later. Two ambient mechanisms would
+otherwise defeat that check, since it can only inspect the URI the exporter
+aimed at: reqwest replays a redirect with the original headers, and defaults to
+`auto_sys_proxy` with no loopback exemption of its own — so an `HTTP_PROXY` in
+the environment would send an export aimed at `http://localhost:4318` to that
+proxy, straight through the exemption. `export_http_client` disables both.
+
+The guard is not `Authorization`-only. Every header the operator declared
+through `OTEL_EXPORTER_OTLP_HEADERS` counts as a credential, because that is
+where OTLP credentials live and `Authorization` is merely the most common
+spelling — `x-honeycomb-team`, `api-key` and `dd-api-key` are all in ordinary
+use. Those same values are redacted out of any error body before it is logged,
+by value rather than by keyword: a collector answering
+`unauthorized: key 'sk-abc123' rejected` contains neither `authorization` nor
+`bearer `, and `freenet service report` uploads node logs wholesale.
 
 The default is `disabled` — no `Authorization` header. Pointing the exporter at
 your own collector must not ship a signed assertion of this node's identity

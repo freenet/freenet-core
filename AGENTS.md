@@ -394,13 +394,32 @@ Rules when touching `tracing/otel.rs`:
   be made deferrable to `OTEL_RESOURCE_ATTRIBUTES`. They are what the
   collector checks the bearer-token signature against; an override would
   export an identity that does not match the signing key.
+- **Nothing is exported anywhere unless an operator asked.** Freenet is a
+  privacy-focused network, so `otel-telemetry-enabled` defaults false,
+  `otel-auth-mode` defaults `disabled`, and no endpoint is baked in — with
+  nothing configured the SDK default is loopback. Never add a default that
+  points off-machine, and never make the exporter on-by-default.
+- **The node's bearer token signs the request BODY** (as a hash, not
+  transmitted). Sign only the prefix and the token stops binding the payload,
+  so a captured token can be attached to invented metrics — the spoofing the
+  scheme exists to prevent. `REPLAY_WINDOW` is a wire contract with the
+  collector; changing it means changing `docs/otel-metrics.md` too.
+- **No credential leaves in cleartext.** `send_bytes` must refuse when the
+  endpoint is plaintext `http` to a non-loopback host — for our token AND for
+  every header the operator declared via `OTEL_EXPORTER_OTLP_HEADERS`, not just
+  `Authorization`. Redirects and ambient proxies stay disabled on the client:
+  reqwest replays a redirect with the original headers and honours `HTTP_PROXY`
+  with no loopback exemption, so either would carry a credential past a check
+  that only ever sees the endpoint we aimed at. Error bodies are redacted by
+  credential VALUE before logging, and endpoints by userinfo.
 - The exporter always installs its own `HttpClient`, so `opentelemetry-otlp`
   needs none of its `reqwest-*`/TLS features — enabling one pulls a second
   reqwest major, a second TLS stack, and a C/asm aws-lc build into every
   release target.
 
-Everything else — the bearer-token format, endpoint precedence, the
-`OTEL_*` variables honored, and per-instrument notes — is in
+Everything else — the bearer-token format and its collector-side obligations,
+endpoint precedence, the `OTEL_*` variables honored, and per-instrument notes
+— is in
 [`docs/design/otel-metrics-exporter.md`](docs/design/otel-metrics-exporter.md),
 and operator-facing configuration is in
 [`docs/otel-metrics.md`](docs/otel-metrics.md).
