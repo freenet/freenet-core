@@ -753,6 +753,10 @@ pub(crate) struct ReasonRow<'a> {
     /// False for an entry reloaded from persisted metadata at startup, i.e.
     /// exactly the [`HostingCause::StartupRestore`] cohort.
     pub seeded_this_run: bool,
+    /// Reads observed THIS run. Reset to 0 by a reload, so paired with
+    /// `seeded_this_run` it distinguishes a restored entry nothing has asked
+    /// for yet from one that has since served routed traffic.
+    pub read_count: u32,
 }
 
 /// WHY this peer began hosting a contract — the attribution that
@@ -2612,6 +2616,7 @@ impl<T: TimeSource> HostingCache<T> {
                 }),
                 abandoned: entry.abandoned_at.is_some(),
                 seeded_this_run: entry.seeded_this_run,
+                read_count: entry.read_count,
             });
         }
     }

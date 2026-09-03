@@ -272,14 +272,41 @@ pub enum HostingReason {
     /// node's uptime, and would disagree with the hosting policy — which
     /// consults `has_recent_local_client_access` (see `cache.rs`'s
     /// `local_client_access_age_gate_expires` for a test of the divergence).
+    ///
+    /// Reading this post-restart: `load_persisted_entry_with_demand` stamps
+    /// `local_client_last_access = Some(now)` for every entry persisted with
+    /// `local_client_access`, so for one `SUBSCRIPTION_LEASE_DURATION` after
+    /// boot this bucket holds that whole cohort without any access having
+    /// happened this run, and `restored` correspondingly under-reports. The
+    /// partition stays sound and this agrees with the policy signal, but a
+    /// spike here just after a restart is reloaded state rather than live
+    /// client demand.
     LocalAccess,
     /// Was in use and no longer is (`abandoned_at`) — the eviction candidate
     /// pool. Distinguished from `Routed` because a rising `abandoned` count is
     /// churn, while a rising `routed` count is ordinary transit caching.
     Abandoned,
-    /// Reloaded from persisted hosting metadata at startup and not touched
-    /// since (`!seeded_this_run`), the `HostingCause::StartupRestore` cohort
-    /// viewed from the demand side.
+    /// Reloaded from persisted hosting metadata at startup and not read since
+    /// (`!seeded_this_run && read_count == 0`), the
+    /// `HostingCause::StartupRestore` cohort viewed from the demand side.
+    ///
+    /// Both halves are load-bearing. `seeded_this_run` is written at exactly
+    /// two sites — the not-cached insert branch of `record_access` (true) and
+    /// `load_persisted_entry_with_demand` (false) — and never by the
+    /// existing-entry refresh branch. Classifying on it alone would make this
+    /// bucket permanent for the process lifetime: since every node restarts,
+    /// `restored` would absorb the whole persisted hosted set while `routed`
+    /// only ever counted contracts admitted since boot, so live transit demand
+    /// would read fleet-wide as bulk reload. `read_count` IS reset by the
+    /// reload, so it supplies the "since" the name claims.
+    ///
+    /// Residual, deliberately left: `read_count` counts GET/SUBSCRIBE only, so
+    /// a reloaded contract that is exclusively written to — a routed PUT with
+    /// no subscriber and no local client — stays here. That is a far narrower
+    /// case than the one above (which caught every restored contract serving
+    /// any traffic at all), and the obvious write-side twin is not usable:
+    /// `write_generation` is assigned from a caller-supplied snapshot on every
+    /// refresh rather than counted, so `== 0` does not mean "unwritten".
     ///
     /// Separate from `Routed` because the restore path resets `abandoned_at`
     /// to `None` (`cache.rs::load_persisted_entry_with_demand`): without this
@@ -304,6 +331,31 @@ impl HostingReason {
         HostingReason::Routed,
     ];
 
+    /// Index into [`HostingReasonStats`]'s per-reason arrays.
+    ///
+    /// An exhaustive match rather than `self as usize`, because those arrays
+    /// are sized by [`Self::ALL`] and `ALL` is hand-maintained. A new variant
+    /// that nobody adds to `ALL` would leave the arrays one short while
+    /// `self as usize` cheerfully produced the out-of-range index — and that
+    /// index is read inside an OTel observable callback, where a panic kills
+    /// the `PeriodicReader` thread and silently stops EVERY metric for the
+    /// process lifetime. The compiler stops you here instead.
+    ///
+    /// **If you are adding a variant: add it to [`Self::ALL`] as well.** The
+    /// const assertion below catches an `ALL` that is out of order or has a
+    /// duplicate, but it cannot see a variant that was never listed.
+    const fn index(self) -> usize {
+        match self {
+            HostingReason::LocalClient => 0,
+            HostingReason::Downstream => 1,
+            HostingReason::Subscribed => 2,
+            HostingReason::LocalAccess => 3,
+            HostingReason::Abandoned => 4,
+            HostingReason::Restored => 5,
+            HostingReason::Routed => 6,
+        }
+    }
+
     /// Stable attribute value. These strings are a metrics contract — a
     /// collector-side dashboard filters on them, so renaming one silently
     /// empties a panel. Add variants rather than repurposing these.
@@ -320,8 +372,21 @@ impl HostingReason {
     }
 }
 
+/// `ALL` must be in index order, complete, and free of duplicates — every
+/// element of the per-reason arrays is addressed through it.
+const _: () = {
+    let mut i = 0;
+    while i < HostingReason::ALL.len() {
+        assert!(
+            HostingReason::ALL[i].index() == i,
+            "HostingReason::ALL must list every variant exactly once, in index order"
+        );
+        i += 1;
+    }
+};
+
 /// Hosted-contract count and state bytes per [`HostingReason`], indexed by
-/// `reason as usize`. Both arrays partition the hosting cache (see
+/// [`HostingReason::index`]. Both arrays partition the hosting cache (see
 /// [`HostingReason`]), so `counts.iter().sum()` is the hosted-contract count
 /// and `bytes.iter().sum()` is the cache's used bytes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -333,12 +398,12 @@ pub struct HostingReasonStats {
 impl HostingReasonStats {
     /// Contracts held for `reason`.
     pub fn count(&self, reason: HostingReason) -> u64 {
-        self.counts[reason as usize]
+        self.counts[reason.index()]
     }
 
     /// Contract state bytes held for `reason`.
     pub fn bytes(&self, reason: HostingReason) -> u64 {
-        self.bytes[reason as usize]
+        self.bytes[reason.index()]
     }
 }
 
@@ -1119,7 +1184,7 @@ impl HostingManager {
     }
 
     /// Count and state bytes of hosted contracts, partitioned by WHY each one
-    /// is held (see [`HostingReason`]). Fixed cardinality — six buckets, no
+    /// is held (see [`HostingReason`]). Fixed cardinality — seven buckets, no
     /// contract identity survives the walk — so it is safe to export as
     /// metric attributes.
     ///
@@ -1137,6 +1202,7 @@ impl HostingManager {
                 recent_local_client_access,
                 abandoned,
                 seeded_this_run,
+                read_count,
             } = row;
             let (local, downstream) = self.local_and_downstream_counts(key);
             let reason = if local > 0 {
@@ -1149,12 +1215,12 @@ impl HostingManager {
                 HostingReason::LocalAccess
             } else if abandoned {
                 HostingReason::Abandoned
-            } else if !seeded_this_run {
+            } else if !seeded_this_run && read_count == 0 {
                 HostingReason::Restored
             } else {
                 HostingReason::Routed
             };
-            let bucket = reason as usize;
+            let bucket = reason.index();
             stats.counts[bucket] = stats.counts[bucket].saturating_add(1);
             stats.bytes[bucket] = stats.bytes[bucket].saturating_add(size_bytes);
         });
@@ -4762,6 +4828,64 @@ mod tests {
         // exact residual count is not pinned here — only that nothing was lost.
         let aged_total: u64 = HostingReason::ALL.iter().map(|r| aged.count(*r)).sum();
         assert_eq!(aged_total, cache.contract_count, "still a partition");
+    }
+
+    /// `Restored` means "reloaded and not read since", so a restored contract
+    /// that goes on to serve routed traffic must leave the bucket.
+    ///
+    /// Classifying on `!seeded_this_run` alone made it sticky for the process
+    /// lifetime: nothing ever sets that flag back once an entry exists, so
+    /// after any restart `restored` kept the entire persisted hosted set and
+    /// `freenet.node.contracts.hosted{reason="routed"}` read near zero
+    /// fleet-wide. The partition test does not catch it because it asserts
+    /// immediately after loading and never drives an access through.
+    #[test]
+    fn a_restored_contract_that_serves_traffic_moves_to_routed() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+
+        let key = make_contract_key(1);
+        {
+            let mut cache = manager.hosting_cache.write();
+            cache.load_persisted_entry(
+                key,
+                6_400,
+                AccessType::Get,
+                std::time::Duration::from_secs(10),
+                false,
+            );
+            cache.finalize_loading();
+        }
+        let restored = manager.hosted_by_reason();
+        assert_eq!(
+            restored.count(HostingReason::Restored),
+            1,
+            "a freshly reloaded, unread contract is restored"
+        );
+
+        // One routed GET, carrying no demand signal of its own — the only
+        // thing that changes is that this run has now read it.
+        manager.record_contract_access(key, 6_400, AccessType::Get, HostingCause::Other);
+
+        let after = manager.hosted_by_reason();
+        assert_eq!(
+            after.count(HostingReason::Restored),
+            0,
+            "a restored contract that has served a read is no longer untouched"
+        );
+        assert_eq!(
+            after.count(HostingReason::Routed),
+            1,
+            "it is ordinary transit hosting now, which is what routed counts"
+        );
+        assert_eq!(
+            after.bytes(HostingReason::Routed),
+            6_400,
+            "bytes must move with the count, not be double-counted or dropped"
+        );
     }
 
     /// `is_eviction_eligible` gates the dashboard's "next to evict" badge on the
