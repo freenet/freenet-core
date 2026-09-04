@@ -6085,10 +6085,14 @@ mod hol_4391_tests {
             )]);
 
         // B's fetch hangs until released, standing in for a slow network GET.
+        // The counter records that the OFF-LOOP path was the one taken.
         let gate = Arc::new(tokio::sync::Notify::new());
         let gate_for_stub = gate.clone();
+        let off_loop_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_stub = off_loop_calls.clone();
         let _override = OverrideGuard::install(Arc::new(move |missing: Vec<ContractInstanceId>| {
             let gate = gate_for_stub.clone();
+            calls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move {
                 gate.notified().await;
                 Err(ExecutorError::missing_related(missing[0]))
@@ -6130,6 +6134,28 @@ mod hol_4391_tests {
             });
 
         tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // The two DECISIVE assertions. Remove the deferral (drop the
+        // `DeferRelated if parking.is_some()` arm) and both fail: the upsert
+        // then fetches inline and the delegate answers straight away.
+        //
+        // Note for reviewers on why these carry the weight rather than the
+        // GET-promptness check below: this harness has no op_manager, so the
+        // INLINE related fetch fails immediately instead of hanging. The GET
+        // would therefore look prompt even with the deferral removed, which
+        // makes it corroborating rather than decisive HERE. (In the prompt
+        // test it is decisive — `prompter.prompt()` really does hang inline.)
+        assert_eq!(
+            off_loop_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the related fetch must have been routed OFF the loop, not awaited \
+             inline in the upsert (#5544)"
+        );
+        assert!(
+            !delegate_task.is_finished(),
+            "the delegate must still be PARKED while its related fetch is in \
+             flight; finishing already means the fetch was awaited inline"
+        );
 
         let get_c = tokio::time::timeout(
             Duration::from_secs(2),
