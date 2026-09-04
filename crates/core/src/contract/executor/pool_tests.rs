@@ -2,6 +2,8 @@
 
 mod conformance_tests;
 mod delegate_notification_tests;
+#[cfg(feature = "wasmtime-backend")]
+mod delegate_notification_wasm_tests;
 mod disk_budget_gate_tests;
 mod identical_input_probe_tests;
 mod merge_rejected_tests;

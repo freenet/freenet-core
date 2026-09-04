@@ -306,6 +306,15 @@ async fn merge_path_notifies_subscribed_delegates() {
 /// Anchored on API surface (`record_contract_update(`,
 /// `send_update_notification(`, …) rather than on local variable names, so
 /// a rename inside the helper does not silently defeat the pin.
+///
+/// A pin proves a call EXISTS, never that it is wired to the right contract.
+/// The three sites this module cannot drive — both `perform_contract_put`
+/// branches and the related-contract install in `get_updated_state`, all on
+/// `impl Executor<Runtime>` — are asserted behaviourally against a real WASM
+/// runtime in `delegate_notification_wasm_tests`. Neither guard
+/// replaces the other: the pin catches a NEW storing path that fans out
+/// nothing, the behavioural tests catch an EXISTING one pointed at the wrong
+/// key.
 #[test]
 fn finalize_state_commit_is_the_only_post_store_fan_out_site() {
     const EXECUTOR_IMPL_SRC: &str = include_str!("../runtime/executor_impl.rs");

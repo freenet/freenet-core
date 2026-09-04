@@ -6854,6 +6854,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-contract-requires-related"
+version = "0.1.0"
+dependencies = [
+ "freenet-stdlib 0.8.5",
+]
+
+[[package]]
 name = "test-contract-update-nochange"
 version = "0.1.0"
 dependencies = [
