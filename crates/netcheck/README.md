@@ -116,67 +116,28 @@ counts from the jsonl artifact until that table gains the columns
 
 ## Production use (nova)
 
-nova runs the primary gateway; the ephemeral peer is pinned to vega (the
-secondary) so the GETs are routed. Resolve the address and key from the
-public index rather than hardcoding them, since the IP and the key can rotate:
+nova runs BOTH gateways: `freenet-gateway` on network port **31337** and
+`freenet-gateway-2` on **31338**. The AWS gateway that used to be the second
+host was retired in September 2026.
+
+The ephemeral peer must be pinned to a gateway OTHER than the one the PUTs go
+through, or a GET can be answered by the node that just stored the data — which
+proves transfer, not findability. `scripts/netcheck-nightly.sh` PUTs through
+`ws://127.0.0.1:7509` (gw1) and therefore pins the getter to **gw2**:
 
 ```bash
-VEGA_IP=$(getent hosts vega.locut.us | awk '{print $1}')
-VEGA_KEY=$(curl -fsS https://freenet.org/keys/public.vega.gw.pem)
-
-netcheck put-get \
-  --gateway-ws ws://127.0.0.1:7509 \
-  --gateway-spec "${VEGA_IP}:31337,${VEGA_KEY}" \
-  --freenet-bin /usr/local/bin/freenet \
-  --manifest    /home/runner/netcheck/manifest.json \
-  --ephemeral-dir /home/runner/netcheck/run \
-  --ephemeral-network-port 32177   # UDP port opened for netcheck on nova
+GW2_IP=$(getent hosts gw2.freenet.org | awk '{print $1}' | head -1)
+GW2_KEY=$(curl -fsS https://freenet.org/keys/public.gw2.pem)
+netcheck --gateway-ws ws://127.0.0.1:7509 \
+         --gateway-spec "${GW2_IP}:31338,${GW2_KEY}"
 ```
 
-`--freenet-bin` points at the **installed release** binary on purpose: the
-ephemeral peer is the measuring instrument, so it should be the same
-binary real users run. A peer built from an unreleased `main` would make
-every failure ambiguous.
+Note this is weaker than the previous arrangement: gw1 and gw2 are separate
+processes but the SAME host, where the retired gateway was a separate machine
+on a different network. The invariant still holds — the GET is answered by a
+different node than the PUT — but it no longer crosses a host or a link. If an
+off-host gateway exists again, prefer it here.
 
-### Running alongside a real node
-
-netcheck is designed to be safe on a host that also runs a production
-gateway, and the guarantees are structural rather than conventional:
-
-- The ephemeral node gets its own `--config-dir`/`--data-dir` and its own
-  ports; it never reads or writes the real node's state.
-- Child processes are killed **by process handle**, never by name: there
-  is no `pkill` anywhere in this crate.
-- The node's own single-instance check is read-only and scoped to its
-  configured WS port: if the port is busy it logs and exits, it never
-  signals the other process. Keep `--ephemeral-ws-port` (default 7519)
-  away from the real node's port.
-- `--disable-auto-update` is passed to the ephemeral node: it lives for
-  minutes, and detecting a new release mid-run would make it exit 42 and
-  fail the check for a reason unrelated to the network.
-
-Two things the caller is responsible for:
-
-- **`--ephemeral-dir`.** Left unset, the node works in an anonymous temp
-  dir that is only cleaned up on a normal exit; a killed run (a cancelled
-  CI job) leaks it. The node's hosting cache is budgeted at `RAM/8` capped
-  at 1 GiB, so on a large host a leak is not small. Point it at a known
-  path and clear that path before each run.
-- **Disk headroom.** Check free space before running on a shared host and
-  skip the run rather than filling the disk out from under the real node.
-
-### Nightly
-
-`scripts/netcheck-nightly.sh` is the production recipe above with both of
-those responsibilities handled, and it publishes the report through
-`netcheck emit`. `.github/workflows/netcheck-nightly.yml` runs it at 04:00
-UTC on the self-hosted runner and does nothing else: the logic lives in the
-script so it can be run by hand over ssh, which a workflow file cannot be
-until it reaches the default branch.
-
-Every path and port is overridable by environment variable
-(`NETCHECK_GATEWAY_WS`, `NETCHECK_STATE_DIR`, `NETCHECK_OTLP_ENDPOINT`, ...),
-so a second vantage point needs no edit to the script.
 
 ## Local testing, fully isolated
 

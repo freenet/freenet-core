@@ -45,6 +45,10 @@ pub mod event_aggregator;
 pub mod telemetry;
 pub use telemetry::TelemetryReporter;
 
+/// Standards-configured OpenTelemetry SDK metrics pipeline. Strictly isolated
+/// from `telemetry` above — see `docs/design/otel-metrics-exporter.md`.
+pub mod otel;
+
 /// Automatic state verification through telemetry linearization.
 pub mod state_verifier;
 

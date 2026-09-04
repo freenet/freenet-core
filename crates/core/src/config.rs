@@ -247,6 +247,9 @@ pub struct ConfigArgs {
 
     #[command(flatten)]
     pub telemetry: TelemetryArgs,
+
+    #[command(flatten)]
+    pub otel: OtelArgs,
 }
 
 impl Default for ConfigArgs {
@@ -316,6 +319,7 @@ impl Default for ConfigArgs {
             shutdown_drain_secs: None,
             disable_auto_update: false,
             telemetry: Default::default(),
+            otel: Default::default(),
         }
     }
 }
@@ -963,7 +967,9 @@ impl ConfigArgs {
             if !cfg.telemetry.enabled {
                 self.telemetry.enabled = false;
             }
-            if self.telemetry.endpoint.is_none() {
+            if self.telemetry.endpoint.is_none()
+                && cfg.telemetry.endpoint != LEGACY_TELEMETRY_ENDPOINT
+            {
                 self.telemetry
                     .endpoint
                     .get_or_insert(cfg.telemetry.endpoint);
@@ -982,6 +988,17 @@ impl ConfigArgs {
             if cfg.telemetry.iface_tx_enabled {
                 self.telemetry.iface_tx_enabled = true;
             }
+            // Kept separate from the telemetry merge above on purpose: the two
+            // features are independent. Unlike reference-ping/iface-tx this
+            // merge is bidirectional — `--otel-telemetry-enabled=false` parses
+            // to `Some(false)` and must override a config.toml that says true.
+            self.otel.enabled.get_or_insert(cfg.otel.enabled);
+            if let Some(endpoint) = cfg.otel.endpoint {
+                self.otel.endpoint.get_or_insert(endpoint);
+            }
+            // Always emitted (non-Option in OtelConfig), so merge
+            // unconditionally; the CLI value still wins via get_or_insert.
+            self.otel.auth_mode.get_or_insert(cfg.otel.auth_mode);
         }
 
         // Validate the effective config (CLI + values merged from config.toml).
@@ -1491,6 +1508,14 @@ impl ConfigArgs {
                 reference_ping_enabled: self.telemetry.reference_ping_enabled,
                 iface_tx_enabled: self.telemetry.iface_tx_enabled,
             },
+            otel: OtelConfig {
+                enabled: self.otel.enabled.unwrap_or(false),
+                endpoint: self.otel.endpoint,
+                auth_mode: self.otel.auth_mode.unwrap_or_default(),
+                // Same --id rule as telemetry: simulated networks and
+                // integration tests must not ship data to a collector.
+                is_test_environment: self.id.is_some(),
+            },
         };
 
         fs::create_dir_all(this.config_dir())?;
@@ -1731,6 +1756,12 @@ pub struct Config {
     /// Telemetry configuration
     #[serde(flatten)]
     pub telemetry: TelemetryConfig,
+
+    /// OpenTelemetry SDK metrics exporter settings. Strictly isolated from
+    /// `telemetry` above — see `docs/design/otel-metrics-exporter.md`.
+    #[serde(flatten)]
+    pub otel: OtelConfig,
+
     /// Maximum seconds to wait on graceful shutdown for in-flight
     /// client-originated operations (PUT/UPDATE/GET/SUBSCRIBE) to
     /// finish before tearing down peer connections.
@@ -2753,9 +2784,33 @@ pub struct WebsocketApiArgs {
     pub per_user_export_min_interval_secs: Option<u64>,
 }
 
-/// Default telemetry endpoint (nova.locut.us OTLP collector).
-/// Using domain name for resilience to IP changes.
-pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "http://nova.locut.us:4318";
+/// Default telemetry endpoint (telemetry.freenet.org OTLP collector).
+/// Using domain name for resilience to IP changes. Deliberately the
+/// telemetry role name, not a gateway name (gw1/gw2.freenet.org) — coupling
+/// this to a gateway's name would drag the telemetry default along with any
+/// future gateway host move.
+///
+/// NOTE: every binary released before this change has the OLD default
+/// (`nova.locut.us:4318`) baked in and will keep sending telemetry there for
+/// as long as it runs. That DNS record must stay resolving to the collector
+/// indefinitely — changing this default does not retroactively update
+/// already-deployed peers, only builds made after this merges.
+pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "http://telemetry.freenet.org:4318";
+
+/// The endpoint `DEFAULT_TELEMETRY_ENDPOINT` used before 2026-09.
+///
+/// `build()` PERSISTS the resolved telemetry endpoint into `config.toml`, and
+/// the file value is merged back on every start — so without this sentinel an
+/// existing node keeps the old endpoint forever, even after auto-updating, and
+/// the change would reach FRESH INSTALLS ONLY. Same failure mode and same
+/// remedy as `LEGACY_FLAT_HOSTING_BUDGET_BYTES` above.
+///
+/// A FILE value equal to this exact string is treated as auto-derived rather
+/// than an operator choice, so it re-derives to the current default. An
+/// explicit `--telemetry-endpoint` or env var is parsed into `self` BEFORE the
+/// file merge and still wins, including if an operator genuinely wants this
+/// value.
+pub const LEGACY_TELEMETRY_ENDPOINT: &str = "http://nova.locut.us:4318";
 
 #[derive(clap::Parser, Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryArgs {
@@ -2891,6 +2946,110 @@ fn default_reference_ping_enabled() -> bool {
 
 fn default_iface_tx_enabled() -> bool {
     false
+}
+
+/// How the OTel exporter authenticates to the collector.
+///
+/// `freenet` sends a per-request `Authorization: Bearer
+/// freenet/<pubkey>/<audience>/<timestamp>/<signature>` token — an XEdDSA
+/// signature over the preceding fields, signed with the node's x25519
+/// transport secret — see `tracing::otel::bearer_token`. Future methods get
+/// new variants.
+///
+/// `disabled` is the DEFAULT and sends no `Authorization` header: pointing the
+/// exporter at your own collector must not ship a signed assertion of this
+/// node's identity somewhere it was never asked to. Operators exporting to a
+/// collector that verifies freenet tokens opt in explicitly; anyone else
+/// carries their own auth in `OTEL_EXPORTER_OTLP_HEADERS`, which the exporter
+/// never overwrites.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum OtelAuthMode {
+    Freenet,
+    #[default]
+    Disabled,
+}
+
+/// CLI/file args for the OpenTelemetry SDK metrics exporter.
+///
+/// Strictly independent of [`TelemetryArgs`]: no shared field, no shared
+/// default, no fallback in either direction.
+#[derive(clap::Parser, Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OtelArgs {
+    /// Enable the OpenTelemetry SDK metrics exporter. Independent of
+    /// `telemetry-enabled`; enabling or disabling one has no effect on the
+    /// other.
+    ///
+    /// `num_args`/`default_missing_value` rather than a bare flag: with an
+    /// `env` binding, clap's `SetTrue` action treats ANY value of the variable
+    /// as true, so `FREENET_OTEL_TELEMETRY_ENABLED=false` would silently turn
+    /// the exporter ON. This form accepts `--otel-telemetry-enabled`,
+    /// `--otel-telemetry-enabled=false`, and a properly parsed env value.
+    ///
+    /// `Option` and NO `default_value`, unlike the sibling telemetry flags:
+    /// with a default, "unset" and "explicitly false" are indistinguishable
+    /// after parsing, so `build()` cannot let `--otel-telemetry-enabled=false`
+    /// override a `config.toml` that says true — i.e. the off switch would not
+    /// work. `None` means "not given"; `build()` resolves it to `false`.
+    #[arg(
+        id = "otel_telemetry_enabled",
+        long = "otel-telemetry-enabled",
+        env = "FREENET_OTEL_TELEMETRY_ENABLED",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
+    #[serde(
+        rename = "otel-telemetry-enabled",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enabled: Option<bool>,
+
+    /// OTLP/HTTP collector base URL (e.g. `http://collector:4318`).
+    ///
+    /// No clap `env =` binding on purpose. The standard
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`
+    /// variables must take priority over this file-level value, and binding
+    /// them here would merge them into the config layer and invert that
+    /// precedence. They are resolved in `tracing::otel` instead.
+    #[arg(id = "otel_endpoint", long = "otel-endpoint")]
+    #[serde(rename = "otel-endpoint", skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+
+    /// Collector authentication method. `Option` so `build()` can tell "not
+    /// given on the CLI" from an explicit choice and merge the config-file
+    /// value; resolves to [`OtelAuthMode::default`] (`disabled`) when neither
+    /// sets it.
+    #[arg(id = "otel_auth_mode", long = "otel-auth-mode", value_enum)]
+    #[serde(rename = "otel-auth-mode", skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<OtelAuthMode>,
+}
+
+/// Resolved configuration for the OpenTelemetry SDK metrics exporter.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OtelConfig {
+    /// Whether the SDK metrics exporter is enabled.
+    #[serde(default, rename = "otel-telemetry-enabled")]
+    pub enabled: bool,
+
+    /// Operator-configured OTLP/HTTP collector base URL, if any. `None` means
+    /// "let the SDK resolve it" — see `tracing::otel::resolve_metrics_endpoint`.
+    #[serde(
+        default,
+        rename = "otel-endpoint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub endpoint: Option<String>,
+
+    /// Collector authentication method.
+    #[serde(default, rename = "otel-auth-mode")]
+    pub auth_mode: OtelAuthMode,
+
+    /// Whether this is a test environment (detected via `--id`). Mirrors
+    /// [`TelemetryConfig::is_test_environment`]; suppresses export so test
+    /// networks can't ship data to a collector.
+    #[serde(skip)]
+    pub is_test_environment: bool,
 }
 
 impl Default for TelemetryConfig {
@@ -3898,7 +4057,7 @@ impl std::hash::Hash for GatewayConfig {
 ///
 /// ```toml
 /// [gateways.address]
-/// host = "vega.locut.us"
+/// host = "gw1.freenet.org"
 /// port = 31337            # optional; defaults to 31337 when omitted
 /// ```
 ///
@@ -3906,7 +4065,7 @@ impl std::hash::Hash for GatewayConfig {
 ///
 /// ```toml
 /// [gateways.address]
-/// hostname = "vega.locut.us:31337"   # host[:port] packed into one string
+/// hostname = "gw1.freenet.org:31337"   # host[:port] packed into one string
 /// ```
 ///
 /// ```toml
@@ -6217,7 +6376,7 @@ shutdown-drain-secs = 42
                    location = 0.25\n\
                    \n\
                    [gateways.address]\n\
-                   host = \"vega.locut.us\"\n\
+                   host = \"gw1.freenet.org\"\n\
                    port = 31337\n";
         assert!(
             toml::from_str::<Gateways>(doc).is_err(),
@@ -6597,7 +6756,7 @@ shutdown-drain-secs = 42
     fn gateways_toml_public_key_is_accepted_in_both_spellings() {
         for key in ["public_key", "public-key"] {
             let doc = format!(
-                "[[gateways]]\naddress = {{ host = \"vega.locut.us\", port = 31337 }}\n\
+                "[[gateways]]\naddress = {{ host = \"gw1.freenet.org\", port = 31337 }}\n\
                  {key} = \"/tmp/freenet-5124/vega.pub\"\n"
             );
             let gateways: Gateways = toml::from_str(&doc)
@@ -6608,6 +6767,164 @@ shutdown-drain-secs = 42
                 "{key}"
             );
         }
+    }
+
+    #[test]
+    fn otel_args_default_is_off_and_endpointless() {
+        // The new pipeline exports nothing yet, so shipping it on would be a
+        // behavior change. Operators opt in explicitly.
+        let args = OtelArgs::default();
+        assert_eq!(
+            args.enabled, None,
+            "otel-telemetry-enabled unset must stay None so an explicit \
+             --otel-telemetry-enabled=false can override config.toml"
+        );
+        assert_eq!(args.endpoint, None, "no implicit collector");
+        assert_eq!(
+            args.auth_mode.unwrap_or_default(),
+            OtelAuthMode::Disabled,
+            "auth must default off: pointing the exporter at a collector must \
+             not ship a signed assertion of this node's identity unasked"
+        );
+    }
+
+    #[test]
+    fn otel_auth_mode_parses_from_cli_and_file() {
+        use clap::Parser;
+        let none = ConfigArgs::try_parse_from(["freenet"]).expect("bare parse");
+        assert_eq!(none.otel.auth_mode, None, "unset on the CLI stays None");
+        let off = ConfigArgs::try_parse_from(["freenet", "--otel-auth-mode", "disabled"])
+            .expect("disabled parse");
+        assert_eq!(off.otel.auth_mode, Some(OtelAuthMode::Disabled));
+        let on = ConfigArgs::try_parse_from(["freenet", "--otel-auth-mode", "freenet"])
+            .expect("freenet parse");
+        assert_eq!(on.otel.auth_mode, Some(OtelAuthMode::Freenet));
+
+        // The file spelling is the lowercase variant name.
+        let cfg: OtelConfig = toml::from_str("otel-auth-mode = \"disabled\"").unwrap();
+        assert_eq!(cfg.auth_mode, OtelAuthMode::Disabled);
+        let cfg: OtelConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.auth_mode,
+            OtelAuthMode::Disabled,
+            "absent key -> default"
+        );
+    }
+
+    #[test]
+    fn otel_flag_parses_from_cli() {
+        use clap::Parser;
+        let none = ConfigArgs::try_parse_from(["freenet"]).expect("bare parse");
+        assert_eq!(none.otel.enabled, None, "no flag -> unset, not false");
+        let set = ConfigArgs::try_parse_from(["freenet", "--otel-telemetry-enabled"])
+            .expect("flag parse");
+        assert_eq!(
+            set.otel.enabled,
+            Some(true),
+            "--otel-telemetry-enabled -> on"
+        );
+        // Explicit `=false` must parse and mean false. Without this form the flag
+        // would be a bare ArgAction::SetTrue, and clap turns ANY value of the bound
+        // env var — including "false" — into true.
+        let off = ConfigArgs::try_parse_from(["freenet", "--otel-telemetry-enabled=false"])
+            .expect("explicit false parse");
+        assert_eq!(
+            off.otel.enabled,
+            Some(false),
+            "--otel-telemetry-enabled=false -> off"
+        );
+        let with_ep = ConfigArgs::try_parse_from([
+            "freenet",
+            "--otel-endpoint",
+            "http://collector.example:4318",
+        ])
+        .expect("endpoint parse");
+        assert_eq!(
+            with_ep.otel.endpoint.as_deref(),
+            Some("http://collector.example:4318")
+        );
+    }
+
+    /// C1 regression: the round-trip guard test above only round-trips the
+    /// serializer's OWN output, so a key-shape mismatch (nested `[otel]`
+    /// table vs. the flat keys the design spec and AGENTS.md document) is
+    /// invisible to it. Write the literal documented `config.toml` text and
+    /// confirm the flat keys actually parse into `Config::otel`.
+    #[tokio::test]
+    async fn otel_flat_config_toml_keys_are_honored() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Base build to create the on-disk secrets + a valid config.toml for
+        // every OTHER field (all of them are `#[serde(flatten)]`d scalars, so
+        // this baseline has no `[table]` headers at all).
+        clap_bare_args(temp_dir.path()).build().await.unwrap();
+        let base = tokio::fs::read_to_string(temp_dir.path().join("config.toml"))
+            .await
+            .unwrap();
+
+        // Strip whatever otel shape build() just wrote (pre-fix: a nested
+        // `[otel]` header + its two keys; post-fix: the two flat keys) so the
+        // literal lines appended below are unambiguous root-level keys.
+        let base: String = base
+            .lines()
+            .filter(|line| {
+                *line != "[otel]"
+                    && !line.starts_with("otel-telemetry-enabled")
+                    && !line.starts_with("otel-endpoint")
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+
+        // The literal config.toml the design spec (Configuration table) and
+        // AGENTS.md document: flat keys at the file root, no `[otel]` table.
+        let literal = format!(
+            "{base}otel-telemetry-enabled = true\notel-endpoint = \"http://collector.example:4318\"\n"
+        );
+        std::fs::write(temp_dir.path().join("config.toml"), literal).unwrap();
+
+        let rebuilt = clap_bare_args(temp_dir.path()).build().await.unwrap();
+        assert!(
+            rebuilt.otel.enabled,
+            "documented flat `otel-telemetry-enabled` key must be honored"
+        );
+        assert_eq!(
+            rebuilt.otel.endpoint.as_deref(),
+            Some("http://collector.example:4318"),
+            "documented flat `otel-endpoint` key must be honored"
+        );
+    }
+
+    #[tokio::test]
+    async fn otel_cli_false_overrides_a_config_file_that_says_true() {
+        // The off switch has to work: an operator who exports to a collector
+        // and then needs it stopped must be able to do it from the command
+        // line without editing config.toml. `Some(false)` from the CLI beats
+        // the file; `None` (flag absent) lets the file's `true` through.
+        let temp_dir = tempfile::tempdir().unwrap();
+        clap_bare_args(temp_dir.path()).build().await.unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let base = tokio::fs::read_to_string(&path).await.unwrap();
+        let base: String = base
+            .lines()
+            .filter(|line| !line.starts_with("otel-telemetry-enabled"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        std::fs::write(&path, format!("{base}otel-telemetry-enabled = true\n")).unwrap();
+
+        // Flag absent first: build() rewrites config.toml, so the negative
+        // case has to run last or it would overwrite the seed.
+        let inherited = clap_bare_args(temp_dir.path()).build().await.unwrap();
+        assert!(
+            inherited.otel.enabled,
+            "with the flag absent, config.toml's `true` must still win"
+        );
+
+        let mut args = clap_bare_args(temp_dir.path());
+        args.otel.enabled = Some(false);
+        assert!(
+            !args.build().await.unwrap().otel.enabled,
+            "--otel-telemetry-enabled=false must override config.toml"
+        );
     }
 
     #[tokio::test]
@@ -7054,6 +7371,51 @@ shutdown-drain-secs = 42
             rebuilt.max_hosting_storage,
             crate::ring::default_hosting_budget_bytes(),
             "a config.toml without the key must re-derive the budget from live RAM"
+        );
+    }
+    /// The telemetry endpoint is PERSISTED into config.toml by `build()`, so
+    /// changing `DEFAULT_TELEMETRY_ENDPOINT` alone reaches FRESH INSTALLS ONLY —
+    /// an existing node merges its stored value back on every start and keeps
+    /// the old endpoint forever, even after auto-updating. Same shape as the
+    /// hosting-budget sentinel above.
+    ///
+    /// (a) a stored value equal to the legacy default must RE-DERIVE, and
+    /// (b) a genuinely operator-chosen value must SURVIVE.
+    #[tokio::test]
+    async fn legacy_telemetry_endpoint_re_derives_but_explicit_survives() {
+        // (a) upgrade boot with the legacy endpoint persisted.
+        let legacy_dir = tempfile::tempdir().unwrap();
+        clap_bare_args(legacy_dir.path()).build().await.unwrap();
+        let cfg_path = legacy_dir.path().join("config.toml");
+        let existing = std::fs::read_to_string(&cfg_path).unwrap();
+        let legacy = existing.replace(DEFAULT_TELEMETRY_ENDPOINT, LEGACY_TELEMETRY_ENDPOINT);
+        assert!(
+            legacy.contains(LEGACY_TELEMETRY_ENDPOINT),
+            "fixture must actually contain the legacy endpoint, got:\n{legacy}"
+        );
+        std::fs::write(&cfg_path, legacy).unwrap();
+        let upgraded = clap_bare_args(legacy_dir.path()).build().await.unwrap();
+        assert_eq!(
+            upgraded.telemetry.endpoint, DEFAULT_TELEMETRY_ENDPOINT,
+            "a persisted LEGACY telemetry endpoint must re-derive on upgrade, \
+             otherwise this change reaches fresh installs only"
+        );
+
+        // (b) an operator's own endpoint must not be clobbered by the sentinel.
+        let custom_dir = tempfile::tempdir().unwrap();
+        clap_bare_args(custom_dir.path()).build().await.unwrap();
+        let custom_path = custom_dir.path().join("config.toml");
+        let base = std::fs::read_to_string(&custom_path).unwrap();
+        let chosen = "http://otel.example.invalid:4318";
+        std::fs::write(
+            &custom_path,
+            base.replace(DEFAULT_TELEMETRY_ENDPOINT, chosen),
+        )
+        .unwrap();
+        let kept = clap_bare_args(custom_dir.path()).build().await.unwrap();
+        assert_eq!(
+            kept.telemetry.endpoint, chosen,
+            "an operator-chosen endpoint must survive; only the legacy default re-derives"
         );
     }
 
@@ -7589,6 +7951,7 @@ shutdown-drain-secs = 42
             shutdown_drain_secs: None,
             disable_auto_update: false,
             telemetry: Default::default(),
+            otel: Default::default(),
         }
     }
 
@@ -7747,6 +8110,12 @@ shutdown-drain-secs = 42
                 reference_ping_enabled: true,
                 iface_tx_enabled: true,
             },
+            otel: OtelConfig {
+                enabled: true,
+                endpoint: Some("http://example.invalid:4319".to_string()),
+                auth_mode: OtelAuthMode::Freenet, // non-default: default is Disabled
+                is_test_environment: false,       // #[serde(skip)] — derived from --id
+            },
             shutdown_drain_secs: 77,
             disable_auto_update: true, // #[serde(skip)] — see destructure below
         }
@@ -7801,6 +8170,7 @@ shutdown-drain-secs = 42
             module_cache_budget_bytes,
             enable_event_log,
             telemetry,
+            otel,
             shutdown_drain_secs,
             // #[serde(skip)] runtime CLI/env flag — set from --disable-auto-update
             // at build() time, intentionally not persisted, so it does not
@@ -7850,6 +8220,23 @@ shutdown-drain-secs = 42
         assert_eq!(
             shutdown_drain_secs, seed.shutdown_drain_secs,
             "shutdown_drain_secs"
+        );
+        let OtelConfig {
+            enabled: otel_enabled,
+            endpoint: otel_endpoint,
+            auth_mode: otel_auth_mode,
+            is_test_environment: _, // serde-skip, derived from --id
+        } = otel;
+        assert_eq!(otel_enabled, seed.otel.enabled, "otel.enabled");
+        assert_eq!(
+            otel_endpoint, seed.otel.endpoint,
+            "otel.endpoint — an operator's collector URL must survive the \
+             config.toml merge"
+        );
+        assert_eq!(
+            otel_auth_mode, seed.otel.auth_mode,
+            "otel.auth_mode — an operator's explicit choice must survive the \
+             config.toml merge, or auth silently reverts on restart"
         );
 
         let NetworkApiConfig {
@@ -8182,7 +8569,7 @@ shutdown-drain-secs = 42
                     location: None,
                 },
                 GatewayConfig {
-                    address: Address::Hostname("technic.locut.us".to_string()),
+                    address: Address::Hostname("gw1.freenet.org".to_string()),
                     public_key_path: PathBuf::from("path/to/key"),
                     location: None,
                 },
@@ -8195,8 +8582,12 @@ shutdown-drain-secs = 42
 
     // ---- Address deserialization: backward compat + new host/port form (#1388) ----
 
-    /// Legacy single-string form, exactly as it appears in the deployed
-    /// `https://freenet.org/keys/gateways.toml` today. MUST keep parsing.
+    /// Legacy single-string form, exactly as it appeared in the deployed
+    /// `https://freenet.org/keys/gateways.toml` for years (retired 2026-08-29,
+    /// replaced by role-based `gwN.freenet.org` names). MUST keep parsing —
+    /// peers holding a cached copy of the old file still need it. Deliberately
+    /// NOT updated to the new hostname: this pins the historical value real
+    /// deployments actually used, not an arbitrary example.
     #[test]
     fn test_address_deser_legacy_hostname_string() {
         let toml_str = r#"
@@ -8214,7 +8605,9 @@ shutdown-drain-secs = 42
     }
 
     /// Legacy single-string form without a port still parses (port is resolved
-    /// later by `parse_socket_addr`, which now defaults to 31337).
+    /// later by `parse_socket_addr`, which now defaults to 31337). Same
+    /// historical-value reasoning as the sibling test above: left as the real
+    /// pre-2026-08-29 deployed hostname on purpose.
     #[test]
     fn test_address_deser_legacy_hostname_string_no_port() {
         let toml_str = r#"
@@ -8253,14 +8646,14 @@ shutdown-drain-secs = 42
             [[gateways]]
             public_key = "keys/public.vega.gw.pem"
             [gateways.address]
-            host = "vega.locut.us"
+            host = "gw1.freenet.org"
             port = 31337
         "#;
         let gateways: Gateways = toml::from_str(toml_str).unwrap();
         assert_eq!(
             gateways.gateways[0].address,
             Address::Host {
-                host: "vega.locut.us".to_string(),
+                host: "gw1.freenet.org".to_string(),
                 port: 31337
             }
         );
@@ -8293,13 +8686,13 @@ shutdown-drain-secs = 42
             [[gateways]]
             public_key = "keys/public.vega.gw.pem"
             [gateways.address]
-            host = "vega.locut.us"
+            host = "gw1.freenet.org"
         "#;
         let gateways: Gateways = toml::from_str(toml_str).unwrap();
         assert_eq!(
             gateways.gateways[0].address,
             Address::Host {
-                host: "vega.locut.us".to_string(),
+                host: "gw1.freenet.org".to_string(),
                 port: DEFAULT_GATEWAY_PORT
             }
         );
@@ -8349,7 +8742,7 @@ shutdown-drain-secs = 42
         let gateways = Gateways {
             gateways: vec![GatewayConfig {
                 address: Address::Host {
-                    host: "vega.locut.us".to_string(),
+                    host: "gw1.freenet.org".to_string(),
                     port: 31337,
                 },
                 public_key_path: PathBuf::from("keys/k.pem"),
@@ -8361,7 +8754,8 @@ shutdown-drain-secs = 42
         // sibling keys), matching the new wire form in the issue — not nested
         // under a `[gateways.address.host]` sub-table (the derived enum form).
         assert!(
-            serialized.contains("host = \"vega.locut.us\"") && serialized.contains("port = 31337"),
+            serialized.contains("host = \"gw1.freenet.org\"")
+                && serialized.contains("port = 31337"),
             "unexpected serialized form:\n{serialized}"
         );
         assert!(
@@ -8382,14 +8776,14 @@ shutdown-drain-secs = 42
     fn test_address_legacy_variants_serialize_unchanged() {
         let hostname = Gateways {
             gateways: vec![GatewayConfig {
-                address: Address::Hostname("vega.locut.us:31337".to_string()),
+                address: Address::Hostname("gw1.freenet.org:31337".to_string()),
                 public_key_path: PathBuf::from("keys/k.pem"),
                 location: None,
             }],
         };
         let s = toml::to_string(&hostname).unwrap();
         assert!(
-            s.contains("hostname = \"vega.locut.us:31337\""),
+            s.contains("hostname = \"gw1.freenet.org:31337\""),
             "legacy hostname form changed:\n{s}"
         );
 
