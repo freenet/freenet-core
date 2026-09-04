@@ -2515,6 +2515,7 @@ fn route_notification_outbound(delegate_key: &DelegateKey, outbound: Vec<Outboun
 /// Shared by the `ContractHandlerEvent::DelegateRequest` arm and by the drain
 /// of requests that queued behind a park, so the exclusion check cannot be
 /// present on one path and missing on the other.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_delegate_request<CH, P>(
     contract_handler: &mut CH,
     park: Option<&mut delegate_park::DelegateParkCtx>,
