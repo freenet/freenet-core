@@ -832,6 +832,32 @@ impl DelegateCallEnv {
     /// A read error is reported as CHANGED: failing towards an extra
     /// broadcast is recoverable, failing towards a silent drop is the bug
     /// #5479 is about.
+    ///
+    /// # This read and the write that follows it are NOT atomic
+    ///
+    /// The comparison happens here; the write happens further down
+    /// `put_contract_state_sync` / `update_contract_state_sync`. Nothing holds
+    /// a lock across the two. **Correctness currently depends on delegate
+    /// handling being serialized by the contract-handling loop** — both entry
+    /// points (`contract.rs`) `await` `handle_delegate_with_contract_requests`
+    /// inline on that single loop with no spawn, so two V2 delegate writes to
+    /// one contract cannot interleave on a node today.
+    ///
+    /// If that serialization is removed, this gate can suppress a REAL change.
+    /// The interleaving is not the symmetric one it looks like: writer A whose
+    /// own bytes happen to equal what it reads decides "no change" and will
+    /// suppress; writer B then commits and broadcasts different bytes; A then
+    /// writes its own bytes and stays silent. Local state ends at A's value
+    /// while the network last heard B's, and nothing re-announces it until the
+    /// next write or the anti-entropy heartbeat. Note that this is precisely
+    /// the idempotent-rewrite workload the gate exists to catch, so the racy
+    /// case is the common case rather than an exotic one.
+    ///
+    /// **#5544 removes that serialization** to fix a node-wide stall. Whoever
+    /// lands it owns this: the gate is not self-sufficient, and the fix is to
+    /// make the compare-and-write atomic (fold the comparison into the same
+    /// ReDb write transaction as the store, the way `update_state_sync`
+    /// already does its check-and-write) rather than to rely on the loop.
     fn state_content_changed(
         &self,
         contract_key: &ContractKey,
