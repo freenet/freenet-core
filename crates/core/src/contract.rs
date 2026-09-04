@@ -4978,7 +4978,7 @@ mod tests {
 mod hol_4391_tests {
     use super::*;
     use crate::config::GlobalExecutor;
-    use crate::contract::executor::mock_wasm_runtime::ValidateOverride;
+    use crate::contract::executor::mock_wasm_runtime::{ScriptedRun, ValidateOverride};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -6276,7 +6276,7 @@ mod hol_4391_tests {
         let _guard = TEST_GUARD.lock().await;
         let (mut handler, send) = build_handler(vec![]).await;
         let script = handler.runtime_mut().delegate_script.clone();
-        script.lock().unwrap().push_back(prompt_outbound());
+        script.lock().unwrap().push_back(prompt_outbound().into());
 
         // A locally stored contract, so the GET below needs no network and its
         // only possible source of delay is the loop being blocked.
@@ -6382,11 +6382,11 @@ mod hol_4391_tests {
         script
             .lock()
             .unwrap()
-            .push_back(payload_then_prompt(b"before-park-1"));
+            .push_back(payload_then_prompt(b"before-park-1").into());
         script
             .lock()
             .unwrap()
-            .push_back(payload_then_prompt(b"before-park-2"));
+            .push_back(payload_then_prompt(b"before-park-2").into());
 
         let send = Arc::new(send);
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -6477,7 +6477,7 @@ mod hol_4391_tests {
         let _guard = TEST_GUARD.lock().await;
         let (mut handler, send) = build_handler(vec![]).await;
         let script = handler.runtime_mut().delegate_script.clone();
-        script.lock().unwrap().push_back(prompt_outbound());
+        script.lock().unwrap().push_back(prompt_outbound().into());
 
         let send = Arc::new(send);
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -6584,13 +6584,24 @@ mod hol_4391_tests {
         let (mut handler, _send) = build_handler(vec![]).await;
         let calls = handler.runtime_mut().delegate_calls.clone();
         let script = handler.runtime_mut().delegate_script.clone();
+        let contexts = handler.runtime_mut().delegate_contexts.clone();
         // Present so that, if the gate is missing, the delegate really does run
-        // rather than erroring out for an unrelated reason.
-        script.lock().unwrap().push_back(Vec::new());
+        // rather than erroring out for an unrelated reason — and writes a
+        // DIFFERENT context, which is what makes the corruption visible.
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: Vec::new(),
+            writes_context: Some(b"clobbered-by-notification".to_vec()),
+        });
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut park = delegate_park::DelegateParkCtx::new(tx);
         let key = test_delegate_key();
+        // What the parked round-trip left behind, as its pre-park `ctx.write()`
+        // would have.
+        contexts
+            .lock()
+            .unwrap()
+            .insert(key.clone(), b"parked-continuation".to_vec());
         assert!(
             matches!(
                 park.park(key.clone(), parked_continuation()),
@@ -6616,6 +6627,16 @@ mod hol_4391_tests {
             0,
             "a notification must NOT re-enter a parked delegate (#5544 B1)"
         );
+        // The assertion that shows the CONSEQUENCE, not just the symptom
+        // (#5544 S7): the parked continuation's context must be untouched. An
+        // extra `process()` is only a problem because it clobbers this.
+        assert_eq!(
+            contexts.lock().unwrap().get(&key).map(Vec::as_slice),
+            Some(b"parked-continuation".as_slice()),
+            "the parked continuation's context must be intact; a notification \
+             that ran would have overwritten it and the delegate would resume \
+             on someone else's bytes (#5544 B1)"
+        );
         let (_continuation, pending) = park.take(&key).expect("still parked");
         assert_eq!(
             pending.len(),
@@ -6626,6 +6647,92 @@ mod hol_4391_tests {
             matches!(pending[0], delegate_park::PendingRun::Notification { .. }),
             "queued as a notification so it resumes through the app-routing path"
         );
+    }
+
+    /// B2 via the context model: an inter-delegate message must not re-enter a
+    /// parked TARGET delegate.
+    ///
+    /// Delegate A is driven by a client and emits `SendDelegateMessage` at B.
+    /// B is parked on a prompt. Delivering the hop would run B's `process()`
+    /// mid-round-trip and overwrite the context its parked continuation
+    /// depends on.
+    ///
+    /// This is the test the mock could not express before S7. Modelling call
+    /// counts alone showed only that an extra invocation happened; modelling
+    /// the context store shows that the invocation CORRUPTED something, which
+    /// is the reason the extra invocation matters.
+    ///
+    /// FALSIFY by deleting the `is_parked(&target_key)` gate on the hop: B's
+    /// context becomes `clobbered-by-hop`.
+    #[tokio::test]
+    async fn an_inter_delegate_message_does_not_re_enter_a_parked_target() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        let contexts = handler.runtime_mut().delegate_contexts.clone();
+
+        let key_b = test_delegate_key();
+        let key_a = DelegateKey::new([8u8; 32], freenet_stdlib::prelude::CodeHash::new([8u8; 32]));
+
+        // Run 1 is B's: it parks on a prompt, having written its continuation.
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: prompt_outbound(),
+            writes_context: Some(b"b-parked-continuation".to_vec()),
+        });
+        // Run 2 is A's: it fires a message at B.
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: vec![OutboundDelegateMsg::SendDelegateMessage(
+                freenet_stdlib::prelude::DelegateMessage::new(
+                    key_b.clone(),
+                    key_a.clone(),
+                    b"ping".to_vec(),
+                ),
+            )],
+            writes_context: None,
+        });
+        // Run 3 would be B's, if the hop were wrongly delivered.
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: Vec::new(),
+            writes_context: Some(b"clobbered-by-hop".to_vec()),
+        });
+
+        let send = Arc::new(send);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter { gate: gate.clone() },
+        ));
+
+        // Park B.
+        let send_b = send.clone();
+        let kb = key_b.clone();
+        let parked: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
+            GlobalExecutor::spawn(async move { send_b.send_to_handler(delegate_event(&kb)).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            contexts.lock().unwrap().get(&key_b).map(Vec::as_slice),
+            Some(b"b-parked-continuation".as_slice()),
+            "B must have parked with its continuation written"
+        );
+
+        // Now drive A, which messages the parked B.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            send.send_to_handler(delegate_event(&key_a)),
+        )
+        .await
+        .expect("A's own request must complete; only the hop to B is dropped");
+
+        assert_eq!(
+            contexts.lock().unwrap().get(&key_b).map(Vec::as_slice),
+            Some(b"b-parked-continuation".as_slice()),
+            "an inter-delegate message must NOT re-enter a parked target; B's \
+             parked continuation was overwritten (#5544 B2)"
+        );
+
+        gate.add_permits(1);
+        let _ = tokio::time::timeout(Duration::from_secs(5), parked).await;
+        handle.abort();
     }
 
     /// A continuation standing in for a delegate parked on a prompt.
@@ -6666,10 +6773,8 @@ mod hol_4391_tests {
         .await;
 
         let script = handler.runtime_mut().delegate_script.clone();
-        script
-            .lock()
-            .unwrap()
-            .push_back(vec![OutboundDelegateMsg::PutContractRequest(
+        script.lock().unwrap().push_back(
+            vec![OutboundDelegateMsg::PutContractRequest(
                 freenet_stdlib::prelude::PutContractRequest {
                     contract: contract_a.clone(),
                     state: WrappedState::new(b"a_state".to_vec()),
@@ -6677,7 +6782,9 @@ mod hol_4391_tests {
                     context: DelegateContext::default(),
                     processed: false,
                 },
-            )]);
+            )]
+            .into(),
+        );
 
         // B's fetch hangs until released, standing in for a slow network GET.
         // The counter records that the OFF-LOOP path was the one taken.
@@ -6819,7 +6926,7 @@ mod hol_4391_tests {
         let calls = handler.runtime_mut().delegate_calls.clone();
         // Only the FIRST invocation prompts; later ones return nothing, so the
         // round-trip terminates instead of parking forever.
-        script.lock().unwrap().push_back(prompt_outbound());
+        script.lock().unwrap().push_back(prompt_outbound().into());
 
         let send = Arc::new(send);
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
