@@ -435,11 +435,14 @@ fn finalize_state_commit_is_the_only_post_store_fan_out_site() {
     );
     let ops_calls = count_call_sites(ops_production, ".finalize_state_commit(");
     assert_eq!(
-        ops_calls, 3,
-        "expected exactly 3 `self.finalize_state_commit(` call sites in \
-         contract_ops.rs (the re-PUT merge, the fresh store in \
-         `perform_contract_put`, and the related-contract install in \
-         `get_updated_state`); found {ops_calls}."
+        ops_calls, 2,
+        "expected exactly 2 `self.finalize_state_commit(` call sites in \
+         contract_ops.rs (the re-PUT merge and the fresh store in \
+         `perform_contract_put`); found {ops_calls}. NOTE: the \
+         related-contract install in `get_updated_state` deliberately does \
+         NOT fan out — the GET path's `cache_contract_locally` already did, \
+         and a call there is a guaranteed DUPLICATE, not a missing leg. Read \
+         the comment at that site before adding one back."
     );
 
     // Counting HELPER CALLS alone cannot notice a new storing path that calls
@@ -456,9 +459,13 @@ fn finalize_state_commit_is_the_only_post_store_fan_out_site() {
     //     - `commit_state_update`          -> finalize at the end of the method
     //   contract_ops.rs
     //     - the re-PUT merge               -> finalize immediately after
-    //     - `verify_and_store_contract`    -> finalize at EACH of its two
-    //       callers (the fresh PUT, and the related-contract install), because
-    //       they fan out under different keys
+    //     - `verify_and_store_contract`    -> finalize at its FRESH-PUT caller
+    //       only. Its other caller, the related-contract install in
+    //       `get_updated_state`, is the one write here that owes nothing: the
+    //       sub-op GET's `cache_contract_locally` stored and fanned out that
+    //       same state before control ever reached it, so this is a re-store
+    //       of an already-announced state. Fanning out again would
+    //       double-notify every delegate and WS client and double-broadcast.
     let writes = count_state_writes(production);
     let ops_writes = count_state_writes(ops_production);
     assert_eq!(

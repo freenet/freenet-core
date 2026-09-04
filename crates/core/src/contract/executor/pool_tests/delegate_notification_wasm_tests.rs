@@ -2,9 +2,9 @@
 //!
 //! `perform_contract_put` and `get_updated_state` live on `impl
 //! Executor<Runtime>` — the real WASM runtime — not on the generic impl the
-//! `pool_tests` harness drives via `Executor<MockWasmRuntime>`. So the three
-//! `finalize_state_commit` call sites they own, all newly routed through the
-//! chokepoint for #5481, were covered only by the source-scrape pin in
+//! `pool_tests` harness drives via `Executor<MockWasmRuntime>`. So the
+//! `finalize_state_commit` call sites they own, routed through the chokepoint
+//! for #5481, were covered only by the source-scrape pin in
 //! `delegate_notification_tests`.
 //!
 //! A structural pin proves a call EXISTS. It does not prove the call is wired
@@ -22,17 +22,23 @@
 //! `wasm_conformance_tests`, which is where the runtime-construction shape
 //! comes from.
 //!
-//! The three sites and the test that covers each:
+//! The sites and the test that covers each:
 //!
 //! | site | test |
 //! |---|---|
 //! | `perform_contract_put`, fresh-install branch | [`local_put_notifies_subscribed_delegates`] |
 //! | `perform_contract_put`, existing-contract merge branch | [`local_reput_merge_notifies_subscribed_delegates`] |
-//! | `get_updated_state`, related-contract install | [`related_contract_install_notifies_the_related_contracts_delegates`] |
 //!
-//! Plus [`failed_ws_notification_neither_fails_the_put_nor_stops_the_other_legs`],
-//! which covers the behaviour change the chokepoint introduces: a failure in
-//! one leg must not fail the commit or abort the remaining legs.
+//! Plus two tests about where the fan-out must NOT be, or must survive:
+//!
+//! - [`related_contract_install_does_not_fan_out_the_get_path_already_did`] —
+//!   the related-contract install in `get_updated_state` is a re-store of a
+//!   state the GET path has already stored and announced, so a
+//!   `finalize_state_commit` there is a guaranteed duplicate rather than a
+//!   missing leg.
+//! - [`failed_ws_notification_neither_fails_the_put_nor_stops_the_other_legs`] —
+//!   the behaviour change the chokepoint introduces: a failure in one leg must
+//!   not fail the commit or abort the remaining legs.
 
 use freenet_stdlib::client_api::ContractRequest;
 use freenet_stdlib::prelude::*;
@@ -550,53 +556,69 @@ async fn failed_ws_notification_neither_fails_the_put_nor_stops_the_other_legs()
     Ok(())
 }
 
-/// The fifth `finalize_state_commit` site, and the one the rule review named:
-/// `get_updated_state` installs a DIFFERENT contract mid-UPDATE — the related
-/// one it fetched in order to validate the update — and owes THAT contract's
-/// subscribers the fan-out.
+/// The related-contract install must NOT fan out — the GET path already did.
 ///
-/// **This site does not execute in production today — see #5549.** The full
-/// reason is under "What this test does NOT prove" below; it is repeated here
-/// because a reader skimming this one test could otherwise take it as evidence
-/// that the fifth site is live.
+/// This test replaces one that asserted the opposite. An earlier revision of
+/// this PR added a `finalize_state_commit` to the install in
+/// `get_updated_state`, on the reasoning that installing a contract's state
+/// owes that contract's subscribers a notification. The reasoning is right; the
+/// placement was wrong, because the notification has already been sent by the
+/// time control arrives.
 ///
-/// The regression this exists to catch is specific: swapping the site's
-/// `related_key`/`related_params` back to the enclosing `key`/`params`. Every
-/// call-count and state-write pin in `delegate_notification_tests`
-/// still passes under that swap, because the call is still there and still
-/// counted — it is simply pointed at the wrong contract, and a delegate
-/// subscribed to the related contract silently never hears about it. Here the
-/// delegate is subscribed to the RELATED contract only, so under that swap the
-/// notification is keyed on the target contract, this channel stays empty, and
-/// the test fails.
+/// The chain, verified end to end:
 ///
-/// Reaching the branch needs two things production has and a unit test does
-/// not: a contract that asks for a related contract from `update_state`
-/// (`test-contract-requires-related`) and a network that answers
-/// (`set_test_sub_op_get_override`, the sub-op GET sibling of the existing
-/// `set_test_network_fetch_override`). Both are test-only; the code path
-/// between them is production's.
+/// 1. The sub-op GET driver calls `cache_contract_locally` on
+///    `Terminal::InlineFound`, BEFORE it builds the `GetResult`
+///    (`operations/get/op_ctx_task.rs`).
+/// 2. `cache_contract_locally` re-queries the local store, finds no matching
+///    state (the contract is absent locally — that is why the fetch happened),
+///    and issues a `ContractHandlerEvent::PutQuery` with the contract code.
+/// 3. That PutQuery routes through `maybe_defer_upsert` into
+///    `bridged_upsert_contract_state_inner`, takes the initial-state-install
+///    branch, and calls `finalize_state_commit` — keyed on the related
+///    contract, which is the right key. **The fan-out has happened.**
+/// 4. Only then does `get_updated_state` see its `GetResult` and re-store.
 ///
-/// The stub is a thread-local, so this test — like the ones using
-/// `set_test_network_fetch_override` — must stay on `current_thread`, or the
-/// executor may run on a worker thread that cannot see it.
+/// The dependency is causal, not incidental: `GetResult.contract` is resolved
+/// by re-querying the LOCAL store after step 2, so it is `Some` only because
+/// step 2 stored it. Had step 2 not run, the re-query would find no state, the
+/// sub-op would resolve `NotFound`, and execution would never reach the
+/// install. A `finalize_state_commit` at the install site is therefore a
+/// GUARANTEED duplicate — double-notifying every subscribed delegate and
+/// WebSocket client, and double-broadcasting to the network — on a codebase
+/// with #5147/#5148 open about broadcast duplication.
 ///
-/// # What this test does NOT prove
+/// So the assertion is an ABSENCE, and absence assertions rot into vacuity
+/// unless something proves the code ran and something proves the observer
+/// works. Both are here:
 ///
-/// That the branch runs in production today. It does not: `get_updated_state`
-/// asks `local_state_or_from_network(&id, false)`, and the sub-op GET driver
-/// hard-nulls the contract whenever `return_contract_code` is false
-/// (`operations/get/op_ctx_task.rs`, `let client_contract = if
-/// return_contract_code { contract } else { None }`), so the `let Some(contract)
-/// = contract else` guard immediately above the install always takes its error
-/// arm with "Missing contract". That mismatch predates #5481 — it arrived with
-/// the executor split — and correcting it changes what this node asks the
-/// network for, so it belongs in its own change rather than riding along here.
-/// This test therefore pins the site's WIRING, which is what the rule review
-/// asked for and what a future edit can silently break; it is deliberately not
-/// evidence that the site is live.
+/// - the related contract's state IS in the local store afterwards, which only
+///   happens if the install branch executed;
+/// - a control PUT at the end DOES notify the same delegate on the same
+///   channel, so an empty channel earlier was a real absence and not a broken
+///   subscription, a missing `delegate_notification_tx`, or a mis-keyed guard.
+///
+/// Reaching the branch still needs two test-only pieces —
+/// `test-contract-requires-related`, whose `update_state` returns
+/// `UpdateModification::requires`, and `set_test_sub_op_get_override` — because
+/// nothing else can enter it. Note the stub stands in for the whole sub-op GET,
+/// which means it also stands in for step 2: the test never runs
+/// `cache_contract_locally`, so the absence it observes is exactly "this site
+/// does not fan out", not "the notification went missing".
+///
+/// The stub is a thread-local, so this test must stay on `current_thread`.
+///
+/// # Also worth knowing
+///
+/// This site does not execute in production at all today (#5549):
+/// `get_updated_state` asks `local_state_or_from_network(&id, false)`, and the
+/// driver hard-nulls the contract when `return_contract_code` is false, so the
+/// `let Some(contract) = contract else` guard always takes its error arm. When
+/// #5549 is fixed the site becomes live — and that is precisely when a fan-out
+/// re-added here would start double-notifying. This test is the guard that
+/// will be in place.
 #[tokio::test(flavor = "current_thread")]
-async fn related_contract_install_notifies_the_related_contracts_delegates()
+async fn related_contract_install_does_not_fan_out_the_get_path_already_did()
 -> Result<(), Box<dyn std::error::Error>> {
     let target = load(REQUIRES_RELATED_CONTRACT, params(3)).await;
     let target_key = target.key();
@@ -605,13 +627,12 @@ async fn related_contract_install_notifies_the_related_contracts_delegates()
     assert_ne!(
         target_key.id(),
         related_key.id(),
-        "the two contracts must be distinct or the assertion below proves nothing"
+        "the two contracts must be distinct or the assertions below prove nothing"
     );
 
     let mut harness = build_harness("delegate-notify-related-install").await?;
 
-    // Establish the contract being UPDATEd. This is the fresh-install branch
-    // again; nothing is subscribed to it, so it fans out to nobody.
+    // Establish the contract being UPDATEd. Nothing is subscribed to it.
     harness
         .executor
         .contract_requests(
@@ -635,9 +656,10 @@ async fn related_contract_install_notifies_the_related_contracts_delegates()
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     harness.executor.set_delegate_notification_tx(tx);
 
-    // Stand in for the network: whatever instance id the target contract asks
-    // for, answer with the related contract and its state. The executor
-    // installs it under the RELATED contract's own key, which is the point.
+    // Stand in for the sub-op GET. In production `cache_contract_locally` has
+    // stored and fanned out this state before the driver returns; the stub
+    // replaces the whole driver, so nothing has fanned out here and any
+    // notification observed below could only have come from the install site.
     let related_state = WrappedState::new(b"state fetched for the related contract".to_vec());
     let _stub = SubOpGetStubGuard;
     {
@@ -661,51 +683,56 @@ async fn related_contract_install_notifies_the_related_contracts_delegates()
         .await
         .map_err(|e| format!("local UPDATE failed: {e}"))?;
 
-    let notification = expect_notification(
-        &mut rx,
-        "installing a related contract mid-UPDATE must fan out to the RELATED \
-         contract's subscribers. An empty channel here is the named regression: \
-         the site keyed its fan-out on the enclosing contract instead of on the \
-         contract it just installed",
-    )
-    .await;
-
-    assert_eq!(
-        notification.contract_id,
-        *related_key.id(),
-        "the fan-out must be keyed on the contract that was just installed \
-         (`related_key`), not on the contract being updated"
-    );
-    assert_ne!(
-        notification.contract_id,
-        *target_key.id(),
-        "keying the fan-out on the enclosing contract is exactly the regression \
-         this test exists to catch"
-    );
-    assert_eq!(
-        notification.delegate_key, delegate,
-        "notification must carry the delegate subscribed to the related contract"
-    );
-    let delivered: &[u8] = notification.new_state.as_ref().as_ref();
-    assert_eq!(
-        delivered,
-        related_state.as_ref(),
-        "the fan-out must carry the related contract's freshly-installed state"
-    );
-
-    // The related contract really was installed, not merely notified about —
-    // otherwise the assertions above could hold for a notification emitted
-    // before (or instead of) the store.
+    // The install branch really executed — otherwise the absence below is
+    // vacuous.
     let stored = harness
         .executor
         .state_store
         .get(&related_key)
         .await
-        .map_err(|e| format!("related contract state must be stored locally: {e}"))?;
+        .map_err(|e| format!("the related contract's state must be stored locally: {e}"))?;
     assert_eq!(
         stored.as_ref(),
         related_state.as_ref(),
-        "the related contract's state must be in the local store"
+        "the install branch must have stored the related contract's state"
+    );
+
+    // The assertion this test exists for.
+    assert!(
+        rx.try_recv().is_err(),
+        "the related-contract install must NOT fan out: the GET path's \
+         `cache_contract_locally` has already stored this state and notified \
+         this delegate. A notification here is a DUPLICATE — every subscribed \
+         delegate and WebSocket client notified twice, and the state broadcast \
+         to the network twice, for one install. Read the comment at the install \
+         site in contract_ops.rs before adding a `finalize_state_commit` back"
+    );
+
+    // Control: the delegate, the channel and the subscription are all live, so
+    // the empty channel above was a real absence rather than a broken harness.
+    // A re-PUT of the now-hosted related contract takes the merge branch, which
+    // does fan out.
+    let merged = WrappedState::new(b"control: a state that really is announced".to_vec());
+    put(&mut harness.executor, related.clone(), merged.clone())
+        .await
+        .map_err(|e| format!("control PUT failed: {e}"))?;
+    let notification = expect_notification(
+        &mut rx,
+        "CONTROL: a genuine commit on the related contract must reach this \
+         delegate. If this fails the harness is broken and the absence asserted \
+         above proves nothing",
+    )
+    .await;
+    assert_eq!(
+        notification.contract_id,
+        *related_key.id(),
+        "the control notification must be for the related contract"
+    );
+    let delivered: &[u8] = notification.new_state.as_ref().as_ref();
+    assert_eq!(
+        delivered,
+        merged.as_ref(),
+        "the control notification must carry the merged state"
     );
 
     Ok(())

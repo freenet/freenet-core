@@ -283,44 +283,46 @@ impl Executor<Runtime> {
                                             }),
                                         ));
                                     };
-                                    let related_key = contract.key();
-                                    let related_params = contract.params();
+                                    // DELIBERATELY NO FAN-OUT HERE. The
+                                    // related contract's subscribers are owed
+                                    // one, and the GET path has already sent
+                                    // it: reaching this arm at all means the
+                                    // sub-op GET resolved from the network, and
+                                    // its `cache_contract_locally` ran first —
+                                    // it stores via `ContractHandlerEvent::
+                                    // PutQuery`, which lands in the
+                                    // initial-state-install branch of
+                                    // `bridged_upsert_contract_state_inner` and
+                                    // fans out from there, keyed on this
+                                    // contract. Adding a second
+                                    // `finalize_state_commit` here would
+                                    // double-notify every subscribed delegate
+                                    // and WebSocket client and double-broadcast
+                                    // to the network, for one install.
+                                    //
+                                    // The dependency is causal, not incidental.
+                                    // `GetResult.contract` is resolved by
+                                    // re-querying the LOCAL store after
+                                    // `cache_contract_locally` returns
+                                    // (`operations/get/op_ctx_task.rs`), so it
+                                    // is `Some` only because that store already
+                                    // happened. If the store had not happened
+                                    // the re-query would find no state, the
+                                    // sub-op would resolve `NotFound`, and
+                                    // execution would never arrive here.
+                                    //
+                                    // `verify_and_store_contract` below is a
+                                    // re-store of that same state. It is
+                                    // pre-existing and left alone (it also
+                                    // re-charges the disk budget and
+                                    // `StateBytesWritten` — see #5553); what
+                                    // must not come back is the fan-out.
                                     self.verify_and_store_contract(
                                         state.clone(),
                                         contract.clone(),
                                         RelatedContracts::default(),
                                     )
                                     .await?;
-                                    // This just installed a DIFFERENT
-                                    // contract's state — the related one we
-                                    // fetched to validate this update — so it
-                                    // owes that contract's subscribers the same
-                                    // post-store fan-out any other install
-                                    // does. Keyed on the related contract, not
-                                    // `key`. Without this a delegate subscribed
-                                    // to the related contract is never told,
-                                    // which is #5481 on a fifth path (found by
-                                    // the external review pass).
-                                    //
-                                    // The fan-out cannot live inside
-                                    // `verify_and_store_contract`: its other
-                                    // caller (the fresh-PUT branch above)
-                                    // already fans out after it, and moving it
-                                    // inside would emit twice there.
-                                    //
-                                    // Note leg 4 means this node now
-                                    // re-broadcasts a state it just fetched.
-                                    // That is bounded — `broadcast_state_change`
-                                    // sends only to peers already interested in
-                                    // that contract, and none may be — and it
-                                    // is what every other install does with a
-                                    // network-delivered state.
-                                    self.finalize_state_commit(
-                                        &related_key,
-                                        &related_params,
-                                        &state,
-                                    )
-                                    .await;
                                     state
                                 }
                             };
