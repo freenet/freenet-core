@@ -231,6 +231,62 @@ fn is_delegate_client(client_id: ClientId) -> bool {
     usize::from(client_id) >= DELEGATE_CLIENT_ID_BASE
 }
 
+/// Counts every occurrence of an event but admits only the 1st, 2nd, 4th,
+/// 8th ... for logging.
+///
+/// BOTH refusal branches of [`register_subscription`] are delegate-driven and
+/// loopable: a V2 delegate can call `subscribe_contract()` in a loop, and a V1
+/// one can emit many `SubscribeContractRequest`s per `process()`. So a
+/// per-occurrence `warn!` on either is a log-flood surface the delegate itself
+/// controls, which is how #4238 flooded gateways.
+///
+/// One type used twice rather than the same six lines written out twice. The
+/// two branches are the same hazard, and a second hand-rolled copy is how one
+/// of them ends up thinned and the other not — which is exactly the state this
+/// change found: the not-hosting branch was rate-limited and cited #4238 in its
+/// own comment, while the cap branch three dozen lines below was not.
+///
+/// Each call site keeps its OWN `static`, because they are different events: a
+/// shared counter would let a flood of one suppress the FIRST occurrence of the
+/// other, which is the one occurrence that must always be logged.
+///
+/// Deliberately racy. Two threads can both admit the same ordinal, and a
+/// concurrent `store` can lower `last_logged`. The cost is a duplicate line;
+/// the alternative is a compare-exchange loop on a path whose only job is to
+/// thin logging. What is NOT racy in a way that matters is the total: it comes
+/// from `fetch_add`, so every occurrence is counted exactly once even when it
+/// is not logged.
+struct LogFloodGate {
+    occurrences: AtomicU64,
+    last_logged: AtomicU64,
+}
+
+impl LogFloodGate {
+    const fn new() -> Self {
+        Self {
+            occurrences: AtomicU64::new(0),
+            last_logged: AtomicU64::new(0),
+        }
+    }
+
+    /// Records one occurrence. Returns the running total when this occurrence
+    /// should be logged, `None` when it should be suppressed.
+    ///
+    /// The total is RETURNED rather than left for the caller to read, so the
+    /// emitted line can carry it: thinning the logging must not hide the
+    /// volume, or a runaway looks the same as a single stray event.
+    fn admit(&self) -> Option<u64> {
+        let total = self.occurrences.fetch_add(1, Ordering::Relaxed) + 1;
+        let last = self.last_logged.load(Ordering::Relaxed);
+        if total == 1 || total >= last.saturating_mul(2) {
+            self.last_logged.store(total, Ordering::Relaxed);
+            Some(total)
+        } else {
+            None
+        }
+    }
+}
+
 /// Register `delegate`'s subscription to `contract` as local client demand.
 ///
 /// Idempotent: `add_client_subscription` inserts into a `HashSet`, so a
@@ -317,26 +373,15 @@ pub(crate) fn register_subscription(
         // that would break callers that subscribe before the node settles), so
         // this line is the only signal that the pin did not take.
         //
-        // Rate-limited, because a delegate controls how often it lands here: a
-        // V2 delegate can call `subscribe_contract()` in a loop and a V1 one
-        // can emit many `SubscribeContractRequest`s per `process()`. An
-        // unrated per-occurrence WARN on a delegate-driven path is how #4238
-        // flooded gateways, and the `Full` arm of
-        // `send_delegate_contract_notifications` carries a counter for exactly
-        // that reason. Every occurrence is still counted; only the logging is
-        // thinned, so the total stays visible.
-        static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
-        static LAST_LOGGED: AtomicU64 = AtomicU64::new(0);
-        let total = SUPPRESSED.fetch_add(1, Ordering::Relaxed) + 1;
-        let last = LAST_LOGGED.load(Ordering::Relaxed);
-        // Log the first, then on a widening cadence: 1, 2, 4, 8, ... so a
-        // runaway is visible without being per-occurrence.
-        if total == 1 || total >= last.saturating_mul(2) {
-            LAST_LOGGED.store(total, Ordering::Relaxed);
+        // Rate-limited, because a delegate controls how often it lands here.
+        // See [`LogFloodGate`] for why, and for why the cap branch below gets
+        // the same treatment from the same type rather than a second copy.
+        static NOT_HOSTING: LogFloodGate = LogFloodGate::new();
+        if let Some(occurrences) = NOT_HOSTING.admit() {
             tracing::warn!(
                 delegate = %delegate,
                 contract = %contract,
-                occurrences = total,
+                occurrences,
                 "delegate subscribed to a contract this node resolves but does \
                  not host: no demand registered, so the pin did NOT take and \
                  the contract will not be renewed on the delegate's behalf. \
@@ -376,14 +421,23 @@ pub(crate) fn register_subscription(
         && op_manager.ring.client_subscription_count(client_id)
             >= crate::contract::executor::MAX_SUBSCRIPTIONS_PER_CLIENT
     {
-        tracing::warn!(
-            delegate = %delegate,
-            contract = %contract,
-            limit = crate::contract::executor::MAX_SUBSCRIPTIONS_PER_CLIENT,
-            "delegate is at the per-subscriber subscription cap; refusing to \
-             register further demand. The subscribe still succeeds and \
-             notifications still work, but this contract is not pinned."
-        );
+        // Rate-limited for the same reason the not-hosting branch above is, and
+        // through the same [`LogFloodGate`]: this branch is reached ONCE PER
+        // SUBSCRIBE CALL by a delegate that is already at the cap, so it is if
+        // anything the easier of the two to drive in a loop — the delegate does
+        // not even have to vary the contract.
+        static AT_CAP: LogFloodGate = LogFloodGate::new();
+        if let Some(occurrences) = AT_CAP.admit() {
+            tracing::warn!(
+                delegate = %delegate,
+                contract = %contract,
+                limit = crate::contract::executor::MAX_SUBSCRIPTIONS_PER_CLIENT,
+                occurrences,
+                "delegate is at the per-subscriber subscription cap; refusing to \
+                 register further demand. The subscribe still succeeds and \
+                 notifications still work, but this contract is not pinned."
+            );
+        }
         return false;
     }
 
@@ -520,6 +574,36 @@ mod tests {
             [seed; 32],
             freenet_stdlib::prelude::CodeHash::from_code(&[seed]),
         )
+    }
+
+    /// The gate must thin the LOGGING without losing the COUNT.
+    ///
+    /// Both halves matter and they fail differently. Admitting every occurrence
+    /// is the log flood the gate exists to stop; dropping occurrences from the
+    /// running total is worse than no rate limiting at all, because the line
+    /// that does get emitted would then understate a runaway and read as a
+    /// single stray event.
+    #[test]
+    fn the_log_flood_gate_thins_logging_on_a_doubling_cadence() {
+        let gate = LogFloodGate::new();
+        let admitted: Vec<u64> = (0..16).filter_map(|_| gate.admit()).collect();
+        assert_eq!(
+            vec![1, 2, 4, 8, 16],
+            admitted,
+            "the gate must admit the 1st, 2nd, 4th, 8th ... occurrence, so a \
+             runaway stays visible without being logged per-occurrence"
+        );
+        assert_eq!(
+            16,
+            gate.occurrences.load(Ordering::Relaxed),
+            "every occurrence must be counted even when it is not logged — the \
+             total is what the emitted line reports"
+        );
+
+        // The first occurrence is never suppressed. A gate that could swallow
+        // it would make a one-off event invisible rather than merely thinned.
+        let fresh = LogFloodGate::new();
+        assert_eq!(Some(1), fresh.admit());
     }
 
     #[test]
@@ -825,6 +909,77 @@ mod tests {
         assert!(!ring.contracts_needing_renewal().contains(&key));
     }
 
+    /// [`drop_subscription`] must be narrow in BOTH directions: one delegate,
+    /// one contract.
+    ///
+    /// Its only caller is the notification-channel-closed arm
+    /// (`executor/runtime/executor_impl.rs`), which clears the hook for one
+    /// contract on one node and must drop exactly the matching demand. Widening
+    /// it in either direction is a silent bug the caller cannot see: too wide by
+    /// delegate steals another delegate's pin, too wide by contract retires pins
+    /// whose hooks are still installed — demand and hook disagreeing, which is
+    /// the state this module exists to prevent.
+    ///
+    /// Everything else here exercises [`drop_delegate_demand`], so without this
+    /// test `drop_subscription` had no behavioural coverage at all and only the
+    /// source-scrape pin below would have noticed it going wrong.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_one_contract_leaves_the_delegates_other_pins_intact() {
+        let fixture = seam_fixture("delegate-demand-4669-drop-one-contract").await;
+        let op_manager = fixture.op_manager.clone();
+        let ring = &op_manager.ring;
+
+        let dropped = contract_key(81);
+        let kept = contract_key(82);
+        for key in [dropped, kept] {
+            let _ = ring.host_contract(
+                key,
+                121,
+                crate::ring::AccessType::Put,
+                crate::ring::HostingCause::Other,
+            );
+        }
+
+        let delegate = delegate_key(83);
+        // A second delegate pinning the SAME contract, so the assertion below
+        // distinguishes "dropped one delegate's pin" from "cleared the contract".
+        let bystander = delegate_key(84);
+        register_subscription(&op_manager, &delegate, &dropped);
+        register_subscription(&op_manager, &delegate, &kept);
+        register_subscription(&op_manager, &bystander, &dropped);
+        assert_eq!((2, 0), ring.local_and_downstream_counts(&dropped));
+
+        drop_subscription(&op_manager, &delegate, &dropped);
+
+        assert_eq!(
+            (1, 0),
+            ring.local_and_downstream_counts(&dropped),
+            "dropping one delegate's demand must not clear the contract's other \
+             subscribers — the channel-closed arm clears the hook map for the \
+             contract, but demand is per-(delegate, contract)"
+        );
+        assert!(ring.contract_in_use(&dropped));
+        assert_eq!(
+            (1, 0),
+            ring.local_and_downstream_counts(&kept),
+            "the SAME delegate's pin on a DIFFERENT contract must survive — \
+             this is the whole difference between `drop_subscription` and \
+             `drop_delegate_demand`, and a widened implementation would retire \
+             pins whose notification hooks are still installed"
+        );
+        assert!(ring.contract_in_use(&kept));
+
+        // The last holder releasing it must still collapse the pin, or a
+        // per-contract drop would leak demand the whole-delegate one does not.
+        drop_subscription(&op_manager, &bystander, &dropped);
+        assert!(!ring.contract_in_use(&dropped));
+        assert!(!ring.contracts_needing_renewal().contains(&dropped));
+        assert!(
+            ring.contract_in_use(&kept),
+            "collapsing one contract must not disturb an unrelated pin"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn unregistering_a_delegate_drops_every_contract_it_pinned() {
         let fixture = seam_fixture("delegate-demand-4669-unregister").await;
@@ -1069,6 +1224,151 @@ mod tests {
              well as its notification hooks. There is no unsubscribe (#2830) \
              and `DELEGATE_SUBSCRIPTIONS` is in-memory, so a demand record left \
              behind here is a pin nothing can release for the life of the process."
+        );
+    }
+
+    /// EVERY `warn!` on the delegate-driven subscribe path must be rate-limited.
+    ///
+    /// This pin exists because the invariant was already stated in this file and
+    /// already violated: the not-hosting branch carried a comment naming #4238
+    /// ("an unrated per-occurrence WARN on a delegate-driven path is how #4238
+    /// flooded gateways") while the cap branch three dozen lines below logged
+    /// per-occurrence. A rule written in a comment beside one of its two call
+    /// sites is not enforced, and the next refusal branch added here has no
+    /// compile-time reason to route through the gate either.
+    ///
+    /// Scrapes the PRODUCTION function only, so the literals in this test module
+    /// cannot satisfy it (`.claude/rules/testing.md`: a pin that finds its own
+    /// source is measuring nothing).
+    #[test]
+    fn every_refusal_warn_on_the_subscribe_path_is_rate_limited() {
+        const SOURCE: &str = include_str!("delegate_demand.rs");
+
+        let start = SOURCE
+            .find("pub(crate) fn register_subscription(")
+            .expect("register_subscription must still exist");
+        let rel_end = SOURCE[start..]
+            .find("\n}\n")
+            .expect("register_subscription must still be a closed top-level fn");
+        let body = &SOURCE[start..start + rel_end + "\n}".len()];
+
+        // Window guards, checked separately from the assertion that uses the
+        // window. Brace balance catches a delimiter that stopped landing on the
+        // fn's closing brace; the two branch markers prove the window still
+        // spans BOTH refusal paths, which a prefix truncation would not.
+        // If either fires, widen the delimiter; do NOT delete these checks.
+        assert_eq!(
+            body.matches('{').count(),
+            body.matches('}').count(),
+            "the scraped `register_subscription` window has unbalanced braces — \
+             the delimiter no longer lands on its closing brace. Widen it; do \
+             NOT delete this check."
+        );
+        for marker in ["is_hosting_contract(", "MAX_SUBSCRIPTIONS_PER_CLIENT"] {
+            assert!(
+                body.contains(marker),
+                "the scraped window no longer contains `{marker}`, so it does \
+                 not span both refusal branches. Widen it; do NOT delete this \
+                 check — the count comparison below would pass vacuously."
+            );
+        }
+
+        let warns = body.matches("tracing::warn!(").count();
+        assert!(
+            warns >= 2,
+            "expected at least the two refusal warns in \
+             `register_subscription`, found {warns} — if a branch was removed, \
+             update this pin deliberately rather than letting it decay"
+        );
+        assert_eq!(
+            warns,
+            body.matches(".admit()").count(),
+            "every `warn!` in `register_subscription` must sit behind a \
+             `LogFloodGate::admit()`. A delegate controls how often it reaches \
+             either refusal branch, so an unrated one is a log-flood surface it \
+             drives (#4238). Route the new branch through a gate; do not relax \
+             this pin."
+        );
+        assert_eq!(
+            warns,
+            body.matches("LogFloodGate::new()").count(),
+            "each rate-limited warn needs its OWN `LogFloodGate` static — a \
+             shared counter would let a flood of one branch suppress the FIRST \
+             occurrence of another, which is the one occurrence that must \
+             always be logged"
+        );
+    }
+
+    /// The notification-channel-closed arm must clear the hook and the demand
+    /// TOGETHER.
+    ///
+    /// This is the sibling of the `UnregisterDelegate` pin above, and it was
+    /// missing: `drop_subscription`'s only caller had no guard at all, so
+    /// deleting the call left every test green. The arm's whole purpose is to
+    /// keep two records in step — clearing `DELEGATE_SUBSCRIPTIONS` without the
+    /// demand is the original #4669 defect (a hook with no pin); dropping the
+    /// demand without the hook is an unconsumable pin. Either half alone is
+    /// worse than neither, which is why both are asserted here rather than only
+    /// the newly-added one.
+    #[test]
+    fn the_closed_notification_channel_arm_drops_hook_and_demand_together() {
+        const SOURCE: &str = include_str!("executor/runtime/executor_impl.rs");
+
+        // Bound to the FUNCTION first. A bare file-wide `contains` would stay
+        // green if the call were moved to an unrelated arm, or left in dead
+        // code — the same trap the `UnregisterDelegate` pin above avoids.
+        let f_start = SOURCE
+            .find("fn send_delegate_contract_notifications(")
+            .expect("the delegate-notification fan-out must still exist");
+        let rel_end = SOURCE[f_start..]
+            .find("\n    }\n")
+            .expect("send_delegate_contract_notifications must still be a closed fn body");
+        let body = &SOURCE[f_start..f_start + rel_end + "\n    }".len()];
+
+        // Validate the WINDOW, separately from the assertions that use it
+        // (`.claude/rules/testing.md`). A window truncated to nothing makes
+        // every `contains` below fail rather than pass, but a window truncated
+        // to a PREFIX would silently move the boundary past the arm while the
+        // `Closed` search below still succeeded on a stale earlier match. Two
+        // independent checks, because they catch different truncations:
+        //
+        //  1. Brace balance — a complete fn body has it, a partial one does not.
+        //  2. The `Full` arm, which sits between the fn header and the `Closed`
+        //     arm, so its presence proves the window spans the region this pin
+        //     is actually about.
+        //
+        // If either fires, WIDEN the delimiter; do NOT delete the check.
+        assert_eq!(
+            body.matches('{').count(),
+            body.matches('}').count(),
+            "the scraped `send_delegate_contract_notifications` window has \
+             unbalanced braces, so the delimiter no longer lands on the fn's \
+             closing brace. Widen it; do NOT delete this check."
+        );
+        assert!(
+            body.contains("TrySendError::Full("),
+            "the scraped window no longer spans the `Full` arm, so it has been \
+             truncated above the `Closed` arm this pin is about. Widen it; do \
+             NOT delete this check."
+        );
+
+        let closed = body
+            .find("TrySendError::Closed(")
+            .expect("the channel-closed arm must still exist");
+        let arm = &body[closed..];
+
+        assert!(
+            arm.contains("DELEGATE_SUBSCRIPTIONS.remove("),
+            "the channel-closed arm must still clear the notification hook — \
+             dropping demand while leaving the hook installed pins a contract \
+             whose updates nothing can consume"
+        );
+        assert!(
+            arm.contains("delegate_demand::drop_subscription("),
+            "the channel-closed arm must ALSO drop the matching demand (#4669). \
+             It clears `DELEGATE_SUBSCRIPTIONS` for this contract, and a demand \
+             record left behind is a pin with no hook — there is no unsubscribe \
+             (#2830), so nothing releases it until the process exits."
         );
     }
 }
