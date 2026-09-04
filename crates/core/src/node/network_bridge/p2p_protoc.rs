@@ -2935,6 +2935,36 @@ impl P2pConnManager {
                                 )
                                 .await;
                             }
+                            NodeEvent::V2DelegateStateChanged { key } => {
+                                // Clear the coalescing marker BEFORE the read.
+                                // A write landing during the read then queues a
+                                // fresh event instead of being folded into this
+                                // one, which is already past the point where it
+                                // could observe it. Clearing after the read
+                                // would drop that write's fan-out.
+                                op_manager.clear_v2_delegate_broadcast_pending(&key);
+                                // The event carries no state; read what is
+                                // stored now. A contract we no longer hold
+                                // reads as None and is simply not broadcast.
+                                if let Some(new_state) =
+                                    op_manager.read_current_contract_state(&key).await
+                                {
+                                    ctx.handle_broadcast_state_change(
+                                        &op_manager,
+                                        key,
+                                        new_state,
+                                        false,
+                                        false,
+                                    )
+                                    .await;
+                                } else {
+                                    tracing::debug!(
+                                        contract = %key,
+                                        "V2 delegate broadcast drained but no local state to \
+                                         send; skipping fan-out"
+                                    );
+                                }
+                            }
                             NodeEvent::SyncStateToPeer {
                                 key,
                                 new_state,

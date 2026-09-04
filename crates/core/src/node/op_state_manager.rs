@@ -216,6 +216,21 @@ pub(crate) struct OpManager {
     /// network instead of landing locally-hosted only (issue #4359).
     pub(crate) pending_broadcasts:
         Arc<crate::operations::update::pending_broadcast::PendingBroadcastStore>,
+    /// Contracts with a V2 delegate state-change broadcast already queued and
+    /// not yet drained.
+    ///
+    /// The queued event names the contract and carries no state; the handler
+    /// re-reads the current stored state when it drains. So the queue holds a
+    /// contract id per pending broadcast rather than a `WrappedState`, and its
+    /// cost does not scale with state size. This set is what makes the queued
+    /// broadcasts coalesce: while one is outstanding for a contract, further
+    /// writes to that contract add nothing to the queue, and the single drain
+    /// broadcasts whatever is stored by the time it runs.
+    ///
+    /// Membership is cleared by the handler BEFORE it re-reads, so a write
+    /// landing during the read queues a fresh event rather than being folded
+    /// into one already in flight.
+    pub(crate) v2_delegate_broadcast_pending: Arc<dashmap::DashSet<ContractInstanceId>>,
     /// Request router for client request deduplication.
     ///
     /// This is initialized lazily from `client_event_handling` because the router is only
@@ -344,6 +359,7 @@ impl Clone for OpManager {
             broadcast_coverage: self.broadcast_coverage.clone(),
             update_propagation_stats: self.update_propagation_stats.clone(),
             pending_broadcasts: self.pending_broadcasts.clone(),
+            v2_delegate_broadcast_pending: self.v2_delegate_broadcast_pending.clone(),
             request_router: self.request_router.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             stream_progress_registry: self.stream_progress_registry.clone(),
@@ -558,6 +574,7 @@ impl OpManager {
             pending_broadcasts: Arc::new(
                 crate::operations::update::pending_broadcast::PendingBroadcastStore::new(),
             ),
+            v2_delegate_broadcast_pending: Arc::new(dashmap::DashSet::new()),
             request_router,
             orphan_stream_registry,
             stream_progress_registry: Arc::new(StreamProgressRegistry::new()),
@@ -943,10 +960,59 @@ impl OpManager {
         .await;
     }
 
+    /// Queue a V2 delegate state-change broadcast for `key`, coalescing with
+    /// any broadcast already queued for the same contract.
+    ///
+    /// Returns `true` when an event was actually enqueued. A `false` return is
+    /// the normal coalesced case — a broadcast for this contract is already
+    /// outstanding and will pick up this write when it drains, because it
+    /// re-reads the stored state rather than carrying a snapshot.
+    ///
+    /// Synchronous and non-blocking on purpose: the only caller runs inside a
+    /// WASM host call on the V2 delegate write path, where blocking would be
+    /// worse than a dropped broadcast. A drop is recoverable — the next write
+    /// or a summary-mismatch resync re-announces the state.
+    pub(crate) fn queue_v2_delegate_broadcast(&self, key: ContractKey) -> bool {
+        // `insert` returns false when the id was already present, i.e. a
+        // broadcast is queued and undrained: coalesce into it and enqueue
+        // nothing.
+        if !self.v2_delegate_broadcast_pending.insert(*key.id()) {
+            return false;
+        }
+        if let Err(err) =
+            self.try_notify_node_event(crate::message::NodeEvent::V2DelegateStateChanged { key })
+        {
+            // Release the marker. Leaving it set after a failed enqueue would
+            // latch this contract permanently: every later write would see a
+            // broadcast "already queued" that no handler will ever drain, and
+            // the contract would silently stop propagating for the process
+            // lifetime.
+            self.v2_delegate_broadcast_pending.remove(key.id());
+            tracing::debug!(
+                contract = %key,
+                error = %err,
+                "Failed to queue V2 delegate state-change broadcast (best-effort)"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Clear the queued-broadcast marker for `key`, called by the handler when
+    /// it begins draining. See [`Self::queue_v2_delegate_broadcast`].
+    pub(crate) fn clear_v2_delegate_broadcast_pending(&self, key: &ContractKey) {
+        self.v2_delegate_broadcast_pending.remove(key.id());
+    }
+
     /// Read the current local state for `key` from the contract handler, or
     /// `None` if we don't host it / the read fails. Used by the #4359 deferred
-    /// re-broadcast flush to avoid re-emitting superseded give-up-time bytes.
-    async fn read_current_contract_state(&self, key: &ContractKey) -> Option<WrappedState> {
+    /// re-broadcast flush to avoid re-emitting superseded give-up-time bytes,
+    /// and by the V2 delegate broadcast drain, which carries no state of its
+    /// own and reads what is stored at drain time.
+    pub(crate) async fn read_current_contract_state(
+        &self,
+        key: &ContractKey,
+    ) -> Option<WrappedState> {
         use crate::contract::ContractHandlerEvent;
         match self
             .notify_contract_handler(ContractHandlerEvent::GetQuery {

@@ -505,26 +505,30 @@ pub(super) fn v2_delegate_state_write_callback(
                 );
                 return;
             }
-            if let Err(err) =
-                op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
-                    key: *key,
-                    new_state: new_state.clone(),
-                    is_retry: false,
-                    is_reemit: false,
-                })
-            {
-                // Best-effort by design (#4145 / #4231): a missed broadcast
-                // heals via the next UPDATE or a summary-mismatch
-                // SyncStateToPeer round. The rate-limited `notify_node_event:
-                // Notification channel full for too long` ERROR in
-                // op_state_manager.rs is the sustained-back-pressure alert.
-                tracing::debug!(
-                    contract = %key,
-                    error = %err,
-                    "Failed to broadcast V2 delegate state change to network peers \
-                     (best-effort)"
-                );
-            }
+            // Queue the fan-out rather than enqueueing the state itself.
+            //
+            // `NodeEvent::V2DelegateStateChanged` names the contract and
+            // carries no state, and the handler re-reads what is stored when
+            // it drains. Two reasons this is the right shape here, both of
+            // which the state-carrying `BroadcastStateChange` cannot give:
+            //
+            // 1. The event-loop notification channel is bounded by message
+            //    COUNT (`DEFAULT_EVENT_LOOP_CHANNEL_CAPACITY`), and a
+            //    `WrappedState` runs to `MAX_STATE_SIZE`. Queueing ids keeps
+            //    the queue's retained bytes bounded by that count rather than
+            //    by count times the largest state.
+            // 2. Successive writes to one contract coalesce into the single
+            //    queued broadcast, which then carries the NEWEST state rather
+            //    than the oldest — strictly better than the snapshot a
+            //    state-carrying event would have frozen at emit time.
+            //
+            // Best-effort by design (#4145 / #4231): a dropped queue attempt
+            // heals via the next write or a summary-mismatch SyncStateToPeer
+            // round. `queue_v2_delegate_broadcast` logs the drop and releases
+            // its own marker; the rate-limited `notify_node_event:
+            // Notification channel full for too long` ERROR in
+            // op_state_manager.rs is the sustained-back-pressure alert.
+            op_manager.queue_v2_delegate_broadcast(*key);
         },
     )
 }
@@ -3148,18 +3152,27 @@ mod state_write_attribution_pin_tests {
         for required in [
             "cache_invalidator.invalidate(",
             ".commit_state_write(",
-            "NodeEvent::BroadcastStateChange",
+            // The propagation leg. It queues a key-only event rather than
+            // enqueueing the state; see `queue_v2_delegate_broadcast`.
+            "queue_v2_delegate_broadcast(",
             "is_contract_broken(",
         ] {
+            // `count_call_sites`, not `body.contains`: the callback carries a
+            // long comment block that names each of these symbols, and a raw
+            // substring search is satisfied by the COMMENT alone. That is the
+            // vacuous-pin shape `.claude/rules/bug-prevention-patterns.md`
+            // warns about — the pin would keep passing after the call it
+            // guards was deleted, as long as the prose survived.
             assert!(
-                body.contains(required),
-                "the V2 delegate write callback must invoke `{required}`. \
-                 Dropping the invalidation serves stale bytes and stale \
-                 summaries; dropping commit_state_write re-opens the \
-                 EvictContract race and undercounts the meter; dropping \
-                 BroadcastStateChange is #5479 (the write returns success \
-                 and the network never learns of it); dropping the \
-                 broken-contract check re-engages a suppressed storm."
+                count_call_sites(body, required) >= 1,
+                "the V2 delegate write callback must invoke `{required}` as \
+                 real code (not merely mention it in a comment). Dropping the \
+                 invalidation serves stale bytes and stale summaries; dropping \
+                 commit_state_write re-opens the EvictContract race and \
+                 undercounts the meter; dropping the broadcast queue is #5479 \
+                 (the write returns success and the network never learns of \
+                 it); dropping the broken-contract check re-engages a \
+                 suppressed storm."
             );
         }
     }
