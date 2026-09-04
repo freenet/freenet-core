@@ -174,17 +174,36 @@ pub(super) const PARK_TTL: Duration = Duration::from_secs(90);
 /// the TTL stays what it is meant to be — unreachable in practice.
 pub(super) const PARK_WORK_BUDGET: Duration = Duration::from_secs(75);
 
-/// A delegate request that arrived while its delegate was parked.
+/// A delegate invocation that arrived while its delegate was parked.
 ///
 /// Held here rather than requeued into the fair queue: every delegate request
 /// shares the single `QueueKey::Default` lane (`fair_queue.rs`), so a
 /// pop-see-parked-repush cycle would busy-spin the loop.
-pub(super) struct PendingRequest {
-    pub id: EventId,
-    pub req: DelegateRequest<'static>,
-    pub origin_contract: Option<ContractInstanceId>,
-    pub connection_scope: ConnectionScope,
-    pub user_context: Option<UserSecretContext>,
+///
+/// Two variants because the two entry points differ in how their result is
+/// delivered, and a queued run must resume through the SAME path it would have
+/// taken had it not been queued. Collapsing them would route a notification's
+/// residual messages to a client responder that does not exist.
+pub(super) enum PendingRun {
+    /// Client-driven (`ContractHandlerEvent::DelegateRequest`). Answers `id`.
+    Client {
+        id: EventId,
+        req: DelegateRequest<'static>,
+        origin_contract: Option<ContractInstanceId>,
+        connection_scope: ConnectionScope,
+        user_context: Option<UserSecretContext>,
+    },
+    /// Contract-notification-driven. No client; residual `ApplicationMessage`s
+    /// fan out to the apps registered with the delegate.
+    ///
+    /// Queued rather than dropped, but note the delivered state may be STALE by
+    /// the time it drains — up to `PARK_TTL`. That is within the notification
+    /// pipeline's documented contract, which is explicitly best-effort and
+    /// lossy (`send_delegate_contract_notifications`: "Delegates that require
+    /// guaranteed delivery should poll contract state periodically"). Running
+    /// it immediately is NOT an option: it would clobber the parked
+    /// continuation's context, which is the whole reason for the exclusion.
+    Notification { req: DelegateRequest<'static> },
 }
 
 /// Where a resumed run's residual `ApplicationMessage`s must go.
@@ -232,7 +251,7 @@ pub(super) struct Continuation {
 struct ParkEntry {
     continuation: Continuation,
     parked_at: tokio::time::Instant,
-    pending: VecDeque<PendingRequest>,
+    pending: VecDeque<PendingRun>,
 }
 
 /// Why a park ended.
@@ -389,7 +408,7 @@ pub(super) enum QueueOutcome {
     Queued,
     /// The delegate's queue is full. The caller must answer this request with a
     /// visible error rather than dropping it.
-    Rejected(Box<PendingRequest>),
+    Rejected(Box<PendingRun>),
 }
 
 /// Loop-owned per-delegate park state.
@@ -457,7 +476,7 @@ impl DelegateParkCtx {
     /// Caller must have checked [`is_parked`](Self::is_parked); queueing for an
     /// unparked delegate is a caller bug and is reported back as a rejection so
     /// the request is still answered.
-    pub(super) fn queue_pending(&mut self, key: &DelegateKey, req: PendingRequest) -> QueueOutcome {
+    pub(super) fn queue_pending(&mut self, key: &DelegateKey, req: PendingRun) -> QueueOutcome {
         let Some(entry) = self.parked.get_mut(key) else {
             return QueueOutcome::Rejected(Box::new(req));
         };
@@ -505,10 +524,26 @@ impl DelegateParkCtx {
     pub(super) fn take(
         &mut self,
         key: &DelegateKey,
-    ) -> Option<(Continuation, VecDeque<PendingRequest>)> {
+    ) -> Option<(Continuation, VecDeque<PendingRun>)> {
         self.parked
             .remove(key)
             .map(|entry| (entry.continuation, entry.pending))
+    }
+
+    /// The earliest instant at which some park will reach [`PARK_TTL`], or
+    /// `None` when nothing is parked.
+    ///
+    /// The loop uses this to arm a timer in its idle `select!`. Without it the
+    /// backstop sweep only runs when some UNRELATED event happens to wake the
+    /// loop, so on a quiet node — the normal state for a background peer, and
+    /// exactly the condition under which a prompt goes unanswered because no
+    /// dashboard tab is open — a wedged park would never be swept. A backstop
+    /// whose firing depends on other traffic is not a backstop.
+    pub(super) fn next_sweep_deadline(&self) -> Option<tokio::time::Instant> {
+        self.parked
+            .values()
+            .map(|entry| entry.parked_at + PARK_TTL)
+            .min()
     }
 
     /// Keys whose park has outlived [`PARK_TTL`].
@@ -550,8 +585,8 @@ mod tests {
         }
     }
 
-    fn pending(byte: u8) -> PendingRequest {
-        PendingRequest {
+    fn pending(byte: u8) -> PendingRun {
+        PendingRun::Client {
             id: EventId { id: byte as u64 },
             req: DelegateRequest::ApplicationMessages {
                 key: key(byte),

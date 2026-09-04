@@ -610,10 +610,42 @@ where
                     freenet_stdlib::prelude::State::from(state.as_ref().to_vec()),
                 );
             }
-            contract_handler
+            // DEFERRABLE, not the plain upsert (#5544 B4).
+            //
+            // This runs from `handle_delegate_resume`, ON the serial loop. If
+            // the contract asks for a SECOND or DIFFERENT related contract now
+            // that the first set is injected, the plain `upsert_contract_state`
+            // would do that network GET inline and re-create the exact
+            // node-wide stall this change removes.
+            //
+            // A repeated `DeferRelated` becomes `MissingRelated` rather than
+            // deferring again: the same depth=1 / one-deferral cap
+            // `handle_deferred_resume` applies on the client path, and the
+            // pattern `contracts.md` requires for work on the serial loop.
+            // Without the cap a contract could defer indefinitely and hold this
+            // delegate's exclusion open.
+            let outcome = contract_handler
                 .executor()
-                .upsert_contract_state(pending.key, pending.update, related_contracts, pending.code)
-                .await
+                .upsert_contract_state_deferrable(
+                    pending.key,
+                    pending.update,
+                    related_contracts,
+                    pending.code,
+                )
+                .await;
+            match outcome {
+                Ok(UpsertOutcome::Completed(r)) => Ok(r),
+                Ok(UpsertOutcome::DeferRelated(missing)) => {
+                    let id = missing.first().copied().unwrap_or(contract_id);
+                    tracing::warn!(
+                        contract = %contract_id,
+                        "Resumed delegate upsert requested a further related \
+                         contract; refusing to defer twice (depth=1 cap)"
+                    );
+                    Err(ExecutorError::missing_related(id))
+                }
+                Err(err) => Err(err),
+            }
         }
         // The fetch failed or timed out: surface it to the delegate rather than
         // retrying, matching the all-or-nothing semantics of the inline path.
@@ -735,6 +767,10 @@ async fn handle_delegate_with_contract_requests<CH, P>(
     delegate_key: &DelegateKey,
     prompter: &std::sync::Arc<P>,
     mut parking: Option<ParkingCtx<'_>>,
+    // Messages this delegate emitted BEFORE an earlier park, carried in so a
+    // round-trip that parks more than once still yields one complete response.
+    // `Vec::new()` for a fresh run; `continuation.accumulated` for a resume.
+    seed_accumulated: Vec<OutboundDelegateMsg>,
 ) -> DelegateRunOutcome
 where
     CH: ContractHandler + Send + 'static,
@@ -778,7 +814,7 @@ where
     let current_params = initial_params;
     let mut iterations = 0;
     // Accumulate non-contract-request messages across iterations
-    let mut accumulated_messages: Vec<OutboundDelegateMsg> = Vec::new();
+    let mut accumulated_messages: Vec<OutboundDelegateMsg> = seed_accumulated;
 
     loop {
         iterations += 1;
@@ -1287,6 +1323,46 @@ where
                     params: Parameters::from(Vec::new()),
                     inbound,
                 };
+                // PER-DELEGATE EXCLUSION, second door (#5544 B2).
+                //
+                // This is the SECOND call site of `execute_delegate_request`,
+                // and it invokes the TARGET delegate, not the calling one — so
+                // `dispatch_delegate_request`'s check upstream says nothing
+                // about it. Delivering here while the target is parked would
+                // run its `process()` mid-round-trip and clobber the parked
+                // continuation's `DelegateContextCache` entry: the exact
+                // corruption the exclusion exists to prevent, reached through a
+                // different door.
+                //
+                // DROPPED rather than queued, deliberately. The hop is already
+                // single-hop, fire-and-forget, and entirely suppressed on
+                // notification-driven runs, so callers cannot rely on delivery.
+                // Queueing it would mean replaying an ATTESTED caller identity
+                // (`Some(delegate_key)`, the control that replaced the deleted
+                // registration-record refusal — GHSA-824h-7x5x-wfmf) at an
+                // arbitrarily later time under a scope captured earlier, and
+                // deferring an attestation is not something to introduce as a
+                // side effect of a stall fix. Losing a fire-and-forget message
+                // beats corrupting the target's state.
+                //
+                // `info!`, not `debug!`: the crate sets `release_max_level_info`
+                // so a `debug!` compiles out of shipped binaries and a delegate
+                // author would have no way to see why their message vanished —
+                // the same reasoning as the suppression log below.
+                if parking
+                    .as_ref()
+                    .is_some_and(|ctx| ctx.park.is_parked(&target_key))
+                {
+                    tracing::info!(
+                        from_delegate = %delegate_key,
+                        target_delegate = %target_key,
+                        "Dropped an inter-delegate message: the target is parked \
+                         mid-round-trip and running it now would clobber its \
+                         parked continuation (#5544)"
+                    );
+                    continue;
+                }
+
                 match contract_handler
                     .executor()
                     // Inter-delegate hop: `user_context = None`. A
@@ -1848,7 +1924,19 @@ where
         }
 
         // Fair queue is empty. Block-wait for a new event, a resumed deferral,
-        // or a delegate notification.
+        // a delegate notification — or the park backstop deadline.
+        //
+        // That last arm is load-bearing (#5544 B6). Without it the sweep at the
+        // top of this loop only runs when some UNRELATED event happens to wake
+        // the select, so on a quiet node a wedged park would be swept late or
+        // never — and a quiet node is the normal state for a background peer,
+        // and precisely the condition under which a prompt goes unanswered
+        // because no dashboard tab is open. A backstop whose firing depends on
+        // other traffic is not a backstop.
+        //
+        // `pending()` when nothing is parked, so an idle node with no parks
+        // still blocks indefinitely rather than spinning on a timer.
+        let park_deadline = park_ctx.next_sweep_deadline();
         tokio::select! {
             result = contract_handler.channel().recv_from_sender() => {
                 let (id, event, priority) = result?;
@@ -1866,6 +1954,15 @@ where
             }
             Some(export_resume) = export_resume_rx.recv() => {
                 handle_export_resume(&mut contract_handler, export_resume).await;
+            }
+            () = async {
+                match park_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Wake only; the sweep itself runs at the top of the next
+                // iteration, so there is exactly one sweep implementation.
             }
             Some(delegate_resume) = delegate_resume_rx.recv() => {
                 handle_delegate_resume(
@@ -2549,7 +2646,7 @@ async fn handle_delegate_notification<CH, P>(
     contract_handler: &mut CH,
     notification: executor::DelegateNotification,
     prompter: &std::sync::Arc<P>,
-    park: Option<&mut delegate_park::DelegateParkCtx>,
+    mut park: Option<&mut delegate_park::DelegateParkCtx>,
 ) where
     CH: ContractHandler + Send + 'static,
     P: UserInputPrompter + 'static,
@@ -2609,6 +2706,57 @@ async fn handle_delegate_notification<CH, P>(
         inbound,
     };
 
+    // PER-DELEGATE EXCLUSION, first door (#5544 B1).
+    //
+    // A notification is a THIRD way into a delegate, alongside the client
+    // request and the inter-delegate hop, and it is driven by a contract's
+    // state changing rather than by anything this delegate did. So a delegate
+    // that is parked mid-round-trip — waiting up to `USER_INPUT_TIMEOUT` on a
+    // permission prompt — AND subscribed to a contract can be re-entered here
+    // the moment that contract changes, clobbering the parked continuation's
+    // `DelegateContextCache` entry.
+    //
+    // That combination is not exotic: holding a durable subscription while
+    // prompting the user is the shape the delegate epic is heading for, and a
+    // V2 delegate registers its subscription with `ctx.subscribe_contract()`.
+    //
+    // Note this hazard is about INTERLEAVING, not simultaneity: this path also
+    // runs on the serial loop, so nothing runs concurrently, and the global
+    // one-`process()`-at-a-time property does NOT save us. A serially executed
+    // notification landing INSIDE the park window corrupts the continuation
+    // just as thoroughly as a concurrent one would.
+    if let Some(park) = park.as_deref_mut()
+        && park.is_parked(&delegate_key)
+    {
+        match park.queue_pending(
+            &delegate_key,
+            delegate_park::PendingRun::Notification { req },
+        ) {
+            delegate_park::QueueOutcome::Queued => {
+                tracing::debug!(
+                    delegate = %delegate_key,
+                    contract = %contract_id,
+                    "Delegate is parked; queued this notification behind it"
+                );
+            }
+            delegate_park::QueueOutcome::Rejected(_) => {
+                // The pending queue is full. Dropping is within the
+                // notification pipeline's documented best-effort contract (see
+                // `send_delegate_contract_notifications`), and running it would
+                // corrupt the parked continuation. `info!` so it is visible in
+                // shipped binaries — a silently vanishing notification is the
+                // hardest kind of bug to chase from a user report.
+                tracing::info!(
+                    delegate = %delegate_key,
+                    contract = %contract_id,
+                    "Dropped a contract notification: the delegate is parked and \
+                     its pending queue is full (#5544)"
+                );
+            }
+        }
+        return;
+    }
+
     // A notification-driven run has no client responder to carry; the slot
     // exists only to satisfy the shared `ParkingCtx` shape.
     let mut no_responder = None;
@@ -2641,6 +2789,7 @@ async fn handle_delegate_notification<CH, P>(
             delivery: delegate_park::Delivery::Apps,
             carried_responder: &mut no_responder,
         }),
+        Vec::new(),
     )
     .await;
 
@@ -2798,6 +2947,7 @@ async fn dispatch_delegate_request<CH, P>(
             &delegate_key,
             prompter,
             None,
+            Vec::new(),
         )
         .await;
         let response = match outcome {
@@ -2824,7 +2974,7 @@ async fn dispatch_delegate_request<CH, P>(
     // the parked continuation and it would resume reading the wrong bytes.
     // Queue instead, and drain on resume.
     if park.is_parked(&delegate_key) {
-        let pending = delegate_park::PendingRequest {
+        let pending = delegate_park::PendingRun::Client {
             id,
             req,
             origin_contract,
@@ -2839,9 +2989,32 @@ async fn dispatch_delegate_request<CH, P>(
                 );
             }
             delegate_park::QueueOutcome::Rejected(pending) => {
-                // Answer rather than drop: a silently dropped request hangs
-                // that client forever.
-                contract_handler.channel().drop_waiting_response(pending.id);
+                // A REFUSAL, and it must not render as a successful empty run.
+                //
+                // `DelegateResponse(Vec::new())` is what a delegate that ran and
+                // said nothing returns, so answering with it would report
+                // success for work `process()` never performed, and log as
+                // executed. Drop the responder instead — the client's oneshot
+                // closes and it surfaces an error, the same shape the fair
+                // queue's own rejection path produces. (code-style.md: "a
+                // refusal that is not counted renders as a clean zero".)
+                let delegate_park::PendingRun::Client { id, .. } = *pending else {
+                    // A notification never reaches this arm — `queue_pending`
+                    // only returns `Rejected` for what it was handed, and the
+                    // notification path handles its own rejection.
+                    tracing::error!(
+                        delegate = %delegate_key,
+                        "non-client run rejected on the client queue path"
+                    );
+                    return;
+                };
+                tracing::warn!(
+                    delegate_key = %delegate_key,
+                    "Refused a delegate request: the delegate is parked and its \
+                     pending queue is full. Dropping the responder so the client \
+                     sees an error rather than a successful empty response (#5544)"
+                );
+                contract_handler.channel().drop_waiting_response(id);
             }
         }
         return;
@@ -2865,6 +3038,7 @@ async fn dispatch_delegate_request<CH, P>(
             delivery: delegate_park::Delivery::Client,
             carried_responder: &mut carried_responder,
         }),
+        Vec::new(),
     )
     .await;
 
@@ -2974,6 +3148,7 @@ async fn handle_delegate_resume<CH, P>(
     all_inbound.extend(inbound);
 
     let mut carried_responder = responder;
+    #[allow(clippy::if_not_else)]
     let outcome = if all_inbound.is_empty() {
         // Nothing to feed back — a dropped park that had computed no responses
         // before it. Do NOT re-enter the delegate with an empty inbound; that
@@ -2985,7 +3160,7 @@ async fn handle_delegate_resume<CH, P>(
             params,
             inbound: all_inbound,
         };
-        let outcome = handle_delegate_with_contract_requests(
+        handle_delegate_with_contract_requests(
             contract_handler,
             req,
             origin_contract.as_ref(),
@@ -2999,19 +3174,14 @@ async fn handle_delegate_resume<CH, P>(
                 delivery,
                 carried_responder: &mut carried_responder,
             }),
+            // SEED, not append-afterwards (#5544 B3). What the delegate emitted
+            // before the earlier park has to be inside the run, so that if this
+            // run parks AGAIN it lands in the new continuation. Appending to the
+            // `Completed` arm only — as this did — silently dropped every
+            // pre-park message on the second park.
+            accumulated,
         )
-        .await;
-        match outcome {
-            // Carry forward what the delegate produced BEFORE it parked, so a
-            // multi-park round-trip still yields one complete response.
-            DelegateRunOutcome::Completed(mut msgs) => {
-                let mut all = accumulated;
-                all.append(&mut msgs);
-                DelegateRunOutcome::Completed(all)
-            }
-            DelegateRunOutcome::Parked => DelegateRunOutcome::Parked,
-            DelegateRunOutcome::Failed(err) => DelegateRunOutcome::Failed(err),
-        }
+        .await
     };
 
     match outcome {
@@ -3060,17 +3230,107 @@ async fn handle_delegate_resume<CH, P>(
     // every item: the resumed run (or an earlier drained request) may have
     // parked this delegate again, and exclusion must still hold.
     for queued in pending {
-        dispatch_delegate_request(
-            contract_handler,
-            Some(&mut *park),
-            prompter,
-            queued.id,
-            queued.req,
-            queued.origin_contract,
-            queued.connection_scope,
-            queued.user_context,
-        )
-        .await;
+        match queued {
+            delegate_park::PendingRun::Client {
+                id,
+                req,
+                origin_contract,
+                connection_scope,
+                user_context,
+            } => {
+                dispatch_delegate_request(
+                    contract_handler,
+                    Some(&mut *park),
+                    prompter,
+                    id,
+                    req,
+                    origin_contract,
+                    connection_scope,
+                    user_context,
+                )
+                .await;
+            }
+            // A queued notification resumes through the SAME path it would have
+            // taken had it not been queued, so its residual messages still fan
+            // out to registered apps rather than to a client responder that does
+            // not exist. `run_queued_notification` re-checks the park, so a
+            // delegate that parked again during this drain re-queues instead of
+            // being re-entered.
+            delegate_park::PendingRun::Notification { req } => {
+                run_queued_notification(
+                    contract_handler,
+                    Some(&mut *park),
+                    prompter,
+                    &delegate_key,
+                    req,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// Re-run a notification-driven delegate invocation that had been queued behind
+/// a park.
+///
+/// Split from `handle_delegate_notification` because that function owns
+/// building the `ContractNotification` from a `DelegateNotification`; by the
+/// time a queued run drains, the request has already been built and the
+/// notification consumed.
+async fn run_queued_notification<CH, P>(
+    contract_handler: &mut CH,
+    mut park: Option<&mut delegate_park::DelegateParkCtx>,
+    prompter: &std::sync::Arc<P>,
+    delegate_key: &DelegateKey,
+    req: DelegateRequest<'static>,
+) where
+    CH: ContractHandler + Send + 'static,
+    P: UserInputPrompter + 'static,
+{
+    // The delegate may have parked again while this drain was running.
+    if let Some(park) = park.as_deref_mut()
+        && park.is_parked(delegate_key)
+    {
+        match park.queue_pending(
+            delegate_key,
+            delegate_park::PendingRun::Notification { req },
+        ) {
+            delegate_park::QueueOutcome::Queued => {}
+            delegate_park::QueueOutcome::Rejected(_) => {
+                tracing::info!(
+                    delegate = %delegate_key,
+                    "Dropped a queued contract notification: the delegate parked \
+                     again and its pending queue is full (#5544)"
+                );
+            }
+        }
+        return;
+    }
+
+    let mut no_responder = None;
+    let outcome = handle_delegate_with_contract_requests(
+        contract_handler,
+        req,
+        None,
+        crate::client_events::ConnectionScope::Local,
+        InterDelegateDispatch::Suppressed,
+        None,
+        delegate_key,
+        prompter,
+        park.map(|park| ParkingCtx {
+            park,
+            delivery: delegate_park::Delivery::Apps,
+            carried_responder: &mut no_responder,
+        }),
+        Vec::new(),
+    )
+    .await;
+
+    match outcome {
+        DelegateRunOutcome::Parked => {}
+        DelegateRunOutcome::Completed(outbound) => {
+            route_notification_outbound(delegate_key, outbound);
+        }
     }
 }
 
@@ -6220,6 +6480,17 @@ mod hol_4391_tests {
         DelegateKey::new([7u8; 32], freenet_stdlib::prelude::CodeHash::new([7u8; 32]))
     }
 
+    /// An `ApplicationMessage` carrying `payload`, followed by the prompt that
+    /// makes the delegate park. Used to prove pre-park output survives a park —
+    /// see `a_delegate_that_parks_twice_still_answers_its_client_once`.
+    fn payload_then_prompt(payload: &[u8]) -> Vec<OutboundDelegateMsg> {
+        let mut out = vec![OutboundDelegateMsg::ApplicationMessage(
+            freenet_stdlib::prelude::ApplicationMessage::new(payload.to_vec()),
+        )];
+        out.extend(prompt_outbound());
+        out
+    }
+
     /// One scripted `RequestUserInput`, which is what makes the delegate park.
     fn prompt_outbound() -> Vec<OutboundDelegateMsg> {
         let message = freenet_stdlib::prelude::NotificationMessage::try_from(&serde_json::json!({
@@ -6361,9 +6632,19 @@ mod hol_4391_tests {
         let (mut handler, send) = build_handler(vec![]).await;
         let script = handler.runtime_mut().delegate_script.clone();
         let calls = handler.runtime_mut().delegate_calls.clone();
-        // Prompt, then prompt AGAIN on the resume, then finish.
-        script.lock().unwrap().push_back(prompt_outbound());
-        script.lock().unwrap().push_back(prompt_outbound());
+        // Emit a payload BEFORE each prompt. Without a payload this test could
+        // not see B3 — the bug where a second park silently discarded
+        // everything the delegate had emitted before the first one — because
+        // `accumulated` was empty in both parks and the only assertion was that
+        // *some* DelegateResponse came back.
+        script
+            .lock()
+            .unwrap()
+            .push_back(payload_then_prompt(b"before-park-1"));
+        script
+            .lock()
+            .unwrap()
+            .push_back(payload_then_prompt(b"before-park-2"));
 
         let send = Arc::new(send);
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -6410,12 +6691,214 @@ mod hol_4391_tests {
             .expect("a twice-parked delegate must still resolve")
             .expect("join")
             .expect("the original client must be answered after the second park");
+        let ContractHandlerEvent::DelegateResponse(msgs) = resp else {
+            panic!("expected one DelegateResponse covering the whole round-trip, got {resp}");
+        };
+
+        // THE B3 ASSERTION. Both pre-park payloads must survive to the single
+        // final response. Before the fix, the resumed run's `accumulated` was
+        // dropped on the `Parked` arm, so `before-park-1` vanished.
+        let payloads: Vec<Vec<u8>> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                OutboundDelegateMsg::ApplicationMessage(am) => Some(am.payload.clone()),
+                _ => None,
+            })
+            .collect();
         assert!(
-            matches!(resp, ContractHandlerEvent::DelegateResponse(_)),
-            "expected one DelegateResponse covering the whole round-trip, got {resp}"
+            payloads.iter().any(|p| p == b"before-park-1"),
+            "output emitted before the FIRST park must survive the second park \
+             (#5544 B3); got {payloads:?}"
+        );
+        assert!(
+            payloads.iter().any(|p| p == b"before-park-2"),
+            "output emitted before the second park must survive; got {payloads:?}"
         );
 
         handle.abort();
+    }
+
+    /// B5: the request refused because the pending queue is full must surface an
+    /// ERROR, not a successful empty response.
+    ///
+    /// `DelegateResponse(Vec::new())` is exactly what a delegate that ran and
+    /// said nothing returns, so answering a refusal with it reports success for
+    /// work `process()` never performed — the repo's "a refusal that is not
+    /// counted renders as a clean zero" pattern. Dropping the responder makes
+    /// the client's channel close, which surfaces as an error.
+    ///
+    /// FALSIFY by restoring `send_delegate_response(.., Vec::new())` in
+    /// `dispatch_delegate_request`'s `Rejected` arm: the ninth request then
+    /// returns Ok and this fails.
+    #[tokio::test]
+    async fn a_request_refused_behind_a_full_pending_queue_errors_not_succeeds() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        script.lock().unwrap().push_back(prompt_outbound());
+
+        let send = Arc::new(send);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter { gate: gate.clone() },
+        ));
+
+        let key_d = test_delegate_key();
+
+        // Park it.
+        let send_0 = send.clone();
+        let k0 = key_d.clone();
+        let parked: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
+            GlobalExecutor::spawn(async move { send_0.send_to_handler(delegate_event(&k0)).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Fill the pending queue to exactly its cap.
+        let mut queued = Vec::new();
+        for _ in 0..delegate_park::MAX_PENDING_PER_DELEGATE {
+            let s = send.clone();
+            let k = key_d.clone();
+            queued.push(GlobalExecutor::spawn(async move {
+                s.send_to_handler(delegate_event(&k)).await
+            }));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // One more than the cap: must be REFUSED with an error.
+        let over = tokio::time::timeout(
+            Duration::from_secs(2),
+            send.send_to_handler(delegate_event(&key_d)),
+        )
+        .await
+        .expect("a refused request must be answered promptly, not left hanging");
+        assert!(
+            over.is_err(),
+            "over-cap request must surface an error, not a successful empty \
+             DelegateResponse that is indistinguishable from a delegate that \
+             ran and said nothing (#5544 B5); got {over:?}"
+        );
+
+        gate.add_permits(1);
+        let _ = tokio::time::timeout(Duration::from_secs(5), parked).await;
+        handle.abort();
+    }
+
+    /// B6: the park backstop must be able to fire on an otherwise idle node.
+    ///
+    /// The sweep runs at the top of a loop iteration, and iterations only happen
+    /// when something wakes the `select!`. Without a timer arm the backstop
+    /// fires whenever unrelated traffic next arrives — on a quiet node, which is
+    /// the normal state for a background peer and exactly the condition under
+    /// which a prompt goes unanswered, effectively never.
+    ///
+    /// LIMITATION, stated rather than papered over: this asserts the DEADLINE
+    /// computation and that the loop consults it, not an end-to-end sweep on an
+    /// idle node. A decisive end-to-end test is not reachable today, because
+    /// `PARK_WORK_BUDGET` (75s) is deliberately below `PARK_TTL` (90s) so the
+    /// `ParkGuard` always resumes the park first — which is what makes the TTL a
+    /// backstop rather than a timeout. Reaching the sweep would need a park with
+    /// no live guard, which no production path can currently produce. The value
+    /// of the fix is that IF that ever becomes reachable, the backstop works.
+    #[test]
+    fn park_sweep_deadline_is_armed_and_the_loop_waits_on_it() {
+        // The loop must consult the deadline, not sweep only on other traffic.
+        let src = include_str!("contract.rs");
+        let body = src
+            .split("pub(crate) async fn contract_handling")
+            .nth(1)
+            .expect("contract_handling must exist");
+        assert!(
+            body.contains("park_ctx.next_sweep_deadline()"),
+            "contract_handling must compute the park sweep deadline"
+        );
+        assert!(
+            body.contains("tokio::time::sleep_until(deadline)"),
+            "the idle select! must WAIT on the park sweep deadline, or the \
+             backstop cannot fire without unrelated traffic (#5544 B6)"
+        );
+    }
+
+    /// B1: a contract notification arriving for a delegate that is currently
+    /// parked must be QUEUED, not run.
+    ///
+    /// The notification path is a third door into a delegate, alongside the
+    /// client request and the inter-delegate hop, and it is driven by a
+    /// contract changing rather than by anything the delegate did. Running it
+    /// mid-park re-enters `process()` and clobbers the parked continuation's
+    /// context entry — the corruption the exclusion exists to prevent, reached
+    /// through a door the exclusion originally did not guard.
+    ///
+    /// NOTE: this is about INTERLEAVING, not simultaneity. The notification
+    /// path also runs on the serial loop, so the global
+    /// one-`process()`-at-a-time property is untouched and does not help. A
+    /// serially executed notification landing inside the park window corrupts
+    /// just as thoroughly as a concurrent one would.
+    ///
+    /// FALSIFY by deleting the `is_parked` gate in `handle_delegate_notification`:
+    /// `delegate_calls` then records the notification's run.
+    #[tokio::test]
+    async fn a_notification_for_a_parked_delegate_is_queued_not_run() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let calls = handler.runtime_mut().delegate_calls.clone();
+        let script = handler.runtime_mut().delegate_script.clone();
+        // Present so that, if the gate is missing, the delegate really does run
+        // rather than erroring out for an unrelated reason.
+        script.lock().unwrap().push_back(Vec::new());
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx);
+        let key = test_delegate_key();
+        assert!(
+            matches!(
+                park.park(key.clone(), parked_continuation()),
+                delegate_park::ParkAdmission::Admitted
+            ),
+            "the delegate must start out parked"
+        );
+
+        handle_delegate_notification(
+            &mut handler,
+            executor::DelegateNotification {
+                delegate_key: key.clone(),
+                contract_id: ContractInstanceId::new([9u8; 32]),
+                new_state: Arc::new(WrappedState::new(b"changed".to_vec())),
+            },
+            &std::sync::Arc::new(crate::contract::user_input::AutoApprovePrompter),
+            Some(&mut park),
+        )
+        .await;
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "a notification must NOT re-enter a parked delegate (#5544 B1)"
+        );
+        let (_continuation, pending) = park.take(&key).expect("still parked");
+        assert_eq!(
+            pending.len(),
+            1,
+            "the notification must be queued, not lost"
+        );
+        assert!(
+            matches!(pending[0], delegate_park::PendingRun::Notification { .. }),
+            "queued as a notification so it resumes through the app-routing path"
+        );
+    }
+
+    /// A continuation standing in for a delegate parked on a prompt.
+    fn parked_continuation() -> delegate_park::Continuation {
+        delegate_park::Continuation {
+            params: Parameters::from(Vec::new()),
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+            inter_delegate: InterDelegateDispatch::Allowed,
+            accumulated: Vec::new(),
+            inbound_so_far: Vec::new(),
+            responder: None,
+            delivery: delegate_park::Delivery::Client,
+        }
     }
 
     /// The second half of #5544: a delegate PUT whose contract asks for a
