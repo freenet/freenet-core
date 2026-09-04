@@ -429,13 +429,21 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
             // Script exhausted after a real scripted run: the delegate has
             // nothing more to say. Record the entry so exclusion assertions
             // still see it.
-            self.runtime.delegate_calls.lock().unwrap().push(key.clone());
+            self.runtime
+                .delegate_calls
+                .lock()
+                .unwrap()
+                .push(key.clone());
             return Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
                 key,
                 values: Vec::new(),
             });
         };
-        self.runtime.delegate_calls.lock().unwrap().push(key.clone());
+        self.runtime
+            .delegate_calls
+            .lock()
+            .unwrap()
+            .push(key.clone());
         Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key, values })
     }
 

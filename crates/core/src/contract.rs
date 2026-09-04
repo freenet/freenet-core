@@ -612,12 +612,7 @@ where
             }
             contract_handler
                 .executor()
-                .upsert_contract_state(
-                    pending.key,
-                    pending.update,
-                    related_contracts,
-                    pending.code,
-                )
+                .upsert_contract_state(pending.key, pending.update, related_contracts, pending.code)
                 .await
         }
         // The fetch failed or timed out: surface it to the delegate rather than
@@ -1514,11 +1509,11 @@ where
                                     .await
                                 }
                             };
-                            let done = tokio::time::timeout(
-                                delegate_park::PARK_WORK_BUDGET,
-                                async { tokio::join!(answers, fetches) },
-                            )
-                            .await;
+                            let done =
+                                tokio::time::timeout(delegate_park::PARK_WORK_BUDGET, async {
+                                    tokio::join!(answers, fetches)
+                                })
+                                .await;
                             match done {
                                 Ok((responses, resolved)) => guard.send(responses, resolved),
                                 Err(_) => {
@@ -1550,8 +1545,7 @@ where
             // Inline fallback: no parking context (direct unit-test calls), or
             // the park cap was hit.
             for pending in std::mem::take(&mut deferred_upserts) {
-                inbound_responses
-                    .push(run_deferred_upsert_inline(contract_handler, pending).await);
+                inbound_responses.push(run_deferred_upsert_inline(contract_handler, pending).await);
             }
             if !user_input_requests.is_empty() {
                 inbound_responses.extend(
@@ -1729,13 +1723,8 @@ where
         for _ in 0..MAX_RESUME_DRAIN_BATCH {
             match delegate_resume_rx.try_recv() {
                 Ok(resume) => {
-                    handle_delegate_resume(
-                        &mut contract_handler,
-                        &mut park_ctx,
-                        &prompter,
-                        resume,
-                    )
-                    .await;
+                    handle_delegate_resume(&mut contract_handler, &mut park_ctx, &prompter, resume)
+                        .await;
                 }
                 Err(_) => break,
             }
@@ -6160,7 +6149,10 @@ mod hol_4391_tests {
     /// not clicked yet. The real `DashboardPrompter` waits up to
     /// `USER_INPUT_TIMEOUT` (60s) for exactly this.
     struct GatedPrompter {
-        gate: Arc<tokio::sync::Notify>,
+        /// One permit per prompt the test lets through. A `Notify` will not do:
+        /// it stores at most ONE permit, so a test that has to release two
+        /// prompts could silently lose a release.
+        gate: Arc<tokio::sync::Semaphore>,
     }
 
     impl user_input::UserInputPrompter for GatedPrompter {
@@ -6170,7 +6162,11 @@ mod hol_4391_tests {
             _delegate_key: &str,
             _caller: user_input::CallerIdentity,
         ) -> Option<(usize, ClientResponse<'static>)> {
-            self.gate.notified().await;
+            self.gate
+                .acquire()
+                .await
+                .expect("prompt gate closed")
+                .forget();
             Some((0, ClientResponse::new(b"approved".to_vec())))
         }
     }
@@ -6230,7 +6226,7 @@ mod hol_4391_tests {
         let key_c = contract_c.key();
 
         let send = Arc::new(send);
-        let gate = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let handle = GlobalExecutor::spawn(contract_handling(
             handler,
             GatedPrompter { gate: gate.clone() },
@@ -6258,9 +6254,9 @@ mod hol_4391_tests {
         let send_d = send.clone();
         let key_d = test_delegate_key();
         let delegate_task: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
-            GlobalExecutor::spawn(async move {
-                send_d.send_to_handler(delegate_event(&key_d)).await
-            });
+            GlobalExecutor::spawn(
+                async move { send_d.send_to_handler(delegate_event(&key_d)).await },
+            );
 
         // Let the loop pick up the delegate request and park it.
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -6292,7 +6288,7 @@ mod hol_4391_tests {
         }
 
         // Release the human: the delegate resumes and its client is answered.
-        gate.notify_one();
+        gate.add_permits(1);
         let resp = tokio::time::timeout(Duration::from_secs(5), delegate_task)
             .await
             .expect("the parked delegate must resolve once the prompt is answered")
@@ -6301,6 +6297,77 @@ mod hol_4391_tests {
         assert!(
             matches!(resp, ContractHandlerEvent::DelegateResponse(_)),
             "parked delegate must answer its original client exactly once, got {resp}"
+        );
+
+        handle.abort();
+    }
+
+    /// A delegate that prompts TWICE parks, resumes, and parks again. Its
+    /// client must still be answered exactly once, at the end.
+    ///
+    /// This exercises the path where the parked client responder is carried
+    /// FORWARD into the second continuation rather than being answered early
+    /// or dropped. Getting it wrong gives either a client that hangs forever
+    /// or one that receives a truncated first response — neither of which the
+    /// single-prompt tests can see.
+    #[tokio::test]
+    async fn a_delegate_that_parks_twice_still_answers_its_client_once() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        let calls = handler.runtime_mut().delegate_calls.clone();
+        // Prompt, then prompt AGAIN on the resume, then finish.
+        script.lock().unwrap().push_back(prompt_outbound());
+        script.lock().unwrap().push_back(prompt_outbound());
+
+        let send = Arc::new(send);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter { gate: gate.clone() },
+        ));
+
+        let send_d = send.clone();
+        let key_d = test_delegate_key();
+        let delegate_task: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
+            GlobalExecutor::spawn(
+                async move { send_d.send_to_handler(delegate_event(&key_d)).await },
+            );
+
+        // First park.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "first entry into the delegate"
+        );
+        assert!(!delegate_task.is_finished(), "must be parked on prompt 1");
+
+        // Release prompt 1 -> resume -> the delegate prompts again -> re-park.
+        gate.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "the resume must have re-entered the delegate exactly once"
+        );
+        assert!(
+            !delegate_task.is_finished(),
+            "must be parked AGAIN on prompt 2; answering the client here would \
+             truncate the round-trip"
+        );
+
+        // Release prompt 2: the delegate finishes and the ORIGINAL client
+        // responder, carried across both parks, is answered.
+        gate.add_permits(1);
+        let resp = tokio::time::timeout(Duration::from_secs(5), delegate_task)
+            .await
+            .expect("a twice-parked delegate must still resolve")
+            .expect("join")
+            .expect("the original client must be answered after the second park");
+        assert!(
+            matches!(resp, ContractHandlerEvent::DelegateResponse(_)),
+            "expected one DelegateResponse covering the whole round-trip, got {resp}"
         );
 
         handle.abort();
@@ -6348,14 +6415,15 @@ mod hol_4391_tests {
         let gate_for_stub = gate.clone();
         let off_loop_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_for_stub = off_loop_calls.clone();
-        let _override = OverrideGuard::install(Arc::new(move |missing: Vec<ContractInstanceId>| {
-            let gate = gate_for_stub.clone();
-            calls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Box::pin(async move {
-                gate.notified().await;
-                Err(ExecutorError::missing_related(missing[0]))
-            })
-        }));
+        let _override =
+            OverrideGuard::install(Arc::new(move |missing: Vec<ContractInstanceId>| {
+                let gate = gate_for_stub.clone();
+                calls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    gate.notified().await;
+                    Err(ExecutorError::missing_related(missing[0]))
+                })
+            }));
 
         // A locally stored contract whose GET needs no network at all.
         let contract_c = make_contract(b"park_put_c_cached");
@@ -6387,9 +6455,9 @@ mod hol_4391_tests {
         let send_d = send.clone();
         let key_d = test_delegate_key();
         let delegate_task: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
-            GlobalExecutor::spawn(async move {
-                send_d.send_to_handler(delegate_event(&key_d)).await
-            });
+            GlobalExecutor::spawn(
+                async move { send_d.send_to_handler(delegate_event(&key_d)).await },
+            );
 
         tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -6484,7 +6552,7 @@ mod hol_4391_tests {
         script.lock().unwrap().push_back(prompt_outbound());
 
         let send = Arc::new(send);
-        let gate = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let handle = GlobalExecutor::spawn(contract_handling(
             handler,
             GatedPrompter { gate: gate.clone() },
@@ -6521,7 +6589,7 @@ mod hol_4391_tests {
 
         // Release the prompt: the parked run resumes, then the queued request
         // is drained — both reach the delegate, in order.
-        gate.notify_one();
+        gate.add_permits(1);
         let r1 = tokio::time::timeout(Duration::from_secs(5), first)
             .await
             .expect("first delegate request must resolve")
@@ -6546,5 +6614,4 @@ mod hol_4391_tests {
 
         handle.abort();
     }
-
 }
