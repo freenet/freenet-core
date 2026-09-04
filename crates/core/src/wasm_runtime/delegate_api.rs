@@ -476,6 +476,43 @@ mod tests {
             }
         }
 
+        /// Create a DelegateCallEnv wired with BOTH the post-write callback and
+        /// the pre-write admission gate.
+        ///
+        /// The single-hook builders above cannot express a test that observes
+        /// how the two INTERACT — which of them runs first, and whether one
+        /// short-circuiting suppresses the other. See
+        /// `test_env_unchanged_rewrite_still_consults_the_disk_budget_gate`.
+        ///
+        /// # Safety
+        /// Caller must ensure the returned env does not outlive `self`.
+        unsafe fn make_env_with_callback_and_admit(
+            &mut self,
+            cb: super::super::runtime::StateWriteCallback,
+            admit: super::super::runtime::StateAdmitCallback,
+        ) -> DelegateCallEnv {
+            let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
+            // SAFETY: The caller guarantees the returned env does not outlive `self`,
+            // which keeps the borrowed `secret_store` and `contract_store` alive.
+            unsafe {
+                DelegateCallEnv::new(
+                    vec![],
+                    &mut self.secret_store,
+                    &self.contract_store,
+                    Some(self.db.clone()),
+                    Some(cb),
+                    Some(admit),
+                    delegate_key,
+                    &mut self.delegate_store,
+                    0,
+                    vec![],
+                    None,
+                    self.created_delegates_count.clone(),
+                    self.inherited_origins.clone(),
+                )
+            }
+        }
+
         /// Create a DelegateCallEnv with attested contracts for testing attestation inheritance.
         ///
         /// # Safety
@@ -998,6 +1035,107 @@ mod tests {
             "a rejected oversized V2 PUT must leave the previously-stored state \
              untouched — the check runs before the raw `Storage` write, so \
              nothing should have landed"
+        );
+
+        // The delegate-visible outcome, not just the Rust error. An oversized
+        // state is a CALLER error, so it maps to ERR_INVALID_PARAM rather than
+        // the ERR_STORE_ERROR the disk-budget rejection uses — a delegate
+        // branching on the code must be able to tell "you sent me something
+        // impossible" from "my disk is full".
+        assert_eq!(
+            super::super::native_api::delegate_contracts::delegate_env_error_to_code(
+                &DelegateEnvError::StateTooLarge {
+                    size: super::super::MAX_STATE_SIZE + 1,
+                    limit: super::super::MAX_STATE_SIZE,
+                }
+            ),
+            contract_error_codes::ERR_INVALID_PARAM as i64,
+        );
+    }
+
+    /// Gate interaction: a content-UNCHANGED rewrite must still be admitted by
+    /// the disk-budget gate, and suppressing the post-write hook must not
+    /// suppress the gate.
+    ///
+    /// `put_contract_state_sync` runs five sequenced steps — wrap,
+    /// `check_state_size`, `state_content_changed` (a DB read), the
+    /// disk-budget admit callback, `store_state_sync`, then the conditional
+    /// `after_state_write`. Each is covered on its own; nothing pins the
+    /// ORDER, so a reorder that moved the admit gate behind the no-change
+    /// short-circuit would silently stop metering identical rewrites and no
+    /// existing test would notice.
+    #[tokio::test]
+    async fn test_env_unchanged_rewrite_still_consults_the_disk_budget_gate() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(124, &[1, 2, 3]).await;
+
+        let admit_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admit_calls_for_cb = admit_calls.clone();
+        let admit: super::super::runtime::StateAdmitCallback =
+            std::sync::Arc::new(move |_k: &ContractKey, _size: usize, _is_update: bool| {
+                admit_calls_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            });
+
+        let write_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let write_calls_for_cb = write_calls.clone();
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            move |_k: &ContractKey, _s: &freenet_stdlib::prelude::WrappedState| {
+                write_calls_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+
+        // SAFETY: `env_holder` is alive for the duration of this test.
+        let env = unsafe { env_holder.make_env_with_callback_and_admit(cb, admit) };
+
+        // Rewrite the seeded bytes verbatim: unchanged content, so the
+        // post-write hook is suppressed — but the write still happens.
+        env.put_contract_state_sync(&contract_id, vec![1, 2, 3])
+            .expect("an unchanged V2 PUT should still succeed");
+
+        assert_eq!(
+            admit_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the disk-budget gate must run even for a content-unchanged \
+             rewrite: the raw `Storage` write still happens, so the write \
+             the gate exists to admit is still being made. A reorder that \
+             skipped it here would stop metering identical rewrites"
+        );
+        assert_eq!(
+            write_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the post-write hook must still be suppressed for unchanged \
+             content — the admit gate running does not re-enable it"
+        );
+    }
+
+    /// Gate interaction: a state of EXACTLY `MAX_STATE_SIZE` must be admitted.
+    ///
+    /// `check_state_size` rejects `size > MAX_STATE_SIZE`, so the boundary
+    /// value itself is legal. An off-by-one to `>=` would be invisible to the
+    /// oversized test above, which uses `MAX_STATE_SIZE + 1`.
+    #[tokio::test]
+    async fn test_env_state_at_exactly_max_size_is_admitted() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(125, &[1, 2, 3]).await;
+
+        // SAFETY: `env_holder` is alive for the duration of this test.
+        let env = unsafe { env_holder.make_env() };
+
+        let at_limit = vec![0u8; super::super::MAX_STATE_SIZE];
+        let result = env.put_contract_state_sync(&contract_id, at_limit);
+        assert!(
+            result.is_ok(),
+            "a state of exactly MAX_STATE_SIZE is within the ceiling and must \
+             be accepted — `check_state_size` rejects `> MAX_STATE_SIZE`, not \
+             `>=`. Got {result:?}"
+        );
+        assert_eq!(
+            env.get_contract_state_sync(&contract_id)
+                .unwrap()
+                .map(|s| s.len()),
+            Some(super::super::MAX_STATE_SIZE),
+            "the boundary-size state must actually have landed"
         );
     }
 
