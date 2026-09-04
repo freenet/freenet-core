@@ -384,6 +384,23 @@ jobs:
     steps:
       - uses: docker/setup-qemu-action@v3
 
+      # Authenticated on purpose. This step's job is "does the published image
+      # run on both architectures", and pulling anonymously conflates that with
+      # "is the package public", which is a separate property checked below.
+      #
+      # Without the login, the FIRST publish of a package always fails here and
+      # every later one passes, because GHCR creates a package private and only
+      # a human can change that. An asymmetry that fires exactly once reads as a
+      # flake forever afterwards, and the failure it produced
+      # (`unauthorized` on a manifest HEAD) looks like a broken image rather
+      # than a settings problem. That happened on v0.2.133, the release that
+      # introduced this workflow.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
       # Pulls what was actually published, per architecture, and runs the
       # binary. Publishing an arm64 manifest that cannot execute is otherwise
       # invisible until a user on a Raspberry Pi reports it.
@@ -403,6 +420,27 @@ jobs:
             echo "expected ${expected}, image ships ${actual}"
             test "$expected" = "$actual"
           done
+
+      # Checked separately from the pull above, and stated as its own failure,
+      # because a working image nobody can download is still a broken release
+      # from a user's point of view. GitHub exposes no API to change this
+      # (PATCH on the package route is 404), so it cannot be automated and the
+      # message has to be good enough to act on without further digging.
+      - name: The published package is publicly pullable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          visibility=$(gh api "orgs/${{ github.repository_owner }}/packages/container/freenet-core" \
+            --jq '.visibility' 2>/dev/null || echo unknown)
+          echo "package visibility: ${visibility}"
+
+          if [ "$visibility" = public ]; then
+            exit 0
+          fi
+
+          echo "::error::The image published, but the GHCR package is '${visibility}', so nobody outside the org can pull it. GitHub creates a new package private and offers no API to change it, so this needs one manual change, once, ever: open https://github.com/orgs/${{ github.repository_owner }}/packages/container/package/freenet-core, go to package settings, and set visibility to Public. Then re-run this workflow with: gh workflow run docker-publish.yml --field tag=${{ github.event.release.tag_name || inputs.tag }}"
+          exit 1
 
   # Without this a failed publish leaves `latest` stale and says so nowhere but
   # a red tick in the Actions tab. Existing containers keep self-updating, so
