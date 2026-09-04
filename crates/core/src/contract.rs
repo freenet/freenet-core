@@ -3094,20 +3094,6 @@ mod tests {
         ContractKey::from_params_and_code(&params, &code)
     }
 
-    /// H2 — the control that REPLACED the deleted registration-record gate.
-    ///
-    /// Removing a control is only safe if the thing standing in for it is
-    /// itself pinned. The inter-delegate hop is safe because it forwards the
-    /// ORIGINATING connection scope, so a non-local caller cannot launder its
-    /// lack of attestation through a delegate. Nothing enforced that: passing a
-    /// literal `ConnectionScope::Local` at the hop compiled and broke nothing.
-    ///
-    /// Two properties, because the hop has two callers with different scope
-    /// provenance:
-    ///  1. the hop forwards the `connection_scope` VARIABLE, never a literal; and
-    ///  2. the notification path — which has no connection and therefore
-    ///     hardcodes `Local` — is `InterDelegateDispatch::Suppressed`, so that
-    ///     hardcoded value can never reach the hop.
     /// Pin: the unexpected-response arm must return `Err`, not a fake success.
     ///
     /// The executor answering a delegate request with a variant that is not a
@@ -3208,6 +3194,20 @@ mod tests {
         );
     }
 
+    /// H2 — the control that REPLACED the deleted registration-record gate.
+    ///
+    /// Removing a control is only safe if the thing standing in for it is
+    /// itself pinned. The inter-delegate hop is safe because it forwards the
+    /// ORIGINATING connection scope, so a non-local caller cannot launder its
+    /// lack of attestation through a delegate. Nothing enforced that: passing a
+    /// literal `ConnectionScope::Local` at the hop compiled and broke nothing.
+    ///
+    /// Two properties, because the hop has two callers with different scope
+    /// provenance:
+    ///  1. the hop forwards the `connection_scope` VARIABLE, never a literal; and
+    ///  2. the notification path — which has no connection and therefore
+    ///     hardcodes `Local` — is `InterDelegateDispatch::Suppressed`, so that
+    ///     hardcoded value can never reach the hop.
     #[test]
     fn inter_delegate_hop_forwards_the_originating_scope() {
         let src = include_str!("contract.rs");

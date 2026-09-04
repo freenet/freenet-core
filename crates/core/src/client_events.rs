@@ -2490,6 +2490,7 @@ mod unsupported_request_tests {
 #[cfg(test)]
 mod delegate_request_outcome_tests {
     use super::*;
+    use freenet_stdlib::prelude::ApplicationMessage;
 
     fn key() -> DelegateKey {
         DelegateKey::new([3u8; 32], CodeHash::new([0u8; 32]))
@@ -2514,8 +2515,53 @@ mod delegate_request_outcome_tests {
         );
     }
 
+    /// The success arm must return the delegate's OWN values, not merely
+    /// something that is not an error.
+    ///
+    /// Passing only `vec![]` here would be vacuous: a mutation to
+    /// `Ok(_) => Ok(vec![])` discards every outbound message the delegate
+    /// produced and an emptiness-only assertion still passes. So this drives a
+    /// non-empty payload and asserts it arrives verbatim. `OutboundDelegateMsg`
+    /// is not `PartialEq`, hence the match on the payload rather than
+    /// `assert_eq!` on the Vec.
     #[test]
     fn successful_execution_returns_the_values() {
+        let payload = vec![7u8, 8, 9];
+        let res = delegate_request_outcome(
+            Ok(ContractHandlerEvent::DelegateResponse(Ok(vec![
+                OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload.clone())),
+            ]))),
+            ClientId::next(),
+            RequestId::new(),
+            &key(),
+            Some("ApplicationMessages"),
+        );
+        let values = res.expect("a successful response must not be an error");
+        assert_eq!(
+            values.len(),
+            1,
+            "the delegate's outbound messages must be returned, not dropped"
+        );
+        // `let ... else` rather than a `match` with a catch-all: this crate
+        // denies `clippy::wildcard_enum_match_arm`, and spelling out all seven
+        // sibling variants here would need editing every time one is added,
+        // for no gain -- the test only cares about the one it asked for.
+        let OutboundDelegateMsg::ApplicationMessage(msg) = &values[0] else {
+            panic!("expected the ApplicationMessage back, got {:?}", &values[0]);
+        };
+        assert_eq!(
+            msg.payload, payload,
+            "the payload must arrive verbatim; a success arm that substitutes \
+             its own value is the mutation this pins"
+        );
+    }
+
+    /// The companion to the above, and the one closest to #5263: a delegate
+    /// that legitimately produces NO outbound messages is still a SUCCESS.
+    /// This is the regression this PR could most plausibly cause — turning a
+    /// legitimate no-op response into a client-visible error.
+    #[test]
+    fn genuinely_empty_success_stays_ok() {
         let res = delegate_request_outcome(
             Ok(ContractHandlerEvent::DelegateResponse(Ok(vec![]))),
             ClientId::next(),
@@ -2524,7 +2570,7 @@ mod delegate_request_outcome_tests {
             Some("ApplicationMessages"),
         );
         assert!(
-            res.expect("a successful response must not be an error")
+            res.expect("an empty but successful response must not be an error")
                 .is_empty(),
             "an empty Vec on a genuinely successful response is still correct — \
              only a genuine failure should become Err"
