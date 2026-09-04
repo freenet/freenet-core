@@ -82,8 +82,29 @@ package as **private**, so until its visibility is set to public once, every
 `docker pull` in the Docker README fails for everyone except maintainers, and
 the error reads as a missing image rather than a permissions problem.
 
-After the first successful publish, check it under the repository's Packages
-settings and make it public. This is needed once, not per release.
+This is needed once, not per release, and it cannot be automated: there is no
+REST API for it (`PATCH` on the package route returns 404), so it is a manual
+change in the web UI.
+
+    https://github.com/orgs/freenet/packages/container/package/freenet-core
+    -> package settings -> visibility -> Public
+
+**This happened on v0.2.133**, the release that introduced the workflow. The
+image published correctly and the `smoke` job failed with
+
+    Head "https://ghcr.io/v2/freenet/freenet-core/manifests/v0.2.133": unauthorized
+
+which looks like a broken image and is actually the package being private. The
+smoke job now authenticates its pull, so it tests whether the image runs rather
+than whether the package is public, and checks visibility as a separate step
+whose error message names this section. If you see that error on a future
+release, the package visibility has been reset rather than the image being bad.
+
+After changing it, re-run the publish for that tag:
+
+```bash
+gh workflow run docker-publish.yml --field tag=vX.Y.Z
+```
 
 ### Windows code signing (Authenticode)
 
