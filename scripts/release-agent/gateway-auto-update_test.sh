@@ -50,7 +50,15 @@ cat > "$TMP/bin/systemctl" <<EOF
 #!/bin/bash
 case "\$1" in
   is-active)
-    state="\$(cat "$TMP/service-state" 2>/dev/null || echo unknown)"
+    # Per-unit state file if present, else the shared default. Lets a companion
+    # be down while the primary is up, which is the case the companion check
+    # exists for.
+    unit="\${2%.service}"
+    if [[ -f "$TMP/state-\$unit" ]]; then
+      state="\$(cat "$TMP/state-\$unit")"
+    else
+      state="\$(cat "$TMP/service-state" 2>/dev/null || echo unknown)"
+    fi
     echo "\$state"
     [[ "\$state" == "active" ]] && exit 0 || exit 3
     ;;
@@ -133,6 +141,64 @@ if deploy_update "$TMP/fake-binary" 2>/dev/null; then
 else
     pass "deploy_update: dead service caught despite deploy script exiting 0"
 fi
+
+# ── companion units (WantedBy=) ──────────────────────────────────────
+#
+# nova runs a SECOND gateway process, freenet-gateway-2, with
+# `WantedBy=freenet-gateway.service` and no release-agent of its own. systemd
+# does NOT propagate a wanted unit's START FAILURE back to the primary, so
+# without this check the primary comes up, the update reports success, and the
+# second gateway is silently down — the v0.2.71 failure class again.
+#
+# SYSTEMD_UNIT_ROOTS points the lookup at a fixture instead of /etc/systemd.
+
+export SYSTEMD_UNIT_ROOTS="$TMP/units"
+WANTS="$TMP/units/freenet-gateway.service.wants"
+mkdir -p "$WANTS" || { echo "FAIL: could not create $WANTS" >&2; exit 1; }
+
+echo "active" > "$TMP/service-state"
+
+# (1) No companions: the loop must fall through, not fail.
+if verify_service_active "freenet-gateway" 2>/dev/null; then
+    pass "companions: none configured -> 0"
+else
+    fail "companions: an empty wants dir must not fail the update"
+fi
+
+# (2) Companion present and active.
+touch "$WANTS/freenet-gateway-2.service"
+echo "active" > "$TMP/state-freenet-gateway-2"
+if verify_service_active "freenet-gateway" 2>/dev/null; then
+    pass "companions: active companion -> 0"
+else
+    fail "companions: an active companion must not fail the update"
+fi
+
+# (3) THE CASE THIS EXISTS FOR: primary active, companion down. Must fail.
+echo "inactive" > "$TMP/state-freenet-gateway-2"
+if verify_service_active "freenet-gateway" 2>/dev/null; then
+    fail "companions: primary active + companion INACTIVE must NOT return 0 (silent gateway outage)"
+else
+    pass "companions: inactive companion -> non-zero"
+fi
+
+# (4) A failed companion is equally unacceptable.
+echo "failed" > "$TMP/state-freenet-gateway-2"
+if verify_service_active "freenet-gateway" 2>/dev/null; then
+    fail "companions: primary active + companion FAILED must NOT return 0"
+else
+    pass "companions: failed companion -> non-zero"
+fi
+
+# (5) A wants dir that does not exist must not fail (hosts without companions).
+rm -f "$TMP/state-freenet-gateway-2"
+export SYSTEMD_UNIT_ROOTS="$TMP/no-such-root"
+if verify_service_active "freenet-gateway" 2>/dev/null; then
+    pass "companions: missing wants root -> 0"
+else
+    fail "companions: a missing wants root must not fail the update"
+fi
+unset SYSTEMD_UNIT_ROOTS
 
 # Same deploy script, but now the service is genuinely active → success.
 echo "active" > "$TMP/service-state"
