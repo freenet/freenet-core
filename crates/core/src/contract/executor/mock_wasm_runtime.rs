@@ -85,7 +85,23 @@ pub(crate) struct MockWasmRuntime {
     /// Per-contract update_state overrides for testing the
     /// `requires(missing)` fetch-and-retry path.
     pub(crate) update_overrides: HashMap<ContractInstanceId, UpdateOverride>,
+    /// Scripted delegate outbound messages (#5544). Each
+    /// `execute_delegate_request` pops the next entry; an exhausted script
+    /// returns no messages, which the caller reads as "the delegate is done".
+    pub(crate) delegate_script: DelegateScript,
+    /// One entry appended per `execute_delegate_request`, so a test can assert
+    /// HOW MANY times the delegate's `process()` was entered and in what order
+    /// relative to a park. This is what makes the per-delegate exclusion
+    /// falsifiable: the invariant is "no second entry while parked".
+    pub(crate) delegate_calls: DelegateCallLog,
 }
+
+/// Shared handle to a mock delegate's scripted responses.
+pub(crate) type DelegateScript =
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<OutboundDelegateMsg>>>>;
+
+/// Shared handle to the log of delegate invocations.
+pub(crate) type DelegateCallLog = std::sync::Arc<std::sync::Mutex<Vec<DelegateKey>>>;
 
 impl ContractRuntimeInterface for MockWasmRuntime {
     fn validate_state(
@@ -393,15 +409,34 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
 
     async fn execute_delegate_request(
         &mut self,
-        _req: DelegateRequest<'_>,
+        req: DelegateRequest<'_>,
         _origin_contract: Option<&ContractInstanceId>,
         _caller_delegate: Option<&DelegateKey>,
         _connection_scope: crate::client_events::ConnectionScope,
         _user_context: Option<&UserSecretContext>,
     ) -> Response {
-        Err(ExecutorError::other(anyhow::anyhow!(
-            "delegates not supported in MockWasmRuntime"
-        )))
+        // Scripted, for the #5544 park/resume tests. Without a script this
+        // stays the "not supported" error it has always been, so no existing
+        // test changes behaviour.
+        let key = req.key().clone();
+        let script = self.runtime.delegate_script.lock().unwrap().pop_front();
+        let Some(values) = script else {
+            if self.runtime.delegate_calls.lock().unwrap().is_empty() {
+                return Err(ExecutorError::other(anyhow::anyhow!(
+                    "delegates not supported in MockWasmRuntime"
+                )));
+            }
+            // Script exhausted after a real scripted run: the delegate has
+            // nothing more to say. Record the entry so exclusion assertions
+            // still see it.
+            self.runtime.delegate_calls.lock().unwrap().push(key.clone());
+            return Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
+                key,
+                values: Vec::new(),
+            });
+        };
+        self.runtime.delegate_calls.lock().unwrap().push(key.clone());
+        Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key, values })
     }
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
@@ -439,6 +474,8 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             contract_store: contract_store.unwrap_or_default(),
             validate_overrides: HashMap::new(),
             update_overrides: HashMap::new(),
+            delegate_script: DelegateScript::default(),
+            delegate_calls: DelegateCallLog::default(),
         };
 
         Executor::new(
@@ -469,6 +506,8 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             contract_store: InMemoryContractStore::default(),
             validate_overrides: HashMap::new(),
             update_overrides: HashMap::new(),
+            delegate_script: DelegateScript::default(),
+            delegate_calls: DelegateCallLog::default(),
         };
 
         Executor::new(state_store, || Ok(()), OperationMode::Local, runtime, None).await
@@ -491,6 +530,8 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             contract_store: InMemoryContractStore::default(),
             validate_overrides: HashMap::new(),
             update_overrides: HashMap::new(),
+            delegate_script: DelegateScript::default(),
+            delegate_calls: DelegateCallLog::default(),
         };
 
         Executor::new(

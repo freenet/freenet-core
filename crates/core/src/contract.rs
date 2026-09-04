@@ -5669,4 +5669,249 @@ mod hol_4391_tests {
             other => panic!("expected RegisterSubscriberListenerResponse, got {other}"),
         }
     }
+
+    // ---- #5544: a parked delegate must not stall the loop, and must not be
+    // ---- re-entered while parked.
+
+    /// A prompter that hangs until released, standing in for a human who has
+    /// not clicked yet. The real `DashboardPrompter` waits up to
+    /// `USER_INPUT_TIMEOUT` (60s) for exactly this.
+    struct GatedPrompter {
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    impl user_input::UserInputPrompter for GatedPrompter {
+        async fn prompt(
+            &self,
+            _request: &UserInputRequest<'static>,
+            _delegate_key: &str,
+            _caller: user_input::CallerIdentity,
+        ) -> Option<(usize, ClientResponse<'static>)> {
+            self.gate.notified().await;
+            Some((0, ClientResponse::new(b"approved".to_vec())))
+        }
+    }
+
+    fn test_delegate_key() -> DelegateKey {
+        DelegateKey::new([7u8; 32], freenet_stdlib::prelude::CodeHash::new([7u8; 32]))
+    }
+
+    /// One scripted `RequestUserInput`, which is what makes the delegate park.
+    fn prompt_outbound() -> Vec<OutboundDelegateMsg> {
+        let message = freenet_stdlib::prelude::NotificationMessage::try_from(&serde_json::json!({
+            "message": "allow?"
+        }))
+        .expect("notification message");
+        vec![OutboundDelegateMsg::RequestUserInput(UserInputRequest {
+            request_id: 1,
+            message,
+            responses: vec![ClientResponse::new(b"yes".to_vec())],
+        })]
+    }
+
+    fn delegate_event(key: &DelegateKey) -> ContractHandlerEvent {
+        ContractHandlerEvent::DelegateRequest {
+            req: DelegateRequest::ApplicationMessages {
+                key: key.clone(),
+                params: Parameters::from(Vec::new()),
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                    freenet_stdlib::prelude::ApplicationMessage::new(b"go".to_vec()),
+                )],
+            },
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+        }
+    }
+
+    /// THE #5544 REGRESSION TEST: unrelated contract work must keep draining
+    /// while a delegate sits parked on a permission prompt.
+    ///
+    /// Before the fix, `prompter.prompt(...)` was awaited on the serial
+    /// `contract_handling` loop, so a delegate awaiting a human froze every
+    /// GET/PUT/UPDATE/subscribe on the node for up to `USER_INPUT_TIMEOUT`
+    /// (60s). Asserting only that the delegate still works would NOT catch a
+    /// regression to inline blocking — the delegate works either way. What
+    /// distinguishes the two is whether anything ELSE can run meanwhile, so
+    /// that is what this asserts, under a timeout far below 60s.
+    #[tokio::test]
+    async fn parked_delegate_prompt_does_not_block_the_loop() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        script.lock().unwrap().push_back(prompt_outbound());
+
+        // A locally stored contract, so the GET below needs no network and its
+        // only possible source of delay is the loop being blocked.
+        let contract_c = make_contract(b"park_c_cached");
+        let key_c = contract_c.key();
+
+        let send = Arc::new(send);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter { gate: gate.clone() },
+        ));
+
+        let put_c = put_local(
+            send.as_ref(),
+            contract_c,
+            WrappedState::new(b"c_state".to_vec()),
+        )
+        .await;
+        assert!(
+            matches!(
+                put_c,
+                ContractHandlerEvent::PutResponse {
+                    new_value: Ok(_),
+                    ..
+                }
+            ),
+            "seed PUT for C must succeed, got {put_c}"
+        );
+
+        // Drive the delegate on a background task: it emits RequestUserInput,
+        // parks, and stays parked until the gate opens.
+        let send_d = send.clone();
+        let key_d = test_delegate_key();
+        let delegate_task: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
+            GlobalExecutor::spawn(async move {
+                send_d.send_to_handler(delegate_event(&key_d)).await
+            });
+
+        // Let the loop pick up the delegate request and park it.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // The crux. Inline blocking makes this time out.
+        let get_c = tokio::time::timeout(
+            Duration::from_secs(2),
+            send.send_to_handler(ContractHandlerEvent::GetQuery {
+                instance_id: *key_c.id(),
+                return_contract_code: false,
+            }),
+        )
+        .await
+        .expect(
+            "a local-store GET must NOT block behind a delegate parked on a \
+             user prompt (#5544)",
+        )
+        .expect("GET for C must respond");
+        match get_c {
+            ContractHandlerEvent::GetResponse { response, .. } => {
+                let store = response.expect("GET for C must succeed");
+                assert_eq!(
+                    store.state.expect("C has state").as_ref(),
+                    b"c_state",
+                    "GET must return C's stored state"
+                );
+            }
+            other => panic!("expected GetResponse for C, got {other}"),
+        }
+
+        // Release the human: the delegate resumes and its client is answered.
+        gate.notify_waiters();
+        let resp = tokio::time::timeout(Duration::from_secs(5), delegate_task)
+            .await
+            .expect("the parked delegate must resolve once the prompt is answered")
+            .expect("delegate task join")
+            .expect("delegate request must be answered");
+        assert!(
+            matches!(resp, ContractHandlerEvent::DelegateResponse(_)),
+            "parked delegate must answer its original client exactly once, got {resp}"
+        );
+
+        handle.abort();
+    }
+
+    /// THE EXCLUSION TEST. Pins the invariant that makes parking sound.
+    ///
+    /// `DelegateContextCache` is keyed by `DelegateKey` and last-write-wins, so
+    /// it is only correct while at most one `process()` per delegate is in
+    /// flight. Before #5544 the serial loop supplied that for free; parking
+    /// removes it, so `DelegateParkCtx` has to supply it instead. If it did
+    /// not, a second request would run `process()` and overwrite the parked
+    /// continuation, and the delegate would resume reading someone else's
+    /// bytes — silent state corruption, not a crash, which is why it needs a
+    /// test rather than trust.
+    ///
+    /// NOTE FOR REVIEWERS: this test CANNOT fail on pre-#5544 `main`, because
+    /// there the blocked loop prevents the interleave by construction. It is a
+    /// pin against *this* change regressing: delete the `is_parked` check in
+    /// `dispatch_delegate_request` and it fails, because the second request
+    /// reaches the executor while the first is still parked. That is the
+    /// falsification to run if you want to confirm it is not vacuous.
+    #[tokio::test]
+    async fn a_parked_delegate_is_not_re_entered_until_it_resumes() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        let calls = handler.runtime_mut().delegate_calls.clone();
+        // Only the FIRST invocation prompts; later ones return nothing, so the
+        // round-trip terminates instead of parking forever.
+        script.lock().unwrap().push_back(prompt_outbound());
+
+        let send = Arc::new(send);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter { gate: gate.clone() },
+        ));
+
+        let key_d = test_delegate_key();
+
+        // Request 1 parks the delegate.
+        let send_1 = send.clone();
+        let k1 = key_d.clone();
+        let first: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
+            GlobalExecutor::spawn(async move { send_1.send_to_handler(delegate_event(&k1)).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the first request must have entered the delegate exactly once"
+        );
+
+        // Request 2 for the SAME delegate arrives while it is parked.
+        let send_2 = send.clone();
+        let k2 = key_d.clone();
+        let second: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
+            GlobalExecutor::spawn(async move { send_2.send_to_handler(delegate_event(&k2)).await });
+
+        // Give the loop ample opportunity to (wrongly) run it.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "a parked delegate must NOT be re-entered: the queued request would \
+             overwrite the parked continuation's context (#5544)"
+        );
+
+        // Release the prompt: the parked run resumes, then the queued request
+        // is drained — both reach the delegate, in order.
+        gate.notify_waiters();
+        let r1 = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("first delegate request must resolve")
+            .expect("join")
+            .expect("first must be answered");
+        assert!(matches!(r1, ContractHandlerEvent::DelegateResponse(_)));
+        let r2 = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the queued request must be drained once the park ends")
+            .expect("join")
+            .expect("second must be answered");
+        assert!(
+            matches!(r2, ContractHandlerEvent::DelegateResponse(_)),
+            "a request queued behind a park must still be answered, never dropped"
+        );
+        assert!(
+            calls.lock().unwrap().len() >= 3,
+            "expected the resume plus the drained request to enter the delegate, \
+             got {} entries",
+            calls.lock().unwrap().len()
+        );
+
+        handle.abort();
+    }
+
 }
