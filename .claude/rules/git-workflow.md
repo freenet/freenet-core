@@ -40,6 +40,17 @@ for the agents being most careful about isolation. Discovered 2026-09-04 while
 verifying PR #5493 from a sibling worktree: four bogus clippy errors in
 untouched files, all of which vanished under the pinned toolchain.
 
+**There is no rustdoc job in CI**, so a broken intra-doc link — `[`foo`]`
+naming an item that was renamed or removed — fails nothing. `cargo clippy` does
+not resolve doc links and `cargo test` does not either; only `cargo doc` would,
+and nothing runs it. Check doc links by hand when you move or rename an item
+that rustdoc prose refers to.
+
+Both of these are the same shape and worth naming as one habit: **a check you
+assume is running may not be.** Before trusting a gate, confirm it exists and
+that it is looking at what you think — the toolchain trap is a gate reading the
+wrong source of truth, the rustdoc gap is a gate that was never there.
+
 ### WHEN creating a commit message
 
 ```
