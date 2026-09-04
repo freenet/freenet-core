@@ -1473,6 +1473,16 @@ where
                         // task is dropped, panics or is cancelled, so the park
                         // always ends, its pending queue always drains and the
                         // parked client is always answered.
+                        //
+                        // NOTE, load-bearing: this task deliberately captures
+                        // NO `ContractHandler` and no executor — only the
+                        // prompter, an OpManager handle and plain data. That is
+                        // what keeps delegate `process()` globally serial on the
+                        // loop even though the loop is now released mid-
+                        // round-trip, which #5490's non-atomic
+                        // `state_content_changed` gate depends on. Do not hand
+                        // this task the handler. See `delegate_park`'s module
+                        // docs, "What parking does NOT relax".
                         GlobalExecutor::spawn(async move {
                             // Prompts and fetches run CONCURRENTLY, and the whole
                             // body is capped by PARK_WORK_BUDGET. Sequentially
