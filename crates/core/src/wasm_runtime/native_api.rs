@@ -837,27 +837,49 @@ impl DelegateCallEnv {
     ///
     /// The comparison happens here; the write happens further down
     /// `put_contract_state_sync` / `update_contract_state_sync`. Nothing holds
-    /// a lock across the two. **Correctness currently depends on delegate
-    /// handling being serialized by the contract-handling loop** — both entry
-    /// points (`contract.rs`) `await` `handle_delegate_with_contract_requests`
-    /// inline on that single loop with no spawn, so two V2 delegate writes to
-    /// one contract cannot interleave on a node today.
+    /// a lock across the two, and this code owns nothing that makes the pair
+    /// safe. **Correctness depends on delegate `process()` being GLOBALLY
+    /// serialized by the contract-handling loop** — `execute_delegate_request`
+    /// is reached only from `handle_delegate_with_contract_requests`, whose
+    /// call sites all `await` it inline on that single-task loop with no
+    /// spawn, so two V2 delegate writes cannot run concurrently on a node.
     ///
-    /// If that serialization is removed, this gate can suppress a REAL change.
-    /// The interleaving is not the symmetric one it looks like: writer A whose
-    /// own bytes happen to equal what it reads decides "no change" and will
+    /// Were that to change, this gate could suppress a REAL change. The
+    /// interleaving is not the symmetric one it looks like: writer A whose own
+    /// bytes happen to equal what it reads decides "no change" and will
     /// suppress; writer B then commits and broadcasts different bytes; A then
     /// writes its own bytes and stays silent. Local state ends at A's value
     /// while the network last heard B's, and nothing re-announces it until the
-    /// next write or the anti-entropy heartbeat. Note that this is precisely
-    /// the idempotent-rewrite workload the gate exists to catch, so the racy
-    /// case is the common case rather than an exotic one.
+    /// next write or the anti-entropy heartbeat. That is precisely the
+    /// idempotent-rewrite workload this gate exists to catch, so the racy case
+    /// would be the common case rather than an exotic one.
     ///
-    /// **#5544 removes that serialization** to fix a node-wide stall. Whoever
-    /// lands it owns this: the gate is not self-sufficient, and the fix is to
-    /// make the compare-and-write atomic (fold the comparison into the same
-    /// ReDb write transaction as the store, the way `update_state_sync`
-    /// already does its check-and-write) rather than to rely on the loop.
+    /// # Per-delegate exclusion would NOT be enough
+    ///
+    /// Read this before concluding some newer delegate-concurrency mechanism
+    /// already covers this gate. **The racing pair is two DIFFERENT delegates
+    /// writing the same contract**, so an exclusion that serializes each
+    /// delegate against itself leaves the race fully intact. Only GLOBAL
+    /// serialization of delegate execution — or an atomic compare-and-write
+    /// here — closes it.
+    ///
+    /// #5544 (implemented by #5554) removes a node-wide stall by moving work
+    /// off this loop, and **preserves the global serialization above**: the
+    /// off-loop task captures neither a `ContractHandler` nor an executor, so
+    /// it structurally cannot invoke a delegate — its jobs (awaiting a human,
+    /// driving a sub-op GET) need neither, and a resumed `process()` always
+    /// runs back on the loop. Parking therefore opens a window in which a
+    /// different delegate may START, not one in which two may RUN. The gate
+    /// stays safe across that change.
+    ///
+    /// # The durable fix
+    ///
+    /// The guarantee above is an unenforced property of the contract-handling
+    /// loop, not an invariant this code holds. Nothing here fails if a future
+    /// change breaks it. The durable fix is to make the compare-and-write
+    /// atomic — fold the comparison into the same ReDb write transaction as
+    /// the store, the way `update_state_sync` already does its check-and-write
+    /// — so this gate stops depending on a caller-side property at all.
     fn state_content_changed(
         &self,
         contract_key: &ContractKey,
