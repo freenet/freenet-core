@@ -42,6 +42,63 @@
 //! which is the correct semantics, not a compromise. Everything else on the
 //! node keeps running.
 //!
+//! # What parking does NOT relax: `process()` stays globally serial
+//!
+//! Parking releases the loop while a delegate is **suspended**, never while it
+//! is **running**. That distinction is load-bearing for code outside this
+//! module, so state it as an invariant:
+//!
+//! > **At most one delegate `process()` executes node-wide at any instant, and
+//! > it always executes on the `contract_handling` loop.**
+//!
+//! Two separate properties depend on it:
+//!
+//! * `DelegateContextCache` needs one `process()` **per delegate** — that is
+//!   the narrower guarantee, and it is the one [`DelegateParkCtx`]'s exclusion
+//!   supplies, because parking genuinely does let a delegate's round-trip span
+//!   loop iterations.
+//! * `native_api::state_content_changed` (V2 delegate writes, #5490) needs one
+//!   write **per contract**. Its read-then-write pair is not atomic, and its
+//!   racing pair is two DIFFERENT delegates writing the SAME contract — which
+//!   per-delegate exclusion permits by construction. It is safe only because of
+//!   the global property above, not because of anything in this module.
+//!
+//! Why the global property still holds after #5544, by construction rather than
+//! by convention:
+//!
+//! 1. `execute_delegate_request` has exactly two call sites, both inside
+//!    `handle_delegate_with_contract_requests`.
+//! 2. That function has four call sites — `handle_delegate_notification`,
+//!    `dispatch_delegate_request` (twice) and `handle_delegate_resume` — and
+//!    every one of them is reached only by being awaited from
+//!    `contract_handling`, which is a single task per node.
+//! 3. The off-loop task this module spawns captures a `ParkGuard`, an
+//!    `Arc<P: UserInputPrompter>`, an `Option<Arc<OpManager>>` and plain data.
+//!    It does **not** capture the `ContractHandler` or an executor, so it
+//!    cannot invoke a delegate even by mistake. Its two jobs — waiting on a
+//!    human and driving a sub-op GET — need neither.
+//! 4. A resume re-enters the delegate from `handle_delegate_resume`, which runs
+//!    **on the loop**. The spawned task only ships a result back down a
+//!    channel; it never runs the continuation itself.
+//!
+//! So the window parking opens is a window in which a *different* delegate may
+//! **start**, not one in which two may **run**. #5490's TOCTOU stays
+//! unreachable, and its atomic compare-and-write (folding the comparison into
+//! the same ReDb write transaction as the store, the way `update_state_sync`
+//! already does) is a follow-up rather than a prerequisite for this change.
+//!
+//! **What would break it.** Spawning any work that holds the
+//! `ContractHandler`, or resuming a continuation anywhere other than the loop.
+//! If you are about to do either, #5490's gate must become atomic first. The
+//! nearest existing precedent is deliberately NOT a counter-example: #4531's
+//! hosted-secret export does run off-loop holding a pooled executor, but it
+//! enumerates and seals secrets and never invokes a delegate.
+//!
+//! **The pattern worth noticing.** This is the second documented-but-unenforced
+//! invariant found to be resting on the serial loop by accident rather than by
+//! design — the context cache was the first. Neither said so where it was
+//! relied upon. When touching this loop, assume there is a third.
+//!
 //! # Ownership
 //!
 //! Loop-owned (`contract_handling` holds it and passes `&mut` down), NOT a
