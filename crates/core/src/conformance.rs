@@ -123,7 +123,10 @@ mod wasm_tests;
 
 pub use bundle::{ReplayBundle, Transition};
 pub use capture::{CaptureHandle, Observation};
-pub use evidence::{ConformanceEvidence, EVIDENCE_SCHEMA_VERSION, EvidenceId, EvidenceRejected};
+pub use evidence::{
+    ConformanceEvidence, EVIDENCE_MAGIC, EVIDENCE_SCHEMA_VERSION, EvidenceError, EvidenceId,
+    EvidenceRejected,
+};
 pub use focus::FocusSelector;
 pub use generator::{GeneratorConfig, generate_cases};
 pub use host_clock::{

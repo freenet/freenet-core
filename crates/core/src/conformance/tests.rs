@@ -2809,6 +2809,65 @@ fn unsupported_schema_is_rejected() {
     ));
 }
 
+#[test]
+fn a_foreign_file_is_not_mistaken_for_evidence() {
+    use super::evidence::{ConformanceEvidence, EvidenceError};
+    assert!(matches!(
+        ConformanceEvidence::decode(b"definitely not evidence"),
+        Err(EvidenceError::BadMagic)
+    ));
+    assert!(matches!(
+        ConformanceEvidence::decode(b"FRNT"),
+        Err(EvidenceError::BadMagic)
+    ));
+    assert!(matches!(
+        ConformanceEvidence::decode(b""),
+        Err(EvidenceError::BadMagic)
+    ));
+}
+
+#[test]
+fn an_evidence_from_an_unsupported_schema_is_refused_before_bincode() {
+    use super::evidence::{ConformanceEvidence, EVIDENCE_SCHEMA_VERSION, EvidenceError};
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    let mut encoded = evidence.encode().expect("encode");
+
+    // Bump the version in the 10-byte header, leaving the magic intact.
+    let bumped = EVIDENCE_SCHEMA_VERSION + 1;
+    encoded[8..10].copy_from_slice(&bumped.to_le_bytes());
+    // Corrupt the body so that bincode would error if deserialization ran first.
+    encoded[10..].fill(0xff);
+
+    match ConformanceEvidence::decode(&encoded) {
+        Err(EvidenceError::UnsupportedSchema { found, supported }) => {
+            assert_eq!(found, bumped);
+            assert_eq!(supported, EVIDENCE_SCHEMA_VERSION);
+        }
+        other => panic!("expected an unsupported-schema refusal, got {other:?}"),
+    }
+
+    // Also verify schema version 1 (older version) is refused without entering bincode.
+    encoded[8..10].copy_from_slice(&1u16.to_le_bytes());
+    match ConformanceEvidence::decode(&encoded) {
+        Err(EvidenceError::UnsupportedSchema { found, supported }) => {
+            assert_eq!(found, 1);
+            assert_eq!(supported, EVIDENCE_SCHEMA_VERSION);
+        }
+        other => panic!("expected schema 1 refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn evidence_encode_decode_roundtrip() {
+    use super::evidence::ConformanceEvidence;
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let bytes = evidence.encode().expect("encode");
+    let decoded = ConformanceEvidence::decode(&bytes).expect("decode");
+    assert_eq!(decoded, evidence);
+}
+
 // ----------------------------------------------------------------------- generator
 
 #[test]

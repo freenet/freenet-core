@@ -32,10 +32,9 @@ use freenet::conformance::generator::Corpus;
 use freenet::conformance::host_clock;
 use freenet::conformance::verifier::Bytes;
 use freenet::conformance::{
-    ConformanceCase, ConformanceEvidence, ConformanceProperty, EVIDENCE_SCHEMA_VERSION,
-    EvidenceRejected, GeneratorConfig, IdempotenceSettling, Inconclusive, MinimizeConfig,
-    OracleBuildError, PropertyOutcome, ReplayBundle, RuntimeOracle, Severity, Transition,
-    generate_cases, minimize, verify_case,
+    ConformanceCase, ConformanceEvidence, ConformanceProperty, EvidenceRejected, GeneratorConfig,
+    IdempotenceSettling, Inconclusive, MinimizeConfig, OracleBuildError, PropertyOutcome,
+    ReplayBundle, RuntimeOracle, Severity, Transition, generate_cases, minimize, verify_case,
 };
 use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId, State, UpdateData};
 use serde::Serialize;
@@ -476,18 +475,8 @@ fn parse_properties(names: &[String]) -> anyhow::Result<Vec<ConformanceProperty>
 /// differ, and both are worth knowing.
 async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::Result<()> {
     let bytes = read_file(path)?;
-    let evidence: ConformanceEvidence = bincode::deserialize(&bytes)
+    let evidence = ConformanceEvidence::decode(&bytes)
         .with_context(|| format!("decoding evidence {}", path.display()))?;
-
-    // Refuse a schema this build does not know, rather than reading fields that may
-    // have changed meaning. Silently misreading evidence is worse than declining.
-    if evidence.schema_version != EVIDENCE_SCHEMA_VERSION {
-        anyhow::bail!(
-            "evidence uses schema version {}, this build understands {}",
-            evidence.schema_version,
-            EVIDENCE_SCHEMA_VERSION
-        );
-    }
 
     // Bounds-check with the same function a receiving peer uses, so this command
     // never accepts evidence the network itself would reject, and do it BEFORE
@@ -1056,8 +1045,9 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
         if !written.insert(id) {
             continue;
         }
-        let bytes =
-            bincode::serialize(&evidence).with_context(|| format!("encoding evidence {id}"))?;
+        let bytes = evidence
+            .encode()
+            .with_context(|| format!("encoding evidence {id}"))?;
         let path = dir.join(format!("{id}.bin"));
         std::fs::write(&path, bytes)
             .with_context(|| format!("writing evidence to {}", path.display()))?;
@@ -3050,11 +3040,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("temp dir");
         let evidence_path = dir.path().join("evidence.bin");
-        std::fs::write(
-            &evidence_path,
-            bincode::serialize(&evidence).expect("encode evidence"),
-        )
-        .expect("write evidence");
+        std::fs::write(&evidence_path, evidence.encode().expect("encode evidence"))
+            .expect("write evidence");
 
         let store_file = dir.path().join("contract.wasm");
         let encoded = ContractCode::from(code.clone())
@@ -3106,11 +3093,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("temp dir");
         let evidence_path = dir.path().join("evidence.bin");
-        std::fs::write(
-            &evidence_path,
-            bincode::serialize(&evidence).expect("encode evidence"),
-        )
-        .expect("write evidence");
+        std::fs::write(&evidence_path, evidence.encode().expect("encode evidence"))
+            .expect("write evidence");
 
         let store_file = dir.path().join("contract.wasm");
         let encoded = ContractCode::from(wrong_code.clone())
@@ -3128,6 +3112,59 @@ mod tests {
             err.to_string().contains(&inner_hash),
             "the error must name the INNER code hash so an operator can compare \
              it against store filenames; got: {err}"
+        );
+    }
+
+    /// An evidence file from an unsupported schema version must be refused politely
+    /// with an explicit version message rather than an opaque deserialization error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_evidence_rejects_unsupported_schema_politely() {
+        let code = minimal_contract_wasm(1);
+        let params = Vec::new();
+        let instance = ContractInstanceId::from_params_and_code(
+            freenet_stdlib::prelude::Parameters::from(params.clone()),
+            ContractCode::from(code.clone()),
+        );
+        let case = ConformanceCase::new(
+            ConformanceProperty::StateIdempotence,
+            vec![Bytes::from(vec![1u8, 2, 3])],
+        );
+        let evidence = ConformanceEvidence::new(instance, params, &case, None);
+        let mut bytes = evidence.encode().expect("encode");
+
+        // Set the schema version to 1 in the framing header.
+        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let evidence_path = dir.path().join("evidence.bin");
+        std::fs::write(&evidence_path, &bytes).expect("write evidence");
+
+        let config = wasm_only_config(None);
+        let err = verify_evidence(&config, &evidence_path)
+            .await
+            .expect_err("unsupported schema must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("evidence uses schema version 1, this build understands 2"),
+            "error should state schema version mismatch cleanly; got: {msg}"
+        );
+    }
+
+    /// A file with bad magic is rejected fast as not conformance evidence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_evidence_rejects_bad_magic() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let evidence_path = dir.path().join("evidence.bin");
+        std::fs::write(&evidence_path, b"not evidence content here").expect("write file");
+
+        let config = wasm_only_config(None);
+        let err = verify_evidence(&config, &evidence_path)
+            .await
+            .expect_err("bad magic must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not conformance evidence (bad magic)"),
+            "error should indicate bad magic; got: {msg}"
         );
     }
 
