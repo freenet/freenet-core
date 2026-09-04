@@ -114,6 +114,20 @@ pub(super) struct PendingRequest {
     pub user_context: Option<UserSecretContext>,
 }
 
+/// Where a resumed run's residual `ApplicationMessage`s must go.
+///
+/// The two entry points differ: a client-driven run answers the parked client
+/// responder (so the client sees ONE response covering the whole round-trip,
+/// exactly as it does today when the loop blocks), while a
+/// notification-driven run has no client and fans out to the apps registered
+/// with the delegate — the same route `handle_delegate_notification` already
+/// uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Delivery {
+    Client,
+    Apps,
+}
+
 /// Everything needed to re-enter a parked delegate on a later loop iteration.
 ///
 /// `params` is carried explicitly and is NOT optional: `DelegateKey` identity
@@ -133,8 +147,12 @@ pub(super) struct Continuation {
     /// Responses already computed for this iteration, awaiting the parked one.
     pub inbound_so_far: Vec<InboundDelegateMsg<'static>>,
     /// The parked client's responder, if this run descends from a client
-    /// request. `None` for a notification-driven run, which has no client.
+    /// request. Attached by the caller immediately after parking (it owns the
+    /// channel the responder is taken from), and re-attached by the resume
+    /// handler if the resumed run parks again — a delegate that prompts twice
+    /// in a row must not strand its client.
     pub responder: Option<StashedResponder>,
+    pub delivery: Delivery,
 }
 
 /// One parked delegate.
@@ -265,14 +283,24 @@ pub(super) enum QueueOutcome {
 }
 
 /// Loop-owned per-delegate park state.
-#[derive(Default)]
 pub(super) struct DelegateParkCtx {
     parked: HashMap<DelegateKey, ParkEntry>,
+    /// Handed to each [`ParkGuard`] so an off-loop task can deliver its resume.
+    /// Kept here rather than threaded separately so every call site needs only
+    /// a single `&mut DelegateParkCtx`.
+    resume_tx: tokio::sync::mpsc::UnboundedSender<DelegateResume>,
 }
 
 impl DelegateParkCtx {
-    pub(super) fn new() -> Self {
-        Self::default()
+    pub(super) fn new(resume_tx: tokio::sync::mpsc::UnboundedSender<DelegateResume>) -> Self {
+        Self {
+            parked: HashMap::new(),
+            resume_tx,
+        }
+    }
+
+    pub(super) fn resume_tx(&self) -> &tokio::sync::mpsc::UnboundedSender<DelegateResume> {
+        &self.resume_tx
     }
 
     /// `true` if this delegate currently has a parked continuation, and so must
@@ -281,6 +309,7 @@ impl DelegateParkCtx {
         self.parked.contains_key(key)
     }
 
+    #[cfg(test)]
     pub(super) fn parked_count(&self) -> usize {
         self.parked.len()
     }
@@ -339,6 +368,33 @@ impl DelegateParkCtx {
         QueueOutcome::Queued
     }
 
+    /// Hand the parked client's responder to a live park.
+    ///
+    /// Separate from [`park`](Self::park) because the responder is taken from
+    /// the contract-handler channel, which the caller owns and this registry
+    /// deliberately knows nothing about. A `None` responder (client already
+    /// gone) is stored as-is: the park still has to terminate.
+    pub(super) fn attach_responder(
+        &mut self,
+        key: &DelegateKey,
+        responder: Option<StashedResponder>,
+    ) {
+        match self.parked.get_mut(key) {
+            Some(entry) => entry.continuation.responder = responder,
+            None => {
+                // Unreachable: the caller attaches immediately after a
+                // successful park, on the same loop iteration, and nothing
+                // else can end a park in between. Log rather than panic — a
+                // dropped response is recoverable, a panicked loop is not.
+                tracing::error!(
+                    delegate = %key,
+                    "attach_responder for a delegate that is not parked; the \
+                     client for this run will not be answered"
+                );
+            }
+        }
+    }
+
     /// End a park, returning its continuation and everything queued behind it.
     pub(super) fn take(
         &mut self,
@@ -384,6 +440,7 @@ mod tests {
             accumulated: Vec::new(),
             inbound_so_far: Vec::new(),
             responder: None,
+            delivery: Delivery::Client,
         }
     }
 
@@ -401,9 +458,17 @@ mod tests {
         }
     }
 
+    fn ctx() -> (
+        DelegateParkCtx,
+        tokio::sync::mpsc::UnboundedReceiver<DelegateResume>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (DelegateParkCtx::new(tx), rx)
+    }
+
     #[tokio::test]
     async fn park_then_take_round_trips() {
-        let mut ctx = DelegateParkCtx::new();
+        let (mut ctx, _rx) = ctx();
         let k = key(1);
         assert!(!ctx.is_parked(&k));
         assert!(matches!(
@@ -418,7 +483,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_wide_cap_refuses_and_hands_the_continuation_back() {
-        let mut ctx = DelegateParkCtx::new();
+        let (mut ctx, _rx) = ctx();
         for i in 0..MAX_PARKED_DELEGATES {
             assert!(matches!(
                 ctx.park(key(i as u8), continuation()),
@@ -437,7 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn double_park_is_refused_not_clobbered() {
-        let mut ctx = DelegateParkCtx::new();
+        let (mut ctx, _rx) = ctx();
         let k = key(1);
         assert!(matches!(
             ctx.park(k.clone(), continuation()),
@@ -454,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_queue_is_capped_and_overflow_is_returned_not_dropped() {
-        let mut ctx = DelegateParkCtx::new();
+        let (mut ctx, _rx) = ctx();
         let k = key(1);
         ctx.park(k.clone(), continuation());
         for i in 0..MAX_PENDING_PER_DELEGATE {
@@ -475,7 +540,7 @@ mod tests {
 
     #[tokio::test]
     async fn queueing_for_an_unparked_delegate_returns_the_request() {
-        let mut ctx = DelegateParkCtx::new();
+        let (mut ctx, _rx) = ctx();
         assert!(matches!(
             ctx.queue_pending(&key(1), pending(1)),
             QueueOutcome::Rejected(_)
@@ -484,7 +549,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn park_expires_only_after_the_ttl() {
-        let mut ctx = DelegateParkCtx::new();
+        let (mut ctx, _rx) = ctx();
         let k = key(1);
         ctx.park(k.clone(), continuation());
 
