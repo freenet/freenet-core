@@ -108,13 +108,26 @@
 //!     do the mirror image: `ContractStore::remove_contract` drops the hook and
 //!     cannot reach the ring to drop the demand.
 //!
-//! # Why there is no per-contract drop
+//! # Why the per-contract drop is as narrow as it is
 //!
-//! Only [`drop_delegate_demand`] exists, not a `drop_subscription(delegate,
-//! contract)`. Every teardown today is whole-delegate — `UnregisterDelegate`,
-//! and the notification channel closing — so a per-contract primitive would be
-//! unused code, and the natural place to write it is alongside its first real
-//! caller, the explicit unsubscribe in #4669 part 4 / #2830.
+//! There are two teardowns, and they differ in scope because the thing each one
+//! keeps demand in step with differs in scope.
+//!
+//! [`drop_delegate_demand`] is whole-delegate and is what `UnregisterDelegate`
+//! uses (`contract/executor/runtime/delegates.rs`): the delegate is going away
+//! entirely, so every pin it holds goes with it.
+//!
+//! [`drop_subscription`] retires one delegate's demand on ONE contract. Its only
+//! caller is the notification-channel-closed arm in
+//! `contract/executor/runtime/executor_impl.rs`, which is itself per-contract —
+//! it clears `DELEGATE_SUBSCRIPTIONS[instance_id]`, and that map is a
+//! process-global `static` while demand is per-`Ring`, so a wider sweep would
+//! strip another node's hooks while dropping only this node's demand. See that
+//! arm's comment for the full argument.
+//!
+//! What still does not exist is an `unsubscribe(delegate, contract)` a DELEGATE
+//! can call. That is #4669 part 4 / #2830, and the natural place to write it is
+//! alongside its first real caller rather than here.
 //!
 //! # No new spawn path
 //!
