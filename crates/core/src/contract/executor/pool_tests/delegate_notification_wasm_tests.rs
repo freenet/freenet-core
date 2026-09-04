@@ -29,6 +29,10 @@
 //! | `perform_contract_put`, fresh-install branch | [`local_put_notifies_subscribed_delegates`] |
 //! | `perform_contract_put`, existing-contract merge branch | [`local_reput_merge_notifies_subscribed_delegates`] |
 //! | `get_updated_state`, related-contract install | [`related_contract_install_notifies_the_related_contracts_delegates`] |
+//!
+//! Plus [`failed_ws_notification_neither_fails_the_put_nor_stops_the_other_legs`],
+//! which covers the behaviour change the chokepoint introduces: a failure in
+//! one leg must not fail the commit or abort the remaining legs.
 
 use freenet_stdlib::client_api::ContractRequest;
 use freenet_stdlib::prelude::*;
@@ -37,7 +41,7 @@ use std::time::Duration;
 
 use crate::client_events::ClientId;
 use crate::config::ConfigArgs;
-use crate::contract::executor::{DelegateNotification, Executor, OperationMode};
+use crate::contract::executor::{ContractExecutor, DelegateNotification, Executor, OperationMode};
 use crate::node::OpManager;
 use crate::operations::get::GetResult;
 use crate::wasm_runtime::{
@@ -53,6 +57,11 @@ const MOCK_ALIGNED_CONTRACT: &str = "test-contract-mock-aligned";
 /// settles on the second. The only fixture that can enter the
 /// fetch-and-install branch of `get_updated_state`.
 const REQUIRES_RELATED_CONTRACT: &str = "test-contract-requires-related";
+
+/// `get_state_delta` always fails. The only way to drive
+/// `send_update_notification` (leg 2) into its error path without adding a
+/// production seam.
+const DELTA_TRAP_CONTRACT: &str = "test-contract-delta-trap";
 
 /// Every test loads its contracts under DISTINCT parameters.
 ///
@@ -113,7 +122,19 @@ impl Drop for SubOpGetStubGuard {
     }
 }
 
-async fn build_op_manager(id: &str) -> (Arc<OpManager>, Box<dyn std::any::Any>) {
+/// Returns the `OpManager`, the event-loop notification RECEIVER, and the
+/// remaining channel ends that merely need to stay alive.
+///
+/// The receiver is handed back separately rather than buried in the opaque
+/// guard box because leg 4 of the fan-out (`broadcast_state_change`) is
+/// observable only as a `NodeEvent::BroadcastStateChange` on it.
+async fn build_op_manager(
+    id: &str,
+) -> (
+    Arc<OpManager>,
+    crate::node::EventLoopNotificationsReceiver,
+    Box<dyn std::any::Any>,
+) {
     let config_args = ConfigArgs {
         id: Some(id.to_string()),
         mode: Some(OperationMode::Local),
@@ -144,27 +165,26 @@ async fn build_op_manager(id: &str) -> (Arc<OpManager>, Box<dyn std::any::Any>) 
     );
     op_manager.ring.attach_op_manager(&op_manager);
 
-    let guards: Box<dyn std::any::Any> = Box::new((
-        notification_rx,
-        ch_channel,
-        wait_for_event,
-        result_router_rx,
-        task_monitor,
-    ));
-    (op_manager, guards)
+    let guards: Box<dyn std::any::Any> =
+        Box::new((ch_channel, wait_for_event, result_router_rx, task_monitor));
+    (op_manager, notification_rx, guards)
 }
 
 /// A real `Executor<Runtime>` in local mode over real (temp-dir) stores, plus
 /// the guards that must outlive it.
 struct Harness {
     executor: Executor<Runtime>,
+    /// Where `broadcast_state_change` (leg 4) lands. Kept alive for every test,
+    /// not only the one that reads it: dropping it would make the leg fail with
+    /// a closed channel, which the executor swallows by design.
+    notifications: crate::node::EventLoopNotificationsReceiver,
     _op_manager: Arc<OpManager>,
     _op_manager_guards: Box<dyn std::any::Any>,
     _temp_dir: tempfile::TempDir,
 }
 
 async fn build_harness(id: &str) -> Result<Harness, Box<dyn std::error::Error>> {
-    let (op_manager, op_manager_guards) = build_op_manager(id).await;
+    let (op_manager, notifications, op_manager_guards) = build_op_manager(id).await;
 
     let temp_dir = crate::util::tests::get_temp_dir();
     let db = crate::contract::storages::Storage::new(temp_dir.path()).await?;
@@ -189,6 +209,7 @@ async fn build_harness(id: &str) -> Result<Harness, Box<dyn std::error::Error>> 
 
     Ok(Harness {
         executor,
+        notifications,
         _op_manager: op_manager,
         _op_manager_guards: op_manager_guards,
         _temp_dir: temp_dir,
@@ -200,6 +221,32 @@ async fn load(name: &'static str, params: Parameters<'static>) -> ContractContai
         .await
         .expect("join contract compile")
         .expect("compile contract")
+}
+
+/// Whether a `BroadcastStateChange` for `key` is sitting on the event-loop
+/// notification channel — the only observable effect of leg 4
+/// (`broadcast_state_change`) from inside the executor.
+///
+/// Drains what is queued rather than blocking: the emit is a synchronous
+/// `try_send` completed before `contract_requests` returns, so anything owed is
+/// already there and an empty channel is a real answer, not a race.
+fn broadcast_emitted_for(
+    notifications: &mut crate::node::EventLoopNotificationsReceiver,
+    key: &ContractKey,
+) -> bool {
+    let mut seen = false;
+    while let Ok(event) = notifications.notifications_receiver.try_recv() {
+        if let either::Either::Right(crate::message::NodeEvent::BroadcastStateChange {
+            key: broadcast_key,
+            ..
+        }) = event
+        {
+            if broadcast_key.id() == key.id() {
+                seen = true;
+            }
+        }
+    }
+    seen
 }
 
 /// Await one delegate notification, failing with `context` rather than a bare
@@ -383,10 +430,135 @@ async fn local_reput_merge_notifies_subscribed_delegates() -> Result<(), Box<dyn
     Ok(())
 }
 
+/// The behaviour change this PR makes deliberate: a failed WebSocket
+/// notification (leg 2) must NOT fail the PUT, and must NOT abort legs 3 and 4.
+///
+/// `perform_contract_put` used to map a `send_update_notification` error into
+/// `StdContractError::Put` and return it — reporting a PUT as FAILED after its
+/// state was already stored and metered, over a `get_state_delta` trap
+/// belonging to some *other* client's cached summary. Routing through
+/// `finalize_state_commit` makes every leg best-effort.
+///
+/// Neither behaviour was ever regression-tested: `grep -rn "failed while
+/// sending notifications"` finds nothing in the tree, so the OLD behaviour had
+/// no test either and a silent revert in either direction would have gone
+/// unnoticed.
+///
+/// The assertion that matters most is the last one. "Every leg is best-effort"
+/// is implied by the structure of `finalize_state_commit` and pinned by nothing:
+/// a `?` reintroduced anywhere in legs 2 or 3 would abort the rest of the
+/// fan-out silently, which is the exact failure class this whole PR exists to
+/// close.
+///
+/// Forcing the error needs no production seam. `send_update_notification`
+/// computes a delta for any subscriber holding a cached summary and propagates
+/// the failure with `?`, so a contract whose `get_state_delta` always fails
+/// (`test-contract-delta-trap`) plus a subscriber registered WITH a summary is
+/// enough.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_ws_notification_neither_fails_the_put_nor_stops_the_other_legs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let contract = load(DELTA_TRAP_CONTRACT, params(5)).await;
+    let contract_key = contract.key();
+
+    let mut harness = build_harness("delegate-notify-leg2-failure").await?;
+
+    let delegate = DelegateKey::new([24u8; 32], CodeHash::new([24u8; 32]));
+    let _subscription = SubscriptionGuard::register(*contract_key.id(), delegate.clone());
+
+    let (delegate_tx, mut delegate_rx) = tokio::sync::mpsc::channel(8);
+    harness.executor.set_delegate_notification_tx(delegate_tx);
+
+    // A WS client WITH a cached summary. The summary is what selects the delta
+    // path; without it the executor sends full state, `get_state_delta` is
+    // never called, and this test would pass while exercising nothing — which
+    // is why the "client received nothing" assertion below is not optional.
+    let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel(8);
+    ContractExecutor::register_contract_notifier(
+        &mut harness.executor,
+        *contract_key.id(),
+        ClientId::FIRST,
+        ws_tx,
+        Some(StateSummary::from(b"cached summary".to_vec())),
+    )
+    .map_err(|e| format!("register notifier: {e}"))?;
+
+    let state = WrappedState::new(b"state whose delta computation traps".to_vec());
+    let response = put(&mut harness.executor, contract.clone(), state.clone()).await;
+
+    // 1. The commit is not failed by the notification failure.
+    assert!(
+        response.is_ok(),
+        "a failed send_update_notification must not fail the PUT: the state is \
+         already stored and metered by the time leg 2 runs, and the trap belongs \
+         to another client's subscription. Got: {response:?}"
+    );
+
+    // 2. The state really is durable, so the assertions below are about a
+    //    commit that happened rather than one that was rolled back.
+    let stored = harness
+        .executor
+        .state_store
+        .get(&contract_key)
+        .await
+        .map_err(|e| format!("state must be stored despite the notification failure: {e}"))?;
+    assert_eq!(
+        stored.as_ref(),
+        state.as_ref(),
+        "the stored state must be the one that was PUT"
+    );
+
+    // 3. Leg 2 really did fail — otherwise this test proves nothing. The delta
+    //    trap aborts the subscriber loop before any `try_send`, so the client
+    //    gets nothing at all.
+    assert!(
+        ws_rx.try_recv().is_err(),
+        "the WS client must have received NOTHING: if a notification arrived, \
+         get_state_delta was never called and leg 2 did not fail, so the rest of \
+         this test is vacuous. Check that the subscriber was registered with a \
+         summary and that the fixture is test-contract-delta-trap"
+    );
+
+    // 4. Leg 3 still fires.
+    let notification = expect_notification(
+        &mut delegate_rx,
+        "a failure in leg 2 (WS clients) must not stop leg 3 (delegates). \
+         `finalize_state_commit` logs and continues; a `?` reintroduced in leg 2 \
+         would abort the fan-out silently, which is the failure class of #5481",
+    )
+    .await;
+    assert_eq!(
+        notification.contract_id,
+        *contract_key.id(),
+        "the delegate notification must be for the committed contract"
+    );
+    let delivered: &[u8] = notification.new_state.as_ref().as_ref();
+    assert_eq!(
+        delivered,
+        state.as_ref(),
+        "the delegate must be handed the committed state"
+    );
+
+    // 5. Leg 4 still fires. Asserted nowhere else: nothing pins that a failure
+    //    in an earlier leg leaves the network broadcast intact.
+    assert!(
+        broadcast_emitted_for(&mut harness.notifications, &contract_key),
+        "a failure in leg 2 must not stop leg 4 (the network broadcast). No \
+         BroadcastStateChange for this contract reached the event-loop channel"
+    );
+
+    Ok(())
+}
+
 /// The fifth `finalize_state_commit` site, and the one the rule review named:
 /// `get_updated_state` installs a DIFFERENT contract mid-UPDATE — the related
 /// one it fetched in order to validate the update — and owes THAT contract's
 /// subscribers the fan-out.
+///
+/// **This site does not execute in production today — see #5549.** The full
+/// reason is under "What this test does NOT prove" below; it is repeated here
+/// because a reader skimming this one test could otherwise take it as evidence
+/// that the fifth site is live.
 ///
 /// The regression this exists to catch is specific: swapping the site's
 /// `related_key`/`related_params` back to the enclosing `key`/`params`. Every
