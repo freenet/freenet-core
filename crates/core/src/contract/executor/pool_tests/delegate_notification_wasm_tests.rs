@@ -32,10 +32,9 @@
 //! Plus two tests about where the fan-out must NOT be, or must survive:
 //!
 //! - [`related_contract_install_does_not_fan_out_the_get_path_already_did`] —
-//!   the related-contract install in `get_updated_state` is a re-store of a
-//!   state the GET path has already stored and announced, so a
-//!   `finalize_state_commit` there is a guaranteed duplicate rather than a
-//!   missing leg.
+//!   the related-contract install in `get_updated_state` writes back a value
+//!   it just read from the local store, so a `finalize_state_commit` there
+//!   announces a transition that did not happen.
 //! - [`failed_ws_notification_neither_fails_the_put_nor_stops_the_other_legs`] —
 //!   the behaviour change the chokepoint introduces: a failure in one leg must
 //!   not fail the commit or abort the remaining legs.
@@ -556,37 +555,35 @@ async fn failed_ws_notification_neither_fails_the_put_nor_stops_the_other_legs()
     Ok(())
 }
 
-/// The related-contract install must NOT fan out — the GET path already did.
+/// The related-contract install must NOT fan out — it changes no state.
 ///
 /// This test replaces one that asserted the opposite. An earlier revision of
 /// this PR added a `finalize_state_commit` to the install in
-/// `get_updated_state`, on the reasoning that installing a contract's state
-/// owes that contract's subscribers a notification. The reasoning is right; the
-/// placement was wrong, because the notification has already been sent by the
-/// time control arrives.
+/// `get_updated_state`, reasoning that installing a contract's state owes that
+/// contract's subscribers a notification. The rule is right; it does not apply,
+/// because nothing is installed — the arm writes back a value it read from the
+/// local store moments earlier.
 ///
-/// The chain, verified end to end:
+/// Why nothing is owed. `GetResult.state` is NOT the network's reply: the
+/// sub-op driver discards the terminal and rebuilds the `GetResult` by
+/// re-querying the LOCAL STORE (`operations/get/op_ctx_task.rs`), and
+/// `verify_and_store_contract` then raw-`store`s that value. So this arm can
+/// only ever write back what the store already holds — no state transition
+/// happens, and there is nothing to announce.
 ///
-/// 1. The sub-op GET driver calls `cache_contract_locally` on
-///    `Terminal::InlineFound`, BEFORE it builds the `GetResult`
-///    (`operations/get/op_ctx_task.rs`).
-/// 2. `cache_contract_locally` re-queries the local store, finds no matching
-///    state (the contract is absent locally — that is why the fetch happened),
-///    and issues a `ContractHandlerEvent::PutQuery` with the contract code.
-/// 3. That PutQuery routes through `maybe_defer_upsert` into
-///    `bridged_upsert_contract_state_inner`, takes the initial-state-install
-///    branch, and calls `finalize_state_commit` — keyed on the related
-///    contract, which is the right key. **The fan-out has happened.**
-/// 4. Only then does `get_updated_state` see its `GetResult` and re-store.
+/// That is a narrower claim than the one an earlier version of this test made
+/// ("the GET path's `cache_contract_locally` already fanned out"). The earlier
+/// claim is usually true and is not safe to rely on: `cache_contract_locally`
+/// can be reached and still not fan out, via its `state_matches`
+/// short-circuit, `Terminal::LocalCompletion`, an orphan-stream
+/// `AlreadyClaimed` early return, or a rejected `PutQuery`. The re-query
+/// argument covers all four.
 ///
-/// The dependency is causal, not incidental: `GetResult.contract` is resolved
-/// by re-querying the LOCAL store after step 2, so it is `Some` only because
-/// step 2 stored it. Had step 2 not run, the re-query would find no state, the
-/// sub-op would resolve `NotFound`, and execution would never reach the
-/// install. A `finalize_state_commit` at the install site is therefore a
-/// GUARANTEED duplicate — double-notifying every subscribed delegate and
-/// WebSocket client, and double-broadcasting to the network — on a codebase
-/// with #5147/#5148 open about broadcast duplication.
+/// It also names the invariant a #5549 fix would break. The obvious fix there
+/// is to hand `Terminal::InlineFound`'s network-delivered state straight to
+/// the caller and skip the re-query; do that, and this arm starts installing
+/// a state the store does NOT hold, silently and with no fan-out. If that
+/// happens this test should be the thing that has to be argued with.
 ///
 /// So the assertion is an ABSENCE, and absence assertions rot into vacuity
 /// unless something proves the code ran and something proves the observer
@@ -601,10 +598,10 @@ async fn failed_ws_notification_neither_fails_the_put_nor_stops_the_other_legs()
 /// Reaching the branch still needs two test-only pieces —
 /// `test-contract-requires-related`, whose `update_state` returns
 /// `UpdateModification::requires`, and `set_test_sub_op_get_override` — because
-/// nothing else can enter it. Note the stub stands in for the whole sub-op GET,
-/// which means it also stands in for step 2: the test never runs
-/// `cache_contract_locally`, so the absence it observes is exactly "this site
-/// does not fan out", not "the notification went missing".
+/// nothing else can enter it. The stub replaces the whole sub-op GET, so
+/// nothing upstream of the install runs at all — which means the absence this
+/// test observes is exactly "this site does not fan out", never "a
+/// notification went missing somewhere upstream".
 ///
 /// The stub is a thread-local, so this test must stay on `current_thread`.
 ///
@@ -656,10 +653,12 @@ async fn related_contract_install_does_not_fan_out_the_get_path_already_did()
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     harness.executor.set_delegate_notification_tx(tx);
 
-    // Stand in for the sub-op GET. In production `cache_contract_locally` has
-    // stored and fanned out this state before the driver returns; the stub
-    // replaces the whole driver, so nothing has fanned out here and any
-    // notification observed below could only have come from the install site.
+    // Stand in for the sub-op GET. The stub replaces the whole driver, so
+    // nothing upstream has fanned out and any notification observed below could
+    // only have come from the install site itself. Note the stub is MORE
+    // permissive than production, which resolves `GetResult` from the local
+    // store: here the state genuinely is new to the store, and the install
+    // still must not announce it.
     let related_state = WrappedState::new(b"state fetched for the related contract".to_vec());
     let _stub = SubOpGetStubGuard;
     {
@@ -700,12 +699,13 @@ async fn related_contract_install_does_not_fan_out_the_get_path_already_did()
     // The assertion this test exists for.
     assert!(
         rx.try_recv().is_err(),
-        "the related-contract install must NOT fan out: the GET path's \
-         `cache_contract_locally` has already stored this state and notified \
-         this delegate. A notification here is a DUPLICATE — every subscribed \
-         delegate and WebSocket client notified twice, and the state broadcast \
-         to the network twice, for one install. Read the comment at the install \
-         site in contract_ops.rs before adding a `finalize_state_commit` back"
+        "the related-contract install must NOT fan out: `GetResult.state` \
+         comes from a re-query of the LOCAL STORE, so this arm writes back a \
+         value the store already holds and announces no transition. A \
+         notification here is a DUPLICATE — every subscribed delegate and \
+         WebSocket client notified twice, and the state broadcast twice, for \
+         one install. Read the comment at the install site in contract_ops.rs \
+         before adding a `finalize_state_commit` back"
     );
 
     // Control: the delegate, the channel and the subscription are all live, so

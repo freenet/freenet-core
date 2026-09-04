@@ -283,40 +283,59 @@ impl Executor<Runtime> {
                                             }),
                                         ));
                                     };
-                                    // DELIBERATELY NO FAN-OUT HERE. The
-                                    // related contract's subscribers are owed
-                                    // one, and the GET path has already sent
-                                    // it: reaching this arm at all means the
-                                    // sub-op GET resolved from the network, and
-                                    // its `cache_contract_locally` ran first —
-                                    // it stores via `ContractHandlerEvent::
-                                    // PutQuery`, which lands in the
-                                    // initial-state-install branch of
-                                    // `bridged_upsert_contract_state_inner` and
-                                    // fans out from there, keyed on this
-                                    // contract. Adding a second
-                                    // `finalize_state_commit` here would
-                                    // double-notify every subscribed delegate
-                                    // and WebSocket client and double-broadcast
-                                    // to the network, for one install.
+                                    // DELIBERATELY NO FAN-OUT HERE, and the
+                                    // reason is NOT "the GET path already
+                                    // announced it".
                                     //
-                                    // The dependency is causal, not incidental.
-                                    // `GetResult.contract` is resolved by
-                                    // re-querying the LOCAL store after
-                                    // `cache_contract_locally` returns
-                                    // (`operations/get/op_ctx_task.rs`), so it
-                                    // is `Some` only because that store already
-                                    // happened. If the store had not happened
-                                    // the re-query would find no state, the
-                                    // sub-op would resolve `NotFound`, and
-                                    // execution would never arrive here.
+                                    // The load-bearing fact is narrower and
+                                    // more durable: `GetResult.state` is not
+                                    // the network's reply. The sub-op driver
+                                    // discards the terminal and rebuilds the
+                                    // `GetResult` by RE-QUERYING THE LOCAL
+                                    // STORE (`operations/get/op_ctx_task.rs`,
+                                    // "Resolve a GetResult by re-querying the
+                                    // local store"). `verify_and_store_contract`
+                                    // below then raw-`store`s that value. So
+                                    // this arm can only ever write back what
+                                    // the store already holds: no state
+                                    // transition happens here, and nothing is
+                                    // owed to anyone.
                                     //
-                                    // `verify_and_store_contract` below is a
-                                    // re-store of that same state. It is
-                                    // pre-existing and left alone (it also
+                                    // An earlier version of this comment said
+                                    // the sub-op's `cache_contract_locally`
+                                    // had already stored and fanned out. That
+                                    // is USUALLY true and is not a safe
+                                    // justification, because there are at
+                                    // least four reachable ways to arrive here
+                                    // with no fan-out having happened: the
+                                    // `state_matches` short-circuit (a
+                                    // concurrent op stored identical bytes
+                                    // first), `Terminal::LocalCompletion`
+                                    // (never calls it), an orphan-stream
+                                    // `AlreadyClaimed` early return, and a
+                                    // `PutQuery` the executor rejects. The
+                                    // re-query argument covers all four; the
+                                    // fan-out argument covers none of them.
+                                    //
+                                    // WHY THIS MATTERS TO #5549. The obvious
+                                    // fix there — hand `Terminal::InlineFound`'s
+                                    // network-delivered state straight to the
+                                    // caller and skip the re-query round trip —
+                                    // DESTROYS the invariant above without
+                                    // touching this file. This arm would then
+                                    // install a state the store does not hold,
+                                    // silently and with no fan-out. If you are
+                                    // changing how `GetResult` is sourced, this
+                                    // site owes a fan-out again; see #5549.
+                                    //
+                                    // Two known warts, both pre-existing and
+                                    // deliberately not fixed here: the re-store
                                     // re-charges the disk budget and
-                                    // `StateBytesWritten` — see #5553); what
-                                    // must not come back is the fan-out.
+                                    // `StateBytesWritten` (#5553), and it is a
+                                    // BLIND overwrite — between the re-query
+                                    // and this `store` another operation may
+                                    // have advanced the state, and this clobbers
+                                    // it rather than merging.
                                     self.verify_and_store_contract(
                                         state.clone(),
                                         contract.clone(),

@@ -2289,8 +2289,23 @@ where
     }
 
     /// The complete post-store fan-out for a contract state this node has
-    /// just committed. **Every path that stores a state MUST call this**
-    /// rather than hand-inlining a subset of its legs.
+    /// just committed. **Every storing path in `runtime/executor_impl.rs` and
+    /// `runtime/contract_ops.rs` MUST call this** rather than hand-inlining a
+    /// subset of its legs.
+    ///
+    /// Those two files are the scope, not the whole crate.
+    /// `executor/mock_runtime.rs` stores and broadcasts directly, on a
+    /// different type, and is compiled unconditionally — so the audit grep in
+    /// `.claude/rules/bug-prevention-patterns.md` returns hits from it that are
+    /// NOT violations. Stated here so the first person to run that grep does
+    /// not have to rediscover it.
+    ///
+    /// One storing path in `contract_ops.rs` deliberately does NOT call this:
+    /// the related-contract install in `get_updated_state`, which writes back a
+    /// value it read from the local store moments earlier and so announces no
+    /// transition. Its justification is at the site, and a behavioural test
+    /// (`related_contract_install_does_not_fan_out_the_get_path_already_did`)
+    /// goes red if a call is added there.
     ///
     /// The four legs, in order:
     ///

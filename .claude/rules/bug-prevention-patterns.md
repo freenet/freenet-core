@@ -747,8 +747,17 @@ does.
 ### Audit
 
 ```bash
-# The post-store fan-out legs: each must have exactly one call site.
-grep -rn "\.record_contract_update(\|\.send_update_notification(\|\.send_delegate_contract_notifications(\|\.broadcast_state_change(" crates/core/src/contract/
+# The post-store fan-out legs. Scoped to the two files that own the real
+# executor's storing paths: each leg must have exactly ONE call site across
+# them, and that site must be inside `finalize_state_commit`.
+grep -rn "\.record_contract_update(\|\.send_update_notification(\|\.send_delegate_contract_notifications(\|\.broadcast_state_change(" \
+  crates/core/src/contract/executor/runtime/executor_impl.rs \
+  crates/core/src/contract/executor/runtime/contract_ops.rs
+# Widening to crates/core/src/contract/ returns about a dozen hits and the
+# "exactly one" claim reads as false. Three are `mock_runtime.rs`, which has
+# its OWN `broadcast_state_change` on a different type and is not part of this
+# invariant; the rest are needle strings inside the pin test that enforces it.
+# Say which you mean before you claim the rule holds.
 # Op-originator side effects: every legacy-path hit needs an equivalent
 # reachable from the driver.
 grep -rn "ring.subscribe(\|complete_subscription_request\|announce_contract_hosted\|fetch_contract_if_missing" crates/core/src/operations/

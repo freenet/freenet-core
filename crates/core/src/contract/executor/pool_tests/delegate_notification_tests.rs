@@ -411,15 +411,20 @@ fn finalize_state_commit_is_the_only_post_store_fan_out_site() {
     // misread — so what is worth pinning is that the loop still matches on the
     // variant rather than being rewritten to discard it with `let _ =` or
     // `.is_ok()`, which would restore the same bug through a different door.
+    // Scoped to `bridged_upsert_contract_state_inner`, NOT the whole file:
+    // `commit_state_update`'s own return sites mention both variants, so a
+    // file-wide check is satisfied by the enum's definition site and would
+    // stay green through the very rewrite it is meant to catch.
+    let replay_scope = upsert_inner_body(production);
     assert!(
-        helper_free_production_contains(production, "StateCommitOutcome::Committed"),
+        code_contains(replay_scope, "StateCommitOutcome::Committed"),
         "the queued-operation replay loop must branch on \
          `StateCommitOutcome::Committed`. Treating any `Ok` as a commit makes \
          a broken-contract suppression look like a successful one, and the \
          install branch then skips a fan-out it still owes."
     );
     assert!(
-        helper_free_production_contains(production, "StateCommitOutcome::SuppressedBrokenContract"),
+        code_contains(replay_scope, "StateCommitOutcome::SuppressedBrokenContract"),
         "the replay loop must handle the suppression case explicitly, so the \
          install branch's own fan-out is still performed when a replay stored \
          nothing."
@@ -461,11 +466,12 @@ fn finalize_state_commit_is_the_only_post_store_fan_out_site() {
     //     - the re-PUT merge               -> finalize immediately after
     //     - `verify_and_store_contract`    -> finalize at its FRESH-PUT caller
     //       only. Its other caller, the related-contract install in
-    //       `get_updated_state`, is the one write here that owes nothing: the
-    //       sub-op GET's `cache_contract_locally` stored and fanned out that
-    //       same state before control ever reached it, so this is a re-store
-    //       of an already-announced state. Fanning out again would
-    //       double-notify every delegate and WS client and double-broadcast.
+    //       `get_updated_state`, is the one write here that owes nothing —
+    //       because `GetResult.state` is sourced from a re-query of the LOCAL
+    //       STORE, so that arm can only write back what the store already
+    //       holds. No state transition, nothing to announce. (Not "the GET
+    //       path already fanned out": that is usually true and is not what
+    //       makes it safe. See the comment at the site.)
     let writes = count_state_writes(production);
     let ops_writes = count_state_writes(ops_production);
     assert_eq!(
@@ -488,14 +494,19 @@ fn finalize_state_commit_is_the_only_post_store_fan_out_site() {
 /// with no fan-out at all while every "exactly one call site" assertion above
 /// was true.
 fn count_state_writes(src: &str) -> usize {
-    // Strip ALL whitespace, so `self.state_store\n    .store(` and
+    // Comments and string literals are blanked FIRST, for the same reason
+    // `count_call_sites` does it: an unblanked scan counts a write that has
+    // been commented out, and the two helpers disagreeing about what "source"
+    // means is how one of them ends up vacuous while the other is fine.
+    let code = blank_comments_and_strings(src);
+    // Then strip ALL whitespace, so `self.state_store\n    .store(` and
     // `self.state_store.store(` collapse to the same needle. Joining on a
     // single space does NOT work: rustfmt breaks the line after
     // `self.state_store`, not around each `.`, so the flattened form is
     // `self.state_store .store(` and neither spaced nor unspaced needle
     // matches. (Asked for it and got (0, 0) — which is why this pin asserts
     // an exact count rather than "at least one".)
-    let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
     flat.matches("self.state_store.store(").count()
         + flat.matches("self.state_store.update(").count()
 }
@@ -528,45 +539,170 @@ fn brace_delimited_body(src: &str, start: usize) -> &str {
     panic!("unbalanced braces while scraping the item body starting at {start}");
 }
 
-/// Whether `needle` appears in non-comment, non-string-literal source.
-fn helper_free_production_contains(src: &str, needle: &str) -> bool {
+/// The brace-delimited body of `bridged_upsert_contract_state_inner`, which is
+/// where the queued-operation replay loop lives.
+///
+/// Scoping matters here rather than being tidiness. `StateCommitOutcome::`
+/// appears FOUR times in `executor_impl.rs`: twice in the replay match, and
+/// twice in `commit_state_update`'s own `return` sites. An unscoped "does this
+/// token appear" check is therefore satisfied by the enum's DEFINITION SITE, so
+/// deleting the replay match entirely and writing `if ....await.is_ok()` would
+/// leave it green — restoring the exact bug the enum was introduced to close.
+/// Two reviewers found that independently on #5484.
+///
+/// The function body is the right scope rather than the loop itself: it
+/// excludes both `commit_state_update` sites, and it does not depend on the
+/// loop keeping any particular shape.
+fn upsert_inner_body(src: &str) -> &str {
+    const SIG: &str = "async fn bridged_upsert_contract_state_inner(";
+    let start = src
+        .find(SIG)
+        .expect("bridged_upsert_contract_state_inner must exist");
+    brace_delimited_body(src, start)
+}
+
+/// Whether `needle` appears in `src` as CODE — not in a comment, not inside a
+/// string literal.
+///
+/// Deliberately says nothing about scope: pass the region you mean. The
+/// previous name (`helper_free_production_contains`) promised a region
+/// excluding the fan-out helper and delivered a whole-file search, which is how
+/// the unscoped `StateCommitOutcome` assertions above came to pin nothing.
+fn code_contains(src: &str, needle: &str) -> bool {
     count_call_sites(src, needle) > 0
 }
 
 /// Count `needle` occurrences, one per matching LINE (two calls on one line
 /// count once — rustfmt does not produce that shape here, and the assertions
-/// below would fail loud rather than pass if it ever did). Whole-line `//`
-/// comments and the contents of string literals are skipped, so the scraped
-/// file's own prose and log messages cannot satisfy a pin.
+/// below would fail loud rather than pass if it ever did).
+///
+/// Comments and string literals are blanked first, so the scraped file's own
+/// prose and log messages cannot satisfy a pin — and, since #5484, neither can
+/// a call someone has commented OUT.
 fn count_call_sites(src: &str, needle: &str) -> usize {
-    src.lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("//") {
-                return false;
-            }
-            strip_string_literals(line).contains(needle)
-        })
+    blank_comments_and_strings(src)
+        .lines()
+        .filter(|line| line.contains(needle))
         .count()
 }
 
-fn strip_string_literals(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut in_string = false;
-    let mut prev_was_backslash = false;
-    for c in line.chars() {
-        if in_string {
-            if c == '"' && !prev_was_backslash {
-                in_string = false;
-                out.push('"');
-            }
-        } else if c == '"' {
-            in_string = true;
-            out.push('"');
-        } else {
-            out.push(c);
-        }
-        prev_was_backslash = c == '\\' && !prev_was_backslash;
+/// Replace every comment and string-literal character with a space, preserving
+/// newlines so callers can still count one hit per line.
+///
+/// The line-based filter this replaces stripped only WHOLE-LINE `//` comments
+/// and string contents. It could not see a `/* ... */` spanning lines, so a
+/// call wrapped in a block comment still counted as live: block-commenting the
+/// sole `record_contract_update` call left BOTH the exact-count and the
+/// helper-containment assertions green while the telemetry leg was gone. Found
+/// by the external review pass on #5484 — in the very PR that writes down this
+/// failure class. It also missed the smaller sibling, a needle sitting after a
+/// TRAILING `//` on an otherwise-live line.
+///
+/// Char literals are recognised narrowly (`'x'`, `'\n'`) so that a `'"'` in the
+/// scraped source cannot flip the scanner into string mode, while a lifetime
+/// (`'a`, which is a quote followed by an identifier and no closing quote) is
+/// left alone.
+///
+/// Fails loud on an unterminated string or block comment rather than returning
+/// a silently-truncated view — a pin that mis-parses must go red, not pass.
+fn blank_comments_and_strings(src: &str) -> String {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mode {
+        Code,
+        LineComment,
+        BlockComment,
+        StringLit,
     }
+
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut mode = Mode::Code;
+    let mut escaped = false;
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match mode {
+            Mode::Code => {
+                if c == '/' && next == Some('/') {
+                    mode = Mode::LineComment;
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                if c == '/' && next == Some('*') {
+                    mode = Mode::BlockComment;
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    mode = Mode::StringLit;
+                    escaped = false;
+                    out.push(' ');
+                    i += 1;
+                    continue;
+                }
+                // A char literal, blanked whole so `'"'` cannot open a string.
+                // A lifetime has no closing quote in this window and falls
+                // through to the plain copy below.
+                if c == '\'' {
+                    let close = if next == Some('\\') {
+                        (i + 2..chars.len().min(i + 8)).find(|&j| chars[j] == '\'')
+                    } else if chars.get(i + 2) == Some(&'\'') {
+                        Some(i + 2)
+                    } else {
+                        None
+                    };
+                    if let Some(close) = close {
+                        for _ in i..=close {
+                            out.push(' ');
+                        }
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                out.push(c);
+                i += 1;
+            }
+            Mode::LineComment => {
+                if c == '\n' {
+                    mode = Mode::Code;
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+                i += 1;
+            }
+            Mode::BlockComment => {
+                if c == '*' && next == Some('/') {
+                    mode = Mode::Code;
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                out.push(if c == '\n' { '\n' } else { ' ' });
+                i += 1;
+            }
+            Mode::StringLit => {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    mode = Mode::Code;
+                }
+                out.push(if c == '\n' { '\n' } else { ' ' });
+                i += 1;
+            }
+        }
+    }
+
+    assert!(
+        mode == Mode::Code || mode == Mode::LineComment,
+        "unterminated string literal or block comment while blanking the \
+         scraped source; the pin cannot trust what it just parsed"
+    );
     out
 }
