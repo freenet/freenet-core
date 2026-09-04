@@ -81,15 +81,17 @@ fn test_key(seed: u8) -> ContractKey {
     ContractKey::from_params_and_code(&params, &code)
 }
 
-/// Drain the notification channel and return the first `BroadcastStateChange`,
-/// or `None` if the channel holds no such event.
-fn take_broadcast(rx: &mut EventLoopNotificationsReceiver) -> Option<(ContractKey, WrappedState)> {
+/// Drain the notification channel and return every queued V2 broadcast, in
+/// order. The event names the contract and carries NO state — the handler
+/// re-reads what is stored when it drains — so there are no bytes to return.
+fn take_broadcasts(rx: &mut EventLoopNotificationsReceiver) -> Vec<ContractKey> {
+    let mut out = Vec::new();
     while let Ok(event) = rx.notifications_receiver.try_recv() {
-        if let Either::Right(NodeEvent::BroadcastStateChange { key, new_state, .. }) = event {
-            return Some((key, new_state));
+        if let Either::Right(NodeEvent::V2DelegateStateChanged { key }) = event {
+            out.push(key);
         }
     }
-    None
+    out
 }
 
 /// #5479: the installed V2 write callback must emit `BroadcastStateChange`
@@ -99,7 +101,7 @@ fn take_broadcast(rx: &mut EventLoopNotificationsReceiver) -> Option<(ContractKe
 /// it received only `(key, state_size)`, so the state to broadcast was not
 /// available to it. The signature change is the fix; this asserts the emission.
 #[tokio::test(flavor = "current_thread")]
-async fn v2_delegate_write_callback_emits_broadcast_state_change() {
+async fn v2_delegate_write_callback_queues_a_broadcast() {
     let (op_manager, mut notifications, _guards) = build_op_manager("v2-prop-emit").await;
     let state_store = StateStore::new(MockStateStorage::new(), 10_000_000).unwrap();
 
@@ -110,20 +112,108 @@ async fn v2_delegate_write_callback_emits_broadcast_state_change() {
         v2_delegate_state_write_callback(state_store.cache_invalidator(), Some(op_manager.clone()));
     callback(&key, &written);
 
-    let (broadcast_key, broadcast_state) = take_broadcast(&mut notifications).expect(
-        "a V2 delegate write must emit NodeEvent::BroadcastStateChange — without it the \
-         write is invisible to the network even though the host function returned success \
-         (this is #5479)",
-    );
+    let queued = take_broadcasts(&mut notifications);
     assert_eq!(
-        broadcast_key, key,
-        "broadcast must name the written contract"
+        queued,
+        vec![key],
+        "a V2 delegate write must queue exactly one NodeEvent::V2DelegateStateChanged \
+         naming the written contract — without it the write is invisible to the network \
+         even though the host function returned success (this is #5479)"
     );
+}
+
+/// Successive writes to ONE contract must coalesce into a single queued
+/// broadcast while that broadcast is undrained.
+///
+/// This is the property that makes the queue's message-count bound also a
+/// bound on what it retains: the event carries a contract id rather than a
+/// `WrappedState`, and repeats for the same contract add nothing at all. The
+/// single drain re-reads stored state, so it fans out the NEWEST value — the
+/// coalescing loses no information, it only avoids re-announcing the same
+/// contract N times.
+#[tokio::test(flavor = "current_thread")]
+async fn v2_delegate_writes_to_one_contract_coalesce_while_undrained() {
+    let (op_manager, mut notifications, _guards) = build_op_manager("v2-prop-coalesce").await;
+    let state_store = StateStore::new(MockStateStorage::new(), 10_000_000).unwrap();
+
+    let key = test_key(15);
+    let callback =
+        v2_delegate_state_write_callback(state_store.cache_invalidator(), Some(op_manager.clone()));
+
+    // Ten content-changing writes, nothing draining the channel in between.
+    for i in 0..10u8 {
+        callback(&key, &WrappedState::new(vec![i, i, i, i]));
+    }
+
     assert_eq!(
-        broadcast_state.as_ref(),
-        written.as_ref(),
-        "broadcast must carry the bytes that were actually written, not a re-read or a \
-         reconstruction"
+        take_broadcasts(&mut notifications),
+        vec![key],
+        "ten writes to one contract with nothing draining must queue ONE broadcast, not \
+         ten: the marker set by the first write suppresses the rest until a drain clears \
+         it. If this reads ten, the coalescing is gone and the queue again grows one \
+         entry per write"
+    );
+}
+
+/// Coalescing must be PER CONTRACT — a queued broadcast for one contract must
+/// not suppress another contract's.
+#[tokio::test(flavor = "current_thread")]
+async fn v2_delegate_broadcast_coalescing_is_per_contract() {
+    let (op_manager, mut notifications, _guards) = build_op_manager("v2-prop-per-key").await;
+    let state_store = StateStore::new(MockStateStorage::new(), 10_000_000).unwrap();
+
+    let callback =
+        v2_delegate_state_write_callback(state_store.cache_invalidator(), Some(op_manager.clone()));
+    let (a, b) = (test_key(16), test_key(17));
+    callback(&a, &WrappedState::new(vec![1]));
+    callback(&b, &WrappedState::new(vec![2]));
+    callback(&a, &WrappedState::new(vec![3]));
+
+    let mut queued = take_broadcasts(&mut notifications);
+    queued.sort_by_key(|k| k.id().as_bytes().to_vec());
+    let mut expected = vec![a, b];
+    expected.sort_by_key(|k| k.id().as_bytes().to_vec());
+    assert_eq!(
+        queued, expected,
+        "each contract must get its own queued broadcast; the repeat write to `a` \
+         coalesces into a's pending entry and must not be suppressed by, or suppress, b's"
+    );
+}
+
+/// Once a queued broadcast is DRAINED, the next write must queue a fresh one.
+///
+/// The marker is cleared by the handler when it begins draining, so this pins
+/// that the suppression is a coalescing window and not a latch — a latch would
+/// silently stop a contract propagating for the rest of the process lifetime.
+#[tokio::test(flavor = "current_thread")]
+async fn v2_delegate_broadcast_requeues_after_drain() {
+    let (op_manager, mut notifications, _guards) = build_op_manager("v2-prop-requeue").await;
+    let state_store = StateStore::new(MockStateStorage::new(), 10_000_000).unwrap();
+
+    let key = test_key(18);
+    let callback =
+        v2_delegate_state_write_callback(state_store.cache_invalidator(), Some(op_manager.clone()));
+
+    callback(&key, &WrappedState::new(vec![1]));
+    assert_eq!(take_broadcasts(&mut notifications), vec![key]);
+
+    // Second write while the marker is still set: coalesced away.
+    callback(&key, &WrappedState::new(vec![2]));
+    assert!(
+        take_broadcasts(&mut notifications).is_empty(),
+        "still-pending contract must coalesce"
+    );
+
+    // The handler clears the marker as it starts draining.
+    op_manager.clear_v2_delegate_broadcast_pending(&key);
+
+    callback(&key, &WrappedState::new(vec![3]));
+    assert_eq!(
+        take_broadcasts(&mut notifications),
+        vec![key],
+        "after the pending broadcast is drained, the next write must queue a new one. If \
+         this is empty the marker has become a latch and the contract has stopped \
+         propagating permanently"
     );
 }
 
@@ -182,7 +272,7 @@ async fn v2_delegate_write_callback_suppresses_broken_contract_broadcast() {
     callback(&key, &written);
 
     assert!(
-        take_broadcast(&mut notifications).is_none(),
+        take_broadcasts(&mut notifications).is_empty(),
         "a contract flagged as non-idempotent must not be broadcast from the V2 delegate \
          write path either — otherwise V2 is a hole in the suppression that stops the \
          #4279 storm"
