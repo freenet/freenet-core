@@ -55,6 +55,8 @@ fn make_mock_runtime(override_: UpdateOverride) -> MockWasmRuntime {
         update_overrides: overrides,
         delegate_script: Default::default(),
         delegate_calls: Default::default(),
+        delegate_contexts: Default::default(),
+        delegate_observations: Default::default(),
     }
 }
 
@@ -240,6 +242,8 @@ fn healthy_mock_is_idempotent_on_reapply() {
         update_overrides: HashMap::new(),
         delegate_script: Default::default(),
         delegate_calls: Default::default(),
+        delegate_contexts: Default::default(),
+        delegate_observations: Default::default(),
     };
     let key = fake_key();
     let params = Parameters::from(vec![]);
