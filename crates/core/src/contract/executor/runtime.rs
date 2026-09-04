@@ -452,12 +452,6 @@ fn install_v2_delegate_state_write_hooks(
 ///   `should_summarize_or_broadcast` for a contract held only because a
 ///   delegate wrote it. That is **#4669** (a delegate subscription must
 ///   register demand), not this fix.
-///
-/// Local fan-out — WebSocket clients and other delegates subscribed on THIS
-/// node — is deliberately NOT here and is not reachable from here: the
-/// `DelegateNotificationSender` is installed on the executor after this runs
-/// (`pool.rs`), and the WS subscriber maps need `&mut Executor`. Tracked
-/// separately.
 pub(super) fn v2_delegate_state_write_callback(
     cache_invalidator: crate::wasm_runtime::StateCacheInvalidator,
     op_manager: Option<Arc<OpManager>>,

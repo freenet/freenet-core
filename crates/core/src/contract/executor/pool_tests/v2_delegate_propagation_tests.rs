@@ -300,3 +300,46 @@ async fn v2_delegate_write_callback_without_op_manager_only_invalidates() {
          and a local-only executor still serves reads from these caches"
     );
 }
+
+/// A FAILED enqueue must release the coalescing marker.
+///
+/// This is the error path `queue_v2_delegate_broadcast` calls out as critical,
+/// and it fails in the worst direction available: leaving the marker set turns
+/// a one-off dropped broadcast into a permanent wedge. Every later write to
+/// that contract would coalesce into a queued broadcast that no handler will
+/// ever drain — because none was ever queued — so the contract silently stops
+/// propagating for the lifetime of the process. That is the same
+/// write-returns-success-but-the-network-never-learns shape as #5479, one
+/// layer up, and it would be very hard to diagnose from outside the node.
+///
+/// Dropping the receiver closes the notification channel, so `try_send`
+/// returns `Closed` and the enqueue fails deterministically — no need to push
+/// 2048 messages to fill it.
+#[tokio::test(flavor = "current_thread")]
+async fn v2_delegate_failed_enqueue_releases_the_coalescing_marker() {
+    let (op_manager, notifications, _guards) = build_op_manager("v2-prop-enqueue-fail").await;
+    let state_store = StateStore::new(MockStateStorage::new(), 10_000_000).unwrap();
+
+    // Close the channel: every subsequent enqueue attempt now fails.
+    drop(notifications);
+
+    let key = test_key(19);
+    let callback =
+        v2_delegate_state_write_callback(state_store.cache_invalidator(), Some(op_manager.clone()));
+    callback(&key, &WrappedState::new(vec![1, 2, 3]));
+
+    assert!(
+        !op_manager.v2_delegate_broadcast_pending.contains(key.id()),
+        "a failed enqueue must release the coalescing marker. Left set, it latches the \
+         contract: every later write coalesces into a broadcast that was never queued and \
+         will never drain, so the contract stops propagating permanently"
+    );
+
+    // And the latch must genuinely be absent, not merely unobserved: a second
+    // write has to be free to try again rather than be swallowed as a repeat.
+    callback(&key, &WrappedState::new(vec![4, 5, 6]));
+    assert!(
+        !op_manager.v2_delegate_broadcast_pending.contains(key.id()),
+        "a later write must still attempt its own enqueue after an earlier failure"
+    );
+}
