@@ -2355,12 +2355,10 @@ async fn handle_delegate_notification<CH, P>(
     .await;
 
     match outcome {
-        DelegateRunOutcome::Parked => {
-            // Notification-driven run: no client responder to stash. The
-            // residual messages are routed by `handle_delegate_resume` when the
-            // park resolves.
-            return;
-        }
+        // Notification-driven run: no client responder to stash. The residual
+        // messages are routed by `handle_delegate_resume` when the park
+        // resolves.
+        DelegateRunOutcome::Parked => {}
         DelegateRunOutcome::Completed(outbound) => {
             route_notification_outbound(&delegate_key, outbound);
         }
@@ -2449,6 +2447,7 @@ fn route_notification_outbound(delegate_key: &DelegateKey, outbound: Vec<Outboun
 /// Shared by the `ContractHandlerEvent::DelegateRequest` arm and by the drain
 /// of requests that queued behind a park, so the exclusion check cannot be
 /// present on one path and missing on the other.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_delegate_request<CH, P>(
     contract_handler: &mut CH,
     park: Option<&mut delegate_park::DelegateParkCtx>,
