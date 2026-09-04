@@ -54,9 +54,14 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use freenet_stdlib::client_api::DelegateRequest;
+use either::Either;
 use freenet_stdlib::prelude::{
-    ContractInstanceId, DelegateKey, InboundDelegateMsg, OutboundDelegateMsg, Parameters,
+    ContractContainer, ContractInstanceId, ContractKey, DelegateContext, DelegateKey,
+    InboundDelegateMsg, OutboundDelegateMsg, Parameters, RelatedContracts, StateDelta,
+    WrappedState,
 };
+
+use super::executor::ExecutorError;
 
 use super::handler::{EventId, StashedResponder};
 use crate::client_events::ConnectionScope;
@@ -100,6 +105,17 @@ pub(super) const MAX_PENDING_PER_DELEGATE: usize = 8;
 /// fires first on a merely-slow operation; a park cut short at its own TTL
 /// would report a spurious failure for work that was about to succeed.
 pub(super) const PARK_TTL: Duration = Duration::from_secs(90);
+
+/// Cap on the off-loop task's own runtime, kept BELOW [`PARK_TTL`].
+///
+/// The task runs this iteration's prompts and related-contract fetches
+/// concurrently, but several prompts (each up to `USER_INPUT_TIMEOUT`) could
+/// still sum past the TTL. If that happened the loop's backstop sweep would
+/// force-resume the park while the task was still working, and the task's own
+/// result would then arrive for a park that no longer exists and be discarded.
+/// Bounding the task below the TTL means the guard always wins that race, so
+/// the TTL stays what it is meant to be — unreachable in practice.
+pub(super) const PARK_WORK_BUDGET: Duration = Duration::from_secs(75);
 
 /// A delegate request that arrived while its delegate was parked.
 ///
@@ -172,13 +188,44 @@ pub(super) enum ResumeCause {
     TimedOut,
 }
 
+/// A delegate PUT/UPDATE that could not complete because the contract asked for
+/// related contracts this node does not hold.
+///
+/// The fetch is off-loaded (it is a network GET, and awaiting it on the loop is
+/// the second #5544 stall); the upsert itself must be RE-RUN on the loop,
+/// because it runs WASM and WASM stays serial. So the park carries everything
+/// needed to re-run it.
+pub(super) struct PendingUpsert {
+    pub key: ContractKey,
+    pub update: Either<WrappedState, StateDelta<'static>>,
+    pub related_contracts: RelatedContracts<'static>,
+    pub code: Option<ContractContainer>,
+    /// `true` builds a `PutContractResponse`, `false` an
+    /// `UpdateContractResponse`.
+    pub is_put: bool,
+    /// Echoed back to the delegate so it can match the response to its request.
+    pub context: DelegateContext,
+    /// The related contracts to fetch off-loop.
+    pub missing: Vec<ContractInstanceId>,
+}
+
+/// A [`PendingUpsert`] whose off-loop fetch has finished, one way or the other.
+pub(super) struct ResolvedUpsert {
+    pub pending: PendingUpsert,
+    pub fetched: Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>,
+}
+
 /// Sent from an off-loop task back to the `contract_handling` loop.
 pub(super) struct DelegateResume {
     pub delegate_key: DelegateKey,
     pub cause: ResumeCause,
-    /// The messages to feed back into the delegate. Empty on a dropped or
-    /// timed-out park, which still resumes so the continuation terminates.
+    /// Messages that are ready to feed straight back into the delegate (the
+    /// prompt path). Empty on a dropped or timed-out park, which still resumes
+    /// so the continuation terminates.
     pub inbound: Vec<InboundDelegateMsg<'static>>,
+    /// Upserts whose related contracts were fetched off-loop and which must be
+    /// RE-RUN on the loop before their responses can be built.
+    pub upserts: Vec<ResolvedUpsert>,
 }
 
 /// RAII guard guaranteeing an off-loop task delivers EXACTLY ONE
@@ -217,11 +264,15 @@ impl ParkGuard {
         }
     }
 
-    /// Deliver the resolved inbound messages. Consumes the payload so a later
-    /// `Drop` is a no-op (exactly-once).
-    pub(super) fn send(mut self, inbound: Vec<InboundDelegateMsg<'static>>) {
+    /// Deliver the resolved work. Consumes the payload so a later `Drop` is a
+    /// no-op (exactly-once).
+    pub(super) fn send(
+        mut self,
+        inbound: Vec<InboundDelegateMsg<'static>>,
+        upserts: Vec<ResolvedUpsert>,
+    ) {
         if let Some(p) = self.payload.take() {
-            Self::deliver(p, ResumeCause::Completed, inbound);
+            Self::deliver(p, ResumeCause::Completed, inbound, upserts);
         }
     }
 
@@ -229,6 +280,7 @@ impl ParkGuard {
         p: ParkGuardPayload,
         cause: ResumeCause,
         inbound: Vec<InboundDelegateMsg<'static>>,
+        upserts: Vec<ResolvedUpsert>,
     ) {
         let ParkGuardPayload {
             resume_tx,
@@ -239,6 +291,7 @@ impl ParkGuard {
                 delegate_key: delegate_key.clone(),
                 cause,
                 inbound,
+                upserts,
             })
             .is_err()
         {
@@ -259,7 +312,7 @@ impl Drop for ParkGuard {
                  empty resume so the park terminates, its pending queue drains \
                  and the parked client is answered exactly once (#5544)"
             );
-            Self::deliver(p, ResumeCause::TimedOut, Vec::new());
+            Self::deliver(p, ResumeCause::TimedOut, Vec::new(), Vec::new());
         }
     }
 }
@@ -568,7 +621,7 @@ mod tests {
     async fn guard_delivers_exactly_one_resume_on_success() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let guard = ParkGuard::new(tx, key(1));
-        guard.send(Vec::new());
+        guard.send(Vec::new(), Vec::new());
         let resume = rx.recv().await.expect("one resume");
         assert_eq!(resume.cause, ResumeCause::Completed);
         assert!(rx.try_recv().is_err(), "must not deliver twice");

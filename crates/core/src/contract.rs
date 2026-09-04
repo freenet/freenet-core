@@ -522,6 +522,111 @@ enum InterDelegateDispatch {
     Suppressed,
 }
 
+/// Build the delegate-facing response for a PUT/UPDATE upsert.
+///
+/// Shared by the inline path and the post-fetch resume path so a deferred
+/// upsert reports exactly what an inline one would.
+fn upsert_response_msg(
+    is_put: bool,
+    contract_id: ContractInstanceId,
+    context: DelegateContext,
+    result: Result<UpsertResult, ExecutorError>,
+) -> InboundDelegateMsg<'static> {
+    let outcome = match result {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            tracing::warn!(
+                contract = %contract_id,
+                error = %err,
+                is_put,
+                "Failed to upsert contract for a delegate contract request"
+            );
+            Err(format!("{err}"))
+        }
+    };
+    if is_put {
+        InboundDelegateMsg::PutContractResponse(PutContractResponse {
+            contract_id,
+            result: outcome,
+            context,
+        })
+    } else {
+        InboundDelegateMsg::UpdateContractResponse(UpdateContractResponse {
+            contract_id,
+            result: outcome,
+            context,
+        })
+    }
+}
+
+/// Run a deferred upsert INLINE, related fetch and all.
+///
+/// The fallback when there is no parking context, or when the node-wide park
+/// cap refused this one. It reinstates the pre-#5544 stall for that single
+/// operation, which is the deliberate trade: degrading to the old behaviour
+/// beats dropping a delegate's write.
+async fn run_deferred_upsert_inline<CH>(
+    contract_handler: &mut CH,
+    pending: delegate_park::PendingUpsert,
+) -> InboundDelegateMsg<'static>
+where
+    CH: ContractHandler + Send + 'static,
+{
+    let contract_id = *pending.key.id();
+    let result = contract_handler
+        .executor()
+        .upsert_contract_state(
+            pending.key,
+            pending.update,
+            pending.related_contracts,
+            pending.code,
+        )
+        .await;
+    upsert_response_msg(pending.is_put, contract_id, pending.context, result)
+}
+
+/// Re-run a deferred upsert ON the loop now that its related contracts have
+/// been fetched off it.
+///
+/// The fetched states are injected so the resumed upsert resolves them locally
+/// and does NOT make a second network round trip — the same trick
+/// `handle_deferred_resume` uses for the client-driven path (#4391).
+async fn apply_resolved_upsert<CH>(
+    contract_handler: &mut CH,
+    resolved: delegate_park::ResolvedUpsert,
+) -> InboundDelegateMsg<'static>
+where
+    CH: ContractHandler + Send + 'static,
+{
+    let delegate_park::ResolvedUpsert { pending, fetched } = resolved;
+    let contract_id = *pending.key.id();
+    let mut related_contracts = pending.related_contracts;
+    let result = match fetched {
+        Ok(states) => {
+            for (id, state) in states {
+                inject_related_state(
+                    &mut related_contracts,
+                    id,
+                    freenet_stdlib::prelude::State::from(state.as_ref().to_vec()),
+                );
+            }
+            contract_handler
+                .executor()
+                .upsert_contract_state(
+                    pending.key,
+                    pending.update,
+                    related_contracts,
+                    pending.code,
+                )
+                .await
+        }
+        // The fetch failed or timed out: surface it to the delegate rather than
+        // retrying, matching the all-or-nothing semantics of the inline path.
+        Err(err) => Err(err),
+    };
+    upsert_response_msg(pending.is_put, contract_id, pending.context, result)
+}
+
 /// Drive the permission prompts for one delegate iteration and build the
 /// `UserResponse` messages to feed back.
 ///
@@ -773,6 +878,10 @@ where
         }
 
         let mut inbound_responses: Vec<InboundDelegateMsg<'static>> = Vec::new();
+        // Delegate PUT/UPDATEs whose contract asked for related contracts this
+        // node does not hold. Their network fetch is off-loaded with the rest of
+        // this iteration's slow work rather than awaited here (#5544 stall 1).
+        let mut deferred_upserts: Vec<delegate_park::PendingUpsert> = Vec::new();
 
         // Process PUT requests (fire-and-forget: upsert state, send result back).
         // This calls upsert_contract_state which stores locally AND automatically
@@ -789,15 +898,50 @@ where
                 let contract_key = req.contract.key();
                 let context = req.context;
 
-                let result = contract_handler
+                // Deferrable: on a missing related contract this returns
+                // immediately with the ids instead of awaiting a network GET on
+                // the serial loop (#5544 stall 1). Where parking is
+                // unavailable the fetch still happens, just inline, below.
+                let update = Either::Left(req.state);
+                let outcome = contract_handler
                     .executor()
-                    .upsert_contract_state(
+                    .upsert_contract_state_deferrable(
                         contract_key,
-                        Either::Left(req.state),
-                        req.related_contracts,
-                        Some(req.contract),
+                        update.clone(),
+                        req.related_contracts.clone(),
+                        Some(req.contract.clone()),
                     )
                     .await;
+
+                let result = match outcome {
+                    Ok(UpsertOutcome::Completed(r)) => Ok(r),
+                    Ok(UpsertOutcome::DeferRelated(missing)) if parking.is_some() => {
+                        deferred_upserts.push(delegate_park::PendingUpsert {
+                            key: contract_key,
+                            update,
+                            related_contracts: req.related_contracts,
+                            code: Some(req.contract),
+                            is_put: true,
+                            context,
+                            missing,
+                        });
+                        continue;
+                    }
+                    Ok(UpsertOutcome::DeferRelated(_)) => {
+                        // No parking context (direct unit-test calls): keep the
+                        // legacy inline fetch rather than failing the upsert.
+                        contract_handler
+                            .executor()
+                            .upsert_contract_state(
+                                contract_key,
+                                update,
+                                req.related_contracts,
+                                Some(req.contract),
+                            )
+                            .await
+                    }
+                    Err(err) => Err(err),
+                };
 
                 let put_result = match result {
                     Ok(_) => Ok(()),
@@ -933,15 +1077,47 @@ where
                             }
                         };
 
-                        contract_handler
+                        // Deferrable, exactly as the PUT arm above (#5544
+                        // stall 1): a missing related contract off-loads its
+                        // network GET instead of pinning the serial loop.
+                        let outcome = contract_handler
                             .executor()
-                            .upsert_contract_state(
+                            .upsert_contract_state_deferrable(
                                 full_key,
-                                update_value,
+                                update_value.clone(),
                                 RelatedContracts::default(),
                                 None,
                             )
-                            .await
+                            .await;
+                        match outcome {
+                            Ok(UpsertOutcome::Completed(r)) => Ok(r),
+                            Ok(UpsertOutcome::DeferRelated(missing)) if parking.is_some() => {
+                                deferred_upserts.push(delegate_park::PendingUpsert {
+                                    key: full_key,
+                                    update: update_value,
+                                    related_contracts: RelatedContracts::default(),
+                                    code: None,
+                                    is_put: false,
+                                    context,
+                                    missing,
+                                });
+                                continue;
+                            }
+                            Ok(UpsertOutcome::DeferRelated(_)) => {
+                                // No parking context: keep the legacy inline
+                                // fetch rather than failing the update.
+                                contract_handler
+                                    .executor()
+                                    .upsert_contract_state(
+                                        full_key,
+                                        update_value,
+                                        RelatedContracts::default(),
+                                        None,
+                                    )
+                                    .await
+                            }
+                            Err(err) => Err(err),
+                        }
                     }
                     None => {
                         tracing::debug!(
@@ -1187,54 +1363,44 @@ where
             );
         }
 
-        // Process UserInput requests: prompt the user and send responses back
-        if !user_input_requests.is_empty() {
+        // Off-load this iteration's SLOW work rather than awaiting it on the
+        // serial `contract_handling` loop (#5544). Two kinds, both of which
+        // used to pin the loop:
+        //
+        //   * permission prompts — `prompter.prompt()` waits on a HUMAN for up
+        //     to USER_INPUT_TIMEOUT (60s), and production wires the real
+        //     DashboardPrompter, so any delegate that prompts froze every
+        //     GET/PUT/UPDATE/subscribe on the node for a minute. ghostkeys
+        //     prompts in four places.
+        //   * deferred related-contract fetches — a delegate PUT/UPDATE whose
+        //     contract asks for a related contract this node lacks used to
+        //     await a network GET inline, up to RELATED_FETCH_TIMEOUT (10s).
+        //
+        // Both are parked together under ONE continuation: an iteration can
+        // produce both, and two park points would mean the second kind's work
+        // was silently dropped when the first parked.
+        //
+        // Nothing about the delegate requires us to stay here. It is already
+        // suspended at the runtime level — `RequestUserInput` breaks out of
+        // `process_outbound` and the WASM `process()` call has returned — and
+        // the deferrable upsert has already rolled back its partial work. All
+        // that is needed is to re-enter the delegate when the results arrive.
+        if !user_input_requests.is_empty() || !deferred_upserts.is_empty() {
             tracing::debug!(
                 delegate_key = %delegate_key,
-                count = user_input_requests.len(),
-                "Processing UserInputRequest messages from delegate"
+                prompts = user_input_requests.len(),
+                deferred_upserts = deferred_upserts.len(),
+                "Off-loading slow delegate work from the contract-handling loop"
             );
 
             // The caller identity passed to the prompter is built from the
             // executor's runtime context, NOT from anything the delegate could
-            // influence — so a malicious DELEGATE cannot spoof another app's
-            // identity in the structured fields the prompt UI renders.
-            //
-            // That was never the whole story, and the missing half was a real
-            // hole (GHSA-824h-7x5x-wfmf): the identity came from
-            // `origin_contract`, which the CLIENT chooses by presenting a token
-            // the node mints on request for any contract id. A caller the node
-            // cannot prove is local now resolves to `None` (gated at the top of
-            // this function), so it is rendered as an unattested caller rather
-            // than as the app whose id it named. This bounds the spoof to
-            // callers that are already on this host — see the PR's limitations:
-            // "local" means this HOST, not this USER, and it is not a defence
-            // behind a colocated reverse proxy.
-            //
-            // Today the only attested non-None caller is a web app
-            // (via `MessageOrigin::WebApp`); delegate-to-delegate attestation
-            // is tracked by #3860 and will appear here as a new variant.
-            //
-            // The actual mapping lives in `caller_identity_from_origin` so it
-            // can be unit-tested independently of the executor plumbing.
+            // influence, and `origin_contract` is already gated on
+            // `connection_scope.is_local()` at the top of this function
+            // (GHSA-824h-7x5x-wfmf). See `caller_identity_from_origin`.
             let caller = caller_identity_from_origin(origin_contract);
             let delegate_key_str = delegate_key.to_string();
 
-            // PARK rather than await (#5544).
-            //
-            // `prompter.prompt()` waits on a HUMAN for up to
-            // `USER_INPUT_TIMEOUT` (60s). Awaiting it HERE parks the single
-            // serial `contract_handling` loop for that whole time, so no GET,
-            // PUT, UPDATE, subscribe registration or delegate notification
-            // anywhere on this node is serviced until the user clicks. That is
-            // a node-wide stall triggered by any delegate that prompts, and
-            // ghostkeys prompts in four places.
-            //
-            // Nothing about the delegate needs us to stay here: it is ALREADY
-            // suspended at the runtime level. `RequestUserInput` breaks out of
-            // `process_outbound`, the WASM `process()` call has returned, and
-            // the continuation is in the `DelegateContextCache`. All that is
-            // needed is to re-enter it when the answer arrives.
             if let Some(ctx) = parking.as_mut() {
                 let continuation = delegate_park::Continuation {
                     params: current_params.clone(),
@@ -1244,9 +1410,9 @@ where
                     inter_delegate,
                     accumulated: std::mem::take(&mut accumulated_messages),
                     inbound_so_far: std::mem::take(&mut inbound_responses),
-                    // Attached by the caller right after we return `Parked`
-                    // (it owns the channel), or carried straight through if
-                    // this run is itself a resume that is parking again.
+                    // Attached by the caller right after we return `Parked` (it
+                    // owns the channel), or carried straight through if this run
+                    // is itself a resume that is parking again.
                     responder: ctx.carried_responder.take(),
                     delivery: ctx.delivery,
                 };
@@ -1258,30 +1424,75 @@ where
                         );
                         let prompter = std::sync::Arc::clone(prompter);
                         let key = delegate_key.clone();
-                        // Fire-and-forget is safe here precisely because of the
+                        let op_manager = contract_handler.executor().op_manager_handle();
+                        let prompts = std::mem::take(&mut user_input_requests);
+                        let upserts = std::mem::take(&mut deferred_upserts);
+                        // Fire-and-forget is safe precisely because of the
                         // guard: it delivers exactly one resume even if this
                         // task is dropped, panics or is cancelled, so the park
                         // always ends, its pending queue always drains and the
                         // parked client is always answered.
                         GlobalExecutor::spawn(async move {
-                            let responses = run_user_input_prompts(
-                                prompter.as_ref(),
-                                user_input_requests,
-                                &key,
-                                &delegate_key_str,
-                                caller,
+                            // Prompts and fetches run CONCURRENTLY, and the whole
+                            // body is capped by PARK_WORK_BUDGET. Sequentially
+                            // they could sum past PARK_TTL, at which point the
+                            // loop's backstop sweep would force-resume while this
+                            // task was still running and its result would be
+                            // discarded. Keeping the budget below the TTL means
+                            // the guard always wins the race.
+                            let fetches = async {
+                                futures::future::join_all(upserts.into_iter().map(|pending| {
+                                    let op_manager = op_manager.clone();
+                                    async move {
+                                        let fetched = fetch_related_off_loop(
+                                            op_manager,
+                                            pending.missing.clone(),
+                                        )
+                                        .await;
+                                        delegate_park::ResolvedUpsert { pending, fetched }
+                                    }
+                                }))
+                                .await
+                            };
+                            let answers = async {
+                                if prompts.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    run_user_input_prompts(
+                                        prompter.as_ref(),
+                                        prompts,
+                                        &key,
+                                        &delegate_key_str,
+                                        caller,
+                                    )
+                                    .await
+                                }
+                            };
+                            let done = tokio::time::timeout(
+                                delegate_park::PARK_WORK_BUDGET,
+                                async { tokio::join!(answers, fetches) },
                             )
                             .await;
-                            guard.send(responses);
+                            match done {
+                                Ok((responses, resolved)) => guard.send(responses, resolved),
+                                Err(_) => {
+                                    tracing::warn!(
+                                        delegate = %key,
+                                        "Off-loop delegate work exceeded PARK_WORK_BUDGET; \
+                                         resuming empty so the round-trip terminates"
+                                    );
+                                    guard.send(Vec::new(), Vec::new());
+                                }
+                            }
                         });
                         return DelegateRunOutcome::Parked;
                     }
                     delegate_park::ParkAdmission::Refused(continuation) => {
                         // Node-wide park cap reached. Fall through to the
-                        // pre-#5544 inline wait: it stalls the loop, which is
-                        // what this change exists to stop, but silently losing
-                        // a user's permission prompt would be worse. Restore
-                        // what the refused continuation was carrying.
+                        // pre-#5544 inline waits: they stall the loop, which is
+                        // what this change exists to stop, but silently losing a
+                        // user's permission prompt or a delegate's write would
+                        // be worse. Restore what the refused continuation held.
                         let continuation = *continuation;
                         accumulated_messages = continuation.accumulated;
                         inbound_responses = continuation.inbound_so_far;
@@ -1290,16 +1501,24 @@ where
                 }
             }
 
-            inbound_responses.extend(
-                run_user_input_prompts(
-                    prompter.as_ref(),
-                    user_input_requests,
-                    delegate_key,
-                    &delegate_key_str,
-                    caller,
-                )
-                .await,
-            );
+            // Inline fallback: no parking context (direct unit-test calls), or
+            // the park cap was hit.
+            for pending in std::mem::take(&mut deferred_upserts) {
+                inbound_responses
+                    .push(run_deferred_upsert_inline(contract_handler, pending).await);
+            }
+            if !user_input_requests.is_empty() {
+                inbound_responses.extend(
+                    run_user_input_prompts(
+                        prompter.as_ref(),
+                        std::mem::take(&mut user_input_requests),
+                        delegate_key,
+                        &delegate_key_str,
+                        caller,
+                    )
+                    .await,
+                );
+            }
         }
 
         // Create a new request to send the responses back to the delegate
@@ -1492,6 +1711,7 @@ where
                     delegate_key,
                     cause: delegate_park::ResumeCause::TimedOut,
                     inbound: Vec::new(),
+                    upserts: Vec::new(),
                 },
             )
             .await;
@@ -2597,6 +2817,7 @@ async fn handle_delegate_resume<CH, P>(
         delegate_key,
         cause,
         inbound,
+        upserts,
     } = resume;
 
     let Some((continuation, pending)) = park.take(&delegate_key) else {
@@ -2631,6 +2852,11 @@ async fn handle_delegate_resume<CH, P>(
     } = continuation;
 
     let mut all_inbound = inbound_so_far;
+    // Re-run any deferred upserts ON the loop (WASM stays serial; only the
+    // fetch happened off it), then feed their responses back with the rest.
+    for resolved in upserts {
+        all_inbound.push(apply_resolved_upsert(contract_handler, resolved).await);
+    }
     all_inbound.extend(inbound);
 
     let mut carried_responder = responder;
@@ -5808,7 +6034,7 @@ mod hol_4391_tests {
         }
 
         // Release the human: the delegate resumes and its client is answered.
-        gate.notify_waiters();
+        gate.notify_one();
         let resp = tokio::time::timeout(Duration::from_secs(5), delegate_task)
             .await
             .expect("the parked delegate must resolve once the prompt is answered")
@@ -5817,6 +6043,130 @@ mod hol_4391_tests {
         assert!(
             matches!(resp, ContractHandlerEvent::DelegateResponse(_)),
             "parked delegate must answer its original client exactly once, got {resp}"
+        );
+
+        handle.abort();
+    }
+
+    /// The second half of #5544: a delegate PUT whose contract asks for a
+    /// related contract this node lacks used to await a network GET INLINE, up
+    /// to RELATED_FETCH_TIMEOUT (10s), on the same serial loop. Smaller than
+    /// the prompt stall but reachable with no user involvement at all.
+    ///
+    /// Same falsification shape as the prompt test: with the deferral removed
+    /// the local GET below times out.
+    #[tokio::test]
+    async fn deferred_delegate_upsert_does_not_block_the_loop() {
+        let _guard = TEST_GUARD.lock().await;
+
+        // Contract A requests related contract B, which is never local.
+        let contract_a = make_contract(b"park_put_a");
+        let key_a = contract_a.key();
+        let id_b = *make_contract(b"park_put_b_missing").key().id();
+
+        let (mut handler, send) = build_handler(vec![(
+            *key_a.id(),
+            ValidateOverride::RequestRelated(vec![id_b]),
+        )])
+        .await;
+
+        let script = handler.runtime_mut().delegate_script.clone();
+        script
+            .lock()
+            .unwrap()
+            .push_back(vec![OutboundDelegateMsg::PutContractRequest(
+                freenet_stdlib::prelude::PutContractRequest {
+                    contract: contract_a.clone(),
+                    state: WrappedState::new(b"a_state".to_vec()),
+                    related_contracts: RelatedContracts::default(),
+                    context: DelegateContext::default(),
+                    processed: false,
+                },
+            )]);
+
+        // B's fetch hangs until released, standing in for a slow network GET.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let gate_for_stub = gate.clone();
+        let _override = OverrideGuard::install(Arc::new(move |missing: Vec<ContractInstanceId>| {
+            let gate = gate_for_stub.clone();
+            Box::pin(async move {
+                gate.notified().await;
+                Err(ExecutorError::missing_related(missing[0]))
+            })
+        }));
+
+        // A locally stored contract whose GET needs no network at all.
+        let contract_c = make_contract(b"park_put_c_cached");
+        let key_c = contract_c.key();
+
+        let send = Arc::new(send);
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            crate::contract::user_input::AutoApprovePrompter,
+        ));
+
+        let put_c = put_local(
+            send.as_ref(),
+            contract_c,
+            WrappedState::new(b"c_state".to_vec()),
+        )
+        .await;
+        assert!(
+            matches!(
+                put_c,
+                ContractHandlerEvent::PutResponse {
+                    new_value: Ok(_),
+                    ..
+                }
+            ),
+            "seed PUT for C must succeed, got {put_c}"
+        );
+
+        let send_d = send.clone();
+        let key_d = test_delegate_key();
+        let delegate_task: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
+            GlobalExecutor::spawn(async move {
+                send_d.send_to_handler(delegate_event(&key_d)).await
+            });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let get_c = tokio::time::timeout(
+            Duration::from_secs(2),
+            send.send_to_handler(ContractHandlerEvent::GetQuery {
+                instance_id: *key_c.id(),
+                return_contract_code: false,
+            }),
+        )
+        .await
+        .expect(
+            "a local-store GET must NOT block behind a delegate PUT whose \
+             related-contract fetch is still in flight (#5544)",
+        )
+        .expect("GET for C must respond");
+        match get_c {
+            ContractHandlerEvent::GetResponse { response, .. } => {
+                let store = response.expect("GET for C must succeed");
+                assert_eq!(
+                    store.state.expect("C has state").as_ref(),
+                    b"c_state",
+                    "GET must return C's stored state"
+                );
+            }
+            other => panic!("expected GetResponse for C, got {other}"),
+        }
+
+        // Release the fetch: B is reported missing, so A's upsert fails and the
+        // delegate is told so — the point is that it terminates and answers.
+        gate.notify_one();
+        let resp = tokio::time::timeout(Duration::from_secs(5), delegate_task)
+            .await
+            .expect("the parked delegate must resolve once its fetch completes")
+            .expect("delegate task join")
+            .expect("delegate request must be answered");
+        assert!(
+            matches!(resp, ContractHandlerEvent::DelegateResponse(_)),
+            "a delegate parked on a related fetch must still answer its client, got {resp}"
         );
 
         handle.abort();
@@ -5887,7 +6237,7 @@ mod hol_4391_tests {
 
         // Release the prompt: the parked run resumes, then the queued request
         // is drained — both reach the delegate, in order.
-        gate.notify_waiters();
+        gate.notify_one();
         let r1 = tokio::time::timeout(Duration::from_secs(5), first)
             .await
             .expect("first delegate request must resolve")
