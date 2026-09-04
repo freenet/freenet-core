@@ -53,8 +53,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
-use freenet_stdlib::client_api::DelegateRequest;
 use either::Either;
+use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{
     ContractContainer, ContractInstanceId, ContractKey, DelegateContext, DelegateKey,
     InboundDelegateMsg, OutboundDelegateMsg, Parameters, RelatedContracts, StateDelta,
@@ -373,11 +373,7 @@ impl DelegateParkCtx {
     /// guarantees only one round-trip per delegate is ever in flight, so this
     /// is unreachable by construction and is treated as a refusal rather than
     /// silently clobbering the live continuation.
-    pub(super) fn park(
-        &mut self,
-        key: DelegateKey,
-        continuation: Continuation,
-    ) -> ParkAdmission {
+    pub(super) fn park(&mut self, key: DelegateKey, continuation: Continuation) -> ParkAdmission {
         if self.parked.len() >= MAX_PARKED_DELEGATES || self.parked.contains_key(&key) {
             tracing::warn!(
                 delegate = %key,
