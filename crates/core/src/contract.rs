@@ -2750,6 +2750,41 @@ async fn dispatch_delegate_request<CH, P>(
 {
     let delegate_key = req.key().clone();
 
+    // INVARIANT this function is the chokepoint for, load-bearing for TWO
+    // separate changes and enforced by nothing but the shape of the call graph:
+    //
+    //   At most one delegate `process()` executes node-wide at any instant, and
+    //   it always executes on the `contract_handling` loop.
+    //
+    // #5544 parks a delegate mid-round-trip, which releases the loop while that
+    // delegate is SUSPENDED (its WASM call has already returned) — never while
+    // it is RUNNING. So the window parking opens is one in which a DIFFERENT
+    // delegate may START, not one in which two may RUN:
+    //
+    //   * `execute_delegate_request` is reached only via
+    //     `handle_delegate_with_contract_requests`, whose every caller — this
+    //     function, `handle_delegate_notification` and `handle_delegate_resume`
+    //     — is awaited from `contract_handling`, one task per node.
+    //   * The off-loop task #5544 spawns captures no `ContractHandler` and no
+    //     executor, so it cannot invoke a delegate. It waits on a human and
+    //     drives a sub-op GET; neither needs one.
+    //   * A resume re-enters the delegate from `handle_delegate_resume`, ON the
+    //     loop. The spawned task only ships a result back down a channel.
+    //
+    // Who depends on this, and why per-delegate exclusion is NOT enough:
+    // `native_api::state_content_changed` (V2 delegate writes, #5490) does a
+    // read-then-write that is not atomic. Its racing pair is two DIFFERENT
+    // delegates writing the SAME contract — per-CONTRACT, which the per-delegate
+    // exclusion below permits by construction. It is safe only because of the
+    // global property above. The durable fix is on #5490's side: fold the
+    // comparison into the same ReDb write transaction as the store, as
+    // `update_state_sync` already does.
+    //
+    // BREAKING IT: spawning any work that holds the `ContractHandler`, or
+    // resuming a continuation anywhere other than the loop. Do either and
+    // #5490's gate must become atomic first. (#4531's off-loop secret export is
+    // not a counter-example — it holds a pooled executor but never invokes a
+    // delegate.) See `delegate_park`'s module docs for the full argument.
     let Some(park) = park else {
         // No loop behind us (direct unit-test calls): legacy inline behaviour,
         // stalls and all.
