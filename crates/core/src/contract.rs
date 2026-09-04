@@ -8,6 +8,11 @@ use either::Either;
 use freenet_stdlib::prelude::*;
 
 pub(crate) mod delegate_app_registry;
+// Lands ahead of its call sites so the bounds, the TTL and the exactly-once
+// resume guard can be reviewed and unit-tested on their own. The `allow` goes
+// away in the commit that wires the prompt path.
+#[allow(dead_code)]
+mod delegate_park;
 mod executor;
 mod fair_queue;
 pub(crate) use fair_queue::Priority;
