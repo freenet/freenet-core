@@ -868,6 +868,139 @@ mod tests {
         );
     }
 
+    /// #5479: a byte-identical rewrite must NOT fire the post-write hook.
+    ///
+    /// `DelegateCallEnv::state_content_changed` is the only thing standing
+    /// between the ordinary delegate shape — *on each application message,
+    /// recompute my contract state and store it*, idempotent, writing the same
+    /// bytes most of the time — and one full network fan-out per message. V1
+    /// gets this for free from `bridged_upsert_contract_state_inner`'s
+    /// `UpsertResult::NoChange` short-circuit; the V2 bypass has to re-apply it,
+    /// and `ring::broadcast_coverage` records that no-change applies are ~97% of
+    /// received contract bytes, so the filter is load-bearing rather than an
+    /// optimisation.
+    ///
+    /// Every OTHER V2 test in this module writes each contract exactly once, and
+    /// `state_content_changed` returns `true` when no prior state exists — so
+    /// before this test the whole suite stayed green with the filter gutted to
+    /// `true`. Two writes of the same bytes is the smallest shape that observes
+    /// it at all.
+    #[tokio::test]
+    async fn test_env_identical_rewrite_does_not_fire_write_callback() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(122, &[1, 2, 3]).await;
+
+        let observed =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
+        let observed_for_cb = observed.clone();
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            move |k: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState| {
+                observed_for_cb
+                    .lock()
+                    .unwrap()
+                    .push((*k, new_state.as_ref().to_vec()));
+            },
+        );
+
+        // SAFETY: `env_holder` is alive for the duration of this test.
+        let env = unsafe { env_holder.make_env_with_callback(cb) };
+
+        // First write: no stored state yet, so this one is genuinely a change.
+        env.put_contract_state_sync(&contract_id, vec![7, 8, 9])
+            .expect("first V2 PUT should succeed");
+        assert_eq!(
+            observed.lock().unwrap().len(),
+            1,
+            "the first write stores new content and must fire the hook"
+        );
+
+        // Second write, same bytes. The write itself still succeeds — the
+        // filter suppresses the SIDE EFFECTS, it does not reject the call.
+        env.put_contract_state_sync(&contract_id, vec![7, 8, 9])
+            .expect("a byte-identical V2 PUT must still report success");
+        assert_eq!(
+            observed.lock().unwrap().len(),
+            1,
+            "a byte-identical V2 PUT must NOT fire the post-write hook a second \
+             time: the hook emits BroadcastStateChange, so firing it here turns \
+             an idempotent delegate into one full network fan-out per message \
+             (#5479). If this assertion reads 2, `state_content_changed` has \
+             been gutted or bypassed."
+        );
+
+        // A genuine change after the no-op must still get through — the filter
+        // must suppress, not latch.
+        env.put_contract_state_sync(&contract_id, vec![7, 8, 10])
+            .expect("a changing V2 PUT after a no-op should succeed");
+        let calls = observed.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            2,
+            "a real change following a no-op must fire the hook — the filter \
+             suppresses identical writes, it does not disable the path"
+        );
+        assert_eq!(
+            calls[1].1,
+            vec![7, 8, 10],
+            "the second firing must carry the newly-written bytes"
+        );
+    }
+
+    /// #5479: a V2 write above `MAX_STATE_SIZE` must be rejected, and nothing
+    /// may land.
+    ///
+    /// `StateStore::{store,update}` enforce this ceiling and the V1 commit path
+    /// enforces it again before broadcasting, but the V2 bypass writes through
+    /// the raw `Storage`, which does not. Before #5479 an oversized V2 write was
+    /// a local-disk problem; now the same uncapped `WrappedState` would be cloned
+    /// into a `BroadcastStateChange` and put on the wire, where every recipient
+    /// rejects it at its own guard AFTER paying for the transfer.
+    #[tokio::test]
+    async fn test_env_oversized_state_is_rejected_and_nothing_is_written() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(123, &[1, 2, 3]).await;
+
+        // A callback that would panic if it ever ran: an oversized write must be
+        // refused BEFORE any post-write side effect, so this is unreachable.
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            |_k: &ContractKey, _s: &freenet_stdlib::prelude::WrappedState| {
+                panic!(
+                    "the post-write hook must not run for a state rejected by \
+                     check_state_size — the broadcast it emits is exactly what \
+                     the size ceiling exists to keep off the wire"
+                );
+            },
+        );
+
+        // SAFETY: `env_holder` is alive for the duration of this test.
+        let env = unsafe { env_holder.make_env_with_callback(cb) };
+
+        let oversized = vec![0u8; super::super::MAX_STATE_SIZE + 1];
+        let result = env.put_contract_state_sync(&contract_id, oversized);
+
+        match result {
+            Err(DelegateEnvError::StateTooLarge { size, limit }) => {
+                assert_eq!(size, super::super::MAX_STATE_SIZE + 1);
+                assert_eq!(limit, super::super::MAX_STATE_SIZE);
+            }
+            other => {
+                panic!("a V2 PUT over MAX_STATE_SIZE must fail with StateTooLarge, got {other:?}")
+            }
+        }
+
+        // `TestEnv::store_contract` seeded this contract with `[1, 2, 3]`, so
+        // asserting that exact value back is stronger than asserting `None`: it
+        // proves the rejected write did not partially overwrite existing state,
+        // not merely that it failed to create new state.
+        assert_eq!(
+            env.get_contract_state_sync(&contract_id).unwrap(),
+            Some(vec![1, 2, 3]),
+            "a rejected oversized V2 PUT must leave the previously-stored state \
+             untouched — the check runs before the raw `Storage` write, so \
+             nothing should have landed"
+        );
+    }
+
     /// #4683 finding #2 regression: a V2 delegate PUT that the admit callback
     /// REJECTS (disk over budget) must return `DiskBudgetExceeded`, map to
     /// `ERR_STORE_ERROR`, and leave the write un-landed (state unchanged). This
