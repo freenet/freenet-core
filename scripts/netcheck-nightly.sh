@@ -44,8 +44,12 @@ rm -rf "$RUN_DIR"
 # The getter must join through a gateway that did not receive the PUTs, or the
 # GET can be answered by the node that just stored them. Resolved from the
 # public index so a rotated address or key does not silently stale this script.
-INDEX_KEY_URL="${NETCHECK_GETTER_KEY_URL:-https://freenet.org/keys/public.vega.gw.pem}"
-GETTER_HOST="${NETCHECK_GETTER_HOST:-vega.locut.us}"
+# Defaults point at gw1, NOT the retired AWS gateway. This script joins the live
+# ring through the getter, so a default naming a host that is going away turns
+# the nightly check into a nightly failure the moment DNS is cut — and it fails
+# in a way that looks like a network problem rather than a stale default.
+INDEX_KEY_URL="${NETCHECK_GETTER_KEY_URL:-https://freenet.org/keys/public.nova.gw.pem}"
+GETTER_HOST="${NETCHECK_GETTER_HOST:-gw1.freenet.org}"
 GETTER_PORT="${NETCHECK_GETTER_PORT:-31337}"
 getter_ip=$(getent hosts "$GETTER_HOST" | awk '{print $1}' | head -1)
 getter_key=$(curl -fsS --max-time 30 "$INDEX_KEY_URL" | tr -d '[:space:]')
