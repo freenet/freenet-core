@@ -878,6 +878,34 @@ pub(crate) fn set_test_network_fetch_override(stub: Option<NetworkFetchStub>) {
     TEST_NETWORK_FETCH_OVERRIDE.with(|cell| *cell.borrow_mut() = stub);
 }
 
+/// Test hook for the OTHER network-fetch leg: `local_state_or_from_network`.
+///
+/// Distinct from [`NetworkFetchStub`] because the two legs return different
+/// things and only this one can install a contract. `fetch_related_via_network`
+/// resolves a bare state; `local_state_or_from_network` resolves a whole
+/// `GetResult`, and it is the `GetResult::contract` half that lets
+/// `get_updated_state` install a SECOND contract mid-UPDATE — the site whose
+/// post-store fan-out #5481 is about. Returning `None` stands for
+/// `SubOpGetOutcome::NotFound`.
+#[cfg(test)]
+pub(crate) type SubOpGetStub =
+    std::rc::Rc<dyn Fn(ContractInstanceId) -> Option<crate::operations::get::GetResult>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook used by `local_state_or_from_network` to bypass the real
+    /// network sub-op driver. Set with [`set_test_sub_op_get_override`]
+    /// inside a `#[tokio::test(flavor = "current_thread")]` so the
+    /// thread-local lookup hits the same task that ran the test setup.
+    static TEST_SUB_OP_GET_OVERRIDE: std::cell::RefCell<Option<SubOpGetStub>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_sub_op_get_override(stub: Option<SubOpGetStub>) {
+    TEST_SUB_OP_GET_OVERRIDE.with(|cell| *cell.borrow_mut() = stub);
+}
+
 #[cfg(test)]
 mod executor_pin_tests {
     /// Pin: `local_state_or_from_network` MUST use the sub-op GET

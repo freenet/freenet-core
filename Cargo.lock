@@ -6837,6 +6837,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-contract-delta-trap"
+version = "0.1.0"
+dependencies = [
+ "freenet-stdlib 0.8.5",
+]
+
+[[package]]
 name = "test-contract-integration"
 version = "0.1.11"
 dependencies = [
@@ -6850,6 +6857,13 @@ name = "test-contract-mock-aligned"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "freenet-stdlib 0.8.5",
+]
+
+[[package]]
+name = "test-contract-requires-related"
+version = "0.1.0"
+dependencies = [
  "freenet-stdlib 0.8.5",
 ]
 

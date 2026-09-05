@@ -53,6 +53,23 @@ impl Executor<Runtime> {
                 return Ok(Either::Left(state));
             }
         }
+        // Test hook: stand in for the network leg so the related-contract
+        // INSTALL branch of `get_updated_state` is reachable without a live
+        // network. Deliberately placed AFTER the local-store lookup above, so
+        // the stub can only ever replace the network fetch and never masks a
+        // local hit. Mirrors `TEST_NETWORK_FETCH_OVERRIDE`, which does the same
+        // for `fetch_related_via_network`.
+        #[cfg(test)]
+        {
+            if let Some(stub) = super::TEST_SUB_OP_GET_OVERRIDE.with(|cell| cell.borrow().clone()) {
+                return match stub(*id) {
+                    Some(get_result) => Ok(Either::Right(get_result)),
+                    None => Err(ExecutorError::other(anyhow::anyhow!(
+                        "sub-op GET stub: contract not found"
+                    ))),
+                };
+            }
+        }
         // Fetch from network via the sub-op GET driver. The driver
         // delivers the resolved `GetResult` directly through a oneshot.
         let op_manager = self
