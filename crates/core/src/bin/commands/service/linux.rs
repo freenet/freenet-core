@@ -1235,7 +1235,19 @@ mod tests {
     /// `$EXIT_STATUS` it forwarded through the env var when it did.
     fn run_hook(script: &str, dir: &Path, case: &StopPostCase) -> (bool, String) {
         let marker = dir.join("update-ran");
-        let _ = std::fs::remove_file(&marker);
+        // Not `let _ =`: a marker left behind by the previous scenario would make
+        // the NEXT one report `freenet update` as having run when it did not, so
+        // every "must skip" row would pass while measuring the wrong thing. The
+        // absent case is the normal one and is the only tolerated error.
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!(
+                "could not clear the {} marker between scenarios ({e}); a stale \
+                 marker would make this matrix report skipped hooks as having run",
+                marker.display()
+            ),
+        }
 
         let mut cmd = std::process::Command::new("/bin/sh");
         cmd.arg("-c").arg(script);
