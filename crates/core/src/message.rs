@@ -971,6 +971,51 @@ pub(crate) enum NodeEvent {
         /// and retry re-emissions.
         is_reemit: bool,
     },
+    /// A V2 delegate wrote contract state; fan the change out to the network.
+    ///
+    /// DISPATCH: this ends in the same all-subscriber fan-out as
+    /// [`Self::BroadcastStateChange`] — the handler resolves the state and
+    /// hands it to `handle_broadcast_state_change`, which sends to EVERY
+    /// advertised co-host of the contract. It is not targeted at one peer.
+    ///
+    /// Carries the contract id and NO state. The handler re-reads the current
+    /// stored state when it drains, which gives two properties the
+    /// state-carrying variant cannot:
+    ///
+    /// * **Queue cost is independent of state size.** A queued event is one
+    ///   contract id, not a `WrappedState` of up to `MAX_STATE_SIZE`, so the
+    ///   channel's message-count bound is also a bound on the bytes these
+    ///   events retain.
+    /// * **Pending broadcasts for one contract coalesce.** While a broadcast
+    ///   is queued for a contract, further writes to it enqueue nothing (see
+    ///   `OpManager::queue_v2_delegate_broadcast`), and the single drain
+    ///   broadcasts whatever is stored by the time it runs — so a burst of
+    ///   writes costs one fan-out, carrying the newest state rather than the
+    ///   oldest.
+    ///
+    /// The re-read costs one contract-handler `GetQuery` per drained
+    /// broadcast, which is why the coalescing matters: the cost is per drain,
+    /// not per write. It is BOUNDED at the drain site — that read runs inline
+    /// on the network event loop, where an unbounded await is the #4549 wedge.
+    ///
+    /// It shares the PRINCIPLE of the #4359 deferred-broadcast flush — re-read
+    /// rather than carry bytes that may have been superseded — but is not the
+    /// same mechanism, and the differences are the ones a reader would
+    /// otherwise assume away:
+    ///
+    /// * **When the read happens.** #4359 reads at the TRIGGER and
+    ///   synchronously builds a state-carrying event. This path reads at the
+    ///   DRAIN, because the write callback that queues it is synchronous inside
+    ///   a WASM host call and cannot `.await` anything.
+    /// * **What happens when the read fails.** #4359 falls back to the bytes it
+    ///   stashed (`read_current_state().await.unwrap_or(stashed)`), so it always
+    ///   emits something. This path stashes nothing, so a failed read has no
+    ///   fallback: it is reported and dropped, and the state is re-announced by
+    ///   the next write or by anti-entropy. See the `Unavailable` arm at the
+    ///   drain site.
+    V2DelegateStateChanged {
+        key: ContractKey,
+    },
     /// Send state to a specific peer that reported a stale summary.
     /// Unlike BroadcastStateChange (which fans out to ALL subscribers),
     /// this targets only the peer that needs catching up.
@@ -1120,6 +1165,9 @@ impl Display for NodeEvent {
             }
             NodeEvent::BroadcastStateChange { key, .. } => {
                 write!(f, "BroadcastStateChange (contract: {key})")
+            }
+            NodeEvent::V2DelegateStateChanged { key } => {
+                write!(f, "V2DelegateStateChanged (contract: {key})")
             }
             NodeEvent::SyncStateToPeer { key, target, .. } => {
                 write!(f, "SyncStateToPeer (contract: {key}, target: {target})")

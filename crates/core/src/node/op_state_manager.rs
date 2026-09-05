@@ -216,6 +216,21 @@ pub(crate) struct OpManager {
     /// network instead of landing locally-hosted only (issue #4359).
     pub(crate) pending_broadcasts:
         Arc<crate::operations::update::pending_broadcast::PendingBroadcastStore>,
+    /// Contracts with a V2 delegate state-change broadcast already queued and
+    /// not yet drained.
+    ///
+    /// The queued event names the contract and carries no state; the handler
+    /// re-reads the current stored state when it drains. So the queue holds a
+    /// contract id per pending broadcast rather than a `WrappedState`, and its
+    /// cost does not scale with state size. This set is what makes the queued
+    /// broadcasts coalesce: while one is outstanding for a contract, further
+    /// writes to that contract add nothing to the queue, and the single drain
+    /// broadcasts whatever is stored by the time it runs.
+    ///
+    /// Membership is cleared by the handler BEFORE it re-reads, so a write
+    /// landing during the read queues a fresh event rather than being folded
+    /// into one already in flight.
+    pub(crate) v2_delegate_broadcast_pending: Arc<dashmap::DashSet<ContractInstanceId>>,
     /// Request router for client request deduplication.
     ///
     /// This is initialized lazily from `client_event_handling` because the router is only
@@ -344,6 +359,7 @@ impl Clone for OpManager {
             broadcast_coverage: self.broadcast_coverage.clone(),
             update_propagation_stats: self.update_propagation_stats.clone(),
             pending_broadcasts: self.pending_broadcasts.clone(),
+            v2_delegate_broadcast_pending: self.v2_delegate_broadcast_pending.clone(),
             request_router: self.request_router.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             stream_progress_registry: self.stream_progress_registry.clone(),
@@ -401,6 +417,77 @@ impl Drop for ClientOpGuard {
         // late observation is an extra 200ms poll interval before
         // the drain notices counter==0.
         self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Outcome of a bounded state read on the V2 broadcast drain path.
+///
+/// Three-way on purpose: collapsing `NotHeld` and `Unavailable` into one
+/// `None` is what let a transient read failure silently discard a write that
+/// had already committed and already returned success to the delegate — the
+/// #5479 shape, reintroduced inside its own fix. See
+/// [`OpManager::read_state_for_broadcast_drain`].
+#[derive(Debug)]
+pub(crate) enum DrainStateRead {
+    /// State read successfully; broadcast it.
+    Found(WrappedState),
+    /// We genuinely do not hold this contract. Not broadcasting is correct
+    /// and final — there is nothing to send.
+    NotHeld,
+    /// The read failed or timed out. We may or may not hold the contract; the
+    /// write it would have announced has already committed. NOT the same as
+    /// `NotHeld`, and must not be silent.
+    Unavailable,
+}
+
+/// Count of V2 delegate broadcasts dropped because the notification channel
+/// would have blocked.
+///
+/// A counter as well as a log line, for the reason `.claude/rules/code-style.md`
+/// gives: a refusal that is not counted renders as a clean zero. The paired
+/// message is WARN because `crates/core/Cargo.toml` enables tracing's
+/// `release_max_level_info` — anything below INFO does not exist in a release
+/// binary, which is how #4981 discarded legitimate traffic with no greppable
+/// evidence.
+///
+/// KNOWN LIMIT: this drop heals on the delegate's NEXT write, which is prompt
+/// for a chatty writer and not prompt at all for an infrequent one. A delegate
+/// that writes once a day and loses that write to a full channel stays
+/// unpropagated until the following day, and the anti-entropy heartbeat only
+/// helps peers already interested in the contract. Re-attempting from the loop
+/// instead of dropping needs a bounded sweep of the pending set with its own
+/// TTL — a design change, not a tweak — and is tracked separately.
+static V2_BROADCAST_ENQUEUE_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Map a contract-handler reply onto a [`DrainStateRead`].
+///
+/// Split out from [`OpManager::read_state_for_broadcast_drain`] so the mapping
+/// can be tested exhaustively without a live contract handler. The async
+/// wrapper is then only the round trip; this is the part with the decision in
+/// it, and the decision is the one that regressed before: collapsing a failed
+/// read into the same answer as "we do not hold it" is what silently discarded
+/// an already-committed write.
+pub(crate) fn classify_drain_read(
+    reply: Result<crate::contract::ContractHandlerEvent, ContractError>,
+) -> DrainStateRead {
+    use crate::contract::ContractHandlerEvent;
+    match reply {
+        // The handler answered and it holds state for the contract.
+        Ok(ContractHandlerEvent::GetResponse {
+            response: Ok(store_response),
+            ..
+        }) => match store_response.state {
+            Some(state) => DrainStateRead::Found(state),
+            // Answered, and we genuinely hold no state. Final: nothing to send.
+            None => DrainStateRead::NotHeld,
+        },
+        // The handler answered with an executor error, or answered something
+        // that is not a GetResponse at all. Either way we learned nothing about
+        // whether we hold the contract, so this is NOT `NotHeld`.
+        Ok(_) => DrainStateRead::Unavailable,
+        // Timed out, channel closed, or the handler is gone.
+        Err(_) => DrainStateRead::Unavailable,
     }
 }
 
@@ -558,6 +645,7 @@ impl OpManager {
             pending_broadcasts: Arc::new(
                 crate::operations::update::pending_broadcast::PendingBroadcastStore::new(),
             ),
+            v2_delegate_broadcast_pending: Arc::new(dashmap::DashSet::new()),
             request_router,
             orphan_stream_registry,
             stream_progress_registry: Arc::new(StreamProgressRegistry::new()),
@@ -943,10 +1031,127 @@ impl OpManager {
         .await;
     }
 
+    /// Queue a V2 delegate state-change broadcast for `key`, coalescing with
+    /// any broadcast already queued for the same contract.
+    ///
+    /// Returns `true` when an event was actually enqueued. A `false` return is
+    /// the normal coalesced case — a broadcast for this contract is already
+    /// outstanding and will pick up this write when it drains, because it
+    /// re-reads the stored state rather than carrying a snapshot.
+    ///
+    /// Synchronous and non-blocking on purpose: the only caller runs inside a
+    /// WASM host call on the V2 delegate write path, where blocking would be
+    /// worse than a dropped broadcast. A drop is recoverable — the next write
+    /// or a summary-mismatch resync re-announces the state.
+    pub(crate) fn queue_v2_delegate_broadcast(&self, key: ContractKey) -> bool {
+        // `insert` returns false when the id was already present, i.e. a
+        // broadcast is queued and undrained: coalesce into it and enqueue
+        // nothing.
+        if !self.v2_delegate_broadcast_pending.insert(*key.id()) {
+            return false;
+        }
+        if let Err(err) =
+            self.try_notify_node_event(crate::message::NodeEvent::V2DelegateStateChanged { key })
+        {
+            // Release the marker. Leaving it set after a failed enqueue would
+            // latch this contract permanently: every later write would see a
+            // broadcast "already queued" that no handler will ever drain, and
+            // the contract would silently stop propagating for the process
+            // lifetime.
+            self.v2_delegate_broadcast_pending.remove(key.id());
+            let dropped =
+                V2_BROADCAST_ENQUEUE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            // WARN, not debug: `release_max_level_info` compiles debug out, so
+            // a debug-only line here would make this drop invisible in exactly
+            // the builds that matter. Same reasoning as the drain-read drop.
+            tracing::warn!(
+                contract = %key,
+                error = %err,
+                dropped_total = dropped,
+                "V2 delegate state-change broadcast dropped: notification channel would \
+                 block. The write is committed locally; the network learns of it on the \
+                 next write or via anti-entropy"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Read the current stored state for `key` for a V2 broadcast drain,
+    /// BOUNDED and distinguishing "not held" from "could not read".
+    ///
+    /// Two things this does not share with
+    /// [`Self::read_current_contract_state`], both because this one runs INLINE
+    /// on the network event loop rather than in a spawned task:
+    ///
+    /// * **It is bounded.** The plain read inherits the handler's own
+    ///   `CH_EV_RESPONSE_TIME_OUT` (300 s). A bare `.await` of that on this loop
+    ///   is the #4549 wedge — see this file's `query_app_subscriptions_bounded`,
+    ///   whose comment records a saturated handler killing the network event
+    ///   listener and taking a gateway network-dead. Same remedy, same reason.
+    /// * **It reports the failure.** The plain read maps every failure to
+    ///   `None`, which the caller cannot tell from "we do not hold this
+    ///   contract". For a drain those need opposite handling: not held is a
+    ///   correct no-op, a failed read means a committed write goes unannounced.
+    ///
+    /// # Why this read can time out, and what that costs
+    ///
+    /// The read is a `GetQuery` to the SERIAL `contract_handling` loop, and the
+    /// event being drained was queued by a V2 delegate write that executed ON
+    /// that loop. So the read cannot be served until that delegate returns.
+    ///
+    /// For a delegate that merely computes, that is microseconds and the
+    /// bounded retry at the drain site covers any transient overrun. For a
+    /// delegate that requests USER INPUT it is not: `prompter.prompt(..)` is
+    /// awaited inline inside `handle_delegate_with_contract_requests`, which
+    /// `contract_handling` awaits in turn, so the loop is held for as long as a
+    /// human takes to answer. Such a write is committed, reported successful to
+    /// the delegate, and its broadcast dropped — retries cannot outlast a human.
+    ///
+    /// That case is bounded, not silent: it is counted and WARNed at the drain
+    /// site, and a peer hosting or actively using the contract re-learns the
+    /// state within one anti-entropy round (`INTEREST_HEARTBEAT_INTERVAL`,
+    /// 300 s), because the heartbeat summarize and the broadcast fan-out are
+    /// gated on the SAME `should_summarize_or_broadcast` predicate — see
+    /// `broadcast_queue::should_broadcast_contract`, which says so explicitly.
+    /// The real fix is #5544/#5554, which parks delegates off this loop and
+    /// removes the precondition entirely.
+    pub(crate) async fn read_state_for_broadcast_drain(
+        &self,
+        key: &ContractKey,
+        timeout: std::time::Duration,
+    ) -> DrainStateRead {
+        use crate::contract::ContractHandlerEvent;
+        match self
+            .notify_contract_handler_with_timeout(
+                ContractHandlerEvent::GetQuery {
+                    instance_id: *key.id(),
+                    return_contract_code: false,
+                },
+                timeout,
+            )
+            .await
+        {
+            Ok(ev) => classify_drain_read(Ok(ev)),
+            Err(e) => classify_drain_read(Err(e)),
+        }
+    }
+
+    /// Clear the queued-broadcast marker for `key`, called by the handler when
+    /// it begins draining. See [`Self::queue_v2_delegate_broadcast`].
+    pub(crate) fn clear_v2_delegate_broadcast_pending(&self, key: &ContractKey) {
+        self.v2_delegate_broadcast_pending.remove(key.id());
+    }
+
     /// Read the current local state for `key` from the contract handler, or
     /// `None` if we don't host it / the read fails. Used by the #4359 deferred
-    /// re-broadcast flush to avoid re-emitting superseded give-up-time bytes.
-    async fn read_current_contract_state(&self, key: &ContractKey) -> Option<WrappedState> {
+    /// re-broadcast flush to avoid re-emitting superseded give-up-time bytes,
+    /// and by the V2 delegate broadcast drain, which carries no state of its
+    /// own and reads what is stored at drain time.
+    pub(crate) async fn read_current_contract_state(
+        &self,
+        key: &ContractKey,
+    ) -> Option<WrappedState> {
         use crate::contract::ContractHandlerEvent;
         match self
             .notify_contract_handler(ContractHandlerEvent::GetQuery {
@@ -5685,6 +5890,78 @@ mod tests {
             "NetworkContractHandler::build must call rehydrate_local_hosting_interest \
              after load_hosting_cache so restored hosted contracts serve locally and \
              rejoin anti-entropy (#4780)",
+        );
+    }
+
+    /// `classify_drain_read` must keep "we hold no state" and "the read failed"
+    /// APART. Collapsing them is what let a transient GetQuery failure silently
+    /// discard a write that had already committed and already returned success
+    /// to the delegate — #5479's own shape, reappearing inside its fix.
+    ///
+    /// Exhaustive over the four reply shapes on purpose: three of them are
+    /// error-ish and only ONE of those three is safe to treat as final.
+    #[test]
+    fn classify_drain_read_separates_not_held_from_unavailable() {
+        use crate::contract::ContractHandlerEvent;
+        use crate::contract::StoreResponse;
+        use freenet_stdlib::prelude::WrappedState;
+
+        // 1. Answered, state present → broadcast it.
+        let found = classify_drain_read(Ok(ContractHandlerEvent::GetResponse {
+            key: None,
+            response: Ok(StoreResponse {
+                state: Some(WrappedState::new(vec![1, 2, 3])),
+                contract: None,
+            }),
+        }));
+        match found {
+            DrainStateRead::Found(state) => assert_eq!(state.as_ref(), &[1, 2, 3]),
+            other @ DrainStateRead::NotHeld | other @ DrainStateRead::Unavailable => {
+                panic!("state present must map to Found, got {other:?}")
+            }
+        }
+
+        // 2. Answered, no state → we genuinely do not hold it. Final, silent.
+        assert!(
+            matches!(
+                classify_drain_read(Ok(ContractHandlerEvent::GetResponse {
+                    key: None,
+                    response: Ok(StoreResponse {
+                        state: None,
+                        contract: None,
+                    }),
+                })),
+                DrainStateRead::NotHeld
+            ),
+            "an answered read with no state means we do not hold the contract; not \
+             broadcasting is correct and there is nothing to warn about"
+        );
+
+        // 3. Answered with an executor error → we learned NOTHING about whether
+        //    we hold it, so this must NOT be NotHeld.
+        assert!(
+            matches!(
+                classify_drain_read(Ok(ContractHandlerEvent::GetResponse {
+                    key: None,
+                    response: Err(crate::contract::ExecutorError::other(anyhow::anyhow!(
+                        "executor failure"
+                    ))),
+                })),
+                DrainStateRead::Unavailable
+            ),
+            "an executor error tells us nothing about whether we hold the contract, so \
+             it must be Unavailable — treating it as NotHeld silently drops a committed \
+             write's announcement"
+        );
+
+        // 4. Transport failure (timeout, closed channel, dead handler).
+        assert!(
+            matches!(
+                classify_drain_read(Err(ContractError::NoEvHandlerResponse)),
+                DrainStateRead::Unavailable
+            ),
+            "a failed round trip must be Unavailable, never NotHeld — this is the \
+             timeout case the bounded read exists to produce"
         );
     }
 }
