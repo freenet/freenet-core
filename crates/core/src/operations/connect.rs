@@ -2146,6 +2146,67 @@ mod tests {
     use crate::transport::TransportKeypair;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+    /// Source-scrape pin (issue #4787 review finding): `startup_connect_retries`
+    /// must only increment BEFORE the process's first real bootstrap. A prior
+    /// version had no such gate, so a later transient dip below
+    /// `bootstrap_threshold` (ordinary post-startup churn, e.g. losing peers)
+    /// kept incrementing a counter documented and exported as startup-only.
+    /// `initial_join_procedure` runs inside a `GlobalExecutor::spawn`'d loop for
+    /// the node's lifetime, so this invariant isn't practically unit-testable by
+    /// driving the loop directly — this pins the gate's presence at the source
+    /// level instead. Mutation-verified: removing the `if !min_connections_reached`
+    /// wrapper (leaving the bare `record_bootstrap_startup_connect_retry();` call)
+    /// makes this test FAIL.
+    #[test]
+    fn initial_join_procedure_gates_startup_retry_counter_on_min_connections_reached() {
+        let src = include_str!("connect.rs");
+        let sig = "pub(crate) async fn initial_join_procedure(";
+        let start = src
+            .find(sig)
+            .expect("initial_join_procedure signature not found");
+        let body_start = src[start..]
+            .find('{')
+            .map(|i| start + i)
+            .expect("no opening brace after signature");
+        // Walk forward counting brace depth to find the MATCHING closing
+        // brace, so the region is exact regardless of nested blocks — unlike
+        // a naive "first \n}\n after this point" search, which would stop at
+        // the end of the first inner block instead of the function itself.
+        let mut depth: i32 = 0;
+        let mut end = None;
+        for (i, ch) in src[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(body_start + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end.expect("unbalanced braces scanning initial_join_procedure body");
+        let body = &src[body_start..=end];
+
+        let gate = "if !min_connections_reached {";
+        let gate_at = body.find(gate).expect(
+            "initial_join_procedure must gate the startup retry counter on \
+             !min_connections_reached — see the doc comment on \
+             BootstrapChurnStats::startup_connect_retries",
+        );
+        let after_gate = &body[gate_at..];
+        assert!(
+            after_gate
+                .lines()
+                .take(3)
+                .any(|l| l.contains("record_bootstrap_startup_connect_retry()")),
+            "the `if !min_connections_reached` gate must directly wrap the \
+             record_bootstrap_startup_connect_retry() call, not some other statement"
+        );
+    }
+
     #[test]
     fn resolve_probe_gateway_addr_returns_known_socket() {
         let pub_key = TransportKeypair::new().public().clone();

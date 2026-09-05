@@ -406,11 +406,12 @@ pub struct NetworkStatus {
 #[derive(Default)]
 pub struct BootstrapChurnStats {
     /// Counts calls to the "Registered transient connection" log site, not
-    /// confirmed new-entry insertions: `try_register_transient` also returns
-    /// `true` (and the site still logs/increments) for an already-tracked
-    /// entry, so this can be a slight overcount relative to the transient
-    /// table's real size. Faithfully mirrors the pre-existing log statement's
-    /// own semantics at that site.
+    /// confirmed new-entry insertions: the call site increments unconditionally,
+    /// without branching on `try_register_transient`'s return value, so it also
+    /// counts an already-tracked entry (returns `true`) and a budget-exhausted
+    /// refusal where nothing was actually inserted (returns `false`). Faithfully
+    /// mirrors the pre-existing log statement's own (also-unconditional)
+    /// semantics at that site.
     pub transient_registered: u64,
     pub transient_expired: u64,
     pub promoted_to_ring: u64,
