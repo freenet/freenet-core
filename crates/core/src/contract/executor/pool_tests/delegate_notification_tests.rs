@@ -598,6 +598,14 @@ fn count_call_sites(src: &str, needle: &str) -> usize {
 /// failure class. It also missed the smaller sibling, a needle sitting after a
 /// TRAILING `//` on an otherwise-live line.
 ///
+/// Block comments NEST, as Rust permits: `/* outer /* inner */ still comment */`
+/// is one comment, and exiting on the first `*/` would treat its tail as live
+/// code. That is the same shape as the bug this helper was written to fix — the
+/// previous version skipped one kind of comment while its docstring said
+/// "comments" — so it is counted here rather than left to "nested block
+/// comments are rare", which is exactly what the previous version was
+/// implicitly relying on too.
+///
 /// Char literals are recognised narrowly (`'x'`, `'\n'`) so that a `'"'` in the
 /// scraped source cannot flip the scanner into string mode, while a lifetime
 /// (`'a`, which is a quote followed by an identifier and no closing quote) is
@@ -618,6 +626,8 @@ fn blank_comments_and_strings(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut mode = Mode::Code;
     let mut escaped = false;
+    // How many `/*` are currently open. Only the outermost `*/` returns to code.
+    let mut block_depth = 0usize;
     let mut i = 0usize;
 
     while i < chars.len() {
@@ -633,6 +643,7 @@ fn blank_comments_and_strings(src: &str) -> String {
                 }
                 if c == '/' && next == Some('*') {
                     mode = Mode::BlockComment;
+                    block_depth = 1;
                     out.push_str("  ");
                     i += 2;
                     continue;
@@ -676,8 +687,17 @@ fn blank_comments_and_strings(src: &str) -> String {
                 i += 1;
             }
             Mode::BlockComment => {
+                if c == '/' && next == Some('*') {
+                    block_depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
                 if c == '*' && next == Some('/') {
-                    mode = Mode::Code;
+                    block_depth -= 1;
+                    if block_depth == 0 {
+                        mode = Mode::Code;
+                    }
                     out.push_str("  ");
                     i += 2;
                     continue;
