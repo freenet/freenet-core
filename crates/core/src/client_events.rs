@@ -465,6 +465,73 @@ where
     }
 }
 
+/// Maps the contract handler's response to a client-driven `DelegateRequest`
+/// into either the values to hand back to the client, or the `Error` to
+/// propagate — logging exactly as the inline match this was extracted from
+/// did. Split out of `process_open_request`'s `DelegateOp` arm so the fix for
+/// #5263 (a genuine delegate execution failure must reach the client as
+/// `Err`, not an empty `Ok`) is unit-testable without constructing an
+/// `OpManager`.
+fn delegate_request_outcome(
+    res: Result<ContractHandlerEvent, crate::contract::ContractError>,
+    client_id: ClientId,
+    request_id: RequestId,
+    delegate_key: &DelegateKey,
+    msg_type: Option<&str>,
+) -> Result<Vec<OutboundDelegateMsg>, Error> {
+    match res {
+        Ok(ContractHandlerEvent::DelegateResponse(Ok(values))) => {
+            if let Some(mt) = msg_type {
+                tracing::info!(
+                    delegate = %delegate_key,
+                    msg_type = %mt,
+                    request_id = %request_id,
+                    outcome = "executed",
+                    "DelegateRequest dispatch"
+                );
+            }
+            Ok(values)
+        }
+        // Genuine delegate execution failure (#5263). Previously this arm
+        // didn't exist: a failure was indistinguishable from
+        // `Ok(ContractHandlerEvent::DelegateResponse(Ok(vec![])))`, so the
+        // client silently received an empty successful response instead of
+        // an error.
+        Ok(ContractHandlerEvent::DelegateResponse(Err(exec_err))) => {
+            tracing::error!(
+                client_id = %client_id,
+                request_id = %request_id,
+                delegate = %delegate_key,
+                error = %exec_err,
+                phase = "error",
+                "Delegate execution failed"
+            );
+            Err(Error::Executor(exec_err))
+        }
+        Err(err) => {
+            tracing::error!(
+                client_id = %client_id,
+                request_id = %request_id,
+                delegate = %delegate_key,
+                error = %err,
+                phase = "error",
+                "Delegate operation failed (contract error)"
+            );
+            Err(Error::Contract(err))
+        }
+        Ok(_) => {
+            tracing::error!(
+                client_id = %client_id,
+                request_id = %request_id,
+                delegate = %delegate_key,
+                phase = "error",
+                "Delegate operation failed (unexpected state)"
+            );
+            Err(Error::Op(OpError::UnexpectedOpState))
+        }
+    }
+}
+
 #[inline]
 async fn process_open_request(
     mut request: OpenRequest<'static>,
@@ -1672,7 +1739,7 @@ async fn process_open_request(
                 // it on a channel the delegate/client cannot reach.
                 let user_context = request.user_context;
 
-                let res = match op_manager
+                let handler_res = op_manager
                     .notify_contract_handler_prioritized(
                         ContractHandlerEvent::DelegateRequest {
                             req,
@@ -1682,42 +1749,14 @@ async fn process_open_request(
                         },
                         crate::contract::Priority::ClientLocal,
                     )
-                    .await
-                {
-                    Ok(ContractHandlerEvent::DelegateResponse(res)) => {
-                        if let Some(ref mt) = msg_type {
-                            tracing::info!(
-                                delegate = %delegate_key,
-                                msg_type = %mt,
-                                request_id = %request_id,
-                                outcome = "executed",
-                                "DelegateRequest dispatch"
-                            );
-                        }
-                        res
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            client_id = %client_id,
-                            request_id = %request_id,
-                            delegate = %delegate_key,
-                            error = %err,
-                            phase = "error",
-                            "Delegate operation failed (contract error)"
-                        );
-                        return Err(Error::Contract(err));
-                    }
-                    Ok(_) => {
-                        tracing::error!(
-                            client_id = %client_id,
-                            request_id = %request_id,
-                            delegate = %delegate_key,
-                            phase = "error",
-                            "Delegate operation failed (unexpected state)"
-                        );
-                        return Err(Error::Op(OpError::UnexpectedOpState));
-                    }
-                };
+                    .await;
+                let res = delegate_request_outcome(
+                    handler_res,
+                    client_id,
+                    request_id,
+                    &delegate_key,
+                    msg_type.as_deref(),
+                )?;
 
                 let host_response = Ok(HostResponse::DelegateResponse {
                     key: delegate_key.clone(),
@@ -2438,6 +2477,89 @@ mod unsupported_request_tests {
              client, not merely log and fall through to `Ok(None)` — a \
              client whose request lands here would wait forever with no \
              response. Arm content: {arm:?}"
+        );
+    }
+}
+
+/// Unit tests for `delegate_request_outcome`, the mapping `process_open_request`
+/// uses to turn the contract handler's response to a client `DelegateRequest`
+/// into either the values to return or the `Error` to propagate. These drive
+/// the function directly — no `OpManager` needed — so the #5263 fix (a
+/// genuine delegate execution failure reaches the client as `Err`, not an
+/// empty `Ok`) is covered at the exact layer the client actually sees.
+#[cfg(test)]
+mod delegate_request_outcome_tests {
+    use super::*;
+
+    fn key() -> DelegateKey {
+        DelegateKey::new([3u8; 32], CodeHash::new([0u8; 32]))
+    }
+
+    #[test]
+    fn genuine_execution_failure_becomes_executor_error() {
+        let exec_err = crate::contract::ExecutorError::other(anyhow::anyhow!(
+            "missing message origin for message type: \"application message\""
+        ));
+        let res = delegate_request_outcome(
+            Ok(ContractHandlerEvent::DelegateResponse(Err(exec_err))),
+            ClientId::next(),
+            RequestId::new(),
+            &key(),
+            None,
+        );
+        assert!(
+            matches!(res, Err(Error::Executor(_))),
+            "a genuine delegate execution failure must reach the client as \
+             Err(Error::Executor(_)), not a fake success (#5263); got {res:?}"
+        );
+    }
+
+    #[test]
+    fn successful_execution_returns_the_values() {
+        let res = delegate_request_outcome(
+            Ok(ContractHandlerEvent::DelegateResponse(Ok(vec![]))),
+            ClientId::next(),
+            RequestId::new(),
+            &key(),
+            Some("ApplicationMessages"),
+        );
+        assert!(
+            res.expect("a successful response must not be an error")
+                .is_empty(),
+            "an empty Vec on a genuinely successful response is still correct — \
+             only a genuine failure should become Err"
+        );
+    }
+
+    #[test]
+    fn channel_level_contract_error_propagates_as_contract_error() {
+        let res = delegate_request_outcome(
+            Err(crate::contract::ContractError::NoEvHandlerResponse),
+            ClientId::next(),
+            RequestId::new(),
+            &key(),
+            None,
+        );
+        assert!(
+            matches!(res, Err(Error::Contract(_))),
+            "a channel-level failure (handler dropped, no response) must \
+             surface as Error::Contract; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn unexpected_response_variant_is_reported_as_unexpected_op_state() {
+        let res = delegate_request_outcome(
+            Ok(ContractHandlerEvent::ExportUserSecretsResponse(Ok(vec![]))),
+            ClientId::next(),
+            RequestId::new(),
+            &key(),
+            None,
+        );
+        assert!(
+            matches!(res, Err(Error::Op(OpError::UnexpectedOpState))),
+            "a response of the wrong ContractHandlerEvent variant must be \
+             reported, not silently accepted; got {res:?}"
         );
     }
 }

@@ -543,7 +543,7 @@ async fn handle_delegate_with_contract_requests<CH, P>(
     user_context: Option<&UserSecretContext>,
     delegate_key: &DelegateKey,
     prompter: &P,
-) -> Vec<OutboundDelegateMsg>
+) -> Result<Vec<OutboundDelegateMsg>, ExecutorError>
 where
     CH: ContractHandler + Send + 'static,
     P: UserInputPrompter,
@@ -596,8 +596,14 @@ where
                 iterations = iterations,
                 "Exceeded maximum contract request iterations, possible infinite loop"
             );
-            // Return whatever we accumulated so far
-            return accumulated_messages;
+            // Stays `Ok` DELIBERATELY, and this is an OPEN QUESTION, not a
+            // settled decision. Exhausting the iteration budget may be a
+            // legitimate outcome for a delegate that simply has more work than
+            // the cap allows, in which case converting it to `Err` would turn
+            // working delegates into client-visible failures. Nobody has
+            // established which it is, so #5263 deliberately did not touch it.
+            // Confirm the intent before changing this -- tracked as #5454.
+            return Ok(accumulated_messages);
         }
 
         // Execute the delegate request
@@ -622,27 +628,39 @@ where
                     phase = "unexpected_response",
                     "Unexpected response type from delegate request"
                 );
-                // Return whatever we accumulated so far
-                return accumulated_messages;
+                // An internal invariant violation, not a delegate outcome: the
+                // executor answered a delegate request with a variant that is
+                // not a delegate response at all. Reporting it as an empty
+                // success is the same lie #5263 removes from the failure arm
+                // below -- the client cannot tell "the delegate said nothing"
+                // from "this node is confused". Nothing legitimate reaches
+                // here, so there is no working behaviour to regress.
+                return Err(ExecutorError::other(anyhow::anyhow!(
+                    "unexpected response variant for a delegate request on {delegate_key}"
+                )));
             }
             Err(err) => {
                 // Downgrade "not found" to warn — expected during legacy
-                // migration probes when old delegate WASM isn't on this node
+                // migration probes when old delegate WASM isn't on this node.
+                // A missing-delegate probe stays a benign empty response
+                // rather than a client-visible error; only genuine execution
+                // failures propagate as Err below (#5263 — previously EVERY
+                // failure here, including real ones, silently became an
+                // empty successful DelegateResponse to the client).
                 if err.is_missing_delegate() {
                     tracing::warn!(
                         delegate_key = %delegate_key,
                         "Delegate not found in store (expected for migration probes)"
                     );
-                } else {
-                    tracing::error!(
-                        delegate_key = %delegate_key,
-                        error = %err,
-                        phase = "execution_failed",
-                        "Failed executing delegate request"
-                    );
+                    return Ok(accumulated_messages);
                 }
-                // Return whatever we accumulated so far
-                return accumulated_messages;
+                tracing::error!(
+                    delegate_key = %delegate_key,
+                    error = %err,
+                    phase = "execution_failed",
+                    "Failed executing delegate request"
+                );
+                return Err(err);
             }
         };
 
@@ -691,7 +709,7 @@ where
             && delegate_messages.is_empty()
             && user_input_requests.is_empty()
         {
-            return accumulated_messages;
+            return Ok(accumulated_messages);
         }
 
         let mut inbound_responses: Vec<InboundDelegateMsg<'static>> = Vec::new();
@@ -2136,6 +2154,26 @@ async fn handle_delegate_notification<CH, P>(
     )
     .await;
 
+    // Notification-driven: there is no client waiting to answer, so an
+    // execution failure has nothing to propagate to. Already logged inside
+    // `handle_delegate_with_contract_requests`; there is nothing to route.
+    //
+    // The TTL sweep runs BEFORE this return, not after. It is the registry's
+    // only production caller, and it is what time-bounds the delegate->apps
+    // map per the AGENTS.md GC-exemption rule. Returning above it would make
+    // the sweep conditional on the delegate SUCCEEDING -- and the failure that
+    // motivated #5263 is one a delegate repeats on every single invocation
+    // (rejecting `origin: None`), so on a node whose delegates are all failing
+    // that way the backstop would never run at all. Registrations for apps
+    // that vanished without a clean disconnect would then pin their slots
+    // against MAX_APPS_PER_DELEGATE until the process restarted. Sweeping is
+    // independent of whether this particular execution produced anything.
+    delegate_app_registry::sweep_expired();
+
+    let Ok(outbound) = outbound else {
+        return;
+    };
+
     // Route outbound ApplicationMessages to the apps registered with this
     // delegate (#3275). handle_delegate_with_contract_requests already
     // processed the contract requests (GET/PUT/UPDATE/SUBSCRIBE) internally;
@@ -2164,12 +2202,6 @@ async fn handle_delegate_notification<CH, P>(
             }
         })
         .collect();
-
-    // Opportunistic TTL sweep of the delegate->apps registry, mirroring how
-    // prune_expired_contexts sweeps on delegate activity rather than via a
-    // background task. Bounds stale registrations for apps that vanished
-    // without a clean disconnect (AGENTS.md GC-exemption rule).
-    delegate_app_registry::sweep_expired();
 
     if app_messages.is_empty() {
         return;
@@ -3076,6 +3108,106 @@ mod tests {
     ///  2. the notification path — which has no connection and therefore
     ///     hardcodes `Local` — is `InterDelegateDispatch::Suppressed`, so that
     ///     hardcoded value can never reach the hop.
+    /// Pin: the unexpected-response arm must return `Err`, not a fake success.
+    ///
+    /// The executor answering a delegate request with a variant that is not a
+    /// delegate response is an internal invariant violation. Returning
+    /// `Ok(accumulated_messages)` there is the same lie #5263 removes from the
+    /// execution-failure arm: the client cannot distinguish "the delegate said
+    /// nothing" from "this node is confused".
+    ///
+    /// Pinned from source rather than behaviourally because both mock
+    /// executors (`MockWasmRuntime`, `MockRuntime`) return `Err`
+    /// unconditionally, so no fixture can drive the executor to hand back a
+    /// wrong-variant `Ok`. Truncated at the test module first -- the needles
+    /// occur in this function's own text (see #5450).
+    #[test]
+    fn unexpected_response_variant_does_not_become_a_fake_success() {
+        let full = include_str!("contract.rs");
+        let cutoff = full
+            .find("\nmod tests {")
+            .expect("contract.rs must have a top-level `mod tests`");
+        let src = &full[..cutoff];
+
+        let start = src
+            .find("async fn handle_delegate_with_contract_requests")
+            .expect("handle_delegate_with_contract_requests must exist");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\nasync fn ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let arm = body
+            .find("phase = \"unexpected_response\"")
+            .expect("the unexpected-response arm must exist");
+        let after = &body[arm..];
+        // Bound to this arm: stop at the next match arm's opening.
+        let arm_end = after.find("Err(err) => {").unwrap_or(after.len());
+        let arm = &after[..arm_end];
+
+        assert!(
+            arm.contains("return Err("),
+            "the unexpected-response arm must return an error; returning \
+             Ok(accumulated_messages) reports an internal invariant violation \
+             to the client as an empty SUCCESS (#5263). Arm: {arm:?}"
+        );
+        assert!(
+            !arm.contains("return Ok(accumulated_messages)"),
+            "the unexpected-response arm must not fall back to a fake success"
+        );
+    }
+
+    /// Pin: the delegate->apps TTL sweep must run BEFORE the early return on
+    /// an execution failure.
+    ///
+    /// `sweep_expired` is the registry's ONLY production caller, and it is what
+    /// time-bounds the map per the AGENTS.md GC-exemption rule. #5263 added an
+    /// early `return` on a failed execution; putting the sweep after it makes
+    /// the backstop conditional on the delegate SUCCEEDING. The failure that
+    /// motivated #5263 is one a delegate repeats on EVERY invocation (rejecting
+    /// `origin: None`), so on a node whose delegates all fail that way the
+    /// sweep would never run and stale registrations would pin their slots
+    /// against `MAX_APPS_PER_DELEGATE` until restart.
+    ///
+    /// The source is truncated at the test module BEFORE scraping: both needles
+    /// below also occur in this function's own text, which `include_str!` pulls
+    /// in, so without the cut a rename would silently widen the region instead
+    /// of panicking (see #5450).
+    #[test]
+    fn ttl_sweep_precedes_the_execution_failure_return() {
+        let full = include_str!("contract.rs");
+        let cutoff = full
+            .find("\nmod tests {")
+            .expect("contract.rs must have a top-level `mod tests`");
+        let src = &full[..cutoff];
+
+        let start = src
+            .find("async fn handle_delegate_notification")
+            .expect("handle_delegate_notification must exist");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\nasync fn ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let sweep = body
+            .find("delegate_app_registry::sweep_expired()")
+            .expect("the TTL sweep must live in handle_delegate_notification");
+        let bail = body
+            .find("let Ok(outbound) = outbound else")
+            .expect("the execution-failure early return must exist");
+
+        assert!(
+            sweep < bail,
+            "the TTL sweep ({sweep}) must run BEFORE the execution-failure \
+             return ({bail}); after it, the registry's only production sweep \
+             becomes conditional on the delegate succeeding"
+        );
+    }
+
     #[test]
     fn inter_delegate_hop_forwards_the_originating_scope() {
         let src = include_str!("contract.rs");
@@ -5168,6 +5300,64 @@ mod hol_4391_tests {
                 );
             }
             other => panic!("expected RegisterSubscriberListenerResponse, got {other}"),
+        }
+    }
+
+    /// Regression for #5263: when a delegate's execution fails, the client
+    /// driving `ContractHandlerEvent::DelegateRequest` through
+    /// `handle_contract_event` MUST see the failure ride back as
+    /// `DelegateResponse(Err(_))`, not a fake empty successful response.
+    ///
+    /// `MockWasmRuntime::execute_delegate_request` unconditionally returns a
+    /// generic `ExecutorError::other(...)` for any delegate request — not the
+    /// `is_missing_delegate()` case, which stays a benign empty response for
+    /// legacy migration probes (see `handle_delegate_with_contract_requests`)
+    /// — so no delegate needs to be registered to exercise the genuine
+    /// execution-failure branch this test targets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_request_surfaces_execution_failure_5263() {
+        let (send_halve, rcv_halve, _) = handler::contract_handler_channel();
+        let mut handler = MockWasmContractHandler::new_test(rcv_halve, None, "del_fail_5263").await;
+
+        let delegate_key = DelegateKey::new([7u8; 32], CodeHash::new([0u8; 32]));
+        let req = DelegateRequest::ApplicationMessages {
+            key: delegate_key,
+            params: Parameters::from(vec![]),
+            inbound: vec![],
+        };
+        let event = ContractHandlerEvent::DelegateRequest {
+            req,
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+        };
+        let send_fut = send_halve.send_to_handler(event);
+        let recv_fut = async {
+            let (id, received, _priority) = handler
+                .channel()
+                .recv_from_sender()
+                .await
+                .expect("handler channel should be open");
+            handle_contract_event(
+                &mut handler,
+                id,
+                received,
+                &user_input::AutoApprovePrompter,
+                None,
+            )
+            .await
+            .expect("dispatch must not error");
+        };
+        let (send_res, ()) = tokio::join!(send_fut, recv_fut);
+        match send_res.expect("must receive a response") {
+            ContractHandlerEvent::DelegateResponse(result) => {
+                assert!(
+                    result.is_err(),
+                    "a delegate execution failure must surface an error to the \
+                     client, not a fake empty success (#5263)"
+                );
+            }
+            other => panic!("expected DelegateResponse, got {other}"),
         }
     }
 }
