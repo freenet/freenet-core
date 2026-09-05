@@ -164,6 +164,26 @@ impl P2pConnManager {
     /// Base delay between broadcast retries (scaled by attempt number for linear backoff).
     const BROADCAST_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
+    /// Maximum retry attempts when a V2 delegate broadcast drain cannot read
+    /// the state it was going to send.
+    ///
+    /// Deliberately small, and deliberately NOT a fix for the whole failure.
+    /// The read is a `GetQuery` to the serial `contract_handling` loop, and the
+    /// event being drained was queued by a delegate write that ran ON that
+    /// loop — so the read waits for the delegate that caused it. Retrying
+    /// recovers a delegate that was merely busy for a few seconds.
+    ///
+    /// It does NOT recover a delegate that requests user input:
+    /// `handle_delegate_with_contract_requests` awaits `prompter.prompt(..)`
+    /// inline on that loop, so the hold is human-scale and three retries over a
+    /// few seconds cannot outlast it. That case is not retried into
+    /// submission — it is reported, counted, and healed by anti-entropy.
+    /// #5544/#5554 remove the precondition by parking delegates off the loop.
+    pub(super) const MAX_V2_DRAIN_RETRIES: u8 = 3;
+
+    /// Base delay between V2 drain retries, scaled by attempt number.
+    pub(super) const V2_DRAIN_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+
     /// Maximum entries in the no-target streak tracker. Prevents unbounded growth
     /// from network-influenced contract keys.
     const MAX_BROADCAST_STREAK_ENTRIES: usize = 256;

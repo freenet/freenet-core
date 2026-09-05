@@ -780,6 +780,15 @@ pub(in crate::node) struct P2pConnManager {
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// Per-contract retry count for broadcasts that found no targets yet.
     broadcast_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
+    /// Per-contract retry count for a V2 delegate broadcast drain whose state
+    /// read came back `Unavailable`.
+    ///
+    /// Separate from `broadcast_retries`, which counts a different failure (a
+    /// fan-out that resolved no targets). This one counts "we could not read
+    /// what to send". Bounded by [`Self::MAX_V2_DRAIN_RETRIES`]; the entry is
+    /// removed on success, on a definitive `NotHeld`, and on exhaustion, so it
+    /// cannot accumulate per contract.
+    v2_drain_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
     /// Tracks how many consecutive broadcast cycles found zero targets per contract.
     /// Used to suppress repetitive WARN logs after the first few failures.
     /// Bounded to MAX_BROADCAST_STREAK_ENTRIES to prevent unbounded growth from
@@ -1351,6 +1360,7 @@ impl P2pConnManager {
             congestion_config: config.config.network_api.build_congestion_config(),
             blocked_addresses: config.blocked_addresses.clone(),
             broadcast_retries: HashMap::new(),
+            v2_drain_retries: HashMap::new(),
             broadcast_no_target_streak: HashMap::new(),
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue: super::broadcast_queue::BroadcastQueue::new(),
@@ -1419,6 +1429,7 @@ impl P2pConnManager {
             ack_version_floor_override,
             blocked_addresses,
             broadcast_retries,
+            v2_drain_retries,
             broadcast_no_target_streak,
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue,
@@ -1514,6 +1525,7 @@ impl P2pConnManager {
             ack_version_floor_override,
             blocked_addresses,
             broadcast_retries,
+            v2_drain_retries,
             broadcast_no_target_streak,
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue: broadcast_queue.clone(),
@@ -2997,6 +3009,7 @@ impl P2pConnManager {
                                     crate::node::op_state_manager::DrainStateRead::Found(
                                         new_state,
                                     ) => {
+                                        ctx.v2_drain_retries.remove(&key);
                                         ctx.handle_broadcast_state_change(
                                             &op_manager,
                                             key,
@@ -3007,6 +3020,8 @@ impl P2pConnManager {
                                         .await;
                                     }
                                     crate::node::op_state_manager::DrainStateRead::NotHeld => {
+                                        // Definitive: retrying cannot change it.
+                                        ctx.v2_drain_retries.remove(&key);
                                         tracing::debug!(
                                             contract = %key,
                                             "V2 delegate broadcast drained for a contract we \
@@ -3014,26 +3029,92 @@ impl P2pConnManager {
                                         );
                                     }
                                     crate::node::op_state_manager::DrainStateRead::Unavailable => {
-                                        // A write that already committed and
-                                        // already returned success to the
-                                        // delegate now goes unannounced. WARN,
-                                        // not debug: `release_max_level_info`
-                                        // compiles debug out, and a drop that
-                                        // leaves no evidence in a release build
-                                        // is the #4981 shape.
-                                        let dropped = V2_BROADCAST_DRAINS_DROPPED
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                            + 1;
-                                        tracing::warn!(
-                                            contract = %key,
-                                            dropped_total = dropped,
-                                            timeout_secs =
-                                                V2_BROADCAST_DRAIN_READ_TIMEOUT.as_secs(),
-                                            "V2 delegate broadcast dropped: could not read \
-                                             local state to announce. The write is committed \
-                                             locally; the network learns of it on the next \
-                                             write or via anti-entropy"
-                                        );
+                                        // The read is a GetQuery to the serial
+                                        // contract-handling loop, and the event
+                                        // being drained was queued by a delegate
+                                        // write that ran ON that loop — so this
+                                        // read waits for the delegate that
+                                        // caused it. A bounded retry recovers a
+                                        // delegate that was merely busy.
+                                        //
+                                        // Re-queueing is safe: the marker was
+                                        // cleared before the read, so a fresh
+                                        // write is free to queue its own event
+                                        // and at worst we fan out twice.
+                                        let attempt = ctx.v2_drain_retries.entry(key).or_insert(0);
+                                        if *attempt < Self::MAX_V2_DRAIN_RETRIES {
+                                            *attempt += 1;
+                                            let delay = Self::V2_DRAIN_RETRY_BASE_DELAY
+                                                * u32::from(*attempt);
+                                            let op_mgr = op_manager.clone();
+                                            tokio::spawn(async move {
+                                                tokio::time::sleep(delay).await;
+                                                if op_mgr
+                                                    .try_notify_node_event(
+                                                        crate::message::NodeEvent::
+                                                            V2DelegateStateChanged { key },
+                                                    )
+                                                    .is_err()
+                                                {
+                                                    // The retry never got queued,
+                                                    // so the outcome is the same
+                                                    // as exhausting them: this
+                                                    // write goes unannounced.
+                                                    // Counted and WARNed for that
+                                                    // reason rather than dropped
+                                                    // quietly.
+                                                    let dropped =
+                                                        V2_BROADCAST_DRAINS_DROPPED.fetch_add(
+                                                            1,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        ) + 1;
+                                                    tracing::warn!(
+                                                        contract = %key,
+                                                        dropped_total = dropped,
+                                                        "V2 delegate broadcast dropped: the \
+                                                         drain retry could not be re-queued. \
+                                                         The write is committed locally; a \
+                                                         peer hosting or using this contract \
+                                                         re-learns it within one anti-entropy \
+                                                         round (300s), or sooner on the \
+                                                         delegate's next write"
+                                                    );
+                                                }
+                                            });
+                                        } else {
+                                            // Retries exhausted. A write that
+                                            // already committed and already
+                                            // returned success to the delegate
+                                            // now goes unannounced.
+                                            //
+                                            // WARN, not debug: `release_max_level_info`
+                                            // compiles debug out, and a drop that
+                                            // leaves no evidence in a release build
+                                            // is the #4981 shape.
+                                            ctx.v2_drain_retries.remove(&key);
+                                            let dropped = V2_BROADCAST_DRAINS_DROPPED
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                                + 1;
+                                            tracing::warn!(
+                                                contract = %key,
+                                                dropped_total = dropped,
+                                                retries = Self::MAX_V2_DRAIN_RETRIES,
+                                                timeout_secs =
+                                                    V2_BROADCAST_DRAIN_READ_TIMEOUT.as_secs(),
+                                                "V2 delegate broadcast dropped after retries: \
+                                                 could not read local state to announce. The \
+                                                 usual cause is the contract-handling loop \
+                                                 being held by the delegate that made this \
+                                                 write — a delegate awaiting user input holds \
+                                                 it for a human-scale time and will not be \
+                                                 recovered by retries (#5544/#5554 remove \
+                                                 that precondition). The write is committed \
+                                                 locally; a peer that is hosting or has this \
+                                                 contract in use re-learns it within one \
+                                                 anti-entropy round (INTEREST_HEARTBEAT_INTERVAL, \
+                                                 300s), or sooner on the delegate's next write"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -5405,6 +5486,43 @@ pub(crate) mod tests {
              fan-out and names peers that fan-out never touched — \
              over-suppression. Every queue test passes an empty fanout, so no \
              behavioural test distinguishes the two."
+        );
+    }
+
+    /// Every terminal outcome of the V2 drain must drop its retry entry.
+    ///
+    /// `v2_drain_retries` is keyed by contract and bounded only by removal
+    /// discipline — there is no size cap (matching the neighbouring
+    /// `broadcast_retries`). So an arm that forgets to remove leaks one entry
+    /// per contract that ever hit it, and nothing else in the tree would catch
+    /// it: the map is not observable from any behavioural test of this loop.
+    ///
+    /// All three arms are terminal for the retry: `Found` sent it, `NotHeld` is
+    /// definitive, and the exhausted branch has given up. Only the still-retrying
+    /// branch may leave an entry in place.
+    #[test]
+    fn v2_drain_retry_entries_are_dropped_on_every_terminal_outcome() {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+
+        let arm_anchor = "NodeEvent::V2DelegateStateChanged { key } => {";
+        let arm_start = SOURCE
+            .find(arm_anchor)
+            .expect("the V2DelegateStateChanged dispatch arm is gone — update this pin");
+        let after = &SOURCE[arm_start..];
+        let arm_end = after
+            .find("NodeEvent::SyncStateToPeer {")
+            .map(|p| arm_start + p)
+            .unwrap_or(SOURCE.len());
+        let arm = &SOURCE[arm_start..arm_end];
+
+        let removals = arm.matches("v2_drain_retries.remove(&key)").count();
+        assert_eq!(
+            removals, 3,
+            "expected exactly 3 `v2_drain_retries.remove(&key)` sites in the V2 drain arm \
+             (Found, NotHeld, and retries-exhausted); found {removals}. Fewer means a \
+             terminal outcome leaks one map entry per contract that reaches it, and the map \
+             has no size cap. More means a still-retrying path is dropping its own counter, \
+             which makes the retry unbounded."
         );
     }
 
