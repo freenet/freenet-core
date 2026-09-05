@@ -1834,11 +1834,23 @@ impl HostingManager {
     /// and pruned on client disconnect, so the count is the
     /// currently-active set.
     ///
-    /// The production reaper-tick path no longer calls this per-contract
-    /// accessor (it uses the single-pass [`beneficiary_counts`] bulk
-    /// builder instead); this remains as the per-contract reference used
-    /// by the governance unit tests and the test-only `Ring` accessors.
-    #[cfg(test)]
+    /// The reaper-tick path does not call this per-contract accessor (it uses
+    /// the single-pass [`beneficiary_counts`] bulk builder instead), and for a
+    /// while nothing in production did, so it was `#[cfg(test)]`.
+    ///
+    /// It is un-gated because the delegate demand path
+    /// (`contract::delegate_demand::register_subscription`) needs the
+    /// per-contract subscriber count to enforce `MAX_SUBSCRIBERS_PER_CONTRACT`
+    /// before inserting. That path registers into `client_subscriptions`
+    /// DIRECTLY rather than through the listener registration, so it does not
+    /// inherit the cap the WebSocket path gets — and this is the count that has
+    /// to be bounded, because it is what `local_and_downstream_counts` (the
+    /// eviction ordering key) and `beneficiary_counts` (governance) read.
+    ///
+    /// Note the name now understates it: the set holds every local subscriber,
+    /// which since #4669 includes delegates' synthetic ids, not only WebSocket
+    /// clients. Renaming it would touch the governance call sites, so the
+    /// clarification lives here instead.
     pub(crate) fn local_client_count(&self, instance_id: &ContractInstanceId) -> usize {
         self.client_subscriptions
             .get(instance_id)

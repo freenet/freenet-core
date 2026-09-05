@@ -347,7 +347,9 @@ impl LogFloodGate {
 /// to eliminate. The real fix is for a subscribe to BOOTSTRAP a contract the
 /// node does not hold, via a network GET; that needs `perform_contract_get` to
 /// reach the network at all (today it is a bare local `state_store.get`) and is
-/// the follow-up PR. Until then this is the honest interim: no pin is better
+/// the follow-up PR, tracked as **#5542** ("delegate contract operations cannot
+/// reach the network: GET, SUBSCRIBE and UPDATE all require the contract to be
+/// known locally"). Until then this is the honest interim: no pin is better
 /// than a stuck one.
 ///
 /// Note it narrows the window rather than closing it — a contract evicted
@@ -391,6 +393,63 @@ pub(crate) fn register_subscription(
         return false;
     }
     let client_id = client_id_for(delegate);
+
+    // Apply the SAME per-CONTRACT subscriber cap a WebSocket client gets.
+    //
+    // There are TWO caps on the WebSocket path and this module originally
+    // implemented only one. `MAX_SUBSCRIPTIONS_PER_CLIENT` bounds how many
+    // contracts one subscriber may pin; `MAX_SUBSCRIBERS_PER_CONTRACT` bounds
+    // how many subscribers one CONTRACT may have. Without the second, any
+    // number of distinct delegates could each pin the same hosted contract
+    // while every one of them stayed comfortably under its own per-client cap,
+    // and each synthetic id lands in that contract's `client_subscriptions`
+    // set — externally-driven unbounded growth in a per-key collection, which
+    // is what `.claude/rules/code-style.md` forbids outright, plus inflation of
+    // the two counts that read that set: `local_and_downstream_counts` (the
+    // eviction ordering key) and governance's `beneficiary_counts`.
+    //
+    // Note the two paths bound DIFFERENT maps, which is why this check could
+    // not simply be inherited. The WebSocket path counts
+    // `shared_notifications[instance_id].len()` — the notification-channel list
+    // — and `client_subscriptions` stays under 256 only transitively, because
+    // `add_client_subscription` runs solely inside the `Ok` arm of that
+    // registration. This module registers demand directly, so the collection
+    // that actually grows is `client_subscriptions`, and that is what is
+    // counted here. The two therefore agree on the limit but not on the map;
+    // unifying them is the enforcement-point question in #5556.
+    //
+    // REJECT at the cap rather than evicting, matching the WebSocket path.
+    // `code-style.md` requires LRU eviction instead for entries that ordinary
+    // use REFRESHES (or incumbents hold the cap forever) — that is not this
+    // case: a delegate pin is never refreshed, it is held until teardown, so
+    // rejection is the correct half of that rule. Evicting would also silently
+    // drop a different delegate's pin, which is worse than refusing this one.
+    //
+    // Checked only for a NEW registration, so an idempotent re-subscribe is
+    // never refused by it.
+    if !op_manager
+        .ring
+        .has_client_subscription(contract.id(), client_id)
+        && op_manager.ring.local_subscriber_count(contract.id())
+            >= crate::contract::executor::MAX_SUBSCRIBERS_PER_CONTRACT
+    {
+        // Rate-limited through the same [`LogFloodGate`] as the other two
+        // refusal branches: a delegate drives how often it lands here.
+        static CONTRACT_FULL: LogFloodGate = LogFloodGate::new();
+        if let Some(occurrences) = CONTRACT_FULL.admit() {
+            tracing::warn!(
+                delegate = %delegate,
+                contract = %contract,
+                limit = crate::contract::executor::MAX_SUBSCRIBERS_PER_CONTRACT,
+                occurrences,
+                "contract is at the per-contract subscriber cap; refusing to \
+                 register further delegate demand. The subscribe still succeeds \
+                 and notifications still work, but this contract is not pinned \
+                 for this delegate."
+            );
+        }
+        return false;
+    }
 
     // Apply the SAME per-subscriber cap a WebSocket client gets.
     //
@@ -869,6 +928,85 @@ mod tests {
             cap,
             ring.client_subscription_count(client_id_for(&delegate))
         );
+    }
+
+    /// A contract gets the SAME per-contract subscriber cap from delegates that
+    /// it gets from WebSocket clients.
+    ///
+    /// There are two caps on the WebSocket path and this module shipped only
+    /// one. `MAX_SUBSCRIPTIONS_PER_CLIENT` bounds contracts-per-subscriber and
+    /// was enforced; `MAX_SUBSCRIBERS_PER_CONTRACT` bounds subscribers-per-
+    /// contract and was not, so any number of distinct delegates could each pin
+    /// the same hosted contract while every one stayed under its own per-client
+    /// cap. That is unbounded growth in a per-key collection driven from
+    /// outside the node, and it inflates both counts that read the set:
+    /// `local_and_downstream_counts` (eviction ordering) and governance's
+    /// `beneficiary_counts`.
+    ///
+    /// Uses distinct delegates rather than one delegate many times, because the
+    /// per-client cap would mask the defect otherwise — the whole point is that
+    /// each attacker-controlled delegate looks individually well-behaved.
+    #[tokio::test(start_paused = true)]
+    async fn a_contract_gets_the_same_subscriber_cap_from_delegates_as_from_clients() {
+        let fixture = seam_fixture("delegate-demand-4669-contract-cap").await;
+        let op_manager = fixture.op_manager.clone();
+        let ring = &op_manager.ring;
+        let cap = crate::contract::executor::MAX_SUBSCRIBERS_PER_CONTRACT;
+
+        let key = contract_key(91);
+        let _ = ring.host_contract(
+            key,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+
+        // Distinct delegate keys, none of which approaches the per-client cap:
+        // every one of them holds exactly one subscription.
+        let delegates: Vec<DelegateKey> = (0..=cap)
+            .map(|i| {
+                let mut raw = [0u8; 32];
+                raw[0] = 0xD0;
+                raw[1..5].copy_from_slice(&(i as u32).to_le_bytes());
+                DelegateKey::new(raw, freenet_stdlib::prelude::CodeHash::new([3u8; 32]))
+            })
+            .collect();
+
+        for delegate in delegates.iter().take(cap) {
+            assert!(
+                register_subscription(&op_manager, delegate, &key),
+                "registration below the per-contract cap must succeed"
+            );
+        }
+        assert_eq!(cap, ring.local_subscriber_count(key.id()));
+
+        assert!(
+            !register_subscription(&op_manager, &delegates[cap], &key),
+            "subscriber {} must be refused — a contract must not accumulate \
+             unbounded delegate pins just because each delegate is individually \
+             under its own per-client cap",
+            cap + 1
+        );
+        assert_eq!(
+            cap,
+            ring.local_subscriber_count(key.id()),
+            "the refused delegate must not have been inserted"
+        );
+        assert_eq!(
+            (cap, 0),
+            ring.local_and_downstream_counts(&key),
+            "the eviction ordering key must not be inflated past the cap either \
+             — that count reads the same set"
+        );
+
+        // An idempotent re-subscribe by an ALREADY-registered delegate must
+        // still succeed at the cap: it adds no new subscriber.
+        assert!(
+            register_subscription(&op_manager, &delegates[0], &key),
+            "a repeat subscribe by an existing subscriber must not be refused \
+             by the per-contract cap — it does not grow the set"
+        );
+        assert_eq!(cap, ring.local_subscriber_count(key.id()));
     }
 
     #[tokio::test(start_paused = true)]

@@ -4436,6 +4436,16 @@ impl Ring {
             .has_client_subscription(instance_id, client_id)
     }
 
+    /// How many local subscribers `instance_id` has — WebSocket clients and
+    /// delegates together, since #4669 puts both in `client_subscriptions`.
+    ///
+    /// Used by the delegate demand path to apply `MAX_SUBSCRIBERS_PER_CONTRACT`
+    /// before inserting. O(1): one `DashMap` lookup and a `HashSet::len`, unlike
+    /// the per-subscriber [`Self::client_subscription_count`], which has to scan.
+    pub fn local_subscriber_count(&self, instance_id: &ContractInstanceId) -> usize {
+        self.hosting_manager.local_client_count(instance_id)
+    }
+
     /// Remove a single client subscription for `contract`.
     ///
     /// Returns true when that was the last client subscription for it. Used by
