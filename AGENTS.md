@@ -308,10 +308,10 @@ on every run that's missing the secret, so the gap is visible
 early.
 
 `.github/workflows/check-token-coalesce.yml` runs on every PR that
-touches a workflow file (it is path-filtered to
-`.github/workflows/**.yml` and `**.yaml`, which is safe because it is
-not a required check) and fails if any
-new event-emitting step regresses to bare
+touches a workflow file — it is path-filtered to
+`.github/workflows/**.yml` and `**.yaml`, which is safe here because it
+is not a required check (a path-filtered *required* check is #5451) —
+and fails if any new event-emitting step regresses to bare
 `GITHUB_TOKEN` / `github.token` — see issue #4118 for the regression
 class this guard prevents.
 
