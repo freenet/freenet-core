@@ -370,26 +370,47 @@ pub struct NetworkStatus {
 }
 
 /// Bootstrap-acceptance-churn counters (issue #4787): a restarted node's
-/// connection to a gateway lingers as transient, expires, and the transport
-/// is later reaped as a zombie before the onward CONNECT promotes it to the
-/// ring — cycling the joiner through repeated reconnects before it acquires
-/// real peers. These counters are the "instrumentation before a fix" step
-/// the issue calls for: they don't change acceptance behavior, only make the
-/// churn rate and the time-to-bootstrap legible in production telemetry.
+/// connection to a gateway lingers as transient, its tracking entry expires,
+/// and (if the onward CONNECT never promotes it) the underlying transport is
+/// later reaped as a zombie by a separate, uninstrumented sweep — cycling the
+/// joiner through repeated reconnects before it acquires real peers. These
+/// counters are the "instrumentation before a fix" step the issue calls for:
+/// they don't change acceptance behavior, only make the churn rate and the
+/// time-to-bootstrap legible in production telemetry.
 ///
 /// `transient_registered` / `transient_expired` / `promoted_to_ring` are
 /// GATEWAY-side, monotonic lifetime totals, recorded at the three log sites
 /// in `p2p_protoc/connection_lifecycle.rs` that this issue's live-log
 /// evidence was read from. A sustained high `transient_expired` :
-/// `promoted_to_ring` ratio is the churn signature reported in the issue.
+/// `promoted_to_ring` ratio is the churn signature reported in the issue —
+/// but the two are NOT a clean partition of `transient_registered`: the
+/// #3113 recovery path (a slow CONNECT that completes after the tracking
+/// entry's TTL already expired, `connection_lifecycle.rs`'s
+/// `handle_connect_peer`) increments BOTH `transient_expired` (the tracking
+/// entry lapsed) AND `promoted_to_ring` (it promoted anyway) for the SAME
+/// connection. So `transient_expired + promoted_to_ring` can exceed
+/// `transient_registered`, and a connection that recovers this way is
+/// indistinguishable in these counters from one that is genuinely lost and
+/// later reaped as a zombie (the zombie-reap sweep itself, `p2p_protoc.rs`'s
+/// `drop_zombie_connection`, is not instrumented here) — both increment
+/// `transient_expired` exactly once. Read the ratio as a churn signal, not a
+/// strict recovered-vs-lost accounting.
 ///
 /// `time_to_min_connections` / `startup_connect_retries` are JOINER-side,
 /// recorded by `initial_join_procedure` in `operations/connect.rs`.
 /// `time_to_min_connections` is set at most once per process (the first time
 /// `open_connections()` reaches `min_connections`); `startup_connect_retries`
-/// counts each below-threshold retry round issued before that point.
+/// counts each below-threshold retry round issued before that point only —
+/// a later transient dip back below `min_connections` (ordinary post-startup
+/// churn) does not resume incrementing it.
 #[derive(Default)]
 pub struct BootstrapChurnStats {
+    /// Counts calls to the "Registered transient connection" log site, not
+    /// confirmed new-entry insertions: `try_register_transient` also returns
+    /// `true` (and the site still logs/increments) for an already-tracked
+    /// entry, so this can be a slight overcount relative to the transient
+    /// table's real size. Faithfully mirrors the pre-existing log statement's
+    /// own semantics at that site.
     pub transient_registered: u64,
     pub transient_expired: u64,
     pub promoted_to_ring: u64,

@@ -1996,7 +1996,16 @@ pub(crate) async fn initial_join_procedure(
                     }
                 }
 
-                crate::node::network_status::record_bootstrap_startup_connect_retry();
+                // Only counts retry rounds BEFORE the process's first real
+                // bootstrap (issue #4787 instrumentation semantics — see the
+                // doc comment on `BootstrapChurnStats::startup_connect_retries`).
+                // Without this gate a later transient dip back below
+                // `bootstrap_threshold` (ordinary post-bootstrap churn, e.g.
+                // losing peers) would keep incrementing a counter that is
+                // documented and exported as a startup-only metric.
+                if !min_connections_reached {
+                    crate::node::network_status::record_bootstrap_startup_connect_retry();
+                }
                 tracing::info!(
                     "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways (skipped {} in backoff)",
                     open_conns,
