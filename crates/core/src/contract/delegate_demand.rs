@@ -574,6 +574,33 @@ pub(crate) fn register_subscription(
     delegate: &DelegateKey,
     contract: &ContractKey,
 ) -> bool {
+    // CHEAPEST CHECK FIRST: is this delegate already pinning this contract?
+    //
+    // An idempotent re-subscribe is then a blake3 hash and one DashMap lookup —
+    // no redb read, no map scan. It used to fall through the whole function,
+    // which put a synchronous storage lookup (`contract_state_present`) and an
+    // O(contracts) scan on every repeat, on the serial contract-handling loop.
+    // With #5567's unbounded producer that turned one `process()` into as many
+    // storage lookups as the delegate cared to emit.
+    //
+    // Returns TRUE rather than falling through, because the pin genuinely
+    // exists — and records NOTHING, deliberately. Counting repeats as
+    // `Registered` let a delegate re-subscribing on a timer drive the refusal
+    // RATE toward zero: the counter that exists to make silent refusals visible
+    // would be diluted by the very delegate causing them. The denominator must
+    // be attempts that COULD have pinned, not calls.
+    //
+    // Safe to skip the hosting gate on this path: if the contract had been
+    // evicted, the eviction teardown would have cleared this subscription, so
+    // `has_client_subscription` being true means the pin is still real.
+    let client_id = client_id_for(delegate);
+    if op_manager
+        .ring
+        .has_client_subscription(contract.id(), client_id)
+    {
+        return true;
+    }
+
     // BOTH terms are required, and `is_hosting_contract` alone was the bug.
     //
     // `is_hosting_contract` reads the in-memory hosting cache only, so it is
@@ -654,8 +681,6 @@ pub(crate) fn register_subscription(
         }
         return false;
     }
-    let client_id = client_id_for(delegate);
-
     // Apply the SAME per-CONTRACT subscriber cap a WebSocket client gets.
     //
     // There are TWO caps on the WebSocket path and this module originally
@@ -689,11 +714,8 @@ pub(crate) fn register_subscription(
     //
     // Checked only for a NEW registration, so an idempotent re-subscribe is
     // never refused by it.
-    if !op_manager
-        .ring
-        .has_client_subscription(contract.id(), client_id)
-        && op_manager.ring.local_subscriber_count(contract.id())
-            >= crate::contract::executor::MAX_SUBSCRIBERS_PER_CONTRACT
+    if op_manager.ring.local_subscriber_count(contract.id())
+        >= crate::contract::executor::MAX_SUBSCRIBERS_PER_CONTRACT
     {
         // Rate-limited through the same [`LogFloodGate`] as the other two
         // refusal branches: a delegate drives how often it lands here.
@@ -804,10 +826,7 @@ pub(crate) fn register_subscription(
     // so they would need a lock held across the scan AND the insert,
     // serialising every delegate subscribe on the node across all worker
     // threads, on the WASM call stack.
-    let is_new = !op_manager
-        .ring
-        .has_client_subscription(contract.id(), client_id);
-    if is_new {
+    {
         let (held_by_delegate, delegate_pins_node_wide) = op_manager
             .ring
             .client_and_reserved_range_counts(client_id, DELEGATE_CLIENT_ID_BASE);
@@ -1669,6 +1688,22 @@ mod tests {
         );
         assert_eq!(0, after.contract_full - before.contract_full);
         assert_eq!(0, after.delegate_full - before.delegate_full);
+
+        // An idempotent re-subscribe must NOT move the denominator. Counting
+        // repeats let a delegate re-subscribing on a timer drive the refusal
+        // RATE toward zero — the counter that exists to make silent refusals
+        // visible, diluted by the delegate causing them.
+        assert!(register_subscription(
+            &op_manager,
+            &delegate_key(122),
+            &hosted
+        ));
+        let repeat = crate::node::network_status::delegate_pin_refusal_counts()
+            .expect("counters still readable");
+        assert_eq!(
+            after.registered, repeat.registered,
+            "a repeat subscribe adds no pin, so it must not be counted as one"
+        );
     }
 
     /// Dropping demand a delegate never held must have NO side effects.

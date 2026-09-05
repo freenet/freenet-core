@@ -1034,6 +1034,15 @@ pub type StateAdmitCallback = Arc<
 /// calling it synchronously is sound, and nothing executes WASM while holding
 /// the hosting-cache lock for writing, so the nesting introduces no cycle.
 ///
+/// It also takes a WRITE lock on the process-global `NETWORK_STATUS` to record
+/// the outcome (#5467 Phase 0). Brief and uncontended in practice, but it is a
+/// global lock acquired from the WASM call stack and belongs in this accounting
+/// rather than being discovered later.
+///
+/// An idempotent re-subscribe short-circuits ahead of ALL of this — a blake3
+/// hash and one `DashMap` lookup — so a delegate re-subscribing the same
+/// contract pays none of the storage read, the scan, or the lock.
+///
 /// The scan is O(contracts with subscribers) and is paid on every NEW
 /// registration, not only on a refused one. That is the cost #5556 is about;
 /// the state lookup is what #4610 requires to avoid registering an unrepairable

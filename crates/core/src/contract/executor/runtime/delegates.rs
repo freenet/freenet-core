@@ -427,6 +427,18 @@ impl Executor<Runtime> {
                 // WebSocket disconnect path in `client_events.rs`, including
                 // its upstream-collapse decision.
                 //
+                // NO OWNERSHIP CHECK ON THE KEY, and this PR widens what that
+                // costs. `UnregisterDelegate` takes a client-supplied
+                // `DelegateKey` and nothing verifies the caller owns it, so any
+                // client that knows a public delegate key can unregister it.
+                // Before #4669 that dropped notification hooks; it now ALSO
+                // drops that delegate's ring demand and can send `Unsubscribe`
+                // upstream for contracts another app was keeping alive. The
+                // authorization gap is pre-existing and architectural — see the
+                // module header of `contract::delegate_demand` for the matching
+                // gap on which contracts a delegate may PIN — but the blast
+                // radius is larger now and should not be discovered later.
+                //
                 // SCOPE MISMATCH, unfixed: the retain above walks the
                 // process-global `DELEGATE_SUBSCRIPTIONS`, so it clears this
                 // delegate's hooks on EVERY node in the process, while the
