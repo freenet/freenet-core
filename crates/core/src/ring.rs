@@ -4417,7 +4417,11 @@ impl Ring {
 
     // ==================== Client Subscription Management ====================
 
-    /// Register a client subscription for a contract (WebSocket client subscribed).
+    /// Register a local client subscription for a contract.
+    ///
+    /// Callers are the WebSocket listener registration AND, since #4669, the
+    /// delegate demand path with a synthetic `ClientId` — so this is no longer
+    /// WebSocket-only.
     ///
     /// Returns information about the operation for telemetry.
     pub fn add_client_subscription(

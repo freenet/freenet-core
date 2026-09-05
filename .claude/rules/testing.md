@@ -216,46 +216,6 @@ search with a blind spot; a fixed token is not.
    distinguishes a guard that works from one that happens to be passing.
 
 
-### A filtered `cargo test` that matches nothing exits 0
-
-`cargo test -- <filter>` with a filter matching no test prints `0 passed` and
-exits **0**. That is byte-for-byte indistinguishable from a clean run, so a
-verification step whose filter has drifted — a renamed test, a moved module, a
-changed `mod` path — reports success while executing nothing, and everything
-downstream inherits the falsehood. Seven instances surfaced in one day; the
-worst sat inside a verification harness rather than a test, so it laundered
-every claim built on it.
-
-```
-WHEN a script relies on a filtered test run:
-  → assert the test COUNT, never the exit code
-  → fail the step when zero tests ran, with a message saying the filter
-    matched nothing rather than that the tests passed
-  → name pins individually rather than relying on a module prefix that a
-    refactor can silently move out from under you
-```
-
-**Mutation results are self-evidencing against this trap and ordinary green
-runs are not.** A mutation that fails to fail is visible: if the filter matched
-nothing, the mutated run would report success and the round would show no red.
-So "8 of 8 mutations went red" survives the empty-filter trap in a way that "the
-tests passed" never does. When you cite a green run as evidence, cite the count
-with it.
-
-**And a harness must verify its own restore, not just run one.** `git checkout --`
-reporting success says the command executed, not that the tree now matches what
-you started with — if rule 1 was missed and the file held uncommitted work, the
-restore *succeeds* and silently discards it. Hash the mutated files before the
-first mutation and assert the hash matches after the last restore, so a run that
-corrupted its own inputs fails loudly instead of reporting on code nobody wrote.
-
-That check and the count check above are what make a mutation result trustworthy
-at all, and they fail differently: the hash catches a restore that put back the
-wrong bytes, the count catches a filter that measured nothing. On 2026-09-04 both
-fired on the same #5493 run — the hash turned a plausible "1 of 5 killed" into a
-FATAL naming the discarded work, and the count turned four exit-0 runs into loud
-INCONCLUSIVEs rather than four fake "failed to kill" results.
-
 ## Reference Patterns
 
 **Time injection:**

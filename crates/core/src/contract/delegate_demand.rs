@@ -78,12 +78,23 @@
 //!   agent asking) and it is deliberate, but it means an app can pin contracts
 //!   into the top tier through its delegate. #5467 open question 1 asks where
 //!   that bound lives and explicitly wants a deliberate call rather than a
-//!   constant, so **this module imposes no bound** — see the PR body. Today's
-//!   de-facto limit is that a delegate can only pin a contract this node is
-//!   already HOSTING (see [`register_subscription`], which is gated more
-//!   tightly than the subscribe paths themselves). It cannot enumerate the
-//!   network and pin it; it can still pin everything its own app has PUT
-//!   locally, which is the hole the PR body names.
+//!   constant. This module imposes three SIZE bounds (see
+//!   [`MAX_DELEGATE_PINS_PER_NODE`], [`MAX_PINS_PER_DELEGATE`] and the
+//!   per-contract cap in [`register_subscription`]) and no TIME bound, which is
+//!   the distinction that matters for the GC-exemption rule.
+//!
+//!   **There is no AUTHORIZATION bound at all, and the earlier wording here was
+//!   wrong about it.** It said a delegate "can still pin everything its own app
+//!   has PUT locally". The gate is the node's HOSTED set, not the app's PUT
+//!   set, and a node hosts other people's contracts by ring proximity — very
+//!   different collections. Nothing checks that the contract belongs to the
+//!   delegate's app, was PUT by it, or shares an origin: both resolution paths
+//!   (`resolve_contract_key`, `lookup_key`) are bare code-index lookups with no
+//!   owner concept. **A delegate may pin any contract this node hosts,
+//!   belonging to anyone.** No enumeration is needed either, since the
+//!   interesting ids are published — River room ids, Delta site ids — and
+//!   `get_contract_state_len` answers "does this node hold X". Architectural,
+//!   not fixable here; stated so it is not discovered later.
 //! - **Invariant 2 (demand-driven hosting).** A delegate subscription is real
 //!   demand from a real resident component. It is not holding-driven: nothing
 //!   here makes a peer host a contract it was not already holding.
@@ -92,8 +103,9 @@
 //!   expire). A delegate pin is bounded only by process lifetime and explicit
 //!   `UnregisterDelegate` today, because `DELEGATE_SUBSCRIPTIONS` is in-memory
 //!   and there is no unsubscribe (#2830) and no sleep/wake horizon yet. Closing
-//!   that is #4669 parts 2-4 / #5467 Phase 3; until it lands a delegate pin
-//!   lapses on node restart and nowhere else.
+//!   that is #4669 parts 2-4 / #5467 Phase 3. A pin is NOT released only by
+//!   restart — see "What releases a pin" below for the three paths — but none
+//!   of them is time-based, which is what this invariant is about.
 //!
 //!   Two known residuals of the same shape, tracked as **#5487**. Both are
 //!   self-healing rather than permanent, and both close properly only when the
@@ -140,11 +152,32 @@
 //!
 //! 4. **Process exit.** Demand is in-memory; nothing survives a restart.
 //!
-//! So a delegate that pins contracts and then disappears does NOT strand them
-//! forever: **the hosting cache's byte budget retains final authority over a
-//! pinned contract**, and a pin cannot outrank it. The exposure is bounded by
-//! that budget, not by the delegate's lifetime, which is why the caps above are
-//! a mitigation rather than a rate limit on an unbounded accumulation.
+//! **Enumerate the RESOURCES separately, because the answer differs per
+//! resource and generalising from one is how this section was wrong before.**
+//! An earlier revision said only that the byte budget outranks a pin and
+//! concluded "exposure is bounded". That is true of bytes and false of the
+//! other two:
+//!
+//! - **Disk/memory bytes — BOUNDED.** Path 3 above. A pin cannot outrank the
+//!   byte budget; a delegate that pins and disappears does not strand storage.
+//! - **Node-wide pin SLOTS — NOT bounded by any reclaim path.** Nothing
+//!   releases a slot held by a healthy, still-running, well-behaved delegate.
+//!   Path 3 only fires under BYTE pressure, so a node holding
+//!   [`MAX_DELEGATE_PINS_PER_NODE`] small pinned contracts with free disk never
+//!   triggers it, and the slots are consumed for the life of the process. One
+//!   app can therefore take the whole allowance and every other app's delegate
+//!   is refused — while being told its subscribe succeeded. That is a live
+//!   starvation, not a theoretical one.
+//! - **Broadcast/cost capacity — bounded only because of an explicit fix.**
+//!   `cost_eviction_candidate` vetoes on any local subscriber, so a pin would
+//!   have made a contract permanently immune to the #4861 cost sweep. The cost
+//!   sweep is given a delegate-excluding count for exactly this reason
+//!   (`HostingManager::non_delegate_local_and_downstream_counts`); without it a
+//!   storm contract could exempt itself with one `subscribe_contract()`.
+//!
+//! So: storage is bounded, cost capacity is bounded by construction, and pin
+//! slots are not. The caps bound how fast slots are consumed and by whom; they
+//! do not make the consumption reclaimable.
 //!
 //! The real cost is a PRIORITY one, not a storage leak: a pinned contract
 //! displaces unpinned ones under budget pressure, and in the all-local-
@@ -330,36 +363,18 @@ pub(crate) const MAX_DELEGATE_PINS_PER_NODE: usize = 100;
 /// a backstop is the wrong trade.
 pub(crate) const MAX_PINS_PER_DELEGATE: usize = 500;
 
-// The node-wide ceiling must stay below the per-CONTRACT cap, or that cap is
-// unreachable by delegates and its refusal branch is dead code pretending to be
-// a guard. It is defence in depth over the COMBINED set — delegates plus
-// WebSocket clients — and only binds when enough real clients are already
-// subscribed, which is the honest description of what it does.
-const _: () = assert!(
-    MAX_DELEGATE_PINS_PER_NODE < crate::contract::executor::MAX_SUBSCRIBERS_PER_CONTRACT,
-    "the node-wide delegate ceiling must stay below the per-contract subscriber \
-     cap, or delegates can never reach the latter and it guards nothing"
-);
-
-// MAX_PINS_PER_DELEGATE is currently UNREACHABLE: the node-wide ceiling is
-// lower, so the node-wide branch always refuses first and the per-delegate one
-// is defence in depth that cannot fire. There is deliberately no behavioural
-// test for it — reaching it would mean driving the node-wide bound first, so
-// the test would pass for the wrong reason, which this module has been caught
-// by once already.
-//
-// This fails the BUILD if the node ceiling is ever raised above the
-// per-delegate one (#5556's reserved-renewal-capacity work could do exactly
-// that), because at that moment the branch becomes live and needs real
-// coverage. A compile-time failure is the right severity: a silently untested
-// live bound is how the per-contract cap nearly shipped vacuous.
-const _: () = assert!(
-    MAX_DELEGATE_PINS_PER_NODE <= MAX_PINS_PER_DELEGATE,
-    "the node-wide ceiling has been raised above the per-delegate one, so the \
-     per-delegate refusal branch is now REACHABLE and has no behavioural test. \
-     Add one covering a single delegate hitting its own limit, then update \
-     this guard."
-);
+// There is deliberately NO assertion relating MAX_DELEGATE_PINS_PER_NODE to
+// MAX_SUBSCRIBERS_PER_CONTRACT. An earlier revision asserted the node ceiling
+// must stay BELOW the per-contract cap, on the reasoning that otherwise
+// delegates could never reach the per-contract cap and it would guard nothing.
+// That reasoning is inverted: the per-contract cap is defence in depth over the
+// COMBINED set, so binding only when enough real WebSocket clients are already
+// subscribed is its CORRECT behaviour, not a failure. The assert also
+// permanently capped the node-wide value at 255 by coupling it to a fan-out
+// constant it has nothing to do with — the same category error this file
+// refuses to make with MAX_SUBSCRIPTIONS_PER_CLIENT twenty lines down — and
+// #5556 is expected to raise the ceiling, which would have hit a build failure
+// carrying a wrong explanation.
 
 // No assertion relates MAX_PINS_PER_DELEGATE to MAX_SUBSCRIPTIONS_PER_CLIENT.
 // That would encode a category error: the latter is a network-uniform POLICY
@@ -736,15 +751,15 @@ pub(crate) fn register_subscription(
     // the V1 delegate contract — what happens to the excess, and what the
     // delegate is told — so it is not made here. Filed as #5567.
     //
-    // This cost analysis DEPENDS on the same serial-loop invariant the
-    // atomicity argument below rests on, and the dependency runs the opposite
-    // way, so it is worth naming separately. Today serialisation makes the
-    // scans sequential: N subscribe requests cost N scans one after another on
-    // one thread. If #5554 parks delegates off the loop, they become
-    // CONCURRENT scans over the same map — cheaper in wall-clock, worse in
-    // contention, and at that point the unbounded producer feeds a parallel
-    // path rather than a queued one. Re-derive this when that lands; do not
-    // assume the sequential reading still holds.
+    // This cost analysis depends on the same serial-loop invariant the
+    // atomicity argument below rests on, and it survives #5554 for the same
+    // reason: that change parks a delegate whose `process()` has already
+    // returned, so subscribe requests still arrive sequentially from one
+    // `process()` on the loop. The scans stay sequential — N requests cost N
+    // scans one after another on one thread. Re-derive only if some path ever
+    // invokes a delegate off the loop, at which point these become concurrent
+    // scans over the same map and #5567's unbounded producer feeds a parallel
+    // path rather than a queued one.
     // NOT ATOMIC with the insert below — but the overshoot it would allow is
     // UNREACHABLE today, for a reason worth stating precisely rather than
     // hand-waving as "bounded".
@@ -762,13 +777,25 @@ pub(crate) fn register_subscription(
     // loop-serialisation invariant #5554 documents at
     // `dispatch_delegate_request`; two changes now depend on it.
     //
-    // IF that serialisation is removed — parking delegates off the loop is
-    // exactly what #5554 does — the race becomes reachable, and then the
-    // overshoot is bounded by the number of registrations in flight and cannot
-    // compound: once the count is over, every later registration is refused, so
-    // the excess is a one-time constant rather than a runaway. That is still
-    // acceptable for a backstop set above plausible legitimate use, which is
-    // why this is documented rather than locked.
+    // This holds today, and — per #5554's OWN analysis, not mine — after it as
+    // well. An earlier revision of this comment said #5554 removes the
+    // serialisation. It does not: `execute_delegate_request` is reached only
+    // through `handle_delegate_with_contract_requests`, every route is awaited
+    // from `contract_handling`, and the task #5554 spawns captures a park guard
+    // with no `ContractHandler` and no executor, so it cannot invoke a delegate
+    // at all — it runs prompts and related-contract fetches, not `process()`.
+    // #5554 parks a delegate whose WASM call has ALREADY RETURNED. What it
+    // changes is that one delegate's multi-round-trip SEQUENCE can interleave
+    // with another's, which is why it needs per-delegate exclusion; a single
+    // `register_subscription` still runs inside one `process()` on the loop.
+    //
+    // Do not read this comment as evidence that #5554 removes serialisation —
+    // it says the opposite. Re-derive only if some path ever calls
+    // `execute_delegate_request` off the loop. If that happens the race becomes
+    // reachable, and the overshoot is then bounded by the number of
+    // registrations in flight and cannot compound: once the count is over,
+    // every later registration is refused, so the excess is a one-time constant
+    // rather than a runaway.
     //
     // Making it exact is not cheap. Only the per-CONTRACT bound could be made
     // atomic without a global lock, by moving the check under the entry guard

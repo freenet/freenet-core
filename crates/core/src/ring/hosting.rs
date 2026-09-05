@@ -540,8 +540,15 @@ pub(crate) struct HostingManager {
     /// directly without a parallel mirror.
     active_subscriptions: DashMap<ContractKey, SubscriptionLease>,
 
-    /// Contracts where a local client (WebSocket) is actively subscribed.
-    /// Prevents hosting cache eviction while client subscriptions exist.
+    /// Contracts with an active LOCAL subscriber. Prevents hosting-cache
+    /// eviction while such subscriptions exist.
+    ///
+    /// Since #4669 this is NOT only WebSocket clients: delegate subscriptions
+    /// register demand here under a synthetic `ClientId` from the reserved
+    /// range (`contract::delegate_demand`). The difference matters — a
+    /// WebSocket entry expires on disconnect, a delegate's has no TTL — so
+    /// anything reasoning about the lifetime of entries in this map must say
+    /// which kind it means.
     client_subscriptions: DashMap<ContractInstanceId, HashSet<crate::client_events::ClientId>>,
 
     /// Unified hosting cache with byte-budget demand-ordered eviction ("fuel
@@ -2172,7 +2179,8 @@ impl HostingManager {
     ///   re-home, when demand persists, happens through the interest-gated
     ///   renewal loop (ring-routed via `k_closest_potentially_hosting`), NOT from
     ///   here — this PR builds no proactive re-home signal.
-    /// - `client_subscriptions[key.id()]` — local WebSocket client subscriptions.
+    /// - `client_subscriptions[key.id()]` — local subscriptions: WebSocket
+    ///   clients AND delegate pins (#4669), which share this map.
     ///   Under the fewest-`(local, downstream)` ordering a contract with LOCAL
     ///   subscriptions is only ever a victim in the all-local-subscribed extreme
     ///   (every eligible contract carries a local subscriber and the peer is still
