@@ -147,6 +147,18 @@ pub(super) const MAX_PARKED_DELEGATES: usize = 64;
 /// a ninth.
 pub(super) const MAX_PENDING_PER_DELEGATE: usize = 8;
 
+/// Cap on DISTINCT contracts with a coalesced notification pending behind one
+/// park.
+///
+/// Notifications coalesce per contract, so this bounds the map by the number of
+/// contracts a delegate subscribes to rather than by message rate. In principle
+/// #5493 bounds subscriptions separately; this cap does not assume that has
+/// landed, because "bounded somewhere else" is the assumption that produced
+/// three wrong-scope bounds on this change already. Over the cap the NEW
+/// notification is dropped — the delegate will see that contract's next state
+/// change, which is the pipeline's standing contract.
+pub(super) const MAX_PENDING_NOTIFICATION_CONTRACTS: usize = 64;
+
 /// Cap on deferred related-contract fetches a single park may carry (#5544 S3).
 ///
 /// The client-driven path bounds its off-loop fetches with
@@ -192,6 +204,23 @@ pub(super) fn continuation_bytes(continuation: &Continuation) -> usize {
             .iter()
             .map(outbound_bytes)
             .sum::<usize>()
+}
+
+/// Approximate bytes a queued delegate request pins.
+pub(super) fn request_bytes(req: &DelegateRequest<'static>) -> usize {
+    // Only `ApplicationMessages` carries a payload; the registration variants
+    // do not. Listed alongside the `#[non_exhaustive]` wildcard so a future
+    // payload-bearing variant has to be considered here rather than silently
+    // counting as zero.
+    match req {
+        DelegateRequest::ApplicationMessages { inbound, .. } => {
+            inbound.iter().map(inbound_bytes).sum()
+        }
+        DelegateRequest::RegisterDelegate { .. }
+        | DelegateRequest::UnregisterDelegate(_)
+        | DelegateRequest::RegisterDelegateWithPredecessors { .. }
+        | _ => 0,
+    }
 }
 
 fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
@@ -297,7 +326,21 @@ pub(super) enum PendingRun {
     /// guaranteed delivery should poll contract state periodically"). Running
     /// it immediately is NOT an option: it would clobber the parked
     /// continuation's context, which is the whole reason for the exclusion.
-    Notification { req: DelegateRequest<'static> },
+    ///
+    /// COALESCED per contract rather than capped, and not counted against
+    /// [`MAX_PENDING_PER_DELEGATE`]. Rejecting the 9th notification would be a
+    /// silent loss landing on exactly the wrong population: ghostkeys parks on
+    /// prompts, so the rejection window is precisely when a user is
+    /// interacting, and Harvest with many address contracts subscribed would
+    /// lose payment notifications there. Coalescing is sound because the
+    /// notification contract is already "you will see the next state", so a
+    /// superseded notification carries nothing its successor does not.
+    Notification {
+        /// The contract whose change triggered this. Carried explicitly so
+        /// queued notifications can be COALESCED per contract.
+        contract_id: ContractInstanceId,
+        req: DelegateRequest<'static>,
+    },
 }
 
 /// Where a resumed run's residual `ApplicationMessage`s must go.
@@ -360,7 +403,17 @@ pub(super) struct Continuation {
 struct ParkEntry {
     continuation: Continuation,
     parked_at: tokio::time::Instant,
-    pending: VecDeque<PendingRun>,
+    /// Client requests, FIFO, capped by [`MAX_PENDING_PER_DELEGATE`]. Rejection
+    /// is acceptable here precisely because the caller can be TOLD.
+    pending_clients: VecDeque<PendingRun>,
+    /// Newest pending notification per contract. Superseded ones are dropped,
+    /// which loses nothing the successor does not carry.
+    pending_notifications: HashMap<ContractInstanceId, DelegateRequest<'static>>,
+    /// Bytes held by the queued items above, so they count toward
+    /// [`MAX_PARKED_BYTES`] like the continuation does. Without this the
+    /// coalescing map would be a fresh count-bounded-but-not-byte-bounded hole
+    /// of exactly the kind #5551 tracks: 64 contracts of 50 MB state is 3.2 GB.
+    pending_bytes: usize,
 }
 
 /// Why a park ended.
@@ -585,7 +638,9 @@ impl DelegateParkCtx {
             ParkEntry {
                 continuation,
                 parked_at: tokio::time::Instant::now(),
-                pending: VecDeque::new(),
+                pending_clients: VecDeque::new(),
+                pending_notifications: HashMap::new(),
+                pending_bytes: 0,
             },
         );
         ParkAdmission::Admitted
@@ -597,20 +652,95 @@ impl DelegateParkCtx {
     /// unparked delegate is a caller bug and is reported back as a rejection so
     /// the request is still answered.
     pub(super) fn queue_pending(&mut self, key: &DelegateKey, req: PendingRun) -> QueueOutcome {
+        let parked_bytes = self.parked_bytes;
         let Some(entry) = self.parked.get_mut(key) else {
             return QueueOutcome::Rejected(Box::new(req));
         };
-        if entry.pending.len() >= MAX_PENDING_PER_DELEGATE {
-            tracing::warn!(
-                delegate = %key,
-                queued = entry.pending.len(),
-                limit = MAX_PENDING_PER_DELEGATE,
-                "Delegate pending queue full while parked — rejecting request"
-            );
-            return QueueOutcome::Rejected(Box::new(req));
+
+        match req {
+            // COALESCE, do not reject. A superseded notification carries
+            // nothing its successor does not, so replacing is lossless in a way
+            // rejecting is not — and rejecting would land on ghostkeys and
+            // Harvest exactly when they are most active.
+            PendingRun::Notification { contract_id, req } => {
+                let bytes = request_bytes(&req);
+                let superseded = entry
+                    .pending_notifications
+                    .get(&contract_id)
+                    .map_or(0, request_bytes);
+                let is_new_contract =
+                    superseded == 0 && !entry.pending_notifications.contains_key(&contract_id);
+
+                if is_new_contract
+                    && entry.pending_notifications.len() >= MAX_PENDING_NOTIFICATION_CONTRACTS
+                {
+                    tracing::info!(
+                        delegate = %key,
+                        contract = %contract_id,
+                        limit = MAX_PENDING_NOTIFICATION_CONTRACTS,
+                        "Dropped a notification: too many distinct contracts already \
+                         queued behind this park"
+                    );
+                    return QueueOutcome::Rejected(Box::new(PendingRun::Notification {
+                        contract_id,
+                        req,
+                    }));
+                }
+
+                let projected = parked_bytes
+                    .saturating_add(bytes)
+                    .saturating_sub(superseded);
+                if projected > MAX_PARKED_BYTES {
+                    tracing::info!(
+                        delegate = %key,
+                        contract = %contract_id,
+                        parked_bytes,
+                        adding_bytes = bytes,
+                        byte_limit = MAX_PARKED_BYTES,
+                        "Dropped a notification: queueing it would exceed the parked \
+                         byte budget"
+                    );
+                    return QueueOutcome::Rejected(Box::new(PendingRun::Notification {
+                        contract_id,
+                        req,
+                    }));
+                }
+
+                entry.pending_bytes = entry.pending_bytes.saturating_add(bytes);
+                if let Some(old) = entry.pending_notifications.insert(contract_id, req) {
+                    let freed = request_bytes(&old);
+                    entry.pending_bytes = entry.pending_bytes.saturating_sub(freed);
+                    self.parked_bytes = self.parked_bytes.saturating_sub(freed);
+                    tracing::debug!(
+                        delegate = %key,
+                        contract = %contract_id,
+                        "Coalesced a superseded notification behind a park"
+                    );
+                }
+                self.parked_bytes = self.parked_bytes.saturating_add(bytes);
+                QueueOutcome::Queued
+            }
+            // Client requests keep the cap: over it, the caller is TOLD.
+            client => {
+                if entry.pending_clients.len() >= MAX_PENDING_PER_DELEGATE {
+                    tracing::warn!(
+                        delegate = %key,
+                        queued = entry.pending_clients.len(),
+                        limit = MAX_PENDING_PER_DELEGATE,
+                        "Delegate pending queue full while parked — rejecting request"
+                    );
+                    return QueueOutcome::Rejected(Box::new(client));
+                }
+                let bytes = match &client {
+                    PendingRun::Client { req, .. } => request_bytes(req),
+                    PendingRun::Notification { .. } => 0,
+                };
+                entry.pending_bytes = entry.pending_bytes.saturating_add(bytes);
+                self.parked_bytes = self.parked_bytes.saturating_add(bytes);
+                entry.pending_clients.push_back(client);
+                QueueOutcome::Queued
+            }
         }
-        entry.pending.push_back(req);
-        QueueOutcome::Queued
     }
 
     /// Hand the parked client's responder to a live park.
@@ -648,8 +778,20 @@ impl DelegateParkCtx {
         self.parked.remove(key).map(|entry| {
             self.parked_bytes = self
                 .parked_bytes
-                .saturating_sub(continuation_bytes(&entry.continuation));
-            (entry.continuation, entry.pending)
+                .saturating_sub(continuation_bytes(&entry.continuation))
+                .saturating_sub(entry.pending_bytes);
+            // Client requests first, then coalesced notifications. Clients have
+            // a caller waiting on a response; notifications do not, and their
+            // ordering is already approximate because coalescing drops
+            // superseded ones.
+            let mut pending: VecDeque<PendingRun> = entry.pending_clients;
+            pending.extend(
+                entry
+                    .pending_notifications
+                    .into_iter()
+                    .map(|(contract_id, req)| PendingRun::Notification { contract_id, req }),
+            );
+            (entry.continuation, pending)
         })
     }
 
@@ -809,6 +951,144 @@ mod tests {
         assert!(matches!(
             ctx.queue_pending(&key(1), pending(1)),
             QueueOutcome::Rejected(_)
+        ));
+    }
+
+    fn notification(contract: u8, state: &[u8]) -> PendingRun {
+        let contract_id = ContractInstanceId::new([contract; 32]);
+        PendingRun::Notification {
+            contract_id,
+            req: DelegateRequest::ApplicationMessages {
+                key: key(1),
+                params: Parameters::from(Vec::new()),
+                inbound: vec![InboundDelegateMsg::ContractNotification(
+                    freenet_stdlib::prelude::ContractNotification {
+                        contract_id,
+                        new_state: WrappedState::new(state.to_vec()),
+                        context: DelegateContext::default(),
+                    },
+                )],
+            },
+        }
+    }
+
+    fn queued_state(run: &PendingRun) -> Option<Vec<u8>> {
+        let PendingRun::Notification { req, .. } = run else {
+            return None;
+        };
+        let DelegateRequest::ApplicationMessages { inbound, .. } = req else {
+            return None;
+        };
+        #[allow(clippy::wildcard_enum_match_arm)]
+        inbound.iter().find_map(|m| match m {
+            InboundDelegateMsg::ContractNotification(n) => Some(n.new_state.as_ref().to_vec()),
+            _ => None,
+        })
+    }
+
+    /// Notifications COALESCE per contract instead of being rejected at the
+    /// client queue's cap.
+    ///
+    /// Rejecting them would be a silent loss — a notification has no caller to
+    /// return an error to — and it would land on exactly the wrong population:
+    /// ghostkeys parks on prompts, so the window is precisely when a user is
+    /// interacting, and Harvest with many address contracts subscribed would
+    /// lose payment notifications there.
+    #[tokio::test]
+    async fn notifications_coalesce_per_contract_rather_than_being_rejected() {
+        let (mut ctx, _rx) = ctx();
+        let k = key(1);
+        ctx.park(k.clone(), continuation());
+
+        // Far more than MAX_PENDING_PER_DELEGATE, all for ONE contract.
+        for i in 0..(MAX_PENDING_PER_DELEGATE as u8 + 12) {
+            assert!(
+                matches!(
+                    ctx.queue_pending(&k, notification(7, &[i])),
+                    QueueOutcome::Queued
+                ),
+                "a notification must never be rejected for queue depth; \
+                 superseded ones coalesce"
+            );
+        }
+
+        let (_cont, pending) = ctx.take(&k).expect("park present");
+        assert_eq!(
+            pending.len(),
+            1,
+            "notifications for one contract must collapse to a single pending run"
+        );
+        assert_eq!(
+            queued_state(&pending[0]),
+            Some(vec![MAX_PENDING_PER_DELEGATE as u8 + 11]),
+            "the NEWEST notification must win; a superseded one carries nothing \
+             its successor does not"
+        );
+    }
+
+    /// A full client queue must not block notifications: the two lanes are
+    /// separate, because only one of them has a caller that can be told.
+    #[tokio::test]
+    async fn a_full_client_queue_does_not_reject_notifications() {
+        let (mut ctx, _rx) = ctx();
+        let k = key(1);
+        ctx.park(k.clone(), continuation());
+
+        for i in 0..MAX_PENDING_PER_DELEGATE {
+            assert!(matches!(
+                ctx.queue_pending(&k, pending(i as u8)),
+                QueueOutcome::Queued
+            ));
+        }
+        assert!(
+            matches!(
+                ctx.queue_pending(&k, pending(99)),
+                QueueOutcome::Rejected(_)
+            ),
+            "client requests still hit the cap — the caller can be told"
+        );
+        assert!(
+            matches!(
+                ctx.queue_pending(&k, notification(3, b"x")),
+                QueueOutcome::Queued
+            ),
+            "a notification must still be accepted with the client queue full"
+        );
+
+        let (_cont, pending_runs) = ctx.take(&k).expect("park present");
+        assert_eq!(
+            pending_runs.len(),
+            MAX_PENDING_PER_DELEGATE + 1,
+            "clients plus the coalesced notification"
+        );
+    }
+
+    /// Distinct contracts are capped, so the coalescing map cannot grow without
+    /// bound if subscriptions are not limited elsewhere.
+    #[tokio::test]
+    async fn distinct_notification_contracts_are_capped() {
+        let (mut ctx, _rx) = ctx();
+        let k = key(1);
+        ctx.park(k.clone(), continuation());
+
+        for i in 0..MAX_PENDING_NOTIFICATION_CONTRACTS {
+            assert!(matches!(
+                ctx.queue_pending(&k, notification(i as u8, b"s")),
+                QueueOutcome::Queued
+            ));
+        }
+        assert!(
+            matches!(
+                ctx.queue_pending(&k, notification(250, b"s")),
+                QueueOutcome::Rejected(_)
+            ),
+            "a NEW contract past the cap is refused; the delegate will see that \
+             contract's next state change"
+        );
+        // An already-queued contract still coalesces at the cap.
+        assert!(matches!(
+            ctx.queue_pending(&k, notification(0, b"newer")),
+            QueueOutcome::Queued
         ));
     }
 
