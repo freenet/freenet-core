@@ -2112,6 +2112,36 @@ impl HostingManager {
     /// entries (no lease filter, matching `has_downstream_subscribers`) so the
     /// count equals `contract_in_use` exactly; the periodic
     /// `expire_stale_downstream_subscribers` sweep keeps the map fresh.
+    /// As [`Self::local_and_downstream_counts`], but the local count EXCLUDES
+    /// delegate pins (`contract::delegate_demand`'s reserved `ClientId` range).
+    ///
+    /// For the cost-pressure sweep only. `cost_eviction_candidate` treats any
+    /// local subscriber as a veto, so counting delegate pins there would let a
+    /// delegate exempt its own contract from the sweep designed to catch
+    /// broadcast-cost offenders — which create no byte pressure and so are
+    /// never caught by the sweep that a pin genuinely cannot outrank.
+    pub(crate) fn non_delegate_local_and_downstream_counts(
+        &self,
+        contract: &ContractKey,
+    ) -> (usize, usize) {
+        let local = self
+            .client_subscriptions
+            .get(contract.id())
+            .map(|clients| {
+                clients
+                    .iter()
+                    .filter(|id| !crate::contract::delegate_demand::is_delegate_client(**id))
+                    .count()
+            })
+            .unwrap_or(0);
+        let downstream = self
+            .downstream_subscribers
+            .get(contract)
+            .map(|peers| peers.len())
+            .unwrap_or(0);
+        (local, downstream)
+    }
+
     pub(crate) fn local_and_downstream_counts(&self, contract: &ContractKey) -> (usize, usize) {
         let local = self
             .client_subscriptions
@@ -3105,8 +3135,29 @@ impl HostingManager {
                 cache::MemoryPressure::AtCapacity,
             );
             if !cost_axes.is_empty() {
+                // NOT `local_and_downstream_counts` here, unlike the byte sweep
+                // above, and the difference is load-bearing (#4669).
+                //
+                // `cost_eviction_candidate` requires `local_subs == 0`, so ANY
+                // local subscriber makes a contract permanently immune to
+                // cost-pressure eviction. Since delegate subscriptions began
+                // registering demand in `client_subscriptions`, one
+                // `subscribe_contract()` from a storm app's own delegate would
+                // exempt its contract from the only sweep built to catch it.
+                //
+                // That is a defense bypass rather than a priority shift. The
+                // #4861 cost axis exists precisely because a TINY-state
+                // contract can burn broadcast capacity while creating no byte
+                // pressure — the documented case is 121 bytes holding ~58% of a
+                // gateway's broadcast capacity — so the byte-budget sweep, which
+                // does outrank a pin, never fires for it.
+                //
+                // Delegate pins are therefore excluded from the local count for
+                // COST candidacy only. They keep counting for the byte sweep's
+                // `victim_order`, where being shed last is the correct and
+                // intended behaviour.
                 evicted.extend(cache_guard.evict_cost_pressure(
-                    &|key: &ContractKey| self.local_and_downstream_counts(key),
+                    &|key: &ContractKey| self.non_delegate_local_and_downstream_counts(key),
                     cost_axes,
                 ));
             }

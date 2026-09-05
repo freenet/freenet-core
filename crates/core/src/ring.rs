@@ -4464,6 +4464,18 @@ impl Ring {
             .client_and_reserved_range_counts(client_id, reserved_id_floor)
     }
 
+    /// `(non-delegate local subscribers, downstream)` — the split the
+    /// cost-pressure sweep uses. See
+    /// `HostingManager::non_delegate_local_and_downstream_counts`.
+    #[cfg(test)]
+    pub(crate) fn non_delegate_local_and_downstream_counts(
+        &self,
+        contract: &ContractKey,
+    ) -> (usize, usize) {
+        self.hosting_manager
+            .non_delegate_local_and_downstream_counts(contract)
+    }
+
     /// How many local subscribers `instance_id` has — WebSocket clients and
     /// delegates together, since #4669 puts both in `client_subscriptions`.
     ///

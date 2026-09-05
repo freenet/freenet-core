@@ -239,7 +239,27 @@ use crate::node::network_status::{DelegatePinOutcome, record_delegate_pin_outcom
 /// a collision would let a client disconnect
 /// (`remove_client_from_all_subscriptions`) silently drop a delegate's pin, or
 /// a delegate unregister drop a live client's subscription.
-const DELEGATE_CLIENT_ID_BASE: usize = 1usize << (usize::BITS - 1);
+pub(crate) const DELEGATE_CLIENT_ID_BASE: usize = 1usize << (usize::BITS - 1);
+
+// RESTORED. This assert existed, was deleted by 33288dee2 (a bulk rewrite of
+// the constants block that took it out as collateral), and its absence went
+// unnoticed while the PR body went on advertising it twice — a guard silently
+// dropped with the documentation still asserting it. That is the same defect
+// class this module spends its tests on, committed by the module's own author.
+//
+// The "structurally impossible" claim on `client_id_for` is a 64-BIT claim. On
+// a 32-bit target the reserved base is 2^31, and the real-client counter —
+// seeded `1 + thread_index * COUNTER_BLOCK` from a global thread counter that
+// is never reset — reaches it after a few thousand threads in a long-running
+// process. Every shipped target is 64-bit, so rather than weaken the claim,
+// assert the precondition it rests on and let a 32-bit port fail to BUILD and
+// re-derive the reservation.
+const _: () = assert!(
+    usize::BITS >= 64,
+    "DELEGATE_CLIENT_ID_BASE reserves the top bit of a usize on the assumption \
+     that the real-client counter cannot reach it. That holds at 63 bits and \
+     not at 31 — re-derive the reservation before targeting a 32-bit platform."
+);
 
 /// Node-wide ceiling on delegate pins, across every delegate and contract.
 ///
@@ -393,13 +413,11 @@ pub(crate) fn client_id_for(delegate: &DelegateKey) -> ClientId {
 /// Whether `client_id` is a delegate's synthetic subscriber identity rather
 /// than a real WebSocket client.
 ///
-/// Test-only: nothing in production needs to tell the two apart, because the
-/// point of the reserved range is that neither side ever has to. It exists so
-/// [`DELEGATE_CLIENT_ID_BASE`]'s no-collision claim is asserted rather than
-/// only asserted in prose. Un-gate it when a real consumer appears (#5467
-/// Phase 0's per-delegate diagnostics is the likely one).
-#[cfg(test)]
-fn is_delegate_client(client_id: ClientId) -> bool {
+/// Un-gated because the COST-pressure eviction sweep needs to tell them apart
+/// (`ring/hosting.rs`): a delegate pin must not make a contract immune to that
+/// sweep the way a WebSocket subscription does. Everywhere else still does not
+/// need to know, which is the point of the reserved range.
+pub(crate) fn is_delegate_client(client_id: ClientId) -> bool {
     usize::from(client_id) >= DELEGATE_CLIENT_ID_BASE
 }
 
@@ -1493,6 +1511,55 @@ mod tests {
              per-delegate cap alone would let 256 delegates walk past it"
         );
         assert!(!ring.contract_in_use(&key));
+    }
+
+    /// A delegate pin must NOT make a contract immune to cost-pressure
+    /// eviction, the way a WebSocket subscription does.
+    ///
+    /// `cost_eviction_candidate` vetoes on `local_subs > 0`, so before this was
+    /// fixed one `subscribe_contract()` from a storm app's own delegate exempted
+    /// its contract from the only sweep built to catch it. That is a defense
+    /// bypass rather than a priority shift: the #4861 cost axis exists because a
+    /// TINY-state contract can burn broadcast capacity while creating no byte
+    /// pressure, so the byte-budget sweep — the one a pin genuinely cannot
+    /// outrank — never fires for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_delegate_pin_does_not_veto_cost_pressure_eviction() {
+        let fixture = seam_fixture("delegate-demand-4669-cost").await;
+        let op_manager = fixture.op_manager.clone();
+        let ring = &op_manager.ring;
+
+        let key = contract_key(131);
+        let _ = ring.host_contract(
+            key,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+
+        assert!(register_subscription(&op_manager, &delegate_key(132), &key));
+        assert_eq!(
+            (1, 0),
+            ring.local_and_downstream_counts(&key),
+            "precondition: the pin IS a local subscriber for byte-eviction \
+             ordering, where being shed last is correct"
+        );
+        assert_eq!(
+            (0, 0),
+            ring.non_delegate_local_and_downstream_counts(&key),
+            "but it must NOT count as local demand for COST candidacy, or a \
+             delegate can exempt its own contract from the storm sweep"
+        );
+
+        // A real WebSocket client DOES veto, which is the behaviour being
+        // preserved — without this the assertion above could pass by the method
+        // simply always returning zero.
+        ring.add_client_subscription(key.id(), ClientId::next());
+        assert_eq!(
+            (1, 0),
+            ring.non_delegate_local_and_downstream_counts(&key),
+            "a genuine client subscription must still veto cost eviction"
+        );
     }
 
     /// Every pin attempt is tallied by REASON, successes included.
