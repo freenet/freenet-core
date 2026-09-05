@@ -335,7 +335,7 @@ jobs:
             # order and extra attributes added on certificate reissue are the
             # second and third reasons. Match the CN substring.
             if ($sig.SignerCertificate.Subject -notlike '*CN=Freenet Project Inc*') {
-              throw "Unexpected signer for ${f}: expected a subject containing 'CN=Freenet Project Inc', got '$($sig.SignerCertificate.Subject)'. Either the Azure certificate profile was repointed, or the certificate was legitimately reissued under a new name. See scripts/RELEASE_RECOVERY.md, 'Windows code signing'. Do NOT delete this check to unblock a release."
+              throw "Unexpected signer for ${f}: expected a subject containing 'CN=Freenet Project Inc', got '$($sig.SignerCertificate.Subject)'. Either the Azure certificate profile was repointed, or the certificate was legitimately reissued under a new name. See docs/RELEASING.md, 'Windows code signing (Authenticode)', and scripts/RELEASE_RECOVERY.md, 'Step 3: Tag Created but GitHub Release Missing'. Do NOT delete this check to unblock a release."
             }
           }
 

@@ -391,31 +391,52 @@ fn check_signer_identity_is_asserted(yml: &str) -> Result<(), String> {
     let range = job_range(yml, "build-x86_64-windows")?;
     let lines: Vec<&str> = yml.lines().collect();
 
-    let asserts_signer = (range.0..range.1).any(|i| {
-        let l = lines[i];
-        l.contains("SignerCertificate.Subject")
-            && l.contains("CN=Freenet Project Inc")
-            && !l.trim_start().starts_with('#')
-    });
-
-    if !asserts_signer {
-        return Err(
+    // Anchor on the COMPARISON, not merely on the two names appearing together.
+    //
+    // The obvious predicate — "some non-comment line mentions both
+    // `SignerCertificate.Subject` and `CN=Freenet Project Inc`" — is also
+    // satisfied by the THROW MESSAGE, which quotes the expected CN and
+    // interpolates the observed subject. That makes the guard green for the one
+    // mutation that matters: demote the `if` to a `Write-Host` and the release
+    // stops failing on a wrong signer while this test keeps passing. Requiring
+    // the operator and the pattern verbatim is what separates the enforcing
+    // line from the diagnostic one.
+    let cmp = sole_index(
+        yml,
+        range,
+        "SignerCertificate.Subject -notlike '*CN=Freenet Project Inc*'",
+        1,
+    )
+    .map_err(|e| {
+        format!(
             "the Verify signatures step no longer asserts the SIGNER IDENTITY.\n\
              `Get-AuthenticodeSignature` reporting `Valid` only means the binary chains to a \
-             trusted root and is timestamped — it does NOT mean we signed it. Without a check \
+             trusted root and is timestamped \u{2014} it does NOT mean we signed it. Without a check \
              on `SignerCertificate.Subject` containing `CN=Freenet Project Inc`, a binary \
              signed by a different certificate profile passes the gate, while RELEASING.md and \
              RELEASE_RECOVERY.md both tell operators to expect that subject as though CI had \
-             already verified it."
-                .to_string(),
-        );
+             already verified it.\n\n\
+             Underlying anchor failure: {e}"
+        )
+    })?[0];
+
+    // A comparison whose failure branch does not `throw` is decorative: the step
+    // would print and carry on, while every operator-facing document still
+    // claims CI enforces the publisher.
+    let throws = (cmp..(cmp + 4).min(range.1)).any(|i| lines[i].contains("throw"));
+    if !throws {
+        return Err(format!(
+            "the signer-identity comparison at line {} is no longer followed by a `throw`.\n\
+             A check that cannot fail the job enforces nothing, and RELEASING.md / \
+             RELEASE_RECOVERY.md both tell operators the publisher is verified. Restore the \
+             `throw`, or delete the documentation claiming the guarantee.",
+            cmp + 1
+        ));
     }
 
     Ok(())
 }
 
-/// The timestamp is not optional: Artifact Signing certificates are short-lived
-/// (~3 days), so an untimestamped signature stops validating almost at once.
 #[test]
 fn verification_asserts_the_signer_is_freenet() {
     let yml = cross_compile_yml();
@@ -424,6 +445,8 @@ fn verification_asserts_the_signer_is_freenet() {
     }
 }
 
+/// The timestamp is not optional: Artifact Signing certificates are short-lived
+/// (~3 days), so an untimestamped signature stops validating almost at once.
 #[test]
 fn signing_requests_an_rfc3161_timestamp() {
     let yml = cross_compile_yml();
@@ -471,7 +494,9 @@ fn synthetic_workflow(sign_first: bool, checksums_last: bool) -> String {
           foreach ($f in @('target\\release\\freenet.exe','target\\release\\fdev.exe')) {
             $sig = Get-AuthenticodeSignature $f
             if (-not $sig.TimeStamperCertificate) { throw \"x\" }
-            if ($sig.SignerCertificate.Subject -notlike '*CN=Freenet Project Inc*') { throw \"y\" }
+            if ($sig.SignerCertificate.Subject -notlike '*CN=Freenet Project Inc*') {
+              throw \"Unexpected signer for ${f}: expected a subject containing 'CN=Freenet Project Inc', got '$($sig.SignerCertificate.Subject)'.\"
+            }
           }
 ";
     let upload_block = "\
@@ -646,8 +671,8 @@ fn guard_accepts_an_asserted_signer_identity() {
 fn guard_rejects_a_dropped_signer_identity_assertion() {
     // Status + timestamp still checked, but nobody checks WHO signed it.
     let bad = synthetic_workflow(true, true).replace(
-        "if ($sig.SignerCertificate.Subject -notlike '*CN=Freenet Project Inc*') { throw \"y\" }",
-        "",
+        "if ($sig.SignerCertificate.Subject -notlike '*CN=Freenet Project Inc*') {",
+        "if ($false) {",
     );
     let err = check_signer_identity_is_asserted(&bad)
         .expect_err("dropping the signer-identity assertion MUST be rejected");
@@ -660,6 +685,42 @@ fn guard_rejects_a_signer_assertion_naming_someone_else() {
         .replace("CN=Freenet Project Inc", "CN=Someone Else Entirely");
     check_signer_identity_is_asserted(&bad)
         .expect_err("an assertion naming a different publisher MUST be rejected");
+}
+
+/// The two mutations below run against the REAL workflow text, not the
+/// synthetic, because they are the ones the synthetic cannot express.
+///
+/// In `cross-compile.yml` the comparison and its diagnostic live on separate
+/// lines, and the diagnostic quotes the expected CN while interpolating the
+/// observed subject. So a predicate that merely looks for the two names on one
+/// non-comment line is satisfied by the MESSAGE alone, and stays green through
+/// exactly the edits an operator makes to unblock a release under pressure.
+/// Mutating the real file is the only way to pin that.
+#[test]
+fn guard_rejects_a_neutered_signer_check_in_the_real_workflow() {
+    // Demote the enforcing `if` to a print, leaving the diagnostic line - and
+    // therefore both names - untouched. Nothing fails the job any more.
+    let bad = cross_compile_yml().replace(
+        "if ($sig.SignerCertificate.Subject -notlike '*CN=Freenet Project Inc*') {",
+        "if ($false) { # signer check disabled",
+    );
+    let err = check_signer_identity_is_asserted(&bad)
+        .expect_err("neutering the signer check MUST be rejected");
+    assert!(err.contains("SIGNER IDENTITY"), "unexpected: {err}");
+}
+
+#[test]
+fn guard_rejects_a_repointed_expected_cn_in_the_real_workflow() {
+    // Change only the publisher the comparison demands, leaving the message
+    // (which still names Freenet) alone. CI would now accept someone else's
+    // signature while every operator-facing document still says otherwise.
+    let bad = cross_compile_yml().replace(
+        "-notlike '*CN=Freenet Project Inc*'",
+        "-notlike '*CN=Someone Else Entirely*'",
+    );
+    let err = check_signer_identity_is_asserted(&bad)
+        .expect_err("repointing the expected CN MUST be rejected");
+    assert!(err.contains("SIGNER IDENTITY"), "unexpected: {err}");
 }
 
 #[test]
