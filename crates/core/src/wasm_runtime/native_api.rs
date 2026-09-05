@@ -58,13 +58,33 @@ pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
 /// entry and stores the (possibly-mutated) `Vec` back on exit. Cleared on
 /// `UnregisterDelegate` so an unregistered delegate can't accumulate state.
 ///
-/// Concurrency: the runtime serializes calls into a given delegate instance
-/// (one WASM `process()` at a time), so two prompt round-trips on the same
-/// delegate cannot interleave context writes. Wrapped in `Arc` so a
-/// `RuntimePool` of `Runtime`s shares one cache: a delegate's first call
-/// might run on executor A and its `UserResponse` follow-up on executor B,
-/// so per-`Runtime` storage would have the same locality bug as the
-/// per-call `Vec`.
+/// Concurrency — READ THIS BEFORE RELYING ON IT. Because the map is keyed by
+/// `DelegateKey` alone and is last-write-wins, it is only safe while at most
+/// ONE `process()` per delegate is in flight. That property holds today, but
+/// **the runtime does not provide it**: `prepare_delegate_call` takes no
+/// per-delegate lock (its mutex guards the module cache, keyed by code hash),
+/// `RuntimePool::execute_delegate_request` pops an arbitrary pooled executor
+/// with no per-delegate affinity, and there is no per-delegate mutex anywhere
+/// in `wasm_runtime::delegate`.
+///
+/// It is supplied entirely by the SERIAL `contract::contract_handling` loop:
+/// both call sites of `execute_delegate_request` sit inside
+/// `handle_delegate_with_contract_requests`, which runs on that one loop, so a
+/// second call for the same delegate cannot begin until the first returns.
+///
+/// The consequence, spelled out because an earlier version of this comment
+/// credited the runtime and would have let someone remove the real protection
+/// believing it was redundant: anything that lets a delegate's round-trip span
+/// two loop iterations — parking it mid-prompt, deferring a contract op —
+/// breaks this invariant and must bring its own per-delegate exclusion. A
+/// second run would otherwise overwrite the parked continuation's context, and
+/// the delegate would resume reading someone else's bytes. Silent state
+/// corruption, not a crash.
+///
+/// Wrapped in `Arc` so a `RuntimePool` of `Runtime`s shares one cache: a
+/// delegate's first call might run on executor A and its `UserResponse`
+/// follow-up on executor B, so per-`Runtime` storage would have the same
+/// locality bug as the per-call `Vec`.
 ///
 /// TTL: each entry stores the `Instant` it was last written. On every
 /// `inbound_app_message` call the loader prunes entries older than
