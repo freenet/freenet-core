@@ -229,8 +229,14 @@ does not fire because you are in yours.
 ```
 WHEN writing a mutation/falsification script:
   → restore from git in an EXIT trap, not at the end of the happy path
-  → write a marker file (e.g. `.mutation-in-progress`) before the first
-    mutation and remove it in the SAME trap, so the two cannot disagree
+  → write a marker file before the first mutation and remove it in the SAME
+    trap, so the two cannot disagree. Use the FIXED name
+    `.mutation-in-progress` — not a variant, not a per-run suffix. Whoever
+    cleans up after an agent that died mid-run has to FIND the marker, and
+    cannot grep for a string only you knew: a sweep for `MUTANT` and
+    `MUTATION_APPLIED` missed #5490's `MUTATION:` marker for exactly this
+    reason. One greppable name across the repo is the whole point of the
+    convention.
   → hash the mutated files before the first mutation and assert the hash
     matches after the last restore
   → stage with an explicit pathspec while any run may be live, never
@@ -245,6 +251,39 @@ round: the loud state is the unsafe one.
 catches a run that was interrupted before its trap; the hash catches a restore
 that *ran* and put back the wrong bytes. `git checkout --` reporting success
 says the command executed, not that the tree matches.
+
+**Commit before you mutate.** The restore step is `git checkout -- <file>`,
+which restores from **HEAD** — so it does not undo your mutation, it discards
+every uncommitted change in that file, *including the fix the mutation is
+supposed to be testing*. Run a harness over uncommitted work and it silently
+reverts the work, then reports on code you did not write.
+
+```
+BEFORE running a mutation harness:
+  → commit the code under test, or stash-and-restore around the whole run
+  → never point `git checkout --` at a file holding uncommitted work
+```
+
+On 2026-09-04 a harness verifying two fixes on #5493 ate both of them on its
+first `restore_all`. Everything after that measured the pre-fix tree: the first
+mutation's kill was real, and every later result was meaningless — reported not
+as failures but as *filters matching no test*, because the tests being verified
+no longer existed in the file.
+
+**Two guards caught it and neither would have sufficed alone**, which is the
+argument for keeping both even though they look redundant:
+
+1. **The before/after hash assertion** turned "5 mutations, 1 killed" into a
+   loud FATAL naming the discarded work. `git checkout --` had reported success
+   every time — it did exactly what it was asked, which was the problem.
+2. **The zero-test check** (see "A filtered `cargo test` that matches nothing
+   exits 0" below). Without it those four runs would each have exited 0 and been
+   recorded as *mutations that failed to kill* — a plausible, subtly wrong
+   result that sends you debugging tests which are fine.
+
+The general shape outlives the instance: **a harness that modifies the tree must
+be able to prove it put the tree back**, and "the restore command succeeded" is
+not that proof.
 
 **Why the content check, and not just "verify the diff is yours".** That
 standing advice is NAME-based, and it fails in exactly the case a mutation
