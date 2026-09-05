@@ -66,7 +66,7 @@ jobs:
         run: docker/freenet-node/test-entrypoint.sh
 
       - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build both architectures without pushing
         uses: docker/build-push-action@v7
@@ -311,7 +311,7 @@ jobs:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - uses: docker/login-action@v3
         with:
