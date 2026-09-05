@@ -66,12 +66,29 @@
 //! Why the global property still holds after #5544, by construction rather than
 //! by convention:
 //!
-//! 1. `execute_delegate_request` has exactly two call sites, both inside
+//! 1. `execute_delegate_request` is reached ONLY through
 //!    `handle_delegate_with_contract_requests`.
-//! 2. That function has four call sites — `handle_delegate_notification`,
-//!    `dispatch_delegate_request` (twice) and `handle_delegate_resume` — and
-//!    every one of them is reached only by being awaited from
-//!    `contract_handling`, which is a single task per node.
+//! 2. Every route into that function is awaited, directly or one hop removed,
+//!    from `contract_handling` — a single task per node:
+//!
+//!    ```text
+//!    contract_handling
+//!      ├─ handle_contract_event ─────────► dispatch_delegate_request ─┐
+//!      ├─ handle_delegate_notification ────────────────────────────────┤
+//!      └─ handle_delegate_resume ──┬───────────────────────────────────┤
+//!                                  ├─► dispatch_delegate_request ──────┤
+//!                                  └─► run_queued_notification ────────┘
+//!                                                                      │
+//!                          handle_delegate_with_contract_requests ◄─────┘
+//!                                      └─► execute_delegate_request
+//!    ```
+//!
+//!    Stated as the PROPERTY — every route is awaited from the one loop — and
+//!    not as a count. An exact tally is a fact with an expiry date: this list
+//!    said "four call sites" until `run_queued_notification` was added for the
+//!    notification-coalescing fix, and was wrong the moment it was. The
+//!    property survives a new caller; the number does not. If you add a route,
+//!    it must be awaited from this loop or the invariant is gone.
 //! 3. The off-loop task this module spawns captures a `ParkGuard`, an
 //!    `Arc<P: UserInputPrompter>`, an `Option<Arc<OpManager>>` and plain data.
 //!    It does **not** capture the `ContractHandler` or an executor, so it
