@@ -3044,11 +3044,28 @@ impl P2pConnManager {
                                         let attempt = ctx.v2_drain_retries.entry(key).or_insert(0);
                                         if *attempt < Self::MAX_V2_DRAIN_RETRIES {
                                             *attempt += 1;
-                                            let delay = Self::V2_DRAIN_RETRY_BASE_DELAY
+                                            // Linear backoff with +/-20% jitter
+                                            // so a burst of contracts failing
+                                            // together does not retry in
+                                            // lockstep (`code-style.md`).
+                                            let base = Self::V2_DRAIN_RETRY_BASE_DELAY
                                                 * u32::from(*attempt);
+                                            let jitter_pct: u64 =
+                                                crate::config::GlobalRng::random_range(
+                                                    80u64..=120u64,
+                                                );
+                                            let delay = base.mul_f64(jitter_pct as f64 / 100.0);
                                             let op_mgr = op_manager.clone();
+                                            let shutdown = op_manager.ring.shutdown_token();
                                             tokio::spawn(async move {
-                                                tokio::time::sleep(delay).await;
+                                                // Interruptible: a >=1s plain
+                                                // sleep in a retry loop would
+                                                // keep this task alive past
+                                                // shutdown (`code-style.md`).
+                                                tokio::select! {
+                                                    _ = shutdown.cancelled() => return,
+                                                    _ = tokio::time::sleep(delay) => {}
+                                                }
                                                 if op_mgr
                                                     .try_notify_node_event(
                                                         crate::message::NodeEvent::
