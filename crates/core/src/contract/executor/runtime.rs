@@ -3058,7 +3058,10 @@ mod state_write_attribution_pin_tests {
              {hook_calls}"
         );
         // …and exactly one place that actually invokes the callback.
-        let invocations = count_call_sites(NATIVE_API_SRC, "cb(contract_key, new_state, content_changed)");
+        let invocations = count_call_sites(
+            NATIVE_API_SRC,
+            "cb(contract_key, new_state, content_changed)",
+        );
         assert_eq!(
             invocations, 1,
             "expected exactly 1 callback invocation in native_api.rs (inside \

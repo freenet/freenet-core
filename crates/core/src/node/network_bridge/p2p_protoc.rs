@@ -118,12 +118,6 @@ const V2_BROADCAST_DRAIN_READ_TIMEOUT: Duration = Duration::from_secs(2);
 static V2_BROADCAST_DRAINS_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Read [`V2_BROADCAST_DRAINS_DROPPED`]. Test/diagnostics accessor.
-#[cfg(test)]
-pub(crate) fn v2_broadcast_drains_dropped() -> u64 {
-    V2_BROADCAST_DRAINS_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Best-effort, bounded query to the contract handler for application-level
 /// subscriptions, used by the diagnostics arms of the network event loop (#4549).
 ///
@@ -2990,7 +2984,9 @@ impl P2pConnManager {
                                     )
                                     .await
                                 {
-                                    crate::node::op_state_manager::DrainStateRead::Found(new_state) => {
+                                    crate::node::op_state_manager::DrainStateRead::Found(
+                                        new_state,
+                                    ) => {
                                         ctx.handle_broadcast_state_change(
                                             &op_manager,
                                             key,

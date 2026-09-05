@@ -828,7 +828,9 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
         let observed_for_cb = observed.clone();
         let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
+            move |k: &ContractKey,
+                  new_state: &freenet_stdlib::prelude::WrappedState,
+                  _changed: bool| {
                 observed_for_cb
                     .lock()
                     .unwrap()
@@ -874,7 +876,9 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
         let observed_for_cb = observed.clone();
         let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
+            move |k: &ContractKey,
+                  new_state: &freenet_stdlib::prelude::WrappedState,
+                  _changed: bool| {
                 observed_for_cb
                     .lock()
                     .unwrap()
@@ -1273,7 +1277,9 @@ mod tests {
         // in `Executor::from_config` / `from_config_with_shared_modules`.
         let invalidator = state_store.cache_invalidator();
         let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey, _new_state: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
+            move |k: &ContractKey,
+                  _new_state: &freenet_stdlib::prelude::WrappedState,
+                  _changed: bool| {
                 invalidator.invalidate(k);
             },
         );
@@ -1329,7 +1335,9 @@ mod tests {
 
         let invalidator = state_store.cache_invalidator();
         let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey, _new_state: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
+            move |k: &ContractKey,
+                  _new_state: &freenet_stdlib::prelude::WrappedState,
+                  _changed: bool| {
                 invalidator.invalidate(k);
             },
         );
@@ -1371,7 +1379,9 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
         let observed_for_cb = observed.clone();
         let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
+            move |k: &ContractKey,
+                  new_state: &freenet_stdlib::prelude::WrappedState,
+                  _changed: bool| {
                 observed_for_cb
                     .lock()
                     .unwrap()
