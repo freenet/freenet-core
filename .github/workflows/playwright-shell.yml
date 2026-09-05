@@ -18,7 +18,11 @@ name: Shell Playwright E2E
 # required without first restructuring it into an always-green gate + a
 # conditional real job (see the note in macos-dmg-swap-e2e.yml). Until then it
 # runs as an informational gate on PRs that touch the relevant surface and on
-# main.
+# main. If it IS ever promoted, add its context to REQUIRED_CONTEXTS in
+# .github/scripts/check_required_check_path_filters.py in the same change —
+# that linter is what would otherwise catch this filter, and it only looks at
+# workflows providing a context it knows to be required. #5451 is what happens
+# when a required context comes from a path-filtered workflow.
 
 on:
   push:

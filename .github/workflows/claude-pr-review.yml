@@ -86,8 +86,11 @@ on:
   # required status context "Claude Rule Review". A workflow skipped by a path
   # filter reports NOTHING, and GitHub treats a never-reported required context
   # as "expected" rather than satisfied, so the merge queue refuses the PR entry
-  # permanently. Removed for #5451 alongside the same filter on ci.yml; enforced
-  # by .github/scripts/check_required_check_path_filters.py.
+  # permanently. Removed in #5571 (issue #5451) alongside the same filter on
+  # ci.yml; enforced by .github/scripts/check_required_check_path_filters.py.
+  # Consequence worth knowing: docs-only PRs now get a full rule review, which
+  # costs an LLM call and may raise WARNING findings (e.g. "Missing PR
+  # description sections") on a one-line docs change.
   pull_request_target:
     types: [opened, synchronize, ready_for_review, reopened, labeled]
   # Required by branch protection — merge queue expects this check to report.

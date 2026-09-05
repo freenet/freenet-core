@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Guard against a path filter making a PR structurally unmergeable.
+"""Guard the invariant that every required status check reports on every PR.
 
 A workflow-level ``paths:`` / ``paths-ignore:`` filter does not report a
 skipped check -- it reports NOTHING. GitHub treats a required status context
 that was never reported as **expected**, not as satisfied, so the merge queue
-refuses the pull request entry. Forever. There is no way around it short of
-adding an unrelated file to the PR.
+refuses the pull request entry. Ordinary contributors have no way around it
+short of adding an unrelated file to the PR (a ruleset bypass actor or an admin
+merge could still force it through).
 
 Shipped in ``ci.yml`` and ``claude-pr-review.yml`` as a cost optimization
 ("skip CI for docs-only changes"). Seven of the eight required contexts came
 from those two workflows, so a PR whose every file matched ``docs/**`` could
-never merge. #5322 sat blocked from 2026-08-14 until #5451 removed the filters.
+never merge. #5322 sat blocked from 2026-08-14 until #5571 removed the filters.
 
 Two things made it hard to spot:
 
@@ -25,15 +26,36 @@ The knowledge was not even new -- ``macos-dmg-swap-e2e.yml`` carries a comment
 saying precisely this above its own filter-free ``on:`` block. A comment in one
 file protected nothing in the other two. Hence this linter.
 
-Scope: a workflow is in scope only if it defines a job whose reported context
-name is in ``REQUIRED_CONTEXTS`` below. Other workflows may filter freely --
-that is a legitimate and common optimization when no required check is at stake.
+It makes two checks, because a path filter is only one of the ways a required
+context stops reporting:
 
-The ``push:`` trigger is deliberately NOT checked. A push run to main happens
-after the merge; nothing blocks on it, so filtering it is free.
+1. **No path filter on a gating trigger.** A workflow is in scope only if it
+   defines a job whose reported context is in ``REQUIRED_CONTEXTS``. Other
+   workflows may filter freely -- that is a legitimate optimization when no
+   required check is at stake. The ``push:`` trigger is deliberately NOT
+   checked: a push run to main happens after the merge and gates nothing.
+
+2. **Coverage** (on by default; ``--no-coverage-check`` for fixture scans).
+   Every context in ``REQUIRED_CONTEXTS`` must be produced by some workflow in
+   the directory. Without this, check 1 is a signal that can go vacuously
+   green: rename the ``Fmt`` job to ``Format`` and the required context ``Fmt``
+   never reports, every PR is blocked with the #5322 symptom, and a
+   filter-only linter sees nothing wrong. The same assertion also catches the
+   linter losing track of a file it is supposed to be guarding -- a
+   reindentation, a flow-style ``on:`` mapping, a job ``name:`` this parser
+   cannot read -- all of which would otherwise silently narrow its scope to
+   nothing.
+
+Parser scope, stated because check 1's message reads like total coverage and is
+not: block- and flow-style filters are both detected, at the 2-space trigger /
+4-space key indentation every workflow in this repo uses. A workflow written
+with 4-space YAML indentation, a flow-style ``on:`` mapping, or a job ``name:``
+carrying a trailing comment is not parsed. Check 2 is the backstop for exactly
+that: a required-context workflow this parser cannot read drops out of the
+coverage set and fails.
 
 Usage:
-    check_required_check_path_filters.py [WORKFLOW_DIR]
+    check_required_check_path_filters.py [WORKFLOW_DIR] [--no-coverage-check]
     check_required_check_path_filters.py --self-test
 """
 
@@ -41,6 +63,7 @@ from __future__ import annotations
 
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 # The contexts branch protection requires on the default branch.
@@ -50,10 +73,19 @@ from pathlib import Path
 #     --jq '.rules[] | select(.type=="required_status_checks")
 #           | .parameters.required_status_checks[].context'
 #
-# Drift is one-sided in its danger. If a context is REMOVED from the ruleset and
-# left here, this linter merely refuses a path filter that would now be safe --
-# noisy, not harmful. If a context is ADDED to the ruleset and not added here,
-# the new context is unguarded. Update this list whenever the ruleset changes.
+# Three ways this drifts, only the first of which is harmless:
+#
+#   * A context REMOVED from the ruleset and left here -- the linter refuses a
+#     path filter that would now be safe. Noisy, not dangerous.
+#   * A context ADDED to the ruleset and not added here -- that context is
+#     unguarded by check 1. `playwright-shell.yml` is the live candidate: it is
+#     path-filtered and its own comment contemplates being promoted to required.
+#   * A job RENAMED in a workflow without the ruleset following -- the ruleset
+#     then requires a context nothing reports (the #5322 symptom by another
+#     route) AND this file's scope silently shrinks, two failures from one
+#     cause. The coverage check exists for this one and fails closed on it.
+#
+# Update this list whenever the ruleset changes.
 REQUIRED_CONTEXTS = frozenset(
     {
         "Clippy",
@@ -71,8 +103,8 @@ REQUIRED_CONTEXTS = frozenset(
 # the module docstring).
 GATING_TRIGGERS = ("pull_request", "pull_request_target")
 
-# `jobs:` at column 0 ends the `on:` section for our purposes and begins the
-# region where job names live.
+# `jobs:` at column 0 -- everything indented under it is a job, everything
+# outside it is trigger/config territory.
 JOBS_RE = re.compile(r"^jobs:\s*(?:#.*)?$")
 
 # A job key is `  <id>:` at exactly two-space indent inside `jobs:`; its display
@@ -86,8 +118,12 @@ JOB_NAME_RE = re.compile(r"^    name:\s*(?P<name>.+?)\s*$")
 TRIGGER_RE = re.compile(r"^  (?P<trigger>[A-Za-z_][A-Za-z0-9_]*):\s*(?:#.*)?$")
 
 # `    paths:` / `    paths-ignore:` at exactly four-space indent is a filter on
-# the enclosing trigger.
-FILTER_RE = re.compile(r"^    (?P<key>paths|paths-ignore):\s*(?:#.*)?$")
+# the enclosing trigger. The value is matched loosely on purpose: the block form
+# puts it on following lines, but `paths-ignore: ['docs/**', '*.md']` is equally
+# valid YAML and equally capable of reintroducing #5451 -- and the flow style is
+# already this repo's house style for the sibling key (`branches: [main]`), so
+# it is the form someone re-adding the optimization is most likely to write.
+FILTER_RE = re.compile(r"^    (?P<key>paths|paths-ignore):(?:\s.*)?$")
 
 
 def _jobs_line(lines: list[str]) -> int | None:
@@ -98,6 +134,19 @@ def _jobs_line(lines: list[str]) -> int | None:
     return None
 
 
+def _jobs_block(lines: list[str]) -> tuple[int, int]:
+    """The [start, end) line range of the `jobs:` block's body."""
+    jobs_at = _jobs_line(lines)
+    if jobs_at is None:
+        return len(lines), len(lines)
+    end = len(lines)
+    for i in range(jobs_at + 1, len(lines)):
+        if lines[i] and not lines[i][0].isspace():
+            end = i
+            break
+    return jobs_at + 1, end
+
+
 def reported_contexts(text: str) -> set[str]:
     """The status-check contexts this workflow's jobs report.
 
@@ -105,16 +154,11 @@ def reported_contexts(text: str) -> set[str]:
     Both are collected: either could be what branch protection names.
     """
     lines = text.splitlines()
-    jobs_at = _jobs_line(lines)
-    if jobs_at is None:
-        return set()
+    start, end = _jobs_block(lines)
 
     contexts: set[str] = set()
     current_id: str | None = None
-    for line in lines[jobs_at + 1 :]:
-        if line and not line[0].isspace():
-            # A new top-level key ends the jobs block.
-            break
+    for line in lines[start:end]:
         job = JOB_ID_RE.match(line)
         if job:
             current_id = job.group("id")
@@ -133,13 +177,15 @@ def check_source(text: str, name: str) -> list[str]:
         return []
 
     lines = text.splitlines()
-    jobs_at = _jobs_line(lines)
-    on_end = jobs_at if jobs_at is not None else len(lines)
+    jobs_start, jobs_end = _jobs_block(lines)
 
     errors = []
     current_trigger: str | None = None
-    for i in range(on_end):
-        line = lines[i]
+    for i, line in enumerate(lines):
+        # YAML mappings are unordered, so `on:` may legally sit after `jobs:`.
+        # Scan everything OUTSIDE the jobs block rather than only above it.
+        if jobs_start <= i < jobs_end:
+            continue
         trigger = TRIGGER_RE.match(line)
         if trigger:
             current_trigger = trigger.group("trigger")
@@ -153,26 +199,54 @@ def check_source(text: str, name: str) -> list[str]:
                 f"    A workflow skipped by a path filter reports NOTHING, and "
                 f"GitHub treats a never-reported required context as EXPECTED "
                 f"rather than satisfied, so any PR the filter excludes can "
-                f"never enter the merge queue (#5451; #5322 was blocked for "
-                f"three weeks by exactly this).\n"
+                f"never enter the merge queue (#5451; #5322 was blocked by "
+                f"exactly this from 2026-08-14 until #5571).\n"
                 f"    A `merge_group:` trigger does not rescue it: that only "
                 f"runs for a PR already admitted to the queue.\n"
-                f"    Filter at the STEP level instead (see the `skip_check` "
-                f"steps in ci.yml), so the job still runs and still reports."
+                f"    If the cost is worth it, gate the expensive STEPS on a "
+                f"changed-files check instead, so the job still runs and still "
+                f"reports. `ci.yml`'s `skip_check` steps are the shape to "
+                f"follow, though they key on the event rather than on paths, "
+                f"so a path version needs its own diff step."
             )
     return errors
 
 
-def check_dir(workflow_dir: Path) -> list[str]:
+def check_dir(workflow_dir: Path, require_coverage: bool = True) -> list[str]:
     errors = []
+    covered: set[str] = set()
     for path in sorted(
-        p for p in workflow_dir.iterdir() if p.suffix in (".yml", ".yaml")
+        p
+        for p in workflow_dir.iterdir()
+        if p.is_file() and p.suffix in (".yml", ".yaml")
     ):
-        errors.extend(check_source(path.read_text(encoding="utf-8"), str(path)))
+        text = path.read_text(encoding="utf-8")
+        covered |= reported_contexts(text)
+        errors.extend(check_source(text, str(path)))
+
+    if require_coverage:
+        missing = sorted(REQUIRED_CONTEXTS - covered)
+        if missing:
+            errors.append(
+                f"{workflow_dir}: no workflow in this directory reports the "
+                f"required status context(s) {missing}.\n"
+                f"    A required context that nothing reports blocks EVERY pull "
+                f"request, with the same symptom as #5322: the merge queue "
+                f"says the check is 'expected' and refuses entry.\n"
+                f"    Either the job was renamed or removed without the "
+                f"ruleset following, or REQUIRED_CONTEXTS in this script is "
+                f"stale, or this script can no longer parse the workflow that "
+                f"provides it. Re-derive the list with the `gh api` command in "
+                f"the REQUIRED_CONTEXTS comment and reconcile."
+            )
     return errors
 
 
 # --- self-test ---------------------------------------------------------------
+
+# Every `_BAD_*` / `_GOOD_*` fixture below is checked with `check_source`, which
+# does not do the coverage check; the coverage check has its own cases at the
+# bottom.
 
 # The real pre-fix ci.yml shape. Must be flagged once, for `pull_request` — and
 # NOT for the `push` filter above it.
@@ -229,6 +303,53 @@ jobs:
     runs-on: ubuntu-latest
 """
 
+# The flow-sequence form. Identical effect, one line, and the style this repo
+# already uses for `branches: [main]` — so it is the likeliest way the filter
+# comes back. Must be flagged.
+_BAD_FLOW_SEQUENCE = """\
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths-ignore: ['docs/**', '*.md']
+  merge_group:
+
+jobs:
+  fmt_check:
+    name: Fmt
+    runs-on: ubuntu-latest
+"""
+
+# `on:` written after `jobs:`. YAML mappings are unordered, so this is legal and
+# the filter is just as live. Must be flagged.
+_BAD_ON_AFTER_JOBS = """\
+name: CI
+jobs:
+  fmt_check:
+    name: Fmt
+    runs-on: ubuntu-latest
+
+on:
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+"""
+
+# A job with no `name:` reports under its job id, so the id must be matched
+# against the required list too. Must be flagged.
+_BAD_JOB_ID_CONTEXT = """\
+name: Odd
+on:
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+
+jobs:
+  Simulation:
+    runs-on: ubuntu-latest
+"""
+
 # The fix. Must NOT be flagged: the `push` filter is free (nothing gates on a
 # post-merge run), and the gating trigger carries no filter.
 _GOOD_CI = """\
@@ -266,22 +387,9 @@ jobs:
     runs-on: ubuntu-latest
 """
 
-# A job with no `name:` reports under its job id, so the id must be matched
-# against the required list too. Must be flagged.
-_BAD_JOB_ID_CONTEXT = """\
-name: Odd
-on:
-  pull_request:
-    paths-ignore:
-      - 'docs/**'
-
-jobs:
-  Simulation:
-    runs-on: ubuntu-latest
-"""
-
-# `paths` appearing as a STEP input, not a trigger filter. Must NOT be flagged:
-# it sits past `jobs:` and at a deeper indent.
+# `paths` as a STEP input, inside the jobs block. Must NOT be flagged. The
+# jobs-block exclusion is what has to carry this, since `_BAD_ON_AFTER_JOBS`
+# forces the scan to cover lines below `jobs:`.
 _GOOD_PATHS_AS_STEP_INPUT = """\
 name: CI
 on:
@@ -298,6 +406,20 @@ jobs:
             target/debug
 """
 
+# A key that merely starts with `paths` is not a path filter. Must NOT be
+# flagged, or the loosened value-matching above becomes a false-positive source.
+_GOOD_PATHSLIKE_KEY = """\
+name: CI
+on:
+  pull_request:
+    paths_are_not_this: true
+
+jobs:
+  fmt_check:
+    name: Fmt
+    runs-on: ubuntu-latest
+"""
+
 # The `on: [pull_request]` inline-list form carries no filter and cannot.
 # Must NOT be flagged.
 _GOOD_INLINE_TRIGGER_LIST = """\
@@ -310,34 +432,88 @@ jobs:
     runs-on: ubuntu-latest
 """
 
+# (description, source, expected error count, expected 1-based line of the first
+# error or None). The line is asserted so that a mutation reporting the right
+# NUMBER of errors in the wrong place still fails.
 _CASES = [
-    ("pre-fix ci.yml pull_request filter", _BAD_CI, 1),
-    ("pre-fix claude-pr-review.yml filter", _BAD_TARGET, 1),
-    ("allowlist `paths:` on a required workflow", _BAD_PATHS_ALLOWLIST, 1),
-    ("fixed ci.yml (push filter kept)", _GOOD_CI, 0),
-    ("workflow with no required context", _GOOD_NOT_REQUIRED, 0),
-    ("required context from a bare job id", _BAD_JOB_ID_CONTEXT, 1),
-    ("`paths:` as a step input", _GOOD_PATHS_AS_STEP_INPUT, 0),
-    ("inline `on: [pull_request]` list", _GOOD_INLINE_TRIGGER_LIST, 0),
+    ("pre-fix ci.yml pull_request filter", _BAD_CI, 1, 8),
+    ("pre-fix claude-pr-review.yml filter", _BAD_TARGET, 1, 5),
+    ("allowlist `paths:` on a required workflow", _BAD_PATHS_ALLOWLIST, 1, 4),
+    ("flow-sequence `paths-ignore: [...]`", _BAD_FLOW_SEQUENCE, 1, 6),
+    ("`on:` written after `jobs:`", _BAD_ON_AFTER_JOBS, 1, 9),
+    ("required context from a bare job id", _BAD_JOB_ID_CONTEXT, 1, 4),
+    ("fixed ci.yml (push filter kept)", _GOOD_CI, 0, None),
+    ("workflow with no required context", _GOOD_NOT_REQUIRED, 0, None),
+    ("`paths:` as a step input", _GOOD_PATHS_AS_STEP_INPUT, 0, None),
+    ("a key merely starting with `paths`", _GOOD_PATHSLIKE_KEY, 0, None),
+    ("inline `on: [pull_request]` list", _GOOD_INLINE_TRIGGER_LIST, 0, None),
 ]
+
+
+def _coverage_fixture(rename: str | None = None) -> dict[str, str]:
+    """One filter-free workflow per required context, optionally renaming one."""
+    files = {}
+    for i, context in enumerate(sorted(REQUIRED_CONTEXTS)):
+        reported = rename if (rename and context == "Fmt") else context
+        files[f"w{i}.yml"] = (
+            f"name: W{i}\non:\n  pull_request:\n\njobs:\n"
+            f"  job_{i}:\n    name: {reported}\n    runs-on: ubuntu-latest\n"
+        )
+    return files
+
+
+_COVERAGE_CASES = [
+    ("every required context is reported", _coverage_fixture(), 0),
+    (
+        "a required job renamed out from under the ruleset",
+        _coverage_fixture(rename="Format"),
+        1,
+    ),
+]
+
+
+def _first_error_line(errors: list[str]) -> int | None:
+    if not errors:
+        return None
+    return int(errors[0].split(":")[1])
 
 
 def self_test() -> int:
     failures = 0
-    for desc, source, expected in _CASES:
-        found = len(check_source(source, "<fixture>"))
-        if found == expected:
+    for desc, source, expected, expected_line in _CASES:
+        errors = check_source(source, "<fixture>")
+        found = len(errors)
+        line = _first_error_line(errors)
+        if found == expected and line == expected_line:
             print(f"ok   - {desc}")
         else:
             print(
-                f"FAIL - {desc}: expected {expected} error(s), got {found}",
+                f"FAIL - {desc}: expected {expected} error(s) at line "
+                f"{expected_line}, got {found} at line {line}",
                 file=sys.stderr,
             )
             failures += 1
+
+    for desc, files, expected in _COVERAGE_CASES:
+        with tempfile.TemporaryDirectory() as tmp:
+            for filename, source in files.items():
+                (Path(tmp) / filename).write_text(source, encoding="utf-8")
+            found = len(check_dir(Path(tmp)))
+        if found == expected:
+            print(f"ok   - coverage: {desc}")
+        else:
+            print(
+                f"FAIL - coverage: {desc}: expected {expected} error(s), "
+                f"got {found}",
+                file=sys.stderr,
+            )
+            failures += 1
+
+    total = len(_CASES) + len(_COVERAGE_CASES)
     if failures:
         print(f"\n{failures} self-test failure(s)", file=sys.stderr)
         return 1
-    print(f"\nAll {len(_CASES)} self-tests passed")
+    print(f"\nAll {total} self-tests passed")
     return 0
 
 
@@ -345,12 +521,16 @@ def main(argv: list[str]) -> int:
     if "--self-test" in argv:
         return self_test()
 
-    workflow_dir = Path(argv[1]) if len(argv) > 1 else Path(".github/workflows")
+    require_coverage = "--no-coverage-check" not in argv
+    positional = [a for a in argv[1:] if not a.startswith("--")]
+    workflow_dir = (
+        Path(positional[0]) if positional else Path(".github/workflows")
+    )
     if not workflow_dir.is_dir():
         print(f"ERROR: {workflow_dir} is not a directory", file=sys.stderr)
         return 2
 
-    errors = check_dir(workflow_dir)
+    errors = check_dir(workflow_dir, require_coverage=require_coverage)
     if errors:
         print(
             "ERROR: required-check path-filter check failed "
