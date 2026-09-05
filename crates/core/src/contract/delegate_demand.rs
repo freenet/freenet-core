@@ -716,7 +716,17 @@ pub(crate) fn register_subscription(
     // the shared serial paths"), and it predates this module: the loop existed
     // before demand registration was added to it. Bounding it is a change to
     // the V1 delegate contract — what happens to the excess, and what the
-    // delegate is told — so it is not made here. Flagged rather than fixed.
+    // delegate is told — so it is not made here. Filed as #5567.
+    //
+    // This cost analysis DEPENDS on the same serial-loop invariant the
+    // atomicity argument below rests on, and the dependency runs the opposite
+    // way, so it is worth naming separately. Today serialisation makes the
+    // scans sequential: N subscribe requests cost N scans one after another on
+    // one thread. If #5554 parks delegates off the loop, they become
+    // CONCURRENT scans over the same map — cheaper in wall-clock, worse in
+    // contention, and at that point the unbounded producer feeds a parallel
+    // path rather than a queued one. Re-derive this when that lands; do not
+    // assume the sequential reading still holds.
     // NOT ATOMIC with the insert below — but the overshoot it would allow is
     // UNREACHABLE today, for a reason worth stating precisely rather than
     // hand-waving as "bounded".
