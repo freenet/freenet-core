@@ -845,10 +845,29 @@ where
     loop {
         iterations += 1;
         if iterations > MAX_CONTRACT_REQUEST_ITERATIONS {
+            // KNOWN GAP: this truncation is visible to the NODE and invisible
+            // to the DELEGATE. We log, return whatever accumulated, and the
+            // delegate is never told it was cut short or which of its requests
+            // were dropped — so it cannot retry the remainder, degrade, or
+            // report the failure to its app.
+            //
+            // Consumer impact, concretely: a Harvest delegate bootstrapping 500
+            // per-address subscriptions needs 500 iterations and silently gets
+            // 100, with no signal distinguishing that from "all done".
+            //
+            // Surfacing it properly needs a freenet-stdlib change — there is no
+            // `InboundDelegateMsg` variant or response field that can carry
+            // "your run was truncated", and inventing one by appending a
+            // synthetic `ApplicationMessage` would be worse, since an app
+            // cannot tell it from delegate output. Deliberately NOT done here;
+            // tracked separately.
             tracing::error!(
                 delegate_key = %delegate_key,
                 iterations = iterations,
-                "Exceeded maximum contract request iterations, possible infinite loop"
+                accumulated = accumulated_messages.len(),
+                "Exceeded maximum contract request iterations, possible infinite \
+                 loop — returning a TRUNCATED response; the delegate is not \
+                 told, see the comment here and MAX_CONTRACT_REQUEST_ITERATIONS"
             );
             // Return whatever we accumulated so far
             return DelegateRunOutcome::Completed(accumulated_messages);
@@ -1651,6 +1670,18 @@ where
                         // what this change exists to stop, but silently losing a
                         // user's permission prompt or a delegate's write would
                         // be worse. Restore what the refused continuation held.
+                        //
+                        // NOT INHERITABLE BY #5542 — read this before reusing
+                        // the machinery. The fallback is defensible HERE
+                        // because both inline waits are self-inflicted on the
+                        // user's own node and bounded by the prompt timeout
+                        // (60s) or the related fetch (10s). It is NOT
+                        // defensible for a delegate GET/SUBSCRIBE that reaches
+                        // the network: "inline" there means a sub-op GET on the
+                        // serial loop for up to SUB_OP_FETCH_TIMEOUT (120s),
+                        // reachable by any delegate once 64 others are parked.
+                        // #5542 must REFUSE with an error on park exhaustion,
+                        // never fall back inline.
                         let continuation = *continuation;
                         accumulated_messages = continuation.accumulated;
                         inbound_responses = continuation.inbound_so_far;
@@ -2748,7 +2779,7 @@ async fn handle_delegate_notification<CH, P>(
     {
         match park.queue_pending(
             &delegate_key,
-            delegate_park::PendingRun::Notification { req },
+            delegate_park::PendingRun::Notification { contract_id, req },
         ) {
             delegate_park::QueueOutcome::Queued => {
                 tracing::debug!(
@@ -3262,12 +3293,13 @@ where
             // not exist. `run_queued_notification` re-checks the park, so a
             // delegate that parked again during this drain re-queues instead of
             // being re-entered.
-            delegate_park::PendingRun::Notification { req } => {
+            delegate_park::PendingRun::Notification { contract_id, req } => {
                 run_queued_notification(
                     contract_handler,
                     Some(&mut *park),
                     prompter,
                     &delegate_key,
+                    contract_id,
                     req,
                 )
                 .await;
@@ -3289,6 +3321,7 @@ async fn run_queued_notification<CH, P>(
     mut park: Option<&mut delegate_park::DelegateParkCtx>,
     prompter: &std::sync::Arc<P>,
     delegate_key: &DelegateKey,
+    contract_id: ContractInstanceId,
     req: DelegateRequest<'static>,
 ) where
     CH: ContractHandler + Send + 'static,
@@ -3300,7 +3333,7 @@ async fn run_queued_notification<CH, P>(
     {
         match park.queue_pending(
             delegate_key,
-            delegate_park::PendingRun::Notification { req },
+            delegate_park::PendingRun::Notification { contract_id, req },
         ) {
             delegate_park::QueueOutcome::Queued => {}
             delegate_park::QueueOutcome::Rejected(_) => {
@@ -6298,6 +6331,30 @@ mod hol_4391_tests {
     // ---- #5544: a parked delegate must not stall the loop, and must not be
     // ---- re-entered while parked.
 
+    /// Wait until `cond` holds, or fail with `label`.
+    ///
+    /// Replaces fixed sleeps before POSITIVE assertions. These tests run the
+    /// real `contract_handling` loop on a machine that may be compiling several
+    /// other worktrees at once, and a wall-clock sleep that is obviously long
+    /// enough on an idle machine is a flaky test under load — which is a broken
+    /// test, not an unlucky one. Polling for the condition is both faster in
+    /// the common case and correct in the slow one.
+    ///
+    /// Deliberately NOT used before negative assertions ("this must NOT have
+    /// happened"): a non-event cannot be waited for, so those keep an explicit
+    /// sleep, and each says so.
+    async fn wait_until(label: &str, mut cond: impl FnMut() -> bool) {
+        const LIMIT: Duration = Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + LIMIT;
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("timed out after {LIMIT:?} waiting for: {label}");
+    }
+
     /// A prompter that hangs until released, standing in for a human who has
     /// not clicked yet. The real `DashboardPrompter` waits up to
     /// `USER_INPUT_TIMEOUT` (60s) for exactly this.
@@ -6382,6 +6439,7 @@ mod hol_4391_tests {
         let _guard = TEST_GUARD.lock().await;
         let (mut handler, send) = build_handler(vec![]).await;
         let script = handler.runtime_mut().delegate_script.clone();
+        let calls_probe = handler.runtime_mut().delegate_calls.clone();
         script.lock().unwrap().push_back(prompt_outbound().into());
 
         // A locally stored contract, so the GET below needs no network and its
@@ -6423,7 +6481,11 @@ mod hol_4391_tests {
             );
 
         // Let the loop pick up the delegate request and park it.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let parked_calls = calls_probe.clone();
+        wait_until("the delegate to be entered and park", || {
+            parked_calls.lock().unwrap().len() == 1
+        })
+        .await;
 
         // The crux. Inline blocking makes this time out.
         let get_c = tokio::time::timeout(
@@ -6509,7 +6571,11 @@ mod hol_4391_tests {
             );
 
         // First park.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let probe = calls.clone();
+        wait_until("the first entry into the delegate", || {
+            probe.lock().unwrap().len() == 1
+        })
+        .await;
         assert_eq!(
             calls.lock().unwrap().len(),
             1,
@@ -6519,7 +6585,11 @@ mod hol_4391_tests {
 
         // Release prompt 1 -> resume -> the delegate prompts again -> re-park.
         gate.add_permits(1);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let probe = calls.clone();
+        wait_until("the resume to re-enter the delegate", || {
+            probe.lock().unwrap().len() == 2
+        })
+        .await;
         assert_eq!(
             calls.lock().unwrap().len(),
             2,
@@ -6583,6 +6653,7 @@ mod hol_4391_tests {
         let _guard = TEST_GUARD.lock().await;
         let (mut handler, send) = build_handler(vec![]).await;
         let script = handler.runtime_mut().delegate_script.clone();
+        let calls_probe = handler.runtime_mut().delegate_calls.clone();
         script.lock().unwrap().push_back(prompt_outbound().into());
 
         let send = Arc::new(send);
@@ -6599,7 +6670,11 @@ mod hol_4391_tests {
         let k0 = key_d.clone();
         let parked: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
             GlobalExecutor::spawn(async move { send_0.send_to_handler(delegate_event(&k0)).await });
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let probe = calls_probe.clone();
+        wait_until("the delegate to park before its queue is filled", || {
+            probe.lock().unwrap().len() == 1
+        })
+        .await;
 
         // Fill the pending queue to exactly its cap.
         let mut queued = Vec::new();
@@ -6868,12 +6943,13 @@ mod hol_4391_tests {
         let kb = key_b.clone();
         let parked: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
             GlobalExecutor::spawn(async move { send_b.send_to_handler(delegate_event(&kb)).await });
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(
-            contexts.lock().unwrap().get(&key_b).map(Vec::as_slice),
-            Some(b"b-parked-continuation".as_slice()),
-            "B must have parked with its continuation written"
-        );
+        let probe = contexts.clone();
+        let kb_probe = key_b.clone();
+        wait_until("B to park with its continuation written", || {
+            probe.lock().unwrap().get(&kb_probe).map(Vec::as_slice)
+                == Some(b"b-parked-continuation".as_slice())
+        })
+        .await;
 
         // Now drive A, which messages the parked B.
         let _ = tokio::time::timeout(
@@ -6997,7 +7073,11 @@ mod hol_4391_tests {
                 async move { send_d.send_to_handler(delegate_event(&key_d)).await },
             );
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let probe = off_loop_calls.clone();
+        wait_until("the off-loop related fetch to be started", || {
+            probe.load(std::sync::atomic::Ordering::SeqCst) == 1
+        })
+        .await;
 
         // The two DECISIVE assertions. Remove the deferral (drop the
         // `DeferRelated if parking.is_some()` arm) and both fail: the upsert
@@ -7103,7 +7183,11 @@ mod hol_4391_tests {
         let k1 = key_d.clone();
         let first: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
             GlobalExecutor::spawn(async move { send_1.send_to_handler(delegate_event(&k1)).await });
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let probe = calls.clone();
+        wait_until("the first request to enter the delegate and park", || {
+            probe.lock().unwrap().len() == 1
+        })
+        .await;
         assert_eq!(
             calls.lock().unwrap().len(),
             1,
@@ -7116,7 +7200,12 @@ mod hol_4391_tests {
         let second: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
             GlobalExecutor::spawn(async move { send_2.send_to_handler(delegate_event(&k2)).await });
 
-        // Give the loop ample opportunity to (wrongly) run it.
+        // A NEGATIVE assertion follows ("this must NOT have happened"), and a
+        // non-event cannot be waited for — so this one stays a sleep by
+        // necessity, not by laziness. It is sound because the positive
+        // precondition (the first request having parked) was established with
+        // `wait_until` above, so a slow machine delays this check rather than
+        // invalidating it.
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(
             calls.lock().unwrap().len(),
