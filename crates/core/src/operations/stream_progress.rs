@@ -56,7 +56,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -97,6 +97,16 @@ pub(crate) struct StreamProgressHandle {
     /// The single shared clock both writer and reader read from. See the
     /// single-epoch invariant in the type docs.
     now_millis: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// One-way latch: has the originator-loopback relay driver (Task B)
+    /// durably committed the contract to local storage yet? Distinct from
+    /// `last_progress_millis` — that tracks per-*fragment* liveness and goes
+    /// quiet the moment sending finishes, while this tracks a single
+    /// irreversible fact set once, before any downstream dispatch is even
+    /// attempted (see `mark_local_store_committed`). Lets the retry loop
+    /// (Task A) tell "the PUT never applied" apart from "it applied, we
+    /// just never heard the downstream reply" when its watchdog gives up
+    /// (#5458).
+    local_store_committed: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for StreamProgressHandle {
@@ -105,6 +115,10 @@ impl std::fmt::Debug for StreamProgressHandle {
             .field(
                 "last_progress_millis",
                 &self.last_progress_millis.load(Ordering::Relaxed),
+            )
+            .field(
+                "local_store_committed",
+                &self.local_store_committed.load(Ordering::Relaxed),
             )
             .finish_non_exhaustive()
     }
@@ -123,7 +137,23 @@ impl StreamProgressHandle {
             last_progress_millis: Arc::new(AtomicU64::new(initial)),
             notify: Arc::new(Notify::new()),
             now_millis,
+            local_store_committed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Latch that the local store has committed durably. Called exactly
+    /// once, by the originator-loopback relay driver, immediately after
+    /// `relay_put_store_locally` returns `Ok` — before it attempts (or even
+    /// decides on) the downstream dispatch. Idempotent; a relaxed store is
+    /// enough because the only thing that matters is "has this ever been
+    /// set", read later by a completely different task.
+    pub(crate) fn mark_local_store_committed(&self) {
+        self.local_store_committed.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether [`Self::mark_local_store_committed`] has been called yet.
+    pub(crate) fn local_store_committed(&self) -> bool {
+        self.local_store_committed.load(Ordering::Relaxed)
     }
 
     /// Record a fragment dispatch. Reads the handle's OWN clock (never a caller-
@@ -505,6 +535,49 @@ mod tests {
             "after the writer's record + 30 s of silence, since_last must show \
              the true elapsed time so the stall fires; a cross-epoch clock would \
              saturate this to 0 and defeat the whole fix"
+        );
+    }
+
+    /// #5458: `local_store_committed` starts false and latches true exactly
+    /// once `mark_local_store_committed` is called — it must never flip back,
+    /// and it must be independent of the fragment-progress clock (a handle
+    /// with zero fragments recorded can still be committed, since the local
+    /// store runs before the first fragment is ever sent).
+    #[test]
+    fn local_store_committed_defaults_false_and_latches_true() {
+        let handle = StreamProgressHandle::new(VirtualTime::new());
+        assert!(
+            !handle.local_store_committed(),
+            "a freshly-constructed handle must not read as committed"
+        );
+
+        handle.mark_local_store_committed();
+        assert!(
+            handle.local_store_committed(),
+            "the latch must read true once marked"
+        );
+
+        // Idempotent: marking again does not un-latch or panic.
+        handle.mark_local_store_committed();
+        assert!(handle.local_store_committed());
+    }
+
+    /// #5458: Task B (the originator-loopback relay driver) and Task A (the
+    /// client's retry loop) each hold their OWN clone of the handle — the
+    /// commit latch must be visible across clones, exactly like the existing
+    /// fragment-progress fields, or the signal can never cross the task
+    /// boundary it exists to bridge.
+    #[test]
+    fn local_store_committed_is_shared_across_clones() {
+        let reader = StreamProgressHandle::new(VirtualTime::new());
+        let writer = reader.clone();
+
+        assert!(!reader.local_store_committed());
+        writer.mark_local_store_committed();
+        assert!(
+            reader.local_store_committed(),
+            "the latch is behind an Arc — a clone's write must be visible \
+             through every other clone, including the one constructed first"
         );
     }
 

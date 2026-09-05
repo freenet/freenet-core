@@ -148,6 +148,29 @@ async fn run_client_put(
     deliver_outcome(&op_manager, client_tx, outcome);
 }
 
+/// Decide whether an `Exhausted` retry-loop outcome should be reported to
+/// the client as success rather than a failure (#5458).
+///
+/// A streaming PUT gets exactly one attempt
+/// (`MAX_PEER_ADVANCEMENTS_STREAMING == 0`): its watchdog abandoning the
+/// wait for a downstream reply is the ONLY way it reaches `Exhausted`, and
+/// by construction (`drive_relay_put`'s Step 1) the contract is already
+/// durably stored on this node before any downstream dispatch is even
+/// attempted. So "exhausted" there means "we gave up waiting to hear back",
+/// not "the PUT failed" — PROVIDED the local store had actually finished
+/// before the watchdog fired, which `local_store_committed` is the one
+/// honest signal for (the watchdog's own clock starts before the store
+/// even begins, so a very early false stall is a real possibility this
+/// function must not paper over).
+///
+/// Non-streaming PUTs retry across multiple peers before exhausting, so a
+/// local copy existing does not mean the network-wide propagation that
+/// class of caller is more plausibly relying on has happened — they are
+/// deliberately excluded here and keep reporting the real failure.
+fn exhausted_attempt_is_local_success(is_streaming: bool, local_store_committed: bool) -> bool {
+    is_streaming && local_store_committed
+}
+
 /// PUT driver has exactly two outcomes — no `SkipAlreadyDelivered` because
 /// PUT doesn't use `NodeEvent::LocalPutComplete` (the driver owns local
 /// completion delivery directly).
@@ -555,6 +578,53 @@ async fn drive_client_put_inner(
             .into())))
         }
         RetryLoopOutcome::Exhausted(cause) => {
+            // #5458: see `exhausted_attempt_is_local_success` for why a
+            // streaming PUT's watchdog giving up is not the same as the PUT
+            // having failed.
+            let locally_stored = exhausted_attempt_is_local_success(
+                is_streaming,
+                driver
+                    .stream_progress
+                    .as_ref()
+                    .is_some_and(|p| p.handle().local_store_committed()),
+            );
+            if locally_stored {
+                tracing::info!(
+                    tx = %client_tx,
+                    contract = %key,
+                    %cause,
+                    phase = "put_exhausted_but_locally_stored",
+                    "PUT: streaming attempt gave up waiting for the downstream \
+                     reply, but the contract is already durably stored on this \
+                     node; reporting success instead of the timeout (#5458)"
+                );
+                op_manager.completed(client_tx);
+                super::finalize_put_at_originator(
+                    op_manager,
+                    client_tx,
+                    key,
+                    PutFinalizationData {
+                        sender: driver.current_target.clone(),
+                        // Unlike `LocalCompletion` (definitively zero remote
+                        // hops), the payload WAS forwarded here — we just
+                        // never learned how far. `None` avoids reporting a
+                        // knowingly wrong hop count.
+                        hop_count: None,
+                        state_hash: None,
+                        state_size: None,
+                    },
+                    false,
+                    false,
+                )
+                .await;
+
+                maybe_subscribe_child(op_manager, client_tx, key, subscribe, blocking_subscribe)
+                    .await;
+
+                return Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
+                    ContractResponse::PutResponse { key },
+                ))));
+            }
             Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                 cause: cause.into(),
             }
@@ -1704,6 +1774,20 @@ where
         put_store_cause(originator_loopback),
     )
     .await?;
+
+    // #5458: the contract is now durably stored on this node, independent of
+    // whatever happens to the downstream forward below. On the
+    // originator-loopback path, `incoming_tx` is the same `attempt_tx` the
+    // client's own retry loop (Task A) registered a `StreamProgress` handle
+    // under before sending — latch the fact so Task A can tell "this PUT
+    // never applied" apart from "it applied, we just never got the
+    // downstream reply" if its watchdog gives up waiting. A genuine relay
+    // hop's lookup is a harmless no-op: this node's own registry never had
+    // `incoming_tx` inserted (that only happens in the client's own
+    // `drive_retry_loop`, on the client's own node).
+    if let Some(progress) = op_manager.stream_progress_registry().get(&incoming_tx) {
+        progress.mark_local_store_committed();
+    }
 
     // ── Step 2: Build skip list + select next hop ──────────────────────────
     let mut new_skip_list = skip_list;
@@ -5799,7 +5883,10 @@ mod tests {
     #[test]
     fn driver_outcome_exhausted_produces_client_error() {
         // Verify that RetryLoopOutcome::Exhausted maps to a client-visible
-        // OperationError, not a silent drop or infrastructure error.
+        // OperationError, not a silent drop or infrastructure error. This is
+        // the baseline (non-locally-stored) case; see
+        // `exhausted_attempt_is_local_success_*` below for the #5458 case
+        // where an exhausted streaming attempt is reported as success instead.
         let cause = "PUT to contract failed after 3 attempts".to_string();
         let outcome: DriverOutcome =
             match RetryLoopOutcome::<(ContractKey, Option<usize>)>::Exhausted(cause) {
@@ -5816,6 +5903,112 @@ mod tests {
         assert!(
             matches!(outcome, DriverOutcome::Publish(Err(_))),
             "Exhaustion must produce a client error, not be swallowed"
+        );
+    }
+
+    /// #5458: the decision table for `exhausted_attempt_is_local_success`.
+    /// Only the streaming-AND-committed cell may report success; the other
+    /// three must keep reporting the real failure.
+    #[test]
+    fn exhausted_attempt_is_local_success_decision_table() {
+        assert!(
+            exhausted_attempt_is_local_success(true, true),
+            "streaming + locally committed → success"
+        );
+        assert!(
+            !exhausted_attempt_is_local_success(true, false),
+            "streaming but NOT yet committed (watchdog fired before the local \
+             store finished) must NOT report success — that would be a false \
+             positive for a PUT that never actually applied"
+        );
+        assert!(
+            !exhausted_attempt_is_local_success(false, true),
+            "non-streaming PUTs retry across peers before exhausting; a local \
+             copy existing must not paper over exhausting every peer"
+        );
+        assert!(
+            !exhausted_attempt_is_local_success(false, false),
+            "neither streaming nor committed → definitely not a success"
+        );
+    }
+
+    /// #5458 regression: `drive_relay_put` must latch `mark_local_store_committed`
+    /// on the tx's `StreamProgress` handle (if one is registered) AFTER the
+    /// local store succeeds and BEFORE attempting the downstream forward —
+    /// mirroring `drive_relay_put_stores_locally_before_forwarding`'s ordering
+    /// check for the store itself. Without this, `drive_client_put_inner`'s
+    /// `Exhausted` arm has no way to distinguish a genuinely-applied streaming
+    /// PUT from one whose local store never even ran.
+    #[test]
+    fn drive_relay_put_marks_local_store_committed_after_storing_locally() {
+        let prod = production_source();
+        let body = extract_fn_body(prod, "async fn drive_relay_put<CB>(");
+
+        let store_pos = body
+            .find("relay_put_store_locally(")
+            .expect("relay_put_store_locally call missing in drive_relay_put");
+        let mark_pos = body.find("mark_local_store_committed()").expect(
+            "drive_relay_put MUST call mark_local_store_committed() after the \
+             local store succeeds (#5458)",
+        );
+        assert!(
+            mark_pos > store_pos,
+            "mark_local_store_committed must run AFTER relay_put_store_locally \
+             — it exists to prove the store actually happened, not to predict it"
+        );
+
+        for forward_marker in ["ctx.send_to_and_await(", "send_to_and_register_waiter("] {
+            let forward_pos = body
+                .find(forward_marker)
+                .unwrap_or_else(|| panic!("{forward_marker} call missing in drive_relay_put"));
+            assert!(
+                mark_pos < forward_pos,
+                "mark_local_store_committed must run BEFORE the downstream \
+                 forward ({forward_marker}) — the whole point is to record the \
+                 fact before anything about the forward can go wrong"
+            );
+        }
+    }
+
+    /// #5458 regression: `drive_client_put_inner`'s `Exhausted` arm must
+    /// actually consult `exhausted_attempt_is_local_success` and, when it
+    /// returns true, publish a success `PutResponse` instead of the generic
+    /// `OperationError` — not merely compute the boolean and ignore it.
+    ///
+    /// Mutation-verified: deleting the `if locally_stored { ... }` early
+    /// return (leaving only the unconditional `Err` at the bottom) makes this
+    /// FAIL, because `PutResponse` no longer appears before the `Err(...)`
+    /// this test anchors on.
+    #[test]
+    fn drive_client_put_inner_reports_success_when_locally_stored_and_exhausted() {
+        let prod = production_source();
+        let body = extract_fn_body(prod, "async fn drive_client_put_inner(");
+
+        let exhausted_pos = body
+            .find("RetryLoopOutcome::Exhausted(cause)")
+            .expect("Exhausted arm missing from drive_client_put_inner");
+        let arm = &body[exhausted_pos..];
+
+        let decision_pos = arm
+            .find("exhausted_attempt_is_local_success(")
+            .expect("Exhausted arm must consult exhausted_attempt_is_local_success");
+        let success_pos = arm
+            .find("ContractResponse::PutResponse { key }")
+            .expect("Exhausted arm must be able to publish a PutResponse success");
+        let error_pos = arm
+            .find("ErrorKind::OperationError")
+            .expect("Exhausted arm must still be able to publish the real failure");
+
+        assert!(
+            decision_pos < success_pos,
+            "the local-success decision must be computed before the success \
+             path that acts on it"
+        );
+        assert!(
+            success_pos < error_pos,
+            "the success return must be reachable BEFORE the unconditional \
+             error at the bottom of the arm, i.e. behind an early return — \
+             otherwise the success branch is dead code"
         );
     }
 
