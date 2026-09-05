@@ -232,11 +232,24 @@ async fn fdev_publish_observed(args: &[&str]) {
     // bounds the dead time either way and makes the test independent of
     // node-side timeout tuning.
     //
-    // Note what is being tolerated: that path is a REAL defect, filed as #5458
-    // (the store succeeds and the originator never gets its terminal reply),
-    // not a fixture quirk. Capping the wait makes this helper absorb it more
-    // quietly than a 300 s hang did, so the issue reference belongs here — when
-    // #5458 is fixed, this cap and the polling below can both go.
+    // Note what is being tolerated: that path was a REAL defect, filed as
+    // #5458 (the store succeeds and the originator never gets its terminal
+    // reply), not a fixture quirk. Capping the wait makes this helper absorb
+    // it more quietly than a 300 s hang did.
+    //
+    // #5458 status: PARTIALLY addressed, this cap and the polling below
+    // still stay. The fix makes the originator's own watchdog
+    // (STREAM_OP_INACTIVITY_TIMEOUT, 240 s) report success instead of a
+    // false failure once it gives up waiting for the downstream reply AND
+    // the local store already committed — see
+    // `operations::put::op_ctx_task::exhausted_attempt_is_local_success`.
+    // That fires well past this helper's 30 s cap, so it does not change
+    // what THIS test observes: fdev still sees nothing within 30 s either
+    // way, and the real downstream reply this helper was written to wait
+    // for is still not made reliable or prompt by that fix. The 300 s hang
+    // this cap exists to avoid is therefore still a live possibility, just
+    // with a correct (rather than a false-failure) answer waiting at the
+    // end of it.
     let output = Command::new(fdev_bin())
         .args(args)
         .env("FDEV_RESPONSE_TIMEOUT", "30")

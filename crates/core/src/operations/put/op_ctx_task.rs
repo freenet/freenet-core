@@ -163,6 +163,32 @@ async fn run_client_put(
 /// even begins, so a very early false stall is a real possibility this
 /// function must not paper over).
 ///
+/// # What "success" means here — and what it does NOT confirm
+///
+/// This cannot distinguish "the downstream peer received and stored the
+/// contract, only the reply was lost" (the scenario #5458's own evidence
+/// documents — the peer's telemetry showed the store succeeded) from "the
+/// downstream peer never received anything at all" (dead target, dropped
+/// mid-transfer, one-way partition) — both dispatch without a synchronous
+/// error, so both reach this same `Exhausted` path. Reporting success here
+/// means "your data is durably stored in the network" (this node is a
+/// legitimate host per `.claude/rules/hosting-invariants.md` invariant 2),
+/// NOT "confirmed replicated to or discoverable from the target peer".
+/// That is a real, deliberate widening of the existing `ReplyClass::
+/// LocalCompletion` / #3465 precedent this mirrors: those cover a KNOWN
+/// non-delivery (no next hop, or the forward's own dispatch call returned
+/// an error), where "local success" is the only honest answer. Here the
+/// forward's outcome is genuinely UNKNOWN. The tradeoff is accepted
+/// because the alternative — reporting failure — was already just as
+/// unreliable a signal (fdev's own error text says "may have succeeded,
+/// verify out-of-band"), and #5458's evidence is that the unknown case
+/// resolves to "succeeded" far more often than not. It does mean a client
+/// that hits this path after a genuinely dead target gets no signal to
+/// retry elsewhere, and the contract may end up discoverable only from
+/// this node. See freenet/freenet-core#5458's own "suggested starting
+/// points" for the still-open work on making the real downstream reply
+/// arrive reliably, which would close this gap properly.
+///
 /// Non-streaming PUTs retry across multiple peers before exhausting, so a
 /// local copy existing does not mean the network-wide propagation that
 /// class of caller is more plausibly relying on has happened — they are
@@ -5984,10 +6010,12 @@ mod tests {
         let prod = production_source();
         let body = extract_fn_body(prod, "async fn drive_client_put_inner(");
 
-        let exhausted_pos = body
-            .find("RetryLoopOutcome::Exhausted(cause)")
-            .expect("Exhausted arm missing from drive_client_put_inner");
-        let arm = &body[exhausted_pos..];
+        // Brace-matched to the arm's OWN body (not sliced to end-of-function):
+        // `extract_fn_body` finds the first `{` after the given prefix, and
+        // the prefix here already ends in `{` — the arm's own opening brace —
+        // so this returns exactly the arm's contents, immune to a later match
+        // arm coincidentally containing either marker string.
+        let arm = extract_fn_body(body, "RetryLoopOutcome::Exhausted(cause) => {");
 
         let decision_pos = arm
             .find("exhausted_attempt_is_local_success(")

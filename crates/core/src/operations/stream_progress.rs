@@ -388,6 +388,24 @@ impl Drop for StreamProgressGuard {
 /// handler case is rarer than the lost-reply case, so the bound goes to the
 /// common one.
 ///
+/// **#5458 update:** this watchdog firing while the local store already
+/// succeeded no longer produces a client-visible failure for the common case —
+/// `drive_client_put_inner`'s `Exhausted` arm now checks
+/// `StreamProgressHandle::local_store_committed` (set by `drive_relay_put`
+/// right after the local store succeeds) and reports success instead, via
+/// `exhausted_attempt_is_local_success`. That mitigates the "fast wrong
+/// answer" this window is sized to prefer, for the case where the local store
+/// really did finish before the watchdog fired. It does NOT make the terminal
+/// reply itself arrive, and does not help the case where the local store
+/// genuinely hadn't finished yet (a real failure still gets reported there,
+/// correctly) — so this constant's two-sided compromise still matters exactly
+/// as described above; only the consequence of getting it wrong on the "too
+/// short" side has changed from "wrong failure" to "correctly not yet a
+/// success". See `exhausted_attempt_is_local_success`'s doc comment in
+/// `operations::put::op_ctx_task` for what "success" does and does not
+/// confirm, and freenet/freenet-core#5458 for the still-open question of
+/// making the downstream reply itself reliable.
+///
 /// The real fix for both is to make the terminal reply arrive; until then this
 /// constant is a compromise between two bad outcomes rather than a derivation
 /// with a single right answer. Do not "tighten" it toward either end without
