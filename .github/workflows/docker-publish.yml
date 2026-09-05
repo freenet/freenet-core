@@ -345,7 +345,7 @@ jobs:
           echo "is_stable=${is_stable}" >> "$GITHUB_OUTPUT"
           echo "stable release: ${is_stable}"
 
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@v6
         id: metadata
         with:
           images: ghcr.io/${{ github.repository }}
