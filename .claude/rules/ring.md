@@ -275,10 +275,7 @@ SummaryRequest / ChangeInterests):
 Any condition that exempts an entry from garbage collection
 (is_transient, has_pending, etc.) MUST:
   1. Expire via TTL, OR
-  2. Be overridden by an absolute age threshold, OR
-  3. Be outranked by a reclaim path that runs INDEPENDENTLY of the
-     holder — one that can take the resource back without the holder
-     releasing it, cooperating, or still existing.
+  2. Be overridden by an absolute age threshold
 
 Unbounded exemptions create permanent GC blind spots.
 
@@ -291,32 +288,6 @@ CORRECT:
       (!entry.is_zombie() || entry.is_transient) && !dominated_by_age
   })
 ```
-
-**Why (3) belongs here, and why the TTL test alone gives false positives.**
-A TTL is a PROXY for the property that actually matters, which is
-reclaimability, and it tracks that property only while nothing outranks the
-holder. In this crate something does: the hosting cache's byte budget. A
-delegate pin (#4669) has no TTL and no absolute-age override, so it fails (1)
-and (2) — and is nonetheless fully reclaimable, because the eviction candidate
-set is filtered only by the op-scoped backstop (`hosting/cache.rs`,
-`AtCapacity => protected != Some(key)`; `Overflow => true`). Subscribed and
-in-use contracts are candidates, merely sorted last by fewest-`(local,
-downstream)`, and when the peer is still over budget the fewest-subscriber
-contract IS shed — including a subscribed one, with its subscription state torn
-down by `teardown_evicted_in_use_contract` before the reclaim gate reads
-`contract_in_use`. That is deliberate: it is the change from the shipped #4720
-code, "which hard-pinned every subscribed contract", and production callers
-pass `AtCapacity` unconditionally, so it is live in the field rather than gated.
-
-So ask the reclaimability question directly — **"is there a path that takes this
-resource back independently of the holder?"** — rather than inferring it from a
-TTL. An exemption that fails (1) and (2) but satisfies (3) is bounded, and
-flagging it produces an override rather than a fix. An override that becomes
-routine stops being a decision.
-
-The residual cost of a (3)-only exemption is worth naming when you rely on it:
-it is a PRIORITY cost, not a leak. The exempt entry is reclaimed last, so it
-displaces others under pressure. Bound how much of that one holder can cause.
 
 **Audit targets:**
 - All `prune_connection` / `drop_connection` call sites — verify all related maps are cleaned up
