@@ -3177,6 +3177,10 @@ mod state_write_attribution_pin_tests {
             // The propagation leg. It queues a key-only event rather than
             // enqueueing the state; see `queue_v2_delegate_broadcast`.
             "queue_v2_delegate_broadcast(",
+            // Leg 3 in the rustdoc above. Deleting it was green before this
+            // line existed: the dashboard timestamp for a contract written only
+            // by a V2 delegate would silently stop advancing.
+            ".record_contract_update(",
             "is_contract_broken(",
         ] {
             // `count_call_sites`, not `body.contains`: the callback carries a

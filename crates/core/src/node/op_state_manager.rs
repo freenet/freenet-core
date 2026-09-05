@@ -460,6 +460,33 @@ pub(crate) enum DrainStateRead {
 static V2_BROADCAST_ENQUEUE_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Count a dropped V2 broadcast enqueue, warning only at power-of-two milestones.
+///
+/// RATE-LIMITED deliberately. This fires exactly when the notification channel
+/// is `Full`, and `try_notify_node_event_on` logs that same condition at
+/// `debug!` precisely because a per-occurrence WARN on it flooded production
+/// gateways after the HN spike (#4238) at 8-14 MB/hour. The marker is released
+/// on failure, so every subsequent write to the contract retries and would log
+/// again — an unconditional WARN here is that incident by another door.
+/// `release_max_level_info` still rules out `debug!` (the drop would leave no
+/// evidence in a release build, the #4981 shape), so the resolution is the one
+/// `tracing::register::note_dropped_event_log` already uses for this exact
+/// trade: count every occurrence, warn at 1, 2, 4, 8, ...
+fn note_v2_broadcast_enqueue_dropped(key: &ContractKey, err: &OpError) {
+    let dropped =
+        V2_BROADCAST_ENQUEUE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if dropped.is_power_of_two() {
+        tracing::warn!(
+            contract = %key,
+            error = %err,
+            dropped_total = dropped,
+            "V2 delegate state-change broadcast dropped: notification channel would block. \
+             The write is committed locally; the network learns of it on the next write or \
+             within one anti-entropy round (300s). Logged at power-of-two milestones (#4238)."
+        );
+    }
+}
+
 /// Map a contract-handler reply onto a [`DrainStateRead`].
 ///
 /// Split out from [`OpManager::read_state_for_broadcast_drain`] so the mapping
@@ -1059,19 +1086,7 @@ impl OpManager {
             // the contract would silently stop propagating for the process
             // lifetime.
             self.v2_delegate_broadcast_pending.remove(key.id());
-            let dropped =
-                V2_BROADCAST_ENQUEUE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            // WARN, not debug: `release_max_level_info` compiles debug out, so
-            // a debug-only line here would make this drop invisible in exactly
-            // the builds that matter. Same reasoning as the drain-read drop.
-            tracing::warn!(
-                contract = %key,
-                error = %err,
-                dropped_total = dropped,
-                "V2 delegate state-change broadcast dropped: notification channel would \
-                 block. The write is committed locally; the network learns of it on the \
-                 next write or via anti-entropy"
-            );
+            note_v2_broadcast_enqueue_dropped(&key, &err);
             return false;
         }
         true
@@ -1145,13 +1160,14 @@ impl OpManager {
 
     /// Read the current local state for `key` from the contract handler, or
     /// `None` if we don't host it / the read fails. Used by the #4359 deferred
-    /// re-broadcast flush to avoid re-emitting superseded give-up-time bytes,
-    /// and by the V2 delegate broadcast drain, which carries no state of its
-    /// own and reads what is stored at drain time.
-    pub(crate) async fn read_current_contract_state(
-        &self,
-        key: &ContractKey,
-    ) -> Option<WrappedState> {
+    /// re-broadcast flush to avoid re-emitting superseded give-up-time bytes.
+    ///
+    /// NOT used by the V2 delegate broadcast drain, which needs a bounded read
+    /// that distinguishes a failure from "not held" and therefore has its own
+    /// [`Self::read_state_for_broadcast_drain`]. An earlier version of this
+    /// comment claimed the drain as a caller and widened the visibility for it;
+    /// both were wrong, and the visibility is back to private.
+    async fn read_current_contract_state(&self, key: &ContractKey) -> Option<WrappedState> {
         use crate::contract::ContractHandlerEvent;
         match self
             .notify_contract_handler(ContractHandlerEvent::GetQuery {

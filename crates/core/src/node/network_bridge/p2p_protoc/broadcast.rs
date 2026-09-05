@@ -184,6 +184,30 @@ impl P2pConnManager {
     /// Base delay between V2 drain retries, scaled by attempt number.
     pub(super) const V2_DRAIN_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
+    /// Decide whether a V2 drain retry happens, and after how long.
+    ///
+    /// Split out from the dispatch arm for the same reason `classify_drain_read`
+    /// was split out of the read: the policy is the part with a decision in it,
+    /// and inline in a `match` arm of the select loop it is unreachable from any
+    /// test. Source-order pins can assert the shape of that arm; only this can
+    /// assert that retries actually stop at the cap and that the jitter stays in
+    /// its documented band.
+    ///
+    /// `jitter_pct` is a parameter rather than a `GlobalRng` call inside, so the
+    /// arithmetic is deterministic under test while production still supplies a
+    /// random factor.
+    ///
+    /// Returns `None` once `attempts_so_far` has reached
+    /// [`Self::MAX_V2_DRAIN_RETRIES`], i.e. the caller must give up.
+    pub(super) fn plan_v2_drain_retry(attempts_so_far: u8, jitter_pct: u64) -> Option<Duration> {
+        if attempts_so_far >= Self::MAX_V2_DRAIN_RETRIES {
+            return None;
+        }
+        let attempt = attempts_so_far + 1;
+        let base = Self::V2_DRAIN_RETRY_BASE_DELAY * u32::from(attempt);
+        Some(base.mul_f64(jitter_pct as f64 / 100.0))
+    }
+
     /// Maximum entries in the no-target streak tracker. Prevents unbounded growth
     /// from network-influenced contract keys.
     const MAX_BROADCAST_STREAK_ENTRIES: usize = 256;

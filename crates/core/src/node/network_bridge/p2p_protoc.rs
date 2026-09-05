@@ -96,14 +96,24 @@ const QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
 /// `CH_EV_RESPONSE_TIME_OUT` (300 s), so an unbounded await here is the #4549
 /// wedge — a saturated contract handler stalls, then kills, the listener.
 ///
-/// Shorter than the diagnostics bound (5 s) on purpose. That one serves an
-/// operator poll where a slow answer still beats none; this one only decides
-/// whether a broadcast goes out now or waits for the next write, and the loop
-/// it blocks warns at 100 ms of iteration time. Failing fast and letting
-/// anti-entropy heal is the better trade here, so the cap is the smallest that
-/// still clears a normally-loaded handler rather than the largest that is
-/// tolerable.
-const V2_BROADCAST_DRAIN_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// Deliberately the SAME bound as the contract-handler round trips
+/// `handle_broadcast_state_change` makes three lines later on this very arm
+/// (`ring::interest::BROADCAST_CH_TIMEOUT`). An earlier version of this
+/// constant was 2 s, justified as "failing fast to protect the loop" — which
+/// was wrong twice over. The arm is already willing to spend `BROADCAST_CH_TIMEOUT`
+/// per target immediately afterwards, so a tighter cap here protected nothing;
+/// and it was the only one of the two whose expiry LOSES DATA, since it decides
+/// whether a committed write is announced at all. A cap 5x tighter than the
+/// call that follows it, on the only step that can drop a write, is the wrong
+/// way round.
+///
+/// It also claimed the loop "warns at 100 ms of iteration time", which is not
+/// true of this await: `SLOW_EVENT_THRESHOLD` is measured around
+/// `process_select_result`, and the `NodeAction` dispatch that contains this
+/// arm runs after that elapsed time is taken. A stall here produces no slow-
+/// iteration warning at all, so nothing was observing the cost the tight bound
+/// was supposedly buying.
+const V2_BROADCAST_DRAIN_READ_TIMEOUT: Duration = crate::ring::interest::BROADCAST_CH_TIMEOUT;
 
 /// Count of V2 delegate broadcasts dropped because the drain could not read
 /// local state.
@@ -117,6 +127,39 @@ const V2_BROADCAST_DRAIN_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// clean zero.
 static V2_BROADCAST_DRAINS_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Count a dropped V2 broadcast drain, and WARN at power-of-two milestones.
+///
+/// RATE-LIMITED on purpose, and the reason is a production incident rather than
+/// taste. `try_notify_node_event_on` logs its `Full` arm at `debug!` with the
+/// note that a per-occurrence WARN there flooded production gateways after the
+/// HN spike (#4238) at 8-14 MB/hour. This path is reached under exactly that
+/// condition — a saturated node — and once per V2 write, so an unconditional
+/// WARN here would re-create the same flood by a different door.
+///
+/// `release_max_level_info` still rules out `debug!` (the drop would leave no
+/// evidence in a release build, the #4981 shape), so the answer is neither
+/// every occurrence nor none: count all, warn at 1, 2, 4, 8, ... exactly as
+/// `tracing::register::note_dropped_event_log` does for the same trade.
+fn note_v2_broadcast_drain_dropped(key: &freenet_stdlib::prelude::ContractKey) {
+    let dropped =
+        V2_BROADCAST_DRAINS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if dropped.is_power_of_two() {
+        tracing::warn!(
+            contract = %key,
+            dropped_total = dropped,
+            timeout_secs = V2_BROADCAST_DRAIN_READ_TIMEOUT.as_secs(),
+            "V2 delegate broadcast dropped: could not read local state to announce, and \
+             the bounded retry did not recover it. The usual cause is the contract-handling \
+             loop being held by the delegate that made this write — a delegate awaiting user \
+             input holds it for a human-scale time and will not be recovered by retries \
+             (#5544/#5554 remove that precondition). The write is committed locally; a peer \
+             hosting or using this contract re-learns it within one anti-entropy round \
+             (INTEREST_HEARTBEAT_INTERVAL, 300s), or sooner on the delegate's next write. \
+             Logged at power-of-two milestones (#4238)."
+        );
+    }
+}
 
 /// Best-effort, bounded query to the contract handler for application-level
 /// subscriptions, used by the diagnostics arms of the network event loop (#4549).
@@ -3042,19 +3085,17 @@ impl P2pConnManager {
                                         // write is free to queue its own event
                                         // and at worst we fan out twice.
                                         let attempt = ctx.v2_drain_retries.entry(key).or_insert(0);
-                                        if *attempt < Self::MAX_V2_DRAIN_RETRIES {
+                                        // Linear backoff with +/-20% jitter so a
+                                        // burst of contracts failing together
+                                        // does not retry in lockstep against the
+                                        // one serial loop that was already too
+                                        // busy to answer (`code-style.md`).
+                                        let jitter_pct: u64 =
+                                            crate::config::GlobalRng::random_range(80u64..=120u64);
+                                        if let Some(delay) =
+                                            Self::plan_v2_drain_retry(*attempt, jitter_pct)
+                                        {
                                             *attempt += 1;
-                                            // Linear backoff with +/-20% jitter
-                                            // so a burst of contracts failing
-                                            // together does not retry in
-                                            // lockstep (`code-style.md`).
-                                            let base = Self::V2_DRAIN_RETRY_BASE_DELAY
-                                                * u32::from(*attempt);
-                                            let jitter_pct: u64 =
-                                                crate::config::GlobalRng::random_range(
-                                                    80u64..=120u64,
-                                                );
-                                            let delay = base.mul_f64(jitter_pct as f64 / 100.0);
                                             let op_mgr = op_manager.clone();
                                             let shutdown = op_manager.ring.shutdown_token();
                                             tokio::spawn(async move {
@@ -3066,13 +3107,14 @@ impl P2pConnManager {
                                                     _ = shutdown.cancelled() => return,
                                                     _ = tokio::time::sleep(delay) => {}
                                                 }
-                                                if op_mgr
-                                                    .try_notify_node_event(
-                                                        crate::message::NodeEvent::
-                                                            V2DelegateStateChanged { key },
-                                                    )
-                                                    .is_err()
-                                                {
+                                                // Through the marker-respecting
+                                                // API, not a raw emit: if a
+                                                // fresh write has already queued
+                                                // its own drain for this
+                                                // contract, this retry coalesces
+                                                // into it instead of adding a
+                                                // second event.
+                                                if !op_mgr.queue_v2_delegate_broadcast(key) {
                                                     // The retry never got queued,
                                                     // so the outcome is the same
                                                     // as exhausting them: this
@@ -3080,22 +3122,7 @@ impl P2pConnManager {
                                                     // Counted and WARNed for that
                                                     // reason rather than dropped
                                                     // quietly.
-                                                    let dropped =
-                                                        V2_BROADCAST_DRAINS_DROPPED.fetch_add(
-                                                            1,
-                                                            std::sync::atomic::Ordering::Relaxed,
-                                                        ) + 1;
-                                                    tracing::warn!(
-                                                        contract = %key,
-                                                        dropped_total = dropped,
-                                                        "V2 delegate broadcast dropped: the \
-                                                         drain retry could not be re-queued. \
-                                                         The write is committed locally; a \
-                                                         peer hosting or using this contract \
-                                                         re-learns it within one anti-entropy \
-                                                         round (300s), or sooner on the \
-                                                         delegate's next write"
-                                                    );
+                                                    note_v2_broadcast_drain_dropped(&key);
                                                 }
                                             });
                                         } else {
@@ -3109,28 +3136,7 @@ impl P2pConnManager {
                                             // leaves no evidence in a release build
                                             // is the #4981 shape.
                                             ctx.v2_drain_retries.remove(&key);
-                                            let dropped = V2_BROADCAST_DRAINS_DROPPED
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                                + 1;
-                                            tracing::warn!(
-                                                contract = %key,
-                                                dropped_total = dropped,
-                                                retries = Self::MAX_V2_DRAIN_RETRIES,
-                                                timeout_secs =
-                                                    V2_BROADCAST_DRAIN_READ_TIMEOUT.as_secs(),
-                                                "V2 delegate broadcast dropped after retries: \
-                                                 could not read local state to announce. The \
-                                                 usual cause is the contract-handling loop \
-                                                 being held by the delegate that made this \
-                                                 write — a delegate awaiting user input holds \
-                                                 it for a human-scale time and will not be \
-                                                 recovered by retries (#5544/#5554 remove \
-                                                 that precondition). The write is committed \
-                                                 locally; a peer that is hosting or has this \
-                                                 contract in use re-learns it within one \
-                                                 anti-entropy round (INTEREST_HEARTBEAT_INTERVAL, \
-                                                 300s), or sooner on the delegate's next write"
-                                            );
+                                            note_v2_broadcast_drain_dropped(&key);
                                         }
                                     }
                                 }
@@ -5506,6 +5512,65 @@ pub(crate) mod tests {
         );
     }
 
+    /// The V2 drain retry POLICY, which the source-order pins cannot reach.
+    ///
+    /// The pins assert the shape of the dispatch arm; they cannot tell you that
+    /// retries stop at the cap or that the jitter stays inside its documented
+    /// band. Both matter here for a specific reason: the drops are CORRELATED —
+    /// the read fails because it is queued behind a delegate notification
+    /// batch, so one busy batch drops many contracts at once. Un-jittered
+    /// backoff would then re-queue all of them in lockstep against the same
+    /// serial loop that was already too busy, making the retry amplify the
+    /// congestion it exists to recover from.
+    #[test]
+    fn v2_drain_retry_policy_is_bounded_and_jittered() {
+        use super::P2pConnManager;
+
+        // Stops exactly at the cap, and the cap is what gives up.
+        for attempts in 0..P2pConnManager::MAX_V2_DRAIN_RETRIES {
+            assert!(
+                P2pConnManager::plan_v2_drain_retry(attempts, 100).is_some(),
+                "attempt {attempts} is below MAX_V2_DRAIN_RETRIES and must still retry"
+            );
+        }
+        assert!(
+            P2pConnManager::plan_v2_drain_retry(P2pConnManager::MAX_V2_DRAIN_RETRIES, 100)
+                .is_none(),
+            "at MAX_V2_DRAIN_RETRIES the drain must give up rather than retry forever — an \
+             unbounded retry here is a loop against the contract handler that is already \
+             saturated"
+        );
+        assert!(
+            P2pConnManager::plan_v2_drain_retry(u8::MAX, 100).is_none(),
+            "any count past the cap must also give up"
+        );
+
+        // Linear growth at the neutral factor.
+        let base = P2pConnManager::V2_DRAIN_RETRY_BASE_DELAY;
+        assert_eq!(P2pConnManager::plan_v2_drain_retry(0, 100), Some(base));
+        assert_eq!(P2pConnManager::plan_v2_drain_retry(1, 100), Some(base * 2));
+        assert_eq!(P2pConnManager::plan_v2_drain_retry(2, 100), Some(base * 3));
+
+        // Jitter band: +/-20% of the linear delay at each attempt, and the
+        // extremes must actually MOVE the delay — a jitter that silently
+        // collapsed to 1.0 would pass a bounds-only check.
+        for attempts in 0..P2pConnManager::MAX_V2_DRAIN_RETRIES {
+            let linear = base * u32::from(attempts + 1);
+            let low = P2pConnManager::plan_v2_drain_retry(attempts, 80).unwrap();
+            let high = P2pConnManager::plan_v2_drain_retry(attempts, 120).unwrap();
+            assert!(
+                low < linear && high > linear,
+                "jitter must actually spread attempt {attempts}: got low={low:?}, \
+                 linear={linear:?}, high={high:?}. If low == high == linear the jitter \
+                 factor is being ignored and correlated drops will retry in lockstep"
+            );
+            assert!(
+                low >= linear.mul_f64(0.8) && high <= linear.mul_f64(1.2),
+                "jitter must stay within the documented +/-20% band at attempt {attempts}"
+            );
+        }
+    }
+
     /// Every terminal outcome of the V2 drain must drop its retry entry.
     ///
     /// `v2_drain_retries` is keyed by contract and bounded only by removal
@@ -5569,11 +5634,26 @@ pub(crate) mod tests {
         // Bound at the next dispatch arm so a later arm's text cannot satisfy
         // the assertion.
         let after = &SOURCE[arm_start..];
-        let arm_end = after
-            .find("NodeEvent::SyncStateToPeer {")
-            .map(|p| arm_start + p)
-            .unwrap_or(SOURCE.len());
-        let arm = &SOURCE[arm_start..arm_end];
+        // Bounded, and it must FAIL rather than fall through: an
+        // `unwrap_or(SOURCE.len())` would absorb the rest of the file including
+        // this test's own `expect` strings, which contain both needles in the
+        // passing order — a vacuous pass triggered by nothing worse than the
+        // arms being reordered.
+        let arm_end = arm_start
+            + after.find("NodeEvent::SyncStateToPeer {").expect(
+                "SyncStateToPeer arm no longer follows the V2 drain arm — this pin \
+                         bounds its search on it, and without a bound it would scan its own \
+                         assertion text and pass vacuously. Re-anchor it.",
+            );
+        // Strip line comments before searching: `arm.find(..)` matches inside a
+        // comment, so COMMENTING OUT the clear left this pin green. The call it
+        // guards is the whole lost-write story.
+        let arm: String = SOURCE[arm_start..arm_end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let arm = arm.as_str();
 
         let clear_pos = arm.find("clear_v2_delegate_broadcast_pending(").expect(
             "the V2 drain no longer clears the coalescing marker. Without the clear the              marker latches: every later write to this contract coalesces into a              broadcast that has already drained, and the contract stops propagating",
