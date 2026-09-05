@@ -1145,6 +1145,37 @@ impl GetTerminalOutcome {
     }
 }
 
+/// Why the client GET retry loop gave up advancing to a new peer, carried by
+/// [`GetEvent::ClientTerminal`] on the `RetryLoopOutcome::Exhausted` path
+/// only (`None` on a terminal reply). This is the discriminator #5252 asked
+/// for: separating "we asked peers and none had it" from "we ran out of
+/// distinct peers to ask" was previously only a `debug!` log line
+/// (`crates/core/src/operations/get/op_ctx_task.rs`), which never runs in a
+/// release build (`release_max_level_info`) and was never wired to reach the
+/// telemetry collector even if it had.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub(crate) enum GetExhaustionReason {
+    /// `advance_to_next_peer` hit `MAX_RETRIES` peer advancements — the
+    /// retry budget, not candidate supply, ended the search.
+    RetryBudget,
+    /// `advance_to_next_peer` had budget remaining but
+    /// `k_closest_potentially_hosting` (and the bootstrap-gateway fallback)
+    /// returned no usable candidate — the search ran out of distinct peers
+    /// to ask before it ran out of retries.
+    NoRoutingCandidates,
+}
+
+impl GetExhaustionReason {
+    /// Stable snake_case string for the OTLP/json export.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            GetExhaustionReason::RetryBudget => "retry_budget",
+            GetExhaustionReason::NoRoutingCandidates => "no_routing_candidates",
+        }
+    }
+}
+
 /// Why a streamed (> 64 KB `streaming_threshold`) GET transfer aborted before
 /// its state could be assembled and cached. Telemetry-only; carried on
 /// [`GetEvent::ClientTerminal`] so analysts can see WHERE large fetches fail
@@ -1379,6 +1410,21 @@ pub(crate) enum GetEvent {
         /// (the inline `GetSuccess`/`GetFailure` paths miss them — see #4796),
         /// so this is the only terminal that can carry the abort cause.
         stream_abort_cause: Option<StreamAbortCause>,
+        /// Why the retry loop gave up advancing to a new peer (#5252):
+        /// `Some` only on the `RetryLoopOutcome::Exhausted` path (`outcome`
+        /// is `NotFound` or `TimeoutExhausted`); `None` when a terminal reply
+        /// was actually received (`outcome = Success`, or a streaming
+        /// failure that still reached a terminal header). See
+        /// [`GetExhaustionReason`].
+        exhaustion_reason: Option<GetExhaustionReason>,
+        /// Peer advancements performed before the retry loop gave up —
+        /// `advance_to_next_peer`'s `retries` counter at the moment of
+        /// exhaustion. `None` except on the `RetryLoopOutcome::Exhausted`
+        /// path. Paired with `exhaustion_reason`; this is the second half of
+        /// the discriminator #5252 asked for (the first debug-only version
+        /// also carried `tried.len()`, which tracked this value within one
+        /// of a candidate miss not pushing to `tried`).
+        peer_advancements: Option<usize>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
