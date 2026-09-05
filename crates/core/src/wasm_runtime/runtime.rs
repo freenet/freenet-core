@@ -1025,11 +1025,20 @@ pub type StateAdmitCallback = Arc<
 /// demand. Without it, a V2 delegate subscribe is a passive notification hook
 /// that never sets `contract_in_use` — the #4669 defect.
 ///
-/// Registration takes a `parking_lot` read lock on the hosting cache and then a
-/// `DashMap` insert — no I/O and no await, so calling it on the WASM call stack
-/// is safe. Nothing executes WASM while holding that lock for writing, so the
-/// nesting introduces no cycle; the read is worth naming because "pure DashMap
-/// insert" would understate what the call site is holding.
+/// Registration is NOT free, and the cost is worth naming because this runs on
+/// the WASM call stack. It takes a `parking_lot` read lock on the hosting cache,
+/// performs a synchronous redb point lookup to confirm the contract's state is
+/// present (`contract_state_present` — real I/O, though it does not deserialize
+/// the value), walks `client_subscriptions` once to evaluate the per-delegate
+/// and node-wide pin bounds, and then does a `DashMap` insert. No await, so
+/// calling it synchronously is sound, and nothing executes WASM while holding
+/// the hosting-cache lock for writing, so the nesting introduces no cycle.
+///
+/// The scan is O(contracts with subscribers) and is paid on every NEW
+/// registration, not only on a refused one. That is the cost #5556 is about;
+/// the state lookup is what #4610 requires to avoid registering an unrepairable
+/// phantom. Both are deliberate, and neither should be "optimized" into an
+/// in-memory hosting-cache check without reading those issues first.
 pub type DelegateSubscribeCallback = Arc<
     dyn Fn(&freenet_stdlib::prelude::DelegateKey, &freenet_stdlib::prelude::ContractKey)
         + Send

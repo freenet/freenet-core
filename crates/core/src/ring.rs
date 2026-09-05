@@ -4436,6 +4436,22 @@ impl Ring {
             .has_client_subscription(instance_id, client_id)
     }
 
+    /// `(subscriptions held by `client_id`, total held by any client in the
+    /// reserved range at or above `reserved_id_floor`)` — from ONE pass.
+    ///
+    /// The delegate admission gate needs both, and fusing them means the
+    /// node-wide bound costs nothing beyond the scan the per-delegate cap was
+    /// already paying. See `HostingManager::client_and_reserved_range_counts`
+    /// for why both are DERIVED rather than kept in a maintained counter.
+    pub fn client_and_reserved_range_counts(
+        &self,
+        client_id: crate::client_events::ClientId,
+        reserved_id_floor: usize,
+    ) -> (usize, usize) {
+        self.hosting_manager
+            .client_and_reserved_range_counts(client_id, reserved_id_floor)
+    }
+
     /// How many local subscribers `instance_id` has — WebSocket clients and
     /// delegates together, since #4669 puts both in `client_subscriptions`.
     ///
@@ -4448,7 +4464,17 @@ impl Ring {
 
     /// Remove a single client subscription for `contract`.
     ///
-    /// Returns true when that was the last client subscription for it. Used by
+    /// Returns whether anything was actually removed, and whether that was the
+    /// last client subscription for the contract.
+    ///
+    /// The `was_present` half is load-bearing, not informational. Every caller
+    /// side effect below is gated on it, because this is reached for delegates
+    /// that never held a pin here at all — a registration refused by one of the
+    /// admission bounds, or a delegate whose demand lives on a DIFFERENT node's
+    /// ring in a shared-process multi-node test. Acting unconditionally would
+    /// stamp `abandoned_at` (resetting the contract's eviction recency to the
+    /// frontier) and spawn a collapse decision for a contract this delegate was
+    /// never holding. Used by
     /// the delegate demand path (`contract::delegate_demand`) to drop one
     /// delegate's pin on one contract without disturbing the others it holds.
     ///
@@ -4466,12 +4492,14 @@ impl Ring {
         &self,
         contract: &ContractKey,
         client_id: crate::client_events::ClientId,
-    ) -> bool {
-        let was_last = self
+    ) -> crate::ring::hosting::ClientSubscriptionRemoval {
+        let removed = self
             .hosting_manager
-            .remove_client_subscription(contract.id(), client_id);
-        self.hosting_manager.maybe_record_abandonment(contract);
-        was_last
+            .remove_client_subscription_if_present(contract.id(), client_id);
+        if removed.was_present {
+            self.hosting_manager.maybe_record_abandonment(contract);
+        }
+        removed
     }
 
     /// Remove a client from all its subscriptions (used when client disconnects).

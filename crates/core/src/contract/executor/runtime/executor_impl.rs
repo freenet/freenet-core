@@ -2465,13 +2465,18 @@ where
                     // node-wide sweep coherent.
                     crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&instance_id);
                     if let Some(op_manager) = &self.op_manager {
-                        for delegate_key in &subscribers {
-                            crate::contract::delegate_demand::drop_subscription(
-                                op_manager,
-                                delegate_key,
-                                key,
-                            );
-                        }
+                        // ONE collapse decision for the whole subscriber list,
+                        // not one per delegate. Spawning it per delegate makes N
+                        // tasks race to the same conclusion and lands N shadow
+                        // comparisons in `record_reconcile_shadow_comparison`,
+                        // whose denominator is the #4642 P6 ship-gate
+                        // falsifier — the very double-counting
+                        // `collapse_if_no_interest` refuses to do to itself.
+                        crate::contract::delegate_demand::drop_subscriptions_for_contract(
+                            op_manager,
+                            &subscribers,
+                            key,
+                        );
                     }
                     return;
                 }
