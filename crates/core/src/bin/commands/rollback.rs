@@ -574,15 +574,25 @@ pub(crate) fn commit_announcement(
 /// evidence the mechanism does not have.
 pub fn commit_probation(current_version: &str) {
     if let Some(dir) = state_dir() {
-        // Announce AFTER the state transition, never before. `eprintln!` panics
-        // on a write error (EPIPE once the supervisor's reader is gone), and a
-        // panic in front of the removal would leave a healthy node's marker
-        // armed — turning an observability line into a rollback bug. In this
-        // order the worst case is a lost announcement.
+        // `eprintln!` is the ONLY fallible step here, so it goes last.
+        //
+        // It panics on a write error (EPIPE once the supervisor's reader is
+        // gone; a Windows child that inherited invalid standard handles), and a
+        // panic unwinds this whole task. So anything sequenced after it is lost
+        // when stderr is broken:
+        //
+        //  - Before the removal, a panic would leave a healthy node's marker
+        //    armed — an observability line turned into a rollback bug.
+        //  - Before the `tracing` record, a panic would take that record with
+        //    it, leaving the operator with NEITHER channel on exactly the node
+        //    whose stderr is already broken. That is strictly worse than before
+        //    this announcement existed, when the record always got written.
+        //
+        // Hence: transition, then log, then announce. The message is built up
+        // front because the `match` below consumes `outcome`; building a string
+        // cannot fail, so doing it early costs nothing.
         let outcome = commit_probation_at(dir.as_path(), current_version);
-        if let Some(line) = commit_announcement(&outcome, current_version) {
-            eprintln!("{line}");
-        }
+        let announcement = commit_announcement(&outcome, current_version);
         match outcome {
             CommitOutcome::Committed => tracing::info!(
                 version = current_version,
@@ -607,6 +617,9 @@ pub fn commit_probation(current_version: &str) {
                 "Probation passed but the marker could not be removed; rollback is STILL armed."
             ),
             CommitOutcome::Nothing => {}
+        }
+        if let Some(line) = announcement {
+            eprintln!("{line}");
         }
     }
 }
