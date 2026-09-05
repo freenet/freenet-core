@@ -1093,6 +1093,29 @@ impl OpManager {
     ///   `None`, which the caller cannot tell from "we do not hold this
     ///   contract". For a drain those need opposite handling: not held is a
     ///   correct no-op, a failed read means a committed write goes unannounced.
+    ///
+    /// # Why this read can time out, and what that costs
+    ///
+    /// The read is a `GetQuery` to the SERIAL `contract_handling` loop, and the
+    /// event being drained was queued by a V2 delegate write that executed ON
+    /// that loop. So the read cannot be served until that delegate returns.
+    ///
+    /// For a delegate that merely computes, that is microseconds and the
+    /// bounded retry at the drain site covers any transient overrun. For a
+    /// delegate that requests USER INPUT it is not: `prompter.prompt(..)` is
+    /// awaited inline inside `handle_delegate_with_contract_requests`, which
+    /// `contract_handling` awaits in turn, so the loop is held for as long as a
+    /// human takes to answer. Such a write is committed, reported successful to
+    /// the delegate, and its broadcast dropped — retries cannot outlast a human.
+    ///
+    /// That case is bounded, not silent: it is counted and WARNed at the drain
+    /// site, and a peer hosting or actively using the contract re-learns the
+    /// state within one anti-entropy round (`INTEREST_HEARTBEAT_INTERVAL`,
+    /// 300 s), because the heartbeat summarize and the broadcast fan-out are
+    /// gated on the SAME `should_summarize_or_broadcast` predicate — see
+    /// `broadcast_queue::should_broadcast_contract`, which says so explicitly.
+    /// The real fix is #5544/#5554, which parks delegates off this loop and
+    /// removes the precondition entirely.
     pub(crate) async fn read_state_for_broadcast_drain(
         &self,
         key: &ContractKey,
