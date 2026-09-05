@@ -3211,6 +3211,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "delegate_pin_delegate_full",
                         snapshot.delegate_pin_delegate_full,
                     ),
+                    (
+                        "delegate_pin_evicted_mid_registration",
+                        snapshot.delegate_pin_evicted_mid_registration,
+                    ),
                 ] {
                     obj.insert(key.to_string(), serde_json::json!(value));
                 }
@@ -4160,6 +4164,7 @@ mod tests {
         info.delegate_pin_contract_full = Some(613);
         info.delegate_pin_node_full = Some(617);
         info.delegate_pin_delegate_full = Some(619);
+        info.delegate_pin_evicted_mid_registration = Some(631);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("delegate_pin_registered", 601),
@@ -4167,6 +4172,7 @@ mod tests {
             ("delegate_pin_contract_full", 613),
             ("delegate_pin_node_full", 617),
             ("delegate_pin_delegate_full", 619),
+            ("delegate_pin_evicted_mid_registration", 631),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

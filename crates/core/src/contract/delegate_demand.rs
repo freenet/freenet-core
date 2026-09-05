@@ -828,6 +828,59 @@ pub(crate) fn register_subscription(
     op_manager
         .ring
         .add_client_subscription(contract.id(), client_id);
+
+    // RE-CHECK the hosting gate, and roll back if it went false.
+    //
+    // The serialisation argument below covers the three CAPS, whose inputs only
+    // this path writes. It does NOT cover the hosting gate, because the state
+    // that invalidates it is produced by the ring maintenance sweep
+    // (`ring.rs`, `sweep_expired_hosting` -> `teardown_evicted_in_use_contract`),
+    // which runs on its own task and is not serialised against the
+    // contract-handling loop at all. The window is not narrow either: between
+    // the gate and the insert this function does a blake3 hash, two DashMap
+    // lookups and a full scan of `client_subscriptions`.
+    //
+    // An entry inserted after the contract left the hosting cache is the exact
+    // phantom the gate exists to prevent, and it is UNREPAIRABLE in a way the
+    // #4440 one is not. It is never renewed (`contracts_needing_renewal` branch
+    // 2 resolves the instance id back through the hosting cache, which no
+    // longer has it), never reclaimed (`reclaim_evicted_contract` early-returns
+    // on `contract_in_use` and re-queues), never re-evicted (it is out of the
+    // cache, so no eviction decision can select it), and never repaired
+    // (`reconcile_phantom_in_use` iterates `downstream_subscribers` only). It
+    // would also hold one of the node-wide pin slots forever and inflate
+    // governance benefit for a contract this node no longer hosts.
+    //
+    // One cache lookup closes the observable case. It is not a lock, so it does
+    // not make the sequence atomic — an eviction landing after THIS check is
+    // still possible — but it collapses the window from "hash + two lookups +
+    // full scan" to a single read, and the residue is bounded by the same
+    // sweep re-running rather than persisting forever.
+    //
+    // `contract_state_present` is deliberately NOT re-checked: it is a redb
+    // lookup rather than a cache read, and the eviction path clears the hosting
+    // cache first, so the cheap check is the one that catches this.
+    if !op_manager.ring.is_hosting_contract(contract) {
+        op_manager
+            .ring
+            .remove_client_subscription(contract, client_id);
+        record_delegate_pin_outcome(DelegatePinOutcome::EvictedMidRegistration);
+        static EVICTED_MID: LogFloodGate = LogFloodGate::new();
+        if let Some(occurrences) = EVICTED_MID.admit() {
+            tracing::warn!(
+                delegate = %delegate,
+                contract = %contract,
+                occurrences,
+                "contract left the hosting cache while its delegate pin was \
+                 being registered; the registration was rolled back rather \
+                 than left as an unrepairable phantom. The subscribe still \
+                 succeeds and notifications still work, but this contract is \
+                 not pinned."
+            );
+        }
+        return false;
+    }
+
     // Counted too, not just the refusals: a refusal count with no denominator
     // cannot distinguish "5 pins failed out of 5" from "out of 50,000".
     record_delegate_pin_outcome(DelegatePinOutcome::Registered);
@@ -2002,6 +2055,75 @@ mod tests {
              shared counter would let a flood of one branch suppress the FIRST \
              occurrence of another, which is the one occurrence that must \
              always be logged"
+        );
+    }
+
+    /// The insert must be followed by a re-check of the hosting gate.
+    ///
+    /// A SOURCE-SCRAPE pin rather than a behavioural test, deliberately, and it
+    /// is worth saying why. The condition it guards is a race against the ring
+    /// maintenance sweep, which runs on its own task; there is no hook to evict
+    /// a contract between this function's gate and its insert, so a
+    /// "behavioural" test would have to fake the interleaving and would then be
+    /// asserting on the fake rather than on the race. Writing one would give
+    /// the appearance of coverage without the substance — the vacuous-guard
+    /// shape this module has been caught by twice.
+    ///
+    /// What CAN be pinned is the structure: the insert is followed by a
+    /// re-check and a rollback before any success is reported. Deleting the
+    /// re-check reddens this (mutation-verified), which is the property that
+    /// matters — the phantom it prevents is unrepairable, so the code must not
+    /// lose the check silently.
+    #[test]
+    fn the_insert_is_followed_by_a_hosting_recheck_and_rollback() {
+        const SOURCE: &str = include_str!("delegate_demand.rs");
+
+        let start = SOURCE
+            .find("pub(crate) fn register_subscription(")
+            .expect("register_subscription must still exist");
+        let rel_end = SOURCE[start..]
+            .find("\n}\n")
+            .expect("register_subscription must still be a closed top-level fn");
+        let body = &SOURCE[start..start + rel_end + "\n}".len()];
+
+        // Window guard, checked separately from the assertion that uses it.
+        assert_eq!(
+            body.matches('{').count(),
+            body.matches('}').count(),
+            "the scraped `register_subscription` window has unbalanced braces — \
+             widen the delimiter; do NOT delete this check."
+        );
+
+        let insert = body
+            .find("add_client_subscription(contract.id(), client_id)")
+            .expect("the demand insert must still exist");
+        let after = &body[insert..];
+
+        assert!(
+            after.contains("is_hosting_contract(contract)"),
+            "the insert must be followed by a re-check of the hosting gate. The \
+             gate before it is invalidated by the ring maintenance sweep, which \
+             runs on a DIFFERENT task and is not serialised against the \
+             contract loop — so an entry can land after the contract left the \
+             hosting cache. That phantom is unrepairable: never renewed, never \
+             reclaimed, never re-evicted, never repaired."
+        );
+        assert!(
+            after.contains("remove_client_subscription(contract, client_id)"),
+            "the re-check must ROLL BACK the insert, not merely observe it — \
+             leaving the entry is precisely the unrepairable phantom"
+        );
+
+        let recheck = after
+            .find("is_hosting_contract(contract)")
+            .expect("checked above");
+        let success = after
+            .find("DelegatePinOutcome::Registered")
+            .expect("the success path must still record its outcome");
+        assert!(
+            recheck < success,
+            "the re-check must run BEFORE the registration is reported as a \
+             success, or the counter records a pin that was rolled back"
         );
     }
 

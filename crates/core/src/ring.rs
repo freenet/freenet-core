@@ -2022,6 +2022,8 @@ impl Ring {
                 snapshot.delegate_pin_contract_full = Some(delegate_pin.contract_full);
                 snapshot.delegate_pin_node_full = Some(delegate_pin.node_full);
                 snapshot.delegate_pin_delegate_full = Some(delegate_pin.delegate_full);
+                snapshot.delegate_pin_evicted_mid_registration =
+                    Some(delegate_pin.evicted_mid_registration);
             }
 
             // Reconcile-controller SHADOW comparison counters, split PER SITE

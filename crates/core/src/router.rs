@@ -634,6 +634,10 @@ pub(crate) struct RouterSnapshotInfo {
     pub delegate_pin_contract_full: Option<u64>,
     pub delegate_pin_node_full: Option<u64>,
     pub delegate_pin_delegate_full: Option<u64>,
+    /// Registrations rolled back because the contract left the hosting cache
+    /// between the gate and the insert. Separate from `not_hosted` so the
+    /// ordinary startup race stays measurable on its own.
+    pub delegate_pin_evicted_mid_registration: Option<u64>,
     /// Reconcile-controller SHADOW comparison counters, split PER SITE (hosting
     /// redesign keystone step-2, #4642). Populated by `Ring` from the per-node
     /// `network_status` singleton on the snapshot cadence. Per site,
@@ -1756,6 +1760,7 @@ impl Router {
             delegate_pin_contract_full: None,
             delegate_pin_node_full: None,
             delegate_pin_delegate_full: None,
+            delegate_pin_evicted_mid_registration: None,
             // Reconcile-controller shadow comparison counters, split per site
             // (keystone step-2, #4642), populated by Ring from the network_status
             // singleton on the snapshot cadence.

@@ -457,6 +457,13 @@ pub struct DelegatePinRefusalStats {
     pub node_full: u64,
     /// The delegate is at `MAX_PINS_PER_DELEGATE`.
     pub delegate_full: u64,
+    /// The contract left the hosting cache BETWEEN the gate and the insert, so
+    /// the registration was rolled back. Counted separately from `not_hosted`
+    /// on purpose: that one is the ordinary startup race (the delegate asked
+    /// before the node had fetched), whose rate decides whether the #4669
+    /// re-registration sweep is worth prioritising. Folding a mid-registration
+    /// eviction into it would corrupt exactly the number that decision rests on.
+    pub evicted_mid_registration: u64,
 }
 
 /// Per-node counters for the reconcile-controller SHADOW comparison AT ONE SITE
@@ -1436,6 +1443,7 @@ pub enum DelegatePinOutcome {
     ContractFull,
     NodeFull,
     DelegateFull,
+    EvictedMidRegistration,
 }
 
 /// Tally one delegate pin attempt by outcome (#4669 / #5467 Phase 0).
@@ -1454,6 +1462,7 @@ pub fn record_delegate_pin_outcome(outcome: DelegatePinOutcome) {
                 DelegatePinOutcome::ContractFull => &mut stats.contract_full,
                 DelegatePinOutcome::NodeFull => &mut stats.node_full,
                 DelegatePinOutcome::DelegateFull => &mut stats.delegate_full,
+                DelegatePinOutcome::EvictedMidRegistration => &mut stats.evicted_mid_registration,
             };
             *slot = slot.saturating_add(1);
         }
