@@ -44,7 +44,14 @@ mod pool_tests;
 pub(super) mod runtime;
 
 /// Notification sent when a subscribed contract's state changes.
-/// Delivered from `commit_state_update()` to the `contract_handling()` loop.
+///
+/// Delivered to the `contract_handling()` loop from
+/// `Executor::finalize_state_commit`, the single post-store fan-out site for
+/// every state-storing path: the initial-state install, the merge path, and
+/// both branches of `perform_contract_put`. It used to be sent from
+/// `commit_state_update` alone, so an install — including every
+/// ResyncResponse-driven recovery — notified no delegate at all (#5481).
+///
 /// Uses `Arc<WrappedState>` so multiple subscribers share one allocation.
 pub(crate) struct DelegateNotification {
     pub delegate_key: DelegateKey,
@@ -1488,6 +1495,7 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
 
     /// Channel to send delegate notifications when subscribed contracts change state.
     /// Set when running in a pool via `set_delegate_notification_tx()`.
+    /// `Executor::finalize_state_commit` is what sends on it.
     delegate_notification_tx: Option<DelegateNotificationSender>,
 }
 

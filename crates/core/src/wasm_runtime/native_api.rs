@@ -8,7 +8,7 @@ use freenet_stdlib::prelude::{
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use super::contract_store::ContractStore;
 use super::delegate_store::DelegateStore;
@@ -35,8 +35,9 @@ pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateCallEnv>> =
 /// Global registry of delegate subscriptions to contracts.
 ///
 /// When a V2 delegate calls `subscribe_contract()`, the (contract, delegate) pair is
-/// recorded here. When `commit_state_update()` persists a new contract state, it checks
-/// this registry and sends notifications to subscribed delegates.
+/// recorded here. When this node commits a new contract state,
+/// `Executor::finalize_state_commit` checks this registry and sends
+/// notifications to subscribed delegates.
 pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
     DashMap<ContractInstanceId, HashSet<DelegateKey>>,
 > = LazyLock::new(DashMap::default);
@@ -289,6 +290,51 @@ thread_local! {
 }
 
 pub(super) type InstanceId = i64;
+
+/// The single allocator for WASM instance ids.
+///
+/// [`MEM_ADDR`], [`DELEGATE_ENV`] and [`CONTRACT_IO`] are process-GLOBAL maps
+/// keyed by instance id, so the id namespace is process-global too: two engines
+/// alive at the same time (two simulated nodes, two pooled executors, or two
+/// tests running in parallel in one test binary) must never be issued the same
+/// id. Every id therefore comes from this one counter, handed out by
+/// [`next_instance_id`] inside `WasmEngine::create_instance` and returned in
+/// the `InstanceHandle`, so no CALLER of `create_instance` can pick an id.
+///
+/// Scope, stated precisely: this closes the `create_instance` surface only. The
+/// WASM ABI is a separate id surface that this does NOT validate: four host
+/// functions (`__frnt__logger__info`, `__frnt__rand__rand_bytes`,
+/// `__frnt__time__utc_now`, `__frnt__fill_buffer`) take an instance id as a
+/// guest-supplied parameter and look it up in these same maps. Do not read the
+/// paragraph above as "every id reaching these maps was issued here".
+///
+/// Nor is it a type-level guarantee. `InstanceHandle.id` is `pub(super)`, so
+/// anything inside `wasm_runtime` can still construct a handle with a chosen id
+/// and hand it to `drop_instance`; `delegate/test.rs` does exactly that twice,
+/// harmlessly, because `process_outbound` binds the handle as `_handle` and
+/// never touches these maps. What the signature closes is the `create_instance`
+/// parameter, which is where every id that actually reached these maps came
+/// from.
+///
+/// Regression this shape prevents (#4213 / #5023): `create_instance` used to
+/// take a caller-supplied id, and the engine unit tests passed hand-picked ones
+/// (`0..10_001`, `0..STORE_REFRESH_THRESHOLD`, `999`, ...). Their
+/// `drop_instance` then removed the `MEM_ADDR` entry of a LIVE delegate or
+/// contract instance in a concurrently-running test that had been issued the
+/// same id here, and every host function on the victim instance began returning
+/// `ERR_NOT_IN_PROCESS`, surfacing as `SecretResult(None)` from a delegate
+/// secret read, or `error_code: -1` from a delegate contract call.
+///
+/// That needs the two tests to share a process, so it bites `cargo test`
+/// (one process per test binary), which is what AGENTS.md tells contributors
+/// to run and what both issues reported. CI runs `cargo nextest`, which gives
+/// each test its own process, so CI was never affected.
+static NEXT_INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
+
+/// Issue the next process-globally unique [`InstanceId`].
+pub(super) fn next_instance_id() -> InstanceId {
+    NEXT_INSTANCE_ID.fetch_add(1, Ordering::SeqCst)
+}
 
 // ---------------------------------------------------------------------------
 // Contract I/O: streaming refill buffers
@@ -629,8 +675,11 @@ impl DelegateCallEnv {
     /// # Arguments
     /// * `wasm_bytes` - Raw WASM code bytes (wrapped into versioned DelegateContainer internally)
     /// * `params` - Parameter bytes for the new delegate
-    /// * `cipher_bytes` - 32-byte XChaCha20Poly1305 cipher key
-    /// * `nonce_bytes` - 24-byte XNonce
+    /// * `cipher_bytes` - 32-byte field kept for wire-format compatibility.
+    ///   Since #4146 the secret store DISCARDS it and derives the new
+    ///   delegate's DEK from the node KEK; it is not key material and any
+    ///   value works. See `SecretsStore::register_delegate`.
+    /// * `nonce_bytes` - 24-byte field, discarded for the same reason.
     ///
     /// # Returns
     /// The new delegate's `DelegateKey` on success, or a `DelegateCreateError`.
@@ -896,8 +945,9 @@ impl DelegateCallEnv {
     /// Register a subscription interest for a contract.
     ///
     /// Validates the contract is known and records the (contract, delegate) pair in
-    /// the global subscription registry. When `commit_state_update()` persists a new
-    /// state for this contract, it will send a `ContractNotification` to the delegate.
+    /// the global subscription registry. When this node commits a new state for the
+    /// contract, `Executor::finalize_state_commit` sends a `ContractNotification`
+    /// to the delegate.
     pub(super) fn subscribe_contract_sync(
         &self,
         instance_id: &ContractInstanceId,
@@ -2102,8 +2152,8 @@ pub(super) mod delegate_contracts {
     ///
     /// Validates that the contract is known (code hash resolvable) and registers
     /// subscription interest in the global `DELEGATE_SUBSCRIPTIONS` registry.
-    /// When the subscribed contract's state changes via `commit_state_update()`,
-    /// a `ContractNotification` is delivered to this delegate.
+    /// When the subscribed contract's state changes, `Executor::finalize_state_commit`
+    /// delivers a `ContractNotification` to this delegate.
     ///
     /// ## Returns
     /// - `0`: success (contract is known, subscription registered)

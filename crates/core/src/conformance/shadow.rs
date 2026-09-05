@@ -126,7 +126,42 @@ pub struct ShadowReport {
     pub inconclusive: usize,
     /// Violations that would have caused a removal, had enforcement been on. The
     /// number the RFC's Phase 5 gate is judged on.
+    ///
+    /// Read it together with `would_remove_settled`. Since #5462 this total includes
+    /// contracts that DO converge — a canonicalizing contract breaks idempotence by
+    /// rewriting a non-canonical stored state once, and is reported honestly rather
+    /// than suppressed. Comparing this number across that change, or against a
+    /// future where the PUT install path canonicalizes, compares different
+    /// populations.
     pub would_remove: usize,
+    /// The subset of `would_remove` whose finding says the state SETTLED.
+    ///
+    /// Carried as its own counter because `would_remove` is a bare `usize` with
+    /// nowhere to record that a finding is benign, and this is the number Phase 5
+    /// is judged on. Leaving the distinction out would pre-filter the corpus by
+    /// omission — the same move as the fixpoint gate #5462 removed, one layer up:
+    /// the population would look uniformly removal-worthy when a large and
+    /// knowable part of it is waiting on an install-path fix instead.
+    ///
+    /// Deliberately additive rather than subtracted from `would_remove`: the
+    /// finding IS removal-eligible, and netting it off would be the severity fork
+    /// the #5462 decision rejected, hidden in a metric.
+    ///
+    /// Read it as a CASE count, not a contract count, and do not read the ratio
+    /// against `would_remove` as "the benign fraction of contracts". Idempotence
+    /// draws a fixed handful of cases per probe while a contract breaking several
+    /// properties feeds the total from each, so the multiplier is not equal across
+    /// the two populations and the ratio systematically misstates the fraction. It
+    /// tells you the class is present and roughly how loud, which is what it is
+    /// for.
+    ///
+    /// `Indeterminate` findings are in `would_remove` and in NEITHER subset. That
+    /// is the conservative default — an unknown class must not be counted benign —
+    /// but it means a residual exists that this pair of numbers cannot show, and
+    /// `Indeterminate` is adversarially reachable (see its rustdoc), so a nonzero
+    /// gap between the total and the sum of what you can classify is itself worth
+    /// looking at.
+    pub would_remove_settled: usize,
     /// Diagnostic-severity findings, which never propose removal in any mode.
     pub reported: usize,
     /// Probes cut short by [`PROBE_TIME_BUDGET`].
@@ -511,6 +546,23 @@ pub(crate) async fn probe_with_budget(
     (report, findings)
 }
 
+/// Count a removal-proposing decision, and whether its finding is the class that
+/// converges.
+///
+/// One function for BOTH `WouldRemove` and `Remove` deliberately. The comment
+/// between those two arms says they are handled together precisely so shadow and
+/// enforcement cannot drift — counting the settled subset in only one of them
+/// would have introduced that drift while the comment claimed otherwise.
+fn count_would_remove(report: &mut ShadowReport, violation: &super::property::Violation) {
+    report.would_remove += 1;
+    if matches!(
+        violation.settling,
+        Some(crate::conformance::IdempotenceSettling::SettledAfter(_))
+    ) {
+        report.would_remove_settled += 1;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn probe_one(
     instance: &ContractInstanceId,
@@ -659,7 +711,7 @@ async fn probe_one(
                 });
             }
             ConformanceAction::WouldRemove(violation) => {
-                report.would_remove += 1;
+                count_would_remove(report, &violation);
                 findings.push(Finding {
                     contract: instance_copy,
                     violation,
@@ -672,7 +724,7 @@ async fn probe_one(
             // removal as a would-remove keeps this honest if a future caller reaches
             // it before the removal path exists.
             ConformanceAction::Remove(violation) => {
-                report.would_remove += 1;
+                count_would_remove(report, &violation);
                 findings.push(Finding {
                     contract: instance_copy,
                     violation,
@@ -913,6 +965,141 @@ pub(crate) async fn probe_fixture_contract(
     // contract was still warming up.
     count_awaiting_samples(&mut report, awaiting);
     Ok((id, report, findings))
+}
+
+#[cfg(test)]
+mod settled_counter_tests {
+    use super::*;
+    use crate::conformance::{
+        ConformanceProperty, IdempotenceSettling, OutputDigest, Severity, Violation,
+    };
+
+    fn violation_with(settling: Option<IdempotenceSettling>) -> Violation {
+        Violation {
+            property: ConformanceProperty::StateIdempotence,
+            severity: Severity::Violation,
+            left: OutputDigest::of(&[1u8]),
+            right: OutputDigest::of(&[2u8]),
+            detail: "test".to_string(),
+            settling,
+        }
+    }
+
+    /// The settled subset is counted, and is ADDITIVE rather than netted off.
+    ///
+    /// `would_remove` is documented as the number Phase 5 is judged on, and since
+    /// #5462 it includes contracts that converge. Subtracting the settled ones
+    /// would be the severity fork the decision rejected, hidden in a metric; the
+    /// finding really is removal-eligible. So the total must stay whole and the
+    /// subset must be reported beside it.
+    #[test]
+    fn settled_findings_are_counted_beside_the_total_not_deducted_from_it() {
+        let mut report = ShadowReport::default();
+
+        count_would_remove(
+            &mut report,
+            &violation_with(Some(IdempotenceSettling::SettledAfter(1))),
+        );
+        count_would_remove(
+            &mut report,
+            &violation_with(Some(IdempotenceSettling::NeverSettled)),
+        );
+        count_would_remove(
+            &mut report,
+            &violation_with(Some(IdempotenceSettling::Indeterminate)),
+        );
+        count_would_remove(&mut report, &violation_with(None));
+
+        assert_eq!(
+            report.would_remove, 4,
+            "every removal-proposing decision counts toward the total exactly ONCE, \
+             including the settled ones: they are removal-eligible findings"
+        );
+        assert_eq!(
+            report.would_remove_settled, 1,
+            "only the SETTLED class is in the subset. `Indeterminate` must not be: \
+             it is an unknown class, and counting an unknown as benign asserts the \
+             very thing that variant exists to refuse. `NeverSettled` and the \
+             properties carrying no settling data are excluded too"
+        );
+    }
+
+    /// Each decision increments the total exactly once.
+    ///
+    /// Added after mutation: incrementing `would_remove` again alongside the shared
+    /// helper survived, because the test above asserted a total that happened to
+    /// match the doubled count. A drifting total is the specific thing the shared
+    /// helper exists to prevent.
+    #[test]
+    fn a_single_decision_increments_the_total_exactly_once() {
+        let mut report = ShadowReport::default();
+        count_would_remove(&mut report, &violation_with(None));
+        assert_eq!(report.would_remove, 1);
+        assert_eq!(report.would_remove_settled, 0);
+    }
+
+    /// Pin: BOTH removal-proposing arms route through the one counter.
+    ///
+    /// The comment between them says they are handled together so shadow and
+    /// enforcement cannot drift. A test of `count_would_remove` alone cannot see an
+    /// arm that stopped calling it, which is exactly how the settled subset would
+    /// silently start under-counting the moment enforcement became reachable.
+    #[test]
+    fn both_removal_arms_route_through_the_counter() {
+        // Bounded by brace-counting to `probe_one`'s OWN body, not by splitting on
+        // its signature and reading to end-of-file. An unbounded region silently
+        // widens to swallow unrelated code — including this test module — and then
+        // passes for the wrong reason. That is the trap the repo documents on its
+        // other scrapes, and my first version of this pin walked into it.
+        let src = include_str!("shadow.rs");
+        let start = src
+            .find("async fn probe_one(")
+            .expect("probe_one not found");
+        let after = &src[start..];
+        let open = after.find('{').expect("probe_one has no body");
+        let mut depth = 0usize;
+        let mut end = open;
+        for (i, c) in after[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(end > open, "could not bound probe_one's body");
+        let body = &after[open..end];
+
+        for arm in [
+            "ConformanceAction::WouldRemove(violation) => {",
+            "ConformanceAction::Remove(violation) => {",
+        ] {
+            let at = body
+                .find(arm)
+                .unwrap_or_else(|| panic!("arm missing: {arm}"));
+            let window = &body[at..at + 200.min(body.len() - at)];
+            assert!(
+                window.contains("count_would_remove("),
+                "{arm} must count through the shared helper, or the two counters \
+                 drift while the comment beside them claims they cannot"
+            );
+            // And ONLY through it. Calling the helper does not stop an arm also
+            // incrementing on its own, which double-counts the number Phase 5 is
+            // judged on — and a test that calls the helper directly cannot see a
+            // second increment at the call site.
+            assert!(
+                !window.contains("report.would_remove"),
+                "{arm} touches the counters directly as well as through the shared \
+                 helper; that double-counts `would_remove` and no helper-level test \
+                 can observe it"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -251,19 +251,17 @@ impl HttpClientApi {
         // (no HTTPS required). Includes is_unspecified() so that 0.0.0.0 bindings
         // (network mode) allow HTTP cookies — most home users lack TLS.
         let localhost = socket.ip().is_loopback() || socket.ip().is_unspecified();
-        let contract_web_path = std::env::temp_dir().join("freenet").join("webs");
-        std::fs::create_dir_all(&contract_web_path).unwrap_or_else(|e| {
-            panic!(
-                "Failed to create contract web directory at {}: {}. \
-                 This may happen if {} was created by another user. \
-                 Try: sudo rm -rf {}",
-                contract_web_path.display(),
-                e,
-                std::env::temp_dir().join("freenet").display(),
-                std::env::temp_dir().join("freenet").display(),
-            )
-        });
 
+        // NOTE: do NOT re-add a `create_dir_all` here. Until #5291 this function
+        // created `$TMPDIR/freenet/webs` and PANICKED the node if it could not —
+        // a directory that stopped being read in April 2025 when the real
+        // webapp cache moved to `webapp_cache` (and later to the XDG cache dir).
+        // The only surviving effect was aborting startup: it took down the
+        // v0.2.124 release canary, which stages its binary at `$TMPDIR/freenet`,
+        // so the mkdir hit ENOTDIR. Unpacked web contracts live under the
+        // config-driven `webapp_cache_dir` below, and `WebappCache::with_root`
+        // creates it — warning rather than aborting, which is the right
+        // response to a directory the node can serve everything else without.
         let (proxy_request_sender, request_to_server) = mpsc::channel(1);
 
         let config = Config::new(localhost, webapp_cache_dir);
@@ -1132,6 +1130,117 @@ mod tests {
     fn dead_request_sender() -> HttpClientApiRequest {
         let (tx, _rx) = mpsc::channel(1);
         HttpClientApiRequest::from_sender(tx)
+    }
+
+    /// Regression for #5291: composing the router must not abort the process
+    /// because something in the system temp directory is in the way.
+    ///
+    /// `as_router_with_origin_contracts` used to `create_dir_all` a vestigial
+    /// `$TMPDIR/freenet/webs` and `panic!` on failure. Nothing had read that
+    /// directory since the real webapp cache was renamed in April 2025, so its
+    /// only remaining effect was to kill the node at startup when `$TMPDIR`
+    /// happened to hold a non-directory (or another user's) `freenet` entry.
+    /// That is exactly what blocked release v0.2.124: the auto-update canary
+    /// stages the binary it gates AT `$TMPDIR/freenet`, so the mkdir hit
+    /// ENOTDIR and the node exited 101 before the update check could run.
+    ///
+    /// Run in a **child process** (a re-exec of this test binary filtered to
+    /// this one test) for two reasons: the hostile condition is a process-wide
+    /// environment variable, which `set_var` makes unsound to install from a
+    /// test thread in edition 2024, and the failure mode is a `panic!` in a
+    /// non-async constructor, which a child's exit status observes directly.
+    /// The child fails every time without the fix and passes every time with
+    /// it.
+    #[test]
+    fn router_construction_survives_a_hostile_temp_dir() {
+        const CHILD_ENV: &str = "FREENET_TEST_5291_CHILD";
+        const CHILD_TEST: &str =
+            "server::client_api::tests::router_construction_survives_a_hostile_temp_dir";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // Premise: the environment really is the hostile one the parent
+            // built. If `temp_dir()` ignored our variables the child would pass
+            // vacuously, so assert the collision exists before relying on it.
+            let clash = std::env::temp_dir().join("freenet");
+            assert!(
+                clash.is_file(),
+                "premise: {} must exist as a FILE for this child to reproduce \
+                 the #5291 condition; got metadata {:?}",
+                clash.display(),
+                std::fs::metadata(&clash)
+            );
+
+            let (api, _router) = HttpClientApi::as_router(&"127.0.0.1:0".parse().unwrap());
+            drop(api);
+            return;
+        }
+
+        let tmp = crate::util::tests::get_temp_dir();
+        // The obstruction: `$TMPDIR/freenet` exists, as a file.
+        std::fs::write(tmp.path().join("freenet"), b"not a directory")
+            .expect("stage the blocking file");
+
+        // Two cache roots, because the deleted mkdir was not the only
+        // `create_dir_all` this function reaches.
+        //
+        // `benign` keeps the child's REAL webapp cache off the developer's home
+        // cache while the obstruction sits where the DELETED mkdir used to
+        // point. That is the #5291 case proper.
+        //
+        // `obstructed` puts the cache root itself under the blocking file, so
+        // the surviving `create_dir_all` in `WebappCache::with_root` fails too.
+        // `with_root` is documented to warn and carry on, and
+        // `with_root_tolerates_a_root_that_is_not_a_directory` pins that
+        // directly — but a guard on `with_root` says nothing about the caller,
+        // and it is this function's job not to turn that warning back into a
+        // dead node. Without this case, making `with_root` fatal would
+        // reinstate the whole #5291 class with the test still green.
+        let benign = tmp.path().join("webapp_cache");
+        let obstructed = tmp.path().join("freenet").join("webapp_cache");
+
+        for (label, cache) in [("benign", &benign), ("obstructed", &obstructed)] {
+            let exe = std::env::current_exe().expect("test binary path");
+            let output = std::process::Command::new(exe)
+                .args(["--exact", "--test-threads=1", "--nocapture", CHILD_TEST])
+                .env(CHILD_ENV, "1")
+                // `temp_dir()` reads TMPDIR on unix and TMP/TEMP on Windows.
+                .env("TMPDIR", tmp.path())
+                .env("TMP", tmp.path())
+                .env("TEMP", tmp.path())
+                .env("FREENET_WEBAPP_CACHE_DIR", cache)
+                .output()
+                .expect("re-exec the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "[{label}] composing the router must not panic when \
+                 $TMPDIR/freenet is not a directory (#5291).\nstdout:\n{stdout}\n\
+                 stderr:\n{stderr}",
+            );
+            // Fail CLOSED on a rename: libtest exits 0 when its filter matches
+            // nothing, so without this the check goes vacuous the moment this
+            // function moves or is renamed.
+            assert!(
+                stdout.contains("1 passed"),
+                "[{label}] the child must actually have run {CHILD_TEST} — if \
+                 this function was renamed or moved, update CHILD_TEST.\n\
+                 stdout:\n{stdout}\nstderr:\n{stderr}",
+            );
+        }
+
+        // The other half of the premise. The child asserts the TMPDIR knob took
+        // effect; this asserts the CACHE-ROOT knob did. If
+        // `FREENET_WEBAPP_CACHE_DIR` ever stopped being read, the obstructed
+        // case would quietly resolve to the ProjectDirs default, create it
+        // successfully, and pass while testing nothing.
+        assert!(
+            benign.is_dir(),
+            "premise: the child must honour FREENET_WEBAPP_CACHE_DIR — {} was \
+             never created, so the obstructed case did not exercise the \
+             surviving create_dir_all",
+            benign.display()
+        );
     }
 
     #[test]

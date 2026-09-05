@@ -282,8 +282,32 @@ while IFS= read -r f; do
                                 # matches, because the closing quote sits where
                                 # the boundary should be. The explicit echo test
                                 # is belt to that braces.
-                                if (step[i] ~ ("bash[[:space:]]+[^[:space:]]*" needle "([[:space:]]|$)") \
-                                    && step[i] !~ ("echo[^;|&$]*bash[[:space:]]+[^[:space:]]*" needle) \
+                                #
+                                # KNOWN RESIDUAL, recorded rather than papered
+                                # over (PR #5443 review). The boundary here is
+                                # "any whitespace", so ANY whitespace-delimited
+                                # literal sh/bash token immediately before the
+                                # path satisfies it -- including a future
+                                # `shellcheck -x -s sh scripts/test-install-sh.sh`
+                                # in the lint step, where sh is a DIALECT FLAG and
+                                # not a shell at all. This closes the case that
+                                # exists today (`...-sh.sh <needle>`, where the sh
+                                # is preceded by a dot) and no more.
+                                # The real fix is to require COMMAND position --
+                                # string start, newline, a ;|& separator, or the
+                                # YAML run: colon -- instead of any whitespace.
+                                # That also wants an optional /path/ prefix so
+                                # `/bin/sh x_test.sh` counts, and an optional flag
+                                # run so `bash -x x_test.sh` counts: the two
+                                # false-BLOCKING forms this currently rejects, and
+                                # false-blocking is the worse direction per the
+                                # note above. Not done here because it is a fiddly
+                                # awk-quoting change that this PR battery could
+                                # not validate in one pass. Do it as its own
+                                # change. NOTE: no apostrophes in this block --
+                                # it lives inside a single-quoted awk program.
+                                if (step[i] ~ ("(^|[[:space:]])(bash|sh)[[:space:]]+[^[:space:]]*" needle "([[:space:]]|$)") \
+                                    && step[i] !~ ("echo[^;|&$\n]*(^|[[:space:]])(bash|sh)[[:space:]]+[^[:space:]]*" needle) \
                                     && step[i] !~ /\n[[:space:]]+if:/) {
                                     print "RUNS"
                                 }
@@ -299,7 +323,7 @@ while IFS= read -r f; do
     # know. Mutation-tested -- with `git ls-files` an untracked probe file was
     # invisible to this very check, so the check that exists to find invisible
     # files could not see the newest one.
-done < <(find "$SCRIPT_DIR" -name '*_test.sh' -type f | sort)
+done < <(find "$SCRIPT_DIR" \( -name '*_test.sh' -o -name 'test-*.sh' \) -type f | sort)
 
 if [[ ! -f "$CI_YML" ]]; then
     echo "FAIL - ci.yml not found at $CI_YML; cannot check that test files are run." >&2
@@ -310,14 +334,15 @@ elif [[ -z "$FMT_JOB" ]]; then
     echo "       every test file as run." >&2
     FAILURES=$((FAILURES + 1))
 elif [[ ${#unrun[@]} -eq 0 ]]; then
-    echo "ok   - every *_test.sh is invoked by 'bash <path>' in ci.yml's Fmt job"
+    echo "ok   - every shell self-test is invoked by 'bash|sh <path>' in ci.yml's Fmt job"
 else
     echo "FAIL - these *_test.sh files are never RUN by ci.yml:" >&2
     for f in "${unrun[@]}"; do echo "         $f" >&2; done
     echo "       They are scored by the assertion counter and executed by nothing," >&2
     echo "       so they look like coverage in a listing while gating nothing. Add a" >&2
     echo "       'run: bash scripts/<name>' step to the Fmt job in ci.yml." >&2
-    echo "       Checked as a real 'bash <path>' invocation inside the Fmt JOB, so:" >&2
+    echo "       Checked as a real 'bash <path>' or 'sh <path>' invocation, anchored at a
+       word boundary, inside the Fmt JOB, so:" >&2
     echo "       a mention in a comment does not count, nor inside an echo, nor a" >&2
     echo "       step in a job that only runs on workflow_dispatch. A multi-line" >&2
     echo "       'run: |' block DOES count." >&2
@@ -336,12 +361,123 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# 1b. The counter's diff PATHSPECS must reach every shell self-test on disk.
+#    Being visible to the alternation is worthless if the diff never shows the
+#    file to it in the first place -- that is a SECOND way to be invisible, and
+#    it is the one that actually bit us. PR #4958 added ten `check_eq`
+#    assertions to `scripts/test-install-sh.sh`, a file ci.yml's Fmt job RUNS,
+#    and the `fix:` gate rejected it for having no test: the pathspec was
+#    `'**/*_test.sh'` and the file is named `test-*.sh`.
+#
+#    Check 1 above could never have caught that. It measures the alternation
+#    against files it finds with its OWN `find`, so a file the ci.yml pathspec
+#    excludes still scores fine here. The two scopes have to be compared to
+#    each other, which is what this does.
+#
+#    COVERAGE IS DECIDED BY GIT, NOT BY A MODEL OF GIT. The first version of
+#    this check compared `basename` against `${spec##*/}` -- a hand-written
+#    imitation of pathspec matching -- and review demonstrated it wrong three
+#    ways, each by mutation: `':(exclude)scripts/test-*.sh'` (the pathspec whose job
+#    is to make git SKIP the file) read as coverage OF it, a directory-scoped
+#    `'scripts/**/*_test.sh'` read as covering all 13 files where git matches 4,
+#    and `'crates/**/*_test.sh'` read as full coverage where git matches none.
+#    `git ls-files` is definitionally correct, handles exclude magic and any
+#    future pathspec syntax, and cannot drift from what the counter's own
+#    `git diff` does.
+#
+#    `--cached --others --exclude-standard` rather than a plain `ls-files`: a
+#    contributor adding a test file has not necessarily staged it, and that
+#    unstaged file is exactly the one whose convention the counter may not know
+#    -- the same reason the population below comes from `find`. Ignored files
+#    stay out.
+uncovered=()
+pathspec_measured=0
+PATHSPEC_HITS="$(grep -cF 'NEW_SHELL_TESTS=$(git diff' "$CI_YML" || true)"
+PATHSPEC_LINE="$(grep -F 'NEW_SHELL_TESTS=$(git diff' "$CI_YML" | tail -1 || true)"
+if [[ -z "$PATHSPEC_LINE" ]]; then
+    echo "FAIL - could not find the NEW_SHELL_TESTS git-diff line in ci.yml." >&2
+    echo "       Without it the pathspec scope is unknown and this check examined" >&2
+    echo "       nothing; it fails rather than passing vacuously." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$PATHSPEC_HITS" -ne 1 ]]; then
+    # Unbounded `grep -F` would let a COMMENT restating the command union its
+    # pathspecs with the live ones, so narrowing the real pathspec stayed green.
+    echo "FAIL - found $PATHSPEC_HITS lines matching the NEW_SHELL_TESTS git-diff" >&2
+    echo "       command in ci.yml; expected exactly 1. A second occurrence -- even" >&2
+    echo "       in a comment -- unions its pathspecs into this measurement and hides" >&2
+    echo "       a narrowing of the live one." >&2
+    FAILURES=$((FAILURES + 1))
+else
+    # Everything after the `-- ` separator, as single-quoted words.
+    mapfile -t PATHSPECS < <(printf '%s\n' "${PATHSPEC_LINE#*-- }" | grep -oE "'[^']+'" | tr -d "'")
+    REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [[ ${#PATHSPECS[@]} -eq 0 ]]; then
+        echo "FAIL - parsed zero pathspecs from ci.yml's NEW_SHELL_TESTS line." >&2
+        echo "       An empty list would report every file as uncovered OR as covered" >&2
+        echo "       depending on the loop's sense; either way it is not a measurement." >&2
+        FAILURES=$((FAILURES + 1))
+    elif [[ -z "$REPO_ROOT" ]]; then
+        echo "FAIL - not inside a git work tree, so git cannot be asked what the" >&2
+        echo "       pathspecs match. This check refuses to guess." >&2
+        FAILURES=$((FAILURES + 1))
+    else
+        covered_set=()
+        mapfile -t covered_set < <(
+            git -C "$REPO_ROOT" ls-files --cached --others --exclude-standard \
+                -- "${PATHSPECS[@]}" 2>/dev/null | sort -u)
+        while IFS= read -r f; do
+            rel="${f#"$REPO_ROOT"/}"
+            covered=0
+            for c in ${covered_set[@]+"${covered_set[@]}"}; do
+                [[ "$c" == "$rel" ]] && covered=1 && break
+            done
+            [[ "$covered" -eq 1 ]] || uncovered+=("$rel")
+        done < <(find "$SCRIPT_DIR" \( -name '*_test.sh' -o -name 'test-*.sh' \) -type f | sort)
+        pathspec_measured=1
+    fi
+fi
+
+if [[ ${#uncovered[@]} -gt 0 ]]; then
+    echo "FAIL - these shell self-tests are outside ci.yml's NEW_SHELL_TESTS pathspecs:" >&2
+    for f in "${uncovered[@]}"; do echo "         $f" >&2; done
+    echo "       The counter never sees their added lines, so a fix: PR whose only" >&2
+    echo "       regression test lives there is rejected for having no test -- however" >&2
+    echo "       many assertions it adds. Add a pathspec to the git diff in ci.yml." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$pathspec_measured" -eq 1 ]]; then
+    # Gated on the flag, not on an empty array: `uncovered` is also empty when
+    # the measurement never ran, and an `ok` printed beside its own FAIL asserts
+    # exactly the property that was not measured.
+    echo "ok   - ci.yml's diff pathspecs reach every shell self-test on disk (asked git)"
+fi
+
+# 1c. ...and the count must still be CONSUMED by the gate.
+#    Everything above measures how the number is COMPUTED. None of it notices if
+#    the number stops being read. Deleting `&& [ "$NEW_SHELL_TESTS" -eq 0 ]`
+#    from the gate condition -- the obvious "simplify this" edit -- restores
+#    PR #4958's exact failure (a fix: PR whose only regression test is a shell
+#    self-test is rejected for having none) while every other assertion in this
+#    file stays green. Found by review, not by the author's own battery.
+if grep -qE '\[ "\$NEW_SHELL_TESTS" -eq 0 \]' "$CI_YML" \
+   && grep -qE 'if \[ "\$NEW_TESTS" -eq 0 \].*NEW_SHELL_TESTS.*NEW_JS_TESTS' "$CI_YML"; then
+    echo "ok   - the fix: gate still consumes NEW_SHELL_TESTS"
+else
+    echo "FAIL - ci.yml's fix:-needs-a-test condition no longer reads NEW_SHELL_TESTS." >&2
+    echo "       The count would be computed and thrown away, so a fix: PR whose only" >&2
+    echo "       regression test is a shell self-test is rejected for having none --" >&2
+    echo "       PR #4958's failure, restored. Expected all three counters in one" >&2
+    echo "       condition: NEW_TESTS, NEW_SHELL_TESTS, NEW_JS_TESTS." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
 # 2. The `printf`-style reporter, which ci.yml lists as a known blind spot. That
 #    entry was once DELETED on the stated ground that the grep returned nothing;
-#    it returns two, in `test-*.sh` files the counter's `**/*_test.sh` glob does
-#    not reach. The sentence was wrong and nothing could tell. So: if that
-#    convention ever appears in a file the counter DOES scan, the blind spot has
-#    stopped being theoretical and this fails.
+#    it returns two, in `test-*.sh` files the counter's glob did not used to
+#    reach. The sentence was wrong and nothing could tell. The glob now reaches
+#    them, and this grep stays scoped to `*_test.sh` deliberately -- see the
+#    parenthetical in the failure branch. So: if that convention ever appears in
+#    a file the counter DOES scan, the blind spot has stopped being theoretical
+#    and this fails.
 printf_in_scanned=()
 while IFS= read -r hit; do
     printf_in_scanned+=("$hit")
@@ -349,16 +485,20 @@ done < <(grep -rnE "printf[[:space:]]+.*['\"](ok|PASS)" \
     "$SCRIPT_DIR"/*_test.sh "$SCRIPT_DIR"/release-agent/*_test.sh 2>/dev/null || true)
 
 if [[ ${#printf_in_scanned[@]} -eq 0 ]]; then
-    echo "ok   - no printf-style success reporter in any file the counter scans (blind spot still theoretical)"
+    echo "ok   - no printf-style success reporter in any *_test.sh (the two test-*.sh are excluded on purpose)"
 else
     echo "FAIL - a printf-style success reporter now exists in a file the counter SCANS:" >&2
     for hit in "${printf_in_scanned[@]}"; do echo "         $hit" >&2; done
     echo "       ci.yml lists this as a known-but-unreached blind spot. It is now" >&2
     echo "       reached: those assertions score zero. Add a printf pattern to the" >&2
     echo "       alternation and a MUST-COUNT row above, then update ci.yml's list." >&2
-    echo "       (The two pre-existing hits, scripts/test-install-sh.sh and" >&2
-    echo "       scripts/test-uninstall-sh.sh, are OUT of scope by filename: the diff" >&2
-    echo "       is globbed to '**/*_test.sh' and they are 'test-*.sh'.)" >&2
+    echo "       (scripts/test-install-sh.sh and scripts/test-uninstall-sh.sh are" >&2
+    echo "       no longer out of scope -- ci.yml's diff pathspec now includes" >&2
+    echo "       'scripts/test-*.sh'. They are excluded from THIS grep on purpose:" >&2
+    echo "       only" >&2
+    echo "       their 'pass() { printf ... }' DEFINITION is unmatched, while their" >&2
+    echo "       'pass \"...\"' and 'check_eq \"...\"' call sites both score. A helper" >&2
+    echo "       definition scoring zero is correct, not a blind spot.)" >&2
     FAILURES=$((FAILURES + 1))
 fi
 

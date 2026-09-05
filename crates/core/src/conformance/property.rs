@@ -703,6 +703,70 @@ pub struct Violation {
     pub right: OutputDigest,
     /// Human-readable statement of what was compared. Diagnostics only; never parsed.
     pub detail: String,
+    /// Extra structure for [`ConformanceProperty::StateIdempotence`]; `None` for
+    /// every other property. See [`IdempotenceSettling`].
+    pub settling: Option<IdempotenceSettling>,
+}
+
+/// How a contract's state behaved when `merge(A, A)` was re-applied after the
+/// first application changed it.
+///
+/// Carried structurally rather than folded into [`Violation::detail`], which is
+/// documented as diagnostic and never parsed. This distinction is the one an
+/// eventual removal policy has to branch on: a contract that normalises once and
+/// then holds still is a materially different animal from one that mutates on
+/// every redelivery, and only the second is unambiguously non-convergent.
+///
+/// It is deliberately NOT a severity fork. Both are `Severity::Violation`, because
+/// `merge(A, A) != A` breaks idempotence either way. Letting the settling
+/// behaviour choose the severity would repeat the move that produced the defect
+/// this replaced: bending the *classification* to soften an *enforcement*
+/// consequence (#5462).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum IdempotenceSettling {
+    /// The state changed this many times and then stopped changing.
+    ///
+    /// A correct CANONICALIZING contract lands here with a count of 1: the PUT
+    /// install path stores the client's raw bytes without ever running
+    /// `update_state`, so a peer can hold a non-canonical state and the first
+    /// merge legitimately rewrites it. The finding is still real — two peers
+    /// delivered the same updates hold different bytes until unrelated traffic
+    /// arrives — but the harm is phantom anti-entropy rather than divergence.
+    /// Canonicalising at install removes this class entirely.
+    SettledAfter(u32),
+    /// No fixpoint within the budget: the state changes on every re-apply, so
+    /// redelivery of the same state keeps mutating it. Unambiguously
+    /// non-convergent, and the case an enforcement policy can act on without
+    /// waiting for the install path to be fixed.
+    NeverSettled,
+    /// Classification could not complete, so whether the state settles is unknown.
+    ///
+    /// The cause may be the CONTRACT (it rejected the re-applied state) or OURS
+    /// (the runtime trapped, a resource ceiling was hit, a related contract was
+    /// wanted). The finding's `detail` names which, because collapsing those two
+    /// into one indistinguishable outcome destroys the only signal that would tell
+    /// us the harness has a bug — see #5509, and #5517's rule that a runtime
+    /// failure must never wear a contract error's label.
+    ///
+    /// The violation still stands: `merge(A, A) != A` was already established by a
+    /// merge that succeeded. Only the follow-up applies failed, and they exist
+    /// solely to say which KIND of break it is.
+    ///
+    /// This variant exists because the alternative was losing the finding. The
+    /// classification merges used to propagate their error out of the whole check,
+    /// which turned an established violation into "we could not tell" — and the
+    /// never-settling class GROWS its state on every apply, so it is the most
+    /// likely to trip a fuel or size ceiling on the second or third one. The class
+    /// an enforcement policy can act on was the class that vanished, and a hostile
+    /// contract could arrange it in one line by trapping on the second identical
+    /// merge.
+    ///
+    /// Deliberately not folded into `NeverSettled` (that is the harsher label and
+    /// asserting it without evidence is exactly the sin this issue is about) nor
+    /// into `settling: None` (ambiguous with "this property carries no settling
+    /// data at all").
+    Indeterminate,
 }
 
 impl std::fmt::Display for Violation {
@@ -765,6 +829,56 @@ pub enum Inconclusive {
     /// evidence about the law this case was checking, and reporting it as such would
     /// name the wrong property and the wrong severity.
     NotReproducible,
+    /// The host or the WASM module itself failed (trap, missing export, store
+    /// error) — not the contract rejecting its input.
+    ///
+    /// Kept just as non-enforceable as [`Inconclusive::ContractError`]: a harness or
+    /// runtime bug is not a merge-law proof either, and removing a contract for a
+    /// defect in the code that executes it would be exactly backwards. What must not
+    /// be shared is the LABEL — see #5509. Naming a runtime trap "contract error"
+    /// accuses the wrong party for every case of this kind, and it is the only
+    /// signal that would ever tell us the harness itself has a bug.
+    ///
+    /// Appended at the END of the enum rather than beside `ContractError` where it
+    /// reads most naturally: `Inconclusive` derives `Serialize`/`Deserialize` and
+    /// bincode's default config encodes an enum's variant index as a wire
+    /// discriminant, so inserting a variant in the middle would silently renumber
+    /// every variant declared after it. See
+    /// `inconclusive_wire_variant_indices_are_frozen` below.
+    RuntimeError(String),
+}
+
+impl Inconclusive {
+    /// The text this variant carries, where it carries one.
+    ///
+    /// Deliberately exhaustive, with NO wildcard arm, and deliberately HERE rather
+    /// than in the tool that formats it. `#[non_exhaustive]` stops other crates
+    /// matching exhaustively, so `fdev`'s report had to use a wildcard - and a
+    /// wildcard is how the contract's own error text came to be dropped for every
+    /// `ContractError`, hiding the second-largest inconclusive class behind a bare
+    /// count (#5461).
+    ///
+    /// Inside the defining crate the compiler CAN enforce the coverage, so it does:
+    /// adding a variant in any shape - `Foo(String)`, `Foo(Box<str>)`,
+    /// `Foo { reason: String }` - fails the build here until it says whether it
+    /// carries text. The `Display` impl below already depends on the same property,
+    /// so this is a demonstrated guarantee rather than a hopeful one, and it replaces
+    /// a source-scraping test that could only ever recognise one syntactic shape.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Inconclusive::ContractError(text)
+            | Inconclusive::RuntimeError(text)
+            | Inconclusive::ResourceLimit(text)
+            | Inconclusive::MalformedCase(text) => Some(text),
+            Inconclusive::InputNotValid
+            | Inconclusive::RelatedRequired
+            | Inconclusive::NoOutputState
+            | Inconclusive::RoundLimit
+            | Inconclusive::NoDeltaPath
+            | Inconclusive::StateNotSettled
+            | Inconclusive::NotReproducible => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Inconclusive {
@@ -773,6 +887,7 @@ impl std::fmt::Display for Inconclusive {
             Inconclusive::InputNotValid => f.write_str("an input state is not valid"),
             Inconclusive::RelatedRequired => f.write_str("contract requires related state"),
             Inconclusive::ContractError(e) => write!(f, "contract error: {e}"),
+            Inconclusive::RuntimeError(e) => write!(f, "runtime/harness failure: {e}"),
             Inconclusive::NoOutputState => f.write_str("update produced no state"),
             Inconclusive::ResourceLimit(e) => write!(f, "resource limit: {e}"),
             Inconclusive::RoundLimit => f.write_str("reconciliation round budget exhausted"),

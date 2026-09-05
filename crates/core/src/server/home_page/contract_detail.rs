@@ -5,7 +5,7 @@ use freenet_stdlib::prelude::ContractInstanceId;
 use super::assets::{CSS, JS, PEER_CSS};
 use super::cards::format_bytes;
 use super::*;
-use crate::conformance::property::Severity;
+use crate::conformance::property::{IdempotenceSettling, Severity};
 use crate::conformance::status;
 
 // ─── Contract detail page ────────────────────────────────────────────────────
@@ -435,9 +435,26 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
     } else {
         let mut rows = String::new();
         for f in record.findings() {
-            let (pill_class, label) = match f.severity {
-                Severity::Violation => ("fresh-stale", "Violation — cannot converge"),
-                Severity::Diagnostic => ("use-idle", "Diagnostic — legal but wasteful"),
+            // Severity alone cannot describe a `state_idempotence` row since
+            // #5462: a canonicalizing contract breaks the law and still converges,
+            // so it carries the same `Violation` as one that never settles. The
+            // settling class is what separates "waiting on the install-path fix"
+            // from "genuinely non-convergent", and showing the first as though it
+            // were the second is the misreading this whole change exists to
+            // prevent.
+            let (pill_class, label) = match (f.severity, f.settling) {
+                (Severity::Violation, Some(IdempotenceSettling::SettledAfter(_))) => (
+                    "fresh-stale",
+                    "Violation — settles after a rewrite (converges)",
+                ),
+                (Severity::Violation, Some(IdempotenceSettling::NeverSettled)) => {
+                    ("fresh-stale", "Violation — never settles")
+                }
+                (Severity::Violation, Some(IdempotenceSettling::Indeterminate)) => {
+                    ("fresh-stale", "Violation — settling unknown")
+                }
+                (Severity::Violation, _) => ("fresh-stale", "Violation — removal-eligible"),
+                (Severity::Diagnostic, _) => ("use-idle", "Diagnostic — legal but wasteful"),
             };
             rows.push_str(&format!(
                 r#"<tr><td>{property}</td><td><span class="fresh-pill {pill_class}">{label}</span></td><td class="right">{would_remove}</td></tr>"#,
@@ -452,7 +469,7 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
                 <div class="info-grid" style="margin-top:0.75rem">
                     {cases_row}
                 </div>
-                <p class="empty" style="margin-top:0.75rem"><strong>Violation</strong> means the contract cannot converge: peers holding it disagree and retry indefinitely. <strong>Diagnostic</strong> is legal but wasteful — it never justifies removal on its own.</p>
+                <p class="empty" style="margin-top:0.75rem"><strong>Violation</strong> means the contract broke an algebraic law and is removal-eligible under enforcement. Most do not converge, but not all: a contract that normalises a stored state once and then holds still breaks idempotence and still agrees with its peers — those rows say <em>settles after a rewrite</em>. <strong>Diagnostic</strong> is legal but wasteful — it never justifies removal on its own.</p>
                 {note}
             </div>"#,
             rows = rows,
@@ -538,6 +555,7 @@ mod tests {
             contract: checked,
             property: PROPERTY,
             severity: Severity::Violation,
+            settling: None,
             would_remove: false,
         });
         status::publish([record], 1, 0, tokio::time::Instant::now());

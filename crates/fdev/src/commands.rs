@@ -416,7 +416,10 @@ pub async fn get_contract_id(config: GetContractIdConfig) -> anyhow::Result<()> 
 }
 
 pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<()> {
-    // Create ContractKey with placeholder code hash - the node will look up the actual key
+    // `ContractRequest::Update` carries a full `ContractKey` while the user gave
+    // us only a base58 instance id, so the code hash is a placeholder the node
+    // resolves from its own instance->code index. That resolution is #4978; on a
+    // node older than that fix this placeholder fails with `missing contract`.
     let instance_id = ContractInstanceId::try_from(config.key)?;
     let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([0u8; 32]));
     println!("Updating contract {key}");
@@ -702,6 +705,33 @@ pub(crate) async fn execute_command(
 
 #[cfg(test)]
 mod tests {
+
+    /// The other half of a mirrored constant (#5432).
+    ///
+    /// `freenet`'s streaming-PUT stall watchdog
+    /// (`operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT`) is sized to
+    /// fire a margin BEFORE this timeout, so that a stalled publish surfaces the
+    /// node's specific reason rather than fdev's generic "may have succeeded,
+    /// verify out-of-band". Core cannot reference this constant — fdev depends
+    /// on core, not the reverse — so core asserts the bound against a local copy
+    /// of this value in
+    /// `stream_progress::tests::inactivity_window_is_bounded_at_both_ends`.
+    ///
+    /// A mirrored constant guarded on only one side is a guard whose two inputs
+    /// can rot from a single edit: lowering this value alone would silently
+    /// invalidate core's bound while core's own test stayed green. This test is
+    /// the counter-pin. If you change the timeout, expect BOTH to fail, and
+    /// update them together.
+    #[test]
+    fn default_response_timeout_matches_the_core_stall_pin() {
+        assert_eq!(
+            DEFAULT_RESPONSE_TIMEOUT,
+            Duration::from_secs(300),
+            "freenet's STREAM_OP_INACTIVITY_TIMEOUT is sized against this value; \
+             see stream_progress::tests::inactivity_window_is_bounded_at_both_ends \
+             and change both together"
+        );
+    }
     use super::*;
     use std::io::Write;
 
