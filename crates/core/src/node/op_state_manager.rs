@@ -440,6 +440,57 @@ pub(crate) enum DrainStateRead {
     Unavailable,
 }
 
+/// Count of V2 delegate broadcasts dropped because the notification channel
+/// would have blocked.
+///
+/// A counter as well as a log line, for the reason `.claude/rules/code-style.md`
+/// gives: a refusal that is not counted renders as a clean zero. The paired
+/// message is WARN because `crates/core/Cargo.toml` enables tracing's
+/// `release_max_level_info` — anything below INFO does not exist in a release
+/// binary, which is how #4981 discarded legitimate traffic with no greppable
+/// evidence.
+///
+/// KNOWN LIMIT: this drop heals on the delegate's NEXT write, which is prompt
+/// for a chatty writer and not prompt at all for an infrequent one. A delegate
+/// that writes once a day and loses that write to a full channel stays
+/// unpropagated until the following day, and the anti-entropy heartbeat only
+/// helps peers already interested in the contract. Re-attempting from the loop
+/// instead of dropping needs a bounded sweep of the pending set with its own
+/// TTL — a design change, not a tweak — and is tracked separately.
+static V2_BROADCAST_ENQUEUE_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Map a contract-handler reply onto a [`DrainStateRead`].
+///
+/// Split out from [`OpManager::read_state_for_broadcast_drain`] so the mapping
+/// can be tested exhaustively without a live contract handler. The async
+/// wrapper is then only the round trip; this is the part with the decision in
+/// it, and the decision is the one that regressed before: collapsing a failed
+/// read into the same answer as "we do not hold it" is what silently discarded
+/// an already-committed write.
+pub(crate) fn classify_drain_read(
+    reply: Result<crate::contract::ContractHandlerEvent, ContractError>,
+) -> DrainStateRead {
+    use crate::contract::ContractHandlerEvent;
+    match reply {
+        // The handler answered and it holds state for the contract.
+        Ok(ContractHandlerEvent::GetResponse {
+            response: Ok(store_response),
+            ..
+        }) => match store_response.state {
+            Some(state) => DrainStateRead::Found(state),
+            // Answered, and we genuinely hold no state. Final: nothing to send.
+            None => DrainStateRead::NotHeld,
+        },
+        // The handler answered with an executor error, or answered something
+        // that is not a GetResponse at all. Either way we learned nothing about
+        // whether we hold the contract, so this is NOT `NotHeld`.
+        Ok(_) => DrainStateRead::Unavailable,
+        // Timed out, channel closed, or the handler is gone.
+        Err(_) => DrainStateRead::Unavailable,
+    }
+}
+
 impl OpManager {
     // `pub(crate)` (widened from `pub(super)`) so in-crate unit tests outside
     // `crate::node` can stand up a real `OpManager` — specifically the
@@ -1008,10 +1059,18 @@ impl OpManager {
             // the contract would silently stop propagating for the process
             // lifetime.
             self.v2_delegate_broadcast_pending.remove(key.id());
-            tracing::debug!(
+            let dropped =
+                V2_BROADCAST_ENQUEUE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            // WARN, not debug: `release_max_level_info` compiles debug out, so
+            // a debug-only line here would make this drop invisible in exactly
+            // the builds that matter. Same reasoning as the drain-read drop.
+            tracing::warn!(
                 contract = %key,
                 error = %err,
-                "Failed to queue V2 delegate state-change broadcast (best-effort)"
+                dropped_total = dropped,
+                "V2 delegate state-change broadcast dropped: notification channel would \
+                 block. The write is committed locally; the network learns of it on the \
+                 next write or via anti-entropy"
             );
             return false;
         }
@@ -1050,15 +1109,8 @@ impl OpManager {
             )
             .await
         {
-            Ok(ContractHandlerEvent::GetResponse {
-                response: Ok(store_response),
-                ..
-            }) => match store_response.state {
-                Some(state) => DrainStateRead::Found(state),
-                None => DrainStateRead::NotHeld,
-            },
-            Ok(_) => DrainStateRead::Unavailable,
-            Err(_) => DrainStateRead::Unavailable,
+            Ok(ev) => classify_drain_read(Ok(ev)),
+            Err(e) => classify_drain_read(Err(e)),
         }
     }
 
@@ -5815,6 +5867,78 @@ mod tests {
             "NetworkContractHandler::build must call rehydrate_local_hosting_interest \
              after load_hosting_cache so restored hosted contracts serve locally and \
              rejoin anti-entropy (#4780)",
+        );
+    }
+
+    /// `classify_drain_read` must keep "we hold no state" and "the read failed"
+    /// APART. Collapsing them is what let a transient GetQuery failure silently
+    /// discard a write that had already committed and already returned success
+    /// to the delegate — #5479's own shape, reappearing inside its fix.
+    ///
+    /// Exhaustive over the four reply shapes on purpose: three of them are
+    /// error-ish and only ONE of those three is safe to treat as final.
+    #[test]
+    fn classify_drain_read_separates_not_held_from_unavailable() {
+        use crate::contract::ContractHandlerEvent;
+        use crate::contract::StoreResponse;
+        use freenet_stdlib::prelude::WrappedState;
+
+        // 1. Answered, state present → broadcast it.
+        let found = classify_drain_read(Ok(ContractHandlerEvent::GetResponse {
+            key: None,
+            response: Ok(StoreResponse {
+                state: Some(WrappedState::new(vec![1, 2, 3])),
+                contract: None,
+            }),
+        }));
+        match found {
+            DrainStateRead::Found(state) => assert_eq!(state.as_ref(), &[1, 2, 3]),
+            other @ DrainStateRead::NotHeld | other @ DrainStateRead::Unavailable => {
+                panic!("state present must map to Found, got {other:?}")
+            }
+        }
+
+        // 2. Answered, no state → we genuinely do not hold it. Final, silent.
+        assert!(
+            matches!(
+                classify_drain_read(Ok(ContractHandlerEvent::GetResponse {
+                    key: None,
+                    response: Ok(StoreResponse {
+                        state: None,
+                        contract: None,
+                    }),
+                })),
+                DrainStateRead::NotHeld
+            ),
+            "an answered read with no state means we do not hold the contract; not \
+             broadcasting is correct and there is nothing to warn about"
+        );
+
+        // 3. Answered with an executor error → we learned NOTHING about whether
+        //    we hold it, so this must NOT be NotHeld.
+        assert!(
+            matches!(
+                classify_drain_read(Ok(ContractHandlerEvent::GetResponse {
+                    key: None,
+                    response: Err(crate::contract::ExecutorError::other(anyhow::anyhow!(
+                        "executor failure"
+                    ))),
+                })),
+                DrainStateRead::Unavailable
+            ),
+            "an executor error tells us nothing about whether we hold the contract, so \
+             it must be Unavailable — treating it as NotHeld silently drops a committed \
+             write's announcement"
+        );
+
+        // 4. Transport failure (timeout, closed channel, dead handler).
+        assert!(
+            matches!(
+                classify_drain_read(Err(ContractError::NoEvHandlerResponse)),
+                DrainStateRead::Unavailable
+            ),
+            "a failed round trip must be Unavailable, never NotHeld — this is the \
+             timeout case the bounded read exists to produce"
         );
     }
 }

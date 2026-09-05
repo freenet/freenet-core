@@ -455,9 +455,10 @@ pub(super) struct DelegateCallEnv {
     /// they do: it invalidates `StateStore`'s caches, bumps the per-contract
     /// generation and refreshes the hosting-cache snapshot (closing the
     /// EvictContract re-host race), reports StateBytesWritten, records the
-    /// contract-update timestamp, and emits the `BroadcastStateChange` that
-    /// propagates the write (#5479). See `super::runtime::StateWriteCallback`
-    /// and `after_state_write`.
+    /// contract-update timestamp, and — for a write that CHANGED the stored
+    /// bytes — queues the key-only `NodeEvent::V2DelegateStateChanged` that
+    /// propagates it (#5479). See `super::runtime::StateWriteCallback` and
+    /// `after_state_write`.
     state_write_callback: Option<super::runtime::StateWriteCallback>,
     /// Pre-write disk-budget admission gate for V2 delegate writes (#4683,
     /// PR 3). Runs BEFORE the raw `Storage` write in
@@ -801,10 +802,12 @@ impl DelegateCallEnv {
     /// path enforces it again before broadcasting. The V2 bypass writes
     /// through the raw `Storage`, which does not — so before #5479 an
     /// oversized V2 write was a local-disk problem, and after it the same
-    /// uncapped `WrappedState` would be cloned into a `BroadcastStateChange`
-    /// and put on the wire, where every recipient rejects it at its own guard
-    /// AFTER paying for the transfer. Enforcing it here, next to the
-    /// disk-budget gate, keeps the ceiling where the write is.
+    /// uncapped `WrappedState` would reach the fan-out and go on the wire,
+    /// where every recipient rejects it at its own guard AFTER paying for the
+    /// transfer. Enforcing it here, next to the disk-budget gate, keeps the
+    /// ceiling where the write is. (The queued event itself carries no state,
+    /// but the drain reads this value back and broadcasts it, so the ceiling is
+    /// still what keeps an oversized state off the wire.)
     fn check_state_size(state_size: usize) -> Result<(), DelegateEnvError> {
         if state_size > crate::wasm_runtime::MAX_STATE_SIZE {
             return Err(DelegateEnvError::StateTooLarge {
@@ -922,7 +925,8 @@ impl DelegateCallEnv {
     /// (see `super::runtime::StateWriteCallback` and
     /// `contract::executor::runtime::v2_delegate_state_write_callback`)
     /// invalidates the `StateStore` caches, runs `Ring::commit_state_write`,
-    /// and emits the `BroadcastStateChange` that propagates the write.
+    /// and — only when `content_changed` — queues the fan-out that propagates
+    /// the write.
     fn after_state_write(
         &self,
         contract_key: &ContractKey,
