@@ -259,10 +259,14 @@ pub(super) fn task_bytes(
                 .code
                 .as_ref()
                 .map_or(0, |c| c.data().len() + c.params().as_ref().len());
+            // BORROW, do not clone. `clone().into_owned()` here deep-copied
+            // every related state MERELY TO MEASURE IT: with up to ten 50 MiB
+            // states that is hundreds of MiB allocated synchronously on the
+            // serial loop, BEFORE the 64 MiB cap could reject the park —
+            // causing the stall and the memory blow-up the cap exists to
+            // prevent. The measurement was the harm.
             let related: usize = u
                 .related_contracts
-                .clone()
-                .into_owned()
                 .states()
                 .map(|(_, st)| st.as_ref().map_or(0, |s| s.as_ref().len()))
                 .sum();
@@ -301,25 +305,40 @@ fn delegate_container_bytes(delegate: &freenet_stdlib::prelude::DelegateContaine
 }
 
 fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
-    match msg {
-        InboundDelegateMsg::ApplicationMessage(m) => m.payload.len(),
-        InboundDelegateMsg::GetContractResponse(r) => {
-            r.state.as_ref().map_or(0, |s| s.as_ref().len())
+    // Charged OUTSIDE the match, for every variant, via the stdlib accessor.
+    // `DelegateContext` runs to nearly 400 KiB, and a client can queue
+    // small-payload messages carrying large contexts behind a park while
+    // `parked_bytes` barely moves. Doing it here rather than in each arm is
+    // deliberate: this budget has now been wrong in six distinct ways, and a
+    // per-arm charge is a seventh spot to forget. A new variant cannot omit it.
+    let context = msg.get_context().map_or(0, |c| c.as_ref().len());
+    context
+        + match msg {
+            InboundDelegateMsg::ApplicationMessage(m) => m.payload.len(),
+            InboundDelegateMsg::GetContractResponse(r) => {
+                r.state.as_ref().map_or(0, |s| s.as_ref().len())
+            }
+            InboundDelegateMsg::ContractNotification(n) => n.new_state.as_ref().len(),
+            InboundDelegateMsg::UserResponse(r) => r.response.len(),
+            InboundDelegateMsg::DelegateMessage(m) => m.payload.len(),
+            // Put/Update/Subscribe responses carry only a small Result. The
+            // wildcard is required by `#[non_exhaustive]`; a future variant
+            // carrying bytes must be added above or it goes uncounted.
+            InboundDelegateMsg::PutContractResponse(_)
+            | InboundDelegateMsg::UpdateContractResponse(_)
+            | InboundDelegateMsg::SubscribeContractResponse(_)
+            | _ => 0,
         }
-        InboundDelegateMsg::ContractNotification(n) => n.new_state.as_ref().len(),
-        InboundDelegateMsg::UserResponse(r) => r.response.len(),
-        InboundDelegateMsg::DelegateMessage(m) => m.payload.len(),
-        // Put/Update/Subscribe responses carry only a small Result. The
-        // wildcard is required by `#[non_exhaustive]`; a future variant
-        // carrying bytes must be added above or it goes uncounted.
-        InboundDelegateMsg::PutContractResponse(_)
-        | InboundDelegateMsg::UpdateContractResponse(_)
-        | InboundDelegateMsg::SubscribeContractResponse(_)
-        | _ => 0,
-    }
 }
 
 fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
+    // Same structural charge as `inbound_bytes`: context first, for every
+    // variant, so it cannot be forgotten by an arm.
+    let context = msg.get_context().map_or(0, |c| c.as_ref().len());
+    context + outbound_payload_bytes(msg)
+}
+
+fn outbound_payload_bytes(msg: &OutboundDelegateMsg) -> usize {
     // The request variants never appear in `accumulated` — they are consumed by
     // the run that produced them — and the rest carry no contract-controlled
     // payload. Listed rather than wildcarded so a future payload-bearing
@@ -327,12 +346,9 @@ fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
     match msg {
         OutboundDelegateMsg::ApplicationMessage(m) => m.payload.len(),
         OutboundDelegateMsg::SendDelegateMessage(m) => m.payload.len(),
-        // NOT zero: `DelegateContext::MAX_SIZE` is 409,600 bytes, and these
-        // accumulate through park -> resume -> re-park via `RunSeed` for up to
-        // MAX_CONTRACT_REQUEST_ITERATIONS, which is ~40 MB per park if
-        // uncounted.
-        OutboundDelegateMsg::ContextUpdated(ctx) => ctx.as_ref().len(),
-        OutboundDelegateMsg::RequestUserInput(_)
+        // `ContextUpdated`'s payload IS its context, already charged above.
+        OutboundDelegateMsg::ContextUpdated(_)
+        | OutboundDelegateMsg::RequestUserInput(_)
         | OutboundDelegateMsg::GetContractRequest(_)
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
@@ -528,6 +544,18 @@ struct ParkEntry {
     /// Newest pending notification per contract. Superseded ones are dropped,
     /// which loses nothing the successor does not carry.
     pending_notifications: HashMap<ContractInstanceId, DelegateRequest<'static>>,
+    /// ARRIVAL ORDER of the contracts in `pending_notifications`.
+    ///
+    /// The map alone would drain in hash order. Each drained notification runs
+    /// delegate WASM and can mutate secrets and contracts, so hash order makes
+    /// observable effects reorder between runs and identical simulation runs
+    /// diverge — the determinism hazard `testing.md` names. `expired()` was
+    /// sorted for the same reason (L7); this is the same defect one function
+    /// over, on the path that actually executes delegate code.
+    ///
+    /// Coalescing keeps a contract's ORIGINAL position: a newer notification
+    /// replaces the value, not the slot, so ordering stays arrival order.
+    notification_order: VecDeque<ContractInstanceId>,
     /// Bytes held by the queued items above, so they count toward
     /// [`MAX_PARKED_BYTES`] like the continuation does. Without this the
     /// coalescing map would be a fresh count-bounded-but-not-byte-bounded hole
@@ -594,6 +622,10 @@ pub(super) struct DelegateResume {
     /// Upserts whose related contracts were fetched off-loop and which must be
     /// RE-RUN on the loop before their responses can be built.
     pub upserts: Vec<ResolvedUpsert>,
+    /// Upserts the off-loop task never resolved — it panicked, was cancelled,
+    /// or ran out of budget. `(contract, is_put)`, turned into failure
+    /// responses by the resume handler so the delegate is told.
+    pub unresolved_upserts: Vec<(ContractInstanceId, bool)>,
 }
 
 /// RAII guard guaranteeing an off-loop task delivers EXACTLY ONE
@@ -618,6 +650,10 @@ struct ParkGuardPayload {
     resume_tx: tokio::sync::mpsc::UnboundedSender<DelegateResume>,
     delegate_key: DelegateKey,
     epoch: u64,
+    /// Prompt request ids this park owes a `UserResponse` for.
+    owed_prompts: Vec<u32>,
+    /// Upserts this park owes a Put/Update response for: `(contract, is_put)`.
+    owed_upserts: Vec<(ContractInstanceId, bool)>,
 }
 
 impl ParkGuard {
@@ -625,12 +661,16 @@ impl ParkGuard {
         resume_tx: tokio::sync::mpsc::UnboundedSender<DelegateResume>,
         delegate_key: DelegateKey,
         epoch: u64,
+        owed_prompts: Vec<u32>,
+        owed_upserts: Vec<(ContractInstanceId, bool)>,
     ) -> Self {
         Self {
             payload: Some(ParkGuardPayload {
                 resume_tx,
                 delegate_key,
                 epoch,
+                owed_prompts,
+                owed_upserts,
             }),
         }
     }
@@ -650,14 +690,75 @@ impl ParkGuard {
     fn deliver(
         p: ParkGuardPayload,
         cause: ResumeCause,
-        inbound: Vec<InboundDelegateMsg<'static>>,
+        mut inbound: Vec<InboundDelegateMsg<'static>>,
         upserts: Vec<ResolvedUpsert>,
     ) {
         let ParkGuardPayload {
             resume_tx,
             delegate_key,
             epoch,
+            owed_prompts,
+            owed_upserts,
         } = p;
+
+        // TERMINAL RESULTS ARE PRODUCED HERE, not in the task body, so that
+        // EVERY exit produces them — including a panic or a cancellation, which
+        // reach `Drop` and never run the task's own cleanup. A delegate left
+        // without a response for work it requested keeps a continuation the
+        // exclusion has already released, and if nothing else is delivered it
+        // is never re-entered at all.
+        //
+        // An empty `ClientResponse` is exactly what a dismissed or timed-out
+        // prompt yields on the normal path, so the delegate sees a shape it
+        // already handles.
+        let answered: std::collections::HashSet<u32> = inbound
+            .iter()
+            .filter_map(|m| match m {
+                InboundDelegateMsg::UserResponse(r) => Some(r.request_id),
+                // Only `UserResponse` carries a request id to reconcile
+                // against `owed_prompts`. Listed rather than wildcarded so a
+                // future variant that carries one has to be considered here.
+                InboundDelegateMsg::ApplicationMessage(_)
+                | InboundDelegateMsg::GetContractResponse(_)
+                | InboundDelegateMsg::PutContractResponse(_)
+                | InboundDelegateMsg::UpdateContractResponse(_)
+                | InboundDelegateMsg::SubscribeContractResponse(_)
+                | InboundDelegateMsg::ContractNotification(_)
+                | InboundDelegateMsg::DelegateMessage(_)
+                | _ => None,
+            })
+            .collect();
+        for request_id in owed_prompts {
+            if !answered.contains(&request_id) {
+                inbound.push(InboundDelegateMsg::UserResponse(
+                    freenet_stdlib::prelude::UserInputResponse {
+                        request_id,
+                        response: freenet_stdlib::prelude::ClientResponse::new(Vec::new()),
+                        context: DelegateContext::default(),
+                    },
+                ));
+            }
+        }
+
+        // Upserts cannot be synthesized here — a `ResolvedUpsert` needs the
+        // `PendingUpsert` the task owns, which is gone by the time `Drop` runs.
+        // The unresolved ids travel instead, and `handle_delegate_resume` turns
+        // them into failure responses where it has `upsert_response_msg`.
+        let resolved: std::collections::HashSet<ContractInstanceId> =
+            upserts.iter().map(|r| *r.pending.key.id()).collect();
+        let unresolved_upserts: Vec<(ContractInstanceId, bool)> = owed_upserts
+            .into_iter()
+            .filter(|(id, _)| !resolved.contains(id))
+            .collect();
+        if !unresolved_upserts.is_empty() {
+            tracing::warn!(
+                delegate = %delegate_key,
+                count = unresolved_upserts.len(),
+                "Off-loop delegate work ended without resolving every upsert; \
+                 synthesizing failures so the delegate is told rather than left \
+                 waiting (#5544)"
+            );
+        }
         if resume_tx
             .send(DelegateResume {
                 delegate_key: delegate_key.clone(),
@@ -665,6 +766,7 @@ impl ParkGuard {
                 cause,
                 inbound,
                 upserts,
+                unresolved_upserts,
             })
             .is_err()
         {
@@ -827,6 +929,7 @@ impl DelegateParkCtx {
                 parked_at: tokio::time::Instant::now(),
                 pending_clients: VecDeque::new(),
                 pending_notifications: HashMap::new(),
+                notification_order: VecDeque::new(),
                 pending_bytes: 0,
             },
         );
@@ -900,6 +1003,9 @@ impl DelegateParkCtx {
                 }
 
                 entry.pending_bytes = entry.pending_bytes.saturating_add(bytes);
+                if is_new_contract {
+                    entry.notification_order.push_back(contract_id);
+                }
                 if let Some(old) = entry.pending_notifications.insert(contract_id, req) {
                     let freed = request_bytes(&old);
                     entry.pending_bytes = entry.pending_bytes.saturating_sub(freed);
@@ -1024,11 +1130,23 @@ impl DelegateParkCtx {
             // ordering is already approximate because coalescing drops
             // superseded ones.
             let mut pending: VecDeque<PendingRun> = entry.pending_clients;
+            // Drain notifications in ARRIVAL order, not hash order. Each one
+            // runs delegate WASM, so hash order would make observable effects
+            // reorder between runs.
+            let mut notifications = entry.pending_notifications;
             pending.extend(
                 entry
-                    .pending_notifications
+                    .notification_order
                     .into_iter()
-                    .map(|(contract_id, req)| PendingRun::Notification { contract_id, req }),
+                    .filter_map(|contract_id| {
+                        notifications
+                            .remove(&contract_id)
+                            .map(|req| PendingRun::Notification { contract_id, req })
+                    }),
+            );
+            debug_assert!(
+                notifications.is_empty(),
+                "every coalesced notification must have an arrival-order slot"
             );
             (entry.continuation, pending)
         })
@@ -1444,6 +1562,65 @@ mod tests {
         );
     }
 
+    /// The context attached to a message is CHARGED. `DelegateContext` runs to
+    /// nearly 400 KiB, so a client can queue small-payload messages carrying
+    /// large contexts behind a park and move `parked_bytes` almost not at all.
+    ///
+    /// FALSIFY by dropping the `msg.get_context()` term from `inbound_bytes`.
+    #[tokio::test]
+    async fn message_contexts_are_charged_not_just_payloads() {
+        let big_ctx = DelegateContext::new(vec![0u8; 200 * 1024]);
+        let tiny_payload = InboundDelegateMsg::ApplicationMessage(
+            freenet_stdlib::prelude::ApplicationMessage::new(vec![1u8; 8])
+                .with_context(big_ctx.clone()),
+        );
+        let mut cont = continuation();
+        cont.inbound_so_far = vec![tiny_payload];
+        assert!(
+            continuation_bytes(&cont) >= 200 * 1024,
+            "a message's context must be charged; payload was 8 bytes and the \
+             context 200 KiB, and only the context makes this a real cost"
+        );
+    }
+
+    /// Coalesced notifications drain in ARRIVAL order, not hash order.
+    ///
+    /// Each drained notification executes delegate WASM and can mutate secrets
+    /// and contracts, so hash order lets observable effects reorder between
+    /// runs and identical simulation runs diverge.
+    ///
+    /// FALSIFY by draining `pending_notifications` directly instead of through
+    /// `notification_order`.
+    #[tokio::test]
+    async fn coalesced_notifications_drain_in_arrival_order() {
+        let (mut ctx, _rx) = ctx();
+        let k = key(1);
+        ctx.park(k.clone(), continuation(), 0);
+
+        // Insert in a fixed order; supersede one in the middle to confirm
+        // coalescing keeps its ORIGINAL slot rather than moving it to the back.
+        let arrival: Vec<u8> = (0..8).collect();
+        for c in &arrival {
+            ctx.queue_pending(&k, notification(*c, b"first"));
+        }
+        ctx.queue_pending(&k, notification(3, b"second"));
+
+        let epoch = ctx.epoch_of(&k).expect("parked");
+        let (_cont, pending) = ctx.take_matching(&k, epoch).expect("parked");
+        let drained: Vec<u8> = pending
+            .iter()
+            .filter_map(|run| match run {
+                PendingRun::Notification { contract_id, .. } => Some(contract_id.as_bytes()[0]),
+                PendingRun::Client { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            drained, arrival,
+            "notifications must drain in arrival order, and a superseded one \
+             must keep its original position"
+        );
+    }
+
     /// P1a: the byte cap must charge what is actually RETAINED, including the
     /// payloads the off-loop task holds, not just what `Continuation` points at.
     ///
@@ -1500,7 +1677,7 @@ mod tests {
     #[tokio::test]
     async fn guard_delivers_exactly_one_resume_on_success() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let guard = ParkGuard::new(tx, key(1), 0);
+        let guard = ParkGuard::new(tx, key(1), 0, Vec::new(), Vec::new());
         guard.send(Vec::new(), Vec::new());
         let resume = rx.recv().await.expect("one resume");
         assert_eq!(resume.cause, ResumeCause::Completed);
@@ -1513,7 +1690,7 @@ mod tests {
         // Simulates the spawned task being cancelled/panicking before it
         // finished its work. Without this the park would never end: the
         // pending queue would never drain and the client would hang.
-        drop(ParkGuard::new(tx, key(1), 0));
+        drop(ParkGuard::new(tx, key(1), 0, Vec::new(), Vec::new()));
         let resume = rx.recv().await.expect("drop must still resume the park");
         assert_eq!(resume.cause, ResumeCause::TimedOut);
         assert!(resume.inbound.is_empty());

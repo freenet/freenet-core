@@ -1646,19 +1646,27 @@ where
                     .park(delegate_key.clone(), continuation, task_bytes)
                 {
                     delegate_park::ParkAdmission::Admitted { epoch } => {
+                        // What this park OWES. The guard synthesizes terminal
+                        // results for anything unresolved on EVERY exit —
+                        // including panic or cancellation, which reach `Drop`
+                        // and never run the task's own cleanup (#5544 P2).
+                        let owed: Vec<u32> =
+                            user_input_requests.iter().map(|r| r.request_id).collect();
+                        let owed_upserts: Vec<(ContractInstanceId, bool)> = deferred_upserts
+                            .iter()
+                            .map(|u| (*u.key.id(), u.is_put))
+                            .collect();
                         let guard = delegate_park::ParkGuard::new(
                             ctx.park.resume_tx().clone(),
                             delegate_key.clone(),
                             epoch,
+                            owed,
+                            owed_upserts,
                         );
                         let prompter = std::sync::Arc::clone(prompter);
                         let key = delegate_key.clone();
                         let op_manager = contract_handler.executor().op_manager_handle();
                         let prompts = std::mem::take(&mut user_input_requests);
-                        // Every request id this run owes an answer for. If the
-                        // budget cancels the sequence part-way, the unanswered
-                        // ones are synthesized as denials below (#5544 P1b).
-                        let owed: Vec<u32> = prompts.iter().map(|r| r.request_id).collect();
                         let upserts = std::mem::take(&mut deferred_upserts);
                         // Fire-and-forget is safe precisely because of the
                         // guard: it delivers exactly one resume even if this
@@ -1741,58 +1749,15 @@ where
                             // requests that finished and none for those that
                             // did not, which is the same shape as a denied
                             // prompt.
-                            let mut responses = std::mem::take(&mut *answers_out.lock().unwrap());
+                            let responses = std::mem::take(&mut *answers_out.lock().unwrap());
                             let resolved = std::mem::take(&mut *fetch_out.lock().unwrap());
 
-                            // Synthesize a DENIAL for every prompt the budget
-                            // cancelled (#5544 P1b). An empty `ClientResponse`
-                            // is exactly what a timed-out or dismissed prompt
-                            // yields on the normal path, so the delegate sees a
-                            // shape it already handles rather than silence — and
-                            // is not left waiting for a `UserResponse` that was
-                            // cancelled out of existence.
-                            let answered: std::collections::HashSet<u32> = responses
-                                .iter()
-                                .filter_map(|m| match m {
-                                    InboundDelegateMsg::UserResponse(r) => Some(r.request_id),
-                                    // Only `UserResponse` carries a request id to
-                                    // reconcile against `owed`. Listed rather than
-                                    // wildcarded so a future variant that carries
-                                    // one has to be considered here, the same
-                                    // convention as `delegate_park::inbound_bytes`.
-                                    InboundDelegateMsg::ApplicationMessage(_)
-                                    | InboundDelegateMsg::GetContractResponse(_)
-                                    | InboundDelegateMsg::PutContractResponse(_)
-                                    | InboundDelegateMsg::UpdateContractResponse(_)
-                                    | InboundDelegateMsg::SubscribeContractResponse(_)
-                                    | InboundDelegateMsg::ContractNotification(_)
-                                    | InboundDelegateMsg::DelegateMessage(_)
-                                    | _ => None,
-                                })
-                                .collect();
-                            let unanswered: Vec<u32> = owed
-                                .into_iter()
-                                .filter(|id| !answered.contains(id))
-                                .collect();
-                            if !unanswered.is_empty() {
-                                tracing::warn!(
-                                    delegate = %key,
-                                    count = unanswered.len(),
-                                    "Synthesizing denials for prompts cancelled by \
-                                     PARK_WORK_BUDGET, so the delegate is told rather \
-                                     than left waiting (#5544 P1b)"
-                                );
-                                for request_id in unanswered {
-                                    responses.push(InboundDelegateMsg::UserResponse(
-                                        UserInputResponse {
-                                            request_id,
-                                            response: ClientResponse::new(Vec::new()),
-                                            context: DelegateContext::default(),
-                                        },
-                                    ));
-                                }
-                            }
-
+                            // Denial synthesis lives in `ParkGuard::deliver`
+                            // now, so it also covers the panic and
+                            // cancellation exits — those reach `Drop` and
+                            // never run this block (#5544 P2). Doing it in
+                            // both places would be duplication; doing it
+                            // only here was the bug.
                             if done.is_err() {
                                 tracing::warn!(
                                     delegate = %key,
@@ -2055,6 +2020,10 @@ where
                     cause: delegate_park::ResumeCause::TimedOut,
                     inbound: Vec::new(),
                     upserts: Vec::new(),
+                    // The sweep does not know what the task owed; that task's
+                    // own guard still fires and is rejected on epoch, so
+                    // nothing is answered twice.
+                    unresolved_upserts: Vec::new(),
                 },
             )
             .await;
@@ -3345,6 +3314,7 @@ where
         cause,
         inbound,
         upserts,
+        unresolved_upserts,
     } = resume;
 
     let Some((continuation, pending)) = park.take_matching(&delegate_key, epoch) else {
@@ -3397,6 +3367,20 @@ where
     // fetch happened off it), then feed their responses back with the rest.
     for resolved in upserts {
         all_inbound.push(apply_resolved_upsert(contract_handler, resolved).await);
+    }
+    // Upserts the off-loop task never resolved (panic, cancellation, budget).
+    // The delegate is TOLD they failed rather than left waiting for a response
+    // nothing remains to produce (#5544 P2). `DelegateContext` is defaulted
+    // because the `PendingUpsert` that carried it is gone by then.
+    for (contract_id, is_put) in unresolved_upserts {
+        all_inbound.push(upsert_response_msg(
+            is_put,
+            contract_id,
+            DelegateContext::default(),
+            Err(ExecutorError::other(anyhow::anyhow!(
+                "delegate upsert did not complete: its off-loop work ended early"
+            ))),
+        ));
     }
     all_inbound.extend(inbound);
 
