@@ -703,7 +703,20 @@ impl ParkGuard {
 
         // TERMINAL RESULTS ARE PRODUCED HERE, not in the task body, so that
         // EVERY exit produces them — including a panic or a cancellation, which
-        // reach `Drop` and never run the task's own cleanup. A delegate left
+        // reach `Drop` and never run the task's own cleanup.
+        //
+        // IF YOU ARE ADDING AN EXIT PATH, RE-ASK THE QUESTION HERE. "Answered on
+        // every exit" is not a property you establish once for a change; it has
+        // to be re-asked at EVERY level that has exits, and having answered it
+        // at one level feels like having answered it. That is not hypothetical:
+        // the same change, in the same session, put an RAII guard on the prompt
+        // REGISTRY entry — correct "on every exit" reasoning — and then put the
+        // response synthesis one level up in the task body, where a panic never
+        // reaches it. The reasoning was right and was applied at one level and
+        // not the next. Keeping the synthesis inside this guard is what makes
+        // the property structural rather than remembered.
+        //
+        // #5544 P1b/P2. A delegate left
         // without a response for work it requested keeps a continuation the
         // exclusion has already released, and if nothing else is delivered it
         // is never re-entered at all.
