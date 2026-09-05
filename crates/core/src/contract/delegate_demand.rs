@@ -108,6 +108,56 @@
 //!     do the mirror image: `ContractStore::remove_contract` drops the hook and
 //!     cannot reach the ring to drop the demand.
 //!
+//! # What releases a pin — it is NOT only the delegate
+//!
+//! A count cap bounds a rate; it does not fix a leak. So the question that
+//! decides whether these bounds are a mitigation or merely a rate limit on
+//! unbounded accumulation is: what ever DECREMENTS demand? There are three
+//! paths plus process exit, and the third is the load-bearing one because it
+//! does not depend on the delegate behaving at all.
+//!
+//! 1. **`UnregisterDelegate`** drops every pin the delegate held, via
+//!    [`drop_delegate_demand`] → `Ring::remove_client_from_all_subscriptions`
+//!    (`contract/executor/runtime/delegates.rs`). So uninstalling a delegate
+//!    releases its contracts. Guarded by a source-scrape pin and covered
+//!    behaviourally by `unregistering_a_delegate_drops_every_contract_it_pinned`.
+//!
+//! 2. **The delegate-notification channel closing** drops the pins for the
+//!    contract it was delivering (`executor_impl.rs`).
+//!
+//! 3. **Subscriber-primary EVICTION**, and this is the one that matters for a
+//!    delegate that crashes, is never invoked again, or is simply buggy. A
+//!    delegate pin makes `contract_in_use` true, which under the fewest-
+//!    `(local, downstream)` ordering means the contract is evicted LAST — not
+//!    that it is exempt. When the node is over its byte budget and every
+//!    eligible contract carries a local subscriber, a pinned contract IS shed,
+//!    and `HostingManager::teardown_evicted_in_use_contract` clears
+//!    `client_subscriptions[key.id()]` wholesale before the reclamation funnel
+//!    runs — deliberately, so `contract_in_use` is false when the reclaim gate
+//!    checks it and the disk state is actually freed. The eviction decision
+//!    flags such a victim `was_in_use` (`ring/hosting/cache.rs`, `local +
+//!    downstream > 0`), and `local` counts delegate synthetic ids.
+//!
+//! 4. **Process exit.** Demand is in-memory; nothing survives a restart.
+//!
+//! So a delegate that pins contracts and then disappears does NOT strand them
+//! forever: **the hosting cache's byte budget retains final authority over a
+//! pinned contract**, and a pin cannot outrank it. The exposure is bounded by
+//! that budget, not by the delegate's lifetime, which is why the caps above are
+//! a mitigation rather than a rate limit on an unbounded accumulation.
+//!
+//! The real cost is a PRIORITY one, not a storage leak: a pinned contract
+//! displaces unpinned ones under budget pressure, and in the all-local-
+//! subscribed extreme the eviction "silently STRANDS the local client" (that
+//! method's own words) with no notification surface. That is the accepted
+//! last-resort behaviour of the eviction ordering, and a delegate pin now
+//! participates in it on the same footing as a WebSocket client's subscription.
+//!
+//! Note the residual tracked as #5487: path 3 clears the DEMAND while leaving
+//! the delegate's notification hook installed, so the delegate keeps a hook
+//! with no pin until it next subscribes. A divergence between the two records,
+//! not a leak of either.
+//!
 //! # A refused pin still reports SUCCESS to the delegate (unfixed)
 //!
 //! Every refusal in [`register_subscription`] — not hosting, no state, contract
