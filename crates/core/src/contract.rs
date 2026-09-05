@@ -57,7 +57,25 @@ use self::user_input::{CallerIdentity, UserInputPrompter};
 use crate::config::GlobalExecutor;
 use crate::wasm_runtime::UserSecretContext;
 
-/// Maximum iterations when handling contract requests to prevent infinite loops
+/// Maximum iterations when handling contract requests to prevent infinite loops.
+///
+/// # What this bounds, and what it does NOT
+///
+/// It bounds one delegate ROUND-TRIP, including across parks: `#5544 S1`
+/// carries the count in `delegate_park::Continuation`, so a delegate that emits
+/// `RequestUserInput` on every re-entry can no longer loop park -> resume ->
+/// park without limit.
+///
+/// It is deliberately NOT carried across a contract NOTIFICATION. A
+/// notification is genuinely a new invocation — driven by a contract changing
+/// rather than by this delegate continuing — so resetting there is correct.
+///
+/// That leaves a real, separate gap, tracked as `#5558`: a delegate is notified
+/// of its OWN writes (`send_delegate_contract_notifications` takes no
+/// originating-delegate parameter), so a delegate that answers a notification by
+/// writing the same contract loops unbounded and broadcasts every round, with
+/// this cap reset each time. **Neither bound subsumes the other**, and nothing
+/// here closes `#5558` — do not read this cap as covering the notification path.
 const MAX_CONTRACT_REQUEST_ITERATIONS: usize = 100;
 
 /// Maximum delegate notifications to drain per iteration.
@@ -733,6 +751,10 @@ struct RunSeed {
     accumulated: Vec<OutboundDelegateMsg>,
     /// Iterations already consumed, so `MAX_CONTRACT_REQUEST_ITERATIONS`
     /// bounds the whole round-trip and a park cannot reset it (#5544 S1).
+    ///
+    /// Bounds the round-trip only. A contract notification is a new invocation
+    /// and legitimately starts a fresh count — see the constant's rustdoc, and
+    /// #5558 for the separate gap that leaves open.
     iterations: usize,
 }
 

@@ -330,6 +330,11 @@ pub(super) struct Continuation {
     /// park -> resume -> park forever, holding its exclusion open the whole
     /// time and rejecting every other request for it. Before parking existed
     /// the same delegate stopped after 100 iterations.
+    ///
+    /// Scope boundary: this covers PARKS, not contract NOTIFICATIONS. A
+    /// notification is a genuinely new invocation and resets the count, which
+    /// is correct — and is also why #5558 (a delegate notified of its own
+    /// writes) is a separate unbounded loop that this does not close.
     pub iterations: usize,
     pub params: Parameters<'static>,
     pub origin_contract: Option<ContractInstanceId>,
