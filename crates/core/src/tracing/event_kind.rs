@@ -1417,12 +1417,13 @@ pub(crate) enum GetEvent {
         /// failure that still reached a terminal header). See
         /// [`GetExhaustionReason`]. Pair with `attempts` for the peer count
         /// on the exhaustion path — NOT a separate `retries`-derived field:
-        /// `advance_to_next_peer`'s `retries` counter increments BEFORE its
-        /// candidate lookup, so it overcounts by one whenever
-        /// `NoRoutingCandidates` fires (the exact bug caught in review for
-        /// an earlier version of this field, see `requests_sent`'s doc in
-        /// `op_ctx_task.rs` for the same overcount on the sibling counter).
-        /// `attempts` (`driver.requests_sent`) has no such bias.
+        /// an earlier version of this field pair also carried
+        /// `peer_advancements` from `advance_to_next_peer`'s `retries`
+        /// counter, but `retries` increments BEFORE the candidate lookup,
+        /// so it overcounts by one whenever `NoRoutingCandidates` fires
+        /// (review caught this; the field was dropped). `attempts`
+        /// (`driver.requests_sent`, documented in `op_ctx_task.rs` as the
+        /// accurate count for exactly this reason) has no such bias.
         exhaustion_reason: Option<GetExhaustionReason>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
