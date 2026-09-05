@@ -426,6 +426,20 @@ impl Executor<Runtime> {
                 // process — a permanent, un-collapsible lease. Mirrors the
                 // WebSocket disconnect path in `client_events.rs`, including
                 // its upstream-collapse decision.
+                //
+                // SCOPE MISMATCH, unfixed: the retain above walks the
+                // process-global `DELEGATE_SUBSCRIPTIONS`, so it clears this
+                // delegate's hooks on EVERY node in the process, while the
+                // demand drop below reaches only THIS node's ring. In a
+                // shared-process multi-node test (every `#[freenet_test]`),
+                // unregistering on node A therefore strips node B's hooks and
+                // leaves B's demand — a pin with nothing able to consume its
+                // updates. Production runs one node per process, so the impact
+                // is test-only; it is not closed by scoping the demand drop,
+                // because the registry has no node dimension to scope BY. The
+                // same mismatch exists in the channel-closed arm
+                // (`executor_impl.rs`). Both close when the hook and the demand
+                // become one record with one owner (#4669 part 3).
                 if let Some(op_manager) = &self.op_manager {
                     crate::contract::delegate_demand::drop_delegate_demand(op_manager, &key);
                 }

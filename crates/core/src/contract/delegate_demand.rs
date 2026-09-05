@@ -176,6 +176,7 @@ use freenet_stdlib::prelude::{ContractKey, DelegateKey};
 
 use crate::client_events::ClientId;
 use crate::node::OpManager;
+use crate::node::network_status::{DelegatePinOutcome, record_delegate_pin_outcome};
 
 /// Base of the [`ClientId`] range reserved for delegates.
 ///
@@ -190,79 +191,110 @@ use crate::node::OpManager;
 /// a delegate unregister drop a live client's subscription.
 const DELEGATE_CLIENT_ID_BASE: usize = 1usize << (usize::BITS - 1);
 
-/// Node-wide BACKSTOP on delegate pins, across every delegate and contract.
+/// Node-wide ceiling on delegate pins, across every delegate and contract.
 ///
-/// # This is a backstop, not a ration, and not the answer to resource abuse
+/// # Chosen against renewal capacity, with headroom reserved for clients
 ///
-/// Its only job is to stop unbounded growth — a logic bomb or an expensive bug
-/// pinning contracts without limit — before it hurts the node. It is set ABOVE
-/// any plausible legitimate use, deliberately, because a cap that stops real
-/// work is silent user harm: a wrongly-limited delegate files no complaint, it
-/// just produces an app that quietly stops working. Harvest wants a contract
-/// per Bitcoin address and Delta wants one per published site, so a number in
-/// the hundreds would be a policy claim about how many pins an app OUGHT to
-/// have, and this is not the place to make one (#5543's first principle).
+/// `Ring::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL` is 10 per 30 s = 20 renewals per
+/// minute. Two figures follow from that and BOTH are right; they describe
+/// different phasing of the same budget:
 ///
-/// **The real mechanism is demand-decay, and it is not built yet.** A delegate
-/// pin should refresh when it is actually USED — a notification fires, the
-/// state is read — and age out when it is not, the same demand-driven model
-/// #4642 gives contracts. That bounds a logic bomb pinning 10,000 contracts it
-/// never reads while costing an app with 500 live pins nothing, because the
-/// distinction that matters is PRODUCTIVE versus UNPRODUCTIVE use, not the
-/// count. Until that exists, this number is a safety net. See #5467 open
-/// question 1 and #5543; do not read it as settled, and do not tune it as
-/// though it were a quota.
+/// - **~160 staggered.** Each subscription needs one renewal per 8-minute
+///   `SUBSCRIPTION_LEASE_DURATION`, so 20/min x 8 min = 160 slots when renewals
+///   are spread evenly across the lease.
+/// - **~40 burst-phased.** `contracts_needing_renewal()` returns contracts
+///   expiring within a 2-minute window, so contracts subscribed TOGETHER share
+///   one window and only 20/min x 2 min = 40 fit. This is the figure
+///   `ring.rs`'s own comment quotes.
 ///
-/// Both refusals are counted and logged with distinct reasons, so the real
-/// distribution can be observed rather than guessed at.
-pub(crate) const MAX_DELEGATE_PINS_PER_NODE: usize = 10_000;
+/// **The burst case is the realistic one for a delegate**: an app subscribing
+/// its contracts at startup produces exactly that phasing. So 100 does NOT
+/// guarantee every pin is renewable — it bounds how badly the node can be
+/// oversubscribed, nothing more.
+///
+/// 100 is a bit under two thirds of the staggered budget, leaving the rest for
+/// ordinary WebSocket clients. That reservation is the whole point: delegate
+/// pins and client subscriptions are shuffled together in the renewal loop, so
+/// exceeding capacity does not degrade delegates gracefully — it expires REAL
+/// USER subscriptions, which is the starvation this bound exists to prevent.
+///
+/// # No number here is correct, and that is the finding
+///
+/// Harvest's working set is open orders — 5-20 concurrent for a hobbyist,
+/// 20-100 for a working seller, low hundreds for a busy one. A single working
+/// seller's delegate therefore consumes this entire node budget, and a busy
+/// one exceeds it. **At current renewal capacity there is no value that both
+/// fits a working seller and leaves clients safe.** Raising it moves the
+/// failure from a visible refusal to silent lease churn, which is worse; these
+/// numbers have NOT been validated against Delta's or Harvest's real per-node
+/// contract counts, and freenet/delta#30's "infrastructure delegate pinning
+/// many users' sites" pattern will hit this immediately.
+///
+/// The capacity is the constraint and a cap can only ration it. The real fix
+/// is to derive the allowance from the renewal window and RESERVE capacity for
+/// ordinary clients, or prioritise the two queues separately — which decouples
+/// delegate demand from client renewals regardless of the number. That is
+/// #5556 and #5467 open question 1, along with demand-decay (a pin refreshing
+/// when it is actually USED and ageing out when it is not, the #4642 model),
+/// which bounds unproductive pinning without charging productive use. Do not
+/// tune this constant as though it were a quota.
+pub(crate) const MAX_DELEGATE_PINS_PER_NODE: usize = 100;
 
-/// Per-delegate BACKSTOP on pins, so one delegate cannot consume the whole
-/// node-wide budget on its own.
+/// Per-delegate ceiling, kept at the WebSocket value.
 ///
-/// Deliberately left at the same value as `MAX_SUBSCRIPTIONS_PER_CLIENT` rather
-/// than lowered. The asymmetry that argues for lowering is real — a client's
-/// subscriptions expire on disconnect and a delegate's have no TTL, no
-/// disconnect and no unsubscribe (#2830) — but acting on it means picking a
-/// number below plausible single-app use, and Harvest's contract-per-address
-/// model can exceed any such number with an ordinary HD wallet. Breaking a real
-/// app to tighten a backstop is the wrong trade; over-permitting here is the
-/// right one while demand-decay is the actual fix.
+/// **Defence in depth only: [`MAX_DELEGATE_PINS_PER_NODE`] is lower, so this
+/// cannot fire today.** It is kept rather than deleted because the node-wide
+/// figure is explicitly provisional — if reserved or separately-prioritised
+/// renewal capacity (#5556) raises it, this becomes the bound that stops one
+/// delegate consuming the whole allowance, and re-deriving it then is easy to
+/// forget. Its refusal reason is counted separately so its firing would be
+/// visible rather than inferred.
 ///
-/// # What the node can actually sustain is MUCH lower, and no cap here fixes it
-///
-/// `Ring::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL` is 10 per 30 s, which its own doc
-/// (`ring.rs`, "Maximum renewal tasks spawned per tick") says "effectively
-/// handles ~40 concurrent subscriptions before renewals can't keep up" — ~160
-/// per 8-minute lease when spread out, ~40 when burst-phased, which is exactly
-/// how an app subscribes on first run. Above that, leases lapse SILENTLY: the
-/// contract falls out of `contracts_needing_renewal` branch 1, re-enters via
-/// branch 2 later, and churns in and out of the update mesh with the subscriber
-/// missing updates and no error raised anywhere.
-///
-/// That budget is NODE-level and shared: it covers WebSocket clients' renewals
-/// as well as delegates'. So it cannot be enforced by a per-delegate cap —
-/// two delegates at 40 already exceed it — and it is not delegate-specific:
-/// `MAX_SUBSCRIPTIONS_PER_CLIENT` has exceeded it by 12x for a single WebSocket
-/// client since long before this module existed. Setting this constant to ~40
-/// would break Harvest at 200 addresses AND still not deliver the property.
-/// The capacity is the bug; a cap here cannot fix it. Tracked separately —
-/// see the PR body and #5556.
+/// Deliberately NOT lowered below the WebSocket number. The asymmetry that
+/// argues for lowering is real — a client's subscriptions expire on
+/// disconnect, a delegate's have no TTL, no disconnect and no unsubscribe
+/// (#2830) — but acting on it means picking a value below plausible single-app
+/// use. Harvest reports 20-100 concurrent open orders for a working seller and
+/// calls 50 "the ceiling for the smallest real user", and its contract-per-
+/// order model scales with transaction volume. Breaking a real app to tighten
+/// a backstop is the wrong trade.
 pub(crate) const MAX_PINS_PER_DELEGATE: usize = 500;
 
-// One delegate must not be able to consume the entire node-wide backstop.
-// Checked at compile time rather than in a test.
-//
-// There is deliberately NO assertion relating this to
-// `MAX_SUBSCRIPTIONS_PER_CLIENT`. An earlier revision asserted it was strictly
-// lower, which encoded a category error: that constant is a network-uniform
-// POLICY ration for clients, this one is a runaway backstop, and requiring an
-// ordering between them would force one to move whenever the other did for
-// reasons that have nothing to do with it.
+// The node-wide ceiling must stay below the per-CONTRACT cap, or that cap is
+// unreachable by delegates and its refusal branch is dead code pretending to be
+// a guard. It is defence in depth over the COMBINED set — delegates plus
+// WebSocket clients — and only binds when enough real clients are already
+// subscribed, which is the honest description of what it does.
 const _: () = assert!(
-    MAX_PINS_PER_DELEGATE < MAX_DELEGATE_PINS_PER_NODE,
-    "one delegate must not be able to consume the entire node-wide pin budget"
+    MAX_DELEGATE_PINS_PER_NODE < crate::contract::executor::MAX_SUBSCRIBERS_PER_CONTRACT,
+    "the node-wide delegate ceiling must stay below the per-contract subscriber \
+     cap, or delegates can never reach the latter and it guards nothing"
 );
+
+// MAX_PINS_PER_DELEGATE is currently UNREACHABLE: the node-wide ceiling is
+// lower, so the node-wide branch always refuses first and the per-delegate one
+// is defence in depth that cannot fire. There is deliberately no behavioural
+// test for it — reaching it would mean driving the node-wide bound first, so
+// the test would pass for the wrong reason, which this module has been caught
+// by once already.
+//
+// This fails the BUILD if the node ceiling is ever raised above the
+// per-delegate one (#5556's reserved-renewal-capacity work could do exactly
+// that), because at that moment the branch becomes live and needs real
+// coverage. A compile-time failure is the right severity: a silently untested
+// live bound is how the per-contract cap nearly shipped vacuous.
+const _: () = assert!(
+    MAX_DELEGATE_PINS_PER_NODE <= MAX_PINS_PER_DELEGATE,
+    "the node-wide ceiling has been raised above the per-delegate one, so the \
+     per-delegate refusal branch is now REACHABLE and has no behavioural test. \
+     Add one covering a single delegate hitting its own limit, then update \
+     this guard."
+);
+
+// No assertion relates MAX_PINS_PER_DELEGATE to MAX_SUBSCRIPTIONS_PER_CLIENT.
+// That would encode a category error: the latter is a network-uniform POLICY
+// ration for clients, this is a backstop, and forcing an ordering would make
+// one move whenever the other did for unrelated reasons.
 
 /// The stable synthetic [`ClientId`] standing in for `delegate` as a local
 /// subscriber.
@@ -446,12 +478,14 @@ impl LogFloodGate {
 /// immediately after this check lands in the same state. That residual is the
 /// same one the bootstrap work closes.
 ///
-/// The `false` branch is the attachment point for #5467 Phase 0's
-/// "pins that never took" counter: a `warn!` is a trace of the event, not a
-/// record of it, and once the subscription is torn down there is no live row
-/// left to show the pin was missing. The counter is not called from here yet
-/// only because it lands in a later change; when it does, it goes beside the
-/// `warn!` below and needs nothing else from this function.
+/// Every branch here — this one and the three cap refusals — records its
+/// outcome through `network_status::record_delegate_pin_outcome` (#5467 Phase
+/// 0), including the SUCCESS path so the refusals have a denominator. A `warn!`
+/// is a trace of an event, not a record of it: once the subscription is torn
+/// down there is no live row left showing the pin was missing, and the
+/// [`LogFloodGate`] cadence means a long-saturated node logs almost nothing.
+/// The reasons are counted separately because they call for different
+/// responses — see `DelegatePinRefusalStats`.
 pub(crate) fn register_subscription(
     op_manager: &OpManager,
     delegate: &DelegateKey,
@@ -487,6 +521,27 @@ pub(crate) fn register_subscription(
     // `wasm_runtime::runtime::DelegateSubscribeCallback` for the accounting.
     // Correctness wins here: the alternative is a pin nothing can renew,
     // reclaim, or repair.
+    //
+    // DEGRADES TO THE BUG ON NON-REDB BUILDS, and that is worse here than for
+    // the predicate's other consumers. `contract_state_present` has a
+    // `#[cfg(feature = "redb")]` fast path and returns `true` unconditionally
+    // otherwise — and also on a store error or an unset storage handle. Under
+    // `--no-default-features --features sqlite` this gate is therefore
+    // `is_hosting_contract && true`: exactly the check the paragraph above
+    // calls the bug.
+    //
+    // The conservative `true` is right for its original caller, where a wrong
+    // answer costs a skipped heartbeat. It is NOT obviously right here, because
+    // a delegate-created phantom is UNREPAIRABLE —
+    // `reconcile_phantom_in_use` iterates `downstream_subscribers` only, so
+    // nothing ever revisits it. The sync sqlite path cannot be fixed cheaply
+    // (there is no cheap synchronous existence check, which is why the fallback
+    // exists); the async sibling `contract_state_present_async` DOES query
+    // sqlite for real, but this call site is synchronous on the WASM call stack
+    // and cannot await it. Making it async is a change to the V2 host-function
+    // signature, not a local fix. redb is the default feature and what ships,
+    // so this is a known gap on a non-default build rather than a live defect —
+    // recorded here so a future sqlite build does not inherit it silently.
     if !(op_manager.ring.is_hosting_contract(contract)
         && op_manager.ring.contract_state_present(contract))
     {
@@ -500,6 +555,7 @@ pub(crate) fn register_subscription(
         // Rate-limited, because a delegate controls how often it lands here.
         // See [`LogFloodGate`] for why, and for why the cap branch below gets
         // the same treatment from the same type rather than a second copy.
+        record_delegate_pin_outcome(DelegatePinOutcome::NotHosted);
         static NOT_HOSTING: LogFloodGate = LogFloodGate::new();
         if let Some(occurrences) = NOT_HOSTING.admit() {
             tracing::warn!(
@@ -558,6 +614,7 @@ pub(crate) fn register_subscription(
     {
         // Rate-limited through the same [`LogFloodGate`] as the other two
         // refusal branches: a delegate drives how often it lands here.
+        record_delegate_pin_outcome(DelegatePinOutcome::ContractFull);
         static CONTRACT_FULL: LogFloodGate = LogFloodGate::new();
         if let Some(occurrences) = CONTRACT_FULL.admit() {
             tracing::warn!(
@@ -634,6 +691,7 @@ pub(crate) fn register_subscription(
             // app is greedy; node-wide says the node is saturated and REAL
             // client subscriptions are at risk of losing renewal slots, which
             // is the condition an operator needs to see.
+            record_delegate_pin_outcome(DelegatePinOutcome::NodeFull);
             static NODE_FULL: LogFloodGate = LogFloodGate::new();
             if let Some(occurrences) = NODE_FULL.admit() {
                 tracing::warn!(
@@ -654,6 +712,7 @@ pub(crate) fn register_subscription(
         }
 
         if held_by_delegate >= MAX_PINS_PER_DELEGATE {
+            record_delegate_pin_outcome(DelegatePinOutcome::DelegateFull);
             static AT_CAP: LogFloodGate = LogFloodGate::new();
             if let Some(occurrences) = AT_CAP.admit() {
                 tracing::warn!(
@@ -684,6 +743,9 @@ pub(crate) fn register_subscription(
     op_manager
         .ring
         .add_client_subscription(contract.id(), client_id);
+    // Counted too, not just the refusals: a refusal count with no denominator
+    // cannot distinguish "5 pins failed out of 5" from "out of 50,000".
+    record_delegate_pin_outcome(DelegatePinOutcome::Registered);
     tracing::debug!(
         delegate = %delegate,
         contract = %contract,
@@ -1154,89 +1216,6 @@ mod tests {
         assert_eq!((0, 0), ring.local_and_downstream_counts(&key));
     }
 
-    /// A delegate gets a LOWER pin cap than a WebSocket client, deliberately.
-    ///
-    /// Registering demand directly walks past the gate the WebSocket path gets
-    /// transitively (`client_events.rs` calls `add_client_subscription` only
-    /// inside the `Ok` arm of the listener registration, where `RuntimePool`
-    /// enforces `MAX_SUBSCRIPTIONS_PER_CLIENT`), so without an explicit check a
-    /// delegate would hold unbounded ring demand.
-    ///
-    /// The number is deliberately NOT the WebSocket one. A client's 500
-    /// subscriptions expire on disconnect; a delegate's pins have no TTL, no
-    /// disconnect and no unsubscribe (#2830), so they are not the same bargain.
-    /// See [`MAX_PINS_PER_DELEGATE`].
-    #[tokio::test(start_paused = true)]
-    async fn a_delegate_gets_a_lower_pin_cap_than_a_websocket_client() {
-        let fixture = seam_fixture("delegate-demand-4669-cap").await;
-        let op_manager = fixture.op_manager.clone();
-        let ring = &op_manager.ring;
-        let delegate = delegate_key(71);
-        let cap = MAX_PINS_PER_DELEGATE;
-
-        // Fill to the cap through the real registration path.
-        let mut keys = Vec::with_capacity(cap + 1);
-        for i in 0..=cap {
-            // Distinct 32-byte ids without colliding with the other tests'
-            // fixed seeds: index the first four bytes.
-            let mut raw = [0u8; 32];
-            raw[0] = 0xC0;
-            raw[1..5].copy_from_slice(&(i as u32).to_le_bytes());
-            let key = ContractKey::from_id_and_code(
-                freenet_stdlib::prelude::ContractInstanceId::new(raw),
-                freenet_stdlib::prelude::CodeHash::new([7u8; 32]),
-            );
-            let _ = ring.host_contract(
-                key,
-                121,
-                crate::ring::AccessType::Put,
-                crate::ring::HostingCause::Other,
-            );
-            keys.push(key);
-        }
-
-        for key in keys.iter().take(cap) {
-            assert!(
-                register_subscription(&op_manager, &delegate, key),
-                "registration below the cap must succeed"
-            );
-        }
-        assert_eq!(
-            cap,
-            ring.client_and_reserved_range_counts(
-                client_id_for(&delegate),
-                DELEGATE_CLIENT_ID_BASE,
-            )
-            .0
-        );
-
-        assert!(
-            !register_subscription(&op_manager, &delegate, &keys[cap]),
-            "the {cap}-th+1 registration must be refused — a delegate must not \
-             hold unbounded permanent ring demand"
-        );
-        assert!(
-            !ring.contract_in_use(&keys[cap]),
-            "the refused contract must not be pinned"
-        );
-
-        // An idempotent re-subscribe to something already registered must NOT
-        // be refused just because the delegate sits at the cap.
-        assert!(
-            register_subscription(&op_manager, &delegate, &keys[0]),
-            "a repeat subscribe to an already-registered contract must still \
-             succeed at the cap — it adds no new demand"
-        );
-        assert_eq!(
-            cap,
-            ring.client_and_reserved_range_counts(
-                client_id_for(&delegate),
-                DELEGATE_CLIENT_ID_BASE,
-            )
-            .0
-        );
-    }
-
     /// A contract's subscriber set is bounded across BOTH kinds of subscriber.
     ///
     /// `MAX_SUBSCRIBERS_PER_CONTRACT` bounds subscribers-per-contract and was
@@ -1336,7 +1315,7 @@ mod tests {
 
         // Fill the node to its ceiling with reserved-range ids spread over many
         // contracts, the way many delegates each holding some pins would.
-        let per_contract = 250usize;
+        let per_contract = (node_cap / 4).max(1);
         let contracts = node_cap / per_contract;
         let mut seeded = 0usize;
         for c in 0..contracts {
@@ -1376,6 +1355,88 @@ mod tests {
              per-delegate cap alone would let 256 delegates walk past it"
         );
         assert!(!ring.contract_in_use(&key));
+    }
+
+    /// Every pin attempt is tallied by REASON, successes included.
+    ///
+    /// This is the #5467 Phase 0 counter, and it is the only durable evidence a
+    /// pin did not take: the delegate is told its subscribe succeeded, and the
+    /// `warn!` is both invisible to the delegate and thinned by
+    /// [`LogFloodGate`] to almost nothing on a long-saturated node.
+    ///
+    /// Asserts the reasons are counted SEPARATELY, which is the property that
+    /// makes the counter worth having — "node is saturated and real client
+    /// renewals are at risk" and "one app is greedy" call for different
+    /// responses, and a single total cannot distinguish them. Also asserts the
+    /// success denominator moves, without which a refusal count cannot say
+    /// whether it represents a rounding error or the whole workload.
+    #[tokio::test(start_paused = true)]
+    async fn pin_outcomes_are_counted_separately_by_reason() {
+        // The counters live on the `NETWORK_STATUS` singleton, which the seam
+        // fixture does not initialise — `record_delegate_pin_outcome` is a
+        // silent no-op until it is. Same idiom as
+        // `ring::connection_manager`'s tests. `init` is a `OnceLock::set` and
+        // ignores a second call, so this is safe whoever got there first.
+        crate::node::network_status::init(0, std::collections::HashSet::new(), "test".to_string());
+
+        let fixture = seam_fixture("delegate-demand-4669-counter").await;
+        let op_manager = fixture.op_manager.clone();
+        let ring = &op_manager.ring;
+
+        // DELTAS, not absolutes: the singleton is process-global, so under
+        // plain `cargo test` another test in the same process may have moved
+        // these already. The exact-equality assertions below additionally
+        // assume no CONCURRENT delegate test in this process — true under
+        // nextest, which CI uses and which gives every test its own process
+        // (`.claude/rules/testing.md`, "cross-test interference").
+        let before = crate::node::network_status::delegate_pin_refusal_counts()
+            .expect("counters readable once NETWORK_STATUS is initialised");
+
+        // A hosted contract with state -> registers.
+        let hosted = contract_key(121);
+        let _ = ring.host_contract(
+            hosted,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        assert!(register_subscription(
+            &op_manager,
+            &delegate_key(122),
+            &hosted
+        ));
+
+        // A contract the node does not host -> refused as not_hosted.
+        let absent = contract_key(123);
+        assert!(!ring.is_hosting_contract(&absent));
+        assert!(!register_subscription(
+            &op_manager,
+            &delegate_key(124),
+            &absent
+        ));
+
+        let after = crate::node::network_status::delegate_pin_refusal_counts()
+            .expect("counters still readable");
+
+        assert_eq!(
+            1,
+            after.registered - before.registered,
+            "the success path must move the denominator, or a refusal count \
+             cannot be read as a rate"
+        );
+        assert_eq!(
+            1,
+            after.not_hosted - before.not_hosted,
+            "the not-hosted refusal must be counted under its own reason"
+        );
+        assert_eq!(
+            0,
+            after.node_full - before.node_full,
+            "an unrelated reason must not move — reasons that shared a counter \
+             would be indistinguishable, which defeats the purpose"
+        );
+        assert_eq!(0, after.contract_full - before.contract_full);
+        assert_eq!(0, after.delegate_full - before.delegate_full);
     }
 
     /// Dropping demand a delegate never held must have NO side effects.
@@ -1467,7 +1528,7 @@ mod tests {
         assert!(!ring.contracts_needing_renewal().contains(&key));
     }
 
-    /// [`drop_subscription`] must be narrow in BOTH directions: one delegate,
+    /// [`drop_subscriptions_for_contract`] must be narrow in BOTH directions: one delegate,
     /// one contract.
     ///
     /// Its only caller is the notification-channel-closed arm
@@ -1479,7 +1540,7 @@ mod tests {
     /// the state this module exists to prevent.
     ///
     /// Everything else here exercises [`drop_delegate_demand`], so without this
-    /// test `drop_subscription` had no behavioural coverage at all and only the
+    /// test `drop_subscriptions_for_contract` had no behavioural coverage at all and only the
     /// source-scrape pin below would have noticed it going wrong.
     #[tokio::test(start_paused = true)]
     async fn dropping_one_contract_leaves_the_delegates_other_pins_intact() {
@@ -1521,7 +1582,7 @@ mod tests {
             (1, 0),
             ring.local_and_downstream_counts(&kept),
             "the SAME delegate's pin on a DIFFERENT contract must survive — \
-             this is the whole difference between `drop_subscription` and \
+             this is the whole difference between `drop_subscriptions_for_contract` and \
              `drop_delegate_demand`, and a widened implementation would retire \
              pins whose notification hooks are still installed"
         );
@@ -1863,7 +1924,7 @@ mod tests {
     /// TOGETHER.
     ///
     /// This is the sibling of the `UnregisterDelegate` pin above, and it was
-    /// missing: `drop_subscription`'s only caller had no guard at all, so
+    /// missing: `drop_subscriptions_for_contract`'s only caller had no guard at all, so
     /// deleting the call left every test green. The arm's whole purpose is to
     /// keep two records in step — clearing `DELEGATE_SUBSCRIPTIONS` without the
     /// demand is the original #4669 defect (a hook with no pin); dropping the

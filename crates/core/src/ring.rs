@@ -2007,6 +2007,23 @@ impl Ring {
                 snapshot.upstream_computed_vs_stored_divergences = Some(divergences);
             }
 
+            // Delegate pin outcomes by reason (#4669 / #5467 Phase 0). Recorded
+            // in `contract::delegate_demand::register_subscription`, where every
+            // refusal still reports SUCCESS to the delegate — this counter (and
+            // a rate-limited `warn!`) is the only evidence a pin did not take.
+            // Read from the per-node network_status singleton; same hand-mirror
+            // footgun as the counters above — a new `RouterSnapshotInfo` field
+            // is invisible to the collector unless added here AND in
+            // `event_kind_to_json`. `None` only before the singleton is
+            // initialized.
+            if let Some(delegate_pin) = crate::node::network_status::delegate_pin_refusal_counts() {
+                snapshot.delegate_pin_registered = Some(delegate_pin.registered);
+                snapshot.delegate_pin_not_hosted = Some(delegate_pin.not_hosted);
+                snapshot.delegate_pin_contract_full = Some(delegate_pin.contract_full);
+                snapshot.delegate_pin_node_full = Some(delegate_pin.node_full);
+                snapshot.delegate_pin_delegate_full = Some(delegate_pin.delegate_full);
+            }
+
             // Reconcile-controller SHADOW comparison counters, split PER SITE
             // (keystone step-2, #4642). Recorded at the on-`main` hosting decision
             // sites (collapse via `send_unsubscribe_upstream`, renewal via
@@ -4450,7 +4467,8 @@ impl Ring {
     ///
     /// Used by the delegate demand path to apply `MAX_SUBSCRIBERS_PER_CONTRACT`
     /// before inserting. O(1): one `DashMap` lookup and a `HashSet::len`, unlike
-    /// the per-subscriber [`Self::client_subscription_count`], which has to scan.
+    /// the per-subscriber half of [`Self::client_and_reserved_range_counts`], which
+    /// has to scan.
     pub fn local_subscriber_count(&self, instance_id: &ContractInstanceId) -> usize {
         self.hosting_manager.local_client_count(instance_id)
     }
