@@ -14,7 +14,7 @@
     "test": "node base58_encode.test.mjs && node dashboard_refresh.test.mjs && node shell_bridge_notifications.test.mjs && node shell_bridge_reload.test.mjs && node shell_bridge_permission_ws.test.mjs && node connecting_recovery.test.mjs && node notify_sw.test.mjs && node update_check.test.mjs && node table_filter.test.mjs && node theme_preference.test.mjs"
   },
   "devDependencies": {
-    "@eslint/js": "^9.39.0",
+    "@eslint/js": "^10.0.1",
     "eslint": "^10.9.1",
     "globals": "^17.11.0",
     "prettier": "^3.9.6"
