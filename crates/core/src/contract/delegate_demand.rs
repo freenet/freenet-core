@@ -667,33 +667,38 @@ pub(crate) fn register_subscription(
     // before demand registration was added to it. Bounding it is a change to
     // the V1 delegate contract — what happens to the excess, and what the
     // delegate is told — so it is not made here. Flagged rather than fixed.
-    // NOT ATOMIC with the insert below, and that is a deliberate accept.
+    // NOT ATOMIC with the insert below — but the overshoot it would allow is
+    // UNREACHABLE today, for a reason worth stating precisely rather than
+    // hand-waving as "bounded".
     //
-    // All three bounds are check-then-insert with no lock spanning the two, and
-    // `RuntimePool` runs V2 host calls on separate worker threads, so N
-    // concurrent registrations can each observe a count below the limit before
-    // any of them inserts. The bound is then exceeded.
+    // All three bounds are check-then-insert with no lock spanning the two, so
+    // in principle N concurrent registrations could each observe a count below
+    // the limit before any inserts. `RuntimePool` CAN hand out executors
+    // concurrently, so the capability exists. The loop never uses it here:
+    // `handle_delegate_with_contract_requests` has exactly two call sites
+    // (`contract.rs`, the notification-delivery path and the
+    // `ContractHandlerEvent::DelegateRequest` arm) and BOTH await it inline on
+    // the serial contract-handling loop with no spawn. Delegate `process()` is
+    // therefore globally serialised, the in-flight count is one, and no two
+    // registrations can interleave between check and insert. This is the same
+    // loop-serialisation invariant #5554 documents at
+    // `dispatch_delegate_request`; two changes now depend on it.
     //
-    // The overshoot is BOUNDED, which is what makes this acceptable for a
-    // backstop: it is at most the number of registrations in flight at once,
-    // and it cannot compound — once the count is over the limit every
-    // subsequent registration is refused, so the excess is a one-time constant
-    // rather than a runaway. That is the property these bounds exist to
-    // provide (see `MAX_DELEGATE_PINS_PER_NODE`: stop unbounded growth, do not
-    // ration), and the numbers are set far above plausible legitimate use, so
-    // being a handful over is immaterial.
+    // IF that serialisation is removed — parking delegates off the loop is
+    // exactly what #5554 does — the race becomes reachable, and then the
+    // overshoot is bounded by the number of registrations in flight and cannot
+    // compound: once the count is over, every later registration is refused, so
+    // the excess is a one-time constant rather than a runaway. That is still
+    // acceptable for a backstop set above plausible legitimate use, which is
+    // why this is documented rather than locked.
     //
-    // Closing it properly is not cheap. Only the per-CONTRACT bound could be
-    // made exact without a global lock, by moving the check inside
-    // `add_client_subscription` under the entry guard it already holds — but
-    // that changes a method the WebSocket path also calls. The per-delegate and
-    // node-wide bounds span the whole map, so they would need a lock held
-    // across the scan AND the insert, serialising every delegate subscribe on
-    // the node across all worker threads, on the WASM call stack. That is a
-    // real cost to tighten a deliberately loose backstop by a small constant.
-    //
-    // Revisit this when demand-decay replaces the counting bounds (#5467 open
-    // question 1, #5543): a decaying pin has no sharp threshold to race against.
+    // Making it exact is not cheap. Only the per-CONTRACT bound could be made
+    // atomic without a global lock, by moving the check under the entry guard
+    // `add_client_subscription` already holds — and that method is also on the
+    // WebSocket path. The per-delegate and node-wide bounds span the whole map,
+    // so they would need a lock held across the scan AND the insert,
+    // serialising every delegate subscribe on the node across all worker
+    // threads, on the WASM call stack.
     let is_new = !op_manager
         .ring
         .has_client_subscription(contract.id(), client_id);
