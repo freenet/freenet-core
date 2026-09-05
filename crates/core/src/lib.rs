@@ -225,3 +225,15 @@ pub mod dev_tool {
 pub mod deadlock_detection;
 
 pub mod test_utils;
+
+/// DELIBERATE clippy violation for the freenet-core#5451 inverse check.
+///
+/// This exists only to prove that a required status context can still report
+/// FAILURE after #5571 removed the workflow-level path filters. It trips
+/// `clippy::needless_return` and `clippy::len_zero`, both denied by
+/// `cargo clippy --all-targets -- -D warnings` in ci.yml.
+///
+/// The branch carrying this must never merge.
+pub fn ci_inverse_check_5451(v: &[u8]) -> bool {
+    return v.len() == 0;
+}
