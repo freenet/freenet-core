@@ -1264,7 +1264,14 @@ mod tests {
             CommitOutcome::ClearFailed { marker_version, .. } => {
                 assert_eq!(marker_version, "0.2.123");
             }
-            other => panic!(
+            // Enumerated, not `other =>`: `wildcard_enum_match_arm` exists so a
+            // new `CommitOutcome` variant breaks every match site rather than
+            // silently falling through here — and this test's own PR is what
+            // added `ClearFailed`, so a wildcard would have swallowed exactly
+            // the kind of variant it is meant to catch.
+            other @ (CommitOutcome::Committed
+            | CommitOutcome::ClearedStale { .. }
+            | CommitOutcome::Nothing) => panic!(
                 "an unremovable marker must NOT report as committed — rollback is still armed. \
                  Got: {other:?}"
             ),
