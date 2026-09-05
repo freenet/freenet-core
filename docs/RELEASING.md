@@ -110,7 +110,11 @@ CN=Freenet Project Inc, O=Freenet Project Inc, L=Austin, S=Texas, C=US
 
 **Unlike every other secret in the table above, this path is fail-closed.** The
 `Verify signatures` step runs `Get-AuthenticodeSignature` on the runner and
-throws if a binary is unsigned, invalid, or missing its RFC3161 timestamp. A
+throws if a binary is unsigned, invalid, missing its RFC3161 timestamp, or
+**signed by a publisher other than `CN=Freenet Project Inc`**. That last check
+matters because `Valid` on its own only means "chains to a trusted root and is
+timestamped" — it says nothing about who signed it, so without an explicit
+subject assertion a binary signed by a different certificate profile would pass. A
 broken Azure configuration therefore fails `build-x86_64-windows`, and because
 `attach-to-release` needs that job, the release stops as a draft rather than
 shipping unsigned binaries. That is deliberate — but it means Azure-side
