@@ -647,6 +647,26 @@ pub(crate) fn register_subscription(
     //
     // Checked only for a NEW registration, so an idempotent re-subscribe is
     // never refused by either bound.
+    // COST: the fused scan below is O(contracts-with-subscribers) and is paid on
+    // every NEW registration, refused ones included. `LogFloodGate` bounds the
+    // LOGGING, not the work — so once the node is at its ceiling, every further
+    // new-contract subscribe pays a full walk to be told no.
+    //
+    // The cheap checks are ordered first, so a refusal never reaches here
+    // unnecessarily: the hosting/state gate, then the O(1) per-contract count,
+    // then the O(1) already-subscribed check. Only a genuinely new pin on a
+    // hosted contract reaches the scan.
+    //
+    // What is NOT bounded is the PRODUCER. A V1 delegate's `process()` returns
+    // an unbounded `Vec<OutboundDelegateMsg>`, and `contract.rs` collects every
+    // `SubscribeContractRequest` from it into an unbounded `Vec` and processes
+    // all of them — on the serial contract-handling loop. There is no cap on
+    // that count anywhere. That is the shape `hosting.rs` names as the
+    // #4440/#4610 lesson in its own words ("never an unbounded producer feeding
+    // the shared serial paths"), and it predates this module: the loop existed
+    // before demand registration was added to it. Bounding it is a change to
+    // the V1 delegate contract — what happens to the excess, and what the
+    // delegate is told — so it is not made here. Flagged rather than fixed.
     // NOT ATOMIC with the insert below, and that is a deliberate accept.
     //
     // All three bounds are check-then-insert with no lock spanning the two, and
