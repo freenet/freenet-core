@@ -174,7 +174,14 @@ pub(super) const MAX_PENDING_PER_DELEGATE: usize = 8;
 /// three wrong-scope bounds on this change already. Over the cap the NEW
 /// notification is dropped — the delegate will see that contract's next state
 /// change, which is the pipeline's standing contract.
-pub(super) const MAX_PENDING_NOTIFICATION_CONTRACTS: usize = 64;
+///
+/// 16 rather than something larger because this lane also sets the worst-case
+/// burst when a park is torn down: one resume runs `1 +
+/// MAX_PENDING_PER_DELEGATE + MAX_PENDING_NOTIFICATION_CONTRACTS` delegate runs
+/// before the fair queue gets a turn (#5544 M6). At 16 that is 25, against a
+/// `MAX_RESUME_DRAIN_BATCH` of 16 — one over-long batch at park tear-down,
+/// which cannot repeat until another park forms. At 64 it was 73.
+pub(super) const MAX_PENDING_NOTIFICATION_CONTRACTS: usize = 16;
 
 /// Cap on deferred related-contract fetches a single park may carry (#5544 S3).
 ///
@@ -221,23 +228,76 @@ pub(super) fn continuation_bytes(continuation: &Continuation) -> usize {
             .iter()
             .map(outbound_bytes)
             .sum::<usize>()
+        // `params` is delegate-supplied and retained for the life of the park.
+        // Omitting it was one of three ways this "byte bound" failed to bound.
+        + continuation.params.as_ref().len()
+}
+
+/// Approximate bytes an off-loop task retains for one park: the prompts it is
+/// driving and the upserts whose related contracts it is fetching.
+///
+/// Charged at admission because the task holds these for exactly as long as the
+/// park exists, and a single `PendingUpsert` can own a full state plus related
+/// contracts plus contract code. `MAX_DEFERRED_UPSERTS_PER_PARK` caps the
+/// COUNT of those, which is the same unit mismatch one level down.
+pub(super) fn task_bytes(
+    prompts: &[freenet_stdlib::prelude::UserInputRequest<'static>],
+    upserts: &[PendingUpsert],
+) -> usize {
+    let prompt_bytes: usize = prompts
+        .iter()
+        .map(|r| r.message.bytes().len() + r.responses.iter().map(|resp| resp.len()).sum::<usize>())
+        .sum();
+    let upsert_bytes: usize = upserts
+        .iter()
+        .map(|u| {
+            let update = match &u.update {
+                Either::Left(state) => state.as_ref().len(),
+                Either::Right(delta) => delta.as_ref().len(),
+            };
+            let code = u
+                .code
+                .as_ref()
+                .map_or(0, |c| c.data().len() + c.params().as_ref().len());
+            let related: usize = u
+                .related_contracts
+                .clone()
+                .into_owned()
+                .states()
+                .map(|(_, st)| st.as_ref().map_or(0, |s| s.as_ref().len()))
+                .sum();
+            update + code + related
+        })
+        .sum();
+    prompt_bytes + upsert_bytes
 }
 
 /// Approximate bytes a queued delegate request pins.
 pub(super) fn request_bytes(req: &DelegateRequest<'static>) -> usize {
-    // Only `ApplicationMessages` carries a payload; the registration variants
-    // do not. Listed alongside the `#[non_exhaustive]` wildcard so a future
-    // payload-bearing variant has to be considered here rather than silently
-    // counting as zero.
+    // The registration variants are NOT free: `RegisterDelegate` carries a whole
+    // `DelegateContainer`, i.e. the delegate's WASM, and `DelegateRequest::key()`
+    // returns that delegate's own key — so a re-registration really does queue
+    // behind that delegate's park. An earlier version of this comment asserted
+    // the opposite of the type definition and charged them zero, which is 8 per
+    // park x 64 parks = 512 delegate modules at a counted cost of nothing.
     match req {
-        DelegateRequest::ApplicationMessages { inbound, .. } => {
-            inbound.iter().map(inbound_bytes).sum()
-        }
-        DelegateRequest::RegisterDelegate { .. }
-        | DelegateRequest::UnregisterDelegate(_)
-        | DelegateRequest::RegisterDelegateWithPredecessors { .. }
-        | _ => 0,
+        DelegateRequest::ApplicationMessages {
+            inbound, params, ..
+        } => inbound.iter().map(inbound_bytes).sum::<usize>() + params.as_ref().len(),
+        DelegateRequest::RegisterDelegate { delegate, .. } => delegate_container_bytes(delegate),
+        DelegateRequest::RegisterDelegateWithPredecessors {
+            delegate,
+            predecessors,
+            ..
+        } => delegate_container_bytes(delegate) + predecessors.len() * 64,
+        DelegateRequest::UnregisterDelegate(_) | _ => 0,
     }
+}
+
+fn delegate_container_bytes(delegate: &freenet_stdlib::prelude::DelegateContainer) -> usize {
+    // `DelegateContainer` exposes the code but not the parameters directly;
+    // the code is the large part (the WASM) and is what matters for the bound.
+    delegate.code().as_ref().len()
 }
 
 fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
@@ -267,8 +327,12 @@ fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
     match msg {
         OutboundDelegateMsg::ApplicationMessage(m) => m.payload.len(),
         OutboundDelegateMsg::SendDelegateMessage(m) => m.payload.len(),
+        // NOT zero: `DelegateContext::MAX_SIZE` is 409,600 bytes, and these
+        // accumulate through park -> resume -> re-park via `RunSeed` for up to
+        // MAX_CONTRACT_REQUEST_ITERATIONS, which is ~40 MB per park if
+        // uncounted.
+        OutboundDelegateMsg::ContextUpdated(ctx) => ctx.as_ref().len(),
         OutboundDelegateMsg::RequestUserInput(_)
-        | OutboundDelegateMsg::ContextUpdated(_)
         | OutboundDelegateMsg::GetContractRequest(_)
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
@@ -419,7 +483,15 @@ pub(super) struct Continuation {
 /// One parked delegate.
 struct ParkEntry {
     continuation: Continuation,
+    /// Identity of THIS park; see [`DelegateResume::epoch`].
+    epoch: u64,
     parked_at: tokio::time::Instant,
+    /// Bytes retained by the OFF-LOOP TASK for this park — the prompts and the
+    /// deferred upserts it is holding. Not part of the continuation, but
+    /// retained for exactly as long, and each `PendingUpsert` can own a full
+    /// state plus related contracts and code. Charged so the byte cap bounds
+    /// what is actually held rather than only what this struct points at.
+    task_bytes: usize,
     /// Client requests, FIFO, capped by [`MAX_PENDING_PER_DELEGATE`]. Rejection
     /// is acceptable here precisely because the caller can be TOLD.
     pending_clients: VecDeque<PendingRun>,
@@ -473,6 +545,17 @@ pub(super) struct ResolvedUpsert {
 /// Sent from an off-loop task back to the `contract_handling` loop.
 pub(super) struct DelegateResume {
     pub delegate_key: DelegateKey,
+    /// Which PARK this resume belongs to (#5544 H1).
+    ///
+    /// A park is identified by `(key, epoch)`, not by key alone. The TTL
+    /// backstop ends a park by force-resuming it WITHOUT consuming the off-loop
+    /// task's `ParkGuard`, so that guard still owes a resume. If the delegate
+    /// has re-parked by the time it arrives, matching on key alone would hand
+    /// the OLD continuation's messages to the NEW park — the cross-round-trip
+    /// context corruption this whole mechanism exists to prevent, reached
+    /// through the backstop itself. The epoch makes the stale resume
+    /// identifiable and droppable.
+    pub epoch: u64,
     pub cause: ResumeCause,
     /// Messages that are ready to feed straight back into the delegate (the
     /// prompt path). Empty on a dropped or timed-out park, which still resumes
@@ -504,17 +587,20 @@ pub(super) struct ParkGuard {
 struct ParkGuardPayload {
     resume_tx: tokio::sync::mpsc::UnboundedSender<DelegateResume>,
     delegate_key: DelegateKey,
+    epoch: u64,
 }
 
 impl ParkGuard {
     pub(super) fn new(
         resume_tx: tokio::sync::mpsc::UnboundedSender<DelegateResume>,
         delegate_key: DelegateKey,
+        epoch: u64,
     ) -> Self {
         Self {
             payload: Some(ParkGuardPayload {
                 resume_tx,
                 delegate_key,
+                epoch,
             }),
         }
     }
@@ -540,10 +626,12 @@ impl ParkGuard {
         let ParkGuardPayload {
             resume_tx,
             delegate_key,
+            epoch,
         } = p;
         if resume_tx
             .send(DelegateResume {
                 delegate_key: delegate_key.clone(),
+                epoch,
                 cause,
                 inbound,
                 upserts,
@@ -574,8 +662,9 @@ impl Drop for ParkGuard {
 
 /// Outcome of asking to park a delegate.
 pub(super) enum ParkAdmission {
-    /// Parked. The caller must spawn the off-loop work with a [`ParkGuard`].
-    Admitted,
+    /// Parked. The caller must spawn the off-loop work with a [`ParkGuard`]
+    /// carrying this `epoch`, so a stale resume can be told from a live one.
+    Admitted { epoch: u64 },
     /// Refused (node-wide cap). The caller keeps the old inline behaviour;
     /// the continuation is handed back so nothing is lost.
     Refused(Box<Continuation>),
@@ -593,12 +682,30 @@ pub(super) enum QueueOutcome {
 /// Loop-owned per-delegate park state.
 pub(super) struct DelegateParkCtx {
     parked: HashMap<DelegateKey, ParkEntry>,
-    /// Running total of `continuation_bytes` across live parks (#5544 S4).
+    /// Running total of every retained payload across live parks (#5544 S4):
+    /// continuations, off-loop task work, and queued pending runs.
     parked_bytes: usize,
+    /// Source of park identities; see [`DelegateResume::epoch`].
+    next_epoch: u64,
+    /// Refusal counters, per cause (L9). A refusal that is only logged is a
+    /// clean zero to anything reading metrics — the same pattern this branch
+    /// fixed for the over-cap client request.
+    refused: RefusalCounts,
     /// Handed to each [`ParkGuard`] so an off-loop task can deliver its resume.
     /// Kept here rather than threaded separately so every call site needs only
     /// a single `&mut DelegateParkCtx`.
     resume_tx: tokio::sync::mpsc::UnboundedSender<DelegateResume>,
+}
+
+/// Why parked work was turned away, counted rather than only logged (L9).
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RefusalCounts {
+    /// Parks refused at the node-wide count or byte cap.
+    pub parks: u64,
+    /// Client requests refused because the pending queue was full or over budget.
+    pub client_requests: u64,
+    /// Notifications dropped at the distinct-contract cap or the byte budget.
+    pub notifications: u64,
 }
 
 impl DelegateParkCtx {
@@ -606,6 +713,8 @@ impl DelegateParkCtx {
         Self {
             parked: HashMap::new(),
             parked_bytes: 0,
+            next_epoch: 0,
+            refused: RefusalCounts::default(),
             resume_tx,
         }
     }
@@ -620,6 +729,25 @@ impl DelegateParkCtx {
         self.parked.contains_key(key)
     }
 
+    /// The live epoch for `key`, for tests that need to end a park they did not
+    /// capture the epoch from. Deliberately test-only: production code always
+    /// has the epoch from `ParkAdmission::Admitted` or the resume itself, and a
+    /// helper that looked one up by key would defeat the identity check.
+    /// Snapshot of what has been turned away, by cause.
+    ///
+    /// The running totals also ride on each refusal's own `warn!`/`info!`, so
+    /// production observability does not depend on anything calling this; this
+    /// accessor is what lets a test pin that the counting happens at all.
+    #[cfg(test)]
+    pub(super) fn refusals(&self) -> RefusalCounts {
+        self.refused
+    }
+
+    #[cfg(test)]
+    pub(super) fn epoch_of(&self, key: &DelegateKey) -> Option<u64> {
+        self.parked.get(key).map(|e| e.epoch)
+    }
+
     #[cfg(test)]
     pub(super) fn parked_count(&self) -> usize {
         self.parked.len()
@@ -631,8 +759,14 @@ impl DelegateParkCtx {
     /// guarantees only one round-trip per delegate is ever in flight, so this
     /// is unreachable by construction and is treated as a refusal rather than
     /// silently clobbering the live continuation.
-    pub(super) fn park(&mut self, key: DelegateKey, continuation: Continuation) -> ParkAdmission {
-        let bytes = continuation_bytes(&continuation);
+    pub(super) fn park(
+        &mut self,
+        key: DelegateKey,
+        continuation: Continuation,
+        // Bytes the off-loop task will retain for this park (see [`task_bytes`]).
+        task_bytes: usize,
+    ) -> ParkAdmission {
+        let bytes = continuation_bytes(&continuation).saturating_add(task_bytes);
         let over_bytes = self.parked_bytes.saturating_add(bytes) > MAX_PARKED_BYTES;
         if self.parked.len() >= MAX_PARKED_DELEGATES || self.parked.contains_key(&key) || over_bytes
         {
@@ -645,22 +779,28 @@ impl DelegateParkCtx {
                 byte_limit = MAX_PARKED_BYTES,
                 over_bytes,
                 already_parked = self.parked.contains_key(&key),
+                total_refused_parks = self.refused.parks.saturating_add(1),
                 "Refusing to park delegate; falling back to the inline path"
             );
+            self.refused.parks = self.refused.parks.saturating_add(1);
             return ParkAdmission::Refused(Box::new(continuation));
         }
         self.parked_bytes = self.parked_bytes.saturating_add(bytes);
+        let epoch = self.next_epoch;
+        self.next_epoch = self.next_epoch.wrapping_add(1);
         self.parked.insert(
             key,
             ParkEntry {
                 continuation,
+                epoch,
+                task_bytes,
                 parked_at: tokio::time::Instant::now(),
                 pending_clients: VecDeque::new(),
                 pending_notifications: HashMap::new(),
                 pending_bytes: 0,
             },
         );
-        ParkAdmission::Admitted
+        ParkAdmission::Admitted { epoch }
     }
 
     /// Queue a request that arrived for a parked delegate.
@@ -685,8 +825,10 @@ impl DelegateParkCtx {
                     .pending_notifications
                     .get(&contract_id)
                     .map_or(0, request_bytes);
-                let is_new_contract =
-                    superseded == 0 && !entry.pending_notifications.contains_key(&contract_id);
+                // `contains_key` alone is the question. An earlier
+                // `superseded == 0 &&` conjunct was dead weight that also read
+                // as if a zero-byte entry were no entry (L11).
+                let is_new_contract = !entry.pending_notifications.contains_key(&contract_id);
 
                 if is_new_contract
                     && entry.pending_notifications.len() >= MAX_PENDING_NOTIFICATION_CONTRACTS
@@ -695,9 +837,11 @@ impl DelegateParkCtx {
                         delegate = %key,
                         contract = %contract_id,
                         limit = MAX_PENDING_NOTIFICATION_CONTRACTS,
+                        total_dropped = self.refused.notifications.saturating_add(1),
                         "Dropped a notification: too many distinct contracts already \
                          queued behind this park"
                     );
+                    self.refused.notifications = self.refused.notifications.saturating_add(1);
                     return QueueOutcome::Rejected(Box::new(PendingRun::Notification {
                         contract_id,
                         req,
@@ -714,9 +858,11 @@ impl DelegateParkCtx {
                         parked_bytes,
                         adding_bytes = bytes,
                         byte_limit = MAX_PARKED_BYTES,
+                        total_dropped = self.refused.notifications.saturating_add(1),
                         "Dropped a notification: queueing it would exceed the parked \
                          byte budget"
                     );
+                    self.refused.notifications = self.refused.notifications.saturating_add(1);
                     return QueueOutcome::Rejected(Box::new(PendingRun::Notification {
                         contract_id,
                         req,
@@ -744,14 +890,36 @@ impl DelegateParkCtx {
                         delegate = %key,
                         queued = entry.pending_clients.len(),
                         limit = MAX_PENDING_PER_DELEGATE,
+                        total_refused = self.refused.client_requests.saturating_add(1),
                         "Delegate pending queue full while parked — rejecting request"
                     );
+                    self.refused.client_requests = self.refused.client_requests.saturating_add(1);
                     return QueueOutcome::Rejected(Box::new(client));
                 }
                 let bytes = match &client {
                     PendingRun::Client { req, .. } => request_bytes(req),
                     PendingRun::Notification { .. } => 0,
                 };
+                // Check the PROJECTED total BEFORE inserting. Adding first and
+                // checking never was worse than an overshoot: once
+                // `parked_bytes` passed the cap, `park()` refused EVERY delegate
+                // node-wide and everything fell back to inline stalls, so one
+                // local app pushing large ApplicationMessages behind a single
+                // park could disable parking for the whole node — reinstating
+                // the exact stall this change removes.
+                if parked_bytes.saturating_add(bytes) > MAX_PARKED_BYTES {
+                    tracing::warn!(
+                        delegate = %key,
+                        parked_bytes,
+                        adding_bytes = bytes,
+                        byte_limit = MAX_PARKED_BYTES,
+                        total_refused = self.refused.client_requests.saturating_add(1),
+                        "Refusing to queue a delegate request: it would exceed the \
+                         parked byte budget"
+                    );
+                    self.refused.client_requests = self.refused.client_requests.saturating_add(1);
+                    return QueueOutcome::Rejected(Box::new(client));
+                }
                 entry.pending_bytes = entry.pending_bytes.saturating_add(bytes);
                 self.parked_bytes = self.parked_bytes.saturating_add(bytes);
                 entry.pending_clients.push_back(client);
@@ -788,14 +956,38 @@ impl DelegateParkCtx {
     }
 
     /// End a park, returning its continuation and everything queued behind it.
-    pub(super) fn take(
+    /// End the park identified by `(key, epoch)`.
+    ///
+    /// Returns `None` when the epoch does not match — a STALE resume, from an
+    /// off-loop task whose park was already ended by the TTL backstop and whose
+    /// delegate has since re-parked. Matching on key alone would feed the old
+    /// continuation's messages into the new park (#5544 H1).
+    pub(super) fn take_matching(
         &mut self,
         key: &DelegateKey,
+        epoch: u64,
     ) -> Option<(Continuation, VecDeque<PendingRun>)> {
+        match self.parked.get(key) {
+            Some(entry) if entry.epoch == epoch => {}
+            Some(entry) => {
+                tracing::warn!(
+                    delegate = %key,
+                    stale_epoch = epoch,
+                    live_epoch = entry.epoch,
+                    "Dropping a STALE park resume: this delegate re-parked after \
+                     its previous park was force-resumed by the TTL backstop. \
+                     Absorbing it would feed the old continuation's messages to \
+                     the new park (#5544 H1)"
+                );
+                return None;
+            }
+            None => return None,
+        }
         self.parked.remove(key).map(|entry| {
             self.parked_bytes = self
                 .parked_bytes
                 .saturating_sub(continuation_bytes(&entry.continuation))
+                .saturating_sub(entry.task_bytes)
                 .saturating_sub(entry.pending_bytes);
             // Client requests first, then coalesced notifications. Clients have
             // a caller waiting on a response; notifications do not, and their
@@ -833,12 +1025,18 @@ impl DelegateParkCtx {
     /// Returned rather than acted on so the caller (which owns the executor and
     /// the channel) performs the force-resume; this keeps the registry a pure
     /// data structure and unit-testable without a loop.
-    pub(super) fn expired(&self, now: tokio::time::Instant) -> Vec<DelegateKey> {
-        self.parked
+    pub(super) fn expired(&self, now: tokio::time::Instant) -> Vec<(DelegateKey, u64)> {
+        let mut out: Vec<(DelegateKey, u64)> = self
+            .parked
             .iter()
             .filter(|(_, entry)| now.duration_since(entry.parked_at) >= PARK_TTL)
-            .map(|(key, _)| key.clone())
-            .collect()
+            .map(|(key, entry)| (key.clone(), entry.epoch))
+            .collect();
+        // Deterministic order: `HashMap` iteration is arbitrary, and a sweep
+        // that force-resumes several parks should not do so in a different
+        // order run to run (L7).
+        out.sort_by_key(|(_, epoch)| *epoch);
+        out
     }
 }
 
@@ -896,11 +1094,13 @@ mod tests {
         let k = key(1);
         assert!(!ctx.is_parked(&k));
         assert!(matches!(
-            ctx.park(k.clone(), continuation()),
-            ParkAdmission::Admitted
+            ctx.park(k.clone(), continuation(), 0),
+            ParkAdmission::Admitted { .. }
         ));
         assert!(ctx.is_parked(&k));
-        let (_cont, pend) = ctx.take(&k).expect("park must be takeable");
+        let (_cont, pend) = ctx
+            .take_matching(&k, ctx.epoch_of(&k).expect("parked"))
+            .expect("park must be takeable");
         assert!(pend.is_empty());
         assert!(!ctx.is_parked(&k), "take must end the park");
     }
@@ -910,15 +1110,15 @@ mod tests {
         let (mut ctx, _rx) = ctx();
         for i in 0..MAX_PARKED_DELEGATES {
             assert!(matches!(
-                ctx.park(key(i as u8), continuation()),
-                ParkAdmission::Admitted
+                ctx.park(key(i as u8), continuation(), 0),
+                ParkAdmission::Admitted { .. }
             ));
         }
         assert_eq!(ctx.parked_count(), MAX_PARKED_DELEGATES);
         // Over the cap: refused, and the continuation comes back so the caller
         // can fall back inline rather than losing the round-trip.
         assert!(matches!(
-            ctx.park(key(200), continuation()),
+            ctx.park(key(200), continuation(), 0),
             ParkAdmission::Refused(_)
         ));
         assert!(!ctx.is_parked(&key(200)));
@@ -929,23 +1129,26 @@ mod tests {
         let (mut ctx, _rx) = ctx();
         let k = key(1);
         assert!(matches!(
-            ctx.park(k.clone(), continuation()),
-            ParkAdmission::Admitted
+            ctx.park(k.clone(), continuation(), 0),
+            ParkAdmission::Admitted { .. }
         ));
         // The live continuation must survive: clobbering it would strand the
         // first round-trip's client responder.
         assert!(matches!(
-            ctx.park(k.clone(), continuation()),
+            ctx.park(k.clone(), continuation(), 0),
             ParkAdmission::Refused(_)
         ));
-        assert!(ctx.take(&k).is_some());
+        assert!(
+            ctx.take_matching(&k, ctx.epoch_of(&k).expect("parked"))
+                .is_some()
+        );
     }
 
     #[tokio::test]
     async fn pending_queue_is_capped_and_overflow_is_returned_not_dropped() {
         let (mut ctx, _rx) = ctx();
         let k = key(1);
-        ctx.park(k.clone(), continuation());
+        ctx.park(k.clone(), continuation(), 0);
         for i in 0..MAX_PENDING_PER_DELEGATE {
             assert!(matches!(
                 ctx.queue_pending(&k, pending(i as u8)),
@@ -958,7 +1161,9 @@ mod tests {
             ctx.queue_pending(&k, pending(99)),
             QueueOutcome::Rejected(_)
         ));
-        let (_cont, pend) = ctx.take(&k).expect("park present");
+        let (_cont, pend) = ctx
+            .take_matching(&k, ctx.epoch_of(&k).expect("parked"))
+            .expect("park present");
         assert_eq!(pend.len(), MAX_PENDING_PER_DELEGATE);
     }
 
@@ -1015,7 +1220,7 @@ mod tests {
     async fn notifications_coalesce_per_contract_rather_than_being_rejected() {
         let (mut ctx, _rx) = ctx();
         let k = key(1);
-        ctx.park(k.clone(), continuation());
+        ctx.park(k.clone(), continuation(), 0);
 
         // Far more than MAX_PENDING_PER_DELEGATE, all for ONE contract.
         for i in 0..(MAX_PENDING_PER_DELEGATE as u8 + 12) {
@@ -1029,7 +1234,9 @@ mod tests {
             );
         }
 
-        let (_cont, pending) = ctx.take(&k).expect("park present");
+        let (_cont, pending) = ctx
+            .take_matching(&k, ctx.epoch_of(&k).expect("parked"))
+            .expect("park present");
         assert_eq!(
             pending.len(),
             1,
@@ -1049,7 +1256,7 @@ mod tests {
     async fn a_full_client_queue_does_not_reject_notifications() {
         let (mut ctx, _rx) = ctx();
         let k = key(1);
-        ctx.park(k.clone(), continuation());
+        ctx.park(k.clone(), continuation(), 0);
 
         for i in 0..MAX_PENDING_PER_DELEGATE {
             assert!(matches!(
@@ -1072,7 +1279,9 @@ mod tests {
             "a notification must still be accepted with the client queue full"
         );
 
-        let (_cont, pending_runs) = ctx.take(&k).expect("park present");
+        let (_cont, pending_runs) = ctx
+            .take_matching(&k, ctx.epoch_of(&k).expect("parked"))
+            .expect("park present");
         assert_eq!(
             pending_runs.len(),
             MAX_PENDING_PER_DELEGATE + 1,
@@ -1082,11 +1291,38 @@ mod tests {
 
     /// Distinct contracts are capped, so the coalescing map cannot grow without
     /// bound if subscriptions are not limited elsewhere.
+    /// L9: refusals are COUNTED, not only logged. A refusal that increments
+    /// nothing renders as a clean zero to anything reading metrics — the same
+    /// pattern this branch fixed for the over-cap client request.
+    #[tokio::test]
+    async fn refusals_are_counted_per_cause() {
+        let (mut ctx, _rx) = ctx();
+        let k = key(1);
+        ctx.park(k.clone(), continuation(), 0);
+
+        for i in 0..MAX_PENDING_PER_DELEGATE {
+            ctx.queue_pending(&k, pending(i as u8));
+        }
+        ctx.queue_pending(&k, pending(99));
+        for i in 0..MAX_PENDING_NOTIFICATION_CONTRACTS {
+            ctx.queue_pending(&k, notification(i as u8, b"s"));
+        }
+        ctx.queue_pending(&k, notification(250, b"s"));
+
+        let counts = ctx.refusals();
+        assert_eq!(counts.client_requests, 1, "the over-cap client request");
+        assert_eq!(
+            counts.notifications, 1,
+            "the over-cap notification contract"
+        );
+        assert_eq!(counts.parks, 0, "no park was refused here");
+    }
+
     #[tokio::test]
     async fn distinct_notification_contracts_are_capped() {
         let (mut ctx, _rx) = ctx();
         let k = key(1);
-        ctx.park(k.clone(), continuation());
+        ctx.park(k.clone(), continuation(), 0);
 
         for i in 0..MAX_PENDING_NOTIFICATION_CONTRACTS {
             assert!(matches!(
@@ -1113,7 +1349,7 @@ mod tests {
     async fn park_expires_only_after_the_ttl() {
         let (mut ctx, _rx) = ctx();
         let k = key(1);
-        ctx.park(k.clone(), continuation());
+        ctx.park(k.clone(), continuation(), 0);
 
         tokio::time::advance(PARK_TTL - Duration::from_secs(1)).await;
         assert!(
@@ -1123,13 +1359,117 @@ mod tests {
         );
 
         tokio::time::advance(Duration::from_secs(2)).await;
-        assert_eq!(ctx.expired(tokio::time::Instant::now()), vec![k]);
+        assert_eq!(
+            ctx.expired(tokio::time::Instant::now()),
+            vec![(k.clone(), ctx.epoch_of(&k).expect("parked"))]
+        );
+    }
+
+    /// H1: a resume from a park the TTL backstop already ended must be REJECTED,
+    /// not absorbed by whatever park exists now.
+    ///
+    /// The sweep force-resumes a park without consuming the off-loop task's
+    /// `ParkGuard`, so that guard still owes a resume. If the delegate has
+    /// re-parked by the time it lands, matching on key alone hands the OLD
+    /// continuation's `UserResponse`/`PutContractResponse` messages to the NEW
+    /// park — the cross-round-trip corruption the whole exclusion exists to
+    /// prevent, arriving through the backstop I was asked to add.
+    ///
+    /// FALSIFY by making `take_matching` ignore the epoch: the stale resume is
+    /// then absorbed and this returns `Some`.
+    #[tokio::test]
+    async fn a_stale_resume_from_a_force_resumed_park_is_rejected() {
+        let (mut ctx, _rx) = ctx();
+        let k = key(1);
+
+        let ParkAdmission::Admitted { epoch: first } = ctx.park(k.clone(), continuation(), 0)
+        else {
+            panic!("first park must be admitted");
+        };
+
+        // The TTL backstop ends park #1 WITHOUT consuming its guard.
+        assert!(
+            ctx.take_matching(&k, first).is_some(),
+            "the sweep ends the park it observed"
+        );
+
+        // The delegate re-parks: a new round-trip, a new continuation.
+        let ParkAdmission::Admitted { epoch: second } = ctx.park(k.clone(), continuation(), 0)
+        else {
+            panic!("second park must be admitted");
+        };
+        assert_ne!(first, second, "each park must have its own identity");
+
+        // Park #1's guard finally fires. It must NOT take park #2.
+        assert!(
+            ctx.take_matching(&k, first).is_none(),
+            "a stale resume must be rejected; absorbing it would feed park #1's \
+             messages into park #2 (#5544 H1)"
+        );
+        assert_eq!(
+            ctx.epoch_of(&k),
+            Some(second),
+            "the live park must survive the stale resume untouched"
+        );
+    }
+
+    /// P1a: the byte cap must charge what is actually RETAINED, including the
+    /// payloads the off-loop task holds, not just what `Continuation` points at.
+    ///
+    /// FALSIFY by reverting any of the three: dropping `task_bytes` from
+    /// `park`, omitting `params` from `continuation_bytes`, or removing the
+    /// projected-total check on the client queue lane.
+    #[tokio::test]
+    async fn the_byte_cap_charges_retained_payloads_not_just_the_continuation() {
+        let (mut ctx, _rx) = ctx();
+
+        // A continuation carrying a large inbound state, as a real parked GET
+        // response would.
+        let big = vec![0u8; 8 * 1024 * 1024];
+        let mut cont = continuation();
+        cont.inbound_so_far = vec![InboundDelegateMsg::ContractNotification(
+            freenet_stdlib::prelude::ContractNotification {
+                contract_id: ContractInstanceId::new([1; 32]),
+                new_state: WrappedState::new(big.clone()),
+                context: DelegateContext::default(),
+            },
+        )];
+        assert!(
+            continuation_bytes(&cont) >= big.len(),
+            "the continuation's inbound state must be charged"
+        );
+
+        // `params` is delegate-supplied and retained; omitting it was one of the
+        // three ways this bound failed to bound.
+        let mut with_params = continuation();
+        with_params.params = Parameters::from(vec![7u8; 4096]);
+        assert!(
+            continuation_bytes(&with_params) >= 4096,
+            "`params` must be charged: it is retained for the life of the park"
+        );
+
+        // Fill the budget with parks that each carry a large task payload, and
+        // confirm admission is refused rather than the total silently growing.
+        let per_park = MAX_PARKED_BYTES / 4;
+        let mut admitted = 0usize;
+        for i in 0..MAX_PARKED_DELEGATES {
+            match ctx.park(key(i as u8), continuation(), per_park) {
+                ParkAdmission::Admitted { .. } => admitted += 1,
+                ParkAdmission::Refused(_) => break,
+            }
+        }
+        assert!(
+            admitted <= 4,
+            "the byte cap must refuse once the RETAINED total is reached; \
+             admitted {admitted} parks of {per_park} bytes each against a \
+             {MAX_PARKED_BYTES} byte budget"
+        );
     }
 
     #[tokio::test]
     async fn guard_delivers_exactly_one_resume_on_success() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let guard = ParkGuard::new(tx, key(1));
+        let guard = ParkGuard::new(tx, key(1), 0);
         guard.send(Vec::new(), Vec::new());
         let resume = rx.recv().await.expect("one resume");
         assert_eq!(resume.cause, ResumeCause::Completed);
@@ -1142,7 +1482,7 @@ mod tests {
         // Simulates the spawned task being cancelled/panicking before it
         // finished its work. Without this the park would never end: the
         // pending queue would never drain and the client would hang.
-        drop(ParkGuard::new(tx, key(1)));
+        drop(ParkGuard::new(tx, key(1), 0));
         let resume = rx.recv().await.expect("drop must still resume the park");
         assert_eq!(resume.cause, ResumeCause::TimedOut);
         assert!(resume.inbound.is_empty());
