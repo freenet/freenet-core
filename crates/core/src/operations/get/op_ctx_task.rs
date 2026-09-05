@@ -288,6 +288,8 @@ async fn emit_get_terminal_event(
     fragments_received: Option<u32>,
     total_fragments: Option<u32>,
     stream_abort_cause: Option<StreamAbortCause>,
+    exhaustion_reason: Option<crate::tracing::GetExhaustionReason>,
+    peer_advancements: Option<usize>,
 ) {
     if let Some(log_event) = crate::tracing::NetEventLog::get_terminal(
         &tx,
@@ -302,6 +304,8 @@ async fn emit_get_terminal_event(
         fragments_received,
         total_fragments,
         stream_abort_cause,
+        exhaustion_reason,
+        peer_advancements,
     ) {
         op_manager
             .ring
@@ -341,6 +345,8 @@ pub(crate) async fn emit_local_get_terminal_event(
         None,  // no hop count for a local hit
         None,  // no stream: fragment/abort fields are streaming-only
         None,
+        None,
+        None, // no exhaustion reason: this path never entered the retry loop
         None,
     )
     .await;
@@ -434,6 +440,7 @@ async fn drive_client_get_inner(
         response_received_at: None,
         saw_not_found: false,
         requests_sent: 0,
+        exhaustion_reason: None,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -696,6 +703,8 @@ async fn drive_client_get_inner(
                     stream_fragments_received,
                     stream_total_fragments,
                     stream_abort_cause,
+                    None, // a terminal reply was received: not an exhaustion
+                    None,
                 )
                 .await;
             }
@@ -731,6 +740,8 @@ async fn drive_client_get_inner(
                     stream_fragments_received,
                     stream_total_fragments,
                     stream_abort_cause,
+                    None, // a terminal reply was received: not an exhaustion
+                    None,
                 )
                 .await;
             }
@@ -770,6 +781,8 @@ async fn drive_client_get_inner(
                 None, // no streaming header ever seen on the exhausted path
                 None,
                 None,
+                driver.exhaustion_reason,
+                Some(driver.retries),
             )
             .await;
             // Dashboard op_stats GET counter (issue #4828). Exhaustion
@@ -837,6 +850,14 @@ struct GetRetryDriver<'a> {
     /// exhaustion (a one-candidate/isolated search that sent a single
     /// request would otherwise report 2).
     requests_sent: usize,
+    /// Set by `advance()` when `advance_to_next_peer` returns an
+    /// exhaustion reason (#5252) — `None` until the retry loop actually
+    /// exhausts, at which point it discriminates "ran out of routing
+    /// candidates" from "ran out of retries" for the terminal-telemetry
+    /// event. This is the enumerated replacement for a `debug!` log line
+    /// that never ran in a release build and was never wired to reach the
+    /// telemetry collector.
+    exhaustion_reason: Option<crate::tracing::GetExhaustionReason>,
 }
 
 /// Terminal value for the GET driver.
@@ -1032,11 +1053,14 @@ impl RetryDriver for GetRetryDriver<'_> {
             &mut self.tried,
             &mut self.retries,
         ) {
-            Some((next_target, _next_addr)) => {
+            Ok((next_target, _next_addr)) => {
                 self.current_target = next_target;
                 AdvanceOutcome::Next
             }
-            None => AdvanceOutcome::Exhausted,
+            Err(reason) => {
+                self.exhaustion_reason = Some(reason);
+                AdvanceOutcome::Exhausted
+            }
         }
     }
 }
@@ -1889,8 +1913,12 @@ async fn lookup_stored_key(
 
 /// Maximum routing rounds before giving up. Matches PUT's
 /// `MAX_PEER_ADVANCEMENTS_NON_STREAMING = 3` and SUBSCRIBE's driver.
-/// With typical ring fan-out of 3–5 peers per k_closest call, 3
-/// rounds covers 9–15 distinct peers. GET kept the legacy
+/// `advance_to_next_peer` calls `k_closest_potentially_hosting(..., 1)` and
+/// takes only `.next()`, discarding any further candidates the ring
+/// returned — so breadth is bounded by `MAX_RETRIES`, NOT by fan-out per
+/// call. 3 rounds plus the initial attempt covers at most 4 distinct peers
+/// (previously documented here as "9–15 distinct peers", which assumed each
+/// round fanned out to several peers; see #5252). GET kept the legacy
 /// `MAX_RETRIES` name because (a) GETs are never streaming today
 /// (no large-payload class on the wire), so the streaming/non-
 /// streaming split PUT needed doesn't apply, and (b) renaming would
@@ -1928,14 +1956,20 @@ fn carry_tried_into_visited(
     }
 }
 
+/// Advance to the next routing candidate, or report why the search
+/// stopped. The `Err` side is the enumerated replacement for #5252's
+/// dark `debug!` line: it distinguishes hitting the retry budget
+/// (`RetryBudget`, candidates may still exist) from genuinely running out
+/// of distinct peers to ask (`NoRoutingCandidates`), which a caller
+/// threads into the terminal-telemetry event via `GetRetryDriver::advance`.
 fn advance_to_next_peer(
     op_manager: &OpManager,
     instance_id: &ContractInstanceId,
     tried: &mut Vec<std::net::SocketAddr>,
     retries: &mut usize,
-) -> Option<(PeerKeyLocation, std::net::SocketAddr)> {
+) -> Result<(PeerKeyLocation, std::net::SocketAddr), crate::tracing::GetExhaustionReason> {
     if *retries >= MAX_RETRIES {
-        return None;
+        return Err(crate::tracing::GetExhaustionReason::RetryBudget);
     }
     *retries += 1;
 
@@ -1957,7 +1991,7 @@ fn advance_to_next_peer(
                         "GET advance: ring empty — falling back to configured gateway"
                     );
                     tried.push(addr);
-                    Some((gw, addr))
+                    Ok((gw, addr))
                 }
                 None => {
                     tracing::debug!(
@@ -1966,7 +2000,7 @@ fn advance_to_next_peer(
                         retries = *retries,
                         "GET advance: no routing candidates — exhausted"
                     );
-                    None
+                    Err(crate::tracing::GetExhaustionReason::NoRoutingCandidates)
                 }
             };
         }
@@ -1980,10 +2014,10 @@ fn advance_to_next_peer(
             peer = ?peer,
             "GET advance: selected routing candidate has no socket address — treating as exhausted"
         );
-        return None;
+        return Err(crate::tracing::GetExhaustionReason::NoRoutingCandidates);
     };
     tried.push(addr);
-    Some((peer, addr))
+    Ok((peer, addr))
 }
 
 // --- Subscribe child ---
@@ -2281,6 +2315,7 @@ async fn drive_sub_op_get(
         response_received_at: None,
         saw_not_found: false,
         requests_sent: 0,
+        exhaustion_reason: None,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -2384,6 +2419,8 @@ async fn drive_sub_op_get(
                 streaming_assembly.fragments_received,
                 streaming_assembly.total_fragments,
                 streaming_assembly.abort_cause,
+                None, // a terminal reply was received: not an exhaustion
+                None,
             )
             .await;
             result
@@ -2402,6 +2439,8 @@ async fn drive_sub_op_get(
                 None, // no streaming header ever seen on the exhausted path
                 None,
                 None,
+                driver.exhaustion_reason,
+                Some(driver.retries),
             )
             .await;
             SubOpGetOutcome::NotFound(cause)
@@ -4744,6 +4783,59 @@ mod tests {
             inner_body.contains("client_tx.is_sub_operation()"),
             "client GET terminal events must tag is_sub_op from \
              client_tx.is_sub_operation(), not a hardcoded value"
+        );
+    }
+
+    /// #5252: the Exhausted arm of both GET drivers must forward WHY the
+    /// retry loop gave up (`driver.exhaustion_reason`) and how many peer
+    /// advancements it took (`driver.retries`) to the terminal-telemetry
+    /// event. This is the enumerated replacement for a `debug!` log line
+    /// that never ran in a release build (`release_max_level_info`) and was
+    /// never wired to reach an `EventKind` even when it did. Source-scrape
+    /// pin — a refactor that drops either argument silently reverts the
+    /// terminal event to carrying no exhaustion discriminator at all.
+    #[test]
+    fn exhausted_arm_forwards_exhaustion_reason_and_peer_advancements() {
+        let src = production_source();
+        for entry in [
+            "async fn drive_client_get_inner(",
+            "async fn drive_sub_op_get(",
+        ] {
+            let body = extract_fn_body(src, entry);
+            assert!(
+                body.contains("driver.exhaustion_reason"),
+                "{entry}'s Exhausted arm must forward driver.exhaustion_reason \
+                 to emit_get_terminal_event (#5252)"
+            );
+            assert!(
+                body.contains("Some(driver.retries)"),
+                "{entry}'s Exhausted arm must forward Some(driver.retries) to \
+                 emit_get_terminal_event (#5252)"
+            );
+        }
+    }
+
+    /// #5252: `advance_to_next_peer` must discriminate WHY it gave up rather
+    /// than collapsing every exhaustion into a bare `None` as before —
+    /// hitting `MAX_RETRIES` (candidates may remain) is a different failure
+    /// mode from genuinely running out of distinct peers to ask (both the
+    /// no-candidate branch and the addressless-candidate branch). Source
+    /// pin, mutation-verified: collapsing either `NoRoutingCandidates` arm
+    /// back to `RetryBudget` (or vice versa) makes this fail.
+    #[test]
+    fn advance_to_next_peer_discriminates_exhaustion_reasons() {
+        let src = production_source();
+        let body = extract_fn_body(src, "fn advance_to_next_peer(");
+        assert!(
+            body.contains("Err(crate::tracing::GetExhaustionReason::RetryBudget)"),
+            "hitting MAX_RETRIES must return GetExhaustionReason::RetryBudget"
+        );
+        assert_eq!(
+            body.matches("Err(crate::tracing::GetExhaustionReason::NoRoutingCandidates)")
+                .count(),
+            2,
+            "both the no-candidate branch and the addressless-candidate \
+             branch must return GetExhaustionReason::NoRoutingCandidates"
         );
     }
 

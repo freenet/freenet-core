@@ -101,8 +101,8 @@ pub(crate) use register::{
 pub use register::{EventFlushHandle, NetLogMessage};
 // NEW_RECORDS_TS is needed by metrics_client's opentelemetry_tracer
 pub(crate) use event_kind::{
-    ConnectEvent, GetEvent, GetTerminalOutcome, PutEvent, StreamAbortCause, SubscribeEvent,
-    UpdateEvent,
+    ConnectEvent, GetEvent, GetExhaustionReason, GetTerminalOutcome, PutEvent, StreamAbortCause,
+    SubscribeEvent, UpdateEvent,
 };
 pub use event_kind::{
     ConnectionType, DisconnectReason, EventKind, HostingStoppedReason, InterestSyncEvent,
@@ -826,6 +826,8 @@ mod get_outcome_summary_tests {
                 fragments_received: None,
                 total_fragments: None,
                 stream_abort_cause: None,
+                exhaustion_reason: None,
+                peer_advancements: None,
                 elapsed_ms: 10,
                 timestamp: 100,
             }),
@@ -976,6 +978,8 @@ mod get_outcome_summary_tests {
                 fragments_received: None,
                 total_fragments: None,
                 stream_abort_cause: None,
+                exhaustion_reason: None,
+                peer_advancements: None,
                 elapsed_ms: 10,
                 timestamp: 100,
             }),
