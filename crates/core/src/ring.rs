@@ -2007,6 +2007,23 @@ impl Ring {
                 snapshot.upstream_computed_vs_stored_divergences = Some(divergences);
             }
 
+            // Delegate pin outcomes by reason (#4669 / #5467 Phase 0). Recorded
+            // in `contract::delegate_demand::register_subscription`, where every
+            // refusal still reports SUCCESS to the delegate — this counter (and
+            // a rate-limited `warn!`) is the only evidence a pin did not take.
+            // Read from the per-node network_status singleton; same hand-mirror
+            // footgun as the counters above — a new `RouterSnapshotInfo` field
+            // is invisible to the collector unless added here AND in
+            // `event_kind_to_json`. `None` only before the singleton is
+            // initialized.
+            if let Some(delegate_pin) = crate::node::network_status::delegate_pin_refusal_counts() {
+                snapshot.delegate_pin_registered = Some(delegate_pin.registered);
+                snapshot.delegate_pin_not_hosted = Some(delegate_pin.not_hosted);
+                snapshot.delegate_pin_contract_full = Some(delegate_pin.contract_full);
+                snapshot.delegate_pin_node_full = Some(delegate_pin.node_full);
+                snapshot.delegate_pin_delegate_full = Some(delegate_pin.delegate_full);
+            }
+
             // Reconcile-controller SHADOW comparison counters, split PER SITE
             // (keystone step-2, #4642). Recorded at the on-`main` hosting decision
             // sites (collapse via `send_unsubscribe_upstream`, renewal via
@@ -4149,6 +4166,24 @@ impl Ring {
         self.hosting_manager.contract_in_use(contract)
     }
 
+    /// `(local client subscriptions, downstream peer subscribers)` for
+    /// `contract` — the first two components of the subscriber-primary eviction
+    /// ordering key (`.claude/rules/hosting-invariants.md`, invariant 3).
+    ///
+    /// Exposed so a caller can assert which eviction TIER a demand registration
+    /// lands in, rather than infer it. A delegate subscription
+    /// (`contract::delegate_demand`) is deliberately a LOCAL subscription — the
+    /// tier evicted last — and that placement is a claim worth testing rather
+    /// than only documenting.
+    ///
+    /// Test-only: production code reaches these counts through the
+    /// `HostingManager` closure the eviction ordering already passes. Un-gate
+    /// it when a production caller appears.
+    #[cfg(test)]
+    pub(crate) fn local_and_downstream_counts(&self, contract: &ContractKey) -> (usize, usize) {
+        self.hosting_manager.local_and_downstream_counts(contract)
+    }
+
     /// Instance ids of every contract [`Self::contract_in_use`] holds for. See
     /// `HostingManager::in_use_contract_ids`.
     pub(crate) fn in_use_contract_ids(&self) -> Vec<ContractInstanceId> {
@@ -4399,6 +4434,83 @@ impl Ring {
         // need to gate on `is_new_for_client` for scoring purposes.
         self.hosting_manager
             .add_client_subscription(instance_id, client_id)
+    }
+
+    /// Whether `client_id` already holds a subscription for `instance_id`.
+    pub fn has_client_subscription(
+        &self,
+        instance_id: &ContractInstanceId,
+        client_id: crate::client_events::ClientId,
+    ) -> bool {
+        self.hosting_manager
+            .has_client_subscription(instance_id, client_id)
+    }
+
+    /// `(subscriptions held by `client_id`, total held by any client in the
+    /// reserved range at or above `reserved_id_floor`)` — from ONE pass.
+    ///
+    /// The delegate admission gate needs both, and fusing them means the
+    /// node-wide bound costs nothing beyond the scan the per-delegate cap was
+    /// already paying. See `HostingManager::client_and_reserved_range_counts`
+    /// for why both are DERIVED rather than kept in a maintained counter.
+    pub fn client_and_reserved_range_counts(
+        &self,
+        client_id: crate::client_events::ClientId,
+        reserved_id_floor: usize,
+    ) -> (usize, usize) {
+        self.hosting_manager
+            .client_and_reserved_range_counts(client_id, reserved_id_floor)
+    }
+
+    /// How many local subscribers `instance_id` has — WebSocket clients and
+    /// delegates together, since #4669 puts both in `client_subscriptions`.
+    ///
+    /// Used by the delegate demand path to apply `MAX_SUBSCRIBERS_PER_CONTRACT`
+    /// before inserting. O(1): one `DashMap` lookup and a `HashSet::len`, unlike
+    /// the per-subscriber half of [`Self::client_and_reserved_range_counts`], which
+    /// has to scan.
+    pub fn local_subscriber_count(&self, instance_id: &ContractInstanceId) -> usize {
+        self.hosting_manager.local_client_count(instance_id)
+    }
+
+    /// Remove a single client subscription for `contract`.
+    ///
+    /// Returns whether anything was actually removed, and whether that was the
+    /// last client subscription for the contract.
+    ///
+    /// The `was_present` half is load-bearing, not informational. Every caller
+    /// side effect below is gated on it, because this is reached for delegates
+    /// that never held a pin here at all — a registration refused by one of the
+    /// admission bounds, or a delegate whose demand lives on a DIFFERENT node's
+    /// ring in a shared-process multi-node test. Acting unconditionally would
+    /// stamp `abandoned_at` (resetting the contract's eviction recency to the
+    /// frontier) and spawn a collapse decision for a contract this delegate was
+    /// never holding. Used by
+    /// the delegate demand path (`contract::delegate_demand`) to drop one
+    /// delegate's pin on one contract without disturbing the others it holds.
+    ///
+    /// Records abandonment on the way out, which the bare
+    /// `HostingManager::remove_client_subscription` does not: the
+    /// client-disconnect path gets that from
+    /// `remove_client_from_all_subscriptions`, and a single-subscription
+    /// removal has to do it here or the two teardowns disagree.
+    /// `record_abandonment` resets the contract's recency to the current
+    /// frontier at subscription TERMINATION (`hosting-invariants.md`
+    /// invariant 3), so without it a formerly-subscribed contract is ranked
+    /// for eviction on a stale last-read it accrued while parked in the
+    /// subscription tier, and is shed earlier than the invariant intends.
+    pub fn remove_client_subscription(
+        &self,
+        contract: &ContractKey,
+        client_id: crate::client_events::ClientId,
+    ) -> crate::ring::hosting::ClientSubscriptionRemoval {
+        let removed = self
+            .hosting_manager
+            .remove_client_subscription_if_present(contract.id(), client_id);
+        if removed.was_present {
+            self.hosting_manager.maybe_record_abandonment(contract);
+        }
+        removed
     }
 
     /// Remove a client from all its subscriptions (used when client disconnects).
@@ -9087,8 +9199,12 @@ mod hosting_observability_wiring_pin {
 /// reporter → meter → axes → sweep chain the manager-level storm test
 /// (`storm_frequency_profile_crosses_cost_trigger_through_real_meter`)
 /// bypasses by assembling its axes by hand from a standalone `Meter`.
+///
+/// `pub(crate)` because `seam_fixture` below is the crate's one real-`OpManager`
+/// test seam, and the delegate-demand tests (`contract::delegate_demand`) need
+/// the same thing. A second copy of that setup is how the two drift.
 #[cfg(test)]
-mod cost_pressure_seam_tests {
+pub(crate) mod cost_pressure_seam_tests {
     use std::time::Duration;
 
     fn seam_key(seed: u8) -> freenet_stdlib::prelude::ContractKey {
@@ -9228,8 +9344,8 @@ mod cost_pressure_seam_tests {
     /// Everything a seam test needs kept alive for its whole run: the OpManager
     /// plus the channel ends and task monitor whose drop would tear the Ring's
     /// background tasks down mid-test.
-    struct SeamFixture {
-        op_manager: std::sync::Arc<crate::node::OpManager>,
+    pub(crate) struct SeamFixture {
+        pub(crate) op_manager: std::sync::Arc<crate::node::OpManager>,
         node_events: tokio::sync::mpsc::Receiver<
             either::Either<crate::message::NetMessage, crate::message::NodeEvent>,
         >,
@@ -9244,7 +9360,7 @@ mod cost_pressure_seam_tests {
     /// background tasks), with the node-event receiver handed back so a test can
     /// assert on EMITTED events rather than on internal bookkeeping. `id`
     /// isolates the on-disk state in its own temp dir.
-    async fn seam_fixture(id: &str) -> SeamFixture {
+    pub(crate) async fn seam_fixture(id: &str) -> SeamFixture {
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),

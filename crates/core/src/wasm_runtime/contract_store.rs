@@ -523,6 +523,32 @@ impl ContractStore {
         self.key_to_code_part.remove(key.id());
 
         // Clean up any delegate subscriptions for this contract instance.
+        //
+        // Only the notification hook is cleared here; the matching DEMAND
+        // registration (#4669 part 1, `contract::delegate_demand`) is not,
+        // because `wasm_runtime` is deliberately independent of `ring` and has
+        // no `OpManager` to reach.
+        //
+        // For the EVICTION path that does not matter: a delegate's demand makes
+        // `contract_in_use` true, so an in-use contract can only reach removal
+        // through the subscriber-primary eviction's in-use branch, and
+        // `HostingManager::teardown_evicted_in_use_contract` clears
+        // `client_subscriptions[key.id()]` wholesale before the reclamation
+        // funnel calls in here — the demand record is already gone.
+        //
+        // It DOES leave a gap on the PUT-rollback paths in
+        // `contract/executor/runtime/contract_ops.rs`, which call
+        // `remove_contract` to undo a partially-installed contract. Tracked,
+        // with its mirror-image counterpart on the eviction path, as #5487. If a
+        // delegate had subscribed to an earlier instance of the same id, that
+        // rollback drops its notification hook while its demand stays. The
+        // contract is then pinned with nothing able to consume its updates.
+        // Bounded, not silent-forever: the pin lapses on node restart, and the
+        // delegate's next subscribe re-installs the hook (both paths are
+        // idempotent). Closing it properly wants the demand and the hook to be
+        // one record with one owner, which is #4669 part 3's durable
+        // delegate-subscription store — not another mirrored teardown call at
+        // each rollback site, which is the drift this module exists to avoid.
         super::DELEGATE_SUBSCRIPTIONS.remove(key.id());
 
         // The WASM blob on disk is keyed by code hash and shared by every

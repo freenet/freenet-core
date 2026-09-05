@@ -346,6 +346,8 @@ pub struct NetworkStatus {
     /// replaced, per collapse site). `connection_drop` (re-root on an upstream loss)
     /// and `host_formation` (announce on first host) remain single-aspect EDGE
     /// shadow sites (focused comparison, record-only).
+    /// Delegate pin outcomes by reason (#4669 / #5467 Phase 0).
+    pub delegate_pin_refusals: DelegatePinRefusalStats,
     pub reconcile_shadow_collapse: ReconcileShadowStats,
     pub reconcile_shadow_renewal: ReconcileShadowStats,
     pub reconcile_shadow_inbound_unsubscribe: ReconcileShadowStats,
@@ -423,6 +425,40 @@ pub enum ReconcileShadowSite {
     HostFormation,
 }
 
+/// Delegate pin refusals, tallied by REASON (#5467 Phase 0).
+///
+/// Every refusal in `contract::delegate_demand::register_subscription` reports
+/// SUCCESS to the delegate — notifications still work, but nothing renews the
+/// contract on its behalf — so the only evidence a pin did not take is this
+/// counter and a rate-limited `warn!`. Without it the failure rate is argued
+/// rather than measured, and the `LogFloodGate` cadence (1, 2, 4, 8 ... over
+/// process lifetime) makes a long-saturated node effectively silent.
+///
+/// The reasons are counted SEPARATELY because they call for different
+/// responses: `not_hosted` means the node had not fetched the contract when
+/// the delegate asked (the normal startup race, self-correcting only if the
+/// delegate re-subscribes); `contract_full` means a popular contract is at its
+/// combined subscriber cap; `node_full` means real client subscriptions are at
+/// risk of losing renewal slots; `delegate_full` means one app is greedy.
+/// Summed into one total they would be indistinguishable, which is the whole
+/// point of counting them.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DelegatePinRefusalStats {
+    /// Pins that took. The denominator — a refusal count alone cannot tell you
+    /// whether 5 refusals is a rounding error or the whole workload.
+    pub registered: u64,
+    /// Node resolves the contract but does not host it, or holds no state for
+    /// it (the `is_hosting_contract && contract_state_present` gate).
+    pub not_hosted: u64,
+    /// The contract is at `MAX_SUBSCRIBERS_PER_CONTRACT`, counting WebSocket
+    /// clients and delegates together.
+    pub contract_full: u64,
+    /// The node is at `MAX_DELEGATE_PINS_PER_NODE`.
+    pub node_full: u64,
+    /// The delegate is at `MAX_PINS_PER_DELEGATE`.
+    pub delegate_full: u64,
+}
+
 /// Per-node counters for the reconcile-controller SHADOW comparison AT ONE SITE
 /// (hosting redesign keystone step-2, #4642).
 ///
@@ -466,6 +502,7 @@ pub enum ReconcileShadowSite {
 /// shadow-compare — so a nonzero `retract_diffs` reflects that missing
 /// site-local retraction, as intended, not a live-advertisement leak.
 #[derive(Default, Clone, Copy)]
+
 pub struct ReconcileShadowStats {
     /// Total shadow comparisons performed at this site (the denominator — one
     /// per decision site invocation).
@@ -775,6 +812,7 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         relayed_op_stats: RelayedOpStats::default(),
         connect_emit_stats: ConnectEmitStats::default(),
         upstream_divergence_stats: UpstreamDivergenceStats::default(),
+        delegate_pin_refusals: DelegatePinRefusalStats::default(),
         reconcile_shadow_collapse: ReconcileShadowStats::default(),
         reconcile_shadow_renewal: ReconcileShadowStats::default(),
         reconcile_shadow_inbound_unsubscribe: ReconcileShadowStats::default(),
@@ -1388,6 +1426,46 @@ pub struct ReconcileShadowSnapshot {
     pub inbound_unsubscribe: ReconcileShadowStats,
     pub connection_drop: ReconcileShadowStats,
     pub host_formation: ReconcileShadowStats,
+}
+
+/// The outcome of one delegate pin attempt, for [`record_delegate_pin_outcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegatePinOutcome {
+    Registered,
+    NotHosted,
+    ContractFull,
+    NodeFull,
+    DelegateFull,
+}
+
+/// Tally one delegate pin attempt by outcome (#4669 / #5467 Phase 0).
+///
+/// Called on EVERY attempt including the successes, so the refusals have a
+/// denominator. A `warn!` is a trace of an event, not a record of it: once the
+/// subscription is torn down there is no live row left showing the pin was
+/// missing, which is why this exists as a counter rather than only a log line.
+pub fn record_delegate_pin_outcome(outcome: DelegatePinOutcome) {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            let stats = &mut s.delegate_pin_refusals;
+            let slot = match outcome {
+                DelegatePinOutcome::Registered => &mut stats.registered,
+                DelegatePinOutcome::NotHosted => &mut stats.not_hosted,
+                DelegatePinOutcome::ContractFull => &mut stats.contract_full,
+                DelegatePinOutcome::NodeFull => &mut stats.node_full,
+                DelegatePinOutcome::DelegateFull => &mut stats.delegate_full,
+            };
+            *slot = slot.saturating_add(1);
+        }
+    }
+}
+
+/// Read the delegate pin outcome counters, or `None` before the
+/// `NETWORK_STATUS` singleton is initialized.
+pub fn delegate_pin_refusal_counts() -> Option<DelegatePinRefusalStats> {
+    NETWORK_STATUS
+        .get()
+        .and_then(|status| status.read().ok().map(|s| s.delegate_pin_refusals))
 }
 
 /// Read the per-site reconcile-controller SHADOW counters (keystone step-2,

@@ -462,6 +462,12 @@ pub(super) struct DelegateCallEnv {
     /// `put_contract_state_sync` / `update_contract_state_sync` and can abort
     /// it. See `super::runtime::StateAdmitCallback`.
     state_admit_callback: Option<super::runtime::StateAdmitCallback>,
+    /// Optional demand registration invoked after a successful V2
+    /// `subscribe_contract()` (#4669 part 1 / #5467 Phase 1). Without it the V2
+    /// subscribe records only the `DELEGATE_SUBSCRIPTIONS` notification hook and
+    /// never sets `contract_in_use`, so the pin silently does not take. See
+    /// `super::runtime::DelegateSubscribeCallback`.
+    delegate_subscribe_callback: Option<super::runtime::DelegateSubscribeCallback>,
     /// Interior-mutable pointer to the runtime's DelegateStore. Valid only during
     /// synchronous `process()` call. Used for creating child delegates.
     delegate_store: std::cell::UnsafeCell<*mut DelegateStore>,
@@ -540,6 +546,7 @@ impl DelegateCallEnv {
         state_store_db: Option<Storage>,
         state_write_callback: Option<super::runtime::StateWriteCallback>,
         state_admit_callback: Option<super::runtime::StateAdmitCallback>,
+        delegate_subscribe_callback: Option<super::runtime::DelegateSubscribeCallback>,
         delegate_key: DelegateKey,
         delegate_store: &mut DelegateStore,
         creation_depth: u32,
@@ -557,6 +564,7 @@ impl DelegateCallEnv {
             state_store_db,
             state_write_callback,
             state_admit_callback,
+            delegate_subscribe_callback,
             delegate_store: std::cell::UnsafeCell::new(delegate_store as *mut DelegateStore),
             creation_depth,
             creations_this_call: std::cell::Cell::new(0),
@@ -908,13 +916,25 @@ impl DelegateCallEnv {
         instance_id: &ContractInstanceId,
     ) -> Result<(), DelegateEnvError> {
         // Validate the contract is known
-        let _contract_key = self.resolve_contract_key(instance_id)?;
+        let contract_key = self.resolve_contract_key(instance_id)?;
 
-        // Register in global subscription registry
+        // Register in global subscription registry (the REACTIVE half: this is
+        // what `ContractNotification` delivery reads).
         DELEGATE_SUBSCRIPTIONS
             .entry(*instance_id)
             .or_default()
             .insert(self.delegate_key.clone());
+
+        // Register the DEMAND half (#4669 part 1 / #5467 Phase 1). The registry
+        // insert above is read only by the notification path — nothing in
+        // `ring/` reads it — so without this the subscribe does not set
+        // `contract_in_use`, does not enter `contracts_needing_renewal()`, and
+        // does not raise the contract's eviction tier. `None` on a runtime with
+        // no ring (local-only / mock executors), where there is no demand
+        // machinery to register with.
+        if let Some(register) = &self.delegate_subscribe_callback {
+            register(&self.delegate_key, &contract_key);
+        }
 
         Ok(())
     }
@@ -2109,6 +2129,12 @@ pub(super) mod delegate_contracts {
     /// subscription interest in the global `DELEGATE_SUBSCRIPTIONS` registry.
     /// When the subscribed contract's state changes, `Executor::finalize_state_commit`
     /// delivers a `ContractNotification` to this delegate.
+    ///
+    /// It ALSO registers ring demand, when this node is hosting the contract
+    /// (#4669) — see `contract::delegate_demand::register_subscription` for the
+    /// gate and for what happens when the node resolves the contract without
+    /// hosting it. Both halves are recorded; only the notification half was
+    /// recorded before.
     ///
     /// ## Returns
     /// - `0`: success (contract is known, subscription registered)

@@ -29,9 +29,20 @@ V2: Async host functions — delegates call contract methods directly:
     - ctx.get_contract_state(id)       → read state (two-step: len + read)
     - ctx.put_contract_state(id, data) → write state (bypasses validate_state)
     - ctx.update_contract_state(id, data) → conditional write (requires existing state)
-    - ctx.subscribe_contract(id)       → register interest (delivery works: see
-                                         Executor::finalize_state_commit; the
-                                         subscription does NOT register demand, #4669)
+    - ctx.subscribe_contract(id)       → register interest. Delivery works (see
+                                         Executor::finalize_state_commit), AND
+                                         since #4669 part 1 the subscribe also
+                                         registers ring DEMAND, so the pin sets
+                                         contract_in_use and enters the renewal
+                                         set. Gated: it registers demand only
+                                         when this node both HOSTS the contract
+                                         and holds its STATE, and only within
+                                         the per-contract / per-delegate /
+                                         node-wide pin bounds. Outside those it
+                                         still returns SUCCESS to the delegate
+                                         while not pinning — the delegate cannot
+                                         currently tell. See
+                                         contract::delegate_demand.
     Backend implementation: func_wrap_async (wasmtime native async support)
     Selected when state_store_db is configured on Runtime
     NOTE: V2 PUT/UPDATE are local-only, bypass contract validation, and skip

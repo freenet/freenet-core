@@ -10,6 +10,47 @@
 3. Run: cargo test
 ```
 
+**Run these from INSIDE the worktree, or name the toolchain explicitly.**
+`rust-toolchain.toml` pins this repo to a specific Rust version, and `rustup`
+resolves that pin from the **current directory** — not from `--manifest-path`.
+So the isolation habit that parallel agents are told to use everywhere else,
+
+```bash
+cargo clippy --manifest-path /path/to/worktree/Cargo.toml   # WRONG toolchain
+```
+
+silently runs the machine's default toolchain against this repo's source. That
+is not a harmless version skew: a newer default has lints the pinned version
+does not, so the run fails with real-looking `-D warnings` errors in files your
+change never touched, and a newer or older one can equally hide a failure CI
+will hit. Either `cd` into the worktree first, or pin it on the command line:
+
+```bash
+cargo +1.94.0 clippy --manifest-path /path/to/worktree/Cargo.toml -- -D warnings
+```
+
+Read the pin from `rust-toolchain.toml` rather than copying the version above —
+this note will go stale and the file will not. `cargo --version` run from
+outside the worktree reports the toolchain you are NOT using, so it cannot
+confirm the pin; check it from inside, or read the file.
+
+This trap is aimed squarely at the `git -C <abs path>` / never-`cd` discipline
+used when several agents share one checkout, which makes it likeliest to fire
+for the agents being most careful about isolation. Discovered 2026-09-04 while
+verifying PR #5493 from a sibling worktree: four bogus clippy errors in
+untouched files, all of which vanished under the pinned toolchain.
+
+**There is no rustdoc job in CI**, so a broken intra-doc link — `[`foo`]`
+naming an item that was renamed or removed — fails nothing. `cargo clippy` does
+not resolve doc links and `cargo test` does not either; only `cargo doc` would,
+and nothing runs it. Check doc links by hand when you move or rename an item
+that rustdoc prose refers to.
+
+Both of these are the same shape and worth naming as one habit: **a check you
+assume is running may not be.** Before trusting a gate, confirm it exists and
+that it is looking at what you think — the toolchain trap is a gate reading the
+wrong source of truth, the rustdoc gap is a gate that was never there.
+
 ### WHEN creating a commit message
 
 ```

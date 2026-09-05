@@ -721,6 +721,23 @@ pub(crate) struct HostingManager {
     resident_overhead_mem_share_bits: AtomicU64,
 }
 
+/// Outcome of [`HostingManager::remove_client_subscription_if_present`].
+///
+/// `was_present` exists because the delegate teardown path calls the removal
+/// for delegates that may hold nothing here — a registration refused by an
+/// admission bound, or one whose demand belongs to another node's ring in a
+/// shared-process multi-node test. Side effects (abandonment recording,
+/// upstream collapse) must be gated on it, or a no-op removal resets the
+/// contract's eviction recency and spawns a collapse decision for a
+/// subscription that never existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClientSubscriptionRemoval {
+    /// Whether this client actually held a subscription that was removed.
+    pub was_present: bool,
+    /// Whether the contract has no client subscriptions left afterwards.
+    pub was_last: bool,
+}
+
 impl HostingManager {
     /// Construct a `HostingManager` on the production wall-clock time source
     /// ([`InstantTimeSrc`]). Equivalent to
@@ -1610,10 +1627,22 @@ impl HostingManager {
         instance_id: &ContractInstanceId,
         client_id: crate::client_events::ClientId,
     ) -> bool {
+        self.remove_client_subscription_if_present(instance_id, client_id)
+            .was_last
+    }
+
+    /// As [`Self::remove_client_subscription`], but also reports whether the
+    /// client actually held the subscription. See [`ClientSubscriptionRemoval`].
+    pub(crate) fn remove_client_subscription_if_present(
+        &self,
+        instance_id: &ContractInstanceId,
+        client_id: crate::client_events::ClientId,
+    ) -> ClientSubscriptionRemoval {
         let mut no_more_subscriptions = false;
+        let mut was_present = false;
 
         if let Some(mut clients) = self.client_subscriptions.get_mut(instance_id) {
-            clients.remove(&client_id);
+            was_present = clients.remove(&client_id);
             if clients.is_empty() {
                 no_more_subscriptions = true;
             }
@@ -1627,10 +1656,70 @@ impl HostingManager {
             contract = %instance_id,
             %client_id,
             no_more_subscriptions,
+            was_present,
             "remove_client_subscription: removed"
         );
 
-        no_more_subscriptions
+        ClientSubscriptionRemoval {
+            was_present,
+            was_last: no_more_subscriptions,
+        }
+    }
+
+    /// `(subscriptions held by `client_id`, total subscriptions held by any
+    /// client at or above `reserved_id_floor`)` — both from ONE pass.
+    ///
+    /// The delegate admission gate needs both numbers on the same call, and the
+    /// second one is the node-wide delegate-pin total
+    /// (`delegate_demand::MAX_DELEGATE_PINS_PER_NODE`). Fused deliberately: two
+    /// separate accessors would walk this map twice on a path that already
+    /// walks it once, so the node-wide bound costs nothing beyond the scan its
+    /// caller was already paying.
+    ///
+    /// DERIVED rather than mirrored, and that is the load-bearing choice. A
+    /// maintained counter would have to be decremented at every mutation site
+    /// of `client_subscriptions`, including
+    /// [`Self::teardown_evicted_in_use_contract`], which drops a whole
+    /// `HashSet` at once — the omission that makes the executor's
+    /// `shared_client_counts` overcount after an eviction teardown today. A
+    /// count that is recomputed cannot drift out of step with the map it
+    /// describes, and a bound enforced from a drifted count wrongly refuses
+    /// registrations forever with no way back. Cost is the same order as the
+    /// scan it replaces; correctness is strictly better. See #5556.
+    ///
+    /// `reserved_id_floor` is passed in rather than imported so the definition
+    /// of "is a delegate id" stays in `contract::delegate_demand`, which owns
+    /// the reserved range.
+    pub fn client_and_reserved_range_counts(
+        &self,
+        client_id: crate::client_events::ClientId,
+        reserved_id_floor: usize,
+    ) -> (usize, usize) {
+        let mut for_client = 0usize;
+        let mut in_reserved_range = 0usize;
+        for entry in self.client_subscriptions.iter() {
+            for held in entry.value() {
+                if *held == client_id {
+                    for_client += 1;
+                }
+                if usize::from(*held) >= reserved_id_floor {
+                    in_reserved_range += 1;
+                }
+            }
+        }
+        (for_client, in_reserved_range)
+    }
+
+    /// Whether `client_id` is already subscribed to `instance_id`.
+    pub fn has_client_subscription(
+        &self,
+        instance_id: &ContractInstanceId,
+        client_id: crate::client_events::ClientId,
+    ) -> bool {
+        self.client_subscriptions
+            .get(instance_id)
+            .map(|clients| clients.contains(&client_id))
+            .unwrap_or(false)
     }
 
     /// Check if there are any client subscriptions for a contract.
@@ -1809,11 +1898,23 @@ impl HostingManager {
     /// and pruned on client disconnect, so the count is the
     /// currently-active set.
     ///
-    /// The production reaper-tick path no longer calls this per-contract
-    /// accessor (it uses the single-pass [`beneficiary_counts`] bulk
-    /// builder instead); this remains as the per-contract reference used
-    /// by the governance unit tests and the test-only `Ring` accessors.
-    #[cfg(test)]
+    /// The reaper-tick path does not call this per-contract accessor (it uses
+    /// the single-pass [`beneficiary_counts`] bulk builder instead), and for a
+    /// while nothing in production did, so it was `#[cfg(test)]`.
+    ///
+    /// It is un-gated because the delegate demand path
+    /// (`contract::delegate_demand::register_subscription`) needs the
+    /// per-contract subscriber count to enforce `MAX_SUBSCRIBERS_PER_CONTRACT`
+    /// before inserting. That path registers into `client_subscriptions`
+    /// DIRECTLY rather than through the listener registration, so it does not
+    /// inherit the cap the WebSocket path gets — and this is the count that has
+    /// to be bounded, because it is what `local_and_downstream_counts` (the
+    /// eviction ordering key) and `beneficiary_counts` (governance) read.
+    ///
+    /// Note the name now understates it: the set holds every local subscriber,
+    /// which since #4669 includes delegates' synthetic ids, not only WebSocket
+    /// clients. Renaming it would touch the governance call sites, so the
+    /// clarification lives here instead.
     pub(crate) fn local_client_count(&self, instance_id: &ContractInstanceId) -> usize {
         self.client_subscriptions
             .get(instance_id)
@@ -1940,11 +2041,31 @@ impl HostingManager {
     /// exists to stop, reintroduced through the back door; the exemption
     /// would also be effectively unbounded, blocking reclamation
     /// indefinitely, which violates the cleanup-exemption rule in `AGENTS.md`
-    /// (exemptions must be time-bounded). Local-client subscriptions and
-    /// downstream subscribers ARE both time-bounded and represent real
-    /// external demand: client subscriptions expire on disconnect; downstream
-    /// subscribers expire via `expire_stale_downstream_subscribers` after
-    /// `SUBSCRIPTION_LEASE_DURATION` without renewal.
+    /// (exemptions must be time-bounded). Downstream subscribers are
+    /// time-bounded — they expire via `expire_stale_downstream_subscribers`
+    /// after `SUBSCRIPTION_LEASE_DURATION` without renewal — and so are
+    /// WebSocket client subscriptions, which expire on disconnect.
+    ///
+    /// **`client_subscriptions` is no longer only WebSocket clients, and the
+    /// delegate half is NOT time-bounded (#4669).** Since delegate
+    /// subscriptions register demand through this map
+    /// (`contract::delegate_demand`), an entry may belong to a delegate's
+    /// synthetic client id, which never disconnects. Such an entry has no TTL
+    /// and no absolute-age override; it is released only by
+    /// `UnregisterDelegate`, the delegate-notification channel closing, or
+    /// process exit, and there is no unsubscribe for a delegate to call
+    /// (#2830). So this method's exemption is time-bounded for WebSocket
+    /// clients and downstream peers, and bounded only by process lifetime for
+    /// delegates.
+    ///
+    /// That gap is deliberate and disclosed rather than accidental — a delegate
+    /// pin is real resident demand and a node cannot tell when an app has
+    /// finished with a contract — but it is a live exception to the
+    /// `AGENTS.md` rule above, so it is bounded by SIZE instead of by time:
+    /// `delegate_demand::MAX_PINS_PER_DELEGATE` and
+    /// `MAX_DELEGATE_PINS_PER_NODE` cap how much unexpiring demand can
+    /// accumulate. Closing it properly (a sleep/wake horizon, persistence, and
+    /// an explicit unsubscribe) is #4669 parts 2-4 / #5467 Phase 3.
     ///
     /// The narrow case "subscribed but no local interest" should be handled
     /// by tearing down the orphaned upstream subscription, not by carrying
@@ -2099,7 +2220,7 @@ impl HostingManager {
     /// lock. Callers must invoke this AFTER any subscription-map guard
     /// they hold has been dropped (the guard is needed to mutate state,
     /// not to read `contract_in_use`).
-    fn maybe_record_abandonment(&self, contract: &ContractKey) {
+    pub(super) fn maybe_record_abandonment(&self, contract: &ContractKey) {
         if !self.contract_in_use(contract) {
             self.hosting_cache.write().record_abandonment(contract);
         }

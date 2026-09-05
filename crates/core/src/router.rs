@@ -623,6 +623,17 @@ pub(crate) struct RouterSnapshotInfo {
     /// lifetime totals, `None` until the ring's snapshot task populates them.
     pub upstream_computed_vs_stored_comparisons: Option<u64>,
     pub upstream_computed_vs_stored_divergences: Option<u64>,
+    /// Delegate pin outcomes by reason (#4669 / #5467 Phase 0), populated by
+    /// `Ring` from the per-node `network_status` singleton on the snapshot
+    /// cadence. `delegate_pin_registered` is the denominator — without it a
+    /// refusal count cannot be read as a rate, only as a raw total.
+    /// Monotonic lifetime totals, `None` until the ring's snapshot task
+    /// populates them.
+    pub delegate_pin_registered: Option<u64>,
+    pub delegate_pin_not_hosted: Option<u64>,
+    pub delegate_pin_contract_full: Option<u64>,
+    pub delegate_pin_node_full: Option<u64>,
+    pub delegate_pin_delegate_full: Option<u64>,
     /// Reconcile-controller SHADOW comparison counters, split PER SITE (hosting
     /// redesign keystone step-2, #4642). Populated by `Ring` from the per-node
     /// `network_status` singleton on the snapshot cadence. Per site,
@@ -1737,6 +1748,14 @@ impl Router {
             // singleton on the snapshot cadence.
             upstream_computed_vs_stored_comparisons: None,
             upstream_computed_vs_stored_divergences: None,
+            // Delegate pin outcome counters by reason (#4669 / #5467 Phase 0),
+            // populated by Ring from the network_status singleton on the
+            // snapshot cadence.
+            delegate_pin_registered: None,
+            delegate_pin_not_hosted: None,
+            delegate_pin_contract_full: None,
+            delegate_pin_node_full: None,
+            delegate_pin_delegate_full: None,
             // Reconcile-controller shadow comparison counters, split per site
             // (keystone step-2, #4642), populated by Ring from the network_status
             // singleton on the snapshot cadence.
