@@ -828,7 +828,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
         let observed_for_cb = observed.clone();
         let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState| {
+            move |k: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
                 observed_for_cb
                     .lock()
                     .unwrap()
@@ -874,7 +874,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
         let observed_for_cb = observed.clone();
         let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState| {
+            move |k: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
                 observed_for_cb
                     .lock()
                     .unwrap()
@@ -905,81 +905,83 @@ mod tests {
         );
     }
 
-    /// #5479: a byte-identical rewrite must NOT fire the post-write hook.
+    /// #5479: a byte-identical rewrite must report `content_changed = false`,
+    /// which is what suppresses the network fan-out.
     ///
-    /// `DelegateCallEnv::state_content_changed` is the only thing standing
-    /// between the ordinary delegate shape — *on each application message,
-    /// recompute my contract state and store it*, idempotent, writing the same
-    /// bytes most of the time — and one full network fan-out per message. V1
-    /// gets this for free from `bridged_upsert_contract_state_inner`'s
-    /// `UpsertResult::NoChange` short-circuit; the V2 bypass has to re-apply it,
-    /// and `ring::broadcast_coverage` records that no-change applies are ~97% of
-    /// received contract bytes, so the filter is load-bearing rather than an
-    /// optimisation.
+    /// The hook itself still RUNS — that is deliberate and is the fix for the
+    /// eviction race. A V2 write commits to the raw `Storage` before the hook,
+    /// so the bookkeeping legs (notably `Ring::commit_state_write`, whose
+    /// generation bump tells a scheduled `EvictContract` the contract was
+    /// written after it was queued) are owed for a byte-identical rewrite too.
+    /// Only the fan-out is skipped, and the flag is how the hook knows.
     ///
-    /// Every OTHER V2 test in this module writes each contract exactly once, and
-    /// `state_content_changed` returns `true` when no prior state exists — so
-    /// before this test the whole suite stayed green with the filter gutted to
-    /// `true`. Two writes of the same bytes is the smallest shape that observes
-    /// it at all.
+    /// The V1 `UpsertResult::NoChange` short-circuit is not a precedent for
+    /// skipping the hook: V1 short-circuits BEFORE writing, so nothing
+    /// committed and nothing is owed.
+    ///
+    /// Every OTHER V2 test in this module writes each contract exactly once,
+    /// and `state_content_changed` returns `true` when no prior state exists —
+    /// so with the filter gutted to `true` the whole suite stayed green. Two
+    /// writes of the same bytes is the smallest shape that observes it.
     #[tokio::test]
-    async fn test_env_identical_rewrite_does_not_fire_write_callback() {
+    async fn test_env_identical_rewrite_reports_no_content_change() {
         let mut env_holder = TestEnv::new().await;
         let contract_id = env_holder.store_contract(122, &[1, 2, 3]).await;
 
-        let observed =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
+        // Record (bytes, content_changed) per invocation.
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(Vec<u8>, bool)>::new()));
         let observed_for_cb = observed.clone();
         let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState| {
+            move |_k: &ContractKey,
+                  new_state: &freenet_stdlib::prelude::WrappedState,
+                  content_changed: bool| {
                 observed_for_cb
                     .lock()
                     .unwrap()
-                    .push((*k, new_state.as_ref().to_vec()));
+                    .push((new_state.as_ref().to_vec(), content_changed));
             },
         );
 
         // SAFETY: `env_holder` is alive for the duration of this test.
         let env = unsafe { env_holder.make_env_with_callback(cb) };
 
-        // First write: no stored state yet, so this one is genuinely a change.
+        // First write: no stored state matches, so this is a real change.
         env.put_contract_state_sync(&contract_id, vec![7, 8, 9])
             .expect("first V2 PUT should succeed");
-        assert_eq!(
-            observed.lock().unwrap().len(),
-            1,
-            "the first write stores new content and must fire the hook"
-        );
-
-        // Second write, same bytes. The write itself still succeeds — the
-        // filter suppresses the SIDE EFFECTS, it does not reject the call.
+        // Second write, same bytes.
         env.put_contract_state_sync(&contract_id, vec![7, 8, 9])
             .expect("a byte-identical V2 PUT must still report success");
-        assert_eq!(
-            observed.lock().unwrap().len(),
-            1,
-            "a byte-identical V2 PUT must NOT fire the post-write hook a second \
-             time: the hook emits BroadcastStateChange, so firing it here turns \
-             an idempotent delegate into one full network fan-out per message \
-             (#5479). If this assertion reads 2, `state_content_changed` has \
-             been gutted or bypassed."
-        );
-
-        // A genuine change after the no-op must still get through — the filter
-        // must suppress, not latch.
+        // Third write, changed again — the flag must not latch.
         env.put_contract_state_sync(&contract_id, vec![7, 8, 10])
             .expect("a changing V2 PUT after a no-op should succeed");
+
         let calls = observed.lock().unwrap();
         assert_eq!(
             calls.len(),
-            2,
-            "a real change following a no-op must fire the hook — the filter \
-             suppresses identical writes, it does not disable the path"
+            3,
+            "the post-write hook must run for EVERY committed write, including a \
+             byte-identical one: the write has already landed in storage, so the \
+             generation bump that guards against an in-flight EvictContract reclaiming \
+             it is owed regardless of whether the content changed"
         );
         assert_eq!(
-            calls[1].1,
-            vec![7, 8, 10],
-            "the second firing must carry the newly-written bytes"
+            calls[0],
+            (vec![7, 8, 9], true),
+            "a first write of new content is a change"
+        );
+        assert_eq!(
+            calls[1],
+            (vec![7, 8, 9], false),
+            "a byte-identical rewrite must report content_changed = false — this is what \
+             suppresses the fan-out, and without it an idempotent delegate becomes one \
+             full network fan-out per message (#5479). If this reads true, \
+             `state_content_changed` has been gutted or bypassed"
+        );
+        assert_eq!(
+            calls[2],
+            (vec![7, 8, 10], true),
+            "a real change following a no-op must report true again — the filter \
+             suppresses, it does not latch"
         );
     }
 
@@ -1000,7 +1002,7 @@ mod tests {
         // A callback that would panic if it ever ran: an oversized write must be
         // refused BEFORE any post-write side effect, so this is unreachable.
         let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            |_k: &ContractKey, _s: &freenet_stdlib::prelude::WrappedState| {
+            |_k: &ContractKey, _s: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
                 panic!(
                     "the post-write hook must not run for a state rejected by \
                      check_state_size — the broadcast it emits is exactly what \
@@ -1080,7 +1082,7 @@ mod tests {
         let write_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let write_calls_for_cb = write_calls.clone();
         let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |_k: &ContractKey, _s: &freenet_stdlib::prelude::WrappedState| {
+            move |_k: &ContractKey, _s: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
                 write_calls_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             },
         );
@@ -1103,9 +1105,11 @@ mod tests {
         );
         assert_eq!(
             write_calls.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "the post-write hook must still be suppressed for unchanged \
-             content — the admit gate running does not re-enable it"
+            1,
+            "the post-write hook must still RUN for unchanged content — the write \
+             committed, so its bookkeeping is owed. What the unchanged case skips is \
+             the fan-out, and the hook decides that from its `content_changed` \
+             argument; see test_env_identical_rewrite_reports_no_content_change"
         );
     }
 
@@ -1269,7 +1273,7 @@ mod tests {
         // in `Executor::from_config` / `from_config_with_shared_modules`.
         let invalidator = state_store.cache_invalidator();
         let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey, _new_state: &freenet_stdlib::prelude::WrappedState| {
+            move |k: &ContractKey, _new_state: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
                 invalidator.invalidate(k);
             },
         );
@@ -1325,7 +1329,7 @@ mod tests {
 
         let invalidator = state_store.cache_invalidator();
         let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey, _new_state: &freenet_stdlib::prelude::WrappedState| {
+            move |k: &ContractKey, _new_state: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
                 invalidator.invalidate(k);
             },
         );
@@ -1367,7 +1371,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
         let observed_for_cb = observed.clone();
         let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState| {
+            move |k: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
                 observed_for_cb
                     .lock()
                     .unwrap()

@@ -457,7 +457,9 @@ pub(super) fn v2_delegate_state_write_callback(
     op_manager: Option<Arc<OpManager>>,
 ) -> crate::wasm_runtime::StateWriteCallback {
     Arc::new(
-        move |key: &ContractKey, new_state: &freenet_stdlib::prelude::WrappedState| {
+        move |key: &ContractKey,
+              new_state: &freenet_stdlib::prelude::WrappedState,
+              content_changed: bool| {
             cache_invalidator.invalidate(key);
             let Some(op_manager) = &op_manager else {
                 return;
@@ -491,6 +493,21 @@ pub(super) fn v2_delegate_state_write_callback(
             //
             // Not registered with `ring::broadcast_coverage` — see the
             // residual list in that module, which this path is named in.
+            // Everything above is owed for ANY committed write. Only the
+            // network fan-out below is skipped when the bytes did not change:
+            // it is the one leg an idempotent rewrite genuinely does not need,
+            // and the one whose cost scales with the subscriber set.
+            //
+            // The generation bump inside `commit_state_write` is why the split
+            // is here rather than at the caller: it is what tells a scheduled
+            // `EvictContract` the contract was written after it was queued
+            // (`pool.rs::remove_contract` guard 3). A V2 write has already
+            // committed to storage by the time this runs, so gating the whole
+            // hook on `content_changed` let an in-flight eviction reclaim a
+            // contract that had just been written.
+            if !content_changed {
+                return;
+            }
             if op_manager.ring.is_contract_broken(key) {
                 tracing::debug!(
                     contract = %key,
@@ -3041,7 +3058,7 @@ mod state_write_attribution_pin_tests {
              {hook_calls}"
         );
         // …and exactly one place that actually invokes the callback.
-        let invocations = count_call_sites(NATIVE_API_SRC, "cb(contract_key, new_state)");
+        let invocations = count_call_sites(NATIVE_API_SRC, "cb(contract_key, new_state, content_changed)");
         assert_eq!(
             invocations, 1,
             "expected exactly 1 callback invocation in native_api.rs (inside \

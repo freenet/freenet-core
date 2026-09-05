@@ -89,6 +89,41 @@ impl std::error::Error for EventLoopExitReason {}
 /// result on timeout rather than freezing (or, previously, killing) the listener.
 const QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bound on the state read the V2 delegate broadcast drain performs.
+///
+/// Same hazard and same remedy as [`QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT`]: the
+/// read runs INLINE on the network event loop, and the handler's own timeout is
+/// `CH_EV_RESPONSE_TIME_OUT` (300 s), so an unbounded await here is the #4549
+/// wedge — a saturated contract handler stalls, then kills, the listener.
+///
+/// Shorter than the diagnostics bound (5 s) on purpose. That one serves an
+/// operator poll where a slow answer still beats none; this one only decides
+/// whether a broadcast goes out now or waits for the next write, and the loop
+/// it blocks warns at 100 ms of iteration time. Failing fast and letting
+/// anti-entropy heal is the better trade here, so the cap is the smallest that
+/// still clears a normally-loaded handler rather than the largest that is
+/// tolerable.
+const V2_BROADCAST_DRAIN_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Count of V2 delegate broadcasts dropped because the drain could not read
+/// local state.
+///
+/// A counter, not only a log line: `crates/core/Cargo.toml` enables tracing's
+/// `release_max_level_info`, so anything logged below INFO does not exist in a
+/// release binary. The accompanying message is therefore WARN, and this counter
+/// gives the same fact a form an operator can poll and graph rather than grep.
+/// `.claude/rules/code-style.md` requires exactly this of a drop that is
+/// invisible on the happy path — a refusal that is not counted renders as a
+/// clean zero.
+static V2_BROADCAST_DRAINS_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read [`V2_BROADCAST_DRAINS_DROPPED`]. Test/diagnostics accessor.
+#[cfg(test)]
+pub(crate) fn v2_broadcast_drains_dropped() -> u64 {
+    V2_BROADCAST_DRAINS_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Best-effort, bounded query to the contract handler for application-level
 /// subscriptions, used by the diagnostics arms of the network event loop (#4549).
 ///
@@ -2944,25 +2979,56 @@ impl P2pConnManager {
                                 // would drop that write's fan-out.
                                 op_manager.clear_v2_delegate_broadcast_pending(&key);
                                 // The event carries no state; read what is
-                                // stored now. A contract we no longer hold
-                                // reads as None and is simply not broadcast.
-                                if let Some(new_state) =
-                                    op_manager.read_current_contract_state(&key).await
-                                {
-                                    ctx.handle_broadcast_state_change(
-                                        &op_manager,
-                                        key,
-                                        new_state,
-                                        false,
-                                        false,
+                                // stored now. BOUNDED (#4549 — this runs inline
+                                // on the event loop) and three-way, because
+                                // "we do not hold it" and "the read failed"
+                                // need opposite handling.
+                                match op_manager
+                                    .read_state_for_broadcast_drain(
+                                        &key,
+                                        V2_BROADCAST_DRAIN_READ_TIMEOUT,
                                     )
-                                    .await;
-                                } else {
-                                    tracing::debug!(
-                                        contract = %key,
-                                        "V2 delegate broadcast drained but no local state to \
-                                         send; skipping fan-out"
-                                    );
+                                    .await
+                                {
+                                    crate::node::op_state_manager::DrainStateRead::Found(new_state) => {
+                                        ctx.handle_broadcast_state_change(
+                                            &op_manager,
+                                            key,
+                                            new_state,
+                                            false,
+                                            false,
+                                        )
+                                        .await;
+                                    }
+                                    crate::node::op_state_manager::DrainStateRead::NotHeld => {
+                                        tracing::debug!(
+                                            contract = %key,
+                                            "V2 delegate broadcast drained for a contract we \
+                                             do not hold; nothing to send"
+                                        );
+                                    }
+                                    crate::node::op_state_manager::DrainStateRead::Unavailable => {
+                                        // A write that already committed and
+                                        // already returned success to the
+                                        // delegate now goes unannounced. WARN,
+                                        // not debug: `release_max_level_info`
+                                        // compiles debug out, and a drop that
+                                        // leaves no evidence in a release build
+                                        // is the #4981 shape.
+                                        let dropped = V2_BROADCAST_DRAINS_DROPPED
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                            + 1;
+                                        tracing::warn!(
+                                            contract = %key,
+                                            dropped_total = dropped,
+                                            timeout_secs =
+                                                V2_BROADCAST_DRAIN_READ_TIMEOUT.as_secs(),
+                                            "V2 delegate broadcast dropped: could not read \
+                                             local state to announce. The write is committed \
+                                             locally; the network learns of it on the next \
+                                             write or via anti-entropy"
+                                        );
+                                    }
                                 }
                             }
                             NodeEvent::SyncStateToPeer {
