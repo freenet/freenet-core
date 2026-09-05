@@ -47,8 +47,18 @@ pub const EVIDENCE_MAGIC: &[u8; 8] = b"FRNTEVD1";
 pub enum EvidenceError {
     #[error("not conformance evidence (bad magic)")]
     BadMagic,
+    #[error(
+        "unframed legacy evidence (schema version {schema_version}) lacks required 10-byte framing header"
+    )]
+    LegacyUnframed { schema_version: u16 },
     #[error("evidence uses schema version {found}, this build understands {supported}")]
     UnsupportedSchema { found: u16, supported: u16 },
+    #[error(
+        "evidence framing header specifies schema {header}, but deserialized payload specifies {body}"
+    )]
+    MismatchedBodySchema { header: u16, body: u16 },
+    #[error("encode: {0}")]
+    Encode(String),
     #[error("decode: {0}")]
     Decode(String),
 }
@@ -376,7 +386,7 @@ impl ConformanceEvidence {
         let mut out = Vec::with_capacity(self.input_bytes() + 128);
         out.extend_from_slice(EVIDENCE_MAGIC);
         out.extend_from_slice(&self.schema_version.to_le_bytes());
-        let body = bincode::serialize(self).map_err(|e| EvidenceError::Decode(e.to_string()))?;
+        let body = bincode::serialize(self).map_err(|e| EvidenceError::Encode(e.to_string()))?;
         out.extend_from_slice(&body);
         Ok(out)
     }
@@ -384,19 +394,38 @@ impl ConformanceEvidence {
     /// Decode an evidence file, verifying magic and schema version *before*
     /// attempting bincode deserialization.
     pub fn decode(bytes: &[u8]) -> Result<Self, EvidenceError> {
-        if bytes.len() < EVIDENCE_MAGIC.len() + 2
-            || &bytes[..EVIDENCE_MAGIC.len()] != EVIDENCE_MAGIC
-        {
+        const HEADER_LEN: usize = EVIDENCE_MAGIC.len() + 2;
+        if bytes.len() < HEADER_LEN || &bytes[..EVIDENCE_MAGIC.len()] != EVIDENCE_MAGIC {
+            if bytes.len() >= 2 {
+                let legacy_version = u16::from_le_bytes([bytes[0], bytes[1]]);
+                if legacy_version == 1 {
+                    return Err(EvidenceError::UnsupportedSchema {
+                        found: 1,
+                        supported: EVIDENCE_SCHEMA_VERSION,
+                    });
+                } else if legacy_version == 2 {
+                    return Err(EvidenceError::LegacyUnframed { schema_version: 2 });
+                }
+            }
             return Err(EvidenceError::BadMagic);
         }
-        let version = u16::from_le_bytes([bytes[8], bytes[9]]);
+        let version =
+            u16::from_le_bytes([bytes[EVIDENCE_MAGIC.len()], bytes[EVIDENCE_MAGIC.len() + 1]]);
         if version != EVIDENCE_SCHEMA_VERSION {
             return Err(EvidenceError::UnsupportedSchema {
                 found: version,
                 supported: EVIDENCE_SCHEMA_VERSION,
             });
         }
-        bincode::deserialize(&bytes[10..]).map_err(|e| EvidenceError::Decode(e.to_string()))
+        let evidence: Self = bincode::deserialize(&bytes[HEADER_LEN..])
+            .map_err(|e| EvidenceError::Decode(e.to_string()))?;
+        if evidence.schema_version != version {
+            return Err(EvidenceError::MismatchedBodySchema {
+                header: version,
+                body: evidence.schema_version,
+            });
+        }
+        Ok(evidence)
     }
 }
 

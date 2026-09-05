@@ -2824,6 +2824,15 @@ fn a_foreign_file_is_not_mistaken_for_evidence() {
         ConformanceEvidence::decode(b""),
         Err(EvidenceError::BadMagic)
     ));
+    // Length guard boundary tests: exactly 8 bytes (magic only) and 9 bytes (truncated version)
+    assert!(matches!(
+        ConformanceEvidence::decode(b"FRNTEVD1"),
+        Err(EvidenceError::BadMagic)
+    ));
+    assert!(matches!(
+        ConformanceEvidence::decode(b"FRNTEVD1\x02"),
+        Err(EvidenceError::BadMagic)
+    ));
 }
 
 #[test]
@@ -2861,11 +2870,72 @@ fn an_evidence_from_an_unsupported_schema_is_refused_before_bincode() {
 #[test]
 fn evidence_encode_decode_roundtrip() {
     use super::evidence::ConformanceEvidence;
-    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
-    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let idem_case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &idem_case, None);
     let bytes = evidence.encode().expect("encode");
+
+    // Golden wire-format pin: exactly 10 bytes framing (8 bytes magic + LE u16 schema_version 2)
+    assert_eq!(&bytes[..10], b"FRNTEVD1\x02\x00");
+
     let decoded = ConformanceEvidence::decode(&bytes).expect("decode");
     assert_eq!(decoded, evidence);
+
+    // Also roundtrip with observed: Some(..) - the motivating case from #5520
+    let comm_case = case(ConformanceProperty::StateCommutativity, &[&[1, 2], &[2, 3]]);
+    let mut fake = Fake::conforming().merging(|_a, b| Ok(b.to_vec()));
+    let observed = verify_case(&mut fake, &comm_case).violation().cloned();
+    assert!(observed.is_some());
+    let annotated = ConformanceEvidence::new(instance(42), vec![7, 8], &comm_case, observed);
+    let bytes_annotated = annotated.encode().expect("encode annotated");
+    assert_eq!(&bytes_annotated[..10], b"FRNTEVD1\x02\x00");
+    let decoded_annotated =
+        ConformanceEvidence::decode(&bytes_annotated).expect("decode annotated");
+    assert_eq!(decoded_annotated, annotated);
+}
+
+#[test]
+fn legacy_unframed_evidence_is_detected_and_reported_politely() {
+    use super::evidence::{ConformanceEvidence, EVIDENCE_SCHEMA_VERSION, EvidenceError};
+
+    // Legacy schema 1 unframed file: starts with LE u16 for 1 (0x01, 0x00)
+    let legacy_schema_1 = [1u8, 0u8, 0xff, 0xff, 0xff];
+    match ConformanceEvidence::decode(&legacy_schema_1) {
+        Err(EvidenceError::UnsupportedSchema { found, supported }) => {
+            assert_eq!(found, 1);
+            assert_eq!(supported, EVIDENCE_SCHEMA_VERSION);
+        }
+        other => panic!("expected schema 1 refusal for legacy file, got {other:?}"),
+    }
+
+    // Legacy schema 2 unframed file (pre-0.2.134): starts with LE u16 for 2 (0x02, 0x00)
+    let legacy_schema_2 = [2u8, 0u8, 0xff, 0xff, 0xff];
+    match ConformanceEvidence::decode(&legacy_schema_2) {
+        Err(EvidenceError::LegacyUnframed { schema_version }) => {
+            assert_eq!(schema_version, 2);
+        }
+        other => panic!("expected legacy unframed refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_rejects_mismatched_body_schema() {
+    use super::evidence::{ConformanceEvidence, EvidenceError};
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let mut bytes = evidence.encode().expect("encode");
+
+    // Body begins at byte 10. The first field in ConformanceEvidence bincode payload
+    // is schema_version (LE u16). Change the body's schema_version to 999 while keeping
+    // header's schema_version as 2.
+    bytes[10..12].copy_from_slice(&999u16.to_le_bytes());
+
+    match ConformanceEvidence::decode(&bytes) {
+        Err(EvidenceError::MismatchedBodySchema { header, body }) => {
+            assert_eq!(header, 2);
+            assert_eq!(body, 999);
+        }
+        other => panic!("expected MismatchedBodySchema, got {other:?}"),
+    }
 }
 
 // ----------------------------------------------------------------------- generator
