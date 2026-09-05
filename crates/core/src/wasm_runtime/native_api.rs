@@ -930,20 +930,28 @@ impl DelegateCallEnv {
         content_changed: bool,
     ) {
         if !content_changed {
-            // Byte-identical rewrite: the cached view is still accurate, the
-            // generation does not need bumping, nothing was really written to
-            // meter, and there is nothing for the network to learn. This is
-            // what the V1 path's `UpsertResult::NoChange` short-circuit
-            // achieves; see `state_content_changed`.
             tracing::debug!(
                 contract = %contract_key,
                 event = "v2_delegate_write_no_content_change",
                 "V2 delegate rewrote identical state; no fan-out"
             );
-            return;
         }
+        // ALWAYS invoked, including for a byte-identical rewrite — the hook
+        // decides for itself what the unchanged case skips.
+        //
+        // The V1 `UpsertResult::NoChange` short-circuit is NOT a precedent for
+        // returning early here, and the difference is the whole point: V1
+        // short-circuits BEFORE writing, so nothing committed and there is
+        // nothing to record. The V2 path has already written to the raw
+        // `Storage` by the time this runs, so the bookkeeping the hook performs
+        // — in particular `Ring::commit_state_write`, whose generation bump is
+        // what tells a scheduled `EvictContract` that the contract was written
+        // after it was queued (`pool.rs::remove_contract` guard 3) — is owed
+        // whether or not the CONTENT changed. Skipping it left a committed
+        // write invisible to that guard, so an in-flight eviction could reclaim
+        // a contract that had just been written.
         if let Some(cb) = &self.state_write_callback {
-            cb(contract_key, new_state);
+            cb(contract_key, new_state, content_changed);
         }
     }
 

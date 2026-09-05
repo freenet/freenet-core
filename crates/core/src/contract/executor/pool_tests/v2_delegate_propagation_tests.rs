@@ -110,7 +110,7 @@ async fn v2_delegate_write_callback_queues_a_broadcast() {
 
     let callback =
         v2_delegate_state_write_callback(state_store.cache_invalidator(), Some(op_manager.clone()));
-    callback(&key, &written);
+    callback(&key, &written, true);
 
     let queued = take_broadcasts(&mut notifications);
     assert_eq!(
@@ -142,7 +142,7 @@ async fn v2_delegate_writes_to_one_contract_coalesce_while_undrained() {
 
     // Ten content-changing writes, nothing draining the channel in between.
     for i in 0..10u8 {
-        callback(&key, &WrappedState::new(vec![i, i, i, i]));
+        callback(&key, &WrappedState::new(vec![i, i, i, i]), true);
     }
 
     assert_eq!(
@@ -165,9 +165,9 @@ async fn v2_delegate_broadcast_coalescing_is_per_contract() {
     let callback =
         v2_delegate_state_write_callback(state_store.cache_invalidator(), Some(op_manager.clone()));
     let (a, b) = (test_key(16), test_key(17));
-    callback(&a, &WrappedState::new(vec![1]));
-    callback(&b, &WrappedState::new(vec![2]));
-    callback(&a, &WrappedState::new(vec![3]));
+    callback(&a, &WrappedState::new(vec![1]), true);
+    callback(&b, &WrappedState::new(vec![2]), true);
+    callback(&a, &WrappedState::new(vec![3]), true);
 
     let mut queued = take_broadcasts(&mut notifications);
     queued.sort_by_key(|k| k.id().as_bytes().to_vec());
@@ -194,11 +194,11 @@ async fn v2_delegate_broadcast_requeues_after_drain() {
     let callback =
         v2_delegate_state_write_callback(state_store.cache_invalidator(), Some(op_manager.clone()));
 
-    callback(&key, &WrappedState::new(vec![1]));
+    callback(&key, &WrappedState::new(vec![1]), true);
     assert_eq!(take_broadcasts(&mut notifications), vec![key]);
 
     // Second write while the marker is still set: coalesced away.
-    callback(&key, &WrappedState::new(vec![2]));
+    callback(&key, &WrappedState::new(vec![2]), true);
     assert!(
         take_broadcasts(&mut notifications).is_empty(),
         "still-pending contract must coalesce"
@@ -207,7 +207,7 @@ async fn v2_delegate_broadcast_requeues_after_drain() {
     // The handler clears the marker as it starts draining.
     op_manager.clear_v2_delegate_broadcast_pending(&key);
 
-    callback(&key, &WrappedState::new(vec![3]));
+    callback(&key, &WrappedState::new(vec![3]), true);
     assert_eq!(
         take_broadcasts(&mut notifications),
         vec![key],
@@ -235,7 +235,7 @@ async fn v2_delegate_write_callback_still_meters_and_invalidates() {
 
     let callback =
         v2_delegate_state_write_callback(state_store.cache_invalidator(), Some(op_manager.clone()));
-    callback(&key, &written);
+    callback(&key, &written, true);
 
     assert_eq!(
         state_store.cached_state_hash(&key),
@@ -269,7 +269,7 @@ async fn v2_delegate_write_callback_suppresses_broken_contract_broadcast() {
 
     let callback =
         v2_delegate_state_write_callback(state_store.cache_invalidator(), Some(op_manager.clone()));
-    callback(&key, &written);
+    callback(&key, &written, true);
 
     assert!(
         take_broadcasts(&mut notifications).is_empty(),
@@ -291,7 +291,7 @@ async fn v2_delegate_write_callback_without_op_manager_only_invalidates() {
     state_store.cache_state_hash(key, crate::wasm_runtime::state_hash(&written));
 
     let callback = v2_delegate_state_write_callback(state_store.cache_invalidator(), None);
-    callback(&key, &written);
+    callback(&key, &written, true);
 
     assert_eq!(
         state_store.cached_state_hash(&key),
@@ -326,7 +326,7 @@ async fn v2_delegate_failed_enqueue_releases_the_coalescing_marker() {
     let key = test_key(19);
     let callback =
         v2_delegate_state_write_callback(state_store.cache_invalidator(), Some(op_manager.clone()));
-    callback(&key, &WrappedState::new(vec![1, 2, 3]));
+    callback(&key, &WrappedState::new(vec![1, 2, 3]), true);
 
     assert!(
         !op_manager.v2_delegate_broadcast_pending.contains(key.id()),
@@ -337,7 +337,7 @@ async fn v2_delegate_failed_enqueue_releases_the_coalescing_marker() {
 
     // And the latch must genuinely be absent, not merely unobserved: a second
     // write has to be free to try again rather than be swallowed as a repeat.
-    callback(&key, &WrappedState::new(vec![4, 5, 6]));
+    callback(&key, &WrappedState::new(vec![4, 5, 6]), true);
     assert!(
         !op_manager.v2_delegate_broadcast_pending.contains(key.id()),
         "a later write must still attempt its own enqueue after an earlier failure"

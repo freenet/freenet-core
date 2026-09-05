@@ -972,18 +972,32 @@ impl Default for RuntimeConfig {
 /// so the callback is plumbed via a trait object owned by `Runtime` to keep
 /// `wasm_runtime` independent of the ring.
 ///
-/// The closure receives the newly-written state itself, not merely its length,
-/// because the production installer needs BOTH: the byte count for
-/// `Ring::commit_state_write(key, state_size)` (the StateBytesWritten meter axis
-/// that feeds governance scoring), and the state VALUE for the
-/// `NodeEvent::BroadcastStateChange` that gives V2 the same propagation V1 gets
-/// from `upsert_contract_state` (#5479). `WrappedState` is `Arc<Vec<u8>>`
-/// internally, so passing and cloning it is a refcount bump, not a state copy.
+/// The closure receives the newly-written state itself rather than a separately
+/// computed length, so the byte count it meters is measured from the value that
+/// was ACTUALLY written. A `usize` parameter can drift from the write it
+/// describes under refactoring — the failure mode `.claude/rules/
+/// bug-prevention-patterns.md` calls "manually-inlined originator side effects"
+/// — and that drift is silent, because an undercounted meter looks like light
+/// traffic. `WrappedState` is `Arc<Vec<u8>>` internally, so passing it is a
+/// refcount bump, not a state copy. The pins in `delegate_api.rs` assert the
+/// callback receives the exact bytes written, which is what makes this
+/// enforceable rather than merely intended.
+///
+/// (An earlier version of this note justified the wider parameter by the state
+/// VALUE being needed for the emitted `BroadcastStateChange`. That stopped
+/// being true when the propagation event became key-only; the reason above is
+/// the one that still holds.)
+///
+/// The `bool` is `content_changed`: whether the write altered the stored bytes.
+/// The callback runs on EVERY successful write, changed or not — a V2 write
+/// commits to storage before this hook, so the bookkeeping legs are owed
+/// regardless — and uses the flag to skip only the network fan-out, which is
+/// the one leg an idempotent rewrite genuinely does not need.
 ///
 /// See `contract::executor::runtime::install_v2_delegate_state_write_hooks` for
 /// the single production installer.
 pub type StateWriteCallback = Arc<
-    dyn Fn(&freenet_stdlib::prelude::ContractKey, &freenet_stdlib::prelude::WrappedState)
+    dyn Fn(&freenet_stdlib::prelude::ContractKey, &freenet_stdlib::prelude::WrappedState, bool)
         + Send
         + Sync
         + 'static,

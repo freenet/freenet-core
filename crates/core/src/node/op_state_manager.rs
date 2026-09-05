@@ -420,6 +420,26 @@ impl Drop for ClientOpGuard {
     }
 }
 
+/// Outcome of a bounded state read on the V2 broadcast drain path.
+///
+/// Three-way on purpose: collapsing `NotHeld` and `Unavailable` into one
+/// `None` is what let a transient read failure silently discard a write that
+/// had already committed and already returned success to the delegate — the
+/// #5479 shape, reintroduced inside its own fix. See
+/// [`OpManager::read_state_for_broadcast_drain`].
+#[derive(Debug)]
+pub(crate) enum DrainStateRead {
+    /// State read successfully; broadcast it.
+    Found(WrappedState),
+    /// We genuinely do not hold this contract. Not broadcasting is correct
+    /// and final — there is nothing to send.
+    NotHeld,
+    /// The read failed or timed out. We may or may not hold the contract; the
+    /// write it would have announced has already committed. NOT the same as
+    /// `NotHeld`, and must not be silent.
+    Unavailable,
+}
+
 impl OpManager {
     // `pub(crate)` (widened from `pub(super)`) so in-crate unit tests outside
     // `crate::node` can stand up a real `OpManager` — specifically the
@@ -996,6 +1016,50 @@ impl OpManager {
             return false;
         }
         true
+    }
+
+    /// Read the current stored state for `key` for a V2 broadcast drain,
+    /// BOUNDED and distinguishing "not held" from "could not read".
+    ///
+    /// Two things this does not share with
+    /// [`Self::read_current_contract_state`], both because this one runs INLINE
+    /// on the network event loop rather than in a spawned task:
+    ///
+    /// * **It is bounded.** The plain read inherits the handler's own
+    ///   `CH_EV_RESPONSE_TIME_OUT` (300 s). A bare `.await` of that on this loop
+    ///   is the #4549 wedge — see this file's `query_app_subscriptions_bounded`,
+    ///   whose comment records a saturated handler killing the network event
+    ///   listener and taking a gateway network-dead. Same remedy, same reason.
+    /// * **It reports the failure.** The plain read maps every failure to
+    ///   `None`, which the caller cannot tell from "we do not hold this
+    ///   contract". For a drain those need opposite handling: not held is a
+    ///   correct no-op, a failed read means a committed write goes unannounced.
+    pub(crate) async fn read_state_for_broadcast_drain(
+        &self,
+        key: &ContractKey,
+        timeout: std::time::Duration,
+    ) -> DrainStateRead {
+        use crate::contract::ContractHandlerEvent;
+        match self
+            .notify_contract_handler_with_timeout(
+                ContractHandlerEvent::GetQuery {
+                    instance_id: *key.id(),
+                    return_contract_code: false,
+                },
+                timeout,
+            )
+            .await
+        {
+            Ok(ContractHandlerEvent::GetResponse {
+                response: Ok(store_response),
+                ..
+            }) => match store_response.state {
+                Some(state) => DrainStateRead::Found(state),
+                None => DrainStateRead::NotHeld,
+            },
+            Ok(_) => DrainStateRead::Unavailable,
+            Err(_) => DrainStateRead::Unavailable,
+        }
     }
 
     /// Clear the queued-broadcast marker for `key`, called by the handler when
