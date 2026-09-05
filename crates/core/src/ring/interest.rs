@@ -337,7 +337,7 @@ impl Drop for ResyncRetrySlot {
 /// Timeout for contract handler queries in the broadcast path (summary and
 /// delta computation). Much shorter than the default 300s to prevent spawned
 /// broadcast tasks from accumulating when the contract handler is slow.
-const BROADCAST_CH_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const BROADCAST_CH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Identifies a peer for interest tracking purposes.
 ///

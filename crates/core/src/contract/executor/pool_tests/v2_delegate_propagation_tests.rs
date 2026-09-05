@@ -343,3 +343,43 @@ async fn v2_delegate_failed_enqueue_releases_the_coalescing_marker() {
         "a later write must still attempt its own enqueue after an earlier failure"
     );
 }
+
+/// The `content_changed = false` half of the callback, which nothing else covers.
+///
+/// Every other test in this file passes `true`, so the early return that gates
+/// ONLY the fan-out is invisible to all of them: moving it above
+/// `commit_state_write` — one line — leaves the entire suite green while
+/// re-opening the eviction race that split was made to close. This is the same
+/// function that carried a stranded mutation earlier in this workstream, so it
+/// gets a behavioural assertion rather than trust.
+///
+/// Asserts both halves of the split at once: the generation still advances (the
+/// bookkeeping is owed for a write that committed), and no broadcast is queued
+/// (the fan-out is the one leg an identical rewrite does not need).
+#[tokio::test(flavor = "current_thread")]
+async fn v2_delegate_unchanged_write_meters_but_does_not_queue() {
+    let (op_manager, mut notifications, _guards) = build_op_manager("v2-prop-unchanged").await;
+    let state_store = StateStore::new(MockStateStorage::new(), 10_000_000).unwrap();
+
+    let key = test_key(21);
+    let written = WrappedState::new(vec![5, 5, 5]);
+    let callback =
+        v2_delegate_state_write_callback(state_store.cache_invalidator(), Some(op_manager.clone()));
+
+    let generation_before = op_manager.ring.state_generation(&key);
+    callback(&key, &written, false);
+
+    assert_ne!(
+        op_manager.ring.state_generation(&key),
+        generation_before,
+        "an unchanged write still COMMITTED to storage, so `commit_state_write` is owed: its \
+         generation bump is what tells a scheduled EvictContract the contract was written \
+         after the eviction was queued. If this is unchanged, the early return has moved \
+         above the bookkeeping and an in-flight eviction can reclaim a just-written contract"
+    );
+    assert!(
+        take_broadcasts(&mut notifications).is_empty(),
+        "an unchanged write must queue NO fan-out — that is the one leg a byte-identical \
+         rewrite does not need, and the whole reason the flag is threaded through"
+    );
+}
