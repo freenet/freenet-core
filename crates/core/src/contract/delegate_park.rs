@@ -147,6 +147,89 @@ pub(super) const MAX_PARKED_DELEGATES: usize = 64;
 /// a ninth.
 pub(super) const MAX_PENDING_PER_DELEGATE: usize = 8;
 
+/// Cap on deferred related-contract fetches a single park may carry (#5544 S3).
+///
+/// The client-driven path bounds its off-loop fetches with
+/// `MAX_INFLIGHT_DEFERRALS` (256) as explicit anti-amplification. The delegate
+/// path cannot consult that counter — it has no `DeferralCtx` — and nothing
+/// caps how many `PutContractRequest`s one `process()` may emit, each able to
+/// name up to `MAX_RELATED_CONTRACTS_PER_REQUEST` (10) missing contracts.
+///
+/// 4 is chosen so the node-wide worst case matches the client path rather than
+/// exceeding it: MAX_PARKED_DELEGATES (64) x 4 x 10 = 2560 ids in flight,
+/// against the client path's 256 x 10 = 2560. Over the cap the excess upserts
+/// fall back to the inline fetch, which stalls the loop for those specific
+/// operations — the same deliberate trade as the park-cap fallback: degrading
+/// to the old behaviour beats dropping a delegate's write.
+pub(super) const MAX_DEFERRED_UPSERTS_PER_PARK: usize = 4;
+
+/// Node-wide cap on the bytes a park may hold (#5544 S4).
+///
+/// `MAX_PARKED_DELEGATES` bounds the NUMBER of parks, which is not the same as
+/// bounding their footprint: `Continuation::inbound_so_far` carries
+/// `GetContractResponse`s holding full `WrappedState`s, so a count cap reads
+/// like a memory bound and is not one. This is the fourth instance of that
+/// pattern found on this change alone (see #5551), and `code-style.md` rule 4
+/// requires the cap be on the quantity actually consumed.
+///
+/// 64 MiB: generous beside the 50 MB single-state ceiling the runtime already
+/// allows, while bounding the aggregate a flood of parked delegates can pin.
+pub(super) const MAX_PARKED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Approximate heap footprint of the payloads a continuation pins.
+///
+/// Counts the large, contract-controlled parts — inbound states and payloads —
+/// and ignores fixed-size bookkeeping. The point is to bound what an attacker
+/// can grow, not to be exact.
+pub(super) fn continuation_bytes(continuation: &Continuation) -> usize {
+    continuation
+        .inbound_so_far
+        .iter()
+        .map(inbound_bytes)
+        .sum::<usize>()
+        + continuation
+            .accumulated
+            .iter()
+            .map(outbound_bytes)
+            .sum::<usize>()
+}
+
+fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
+    match msg {
+        InboundDelegateMsg::ApplicationMessage(m) => m.payload.len(),
+        InboundDelegateMsg::GetContractResponse(r) => {
+            r.state.as_ref().map_or(0, |s| s.as_ref().len())
+        }
+        InboundDelegateMsg::ContractNotification(n) => n.new_state.as_ref().len(),
+        InboundDelegateMsg::UserResponse(r) => r.response.len(),
+        InboundDelegateMsg::DelegateMessage(m) => m.payload.len(),
+        // Put/Update/Subscribe responses carry only a small Result. The
+        // wildcard is required by `#[non_exhaustive]`; a future variant
+        // carrying bytes must be added above or it goes uncounted.
+        InboundDelegateMsg::PutContractResponse(_)
+        | InboundDelegateMsg::UpdateContractResponse(_)
+        | InboundDelegateMsg::SubscribeContractResponse(_)
+        | _ => 0,
+    }
+}
+
+fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
+    // The request variants never appear in `accumulated` — they are consumed by
+    // the run that produced them — and the rest carry no contract-controlled
+    // payload. Listed rather than wildcarded so a future payload-bearing
+    // variant has to be considered here.
+    match msg {
+        OutboundDelegateMsg::ApplicationMessage(m) => m.payload.len(),
+        OutboundDelegateMsg::SendDelegateMessage(m) => m.payload.len(),
+        OutboundDelegateMsg::RequestUserInput(_)
+        | OutboundDelegateMsg::ContextUpdated(_)
+        | OutboundDelegateMsg::GetContractRequest(_)
+        | OutboundDelegateMsg::PutContractRequest(_)
+        | OutboundDelegateMsg::UpdateContractRequest(_)
+        | OutboundDelegateMsg::SubscribeContractRequest(_) => 0,
+    }
+}
+
 /// Backstop lifetime for a park.
 ///
 /// The [`ParkGuard`] already guarantees exactly-one resume per park even if
@@ -173,6 +256,17 @@ pub(super) const PARK_TTL: Duration = Duration::from_secs(90);
 /// Bounding the task below the TTL means the guard always wins that race, so
 /// the TTL stays what it is meant to be — unreachable in practice.
 pub(super) const PARK_WORK_BUDGET: Duration = Duration::from_secs(75);
+
+/// The budget/TTL ordering above is load-bearing, so it is CHECKED rather than
+/// merely described. Tune one of these and the compiler makes you tune the
+/// other — prose in two rustdoc blocks is exactly the kind of coupling that
+/// rots the first time someone adjusts a timeout in isolation.
+const _: () = assert!(
+    PARK_WORK_BUDGET.as_secs() < PARK_TTL.as_secs(),
+    "PARK_WORK_BUDGET must stay below PARK_TTL: the off-loop task has to \
+     finish and deliver its resume before the loop's backstop sweep would \
+     force-resume the park, or the task's result is discarded"
+);
 
 /// A delegate invocation that arrived while its delegate was parked.
 ///
@@ -227,6 +321,16 @@ pub(super) enum Delivery {
 /// WASM env, so resuming with empty params (as the notification path does, a
 /// known v1 limitation) would run a different delegate instance.
 pub(super) struct Continuation {
+    /// Iterations this round-trip has already consumed, so
+    /// `MAX_CONTRACT_REQUEST_ITERATIONS` bounds the WHOLE round-trip rather
+    /// than each leg of it (#5544 S1).
+    ///
+    /// Without this the counter is a call-frame local that every park resets,
+    /// so a delegate emitting `RequestUserInput` on every re-entry loops
+    /// park -> resume -> park forever, holding its exclusion open the whole
+    /// time and rejecting every other request for it. Before parking existed
+    /// the same delegate stopped after 100 iterations.
+    pub iterations: usize,
     pub params: Parameters<'static>,
     pub origin_contract: Option<ContractInstanceId>,
     pub connection_scope: ConnectionScope,
@@ -414,6 +518,8 @@ pub(super) enum QueueOutcome {
 /// Loop-owned per-delegate park state.
 pub(super) struct DelegateParkCtx {
     parked: HashMap<DelegateKey, ParkEntry>,
+    /// Running total of `continuation_bytes` across live parks (#5544 S4).
+    parked_bytes: usize,
     /// Handed to each [`ParkGuard`] so an off-loop task can deliver its resume.
     /// Kept here rather than threaded separately so every call site needs only
     /// a single `&mut DelegateParkCtx`.
@@ -424,6 +530,7 @@ impl DelegateParkCtx {
     pub(super) fn new(resume_tx: tokio::sync::mpsc::UnboundedSender<DelegateResume>) -> Self {
         Self {
             parked: HashMap::new(),
+            parked_bytes: 0,
             resume_tx,
         }
     }
@@ -450,16 +557,24 @@ impl DelegateParkCtx {
     /// is unreachable by construction and is treated as a refusal rather than
     /// silently clobbering the live continuation.
     pub(super) fn park(&mut self, key: DelegateKey, continuation: Continuation) -> ParkAdmission {
-        if self.parked.len() >= MAX_PARKED_DELEGATES || self.parked.contains_key(&key) {
+        let bytes = continuation_bytes(&continuation);
+        let over_bytes = self.parked_bytes.saturating_add(bytes) > MAX_PARKED_BYTES;
+        if self.parked.len() >= MAX_PARKED_DELEGATES || self.parked.contains_key(&key) || over_bytes
+        {
             tracing::warn!(
                 delegate = %key,
                 parked = self.parked.len(),
                 limit = MAX_PARKED_DELEGATES,
+                parked_bytes = self.parked_bytes,
+                adding_bytes = bytes,
+                byte_limit = MAX_PARKED_BYTES,
+                over_bytes,
                 already_parked = self.parked.contains_key(&key),
                 "Refusing to park delegate; falling back to the inline path"
             );
             return ParkAdmission::Refused(Box::new(continuation));
         }
+        self.parked_bytes = self.parked_bytes.saturating_add(bytes);
         self.parked.insert(
             key,
             ParkEntry {
@@ -525,9 +640,12 @@ impl DelegateParkCtx {
         &mut self,
         key: &DelegateKey,
     ) -> Option<(Continuation, VecDeque<PendingRun>)> {
-        self.parked
-            .remove(key)
-            .map(|entry| (entry.continuation, entry.pending))
+        self.parked.remove(key).map(|entry| {
+            self.parked_bytes = self
+                .parked_bytes
+                .saturating_sub(continuation_bytes(&entry.continuation));
+            (entry.continuation, entry.pending)
+        })
     }
 
     /// The earliest instant at which some park will reach [`PARK_TTL`], or
@@ -582,6 +700,7 @@ mod tests {
             inbound_so_far: Vec::new(),
             responder: None,
             delivery: Delivery::Client,
+            iterations: 0,
         }
     }
 
