@@ -1510,6 +1510,16 @@ mod tests {
             opener.ends_with(open),
             "opener must end at the opening delimiter: {opener}"
         );
+        // Uniqueness, for the same reason `production_region` asserts it: this
+        // returns the FIRST match, so a second anchor would be sliced past in
+        // silence and every assertion below would describe the wrong block —
+        // fail-OPEN, the direction a bounded region exists to prevent.
+        assert_eq!(
+            src.matches(opener).count(),
+            1,
+            "expected exactly one `{opener}` in the scanned region; this slice \
+             takes the first, so any other is invisible to the pin that consumes it"
+        );
         let at = src
             .find(opener)
             .unwrap_or_else(|| panic!("block anchor not found: {opener}"));
@@ -1626,6 +1636,31 @@ mod tests {
              legitimate, extend the list deliberately"
         );
 
+        // The enumeration above identifies each mention by only the first 13
+        // characters that follow it, which stops well short of the initialiser:
+        // `AtomicBool::new(true)` leaves all seven windows byte-identical, keeps
+        // the single store where it belongs, and still raises the flag before any
+        // signal arrives — so EVERY fault exits 0. That is the #5230 hole itself,
+        // reached without tripping anything else in this file or in
+        // `tests/graceful_shutdown_exit_code.rs`, which asserts SIGTERM => 0 and
+        // is equally satisfied by a flag that is never false.
+        //
+        // Pinned separately rather than by widening the windows: reaching `false`
+        // needs ~50 characters, which would drag that much incidental following
+        // text into all seven entries and make every adjacent edit churn the list.
+        assert_eq!(
+            flat.matches(&squeeze(
+                "shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false))"
+            ))
+            .count(),
+            1,
+            "the flag must be DECLARED false, exactly once. It means `an operator \
+             asked THIS process to stop`, so any initialiser that can be true \
+             before the signal task observes a signal makes `finish_run` report a \
+             FAULT as a clean exit 0 — the service manager skips its self-heal and \
+             the node stays dead (#5230)"
+        );
+
         let store_at = signal_task
             .find(&squeeze("shutdown_requested.store("))
             .unwrap_or_else(|| {
@@ -1662,6 +1697,18 @@ mod tests {
         let prod = production_region(&src);
         // `= finish_run(` is the CALL; `fn finish_run(` is the definition. Keying
         // on the `=` identifies the call wherever it sits in the file.
+        //
+        // `delimited_block` asserts `= finish_run(` is unique, but a second call
+        // written `return finish_run(result, true);` carries no `=`, so it would
+        // slip past that check while re-opening the hole this pin is named for.
+        // Exactly two mentions: the one call, and the definition.
+        assert_eq!(
+            prod.matches("finish_run(").count(),
+            2,
+            "expected exactly one `finish_run` CALL and one definition in \
+             production. A second call site is not inspected by this pin, so it \
+             could be fed a constant and make every fault exit 0 (#5230)"
+        );
         let args = squeeze(delimited_block(prod, "= finish_run(", '(', ')'));
         assert!(
             args.contains(&squeeze("shutdown_requested.load(")),
