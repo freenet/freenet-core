@@ -4419,13 +4419,6 @@ impl Ring {
             .add_client_subscription(instance_id, client_id)
     }
 
-    /// How many contracts `client_id` is subscribed to, and whether it already
-    /// holds one for a given contract. Used by the delegate demand path to
-    /// apply the same per-subscriber cap the WebSocket path gets.
-    pub fn client_subscription_count(&self, client_id: crate::client_events::ClientId) -> usize {
-        self.hosting_manager.client_subscription_count(client_id)
-    }
-
     /// Whether `client_id` already holds a subscription for `instance_id`.
     pub fn has_client_subscription(
         &self,

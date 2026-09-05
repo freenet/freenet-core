@@ -1666,19 +1666,6 @@ impl HostingManager {
         }
     }
 
-    /// How many contracts `client_id` is subscribed to.
-    ///
-    /// A scan over `client_subscriptions`, because that map is keyed by
-    /// contract and there is no per-client index. Callers are subscribe paths,
-    /// which are infrequent relative to reads, so the scan is acceptable; do
-    /// not call it per message.
-    pub fn client_subscription_count(&self, client_id: crate::client_events::ClientId) -> usize {
-        self.client_subscriptions
-            .iter()
-            .filter(|entry| entry.value().contains(&client_id))
-            .count()
-    }
-
     /// `(subscriptions held by `client_id`, total subscriptions held by any
     /// client at or above `reserved_id_floor`)` — both from ONE pass.
     ///

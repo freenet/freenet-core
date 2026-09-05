@@ -117,7 +117,7 @@
 //! uses (`contract/executor/runtime/delegates.rs`): the delegate is going away
 //! entirely, so every pin it holds goes with it.
 //!
-//! [`drop_subscription`] retires one delegate's demand on ONE contract. Its only
+//! [`drop_subscriptions_for_contract`] retires demand on ONE contract. Its only
 //! caller is the notification-channel-closed arm in
 //! `contract/executor/runtime/executor_impl.rs`, which is itself per-contract —
 //! it clears `DELEGATE_SUBSCRIPTIONS[instance_id]`, and that map is a
@@ -207,6 +207,20 @@ pub(crate) const MAX_DELEGATE_PINS_PER_NODE: usize = 200;
 /// constant: the refusal is counted and logged, so this can be tuned from
 /// production evidence rather than guessed a second time.
 pub(crate) const MAX_PINS_PER_DELEGATE: usize = 50;
+
+// The two orderings the bounds above rely on, checked at COMPILE time rather
+// than in a test: a delegate must get less than a WebSocket client (its pins do
+// not expire), and one delegate must not be able to consume the whole node-wide
+// budget (or the aggregate bound protects nobody from a single greedy app).
+const _: () = assert!(
+    MAX_PINS_PER_DELEGATE < crate::contract::executor::MAX_SUBSCRIPTIONS_PER_CLIENT,
+    "a delegate's permanent pins must get a smaller allowance than a client's \
+     expiring subscriptions"
+);
+const _: () = assert!(
+    MAX_PINS_PER_DELEGATE < MAX_DELEGATE_PINS_PER_NODE,
+    "one delegate must not be able to consume the entire node-wide pin budget"
+);
 
 // The "structurally impossible" claim above is a 64-bit claim. On a 32-bit
 // target the reserved base is 2^31, and the real-client counter — seeded
@@ -623,28 +637,8 @@ pub(crate) fn register_subscription(
     true
 }
 
-/// Drop the demand `delegate` holds on `contract`, if any, and collapse the
-/// upstream subscription when nothing else is left interested.
-///
-/// Scoped to one contract on purpose. Its caller — the channel-closed arm in
-/// `contract/executor/runtime/executor_impl.rs` — clears the matching
-/// notification hook for the same single contract, and the two must move
-/// together. A wider sweep is not available to that caller: the hook map is a
-/// process-global `static` while demand is per-`Ring`, so retiring a delegate
-/// "everywhere" would cross node boundaries in any multi-node test process
-/// while dropping demand on one node only.
-pub(crate) fn drop_subscription(
-    op_manager: &std::sync::Arc<OpManager>,
-    delegate: &DelegateKey,
-    contract: &ContractKey,
-) {
-    if drop_subscription_without_collapse(op_manager, delegate, contract) {
-        collapse_if_no_interest(op_manager, contract);
-    }
-}
-
-/// [`drop_subscription`] without the upstream-collapse decision, returning
-/// whether this delegate actually held demand on `contract`.
+/// Drop the demand `delegate` holds on `contract`, if any, WITHOUT deciding
+/// about the upstream subscription; returns whether it actually held any.
 ///
 /// Split out so a caller retiring MANY delegates from ONE contract collapses
 /// once rather than once per delegate. Spawning the decision per delegate makes
@@ -1037,7 +1031,7 @@ mod tests {
                 .expect("store hosting metadata");
         }
 
-        ring.set_hosting_storage(storage.clone().into());
+        ring.set_hosting_storage(storage.clone());
         ring.load_hosting_cache(&storage, |_id| None)
             .expect("load_hosting_cache");
 
@@ -1118,11 +1112,6 @@ mod tests {
     /// See [`MAX_PINS_PER_DELEGATE`].
     #[tokio::test(start_paused = true)]
     async fn a_delegate_gets_a_lower_pin_cap_than_a_websocket_client() {
-        assert!(
-            MAX_PINS_PER_DELEGATE < crate::contract::executor::MAX_SUBSCRIPTIONS_PER_CLIENT,
-            "a delegate's permanent pins must not get the same allowance as a \
-             client's expiring subscriptions"
-        );
         let fixture = seam_fixture("delegate-demand-4669-cap").await;
         let op_manager = fixture.op_manager.clone();
         let ring = &op_manager.ring;
@@ -1158,7 +1147,11 @@ mod tests {
         }
         assert_eq!(
             cap,
-            ring.client_subscription_count(client_id_for(&delegate))
+            ring.client_and_reserved_range_counts(
+                client_id_for(&delegate),
+                DELEGATE_CLIENT_ID_BASE,
+            )
+            .0
         );
 
         assert!(
@@ -1180,7 +1173,11 @@ mod tests {
         );
         assert_eq!(
             cap,
-            ring.client_subscription_count(client_id_for(&delegate))
+            ring.client_and_reserved_range_counts(
+                client_id_for(&delegate),
+                DELEGATE_CLIENT_ID_BASE,
+            )
+            .0
         );
     }
 
@@ -1273,12 +1270,6 @@ mod tests {
         let op_manager = fixture.op_manager.clone();
         let ring = &op_manager.ring;
         let node_cap = MAX_DELEGATE_PINS_PER_NODE;
-
-        assert!(
-            MAX_PINS_PER_DELEGATE < node_cap,
-            "a single delegate must not be able to consume the whole node-wide \
-             budget, or the aggregate bound protects nobody"
-        );
 
         let mut keys = Vec::with_capacity(node_cap + 1);
         for i in 0..=node_cap {
@@ -1465,7 +1456,7 @@ mod tests {
         register_subscription(&op_manager, &bystander, &dropped);
         assert_eq!((2, 0), ring.local_and_downstream_counts(&dropped));
 
-        drop_subscription(&op_manager, &delegate, &dropped);
+        drop_subscriptions_for_contract(&op_manager, [&delegate], &dropped);
 
         assert_eq!(
             (1, 0),
@@ -1487,7 +1478,7 @@ mod tests {
 
         // The last holder releasing it must still collapse the pin, or a
         // per-contract drop would leak demand the whole-delegate one does not.
-        drop_subscription(&op_manager, &bystander, &dropped);
+        drop_subscriptions_for_contract(&op_manager, [&bystander], &dropped);
         assert!(!ring.contract_in_use(&dropped));
         assert!(!ring.contracts_needing_renewal().contains(&dropped));
         assert!(
