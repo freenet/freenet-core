@@ -216,6 +216,19 @@ search with a blind spot; a fixed token is not.
    distinguishes a guard that works from one that happens to be passing.
 
 
+### Rescued trees have not been through the local gate
+
+When you recover work from a session that died — your own or someone else's —
+run `cargo check`, then `cargo fmt`, then `cargo clippy`, in that order, before
+pushing it. Compiling is not sufficient evidence that it is pushable.
+
+An agent dies wherever it dies, and formatting is the last thing done, not the
+first: a tree can hold finished, correct logic that has never been formatted or
+linted. On 2026-09-04 a rescued commit was verified with `cargo check` alone and
+would have failed both Fmt and Clippy in CI — for hand-edited closure
+signatures and a `#[cfg(test)]` helper left with no caller — neither of which
+had anything to do with the work being rescued.
+
 ## Reference Patterns
 
 **Time injection:**

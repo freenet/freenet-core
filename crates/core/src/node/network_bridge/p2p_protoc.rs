@@ -2971,6 +2971,16 @@ impl P2pConnManager {
                                 // one, which is already past the point where it
                                 // could observe it. Clearing after the read
                                 // would drop that write's fan-out.
+                                //
+                                // The marker also stays clear for the whole
+                                // fan-out below, so a write landing mid-fan-out
+                                // queues a fresh event and re-sends bytes
+                                // already going out. Correct but wasteful, on
+                                // the sink #5147/#5153 exist to shrink.
+                                // Deliberate: holding the marker until the
+                                // fan-out completes would trade a duplicate
+                                // send for a DROPPED one, and a drop here is
+                                // unrecoverable until the next write.
                                 op_manager.clear_v2_delegate_broadcast_pending(&key);
                                 // The event carries no state; read what is
                                 // stored now. BOUNDED (#4549 — this runs inline
@@ -5395,6 +5405,51 @@ pub(crate) mod tests {
              fan-out and names peers that fan-out never touched — \
              over-suppression. Every queue test passes an empty fanout, so no \
              behavioural test distinguishes the two."
+        );
+    }
+
+    /// The V2 drain must clear the coalescing marker BEFORE it reads state.
+    ///
+    /// This ordering is the whole lost-write story and nothing else pins it.
+    /// The behavioural tests in `v2_delegate_propagation_tests` drive the write
+    /// callback and call `clear_v2_delegate_broadcast_pending` THEMSELVES to
+    /// simulate the handler, so they never observe this site at all: moving the
+    /// clear below the read — the single edit that reopens the window — leaves
+    /// every one of them green.
+    ///
+    /// Why the order matters: between the read and the fan-out, a delegate may
+    /// write again. If the marker is still set at that moment the new write
+    /// coalesces into THIS drain, which has already read and cannot see it, and
+    /// its fan-out never happens. Clearing first means such a write queues a
+    /// fresh event instead. The cost is a possible duplicate fan-out; the
+    /// alternative is a silently dropped one, which is #5479 again.
+    #[test]
+    fn v2_drain_clears_marker_before_reading_state() {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+
+        let arm_anchor = "NodeEvent::V2DelegateStateChanged { key } => {";
+        let arm_start = SOURCE
+            .find(arm_anchor)
+            .expect("the V2DelegateStateChanged dispatch arm is gone — update this pin");
+        // Bound at the next dispatch arm so a later arm's text cannot satisfy
+        // the assertion.
+        let after = &SOURCE[arm_start..];
+        let arm_end = after
+            .find("NodeEvent::SyncStateToPeer {")
+            .map(|p| arm_start + p)
+            .unwrap_or(SOURCE.len());
+        let arm = &SOURCE[arm_start..arm_end];
+
+        let clear_pos = arm.find("clear_v2_delegate_broadcast_pending(").expect(
+            "the V2 drain no longer clears the coalescing marker. Without the clear the              marker latches: every later write to this contract coalesces into a              broadcast that has already drained, and the contract stops propagating",
+        );
+        let read_pos = arm
+            .find("read_state_for_broadcast_drain(")
+            .expect("the V2 drain no longer reads state — update this pin");
+
+        assert!(
+            clear_pos < read_pos,
+            "the V2 drain must clear the coalescing marker (offset {clear_pos}) BEFORE              reading state (offset {read_pos}). Clearing afterwards means a write that              lands during the read coalesces into a drain that has already read past it,              and that write is never announced. Arm:\n{arm}"
         );
     }
 

@@ -426,13 +426,21 @@ fn install_v2_delegate_state_write_hooks(
 /// 3. **`Ring::record_contract_update`** — the dashboard "last updated"
 ///    timestamp. `commit_state_write` does not do this; the V1 UPDATE path
 ///    does it separately, so it has to be here too.
-/// 4. **`NodeEvent::BroadcastStateChange`** — the propagation V1 gets for free
-///    from `upsert_contract_state` (#5479). Suppressed for a contract flagged
-///    as violating a CRDT invariant, mirroring
-///    `Executor::broadcast_state_change`, and emitted NON-BLOCKING: a blocking
-///    `notify_node_event(...).await` on a commit path is what wedged both
-///    gateways in #4145, and this one runs inside a synchronous WASM host call,
-///    where blocking would be worse still.
+/// 4. **Queueing the network fan-out** via
+///    `OpManager::queue_v2_delegate_broadcast` — the propagation V1 gets for
+///    free from `upsert_contract_state` (#5479). It enqueues a KEY-ONLY
+///    `NodeEvent::V2DelegateStateChanged`; the handler reads current state when
+///    it drains, so the queue holds contract ids rather than states and repeat
+///    writes to one contract coalesce. Suppressed for a contract flagged as
+///    violating a CRDT invariant, mirroring `Executor::broadcast_state_change`,
+///    and enqueued NON-BLOCKING: a blocking `notify_node_event(...).await` on a
+///    commit path is what wedged both gateways in #4145, and this one runs
+///    inside a synchronous WASM host call, where blocking would be worse still.
+///
+///    This leg — and ONLY this leg — is skipped when the write did not change
+///    the stored bytes. Legs 1-3 run for every committed write; see
+///    `native_api::after_state_write` for why skipping them was a data-loss
+///    bug rather than an optimisation.
 ///
 /// Legs 2-4 need the ring, so they run only when `op_manager` is `Some`
 /// (unit-test and local-only executors have none). Leg 1 always runs.

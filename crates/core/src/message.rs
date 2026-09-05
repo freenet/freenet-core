@@ -994,9 +994,25 @@ pub(crate) enum NodeEvent {
     ///   oldest.
     ///
     /// The re-read costs one contract-handler `GetQuery` per drained
-    /// broadcast, which is why the coalescing matters: the cost is per
-    /// drain, not per write. This mirrors the #4359 deferred-broadcast flush,
-    /// which re-reads for the same stale-state reason.
+    /// broadcast, which is why the coalescing matters: the cost is per drain,
+    /// not per write. It is BOUNDED at the drain site — that read runs inline
+    /// on the network event loop, where an unbounded await is the #4549 wedge.
+    ///
+    /// It shares the PRINCIPLE of the #4359 deferred-broadcast flush — re-read
+    /// rather than carry bytes that may have been superseded — but is not the
+    /// same mechanism, and the differences are the ones a reader would
+    /// otherwise assume away:
+    ///
+    /// * **When the read happens.** #4359 reads at the TRIGGER and
+    ///   synchronously builds a state-carrying event. This path reads at the
+    ///   DRAIN, because the write callback that queues it is synchronous inside
+    ///   a WASM host call and cannot `.await` anything.
+    /// * **What happens when the read fails.** #4359 falls back to the bytes it
+    ///   stashed (`read_current_state().await.unwrap_or(stashed)`), so it always
+    ///   emits something. This path stashes nothing, so a failed read has no
+    ///   fallback: it is reported and dropped, and the state is re-announced by
+    ///   the next write or by anti-entropy. See the `Unavailable` arm at the
+    ///   drain site.
     V2DelegateStateChanged {
         key: ContractKey,
     },
