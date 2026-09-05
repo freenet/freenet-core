@@ -590,6 +590,33 @@ pub(crate) fn register_subscription(
     //
     // Checked only for a NEW registration, so an idempotent re-subscribe is
     // never refused by either bound.
+    // NOT ATOMIC with the insert below, and that is a deliberate accept.
+    //
+    // All three bounds are check-then-insert with no lock spanning the two, and
+    // `RuntimePool` runs V2 host calls on separate worker threads, so N
+    // concurrent registrations can each observe a count below the limit before
+    // any of them inserts. The bound is then exceeded.
+    //
+    // The overshoot is BOUNDED, which is what makes this acceptable for a
+    // backstop: it is at most the number of registrations in flight at once,
+    // and it cannot compound — once the count is over the limit every
+    // subsequent registration is refused, so the excess is a one-time constant
+    // rather than a runaway. That is the property these bounds exist to
+    // provide (see `MAX_DELEGATE_PINS_PER_NODE`: stop unbounded growth, do not
+    // ration), and the numbers are set far above plausible legitimate use, so
+    // being a handful over is immaterial.
+    //
+    // Closing it properly is not cheap. Only the per-CONTRACT bound could be
+    // made exact without a global lock, by moving the check inside
+    // `add_client_subscription` under the entry guard it already holds — but
+    // that changes a method the WebSocket path also calls. The per-delegate and
+    // node-wide bounds span the whole map, so they would need a lock held
+    // across the scan AND the insert, serialising every delegate subscribe on
+    // the node across all worker threads, on the WASM call stack. That is a
+    // real cost to tighten a deliberately loose backstop by a small constant.
+    //
+    // Revisit this when demand-decay replaces the counting bounds (#5467 open
+    // question 1, #5543): a decaying pin has no sharp threshold to race against.
     let is_new = !op_manager
         .ring
         .has_client_subscription(contract.id(), client_id);
