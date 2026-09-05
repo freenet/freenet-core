@@ -738,7 +738,10 @@ does.
    precede announce, so the node never advertises hosting without the body).
 4. **Verify the pin by deleting a leg and watching it go red.** Inspection is not
    verification: a pin needle that no longer matches (rustfmt splitting a long
-   call across lines is the common cause) passes vacuously forever.
+   call across lines is the common cause) passes vacuously forever. When you do
+   this, commit BEFORE mutating and mark the broken lines `MUTATION_APPLIED` —
+   `.claude/rules/testing.md` has the convention and why a fixed token matters
+   to whoever cleans up after a dead session.
 5. **Scrape every file the sequence can live in, and run the audit grep against
    your own branch before claiming the rule holds.** #5481's fixing PR asserted
    "exactly one call site", scraped one file, and left two counterexamples in a

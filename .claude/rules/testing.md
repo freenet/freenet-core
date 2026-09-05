@@ -169,6 +169,53 @@ per-event filtering is preserved, and do **not** install as the global
 default — that slot belongs to `test_log`, and taking it silently stops
 `RUST_LOG=… cargo test` printing anything.
 
+## Deliberately breaking code to verify a test: mark it `MUTATION_APPLIED`
+
+A test or a source-scrape pin is not verified until you have watched it go RED
+under a deliberate break and GREEN again when the break is reverted. Inspection
+is not verification — see the vacuous-pin row in
+`.claude/rules/bug-prevention-patterns.md`. So mutating code is a normal,
+encouraged part of writing one. These rules are about not leaving the mutation
+behind.
+
+### One fixed token
+
+Mark every deliberately-broken line with the exact string `MUTATION_APPLIED` —
+not `MUTANT`, not `MUTATION:`, not a comment that merely reads "temporary".
+One token, so that `grep -rn MUTATION_APPLIED` is a complete answer.
+
+**The point is not tidiness, it is that the person who greps is usually not the
+person who mutated.** On 2026-09-04 four agents hit an account session limit
+simultaneously, mid-mutation. The cleanup grepped `MUTANT|MUTATION_APPLIED` and
+missed a stranded break in another PR, because that agent had written
+`MUTATION:`. Nothing shipped, but only because a human looked twice.
+
+That is the same failure shape as the bug being fixed in the PR that prompted
+this rule: a source scanner whose docstring said it skipped "comments" and which
+skipped one kind of them. **Searching for one variant of the thing you are
+looking for is not searching for the thing.** A convention with variants is a
+search with a blind spot; a fixed token is not.
+
+### The rules
+
+1. **Commit or stash BEFORE mutating.** Restoring is then `git checkout --`,
+   never retyping from memory. This matters more than the marker: a session can
+   die between the break and the restore, and it did.
+2. **Mark every broken line** with `MUTATION_APPLIED`.
+3. **Before committing, `grep -rn MUTATION_APPLIED` and confirm it is empty.**
+   Better, where you have a pre-mutation commit: confirm `git diff` against it
+   shows only the change you intend.
+4. **When cleaning up after someone else's dead session, do not rely on the
+   marker.** Grep for it, AND diff every dirty worktree against its HEAD. A
+   mutation applied by editing an existing line leaves no marker at all if its
+   author forgot one, and only the diff catches that.
+5. **Say which mutation in the commit message**, and say what went red. "Verified
+   by inspection" is not verification. Both directions are worth stating when the
+   fix is to a shared helper: that the bug turns the guard red, and that reverting
+   only the fix — with the bug still in place — turns it green again, is what
+   distinguishes a guard that works from one that happens to be passing.
+
+
 ## Reference Patterns
 
 **Time injection:**
