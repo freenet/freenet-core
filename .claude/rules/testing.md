@@ -109,6 +109,12 @@ WHEN a timing assertion cannot be made decisive in your harness:
   → Do not leave a reader to assume the timeout is the guard
 ```
 
+Running the falsification is itself governed by "Deliberately breaking code to
+verify a test: mark it `MUTATION_APPLIED`" above — commit before you mutate,
+mark the broken line with that exact token, and grep it clean before you
+commit. This section says a "does not block" test MUST be falsified; that one
+says how to falsify without leaving the break behind.
+
 **Known-vacuous, do not trust (audited 2026-09-04):** `#4391`'s
 `deferred_related_fetch_does_not_block_local_get` and
 `same_key_get_during_deferred_put_runs_promptly` both PASS with the deferral
