@@ -666,11 +666,13 @@ async fn run_user_input_prompts<P>(
     delegate_key: &DelegateKey,
     delegate_key_str: &str,
     caller: CallerIdentity,
-) -> Vec<InboundDelegateMsg<'static>>
-where
+    // Answers are appended AS THEY ARRIVE rather than returned at the end, so a
+    // caller whose overall budget expires mid-sequence still keeps the ones a
+    // human already answered (#5544 S6).
+    sink: &std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>,
+) where
     P: UserInputPrompter,
 {
-    let mut out = Vec::with_capacity(requests.len());
     for req in requests {
         let request_id = req.request_id;
         let response = match prompter
@@ -689,16 +691,17 @@ where
                 ClientResponse::new(Vec::new())
             }
         };
-        out.push(InboundDelegateMsg::UserResponse(UserInputResponse {
-            request_id,
-            response,
-            // UserInputRequest has no context field, so we use default.
-            // The delegate's actual context is maintained separately in
-            // the process_outbound loop in delegate.rs.
-            context: DelegateContext::default(),
-        }));
+        sink.lock()
+            .unwrap()
+            .push(InboundDelegateMsg::UserResponse(UserInputResponse {
+                request_id,
+                response,
+                // UserInputRequest has no context field, so we use default.
+                // The delegate's actual context is maintained separately in
+                // the process_outbound loop in delegate.rs.
+                context: DelegateContext::default(),
+            }));
     }
-    out
 }
 
 /// Loop-side context that lets a delegate run PARK instead of blocking.
@@ -717,6 +720,20 @@ struct ParkingCtx<'a> {
     /// new continuation, and if it completes the caller reads what is left here
     /// and answers the client. A fresh run passes `&mut None`.
     carried_responder: &'a mut Option<StashedResponder>,
+}
+
+/// State carried into a delegate run that is continuing an earlier one.
+///
+/// Bundled rather than passed as two more positional arguments to a function
+/// that already carries an `allow(too_many_arguments)`.
+#[derive(Default)]
+struct RunSeed {
+    /// Messages this delegate emitted BEFORE an earlier park, so a round-trip
+    /// that parks more than once still yields one complete response.
+    accumulated: Vec<OutboundDelegateMsg>,
+    /// Iterations already consumed, so `MAX_CONTRACT_REQUEST_ITERATIONS`
+    /// bounds the whole round-trip and a park cannot reset it (#5544 S1).
+    iterations: usize,
 }
 
 /// Outcome of one delegate run.
@@ -767,10 +784,9 @@ async fn handle_delegate_with_contract_requests<CH, P>(
     delegate_key: &DelegateKey,
     prompter: &std::sync::Arc<P>,
     mut parking: Option<ParkingCtx<'_>>,
-    // Messages this delegate emitted BEFORE an earlier park, carried in so a
-    // round-trip that parks more than once still yields one complete response.
-    // `Vec::new()` for a fresh run; `continuation.accumulated` for a resume.
-    seed_accumulated: Vec<OutboundDelegateMsg>,
+    // State carried in from an earlier leg of this round-trip. `RunSeed::
+    // default()` for a fresh run; built from the continuation for a resume.
+    seed: RunSeed,
 ) -> DelegateRunOutcome
 where
     CH: ContractHandler + Send + 'static,
@@ -812,9 +828,11 @@ where
 
     let mut current_req = initial_req;
     let current_params = initial_params;
-    let mut iterations = 0;
     // Accumulate non-contract-request messages across iterations
-    let mut accumulated_messages: Vec<OutboundDelegateMsg> = seed_accumulated;
+    let RunSeed {
+        accumulated: mut accumulated_messages,
+        mut iterations,
+    } = seed;
 
     loop {
         iterations += 1;
@@ -992,7 +1010,11 @@ where
 
                 let result = match outcome {
                     Ok(UpsertOutcome::Completed(r)) => Ok(r),
-                    Ok(UpsertOutcome::DeferRelated(missing)) if parking.is_some() => {
+                    Ok(UpsertOutcome::DeferRelated(missing))
+                        if parking.is_some()
+                            && deferred_upserts.len()
+                                < delegate_park::MAX_DEFERRED_UPSERTS_PER_PARK =>
+                    {
                         deferred_upserts.push(delegate_park::PendingUpsert {
                             key: contract_key,
                             update,
@@ -1168,7 +1190,11 @@ where
                             .await;
                         match outcome {
                             Ok(UpsertOutcome::Completed(r)) => Ok(r),
-                            Ok(UpsertOutcome::DeferRelated(missing)) if parking.is_some() => {
+                            Ok(UpsertOutcome::DeferRelated(missing))
+                                if parking.is_some()
+                                    && deferred_upserts.len()
+                                        < delegate_park::MAX_DEFERRED_UPSERTS_PER_PARK =>
+                            {
                                 deferred_upserts.push(delegate_park::PendingUpsert {
                                     key: full_key,
                                     update: update_value,
@@ -1527,6 +1553,9 @@ where
                     inter_delegate,
                     accumulated: std::mem::take(&mut accumulated_messages),
                     inbound_so_far: std::mem::take(&mut inbound_responses),
+                    // Carry the count so the cap bounds the ROUND-TRIP, not
+                    // each leg (#5544 S1).
+                    iterations,
                     // Attached by the caller right after we return `Parked` (it
                     // owns the channel), or carried straight through if this run
                     // is itself a resume that is parking again.
@@ -1560,6 +1589,21 @@ where
                         // this task the handler. See `delegate_park`'s module
                         // docs, "What parking does NOT relax".
                         GlobalExecutor::spawn(async move {
+                            // Results land in these as they complete, so a
+                            // budget expiry keeps what is already done (#5544
+                            // S6). Discarding on timeout would throw away
+                            // prompt answers a HUMAN has already given, and
+                            // prompts run sequentially, so two slow ones can
+                            // exceed the budget with the first already
+                            // answered.
+                            let answers_sink: std::sync::Arc<
+                                std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>,
+                            > = Default::default();
+                            let fetch_sink: std::sync::Arc<
+                                std::sync::Mutex<Vec<delegate_park::ResolvedUpsert>>,
+                            > = Default::default();
+                            let answers_out = answers_sink.clone();
+                            let fetch_out = fetch_sink.clone();
                             // Prompts and fetches run CONCURRENTLY, and the whole
                             // body is capped by PARK_WORK_BUDGET. Sequentially
                             // they could sum past PARK_TTL, at which point the
@@ -1570,29 +1614,32 @@ where
                             let fetches = async {
                                 futures::future::join_all(upserts.into_iter().map(|pending| {
                                     let op_manager = op_manager.clone();
+                                    let sink = fetch_sink.clone();
                                     async move {
                                         let fetched = fetch_related_off_loop(
                                             op_manager,
                                             pending.missing.clone(),
                                         )
                                         .await;
-                                        delegate_park::ResolvedUpsert { pending, fetched }
+                                        sink.lock().unwrap().push(delegate_park::ResolvedUpsert {
+                                            pending,
+                                            fetched,
+                                        });
                                     }
                                 }))
-                                .await
+                                .await;
                             };
                             let answers = async {
-                                if prompts.is_empty() {
-                                    Vec::new()
-                                } else {
+                                if !prompts.is_empty() {
                                     run_user_input_prompts(
                                         prompter.as_ref(),
                                         prompts,
                                         &key,
                                         &delegate_key_str,
                                         caller,
+                                        &answers_sink,
                                     )
-                                    .await
+                                    .await;
                                 }
                             };
                             let done =
@@ -1600,17 +1647,25 @@ where
                                     tokio::join!(answers, fetches)
                                 })
                                 .await;
-                            match done {
-                                Ok((responses, resolved)) => guard.send(responses, resolved),
-                                Err(_) => {
-                                    tracing::warn!(
-                                        delegate = %key,
-                                        "Off-loop delegate work exceeded PARK_WORK_BUDGET; \
-                                         resuming empty so the round-trip terminates"
-                                    );
-                                    guard.send(Vec::new(), Vec::new());
-                                }
+                            // Either way, resume with whatever completed. On
+                            // expiry that is a PARTIAL result rather than
+                            // nothing, so answers the user already gave are not
+                            // thrown away; the delegate sees responses for the
+                            // requests that finished and none for those that
+                            // did not, which is the same shape as a denied
+                            // prompt.
+                            let responses = std::mem::take(&mut *answers_out.lock().unwrap());
+                            let resolved = std::mem::take(&mut *fetch_out.lock().unwrap());
+                            if done.is_err() {
+                                tracing::warn!(
+                                    delegate = %key,
+                                    kept_answers = responses.len(),
+                                    kept_fetches = resolved.len(),
+                                    "Off-loop delegate work exceeded PARK_WORK_BUDGET; \
+                                     resuming with what completed"
+                                );
                             }
+                            guard.send(responses, resolved);
                         });
                         return DelegateRunOutcome::Parked;
                     }
@@ -1623,6 +1678,7 @@ where
                         let continuation = *continuation;
                         accumulated_messages = continuation.accumulated;
                         inbound_responses = continuation.inbound_so_far;
+                        iterations = continuation.iterations;
                         *ctx.carried_responder = continuation.responder;
                     }
                 }
@@ -1634,16 +1690,17 @@ where
                 inbound_responses.push(run_deferred_upsert_inline(contract_handler, pending).await);
             }
             if !user_input_requests.is_empty() {
-                inbound_responses.extend(
-                    run_user_input_prompts(
-                        prompter.as_ref(),
-                        std::mem::take(&mut user_input_requests),
-                        delegate_key,
-                        &delegate_key_str,
-                        caller,
-                    )
-                    .await,
-                );
+                let sink = std::sync::Mutex::new(Vec::new());
+                run_user_input_prompts(
+                    prompter.as_ref(),
+                    std::mem::take(&mut user_input_requests),
+                    delegate_key,
+                    &delegate_key_str,
+                    caller,
+                    &sink,
+                )
+                .await;
+                inbound_responses.extend(sink.into_inner().unwrap());
             }
         }
 
@@ -1806,11 +1863,21 @@ where
         // iteration for the same reason as the deferred-upsert drain — each
         // resume re-enters WASM — and interleaved with the fair queue so
         // resumes cannot head-of-line-block ordinary contract ops.
-        for _ in 0..MAX_RESUME_DRAIN_BATCH {
+        let mut resume_budget = MAX_RESUME_DRAIN_BATCH;
+        while resume_budget > 0 {
             match delegate_resume_rx.try_recv() {
                 Ok(resume) => {
-                    handle_delegate_resume(&mut contract_handler, &mut park_ctx, &prompter, resume)
-                        .await;
+                    // Spend the WHOLE cost, including the pending requests
+                    // drained behind the park — each is a full delegate run
+                    // (#5544 S5).
+                    let runs = handle_delegate_resume(
+                        &mut contract_handler,
+                        &mut park_ctx,
+                        &prompter,
+                        resume,
+                    )
+                    .await;
+                    resume_budget = resume_budget.saturating_sub(runs.max(1));
                 }
                 Err(_) => break,
             }
@@ -1824,7 +1891,7 @@ where
                 delegate = %delegate_key,
                 "Delegate park exceeded PARK_TTL — force-resuming"
             );
-            handle_delegate_resume(
+            let _ = handle_delegate_resume(
                 &mut contract_handler,
                 &mut park_ctx,
                 &prompter,
@@ -1965,7 +2032,7 @@ where
                 // iteration, so there is exactly one sweep implementation.
             }
             Some(delegate_resume) = delegate_resume_rx.recv() => {
-                handle_delegate_resume(
+                let _ = handle_delegate_resume(
                     &mut contract_handler,
                     &mut park_ctx,
                     &prompter,
@@ -2789,7 +2856,7 @@ async fn handle_delegate_notification<CH, P>(
             delivery: delegate_park::Delivery::Apps,
             carried_responder: &mut no_responder,
         }),
-        Vec::new(),
+        RunSeed::default(),
     )
     .await;
 
@@ -2947,7 +3014,7 @@ async fn dispatch_delegate_request<CH, P>(
             &delegate_key,
             prompter,
             None,
-            Vec::new(),
+            RunSeed::default(),
         )
         .await;
         let response = match outcome {
@@ -3038,7 +3105,7 @@ async fn dispatch_delegate_request<CH, P>(
             delivery: delegate_park::Delivery::Client,
             carried_responder: &mut carried_responder,
         }),
-        Vec::new(),
+        RunSeed::default(),
     )
     .await;
 
@@ -3092,12 +3159,21 @@ async fn send_delegate_response<CH>(
 /// Runs ON the serial loop (the delegate's WASM must stay serial); only the
 /// WAIT happened off it. This is the counterpart to #4391's
 /// `handle_deferred_resume`.
+///
+/// Returns the number of delegate runs performed, INCLUDING the pending
+/// requests drained behind the park. The loop spends that against its
+/// `MAX_RESUME_DRAIN_BATCH` budget (#5544 S5): each drained request is a full
+/// delegate run, so an unaccounted drain could do
+/// `MAX_RESUME_DRAIN_BATCH x MAX_PENDING_PER_DELEGATE` runs before the fair
+/// queue got a single turn — exactly the head-of-line blocking the batch cap
+/// exists to prevent.
 async fn handle_delegate_resume<CH, P>(
     contract_handler: &mut CH,
     park: &mut delegate_park::DelegateParkCtx,
     prompter: &std::sync::Arc<P>,
     resume: delegate_park::DelegateResume,
-) where
+) -> usize
+where
     CH: ContractHandler + Send + 'static,
     P: UserInputPrompter + 'static,
 {
@@ -3115,8 +3191,10 @@ async fn handle_delegate_resume<CH, P>(
             delegate = %delegate_key,
             "Resume for a delegate that is not parked — dropping"
         );
-        return;
+        return 0;
     };
+    // The resumed run itself, plus one per pending request drained below.
+    let mut runs = 1usize;
 
     if cause == delegate_park::ResumeCause::TimedOut {
         tracing::warn!(
@@ -3128,6 +3206,7 @@ async fn handle_delegate_resume<CH, P>(
     }
 
     let delegate_park::Continuation {
+        iterations,
         params,
         origin_contract,
         connection_scope,
@@ -3179,7 +3258,10 @@ async fn handle_delegate_resume<CH, P>(
             // run parks AGAIN it lands in the new continuation. Appending to the
             // `Completed` arm only — as this did — silently dropped every
             // pre-park message on the second park.
-            accumulated,
+            RunSeed {
+                accumulated,
+                iterations,
+            },
         )
         .await
     };
@@ -3230,6 +3312,7 @@ async fn handle_delegate_resume<CH, P>(
     // every item: the resumed run (or an earlier drained request) may have
     // parked this delegate again, and exclusion must still hold.
     for queued in pending {
+        runs += 1;
         match queued {
             delegate_park::PendingRun::Client {
                 id,
@@ -3268,6 +3351,7 @@ async fn handle_delegate_resume<CH, P>(
             }
         }
     }
+    runs
 }
 
 /// Re-run a notification-driven delegate invocation that had been queued behind
@@ -3322,7 +3406,7 @@ async fn run_queued_notification<CH, P>(
             delivery: delegate_park::Delivery::Apps,
             carried_responder: &mut no_responder,
         }),
-        Vec::new(),
+        RunSeed::default(),
     )
     .await;
 
@@ -6907,6 +6991,60 @@ mod hol_4391_tests {
         );
     }
 
+    /// S1: the iteration cap must bound the whole ROUND-TRIP, not each leg.
+    ///
+    /// `iterations` used to be a call-frame local, so every park reset it. A
+    /// delegate that emits `RequestUserInput` on every re-entry then loops
+    /// park -> resume -> park without limit, holding its per-delegate exclusion
+    /// open the entire time so every other request for it queues and is then
+    /// refused. Before parking existed the same delegate stopped after
+    /// `MAX_CONTRACT_REQUEST_ITERATIONS`.
+    ///
+    /// FALSIFY by dropping `iterations` from the `Continuation` (or seeding it
+    /// as 0 in `handle_delegate_resume`): the run then consumes the whole
+    /// script instead of stopping at the cap.
+    #[tokio::test]
+    async fn the_iteration_cap_bounds_the_round_trip_not_each_park() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        let calls = handler.runtime_mut().delegate_calls.clone();
+
+        // A delegate that prompts EVERY time it is entered. More entries than
+        // the cap, so "ran out of script" cannot be mistaken for "hit the cap".
+        let scripted = MAX_CONTRACT_REQUEST_ITERATIONS + 50;
+        for _ in 0..scripted {
+            script.lock().unwrap().push_back(prompt_outbound().into());
+        }
+
+        let send = Arc::new(send);
+        // Answer every prompt immediately; the point here is the loop count,
+        // not the wait.
+        let gate = Arc::new(tokio::sync::Semaphore::new(scripted + 10));
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter { gate: gate.clone() },
+        ));
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            send.send_to_handler(delegate_event(&test_delegate_key())),
+        )
+        .await
+        .expect("a delegate that prompts forever must still terminate (#5544 S1)");
+        assert!(resp.is_ok(), "the client must be answered, got {resp:?}");
+
+        let entered = calls.lock().unwrap().len();
+        assert!(
+            entered <= MAX_CONTRACT_REQUEST_ITERATIONS + 1,
+            "the cap must bound the whole round-trip across parks: entered the \
+             delegate {entered} times, cap is {MAX_CONTRACT_REQUEST_ITERATIONS} \
+             (#5544 S1)"
+        );
+
+        handle.abort();
+    }
+
     /// B2 via the context model: an inter-delegate message must not re-enter a
     /// parked TARGET delegate.
     ///
@@ -6996,6 +7134,7 @@ mod hol_4391_tests {
     /// A continuation standing in for a delegate parked on a prompt.
     fn parked_continuation() -> delegate_park::Continuation {
         delegate_park::Continuation {
+            iterations: 0,
             params: Parameters::from(Vec::new()),
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
