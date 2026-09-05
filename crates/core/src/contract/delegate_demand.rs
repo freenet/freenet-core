@@ -1364,17 +1364,27 @@ mod tests {
         register_subscription(&op_manager, &holder, &key);
         assert_eq!((1, 0), ring.local_and_downstream_counts(&key));
 
-        drop_subscription(&op_manager, &never_registered, &key);
-
-        assert_eq!(
-            (1, 0),
-            ring.local_and_downstream_counts(&key),
-            "a no-op drop must not disturb the real subscriber"
+        // Assert at the SEAM, not only on ring state. Ring state alone cannot
+        // see this: the other delegate keeps `contract_in_use` true, so
+        // `maybe_record_abandonment` is a no-op and the collapse task exits
+        // without sending either way — the observable difference is a spawned
+        // task and a shadow-comparison sample, not a map. A mutation removing
+        // the `was_present` guard was NOT killed by the state assertions below,
+        // which is what promoted this to a return-value assertion.
+        assert!(
+            !drop_subscription_without_collapse(&op_manager, &never_registered, &key),
+            "dropping demand a delegate never held must report that nothing was \
+             released, so the caller runs no side effects for it"
         );
         assert!(
-            ring.contract_in_use(&key),
-            "the contract is still pinned by the delegate that actually holds it"
+            drop_subscription_without_collapse(&op_manager, &holder, &key),
+            "the delegate that DID hold the pin must report a real release — \
+             otherwise the assertion above passes vacuously"
         );
+
+        // And the whole-contract state is undisturbed by the no-op drop: the
+        // real holder was released by the line above, so the count is 0 now.
+        assert_eq!((0, 0), ring.local_and_downstream_counts(&key));
     }
 
     #[tokio::test(start_paused = true)]
