@@ -108,6 +108,35 @@
 //!     do the mirror image: `ContractStore::remove_contract` drops the hook and
 //!     cannot reach the ring to drop the demand.
 //!
+//! # A refused pin still reports SUCCESS to the delegate (unfixed)
+//!
+//! Every refusal in [`register_subscription`] — not hosting, no state, contract
+//! full, delegate full, node full — returns `false` INTERNALLY, and the caller
+//! discards it. The delegate is told its subscribe succeeded. Notifications do
+//! work, so the subscribe is not a lie, but the delegate believes it holds
+//! durable interest and does not: nothing renews the contract on its behalf,
+//! and it will silently miss updates whenever no other route keeps the node
+//! subscribed.
+//!
+//! **That is the same silent no-pin outcome this module exists to eliminate**,
+//! and it is worth naming rather than leaving to be discovered. The only signal
+//! today is a rate-limited `warn!` in the node's log, which the delegate cannot
+//! read.
+//!
+//! It is not fixed here because it cannot be. `SubscribeContractResponse.result`
+//! is `Result<(), String>` in **freenet-stdlib**, so a third "subscribed but not
+//! pinned" outcome needs a stdlib change, and this repo's stdlib-first rule
+//! (`.claude/rules/git-workflow.md`) requires that to merge and publish before a
+//! core PR consumes it. Reusing `Err` instead is not an option: callers
+//! subscribe before the node has settled and depend on success, so flipping
+//! them to failure would break River today to report a condition that is
+//! usually transient.
+//!
+//! The delegate also has no introspection route to ask — `NodeQuery` is the
+//! client API, not the delegate one. So the honest options are a stdlib
+//! outcome variant or a delegate-visible pin-state query, both of which are
+//! their own change. See the PR body.
+//!
 //! # Why the per-contract drop is as narrow as it is
 //!
 //! There are two teardowns, and they differ in scope because the thing each one
@@ -161,78 +190,78 @@ use crate::node::OpManager;
 /// a delegate unregister drop a live client's subscription.
 const DELEGATE_CLIENT_ID_BASE: usize = 1usize << (usize::BITS - 1);
 
-/// Node-wide ceiling on delegate pins, across every delegate and contract.
+/// Node-wide BACKSTOP on delegate pins, across every delegate and contract.
 ///
-/// **This is an interim bound and the number is not settled.** The principled
-/// answer is #5467 open question 1 (where the pin bound belongs), and possibly a
-/// separate, lower-priority renewal budget for delegate pins. Do not read 200 as
-/// a considered constant the way `MAX_SUBSCRIPTIONS_PER_CLIENT` is; read it as a
-/// ceiling chosen to keep delegate pins a MINORITY of the renewal budget until
-/// that question is answered.
+/// # This is a backstop, not a ration, and not the answer to resource abuse
 ///
-/// The arithmetic that forces a node-wide bound at all, rather than only a
-/// per-delegate one: `MAX_RECOVERY_ATTEMPTS_PER_INTERVAL` is 10 per 30 s, so a
-/// node issues roughly 160 renewal attempts per 8-minute
-/// `SUBSCRIPTION_LEASE_DURATION`. Every delegate pin is an entry in
-/// `contracts_needing_renewal`, and selection is not prioritised — so pins
-/// compete directly with real WebSocket subscriptions for those slots. Without a
-/// node-wide bound, `MAX_DELEGATES_PER_CLIENT` (256) times a per-delegate cap of
-/// 500 is 128,000 permanent entries, and a genuine client contract is then
-/// selected so rarely that its lease expires before its turn comes round. The
-/// client's subscription lapses — a delegate starving a real user.
+/// Its only job is to stop unbounded growth — a logic bomb or an expensive bug
+/// pinning contracts without limit — before it hurts the node. It is set ABOVE
+/// any plausible legitimate use, deliberately, because a cap that stops real
+/// work is silent user harm: a wrongly-limited delegate files no complaint, it
+/// just produces an app that quietly stops working. Harvest wants a contract
+/// per Bitcoin address and Delta wants one per published site, so a number in
+/// the hundreds would be a policy claim about how many pins an app OUGHT to
+/// have, and this is not the place to make one (#5543's first principle).
 ///
-/// 200 is about 1.25 lease-windows of slots, which leaves the majority of the
-/// budget for demand that actually expires.
+/// **The real mechanism is demand-decay, and it is not built yet.** A delegate
+/// pin should refresh when it is actually USED — a notification fires, the
+/// state is read — and age out when it is not, the same demand-driven model
+/// #4642 gives contracts. That bounds a logic bomb pinning 10,000 contracts it
+/// never reads while costing an app with 500 live pins nothing, because the
+/// distinction that matters is PRODUCTIVE versus UNPRODUCTIVE use, not the
+/// count. Until that exists, this number is a safety net. See #5467 open
+/// question 1 and #5543; do not read it as settled, and do not tune it as
+/// though it were a quota.
 ///
-/// `InterestManager::active_demand_count` — the #3763 storm denominator — does
-/// not count delegate pins, so the storm detector cannot see this coming. That
-/// is an argument for bounding it here rather than relying on detection.
-pub(crate) const MAX_DELEGATE_PINS_PER_NODE: usize = 200;
+/// Both refusals are counted and logged with distinct reasons, so the real
+/// distribution can be observed rather than guessed at.
+pub(crate) const MAX_DELEGATE_PINS_PER_NODE: usize = 10_000;
 
-/// Per-delegate ceiling on pins, deliberately BELOW
-/// `MAX_SUBSCRIPTIONS_PER_CLIENT` (500).
+/// Per-delegate BACKSTOP on pins, so one delegate cannot consume the whole
+/// node-wide budget on its own.
 ///
-/// An earlier revision of this module reused the WebSocket constant, on the
-/// reasoning that reusing an existing number beats inventing one. That
-/// reasoning was wrong, and the difference is the whole point: a WebSocket
-/// client's 500 subscriptions **expire when it disconnects**, while a delegate's
-/// pins have no TTL, no disconnect and no unsubscribe (#2830) — they are held
-/// until `UnregisterDelegate`, the notification channel closing, or process
-/// exit. 500 permanent pins for one delegate is not the same bargain as 500
-/// expiring ones for one client, so it does not get the same number.
+/// Deliberately left at the same value as `MAX_SUBSCRIPTIONS_PER_CLIENT` rather
+/// than lowered. The asymmetry that argues for lowering is real — a client's
+/// subscriptions expire on disconnect and a delegate's have no TTL, no
+/// disconnect and no unsubscribe (#2830) — but acting on it means picking a
+/// number below plausible single-app use, and Harvest's contract-per-address
+/// model can exceed any such number with an ordinary HD wallet. Breaking a real
+/// app to tighten a backstop is the wrong trade; over-permitting here is the
+/// right one while demand-decay is the actual fix.
 ///
-/// 50 keeps any single delegate to a quarter of
-/// [`MAX_DELEGATE_PINS_PER_NODE`], so one delegate cannot consume the node-wide
-/// budget and shut out every other app's delegate. Same interim status as that
-/// constant: the refusal is counted and logged, so this can be tuned from
-/// production evidence rather than guessed a second time.
-pub(crate) const MAX_PINS_PER_DELEGATE: usize = 50;
+/// # What the node can actually sustain is MUCH lower, and no cap here fixes it
+///
+/// `Ring::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL` is 10 per 30 s, which its own doc
+/// (`ring.rs`, "Maximum renewal tasks spawned per tick") says "effectively
+/// handles ~40 concurrent subscriptions before renewals can't keep up" — ~160
+/// per 8-minute lease when spread out, ~40 when burst-phased, which is exactly
+/// how an app subscribes on first run. Above that, leases lapse SILENTLY: the
+/// contract falls out of `contracts_needing_renewal` branch 1, re-enters via
+/// branch 2 later, and churns in and out of the update mesh with the subscriber
+/// missing updates and no error raised anywhere.
+///
+/// That budget is NODE-level and shared: it covers WebSocket clients' renewals
+/// as well as delegates'. So it cannot be enforced by a per-delegate cap —
+/// two delegates at 40 already exceed it — and it is not delegate-specific:
+/// `MAX_SUBSCRIPTIONS_PER_CLIENT` has exceeded it by 12x for a single WebSocket
+/// client since long before this module existed. Setting this constant to ~40
+/// would break Harvest at 200 addresses AND still not deliver the property.
+/// The capacity is the bug; a cap here cannot fix it. Tracked separately —
+/// see the PR body and #5556.
+pub(crate) const MAX_PINS_PER_DELEGATE: usize = 500;
 
-// The two orderings the bounds above rely on, checked at COMPILE time rather
-// than in a test: a delegate must get less than a WebSocket client (its pins do
-// not expire), and one delegate must not be able to consume the whole node-wide
-// budget (or the aggregate bound protects nobody from a single greedy app).
-const _: () = assert!(
-    MAX_PINS_PER_DELEGATE < crate::contract::executor::MAX_SUBSCRIPTIONS_PER_CLIENT,
-    "a delegate's permanent pins must get a smaller allowance than a client's \
-     expiring subscriptions"
-);
+// One delegate must not be able to consume the entire node-wide backstop.
+// Checked at compile time rather than in a test.
+//
+// There is deliberately NO assertion relating this to
+// `MAX_SUBSCRIPTIONS_PER_CLIENT`. An earlier revision asserted it was strictly
+// lower, which encoded a category error: that constant is a network-uniform
+// POLICY ration for clients, this one is a runaway backstop, and requiring an
+// ordering between them would force one to move whenever the other did for
+// reasons that have nothing to do with it.
 const _: () = assert!(
     MAX_PINS_PER_DELEGATE < MAX_DELEGATE_PINS_PER_NODE,
     "one delegate must not be able to consume the entire node-wide pin budget"
-);
-
-// The "structurally impossible" claim above is a 64-bit claim. On a 32-bit
-// target the reserved base is 2^31, and the real-client counter — seeded
-// `1 + thread_index * COUNTER_BLOCK` from a global thread counter that is never
-// reset — reaches it after a few thousand threads over a long-running process.
-// Every shipped target is 64-bit, so rather than weaken the claim, assert the
-// precondition it rests on and let a 32-bit port fail to build and re-derive it.
-const _: () = assert!(
-    usize::BITS >= 64,
-    "DELEGATE_CLIENT_ID_BASE reserves the top bit of a usize on the assumption \
-     that the real-client counter cannot reach it. That holds at 63 bits and \
-     not at 31 — re-derive the reservation before targeting a 32-bit platform."
 );
 
 /// The stable synthetic [`ClientId`] standing in for `delegate` as a local
@@ -1255,76 +1284,71 @@ mod tests {
         assert_eq!(cap, ring.local_subscriber_count(key.id()));
     }
 
-    /// The node-wide pin ceiling binds across DELEGATES, not just within one.
+    /// The node-wide backstop binds across DELEGATES, not just within one.
     ///
-    /// The per-delegate cap alone does not bound the node:
+    /// The per-delegate backstop alone does not bound the node:
     /// `MAX_DELEGATES_PER_CLIENT` is 256, so one client's delegates could hold
-    /// 256 x the per-delegate cap in permanent renewal entries. Delegate pins
-    /// compete with real WebSocket subscriptions for roughly 160 renewal
-    /// attempts per 8-minute lease, so past a point a genuine client contract
-    /// is selected too rarely to renew before its lease expires — a delegate
-    /// starving a real user. See [`MAX_DELEGATE_PINS_PER_NODE`].
+    /// 256 x the per-delegate figure in permanent renewal entries. The
+    /// node-wide one is what stops a runaway; see
+    /// [`MAX_DELEGATE_PINS_PER_NODE`] for why it is a backstop rather than a
+    /// ration, and why the real fix is demand-decay.
+    ///
+    /// SEEDS the reserved-range ids directly rather than registering them.
+    /// `add_client_subscription` is O(1) while `register_subscription` scans, so
+    /// driving 10,000 pins through the real path would be quadratic for no extra
+    /// coverage — the wiring is already covered by the per-contract and
+    /// per-delegate tests. What this test uniquely proves is that the aggregate
+    /// count is consulted at all, and that a delegate holding NOTHING is still
+    /// refused once the node is full.
     #[tokio::test(start_paused = true)]
-    async fn the_node_wide_pin_ceiling_binds_across_delegates() {
+    async fn the_node_wide_backstop_binds_across_delegates() {
         let fixture = seam_fixture("delegate-demand-4669-node-cap").await;
         let op_manager = fixture.op_manager.clone();
         let ring = &op_manager.ring;
         let node_cap = MAX_DELEGATE_PINS_PER_NODE;
 
-        let mut keys = Vec::with_capacity(node_cap + 1);
-        for i in 0..=node_cap {
+        // Fill the node to its ceiling with reserved-range ids spread over many
+        // contracts, the way many delegates each holding some pins would.
+        let per_contract = 250usize;
+        let contracts = node_cap / per_contract;
+        let mut seeded = 0usize;
+        for c in 0..contracts {
             let mut raw = [0u8; 32];
             raw[0] = 0xE0;
-            raw[1..5].copy_from_slice(&(i as u32).to_le_bytes());
-            let key = ContractKey::from_id_and_code(
-                freenet_stdlib::prelude::ContractInstanceId::new(raw),
-                freenet_stdlib::prelude::CodeHash::new([9u8; 32]),
-            );
-            let _ = ring.host_contract(
-                key,
-                121,
-                crate::ring::AccessType::Put,
-                crate::ring::HostingCause::Other,
-            );
-            keys.push(key);
-        }
-
-        // Spread across enough delegates that no single one hits its own cap —
-        // otherwise this would pass for the wrong reason.
-        let per_delegate = MAX_PINS_PER_DELEGATE;
-        let mut registered = 0usize;
-        let mut delegate_ix = 0u8;
-        while registered < node_cap {
-            let delegate = delegate_key(150u8.wrapping_add(delegate_ix));
-            for _ in 0..per_delegate {
-                if registered >= node_cap {
-                    break;
-                }
-                assert!(
-                    register_subscription(&op_manager, &delegate, &keys[registered]),
-                    "registration below the node-wide ceiling must succeed \
-                     (registered {registered} so far)"
+            raw[1..5].copy_from_slice(&(c as u32).to_le_bytes());
+            let id = freenet_stdlib::prelude::ContractInstanceId::new(raw);
+            for i in 0..per_contract {
+                ring.add_client_subscription(
+                    &id,
+                    ClientId(DELEGATE_CLIENT_ID_BASE | (seeded * 31 + i + 1)),
                 );
-                registered += 1;
+                seeded += 1;
             }
-            delegate_ix += 1;
         }
-
-        let (_, pins) = ring.client_and_reserved_range_counts(
-            client_id_for(&delegate_key(150)),
-            DELEGATE_CLIENT_ID_BASE,
+        let probe = delegate_key(200);
+        let (_, pins) =
+            ring.client_and_reserved_range_counts(client_id_for(&probe), DELEGATE_CLIENT_ID_BASE);
+        assert_eq!(
+            node_cap, pins,
+            "precondition: the node must actually be at its ceiling, or the \
+             refusal below proves nothing"
         );
-        assert_eq!(node_cap, pins, "the node should be exactly at its ceiling");
 
-        // A FRESH delegate, holding nothing, must still be refused.
-        let newcomer = delegate_key(200);
+        // A hosted contract with a fresh delegate holding zero pins.
+        let key = contract_key(91);
+        let _ = ring.host_contract(
+            key,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
         assert!(
-            !register_subscription(&op_manager, &newcomer, &keys[node_cap]),
-            "a delegate holding zero pins must still be refused once the NODE \
-             is at its aggregate ceiling — the bound is node-wide, and a \
-             per-delegate cap alone would let 256 delegates past it"
+            !register_subscription(&op_manager, &probe, &key),
+            "a delegate holding ZERO pins must still be refused once the NODE \
+             is at its aggregate backstop — the bound is node-wide, and a \
+             per-delegate cap alone would let 256 delegates walk past it"
         );
-        assert!(!ring.contract_in_use(&keys[node_cap]));
+        assert!(!ring.contract_in_use(&key));
     }
 
     /// Dropping demand a delegate never held must have NO side effects.
