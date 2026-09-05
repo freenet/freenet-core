@@ -527,7 +527,18 @@ impl<T: TimeSource> SentPacketTracker<T> {
         let mut ack_info = Vec::new();
 
         for packet_id in packet_ids {
-            // Update loss proportion (ACK received = no loss)
+            // Update loss proportion (ACK received = no loss).
+            //
+            // NOTE (#5276): this decay runs for EVERY id in the list, including
+            // ids no longer in `pending_receipts`. Since #5276 the receiver
+            // deliberately re-acknowledges retransmits, so duplicate receipts
+            // for an already-released packet are routine, and they bias this
+            // estimate toward "no loss" in exactly the lossy regime that
+            // produces them. Inert today -- the only production caller discards
+            // the returned rate (`let (ack_info, _loss_rate)`,
+            // peer_connection.rs) and BBR derives loss from its own
+            // round_lost/round_delivered. Move this below the
+            // `pending_receipts.get` guard before wiring the value to anything.
             self.packet_loss_proportion = self.packet_loss_proportion
                 * (1.0 - PACKET_LOSS_DECAY_FACTOR)
                 + (PACKET_LOSS_DECAY_FACTOR * 0.0);
