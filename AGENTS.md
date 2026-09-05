@@ -137,7 +137,13 @@ Cleanup exemptions MUST be time-bounded.
 Any condition that exempts an entry from garbage collection
 (is_transient, has_pending, etc.) MUST either:
   1. Expire via TTL, OR
-  2. Be overridden by an absolute age threshold
+  2. Be overridden by an absolute age threshold, OR
+  3. Be outranked by a reclaim path that runs INDEPENDENTLY of the
+     holder (e.g. the hosting cache's byte-budget eviction, which sheds
+     even subscribed contracts as a last resort). The real property is
+     RECLAIMABILITY; a TTL is only a proxy for it, and the proxy gives
+     a false positive whenever something outranks the holder.
+     See .claude/rules/ring.md for the worked example (#4669 pins).
 
 WHY: Unbounded exemptions create permanent GC blind spots.
 This is a recurring meta-pattern where a fix introduces cleanup with
