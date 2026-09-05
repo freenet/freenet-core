@@ -88,7 +88,7 @@ chrono = { version = "0.4", default-features = true }
 
 # Random
 rand = "0.9"
-rand_chacha = "0.9"
+rand_chacha = "0.10"
 
 # XEdDSA (Signal's construction): signs with the x25519 transport key so the
 # OTel collector can verify node identity against the SAME public key peers
