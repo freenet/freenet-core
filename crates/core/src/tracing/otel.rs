@@ -1445,6 +1445,70 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter, sources: RingSou
         })
         .build();
 
+    // Bootstrap-acceptance-churn counters (#4787): a restarted node's
+    // gateway connection lingers as transient, expires, and is reaped as a
+    // zombie before the onward CONNECT promotes it to the ring, cycling the
+    // joiner through repeated reconnects. Instrumentation only (the issue's
+    // "before a fix" step) — no acceptance behavior changes here. GATEWAY
+    // side: `event` distinguishes the three log sites this is read from; a
+    // sustained high `transient_expired`:`promoted_to_ring` ratio is the
+    // churn signature.
+    let _bootstrap_churn = meter
+        .u64_observable_counter("freenet.bootstrap.churn")
+        .with_description(
+            "Gateway-side transient connection registration/expiry/promotion \
+             totals since startup (bootstrap-acceptance-churn instrumentation, #4787)",
+        )
+        .with_callback(move |observer| {
+            if let Some(status) = (sources.status_scalars)() {
+                observer.observe(
+                    status.bootstrap_transient_registered,
+                    &[KeyValue::new("event", "transient_registered")],
+                );
+                observer.observe(
+                    status.bootstrap_transient_expired,
+                    &[KeyValue::new("event", "transient_expired")],
+                );
+                observer.observe(
+                    status.bootstrap_promoted_to_ring,
+                    &[KeyValue::new("event", "promoted_to_ring")],
+                );
+            }
+        })
+        .build();
+
+    // JOINER side (#4787): time from process start to first reaching
+    // `min_connections`, and how many below-threshold retry rounds it took.
+    // `time_to_min_connections` is `None` until reached (e.g. a node that
+    // never bootstraps), so this gauge simply has no datapoint until then.
+    let _bootstrap_time_to_min_connections = meter
+        .f64_observable_gauge("freenet.bootstrap.time_to_min_connections_seconds")
+        .with_description(
+            "Seconds from process start to first reaching min_connections \
+             (bootstrap-acceptance-churn instrumentation, #4787)",
+        )
+        .with_callback(move |observer| {
+            if let Some(status) = (sources.status_scalars)() {
+                if let Some(elapsed) = status.bootstrap_time_to_min_connections {
+                    observer.observe(elapsed.as_secs_f64(), &[]);
+                }
+            }
+        })
+        .build();
+
+    let _bootstrap_startup_connect_retries = meter
+        .u64_observable_counter("freenet.bootstrap.startup_connect_retries")
+        .with_description(
+            "Below-threshold CONNECT retry rounds issued at startup \
+             (bootstrap-acceptance-churn instrumentation, #4787)",
+        )
+        .with_callback(move |observer| {
+            if let Some(status) = (sources.status_scalars)() {
+                observer.observe(status.bootstrap_startup_connect_retries, &[]);
+            }
+        })
+        .build();
+
     // Read from the dashboard's own cumulative op counters rather than
     // incremented at `record_op_result`: same instrument, one fewer thing that
     // can be forgotten at a new call site. `record_op_result` is itself a
@@ -1827,7 +1891,17 @@ mod tests {
             Some(crate::ring::HostingReasonStats::default())
         }
         fn scalars() -> Option<OtelStatusScalars> {
-            Some(OtelStatusScalars::default())
+            Some(OtelStatusScalars {
+                // `Some`, or the time-to-min-connections gauge emits no
+                // datapoint at all and its name goes unasserted — same
+                // reasoning as `lattice_successor_distance` above.
+                bootstrap_time_to_min_connections: Some(std::time::Duration::from_secs(7)),
+                bootstrap_transient_registered: 10,
+                bootstrap_transient_expired: 9,
+                bootstrap_promoted_to_ring: 1,
+                bootstrap_startup_connect_retries: 4,
+                ..Default::default()
+            })
         }
         RingSources {
             ring_stats: ring,
@@ -2837,6 +2911,10 @@ mod tests {
             "freenet.ring.lattice.neighbor.distance",
             "freenet.ring.lattice.probes",
             "freenet.contract.updates",
+            // Bootstrap-acceptance-churn instrumentation (#4787).
+            "freenet.bootstrap.churn",
+            "freenet.bootstrap.time_to_min_connections_seconds",
+            "freenet.bootstrap.startup_connect_retries",
         ] {
             assert!(
                 names.contains(&expected),
@@ -2902,6 +2980,9 @@ mod tests {
             ),
             ("freenet.ring.lattice.probes", "result=issued"),
             ("freenet.ring.lattice.probes", "result=improvement"),
+            ("freenet.bootstrap.churn", "event=transient_registered"),
+            ("freenet.bootstrap.churn", "event=transient_expired"),
+            ("freenet.bootstrap.churn", "event=promoted_to_ring"),
             ("freenet.contract.updates", "result=accepted"),
             ("freenet.contract.updates", "result=rate_limited"),
             ("freenet.contract.updates", "result=capacity_dropped"),

@@ -3174,9 +3174,33 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     ("relayed_updates_total", snapshot.relayed_updates_total),
                     ("connect_accepts_emitted", snapshot.connect_accepts_emitted),
                     ("connect_rejects_emitted", snapshot.connect_rejects_emitted),
+                    (
+                        "bootstrap_transient_registered",
+                        snapshot.bootstrap_transient_registered,
+                    ),
+                    (
+                        "bootstrap_transient_expired",
+                        snapshot.bootstrap_transient_expired,
+                    ),
+                    (
+                        "bootstrap_promoted_to_ring",
+                        snapshot.bootstrap_promoted_to_ring,
+                    ),
+                    (
+                        "bootstrap_startup_connect_retries",
+                        snapshot.bootstrap_startup_connect_retries,
+                    ),
                 ] {
                     obj.insert(key.to_string(), serde_json::json!(value));
                 }
+                // Bootstrap-acceptance-churn time-to-bootstrap gauge (#4787):
+                // an `Option<f64>`, so it can't join the `Option<u64>` loop
+                // above. Pinned by
+                // `router_snapshot_json_includes_bootstrap_churn_counters`.
+                obj.insert(
+                    "bootstrap_time_to_min_connections_secs".to_string(),
+                    serde_json::json!(snapshot.bootstrap_time_to_min_connections_secs),
+                );
                 // Computed-upstream vs. stored-flag divergence counters (piece D,
                 // #4642 / #4671) — same hand-mirror footgun: a new
                 // `RouterSnapshotInfo` field is invisible to the collector unless
@@ -4095,6 +4119,28 @@ mod tests {
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         assert_eq!(json["connect_accepts_emitted"], 41);
         assert_eq!(json["connect_rejects_emitted"], 42);
+    }
+
+    /// Pin: the bootstrap-acceptance-churn counters (#4787 instrumentation)
+    /// must reach the hand-mirrored OTLP body — same hand-mirror footgun as
+    /// the connect-emit counters above.
+    #[test]
+    fn router_snapshot_json_includes_bootstrap_churn_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.bootstrap_transient_registered = Some(10);
+        info.bootstrap_transient_expired = Some(9);
+        info.bootstrap_promoted_to_ring = Some(1);
+        info.bootstrap_time_to_min_connections_secs = Some(12.5);
+        info.bootstrap_startup_connect_retries = Some(4);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        assert_eq!(json["bootstrap_transient_registered"], 10);
+        assert_eq!(json["bootstrap_transient_expired"], 9);
+        assert_eq!(json["bootstrap_promoted_to_ring"], 1);
+        assert_eq!(json["bootstrap_time_to_min_connections_secs"], 12.5);
+        assert_eq!(json["bootstrap_startup_connect_retries"], 4);
     }
 
     /// Pin: the computed-upstream vs. stored-flag divergence counters (piece D,

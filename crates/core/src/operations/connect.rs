@@ -1861,8 +1861,22 @@ pub(crate) async fn initial_join_procedure(
             }
         }
 
+        // Issue #4787 instrumentation (joiner-side): record how long it takes
+        // this process to first reach `bootstrap_threshold` connections, and
+        // how many below-threshold retry rounds it takes to get there. Set at
+        // most once per process — see `record_bootstrap_min_connections_reached`.
+        let procedure_started_at = Instant::now();
+        let mut min_connections_reached = false;
+
         loop {
             let open_conns = op_manager.ring.open_connections();
+
+            if !min_connections_reached && open_conns >= bootstrap_threshold {
+                min_connections_reached = true;
+                crate::node::network_status::record_bootstrap_min_connections_reached(
+                    procedure_started_at.elapsed(),
+                );
+            }
 
             let unconnected_gateways: Vec<_> =
                 op_manager.ring.is_not_connected(gateways.iter()).collect();
@@ -1982,6 +1996,7 @@ pub(crate) async fn initial_join_procedure(
                     }
                 }
 
+                crate::node::network_status::record_bootstrap_startup_connect_retry();
                 tracing::info!(
                     "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways (skipped {} in backoff)",
                     open_conns,

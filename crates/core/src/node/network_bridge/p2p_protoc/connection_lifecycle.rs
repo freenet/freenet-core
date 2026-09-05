@@ -352,6 +352,7 @@ impl P2pConnManager {
                     .ring
                     .add_connection(loc, PeerId::new(peer.pub_key().clone(), peer_addr), true)
                     .await;
+                crate::node::network_status::record_bootstrap_promoted_to_ring();
                 tracing::info!(
                     tx = %tx,
                     remote = %peer,
@@ -1293,6 +1294,7 @@ impl P2pConnManager {
                     // reservation. Compute location from address directly.
                     let loc = Location::from_address(&peer_addr);
                     connection_manager.try_register_transient(peer_addr, Some(loc));
+                    crate::node::network_status::record_bootstrap_transient_registered();
                     tracing::info!(
                         peer_id = ?peer_id,
                         %peer_addr,
@@ -1312,6 +1314,7 @@ impl P2pConnManager {
                             // the peer to ring topology (see #3113 fix). If it
                             // never succeeds, the transport idle timeout handles
                             // cleanup.
+                            crate::node::network_status::record_bootstrap_transient_expired();
                             tracing::info!(
                                 %peer_addr,
                                 "Transient connection expired; removed tracking entry \

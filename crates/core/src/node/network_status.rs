@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::ring::reconcile::ReconcileActionDivergence;
 use crate::ring::{PeerKeyLocation, SubscribedContractSnapshot};
@@ -143,6 +143,14 @@ pub struct RingStatsSnapshot {
 pub(crate) struct OtelStatusScalars {
     pub connection_attempts: u32,
     pub op_stats: OperationStats,
+    /// Bootstrap-acceptance-churn counters (#4787). Sourced from the same
+    /// `NETWORK_STATUS` lock as the fields above, so it rides this existing
+    /// scalar source rather than a new provider.
+    pub bootstrap_transient_registered: u64,
+    pub bootstrap_transient_expired: u64,
+    pub bootstrap_promoted_to_ring: u64,
+    pub bootstrap_time_to_min_connections: Option<Duration>,
+    pub bootstrap_startup_connect_retries: u64,
 }
 
 /// Read this module's own scalars, or `None` before [`init`] has run.
@@ -169,9 +177,15 @@ pub(crate) fn otel_status_scalars() -> Option<OtelStatusScalars> {
         });
         poisoned.into_inner()
     });
+    let b = &status.bootstrap_churn_stats;
     Some(OtelStatusScalars {
         connection_attempts: status.connection_attempts,
         op_stats: status.op_stats.clone(),
+        bootstrap_transient_registered: b.transient_registered,
+        bootstrap_transient_expired: b.transient_expired,
+        bootstrap_promoted_to_ring: b.promoted_to_ring,
+        bootstrap_time_to_min_connections: b.time_to_min_connections,
+        bootstrap_startup_connect_retries: b.startup_connect_retries,
     })
 }
 
@@ -351,6 +365,36 @@ pub struct NetworkStatus {
     pub reconcile_shadow_inbound_unsubscribe: ReconcileShadowStats,
     pub reconcile_shadow_connection_drop: ReconcileShadowStats,
     pub reconcile_shadow_host_formation: ReconcileShadowStats,
+    /// Bootstrap-acceptance-churn counters (#4787). See [`BootstrapChurnStats`].
+    pub bootstrap_churn_stats: BootstrapChurnStats,
+}
+
+/// Bootstrap-acceptance-churn counters (issue #4787): a restarted node's
+/// connection to a gateway lingers as transient, expires, and the transport
+/// is later reaped as a zombie before the onward CONNECT promotes it to the
+/// ring — cycling the joiner through repeated reconnects before it acquires
+/// real peers. These counters are the "instrumentation before a fix" step
+/// the issue calls for: they don't change acceptance behavior, only make the
+/// churn rate and the time-to-bootstrap legible in production telemetry.
+///
+/// `transient_registered` / `transient_expired` / `promoted_to_ring` are
+/// GATEWAY-side, monotonic lifetime totals, recorded at the three log sites
+/// in `p2p_protoc/connection_lifecycle.rs` that this issue's live-log
+/// evidence was read from. A sustained high `transient_expired` :
+/// `promoted_to_ring` ratio is the churn signature reported in the issue.
+///
+/// `time_to_min_connections` / `startup_connect_retries` are JOINER-side,
+/// recorded by `initial_join_procedure` in `operations/connect.rs`.
+/// `time_to_min_connections` is set at most once per process (the first time
+/// `open_connections()` reaches `min_connections`); `startup_connect_retries`
+/// counts each below-threshold retry round issued before that point.
+#[derive(Default)]
+pub struct BootstrapChurnStats {
+    pub transient_registered: u64,
+    pub transient_expired: u64,
+    pub promoted_to_ring: u64,
+    pub time_to_min_connections: Option<Duration>,
+    pub startup_connect_retries: u64,
 }
 
 /// Per-node counters measuring how often the demand-driven-hosting **computed
@@ -780,6 +824,7 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         reconcile_shadow_inbound_unsubscribe: ReconcileShadowStats::default(),
         reconcile_shadow_connection_drop: ReconcileShadowStats::default(),
         reconcile_shadow_host_formation: ReconcileShadowStats::default(),
+        bootstrap_churn_stats: BootstrapChurnStats::default(),
     };
     match NETWORK_STATUS.get() {
         // Already initialized: overwrite the existing tracker in place so
@@ -1276,6 +1321,91 @@ pub fn connect_emit_counts() -> Option<(u64, u64)> {
     let s = status.read().ok()?;
     let c = &s.connect_emit_stats;
     Some((c.accepts_emitted, c.rejects_emitted))
+}
+
+/// Record that a gateway-side connection was registered as transient (not
+/// yet added to ring topology) — issue #4787 instrumentation. Called from
+/// the "Registered transient connection" site in
+/// `p2p_protoc/connection_lifecycle.rs`.
+pub fn record_bootstrap_transient_registered() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.bootstrap_churn_stats.transient_registered = s
+                .bootstrap_churn_stats
+                .transient_registered
+                .saturating_add(1);
+        }
+    }
+}
+
+/// Record that a transient tracking entry expired (TTL elapsed) before the
+/// onward CONNECT promoted it — issue #4787 instrumentation. Called from the
+/// "Transient connection expired" site in
+/// `p2p_protoc/connection_lifecycle.rs`.
+pub fn record_bootstrap_transient_expired() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.bootstrap_churn_stats.transient_expired =
+                s.bootstrap_churn_stats.transient_expired.saturating_add(1);
+        }
+    }
+}
+
+/// Record that a connection was promoted from transient to ring topology —
+/// issue #4787 instrumentation. Called from the "connect_peer: promoted to
+/// ring" site in `p2p_protoc/connection_lifecycle.rs`.
+pub fn record_bootstrap_promoted_to_ring() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.bootstrap_churn_stats.promoted_to_ring =
+                s.bootstrap_churn_stats.promoted_to_ring.saturating_add(1);
+        }
+    }
+}
+
+/// Record the time from process start to first reaching `min_connections`
+/// (issue #4787 instrumentation, joiner-side). Idempotent: only the first
+/// call per process has any effect, so a wobble around the threshold does
+/// not overwrite the real bootstrap latency with a later value.
+pub fn record_bootstrap_min_connections_reached(elapsed: Duration) {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            if s.bootstrap_churn_stats.time_to_min_connections.is_none() {
+                s.bootstrap_churn_stats.time_to_min_connections = Some(elapsed);
+            }
+        }
+    }
+}
+
+/// Record one below-threshold CONNECT retry round issued by
+/// `initial_join_procedure` at startup (issue #4787 instrumentation,
+/// joiner-side).
+pub fn record_bootstrap_startup_connect_retry() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.bootstrap_churn_stats.startup_connect_retries = s
+                .bootstrap_churn_stats
+                .startup_connect_retries
+                .saturating_add(1);
+        }
+    }
+}
+
+/// Read the current bootstrap-churn counters for export to `router_snapshot`
+/// (issue #4787). Returns `(transient_registered, transient_expired,
+/// promoted_to_ring, time_to_min_connections, startup_connect_retries)` or
+/// `None` before the singleton is initialized.
+pub fn bootstrap_churn_counts() -> Option<(u64, u64, u64, Option<Duration>, u64)> {
+    let status = NETWORK_STATUS.get()?;
+    let s = status.read().ok()?;
+    let b = &s.bootstrap_churn_stats;
+    Some((
+        b.transient_registered,
+        b.transient_expired,
+        b.promoted_to_ring,
+        b.time_to_min_connections,
+        b.startup_connect_retries,
+    ))
 }
 
 /// Count of this node's active connections that are to gateways (the
@@ -2292,6 +2422,49 @@ mod tests {
             Some((5, 2)),
             "getter returns (comparisons, divergences); every call bumps comparisons, \
              only diverged calls bump divergences"
+        );
+    }
+
+    /// End-to-end for the bootstrap-acceptance-churn counters (#4787): each
+    /// record function must feed the `bootstrap_churn_counts()` getter that
+    /// `Ring` polls for the `router_snapshot` export. Distinct counts per
+    /// field so a transposition can't pass; `time_to_min_connections` is
+    /// asserted idempotent (only the FIRST call has effect).
+    #[test]
+    fn bootstrap_churn_counts_reflect_recorded_events() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        // Fresh singleton state for a deterministic baseline (init overwrites
+        // the process-global tracker in place, zeroing the counters).
+        init(31337, HashSet::new(), "test".to_string());
+
+        assert_eq!(
+            bootstrap_churn_counts(),
+            Some((0, 0, 0, None, 0)),
+            "counters start at zero/None after init"
+        );
+
+        record_bootstrap_transient_registered();
+        record_bootstrap_transient_registered();
+        record_bootstrap_transient_registered();
+        record_bootstrap_transient_expired();
+        record_bootstrap_transient_expired();
+        record_bootstrap_promoted_to_ring();
+        record_bootstrap_startup_connect_retry();
+        record_bootstrap_startup_connect_retry();
+        record_bootstrap_startup_connect_retry();
+        record_bootstrap_startup_connect_retry();
+
+        record_bootstrap_min_connections_reached(Duration::from_secs(5));
+        // A second call must NOT overwrite the first — the real bootstrap
+        // latency, not the latest wobble around the threshold.
+        record_bootstrap_min_connections_reached(Duration::from_secs(99));
+
+        assert_eq!(
+            bootstrap_churn_counts(),
+            Some((3, 2, 1, Some(Duration::from_secs(5)), 4)),
+            "getter returns (transient_registered, transient_expired, promoted_to_ring, \
+             time_to_min_connections, startup_connect_retries); time-to-min-connections \
+             is set on the FIRST call only"
         );
     }
 

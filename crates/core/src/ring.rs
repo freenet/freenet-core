@@ -1993,6 +1993,22 @@ impl Ring {
                 snapshot.connect_rejects_emitted = Some(rejects);
             }
 
+            // Bootstrap-acceptance-churn counters (#4787): gateway-side
+            // transient registration/expiry/promotion totals plus
+            // joiner-side time-to-min-connections and startup retry count.
+            // Instrumentation only, no behavior change — see
+            // `network_status::BootstrapChurnStats`.
+            if let Some((registered, expired, promoted, time_to_min_conns, retries)) =
+                crate::node::network_status::bootstrap_churn_counts()
+            {
+                snapshot.bootstrap_transient_registered = Some(registered);
+                snapshot.bootstrap_transient_expired = Some(expired);
+                snapshot.bootstrap_promoted_to_ring = Some(promoted);
+                snapshot.bootstrap_time_to_min_connections_secs =
+                    time_to_min_conns.map(|d| d.as_secs_f64());
+                snapshot.bootstrap_startup_connect_retries = Some(retries);
+            }
+
             // Computed-upstream vs. stored-`is_upstream`-flag divergence counters
             // (#4642 piece D / #4671). Recorded at `send_unsubscribe_upstream`
             // where the stored flag is still consulted; exported here so the
