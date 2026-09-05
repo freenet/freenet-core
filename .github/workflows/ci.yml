@@ -1,7 +1,11 @@
 name: CI
 
 # Cost optimization strategy (Ubicloud runners ~$0.13/run):
-# 1. Skip CI entirely for docs-only changes (paths-ignore)
+# 1. Skip CI entirely for docs-only changes on PUSH TO MAIN only (paths-ignore).
+#    NOT on `pull_request` — see the `on:` block below and #5451. A
+#    workflow-level path filter is the one optimization that can make a PR
+#    permanently unmergeable, so it is confined to the trigger where no
+#    required check is at stake.
 # 2. Skip expensive jobs on main push — PR already validated
 # 3. Skip NAT validation for dependabot PRs — Test is sufficient for version bumps
 # 4. Run fast checks (Fmt, Clippy) in parallel for quick fail-fast
@@ -25,13 +29,23 @@ on:
       - 'LICENSE'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/FUNDING.yml'
+  # DO NOT add `paths-ignore:` (or `paths:`) here. Six of the eight required
+  # status contexts come from this workflow (Fmt, Clippy, Rule Lint, Unit &
+  # Integration, Simulation, NAT Validation). A workflow skipped by a path
+  # filter reports NOTHING, and GitHub treats a never-reported required context
+  # as "expected", not as satisfied — so the merge queue refuses entry forever.
+  # A docs-only PR was therefore structurally unmergeable; #5322 sat blocked
+  # from 2026-08-14 until this was removed. The `merge_group:` trigger below
+  # does not rescue it: that only runs for a PR already ADMITTED to the queue.
+  #
+  # This was easy to miss because `*.md` does not match at depth in GitHub path
+  # filters, so a PR touching `.claude/rules/foo.md` always ran full CI and
+  # merged normally (#5375). Only a PR whose every file matched `docs/**` or a
+  # ROOT-level `*.md` hit it.
+  #
+  # Enforced by .github/scripts/check_required_check_path_filters.py, run from
+  # the Rule Lint job below.
   pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-      - 'LICENSE'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/FUNDING.yml'
   merge_group:
 
 # Cancel in-progress runs when a new commit is pushed to the same branch.
@@ -370,6 +384,17 @@ jobs:
 
       - name: Check merge_group workflows vary their concurrency group
         run: python3 .github/scripts/check_merge_group_concurrency.py .github/workflows
+
+      # Self-test the required-check path-filter linter, then run it. Like the
+      # concurrency linter above it is NOT diff-scoped — the invariant is a
+      # property of each workflow file as it stands. Guards #5451: a workflow
+      # skipped by a path filter reports NOTHING, and a required context that
+      # never reports is "expected" forever, so the merge queue refuses entry.
+      - name: Required-check path-filter linter self-test
+        run: python3 .github/scripts/check_required_check_path_filters.py --self-test
+
+      - name: Check required-check workflows carry no PR path filter
+        run: python3 .github/scripts/check_required_check_path_filters.py .github/workflows
 
       - name: Check for banned patterns in new code
         env:

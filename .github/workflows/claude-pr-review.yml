@@ -82,14 +82,14 @@ name: Claude PR Rule Review
 # - claude-ci-analysis (in ci.yml): failure debugging
 
 on:
+  # DO NOT add `paths-ignore:` (or `paths:`) here. This workflow provides the
+  # required status context "Claude Rule Review". A workflow skipped by a path
+  # filter reports NOTHING, and GitHub treats a never-reported required context
+  # as "expected" rather than satisfied, so the merge queue refuses the PR entry
+  # permanently. Removed for #5451 alongside the same filter on ci.yml; enforced
+  # by .github/scripts/check_required_check_path_filters.py.
   pull_request_target:
     types: [opened, synchronize, ready_for_review, reopened, labeled]
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-      - 'LICENSE'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/FUNDING.yml'
   # Required by branch protection — merge queue expects this check to report.
   # The job skips the actual review in merge_group context (PR was already reviewed).
   merge_group:
