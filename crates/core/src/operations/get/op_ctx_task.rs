@@ -289,7 +289,6 @@ async fn emit_get_terminal_event(
     total_fragments: Option<u32>,
     stream_abort_cause: Option<StreamAbortCause>,
     exhaustion_reason: Option<crate::tracing::GetExhaustionReason>,
-    peer_advancements: Option<usize>,
 ) {
     if let Some(log_event) = crate::tracing::NetEventLog::get_terminal(
         &tx,
@@ -305,7 +304,6 @@ async fn emit_get_terminal_event(
         total_fragments,
         stream_abort_cause,
         exhaustion_reason,
-        peer_advancements,
     ) {
         op_manager
             .ring
@@ -347,7 +345,6 @@ pub(crate) async fn emit_local_get_terminal_event(
         None,
         None,
         None, // no exhaustion reason: this path never entered the retry loop
-        None,
     )
     .await;
 }
@@ -704,7 +701,6 @@ async fn drive_client_get_inner(
                     stream_total_fragments,
                     stream_abort_cause,
                     None, // a terminal reply was received: not an exhaustion
-                    None,
                 )
                 .await;
             }
@@ -741,7 +737,6 @@ async fn drive_client_get_inner(
                     stream_total_fragments,
                     stream_abort_cause,
                     None, // a terminal reply was received: not an exhaustion
-                    None,
                 )
                 .await;
             }
@@ -782,7 +777,6 @@ async fn drive_client_get_inner(
                 None,
                 None,
                 driver.exhaustion_reason,
-                Some(driver.retries),
             )
             .await;
             // Dashboard op_stats GET counter (issue #4828). Exhaustion
@@ -2420,7 +2414,6 @@ async fn drive_sub_op_get(
                 streaming_assembly.total_fragments,
                 streaming_assembly.abort_cause,
                 None, // a terminal reply was received: not an exhaustion
-                None,
             )
             .await;
             result
@@ -2440,7 +2433,6 @@ async fn drive_sub_op_get(
                 None,
                 None,
                 driver.exhaustion_reason,
-                Some(driver.retries),
             )
             .await;
             SubOpGetOutcome::NotFound(cause)
@@ -4787,15 +4779,20 @@ mod tests {
     }
 
     /// #5252: the Exhausted arm of both GET drivers must forward WHY the
-    /// retry loop gave up (`driver.exhaustion_reason`) and how many peer
-    /// advancements it took (`driver.retries`) to the terminal-telemetry
-    /// event. This is the enumerated replacement for a `debug!` log line
-    /// that never ran in a release build (`release_max_level_info`) and was
-    /// never wired to reach an `EventKind` even when it did. Source-scrape
-    /// pin — a refactor that drops either argument silently reverts the
-    /// terminal event to carrying no exhaustion discriminator at all.
+    /// retry loop gave up (`driver.exhaustion_reason`) to the
+    /// terminal-telemetry event. This is the enumerated replacement for a
+    /// `debug!` log line that never ran in a release build
+    /// (`release_max_level_info`) and was never wired to reach an
+    /// `EventKind` even when it did. Source-scrape pin — a refactor that
+    /// drops this argument silently reverts the terminal event to carrying
+    /// no exhaustion discriminator at all. (An earlier version of this
+    /// field pair also forwarded a `peer_advancements` count derived from
+    /// `driver.retries`; review found that counter overcounts by one on the
+    /// `NoRoutingCandidates` path — the same overcount already documented
+    /// on the sibling `requests_sent` field — so it was dropped in favor of
+    /// the terminal event's existing, accurate `attempts` field.)
     #[test]
-    fn exhausted_arm_forwards_exhaustion_reason_and_peer_advancements() {
+    fn exhausted_arm_forwards_exhaustion_reason() {
         let src = production_source();
         for entry in [
             "async fn drive_client_get_inner(",
@@ -4806,11 +4803,6 @@ mod tests {
                 body.contains("driver.exhaustion_reason"),
                 "{entry}'s Exhausted arm must forward driver.exhaustion_reason \
                  to emit_get_terminal_event (#5252)"
-            );
-            assert!(
-                body.contains("Some(driver.retries)"),
-                "{entry}'s Exhausted arm must forward Some(driver.retries) to \
-                 emit_get_terminal_event (#5252)"
             );
         }
     }

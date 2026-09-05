@@ -513,7 +513,6 @@ impl<'a> NetEventLog<'a> {
         total_fragments: Option<u32>,
         stream_abort_cause: Option<super::StreamAbortCause>,
         exhaustion_reason: Option<super::GetExhaustionReason>,
-        peer_advancements: Option<usize>,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
@@ -534,7 +533,6 @@ impl<'a> NetEventLog<'a> {
                 total_fragments,
                 stream_abort_cause,
                 exhaustion_reason,
-                peer_advancements,
                 elapsed_ms: tx.elapsed().as_millis() as u64,
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
@@ -2334,7 +2332,6 @@ mod span_completed_tests {
                 total_fragments: None,
                 stream_abort_cause: None,
                 exhaustion_reason: None,
-                peer_advancements: None,
                 elapsed_ms: 0,
                 timestamp: 0,
             }));

@@ -2035,7 +2035,6 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     total_fragments,
                     stream_abort_cause,
                     exhaustion_reason,
-                    peer_advancements,
                     elapsed_ms,
                     timestamp,
                 } => {
@@ -2073,9 +2072,6 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     if let Some(reason) = exhaustion_reason {
                         json["exhaustion_reason"] =
                             serde_json::Value::String(reason.as_str().to_string());
-                    }
-                    if let Some(advancements) = peer_advancements {
-                        json["peer_advancements"] = serde_json::json!(advancements);
                     }
                     json
                 }
@@ -4929,7 +4925,6 @@ mod tests {
             total_fragments: Some(8),
             stream_abort_cause: None,
             exhaustion_reason: None,
-            peer_advancements: None,
             elapsed_ms: 1234,
             timestamp: 99999,
         });
@@ -4985,7 +4980,6 @@ mod tests {
             total_fragments: Some(10),
             stream_abort_cause: Some(StreamAbortCause::InactivityTimeout),
             exhaustion_reason: None,
-            peer_advancements: None,
             elapsed_ms: 4321,
             timestamp: 7,
         });
@@ -5027,7 +5021,6 @@ mod tests {
             total_fragments: None,
             stream_abort_cause: None,
             exhaustion_reason: None,
-            peer_advancements: None,
             elapsed_ms: 60000,
             timestamp: 1,
         });
@@ -5047,9 +5040,8 @@ mod tests {
 
     /// #5252: a retry-loop exhaustion carries WHY it gave up — out of
     /// distinct routing candidates, vs. having hit the retry budget with
-    /// candidates still available — plus how many peer advancements it took
-    /// to get there. Before this, that distinction existed only in a
-    /// `debug!` log line compiled out of release builds
+    /// candidates still available. Before this, that distinction existed
+    /// only in a `debug!` log line compiled out of release builds
     /// (`release_max_level_info`) and never wired to an `EventKind` at all.
     #[test]
     fn test_event_kind_to_json_get_terminal_exhaustion_reason() {
@@ -5069,13 +5061,12 @@ mod tests {
             outcome: GetTerminalOutcome::TimeoutExhausted,
             streamed: false,
             is_sub_op: false,
-            attempts: 3,
+            attempts: 2,
             hop_count: None,
             fragments_received: None,
             total_fragments: None,
             stream_abort_cause: None,
             exhaustion_reason: Some(GetExhaustionReason::NoRoutingCandidates),
-            peer_advancements: Some(2),
             elapsed_ms: 500,
             timestamp: 1,
         });
@@ -5084,13 +5075,17 @@ mod tests {
         let json = event_kind_to_json(&event);
         assert_eq!(json["outcome"], "timeout_exhausted");
         assert_eq!(json["exhaustion_reason"], "no_routing_candidates");
-        assert_eq!(json["peer_advancements"], 2);
+        // `attempts` (driver.requests_sent) is the accurate peer count on
+        // the exhaustion path — see the field's doc comment on
+        // GetEvent::ClientTerminal for why a separate retries-derived
+        // counter was dropped (it overcounts by one on this exact path).
+        assert_eq!(json["attempts"], 2);
     }
 
     /// A terminal that reached a real reply (success) never carries an
-    /// exhaustion reason or peer-advancement count — those fields are
-    /// specific to the `RetryLoopOutcome::Exhausted` path and must not leak
-    /// into other JSON bodies.
+    /// exhaustion reason — that field is specific to the
+    /// `RetryLoopOutcome::Exhausted` path and must not leak into other JSON
+    /// bodies.
     #[test]
     fn test_event_kind_to_json_get_terminal_omits_exhaustion_fields_on_success() {
         use crate::message::Transaction;
@@ -5118,14 +5113,12 @@ mod tests {
             total_fragments: None,
             stream_abort_cause: None,
             exhaustion_reason: None,
-            peer_advancements: None,
             elapsed_ms: 5,
             timestamp: 1,
         });
 
         let json = event_kind_to_json(&event);
         assert!(json.get("exhaustion_reason").is_none());
-        assert!(json.get("peer_advancements").is_none());
     }
 
     /// A local-cache-hit client GET emits a `ClientTerminal` with
@@ -5159,7 +5152,6 @@ mod tests {
             total_fragments: None,
             stream_abort_cause: None,
             exhaustion_reason: None,
-            peer_advancements: None,
             elapsed_ms: 1,
             timestamp: 1,
         });

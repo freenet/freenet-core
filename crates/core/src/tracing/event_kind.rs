@@ -1415,16 +1415,15 @@ pub(crate) enum GetEvent {
         /// is `NotFound` or `TimeoutExhausted`); `None` when a terminal reply
         /// was actually received (`outcome = Success`, or a streaming
         /// failure that still reached a terminal header). See
-        /// [`GetExhaustionReason`].
+        /// [`GetExhaustionReason`]. Pair with `attempts` for the peer count
+        /// on the exhaustion path — NOT a separate `retries`-derived field:
+        /// `advance_to_next_peer`'s `retries` counter increments BEFORE its
+        /// candidate lookup, so it overcounts by one whenever
+        /// `NoRoutingCandidates` fires (the exact bug caught in review for
+        /// an earlier version of this field, see `requests_sent`'s doc in
+        /// `op_ctx_task.rs` for the same overcount on the sibling counter).
+        /// `attempts` (`driver.requests_sent`) has no such bias.
         exhaustion_reason: Option<GetExhaustionReason>,
-        /// Peer advancements performed before the retry loop gave up —
-        /// `advance_to_next_peer`'s `retries` counter at the moment of
-        /// exhaustion. `None` except on the `RetryLoopOutcome::Exhausted`
-        /// path. Paired with `exhaustion_reason`; this is the second half of
-        /// the discriminator #5252 asked for (the first debug-only version
-        /// also carried `tried.len()`, which tracked this value within one
-        /// of a candidate miss not pushing to `tried`).
-        peer_advancements: Option<usize>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
