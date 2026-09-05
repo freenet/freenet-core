@@ -402,6 +402,21 @@ impl UserInputPrompter for DashboardPrompter {
                 response_tx: tx,
             },
         );
+        // CANCELLATION SAFETY (#5544 P1b). The removal below runs only if this
+        // future is polled to completion. #5544 wraps a delegate's prompts in a
+        // PARK_WORK_BUDGET timeout, so a second prompt can be DROPPED here —
+        // after the insert, before the removal — and the entry then persists
+        // forever, because nothing sweeps `pending`. Thirty-two of those fill
+        // MAX_PENDING_PROMPTS, after which every later permission request on
+        // this node is auto-denied, for every delegate, permanently.
+        //
+        // The guard removes on drop, so insert and removal are paired wherever
+        // the future ends. The explicit cleanup below still runs on the normal
+        // path; `PendingPrompts` is a DashMap and a second remove is a no-op.
+        let _cancel_guard = PromptEntryGuard {
+            pending: self.pending.clone(),
+            nonce: nonce.clone(),
+        };
 
         // Fire the broadcast Added event AFTER the DashMap insert so any
         // subscriber that wakes up on the event can immediately find the entry
@@ -465,6 +480,37 @@ impl UserInputPrompter for DashboardPrompter {
                 tracing::warn!(nonce = %nonce, "Permission prompt timed out after 60s");
                 None
             }
+        }
+    }
+}
+
+/// Removes a pending-prompt registry entry if its prompt future is dropped
+/// before it can clean up after itself (#5544 P1b).
+///
+/// Exists because a cancelled prompt is now reachable: #5544 bounds a parked
+/// delegate's off-loop work with `PARK_WORK_BUDGET`, and prompts run
+/// sequentially inside it, so a slow first prompt can leave a second one
+/// cancelled mid-await. Without this, that entry is never removed and never
+/// swept, and 32 of them disable permission prompting node-wide.
+struct PromptEntryGuard {
+    pending: PendingPrompts,
+    nonce: String,
+}
+
+impl Drop for PromptEntryGuard {
+    fn drop(&mut self) {
+        if self.pending.remove(&self.nonce).is_some() {
+            // Only reachable on the cancelled path: the normal path removes the
+            // entry before this guard drops, so a hit here means the future was
+            // dropped mid-await.
+            tracing::warn!(
+                "Permission prompt was cancelled before it completed; removed its \
+                 registry entry so it cannot accumulate toward MAX_PENDING_PROMPTS \
+                 (#5544 P1b)"
+            );
+            emit_prompt_event(PromptEvent::Removed {
+                nonce: self.nonce.clone(),
+            });
         }
     }
 }

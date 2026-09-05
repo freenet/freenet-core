@@ -1067,9 +1067,30 @@ where
                         });
                         continue;
                     }
+                    Ok(UpsertOutcome::DeferRelated(missing)) if parking.is_some() => {
+                        // Past MAX_DEFERRED_UPSERTS_PER_PARK. REFUSE — do not
+                        // fall back inline (#5544 M5).
+                        //
+                        // My own note at the park-cap fallback says refusing to
+                        // inline "is NOT defensible" when the wait is a network
+                        // op, and that reasoning applies here: nothing caps
+                        // `put_requests.len()`, so a delegate emitting 100
+                        // deferring PUTs would serialize ~100 x
+                        // RELATED_FETCH_TIMEOUT on the loop — about 16 minutes.
+                        // Surfacing MissingRelated is what the depth cap already
+                        // does one level up.
+                        let id = missing.first().copied().unwrap_or(*contract_key.id());
+                        tracing::warn!(
+                            contract = %contract_key,
+                            cap = delegate_park::MAX_DEFERRED_UPSERTS_PER_PARK,
+                            "Refusing a delegate PUT past the per-park deferral cap \
+                             rather than fetching inline on the serial loop (#5544 M5)"
+                        );
+                        Err(ExecutorError::missing_related(id))
+                    }
                     Ok(UpsertOutcome::DeferRelated(_)) => {
-                        // No parking context (direct unit-test calls): keep the
-                        // legacy inline fetch rather than failing the upsert.
+                        // No parking context at all (direct unit-test calls):
+                        // keep the legacy inline fetch rather than failing.
                         contract_handler
                             .executor()
                             .upsert_contract_state(
@@ -1246,6 +1267,18 @@ where
                                     missing,
                                 });
                                 continue;
+                            }
+                            Ok(UpsertOutcome::DeferRelated(missing)) if parking.is_some() => {
+                                // Past the per-park cap: REFUSE, same reasoning
+                                // as the PUT arm (#5544 M5).
+                                let id = missing.first().copied().unwrap_or(*full_key.id());
+                                tracing::warn!(
+                                    contract = %full_key,
+                                    cap = delegate_park::MAX_DEFERRED_UPSERTS_PER_PARK,
+                                    "Refusing a delegate UPDATE past the per-park \
+                                     deferral cap rather than fetching inline (#5544 M5)"
+                                );
+                                Err(ExecutorError::missing_related(id))
                             }
                             Ok(UpsertOutcome::DeferRelated(_)) => {
                                 // No parking context: keep the legacy inline
@@ -1603,16 +1636,29 @@ where
                     responder: ctx.carried_responder.take(),
                     delivery: ctx.delivery,
                 };
-                match ctx.park.park(delegate_key.clone(), continuation) {
-                    delegate_park::ParkAdmission::Admitted => {
+                // Charge what the OFF-LOOP TASK will retain, not just what the
+                // continuation points at: the prompts and the deferred upserts
+                // live for exactly as long as the park, and a single upsert can
+                // own a full state plus related contracts plus code.
+                let task_bytes = delegate_park::task_bytes(&user_input_requests, &deferred_upserts);
+                match ctx
+                    .park
+                    .park(delegate_key.clone(), continuation, task_bytes)
+                {
+                    delegate_park::ParkAdmission::Admitted { epoch } => {
                         let guard = delegate_park::ParkGuard::new(
                             ctx.park.resume_tx().clone(),
                             delegate_key.clone(),
+                            epoch,
                         );
                         let prompter = std::sync::Arc::clone(prompter);
                         let key = delegate_key.clone();
                         let op_manager = contract_handler.executor().op_manager_handle();
                         let prompts = std::mem::take(&mut user_input_requests);
+                        // Every request id this run owes an answer for. If the
+                        // budget cancels the sequence part-way, the unanswered
+                        // ones are synthesized as denials below (#5544 P1b).
+                        let owed: Vec<u32> = prompts.iter().map(|r| r.request_id).collect();
                         let upserts = std::mem::take(&mut deferred_upserts);
                         // Fire-and-forget is safe precisely because of the
                         // guard: it delivers exactly one resume even if this
@@ -1695,8 +1741,58 @@ where
                             // requests that finished and none for those that
                             // did not, which is the same shape as a denied
                             // prompt.
-                            let responses = std::mem::take(&mut *answers_out.lock().unwrap());
+                            let mut responses = std::mem::take(&mut *answers_out.lock().unwrap());
                             let resolved = std::mem::take(&mut *fetch_out.lock().unwrap());
+
+                            // Synthesize a DENIAL for every prompt the budget
+                            // cancelled (#5544 P1b). An empty `ClientResponse`
+                            // is exactly what a timed-out or dismissed prompt
+                            // yields on the normal path, so the delegate sees a
+                            // shape it already handles rather than silence — and
+                            // is not left waiting for a `UserResponse` that was
+                            // cancelled out of existence.
+                            let answered: std::collections::HashSet<u32> = responses
+                                .iter()
+                                .filter_map(|m| match m {
+                                    InboundDelegateMsg::UserResponse(r) => Some(r.request_id),
+                                    // Only `UserResponse` carries a request id to
+                                    // reconcile against `owed`. Listed rather than
+                                    // wildcarded so a future variant that carries
+                                    // one has to be considered here, the same
+                                    // convention as `delegate_park::inbound_bytes`.
+                                    InboundDelegateMsg::ApplicationMessage(_)
+                                    | InboundDelegateMsg::GetContractResponse(_)
+                                    | InboundDelegateMsg::PutContractResponse(_)
+                                    | InboundDelegateMsg::UpdateContractResponse(_)
+                                    | InboundDelegateMsg::SubscribeContractResponse(_)
+                                    | InboundDelegateMsg::ContractNotification(_)
+                                    | InboundDelegateMsg::DelegateMessage(_)
+                                    | _ => None,
+                                })
+                                .collect();
+                            let unanswered: Vec<u32> = owed
+                                .into_iter()
+                                .filter(|id| !answered.contains(id))
+                                .collect();
+                            if !unanswered.is_empty() {
+                                tracing::warn!(
+                                    delegate = %key,
+                                    count = unanswered.len(),
+                                    "Synthesizing denials for prompts cancelled by \
+                                     PARK_WORK_BUDGET, so the delegate is told rather \
+                                     than left waiting (#5544 P1b)"
+                                );
+                                for request_id in unanswered {
+                                    responses.push(InboundDelegateMsg::UserResponse(
+                                        UserInputResponse {
+                                            request_id,
+                                            response: ClientResponse::new(Vec::new()),
+                                            context: DelegateContext::default(),
+                                        },
+                                    ));
+                                }
+                            }
+
                             if done.is_err() {
                                 tracing::warn!(
                                     delegate = %key,
@@ -1939,9 +2035,14 @@ where
         // Backstop sweep for parks that neither completed nor were dropped
         // (see `PARK_TTL`). Force-resume them so a wedged delegate cannot stay
         // wedged: the resume drains its pending queue and answers its client.
-        for delegate_key in park_ctx.expired(tokio::time::Instant::now()) {
+        for (delegate_key, epoch) in park_ctx.expired(tokio::time::Instant::now()) {
+            // Force-resume the park we OBSERVED, by epoch. The off-loop task's
+            // ParkGuard is untouched and still owes a resume; carrying the epoch
+            // is what lets that late resume be recognised as stale and dropped
+            // rather than absorbed by whatever park exists by then (#5544 H1).
             tracing::warn!(
                 delegate = %delegate_key,
+                epoch,
                 "Delegate park exceeded PARK_TTL — force-resuming"
             );
             let _ = handle_delegate_resume(
@@ -1950,6 +2051,7 @@ where
                 &prompter,
                 delegate_park::DelegateResume {
                     delegate_key,
+                    epoch,
                     cause: delegate_park::ResumeCause::TimedOut,
                     inbound: Vec::new(),
                     upserts: Vec::new(),
@@ -3216,10 +3318,17 @@ async fn send_delegate_response<CH>(
 /// Returns the number of delegate runs performed, INCLUDING the pending
 /// requests drained behind the park. The loop spends that against its
 /// `MAX_RESUME_DRAIN_BATCH` budget (#5544 S5): each drained request is a full
-/// delegate run, so an unaccounted drain could do
-/// `MAX_RESUME_DRAIN_BATCH x MAX_PENDING_PER_DELEGATE` runs before the fair
+/// delegate run, so an unaccounted drain could do many of them before the fair
 /// queue got a single turn — exactly the head-of-line blocking the batch cap
 /// exists to prevent.
+///
+/// Worst case for ONE resume is `1 + MAX_PENDING_PER_DELEGATE +
+/// MAX_PENDING_NOTIFICATION_CONTRACTS` runs: the resumed run itself, the queued
+/// client requests, and the coalesced notifications. The notification lane is
+/// deliberately NOT bounded by `MAX_PENDING_PER_DELEGATE` (see `PendingRun`), so
+/// stating "16 x 8" here would have been wrong the moment coalescing landed —
+/// which it was, until #5544 M6. Returning the real count is what keeps the
+/// loop's budget honest regardless of how those caps move.
 async fn handle_delegate_resume<CH, P>(
     contract_handler: &mut CH,
     park: &mut delegate_park::DelegateParkCtx,
@@ -3232,17 +3341,29 @@ where
 {
     let delegate_park::DelegateResume {
         delegate_key,
+        epoch,
         cause,
         inbound,
         upserts,
     } = resume;
 
-    let Some((continuation, pending)) = park.take(&delegate_key) else {
-        // Unreachable: the ParkGuard delivers exactly one resume per park, and
-        // only a resume ends a park.
-        tracing::error!(
+    let Some((continuation, pending)) = park.take_matching(&delegate_key, epoch) else {
+        // REACHABLE, and the previous comment here claiming otherwise was
+        // wrong. It said "the ParkGuard delivers exactly one resume per park,
+        // and only a resume ends a park" — but the TTL backstop ends a park
+        // WITHOUT consuming a guard, so that guard's resume still arrives.
+        // `take_matching` rejects it on epoch mismatch, which is the point:
+        // absorbing it would feed one round-trip's messages to another
+        // (#5544 H1).
+        //
+        // `debug!`, not `error!`: this is now an expected consequence of the
+        // backstop firing, and `take_matching` already logs the re-parked case
+        // at `warn!` with both epochs.
+        tracing::debug!(
             delegate = %delegate_key,
-            "Resume for a delegate that is not parked — dropping"
+            epoch,
+            "Resume for a park that no longer exists (force-resumed by the TTL \
+             backstop, or already ended) — dropping"
         );
         return 0;
     };
@@ -7043,8 +7164,8 @@ mod hol_4391_tests {
             .insert(key.clone(), b"parked-continuation".to_vec());
         assert!(
             matches!(
-                park.park(key.clone(), parked_continuation()),
-                delegate_park::ParkAdmission::Admitted
+                park.park(key.clone(), parked_continuation(), 0),
+                delegate_park::ParkAdmission::Admitted { .. }
             ),
             "the delegate must start out parked"
         );
@@ -7076,7 +7197,8 @@ mod hol_4391_tests {
              that ran would have overwritten it and the delegate would resume \
              on someone else's bytes (#5544 B1)"
         );
-        let (_continuation, pending) = park.take(&key).expect("still parked");
+        let epoch = park.epoch_of(&key).expect("still parked");
+        let (_continuation, pending) = park.take_matching(&key, epoch).expect("still parked");
         assert_eq!(
             pending.len(),
             1,
