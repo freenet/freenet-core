@@ -413,9 +413,39 @@ pub(super) enum PendingRun {
     /// silent loss landing on exactly the wrong population: ghostkeys parks on
     /// prompts, so the rejection window is precisely when a user is
     /// interacting, and Harvest with many address contracts subscribed would
-    /// lose payment notifications there. Coalescing is sound because the
-    /// notification contract is already "you will see the next state", so a
-    /// superseded notification carries nothing its successor does not.
+    /// lose payment notifications there. The window is reachable in practice —
+    /// Harvest's bridge backfill replays thirty blocks on restart and can emit
+    /// several claims for one script within seconds.
+    ///
+    /// # PRECONDITION: the contract's state must be ACCUMULATING
+    ///
+    /// Newest-wins is lossless only if the newest state SUBSUMES what a
+    /// superseded notification carried. That is a property of the CONTRACT, not
+    /// of this mechanism, and the node cannot tell the two apart:
+    ///
+    /// - **Holds** for a grow-only or CRDT-merge state. Harvest's `ClaimSetV1`
+    ///   is a `BTreeMap` merged by set union, deliberately grow-only because a
+    ///   Bitcoin reorg must be expressible without deletion — a retraction is a
+    ///   NEWER assertion at a higher height, not an edit. Coalescing is lossless
+    ///   there.
+    /// - **Does NOT hold** for a register-valued contract, where each update
+    ///   REPLACES the previous. Payment A sets `state = A`, payment B sets
+    ///   `state = B`; dropping A's notification means the delegate never learns
+    ///   A happened. Such a contract needs every distinct notification kept,
+    ///   not collapsed.
+    ///
+    /// The register shape is the more natural modelling, and Harvest said so
+    /// themselves — grow-only was a deliberate, slightly unusual choice. So this
+    /// is an assumption the notification API currently makes ON THE DELEGATE'S
+    /// BEHALF, and nothing here enforces it. #5467 is the place to decide
+    /// whether a delegate should be able to say "do not coalesce mine", or a
+    /// contract should declare its shape.
+    ///
+    /// One bound worth re-checking if `PARK_TTL` ever grows: grow-only is itself
+    /// capped (Harvest prunes at `MAX_CLAIMS` = 512, lowest-`as_of` first), so
+    /// "newest contains everything" holds only until that budget binds. Anything
+    /// arriving inside the current park window is by definition newest and is
+    /// not what gets pruned, so it does not affect this today.
     Notification {
         /// The contract whose change triggered this. Carried explicitly so
         /// queued notifications can be COALESCED per contract.
@@ -1245,8 +1275,9 @@ mod tests {
         assert_eq!(
             queued_state(&pending[0]),
             Some(vec![MAX_PENDING_PER_DELEGATE as u8 + 11]),
-            "the NEWEST notification must win; a superseded one carries nothing \
-             its successor does not"
+            "the NEWEST notification must win. Lossless only while the contract's \
+             state is ACCUMULATING, so the newest subsumes the superseded — see \
+             the precondition on `PendingRun::Notification`"
         );
     }
 
