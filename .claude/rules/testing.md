@@ -216,84 +216,6 @@ search with a blind spot; a fixed token is not.
    distinguishes a guard that works from one that happens to be passing.
 
 
-**A mutation harness leaves the tree dirty, and that is its own hazard.** The
-check above requires editing the source to break it, so for the duration of a
-run the worktree holds a deliberately broken line. During one such run
-`git status` showed `contract.rs` modified and a routine `git add -u` would
-have committed a stubbed-out call — the very line the branch existed to add —
-under a commit message about documentation. This is the cross-worktree
-contamination shape from `never-trust-cwd-with-parallel-agents.md`, arriving
-from your OWN tooling, where the usual guard ("am I in someone else's tree?")
-does not fire because you are in yours.
-
-```
-WHEN writing a mutation/falsification script:
-  → restore from git in an EXIT trap, not at the end of the happy path
-  → write a marker file before the first mutation and remove it in the SAME
-    trap, so the two cannot disagree. Use the FIXED name
-    `.mutation-in-progress` — not a variant, not a per-run suffix. Whoever
-    cleans up after an agent that died mid-run has to FIND the marker, and
-    cannot grep for a string only you knew: a sweep for `MUTANT` and
-    `MUTATION_APPLIED` missed #5490's `MUTATION:` marker for exactly this
-    reason. One greppable name across the repo is the whole point of the
-    convention.
-  → hash the mutated files before the first mutation and assert the hash
-    matches after the last restore
-  → stage with an explicit pathspec while any run may be live, never
-    `git add -u`/`-A`, and confirm by CONTENT (`git show HEAD:<path>` and grep
-    the invariant the mutation removes), not by filename
-
-A SIGKILL then leaves the marker beside the dirty tree, which is the right way
-round: the loud state is the unsafe one.
-```
-
-**Keep both the marker and the hash — they fail differently.** The marker
-catches a run that was interrupted before its trap; the hash catches a restore
-that *ran* and put back the wrong bytes. `git checkout --` reporting success
-says the command executed, not that the tree matches.
-
-**Commit before you mutate.** The restore step is `git checkout -- <file>`,
-which restores from **HEAD** — so it does not undo your mutation, it discards
-every uncommitted change in that file, *including the fix the mutation is
-supposed to be testing*. Run a harness over uncommitted work and it silently
-reverts the work, then reports on code you did not write.
-
-```
-BEFORE running a mutation harness:
-  → commit the code under test, or stash-and-restore around the whole run
-  → never point `git checkout --` at a file holding uncommitted work
-```
-
-On 2026-09-04 a harness verifying two fixes on #5493 ate both of them on its
-first `restore_all`. Everything after that measured the pre-fix tree: the first
-mutation's kill was real, and every later result was meaningless — reported not
-as failures but as *filters matching no test*, because the tests being verified
-no longer existed in the file.
-
-**Two guards caught it and neither would have sufficed alone**, which is the
-argument for keeping both even though they look redundant:
-
-1. **The before/after hash assertion** turned "5 mutations, 1 killed" into a
-   loud FATAL naming the discarded work. `git checkout --` had reported success
-   every time — it did exactly what it was asked, which was the problem.
-2. **The zero-test check** (see "A filtered `cargo test` that matches nothing
-   exits 0" below). Without it those four runs would each have exited 0 and been
-   recorded as *mutations that failed to kill* — a plausible, subtly wrong
-   result that sends you debugging tests which are fine.
-
-The general shape outlives the instance: **a harness that modifies the tree must
-be able to prove it put the tree back**, and "the restore command succeeded" is
-not that proof.
-
-**Why the content check, and not just "verify the diff is yours".** That
-standing advice is NAME-based, and it fails in exactly the case a mutation
-harness creates: when the tool rewrites a file you were *also* editing
-legitimately, `M <file>` in `git status` looks identical whether the restore
-worked or not. One agent caught its near-miss only because the file was
-*unexpectedly* dirty; another was editing the same file the harness mutated, so
-nothing would have looked wrong at all — that one came out clean by ordering,
-not by a check.
-
 ### A filtered `cargo test` that matches nothing exits 0
 
 `cargo test -- <filter>` with a filter matching no test prints `0 passed` and
@@ -319,6 +241,20 @@ nothing, the mutated run would report success and the round would show no red.
 So "8 of 8 mutations went red" survives the empty-filter trap in a way that "the
 tests passed" never does. When you cite a green run as evidence, cite the count
 with it.
+
+**And a harness must verify its own restore, not just run one.** `git checkout --`
+reporting success says the command executed, not that the tree now matches what
+you started with — if rule 1 was missed and the file held uncommitted work, the
+restore *succeeds* and silently discards it. Hash the mutated files before the
+first mutation and assert the hash matches after the last restore, so a run that
+corrupted its own inputs fails loudly instead of reporting on code nobody wrote.
+
+That check and the count check above are what make a mutation result trustworthy
+at all, and they fail differently: the hash catches a restore that put back the
+wrong bytes, the count catches a filter that measured nothing. On 2026-09-04 both
+fired on the same #5493 run — the hash turned a plausible "1 of 5 killed" into a
+FATAL naming the discarded work, and the count turned four exit-0 runs into loud
+INCONCLUSIVEs rather than four fake "failed to kill" results.
 
 ## Reference Patterns
 
