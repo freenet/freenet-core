@@ -107,13 +107,23 @@ image published correctly and the `smoke` job failed with
 
 which looks like a broken image and is actually the package being private. The
 smoke job now authenticates its pull, so it tests whether the image runs rather
-than whether the package is public. Public-ness is checked as a separate step,
-and what that step actually tests is an anonymous `docker manifest inspect` —
-the thing a user does — rather than the package's `visibility` field, because
-`GITHUB_TOKEN` cannot always read org package metadata and a lookup that fails
-must read as "could not tell", never as "not public". Its error message names
-this section. If you see that error on a future
-release, the package visibility has been reset rather than the image being bad.
+than whether the package is public.
+
+Public-ness is a separate job, `public-pull`, and what it actually tests is an
+anonymous `docker manifest inspect` — the thing a user does — rather than the
+package's `visibility` field, because `GITHUB_TOKEN` cannot always read org
+package metadata and a lookup that fails must read as "could not tell", never
+as "not public". It is a separate job rather than a step of `smoke` so that
+"the image is broken" and "a registry setting is wrong" stay distinguishable:
+the dev-room alert for a `smoke` failure says `latest` is now stale, which is
+true of the first and false of the second.
+
+The anonymous fetch is retried three times before failing. It is one
+unauthenticated call from a shared runner IP moments after a push, and a
+release gate that goes red on a network blip stops being read. If the
+`visibility` field says `public` but the anonymous fetch still fails, the job
+says so specifically rather than telling you to set a flag that is already
+set.
 
 After changing it, re-run the publish for that tag:
 

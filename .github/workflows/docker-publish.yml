@@ -395,7 +395,7 @@ jobs:
       # (`unauthorized` on a manifest HEAD) looks like a broken image rather
       # than a settings problem. That happened on v0.2.133, the release that
       # introduced this workflow.
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -421,7 +421,18 @@ jobs:
             test "$expected" = "$actual"
           done
 
-      # Checked separately from the pull above, and stated as its own failure,
+  # Its OWN job, not a step of `smoke`, so the two failures stay distinguishable.
+  # A `smoke` failure means the image is broken; this failing means the image is
+  # fine and a registry SETTING is wrong. `notify-publish-failure` says "latest
+  # is now stale", which is true of the first and false of the second — folding
+  # them together would send whoever reads the alert to look at the publish job.
+  public-pull:
+    name: The published package is publicly pullable
+    needs: smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Checked separately from the smoke pull, and stated as its own failure,
       # because a working image nobody can download is still a broken release
       # from a user's point of view. GitHub exposes no API to change this
       # (PATCH on the package route is 404), so it cannot be automated and the
@@ -431,24 +442,42 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
           IMAGE: ghcr.io/${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          PACKAGE: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
-          visibility=$(gh api "orgs/${{ github.repository_owner }}/packages/container/freenet-core" \
-            --jq '.visibility' 2>/dev/null || echo unknown)
+          # `.visibility // empty` because the API can return 200 without the
+          # field, and `--jq '.visibility'` then prints the literal "null",
+          # which the `|| echo unknown` guard would not catch.
+          visibility=$(gh api "orgs/${REPO_OWNER}/packages/container/${PACKAGE}" \
+            --jq '.visibility // empty' 2>/dev/null || true)
+          visibility=${visibility:-unknown}
           echo "package visibility: ${visibility}"
 
           # The authoritative test is an ANONYMOUS pull, because that is
           # literally what a user does. It needs no API permission, so unlike
           # the visibility field it cannot come back "unknown".
           #
-          # DOCKER_CONFIG is pointed at an empty directory on purpose: the
-          # smoke job logged in to ghcr.io above, and without this the check
-          # would reuse those credentials and pass on a private package.
+          # DOCKER_CONFIG points at an empty directory on purpose: the smoke job
+          # logged in to ghcr.io, and that file also selects the credential
+          # HELPER, so an empty config dir removes both the stored token and any
+          # pointer to a helper. Verified against an instrumented helper: with
+          # the default config it is invoked, with an empty DOCKER_CONFIG it is
+          # never invoked at all.
+          #
+          # Retried, because this is now the whole gate and it is one
+          # unauthenticated call from a shared runner IP moments after a push.
+          # A transient 5xx or an anonymous rate limit must not turn a healthy
+          # release red — a release check that fails on a blip stops being read.
           anon_ok=0
           anon_home=$(mktemp -d)
-          if DOCKER_CONFIG="$anon_home" docker manifest inspect "${IMAGE}:${RELEASE_TAG}" >/dev/null 2>&1; then
-            anon_ok=1
-          fi
+          for attempt in 1 2 3; do
+            if DOCKER_CONFIG="$anon_home" docker manifest inspect "${IMAGE}:${RELEASE_TAG}" >/dev/null 2>&1; then
+              anon_ok=1
+              break
+            fi
+            [ "$attempt" = 3 ] || sleep 10
+          done
           rm -rf "$anon_home"
           echo "anonymous manifest fetch: ${anon_ok}"
 
@@ -461,16 +490,49 @@ jobs:
             exit 0
           fi
 
-          if [ "$visibility" = unknown ]; then
-            # GITHUB_TOKEN cannot always read org package metadata, so treat a
-            # failed lookup as "could not tell", never as "not public" — a
-            # release job that goes red on every run stops being read at all.
-            echo "::error::Could not pull ${IMAGE}:${RELEASE_TAG} anonymously, and could not read the package visibility either (the API lookup failed — GITHUB_TOKEN may lack read access to org packages). Most likely the GHCR package is still private. Check https://github.com/orgs/${{ github.repository_owner }}/packages/container/package/freenet-core and see docs/RELEASING.md, 'One-time setup: GHCR package visibility'."
+          if [ "$visibility" = public ]; then
+            # Do NOT print the set-it-public message here: it would tell the
+            # maintainer to make a change that is already made, on a release
+            # that is probably fine.
+            echo "::error::The package visibility field reads 'public', but an anonymous manifest fetch of ${IMAGE}:${RELEASE_TAG} failed three times. This is NOT the private-package case — suspect a transient GHCR failure or an anonymous rate limit, and re-run this workflow. If it persists, check the package page: https://github.com/orgs/${REPO_OWNER}/packages/container/package/${PACKAGE}"
             exit 1
           fi
 
-          echo "::error::The image published, but the GHCR package is '${visibility}', so nobody outside the org can pull it. GitHub creates a new package private and offers no API to change it, so this needs one manual change, once, ever: open https://github.com/orgs/${{ github.repository_owner }}/packages/container/package/freenet-core, go to package settings, and set visibility to Public. Then re-run this workflow with: gh workflow run docker-publish.yml --field tag=${{ github.event.release.tag_name || inputs.tag }}"
+          if [ "$visibility" = unknown ]; then
+            # GITHUB_TOKEN cannot always read org package metadata, so treat a
+            # failed lookup as "could not tell", never as "not public".
+            echo "::error::Could not pull ${IMAGE}:${RELEASE_TAG} anonymously, and could not read the package visibility either (the API lookup failed — GITHUB_TOKEN may lack read access to org packages). Most likely the GHCR package is still private. Check https://github.com/orgs/${REPO_OWNER}/packages/container/package/${PACKAGE} and see docs/RELEASING.md, 'One-time setup: GHCR package visibility'."
+            exit 1
+          fi
+
+          echo "::error::The image published, but the GHCR package is '${visibility}', so nobody outside the org can pull it. GitHub creates a new package private and offers no API to change it, so this needs one manual change, once, ever: open https://github.com/orgs/${REPO_OWNER}/packages/container/package/${PACKAGE}, go to package settings, and set visibility to Public. Then re-run this workflow with: gh workflow run docker-publish.yml --field tag=\"${RELEASE_TAG}\". See docs/RELEASING.md, 'One-time setup: GHCR package visibility'."
           exit 1
+
+  # `public-pull` is deliberately NOT in notify-publish-failure's `needs`, because
+  # that alert says `latest` is now stale — true when the publish broke, false
+  # when the image is fine and only the registry visibility is wrong. This is
+  # that second alert, so the failure is still announced rather than sitting
+  # unread as a red tick in the Actions tab, but announced accurately.
+  notify-not-public:
+    name: Notify dev room if the published image is not publicly pullable
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [public-pull]
+    if: |
+      always() &&
+      (github.event_name == 'release' || github.event_name == 'workflow_dispatch') &&
+      (needs.public-pull.result == 'failure' || needs.public-pull.result == 'cancelled')
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: notify-not-public
+        uses: ./.github/actions/river-dev-notify
+        with:
+          message: "🐳 The Docker image for ${{ github.event.release.tag_name || inputs.tag }} published FINE, but it could not be pulled anonymously — so `docker pull ghcr.io/freenet/freenet-core` fails for everyone outside the org. The image is NOT stale and running containers are unaffected; this is a registry visibility setting, and GitHub offers no API to change it. Fix once at ${{ github.server_url }}/orgs/${{ github.repository_owner }}/packages/container/package/${{ github.event.repository.name }} (package settings -> visibility -> Public), then re-run. See docs/RELEASING.md, 'One-time setup: GHCR package visibility'. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
 
   # Without this a failed publish leaves `latest` stale and says so nowhere but
   # a red tick in the Actions tab. Existing containers keep self-updating, so
