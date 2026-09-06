@@ -1121,11 +1121,22 @@ pub(crate) async fn send_proactive_summary_notification(
     // is nothing per-peer to compute.
     //
     // This leg ships FULL BYTES this release. Hash-first (#4965) does NOT
-    // apply here: digest-first rides the two multi-entry reply legs
-    // (`InterestsReply` / `ChangeInterestsReply`) only, and the send site 40
-    // lines below carries the evidential reasoning for why this one was left
-    // out. There is no per-peer encoding choice on this path, and no version
-    // gate is consulted.
+    // apply here: digest-first rides the two REPLY legs (`InterestsReply` /
+    // `ChangeInterestsReply`) only, and the send site 40 lines below carries the
+    // evidential reasoning for why this one was left out. There is no per-peer
+    // encoding choice on this path, and no version gate is consulted.
+    //
+    // The reply legs are not both multi-entry — corrected 2026-08-12 (#5153
+    // review F1). Only `InterestsReply` (the ~5-min heartbeat) is;
+    // `ChangeInterestsReply` is single-entry 100% of the time (measured mean
+    // 1.000, `max_entries` 1, over 418,476 messages on 1,284 peers), because
+    // `broadcast_change_interests` gossips one contract per message. That
+    // matters here because it means message length does NOT separate this
+    // notification leg from the churn reply, which is the proxy the R4b
+    // agreement-rate instrument rests on. See the send site below, whose own
+    // multi-entry claim is tracked separately in #5306 — it is the stated
+    // justification for an already-shipped decision, so it is corrected there
+    // rather than silently here.
     //
     // Worth stating because the opposite is the intuitive guess: this is the
     // send site that fires on every state change to every interested peer, so
@@ -3041,7 +3052,7 @@ mod tests {
         let cohosts: HashSet<TransportPublicKey> = [cohost.0.clone()].into_iter().collect();
 
         let targets = proactive_summary_targets(
-            &[cohost.clone()],
+            std::slice::from_ref(&cohost),
             &cohosts,
             "127.0.0.1:9999".parse().unwrap(),
             None,
@@ -3432,9 +3443,12 @@ mod tests {
         let (op_manager, mut rx, _guard) =
             build_notification_test_node("notif-exclusion-subset-4965").await;
         let key = crate::operations::test_utils::make_contract_key(11);
-        op_manager
-            .ring
-            .host_contract(key, 1024, crate::ring::AccessType::Put);
+        op_manager.ring.host_contract(
+            key,
+            1024,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
 
         // A and B: advertised co-hosts AND interested — the excluded
         //          population. TWO of them, deliberately: with only one, a

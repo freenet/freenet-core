@@ -118,6 +118,104 @@ Running specific integration test?
   → Use: cargo test -p freenet --test simulation_integration
 ```
 
+### Cross-test interference is invisible to CI — only plain `cargo test` can see it
+
+Every CI job runs `cargo nextest`, which executes each test in its own
+process. That is deliberate and mostly good (see "Running determinism tests"
+below), but it means **no CI job can observe a bug in which one test
+interferes with another through process-global state** — there is no shared
+process for the interference to happen in. `ci.yml` says "process isolation
+handles it (#3051)", which is true of the symptom and false of the coverage:
+it is blindness, not a guard. `AGENTS.md` tells you to run `cargo test` before
+committing, and that is the only runner that can expose this class.
+
+The mechanism generalises past any one library: **any process-global cache
+whose value is decided by whichever thread arrives first** is order-dependent,
+and per-process isolation hides it completely. The instance that motivated
+this entry (#4927, fixed in #5314): `tracing` caches each callsite's
+`Interest` process-globally on first touch, and resolves it against the
+*registering* thread's subscriber, so a test with no subscriber could pin a
+callsite to `never` and blind another test's thread-local log capture to that
+one callsite. Measured: 29 failures in 1000 `cargo test -p freenet --lib
+subscriber_limit_tests` runs across three tests, 0 in 2000 runs after the fix
+— and **unreachable under `cargo nextest` at any repeat count**.
+
+`[profile.ci] retries = 2` in `.config/nextest.toml` is the *smaller* half of
+this gap: it can only launder a failure CI was otherwise able to see.
+
+```
+WHEN adding or changing a test:
+  Ask: could this interact with other tests through process-global state?
+       (a global/static cache, a `set_global_default`, an env var, a
+        singleton registry, an ambient `tracing`/`log` subscriber, a shared
+        temp path)
+
+  → YES: run plain `cargo test` locally at scale (hundreds of runs of a
+         filter that includes the plausible competitors) and say so in the PR.
+         A green nextest CI run has NOT examined it.
+  → Regression test for such a bug: it must control the interfering
+    population, which usually means a child process (re-exec of the test
+    binary filtered to that one test) — in-process, whether the bug can
+    occur at all depends on what else happens to be running. See
+    `crate::util::test_log_capture` for a worked example, including asserting
+    the child actually ran a test so a rename fails closed.
+```
+
+The fix shape for the `tracing` instance is non-obvious enough to record:
+keep **two** permanently-registered dispatchers alive (`tracing_core`'s
+`has_just_one` fast path triggers at `live <= 1`, so one is not enough),
+report `Interest::sometimes()` rather than `always()` so other subscribers'
+per-event filtering is preserved, and do **not** install as the global
+default — that slot belongs to `test_log`, and taking it silently stops
+`RUST_LOG=… cargo test` printing anything.
+
+## Deliberately breaking code to verify a test: mark it `MUTATION_APPLIED`
+
+A test or a source-scrape pin is not verified until you have watched it go RED
+under a deliberate break and GREEN again when the break is reverted. Inspection
+is not verification — see the vacuous-pin row in
+`.claude/rules/bug-prevention-patterns.md`. So mutating code is a normal,
+encouraged part of writing one. These rules are about not leaving the mutation
+behind.
+
+### One fixed token
+
+Mark every deliberately-broken line with the exact string `MUTATION_APPLIED` —
+not `MUTANT`, not `MUTATION:`, not a comment that merely reads "temporary".
+One token, so that `grep -rn MUTATION_APPLIED` is a complete answer.
+
+**The point is not tidiness, it is that the person who greps is usually not the
+person who mutated.** On 2026-09-04 four agents hit an account session limit
+simultaneously, mid-mutation. The cleanup grepped `MUTANT|MUTATION_APPLIED` and
+missed a stranded break in another PR, because that agent had written
+`MUTATION:`. Nothing shipped, but only because a human looked twice.
+
+That is the same failure shape as the bug being fixed in the PR that prompted
+this rule: a source scanner whose docstring said it skipped "comments" and which
+skipped one kind of them. **Searching for one variant of the thing you are
+looking for is not searching for the thing.** A convention with variants is a
+search with a blind spot; a fixed token is not.
+
+### The rules
+
+1. **Commit or stash BEFORE mutating.** Restoring is then `git checkout --`,
+   never retyping from memory. This matters more than the marker: a session can
+   die between the break and the restore, and it did.
+2. **Mark every broken line** with `MUTATION_APPLIED`.
+3. **Before committing, `grep -rn MUTATION_APPLIED` and confirm it is empty.**
+   Better, where you have a pre-mutation commit: confirm `git diff` against it
+   shows only the change you intend.
+4. **When cleaning up after someone else's dead session, do not rely on the
+   marker.** Grep for it, AND diff every dirty worktree against its HEAD. A
+   mutation applied by editing an existing line leaves no marker at all if its
+   author forgot one, and only the diff catches that.
+5. **Say which mutation in the commit message**, and say what went red. "Verified
+   by inspection" is not verification. Both directions are worth stating when the
+   fix is to a shared helper: that the bug turns the guard red, and that reverting
+   only the fix — with the bug still in place — turns it green again, is what
+   distinguishes a guard that works from one that happens to be passing.
+
+
 ## Reference Patterns
 
 **Time injection:**

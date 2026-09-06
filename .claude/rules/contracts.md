@@ -29,7 +29,9 @@ V2: Async host functions — delegates call contract methods directly:
     - ctx.get_contract_state(id)       → read state (two-step: len + read)
     - ctx.put_contract_state(id, data) → write state (bypasses validate_state)
     - ctx.update_contract_state(id, data) → conditional write (requires existing state)
-    - ctx.subscribe_contract(id)       → register interest (delivery is TODO)
+    - ctx.subscribe_contract(id)       → register interest (delivery works: see
+                                         Executor::finalize_state_commit; the
+                                         subscription does NOT register demand, #4669)
     Backend implementation: func_wrap_async (wasmtime native async support)
     Selected when state_store_db is configured on Runtime
     NOTE: V2 PUT/UPDATE are local-only, bypass contract validation, and skip
@@ -182,6 +184,20 @@ State merging rules:
     Note: this invariant is NOT enforced for `UpdateData::Delta` inputs
     (CmRDT-style "increment by X" deltas legitimately violate it) or
     `UpdateData::RelatedState` (a cross-contract hint, not a CRDT op).
+
+    **Contested as of RFC #5320.** That delta exemption is a live
+    disagreement, not settled fact. The RFC requires delta idempotence on
+    the grounds that Freenet delivery is at-least-once with no dedup for
+    delta redelivery, so an "increment by X" delta silently double-applies
+    when redelivered — which makes it unsafe under this transport whatever
+    its standing as a CRDT in the abstract. Issue #4320 §1 makes the same
+    argument independently. The offline verifier
+    (`crate::conformance::ConformanceProperty::DeltaIdempotence`) therefore
+    checks deltas, but reports them at `Severity::Diagnostic` so the check
+    can never justify removing a contract while the question is open.
+    Whether any deployed contract actually relies on the unsafe pattern is
+    empirical and unanswered; `fdev verify-merge` against deployed WASM is
+    how it gets answered. Do not treat either side as decided until it is.
   - Invalid merges should return error, not panic
 ```
 

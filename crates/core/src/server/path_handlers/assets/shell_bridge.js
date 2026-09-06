@@ -38,7 +38,8 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // bfcache restore does NOT re-run this IIFE, so a page restored from the
   // back-forward cache keeps its stale in-memory flood-cap window. Resync it
   // from the store on a persisted `pageshow` so a Back-restored contract page
-  // can't reset the cap (#4849). The shell's open WebSocket + EventSource
+  // can't reset the cap (#4849). The shell's open WebSockets (the proxied
+  // app socket and the permission-event socket)
   // usually make it bfcache-ineligible, but this doesn't rely on that.
   window.addEventListener('pageshow', function (e) {
     if (e && e.persisted) notifyLimiter.resync();
@@ -564,6 +565,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // by a gesture in the shell: a click inside the sandboxed iframe does not
   // reliably grant the shell the transient activation the browser requires for
   // Notification.requestPermission().
+  // notify-offer:BEGIN (extracted verbatim by shell_bridge_notifications.test.mjs)
+  // Like showAppNotification, every `notification_enable_prompt` gets exactly
+  // one status reply — including the already-showing case, which would
+  // otherwise answer with silence a client can't tell from a lost message.
   function maybeOfferNotifications() {
     if (typeof Notification === 'undefined') {
       notifyStatusToIframe('unsupported');
@@ -587,7 +592,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
       notifyStatusToIframe('dismissed');
       return;
     }
-    if (notifyAffordanceShown) return;
+    if (notifyAffordanceShown) {
+      // The bar is already on screen awaiting a click: the prompt is pending,
+      // not lost. Reply so a client can tell "still deciding" from "dropped".
+      notifyStatusToIframe('default');
+      return;
+    }
     notifyAffordanceShown = true;
 
     var bar = document.createElement('div');
@@ -662,6 +672,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
     bar.appendChild(dismiss);
     document.body.appendChild(bar);
   }
+  // notify-offer:END
 
   // --- Service-worker fallback for notifications (mobile) ----------------
   // Desktop browsers show notifications with the page-level `new
@@ -804,10 +815,46 @@ function freenetBridge(authToken, userToken, hostedMode) {
     });
   }
 
+  // notify-show:BEGIN (extracted verbatim by shell_bridge_notifications.test.mjs)
+  // Every well-formed `notification` message gets exactly one status reply:
+  // EVERY path out of this function posts one, whether it displayed or dropped.
+  // The display paths re-affirm 'granted', and that re-affirmation is what
+  // retracts an earlier 'undeliverable' — e.g. the first notification of a
+  // session racing the service worker's activation — which otherwise stuck for
+  // the whole session (#5043). Two bounds on the guarantee: a `notification`
+  // whose `title` isn't a string never reaches here (the dispatcher's type
+  // check drops it), and delivery of the status itself is best-effort, since
+  // sendToIframe no-ops when the iframe is gone.
   function showAppNotification(msg) {
-    if (typeof Notification === 'undefined') return;
+    if (typeof Notification === 'undefined') {
+      notifyStatusToIframe('unsupported');
+      return;
+    }
     // Gate on BOTH the browser permission and this contract's own consent.
-    if (Notification.permission !== 'granted' || !contractHasConsent()) return;
+    // A framed app can't read Notification.permission itself (opaque origin),
+    // so a permission revoked in site settings after a 'granted' is only
+    // visible to it if we report it here.
+    if (Notification.permission !== 'granted') {
+      notifyStatusToIframe(
+        Notification.permission === 'denied' ? 'denied' : 'default',
+      );
+      return;
+    }
+    if (!contractConsentKey()) {
+      // No contract key to gate consent on: permanent for this page, and
+      // re-prompting can never fix it. maybeOfferNotifications reports the same
+      // condition as 'undeliverable'; keep the two in agreement rather than
+      // sending the app into a prompt loop it cannot win.
+      notifyStatusToIframe('undeliverable');
+      return;
+    }
+    if (!contractHasConsent()) {
+      // Browser-granted but this contract isn't opted in. Reported as 'default'
+      // — the same client-visible meaning as a browser 'default': not enabled
+      // yet, and the next notification_enable_prompt can still fix it.
+      notifyStatusToIframe('default');
+      return;
+    }
     // Notification renders text only (no markup), so no HTML-injection risk;
     // still cap length to prevent oversized/abusive content.
     var title = String(msg.title).slice(0, 128);
@@ -821,7 +868,16 @@ function freenetBridge(authToken, userToken, hostedMode) {
       ckey + ':' + (typeof msg.tag === 'string' ? msg.tag.slice(0, 64) : 'msg');
     // Per-tag throttle + rolling global cap: distinct rooms aren't dropped, but
     // a consented contract can't flood with unique tags.
-    if (!notifyLimiter.ok(opts.tag, Date.now())) return;
+    if (!notifyLimiter.ok(opts.tag, Date.now())) {
+      // Coalesced by the shell's own flood policy, NOT a delivery problem:
+      // permission and consent are both intact. Report 'granted' so the app
+      // can't confuse a throttled message with a lost one — and so a throttled
+      // message still retracts a stale 'undeliverable'. Reporting
+      // 'undeliverable' here would be the #5043 bug in reverse: a working,
+      // deliberately-throttled setup made to look broken.
+      notifyStatusToIframe('granted');
+      return;
+    }
     // Cap the routing tag like opts.tag — it's attacker-controlled (the app
     // supplies msg.tag) and is echoed back into the iframe on click.
     var routeTag = typeof msg.tag === 'string' ? msg.tag.slice(0, 64) : null;
@@ -840,8 +896,13 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // Desktop: use the page-level constructor, UNCHANGED. Mobile: it throws
     // (unsupported), so we fall through to the service-worker path below — the
     // only way to show a notification on mobile.
+    var shownByConstructor = false;
     try {
       var n = new Notification(title, opts);
+      // Set the instant the constructor returns: it has ALREADY displayed, so a
+      // throw from anything below (an exotic onclick setter) must not fall
+      // through to the worker path and display the same notification twice.
+      shownByConstructor = true;
       n.onclick = function () {
         try {
           window.focus();
@@ -856,30 +917,60 @@ function freenetBridge(authToken, userToken, hostedMode) {
           n.close();
         } catch (e) {}
       };
-      return;
     } catch (e) {
-      // Mobile Chrome/Firefox: the non-persistent `new Notification()`
-      // constructor is unsupported and throws. Deliver via the service worker.
+      // EXPECTED on mobile Chrome/Firefox: the non-persistent `new
+      // Notification()` constructor is unsupported and throws, so we deliver via
+      // the service worker below. Logged because on DESKTOP this same throw
+      // means a real bug (malformed opts, permission lost between the check and
+      // the call) and is otherwise indistinguishable from the mobile path.
+      try {
+        console.debug('freenet: Notification constructor threw', e);
+      } catch (e2) {}
+    }
+    // Report OUTSIDE the try: the try must contain only the display attempt, so
+    // its catch means "constructor unsupported" and nothing else. A throw from
+    // the status post inside it would look like a constructor failure and fall
+    // through to a second, duplicate delivery.
+    if (shownByConstructor) {
+      notifyStatusToIframe('granted');
+      return;
     }
 
-    notifyRegistrationReady(1500).then(function (reg) {
-      if (reg && typeof reg.showNotification === 'function') {
-        reg.showNotification(title, opts).then(
-          function () {},
-          function () {
-            // The worker exists but the show failed — nothing else can display
-            // it; tell the app so it can rely on the in-app unread badge.
-            notifyStatusToIframe('undeliverable');
-          },
-        );
-      } else {
+    // Post at most once from the async chain: the .catch below is a backstop for
+    // the whole chain, INCLUDING a throw from a status post in the success
+    // branch, which would otherwise turn one reply into two.
+    var swReplied = false;
+    function swReply(status) {
+      if (swReplied) return;
+      swReplied = true;
+      notifyStatusToIframe(status);
+    }
+
+    notifyRegistrationReady(1500)
+      .then(function (reg) {
+        if (reg && typeof reg.showNotification === 'function') {
+          // Return the inner promise so a rejection (or a synchronous throw, or
+          // a non-thenable return) lands in the single .catch below.
+          return reg.showNotification(title, opts).then(function () {
+            // Delivered: re-affirm, retracting any earlier 'undeliverable'.
+            swReply('granted');
+          });
+        }
         // No usable service worker (e.g. an insecure-context http origin) AND
         // the page-level constructor threw: nothing can display it. Tell the app
         // so it need not keep sending; the in-app unread badge is the fallback.
-        notifyStatusToIframe('undeliverable');
-      }
-    });
+        swReply('undeliverable');
+      })
+      .catch(function () {
+        // Anything else the worker path can throw or reject with — a
+        // SecurityError from a sandboxed service-worker property read (the
+        // #4945 getter hazard, see serviceWorkerOrNull), a showNotification
+        // that throws or returns a non-promise. Nothing was
+        // displayed, so the app must hear about it rather than wait forever.
+        swReply('undeliverable');
+      });
   }
+  // notify-show:END
 
   // Install the click-forward listener eagerly on every shell load (see
   // installNotifyClickListener) so a click on a persistent notification that
@@ -1473,26 +1564,31 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // is pending. The shell is trusted and same-origin with the gateway, so
   // the sandboxed contract cannot reach into this DOM. See issue #3836.
   //
-  // Every open Freenet tab subscribes to /permission/events (Server-Sent
-  // Events) and renders the overlay as soon as the gateway pushes an
-  // `prompt_added` event. When the user responds in one tab, the gateway
-  // emits `prompt_removed` and every tab dismisses its card. This was
-  // previously a 3-second polling loop with a visibility-skip optimisation
-  // that caused the originating tab to silently miss prompts whenever it
-  // wasn't foregrounded; SSE eliminates both the polling-floor latency and
-  // the visibility race.
+  // Every open Freenet tab subscribes to /permission/events/ws (a WebSocket)
+  // and renders the overlay as soon as the gateway pushes a `prompt_added`
+  // event. When the user responds in one tab, the gateway emits
+  // `prompt_removed` and every tab dismisses its card. This was originally a
+  // 3-second polling loop with a visibility-skip optimisation that caused the
+  // originating tab to silently miss prompts whenever it wasn't foregrounded;
+  // a pushed channel eliminates both the polling-floor latency and the
+  // visibility race. It was Server-Sent Events until #5213, when per-tab SSE
+  // turned out to exhaust the browser's per-origin HTTP connection budget --
+  // see the full explanation at `openPermSocket` below.
   // perm-overlay-flow:BEGIN — the delegate permission-prompt overlay and its
-  // Server-Sent-Events stream. #3836 requires that NOTHING in this whole region
+  // event channel. #3836 requires that NOTHING in this whole region
   // constructs a browser Notification: delegate permission prompts must render
   // as in-page overlay cards, never as OS notifications a user can miss or
   // dismiss. The Rust guard `shell_page_permission_overlay_present_and_safe`
-  // scans this marker-bounded region (NOT a code anchor), so the SSE
-  // `prompt_added`/`prompt_removed` handlers below — part of the prompt-render
-  // flow — are INSIDE the guarded region (#4849 F2). The legitimate
+  // scans this marker-bounded region (NOT a code anchor), so the
+  // `prompt_added`/`prompt_removed` handling below — part of the prompt-render
+  // flow — is INSIDE the guarded region (#4849 F2). The legitimate
   // message-notification code (showAppNotification) sits far above BEGIN, so it
   // is outside this region and unaffected.
   var overlayRoot = null;
-  var overlayCards = {}; // nonce -> card element
+  // Null-prototype for the same reason as removalObservedAt: a key spelled
+  // `__proto__` must be an ordinary own key, not a prototype assignment that
+  // makes the card unhideable and leaks into every other lookup.
+  var overlayCards = Object.create(null); // nonce -> card element
   var OVERLAY_CSS =
     '#__freenet_perm_overlay{position:fixed;inset:0;z-index:2147483647;' +
     'background:rgba(8,10,14,0.62);backdrop-filter:blur(4px);' +
@@ -1771,10 +1867,125 @@ function freenetBridge(authToken, userToken, hostedMode) {
     card.appendChild(timer);
     return card;
   }
+  // Monotonic millisecond clock for the causal-ordering comparison in
+  // reconcileFromPending. `Date.now()` is wall-clock and steps BACKWARDS on an
+  // NTP correction, a VM resume, or a user changing the system clock; a
+  // backwards step between `issuedAt` and a later `showCard` makes the card
+  // look older than the request that could not have seen it, which re-opens
+  // the exact prompt-destroying window the comparison exists to close.
+  // `performance.now()` cannot step backwards. Fall back to Date.now() only
+  // where performance is unavailable, which is no worse than before.
+  function permNow() {
+    return typeof performance !== 'undefined' && performance && performance.now
+      ? performance.now()
+      : Date.now();
+  }
+  // When each nonce's removal was OBSERVED, on the monotonic clock. See the
+  // add-pass guard in reconcileFromPending.
+  //
+  // PER NONCE, not one global timestamp. A single shared stamp meant a removal
+  // of ANY nonce suppressed the add of EVERY nonce, and on the `resync` path
+  // that loss is permanent: resync exists precisely because the server DROPPED
+  // `prompt_added` frames, so the socket will never resend them; the socket is
+  // healthy, so the 3s poll is stopped and there is no retry; and a
+  // `prompt_removed` arriving in the few ms while resync's `/permission/pending`
+  // fetch is in flight would skip the dropped prompt forever. It would sit
+  // invisible until the server auto-denied it. A backgrounded tab draining a
+  // churn burst is exactly what produces the lag AND exactly what delivers a
+  // removal in that window, so it is the expected shape of the recovery rather
+  // than a contrived race. Suppressing only the nonce actually removed keeps
+  // the resurrection fix while removing the collateral.
+  //
+  // Bounded, and pruned against the OLDEST IN-FLIGHT request rather than a bare
+  // wall-clock window. An entry only matters to a reconcile whose `issuedAt`
+  // precedes it, so once no outstanding request is older than the entry, the
+  // entry can never change an outcome and is safe to drop.
+  //
+  // A fixed window alone would be wrong in exactly the case that matters: a
+  // wedged node leaves `/permission/pending` fetches outstanding for minutes
+  // (they carry no timeout, and the poll keeps firing every 3s), so a removal
+  // could be pruned while a request older than it was still in flight — and
+  // that request landing afterwards would resurrect the answered prompt, the
+  // very bug this map exists to prevent. The window is kept as a backstop for
+  // the no-requests-in-flight case so a long-lived tab cannot accumulate
+  // entries.
+  //
+  // The in-flight exemption is OVERRIDDEN BY ABSOLUTE AGE, per the project rule
+  // that a GC exemption must either expire or be overridden. Without that
+  // override this had the exact recurring shape the rule exists to catch: a
+  // single `/permission/pending` fetch that never resolves freezes
+  // `oldestInFlight` at that instant, every removal recorded afterwards
+  // satisfies `at >= oldestInFlight` forever, and neither the record map nor
+  // the in-flight list can ever shrink again — a sustained node hang would turn
+  // this into unbounded per-tab growth for the rest of the session rather than
+  // for the hang's duration.
+  //
+  // So a request outstanding longer than the hard bound is treated as DEAD and
+  // dropped from the in-flight list: no real response is coming, and its
+  // absence lets `oldestInFlight` advance so records become collectable again.
+  // Records themselves get the same absolute override as a second line of
+  // defence, so neither structure depends on the other being correct.
+  //
+  // `Object.create(null)`: no prototype, so a nonce spelled `__proto__` or
+  // `constructor` is an ordinary own key and cannot reach Object.prototype.
+  // Nonces are 32 hex chars today, but this must not depend on that.
+  // perm-removal-memory:BEGIN
+  // Extracted and RUN by shell_bridge_permission_ws.test.mjs. It used to
+  // re-implement these in the harness, which meant every test of the last two
+  // rounds asserted properties of the duplicate: deleting the real guard,
+  // never stamping, or reverting the whole in-flight prune all left the suite
+  // green. Keep the markers, and never satisfy one of these names from the
+  // test side again.
+  var REMOVAL_MEMORY_MS = 60000;
+  var REMOVAL_MEMORY_HARD_MS = 600000;
+  var removalObservedAt = Object.create(null);
+  // `issuedAt` of every reconcile whose response has not landed yet.
+  var reconcilesInFlight = [];
+  function noteReconcileStarted(issuedAt) {
+    reconcilesInFlight.push(issuedAt);
+  }
+  function noteReconcileFinished(issuedAt) {
+    var i = reconcilesInFlight.indexOf(issuedAt);
+    if (i >= 0) reconcilesInFlight.splice(i, 1);
+  }
+  function noteRemovalObserved(nonce) {
+    var now = permNow();
+    if (typeof nonce === 'string') removalObservedAt[nonce] = now;
+    // Drop dead requests FIRST, so the floor they hold can advance.
+    var live = [];
+    var oldestInFlight = Infinity;
+    for (var i = 0; i < reconcilesInFlight.length; i++) {
+      var t = reconcilesInFlight[i];
+      if (now - t > REMOVAL_MEMORY_HARD_MS) continue;
+      live.push(t);
+      if (t < oldestInFlight) oldestInFlight = t;
+    }
+    reconcilesInFlight = live;
+    for (var k in removalObservedAt) {
+      var at = removalObservedAt[k];
+      // Past the absolute bound: collected regardless of what is in flight.
+      if (now - at > REMOVAL_MEMORY_HARD_MS) {
+        delete removalObservedAt[k];
+        continue;
+      }
+      // Still able to affect an outstanding request: keep.
+      if (at >= oldestInFlight) continue;
+      if (now - at > REMOVAL_MEMORY_MS) delete removalObservedAt[k];
+    }
+  }
+  function removalObservedSince(nonce, since) {
+    var at = removalObservedAt[nonce];
+    return at !== undefined && at >= since;
+  }
+  // perm-removal-memory:END
   function showCard(nonce, card) {
     var root = ensureOverlayRoot();
     root.appendChild(card);
     root.style.display = 'flex';
+    // When this card became visible. `reconcileFromPending` compares against
+    // it so a snapshot taken BEFORE the card existed cannot hide it. See the
+    // causal-ordering note there.
+    card._fnShownAt = permNow();
     overlayCards[nonce] = card;
     // Move keyboard focus to the primary button so Enter/Space answer the
     // prompt without requiring a mouse click.
@@ -1786,6 +1997,14 @@ function freenetBridge(authToken, userToken, hostedMode) {
     }
   }
   function hideCard(nonce) {
+    // Note the removal BEFORE the early return. Every removal path funnels
+    // here — the socket's `prompt_removed`, the 404 from `/respond` meaning
+    // another tab answered, and reconcile's own hide pass — so this one line
+    // is what keeps `reconcileFromPending`'s add-pass staleness check honest.
+    // Above the return on purpose: a `prompt_removed` for a nonce this tab
+    // never rendered is still an OBSERVED removal, and it is exactly the case
+    // a stale snapshot would otherwise resurrect.
+    noteRemovalObserved(nonce);
     var card = overlayCards[nonce];
     if (!card) return;
     if (card._fnTimerId) {
@@ -1828,42 +2047,133 @@ function freenetBridge(authToken, userToken, hostedMode) {
         });
       });
   }
-  // Snapshot the current pending list and reconcile against the open
-  // overlay cards. Used for initial bootstrap, on `resync` events when an
-  // SSE subscriber lagged, and as a fallback while the EventSource is
-  // reconnecting.
+  // Snapshot the current pending list and reconcile against the open overlay
+  // cards. Used for initial bootstrap, on `resync` events when a subscriber
+  // lagged, and as a fallback while the socket is down or reconnecting.
+  //
+  // The hide pass is gated on CAUSAL ORDERING, not recency, and that gate is
+  // load-bearing: without it this function silently and permanently destroys
+  // live prompts. The fetch is async and nothing cancels an in-flight one, so
+  // the sequence below is reachable on an ordinary node restart:
+  //
+  //   1. socket closes -> startFallbackPoll() issues fetch F1 (node is
+  //      restarting, so F1 is slow)
+  //   2. socket reconnects -> onopen calls stopFallbackPoll(), which clears
+  //      the INTERVAL but cannot cancel F1, still in flight
+  //   3. prompt X is raised and arrives over the socket -> showCard(X)
+  //   4. F1 resolves carrying the PRE-restart list, which has no X -> X is
+  //      hidden, with a healthy socket and no poll running to re-add it
+  //
+  // X then auto-denies at the server timeout and the user never sees it. A
+  // generation counter would fix "stale response wins" but NOT step 3->4,
+  // because F1 is the newest response at the moment it lands. Comparing each
+  // card's `_fnShownAt` against when this request was ISSUED is what makes it
+  // correct: a snapshot taken before the card existed can never hide it.
+  // perm-reconcile:BEGIN
+  // Extracted verbatim by shell_bridge_permission_ws.test.mjs, which runs it
+  // against injected `fetch` / `permNow` / card helpers. Keep the markers.
   function reconcileFromPending() {
-    fetch('/permission/pending')
+    var issuedAt = permNow();
+    var pending;
+    try {
+      pending = fetch('/permission/pending');
+    } catch (err) {
+      // A SYNCHRONOUS throw must not leave a registration behind. Registering
+      // before the call meant such a throw skipped the deregistering `.then`
+      // entirely and that entry pinned the prune floor forever.
+      return;
+    }
+    // Registered only once the request actually exists, so every registration
+    // has a matching deregistration path.
+    noteReconcileStarted(issuedAt);
+    pending
       .then(function (r) {
         return r.json();
       })
       .then(function (prompts) {
         if (!Array.isArray(prompts)) return;
-        var seen = {};
+        var seen = Object.create(null);
+        // The ADD pass needs the mirror of the hide pass's causal check. A
+        // stale snapshot can otherwise RESURRECT a prompt that was answered
+        // after the request went out: F1 is issued and sees X; X is answered
+        // in another tab; F1 lands, X is absent from overlayCards, so X is
+        // shown again. With a healthy socket nothing then removes the ghost,
+        // and the user is looking at a delegate-authored security prompt for a
+        // dead nonce until they click it (404 -> hide) or the socket cycles.
+        //
+        // Skip only the nonce whose OWN removal this snapshot could not have
+        // seen. Suppressing every add on any removal is what created a
+        // permanent loss on the resync path; see removalObservedAt.
         prompts.forEach(function (p) {
           if (!p || typeof p.nonce !== 'string') return;
           seen[p.nonce] = true;
           if (overlayCards[p.nonce]) return;
+          if (removalObservedSince(p.nonce, issuedAt)) return;
           showCard(p.nonce, createCard(p));
         });
         Object.keys(overlayCards).forEach(function (nonce) {
-          if (!seen[nonce]) hideCard(nonce);
+          if (seen[nonce]) return;
+          var card = overlayCards[nonce];
+          // Only hide what this snapshot could actually have observed.
+          // `>=`, not `>`. With `permNow()` on `performance.now()` — a
+          // sub-millisecond float — an exact tie is essentially unreachable, so
+          // this is about which way to resolve one if it ever happens rather
+          // than a case we expect. Keep the card: the two errors are not
+          // symmetric. A card kept one beat too long is corrected by the next
+          // event or reconcile; a card hidden wrongly destroys a live security
+          // prompt outright.
+          if (card && card._fnShownAt >= issuedAt) return;
+          hideCard(nonce);
         });
       })
-      .catch(function () {});
+      .catch(function () {})
+      // Deregister on EVERY outcome — including the non-array early return and
+      // a rejected fetch — or a single failure would pin the prune floor
+      // forever and the map would grow without bound.
+      .then(function () {
+        noteReconcileFinished(issuedAt);
+      });
   }
+  // perm-reconcile:END
 
-  // Open a Server-Sent Events connection so prompts appear with no polling
-  // delay and on every open Freenet tab regardless of foreground/background
-  // state. The browser's EventSource auto-reconnects with exponential
-  // backoff if the connection drops; on each reconnect we re-bootstrap from
-  // /permission/pending so we don't miss anything during the gap.
+  // Open a WebSocket so prompts appear with no polling delay and on every
+  // open Freenet tab regardless of foreground/background state.
   //
-  // While the EventSource is in the disconnected state (its `error` event
-  // has fired and `readyState !== 1`), we run a 3-second polling fallback
-  // against /permission/pending so a tab whose stream fails (gateway
-  // restart, connection-cap rejection, transient network) still receives
-  // prompt updates. The fallback shuts off as soon as the stream re-opens.
+  // Why a WebSocket rather than Server-Sent Events (#5213): every open tab
+  // holds this channel for its entire life, and every Freenet app is served
+  // from the SAME origin. Over SSE that permanently consumed one of the
+  // browser's ~6 HTTP/1.1 connections per origin PER TAB, so at six open tabs
+  // the budget was gone and a seventh tab's own document, wasm and asset
+  // requests queued behind the held-open streams forever. Nothing errored, so
+  // no fallback fired and the app sat on "Loading..." indefinitely. Browsers
+  // pool WebSockets separately and far more generously (~255 per profile in
+  // Chrome, 200 in Firefox), so this channel no longer competes with page
+  // loads. Do NOT move this back onto a long-lived HTTP request.
+  //
+  // Unlike EventSource, a WebSocket does NOT auto-reconnect, so we reconnect
+  // ourselves with exponential backoff plus jitter. While disconnected we run
+  // the same 3-second /permission/pending poll the SSE path used, so a tab
+  // whose socket fails (node restart, cap rejection, transient error) still
+  // receives prompt updates. The poll stops as soon as the socket re-opens,
+  // and every (re)connect re-bootstraps from /permission/pending so nothing
+  // is missed across the gap.
+  // Reconnect state. Backoff starts at 1s and doubles to a 30s ceiling,
+  // reset to 1s once the socket has proved stable.
+  // perm-ws-machine:BEGIN — the stateful half of the permission-event socket:
+  // connection state, reconnect scheduling, and the open/close transitions.
+  // shell_bridge_permission_ws.test.mjs extracts this whole region and runs it
+  // against stubbed `WebSocket`/timers/`fetch`, so the reconnect behaviour is
+  // tested rather than merely name-pinned. Everything this region needs from
+  // outside (showCard/hideCard/createCard/overlayCards/reconcileFromPending/
+  // startFallbackPoll/stopFallbackPoll/location) is referenced but not
+  // defined here, and the test supplies those.
+  // The idempotency guard here is load-bearing as of #5213: openPermSocket
+  // starts the poll before the handshake resolves AND onclose starts it again,
+  // so every retry cycle calls this twice. Without the guard each cycle would
+  // leak a fresh interval hammering /permission/pending forever — an unbounded
+  // silent loop of exactly the shape this file's comments warn about. Kept
+  // inside the marker region so the test drives the REAL interval bookkeeping
+  // rather than a stub that cannot express the leak.
   var fallbackPollHandle = null;
   function startFallbackPoll() {
     if (fallbackPollHandle !== null) return;
@@ -1875,44 +2185,231 @@ function freenetBridge(authToken, userToken, hostedMode) {
     clearInterval(fallbackPollHandle);
     fallbackPollHandle = null;
   }
-  if (typeof EventSource !== 'undefined') {
-    var es = new EventSource('/permission/events');
-    es.addEventListener('prompt_added', function (e) {
+  var permSocket = null;
+  var permReconnectDelay = 1000;
+  var permReconnectHandle = null;
+  var permStableTimer = null;
+  var PERM_RECONNECT_MAX = 30000;
+  // How long a socket must stay open before we treat it as healthy and reset
+  // the backoff. See the note in `onopen`.
+  var PERM_STABLE_AFTER = 10000;
+  var permConsecutiveFailures = 0;
+  var PERM_WARN_AFTER_FAILURES = 5;
+
+  // perm-ws-decisions:BEGIN — pure helpers for the permission WebSocket,
+  // extracted so shell_bridge_permission_ws.test.mjs can exercise them
+  // directly. Keep them free of DOM/global access: everything they need
+  // arrives as an argument, which is what makes them testable at all.
+  //
+  // This block must stay NESTED INSIDE `perm-overlay-flow`. Hoisting these
+  // pure helpers to module scope is the obvious next refactor, and it would
+  // break the #4849 F2 guard: every remaining prompt-added / prompt-removed
+  // event-name literal inside the guarded region now lives in
+  // `permEventAction` below, and F2's non-vacuity check asserts the region
+  // still contains them. (Written WITHOUT the quoted literals on purpose —
+  // spelling them here makes the pin match its own signpost and pass
+  // vacuously, which is the self-match class AGENTS.md says has shipped
+  // twice.) It fails loudly, but the message points at the guard
+  // rather than at the move, so this note is the signpost.
+  function permSocketUrl(loc) {
+    // Derive the scheme from the page so a TLS-served shell upgrades to wss
+    // rather than tripping the browser's mixed-content block.
+    var scheme = loc.protocol === 'https:' ? 'wss://' : 'ws://';
+    return scheme + loc.host + '/permission/events/ws';
+  }
+
+  // Exponential backoff with a ceiling. Separate from the jitter below so the
+  // growth curve can be asserted without a stubbed RNG.
+  function nextPermReconnectDelay(current, max) {
+    return Math.min(current * 2, max);
+  }
+
+  // +/-20% jitter so every tab recovering from one node restart doesn't
+  // reconnect in lockstep and hammer the subscriber cap. `rand` is
+  // `Math.random()`'s output, passed in so the spread is testable.
+  function permReconnectJitter(delay, rand) {
+    return delay * (0.8 + rand * 0.4);
+  }
+
+  // Classify one inbound envelope. Returns the action the imperative wrapper
+  // should take, so malformed or delegate-controlled payloads are rejected in
+  // one auditable place rather than across three branches. Event names and
+  // `data` shapes are identical to the SSE stream this replaced; only the
+  // framing differs (the name rides inside the JSON envelope because a
+  // WebSocket frame has no `event:` slot).
+  function permEventAction(envelope) {
+    if (!envelope || typeof envelope.event !== 'string')
+      return { action: 'ignore' };
+    var data = envelope.data;
+    if (envelope.event === 'resync') return { action: 'resync' };
+    if (
+      envelope.event === 'prompt_added' ||
+      envelope.event === 'prompt_removed'
+    ) {
+      if (!data || typeof data.nonce !== 'string') return { action: 'ignore' };
+      return {
+        action: envelope.event === 'prompt_added' ? 'add' : 'remove',
+        nonce: data.nonce,
+        data: data,
+      };
+    }
+    return { action: 'ignore' };
+  }
+  // perm-ws-decisions:END
+
+  function handlePermEnvelope(envelope) {
+    var decision = permEventAction(envelope);
+    if (decision.action === 'add') {
+      if (overlayCards[decision.nonce]) return;
+      showCard(decision.nonce, createCard(decision.data));
+    } else if (decision.action === 'remove') {
+      hideCard(decision.nonce);
+    } else if (decision.action === 'resync') {
+      // The server emits `resync` when its broadcast channel laps a slow
+      // subscriber. Reconcile from the polling endpoint instead of clearing
+      // first: the reconcile path's diff already adds new cards and hides
+      // ones that disappeared, with no flicker on cards that survive.
+      reconcileFromPending();
+    }
+  }
+
+  function schedulePermReconnect() {
+    if (permReconnectHandle !== null) return;
+    // Make a persistently degraded tab diagnosable. A tab stuck on the 3s poll
+    // (a proxy eating the upgrade, a node stuck at the subscriber cap, a
+    // downgraded node with no /ws route) still shows prompts, so it is
+    // otherwise indistinguishable from a healthy one. #5213 was hard to find
+    // for exactly that reason: nothing errored, so nothing surfaced. One line
+    // at a threshold, not per attempt, so it cannot become its own noise.
+    permConsecutiveFailures++;
+    if (permConsecutiveFailures === PERM_WARN_AFTER_FAILURES) {
       try {
-        var p = JSON.parse(e.data);
-        if (!p || typeof p.nonce !== 'string') return;
-        if (overlayCards[p.nonce]) return;
-        showCard(p.nonce, createCard(p));
-      } catch (err) {}
-    });
-    es.addEventListener('prompt_removed', function (e) {
+        console.warn(
+          'Freenet: permission-event WebSocket has failed ' +
+            PERM_WARN_AFTER_FAILURES +
+            ' times; falling back to polling. Prompts still work but arrive up to 3s late.',
+        );
+      } catch (e) {}
+    }
+    var jittered = permReconnectJitter(permReconnectDelay, Math.random());
+    permReconnectHandle = setTimeout(function () {
+      permReconnectHandle = null;
+      openPermSocket();
+    }, jittered);
+    permReconnectDelay = nextPermReconnectDelay(
+      permReconnectDelay,
+      PERM_RECONNECT_MAX,
+    );
+  }
+
+  function openPermSocket() {
+    // Poll FIRST, and let `onopen` stop it. The poll is the always-on safety
+    // net and the socket is the accelerator, which is what this design claims
+    // to be. Starting it only from `onclose` left one gap: if the upgrade
+    // HANGS rather than fails — a reverse proxy swallowing `Upgrade:`, the
+    // common WebSocket-through-proxy failure — no close event fires, so a tab
+    // showed no prompts and ran no poll until the browser's own handshake
+    // timeout. This also covers the initial bootstrap, since startFallbackPoll
+    // reconciles immediately.
+    startFallbackPoll();
+    // Retire any previous socket BEFORE opening a new one. The identity guard
+    // on `onclose` exists for the case where a future trigger opens a second
+    // socket, but on its own it makes that case WORSE: the guard's early
+    // return also skips the `permStableTimer` cleanup, so socket A's timer
+    // outlives A, fires, and both resets the backoff for a dead socket and
+    // nulls the handle belonging to socket B — silently defeating the
+    // anti-flap protection in precisely the scenario the guard names. Clearing
+    // here means the invariant holds however this function comes to be called.
+    if (permStableTimer !== null) {
+      clearTimeout(permStableTimer);
+      permStableTimer = null;
+    }
+    // A pending reconnect is deliberately LEFT ARMED. Two reviewers reached
+    // opposite conclusions here and the tiebreak is which failure self-heals:
+    //
+    //   clearing it   — a hung upgrade (no open, no close: the common
+    //                   WebSocket-through-proxy failure this file names above)
+    //                   leaves no pending retry at all, so the tab sits on the
+    //                   3s poll for the rest of its life.
+    //   leaving it    — the stale timer may fire and close a HEALTHY socket,
+    //                   which immediately triggers onclose -> reconnect. One
+    //                   wasted cycle, then back to normal.
+    //
+    // Permanent degradation loses to a transient blip, so the timer stays. The
+    // completing half, if a `visibilitychange`/`online` trigger is ever added,
+    // is a handshake watchdog rather than clearing this.
+    if (permSocket !== null) {
+      var stale = permSocket;
+      permSocket = null;
       try {
-        var p = JSON.parse(e.data);
-        if (!p || typeof p.nonce !== 'string') return;
-        hideCard(p.nonce);
+        stale.close();
       } catch (err) {}
-    });
-    // The server emits `resync` when its broadcast channel laps a slow
-    // subscriber. Reconcile from the polling endpoint instead of clearing
-    // first: the reconcile path's diff already adds new cards and hides
-    // ones that disappeared, with no flicker on cards that survive.
-    es.addEventListener('resync', reconcileFromPending);
-    // EventSource fires `open` on initial connect AND on every reconnect.
-    // Reconcile each time so a transient disconnect doesn't leave us out
-    // of date, and stop the fallback poll if it had taken over.
-    es.addEventListener('open', function () {
+    }
+    var sock;
+    try {
+      sock = new WebSocket(permSocketUrl(location));
+    } catch (err) {
+      // Constructor throws on a malformed URL or a blocked scheme. Treat it
+      // exactly like a dropped socket: the poll is already running, so just
+      // schedule the retry.
+      schedulePermReconnect();
+      return;
+    }
+    permSocket = sock;
+    sock.onopen = function () {
       stopFallbackPoll();
       reconcileFromPending();
-    });
-    // `error` fires on connect failure, transient drops, and when the
-    // server caps us out. Switch to polling until the EventSource
-    // re-opens; the browser auto-reconnects in the background.
-    es.addEventListener('error', startFallbackPoll);
-    // Initial bootstrap so we're populated before the SSE handshake
-    // completes (avoids a brief empty state on slow connections).
-    reconcileFromPending();
+      // Reset the backoff only once the socket has PROVEN stable, not the
+      // instant it opens. A peer that accepts the upgrade and drops it
+      // immediately (a reverse proxy that half-supports WebSockets) would
+      // otherwise pin the cycle at open -> reset to 1s -> close -> retry in
+      // ~1s, forever, with no growth and two /permission/pending fetches per
+      // cycle. That is the same shape of silent unbounded loop as #5213.
+      permStableTimer = setTimeout(function () {
+        permStableTimer = null;
+        permReconnectDelay = 1000;
+        // Reset the failure counter HERE, with the backoff, not on bare open.
+        // Resetting it the instant the socket opened meant the accept-then-drop
+        // case — the exact scenario the stability window exists for — grew the
+        // backoff as intended but never reached PERM_WARN_AFTER_FAILURES, so a
+        // permanently degraded tab stayed undiagnosable.
+        permConsecutiveFailures = 0;
+      }, PERM_STABLE_AFTER);
+    };
+    sock.onmessage = function (e) {
+      try {
+        handlePermEnvelope(JSON.parse(e.data));
+      } catch (err) {}
+    };
+    // Recovery is driven from `close` alone. The socket always fires `close`
+    // after `error`, so handling both would double-schedule the reconnect and
+    // halve the effective backoff.
+    //
+    // Everything here is inside the identity guard. Only the CURRENT socket's
+    // close may drive recovery: if a future trigger (a `visibilitychange` or
+    // `online` handler, the natural next addition) ever opens a second socket,
+    // a stale socket's close would otherwise schedule a reconnect that
+    // orphans the live one, leaking a server-side slot until its send timeout.
+    sock.onclose = function () {
+      if (permSocket !== sock) return;
+      permSocket = null;
+      if (permStableTimer !== null) {
+        clearTimeout(permStableTimer);
+        permStableTimer = null;
+      }
+      startFallbackPoll();
+      schedulePermReconnect();
+    };
+  }
+  // perm-ws-machine:END
+
+  if (typeof WebSocket !== 'undefined') {
+    // openPermSocket starts the fallback poll itself, which also performs the
+    // initial bootstrap reconcile, so there is no separate bootstrap call
+    // here and no redundant fetch per retry.
+    openPermSocket();
   } else {
-    // EventSource missing in some embedded webviews -- fall back to the
+    // WebSocket missing in some embedded webviews -- fall back to the
     // legacy 3-second poll so users on those clients still see prompts.
     startFallbackPoll();
   }

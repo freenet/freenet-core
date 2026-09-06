@@ -1814,6 +1814,15 @@ mod queue {
                                 // Hold the scheduling bundle (and therefore the
                                 // lane permit) for the lifetime of the "send".
                                 let _scheduling = scheduling;
+                                // Observation channel; a dropped receiver is
+                                // expected. Neither spelling is lint-clean here:
+                                // `let _ =` trips the crate-wide deny on
+                                // `let_underscore_must_use`, and `drop(...)`
+                                // trips `dropping_copy_types` because this
+                                // `Result` is `Copy`, so the drop does nothing.
+                                // Allow the former per-site; see the note beside
+                                // the lint declarations in crates/core/Cargo.toml.
+                                #[allow(clippy::let_underscore_must_use)]
                                 let _ = tx.send((lane, entry.key));
                                 // Never completes: the permit stays held, so the
                                 // test can saturate a lane deterministically.
@@ -1941,7 +1950,7 @@ mod queue {
                     let tx = tx.clone();
                     async move {
                         let _scheduling = scheduling;
-                        let _ = tx.send(entry.fanout);
+                        drop(tx.send(entry.fanout));
                     }
                 },
             ));
@@ -2110,6 +2119,15 @@ mod queue {
                         move |entry: BroadcastEntry, _s: QueueScheduling| {
                             let tx = tx.clone();
                             async move {
+                                // Observation channel; a dropped receiver is
+                                // expected. Neither spelling is lint-clean here:
+                                // `let _ =` trips the crate-wide deny on
+                                // `let_underscore_must_use`, and `drop(...)`
+                                // trips `dropping_copy_types` because this
+                                // `Result` is `Copy`, so the drop does nothing.
+                                // Allow the former per-site; see the note beside
+                                // the lint declarations in crates/core/Cargo.toml.
+                                #[allow(clippy::let_underscore_must_use)]
                                 let _ = tx.send((lane, entry.key));
                             }
                         },
@@ -2139,7 +2157,7 @@ mod queue {
             );
 
             large.abort();
-            let _ = large.await;
+            drop(large.await);
 
             assert!(
                 small_permits.is_closed(),
@@ -2215,9 +2233,26 @@ mod queue {
                             let tx = tx.clone();
                             let release = release.clone();
                             async move {
+                                // Observation channel; a dropped receiver is
+                                // expected. Neither spelling is lint-clean here:
+                                // `let _ =` trips the crate-wide deny on
+                                // `let_underscore_must_use`, and `drop(...)`
+                                // trips `dropping_copy_types` because this
+                                // `Result` is `Copy`, so the drop does nothing.
+                                // Allow the former per-site; see the note beside
+                                // the lint declarations in crates/core/Cargo.toml.
+                                #[allow(clippy::let_underscore_must_use)]
                                 let _ = tx.send((lane, entry.key));
                                 if matches!(lane, QueuedPayloadClass::Large) {
-                                    let _ = release.acquire_owned().await;
+                                    // A BARRIER, not a held permit: wait until
+                                    // capacity exists, then release immediately.
+                                    // `drop(...)` preserves that exactly, since
+                                    // `let _ = x` also drops at end of statement.
+                                    // Do NOT "fix" this to `let _permit = ...` --
+                                    // binding it holds the permit for the rest of
+                                    // the block and changes when the large lane
+                                    // unblocks.
+                                    drop(release.acquire_owned().await);
                                 } else {
                                     scheduling.permit.ensure_capacity_for(BIG).await;
                                 }
@@ -3344,9 +3379,29 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     // receiver ACK), so on the streaming path a lost stream tail could leave the
     // peer without the state and the cached summary momentarily wrong. Two
     // backstops bound that window: the periodic InterestSync summary exchange
-    // (~5 min, node.rs) re-reconciles what each peer actually has, and a delta
-    // that fails to apply at the receiver triggers a ResyncRequest that clears
-    // the sender's cached summary (node.rs ~2119). The streaming `Delivered`
+    // re-reconciles what each peer actually has, and a delta that fails to
+    // apply at the receiver triggers a ResyncRequest that clears the sender's
+    // cached summary (node.rs ~2119).
+    //
+    // #5238 CHANGED THE FIRST NUMBER, and it is the backstop that matters for
+    // this specific case. This comment used to say "~5 min", which was the
+    // heartbeat interval, because the exchange re-examined every shared
+    // contract on every heartbeat. It is now a bounded rotating window of
+    // `MAX_DIGEST_SUMMARIES_PER_REPLY` contracts per reply, so a GIVEN contract
+    // is re-examined every `ceil(shared / 64)` heartbeats — on the order of 40
+    // minutes at the shared-set sizes measured in the field, not 5.
+    //
+    // The second backstop cannot cover the gap, which is why the number is
+    // worth stating here rather than only at the cap. It fires on a delta that
+    // FAILS TO APPLY; in the case this paragraph is about nothing is sent at
+    // all, because `plan_fanout_send` returns `Skip` on a byte-equal cached
+    // belief, so no delta exists to fail. After a lost stream tail on a
+    // contract that then goes quiet, the sender holds V2, the peer holds V1,
+    // the sender believes the peer holds V2, and anti-entropy is the only
+    // correction. Any later UPDATE to that contract does get sent (our summary
+    // then differs from the cached one), so the exposure is confined to
+    // quiescent contracts — but for those the window grew by roughly 8x.
+    // The streaming `Delivered`
     // signal is sender-side completion, so the rare tail-loss case is corrected
     // by those backstops rather than by an end-to-end ack here. Caching lets the
     // NEXT broadcast to this peer be a small delta instead of full state.

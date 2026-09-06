@@ -150,9 +150,13 @@ impl Executor<Runtime> {
 
     /// Register a delegate and record its WebApp origin, shared by the
     /// `RegisterDelegate` and `RegisterDelegateWithPredecessors` request arms so
-    /// the two cannot drift. Installs the client-supplied cipher/nonce, records
-    /// `origin_contract` as this delegate's attestation, and registers the WASM
-    /// module. Returns the delegate key on success, or a mapped
+    /// the two cannot drift. Forwards the client-supplied cipher/nonce down to
+    /// `SecretsStore::register_delegate` (via `Runtime::register_delegate`,
+    /// which is a pass-through); the store DISCARDS them and derives the
+    /// per-delegate DEK from the node KEK instead, see
+    /// `SecretsStore::derive_delegate_dek`. Records `origin_contract` as this
+    /// delegate's attestation, and registers the WASM module. Returns the
+    /// delegate key on success, or a mapped
     /// [`ExecutorError`] (already carrying `RegisterError(key)`) on failure.
     fn register_delegate_and_record_origin(
         &mut self,
@@ -619,7 +623,10 @@ mod resolve_message_origin_tests {
         // handler rejects it against MAX_MIGRATION_PREDECESSORS).
         let many: Vec<DelegateKey> = (0u8..200).map(dkey).collect();
         assert_eq!(dedupe_predecessors(many).len(), 200);
-        assert!(200 > MAX_MIGRATION_PREDECESSORS);
+        // Compile-time tripwire: if MAX_MIGRATION_PREDECESSORS is ever raised to
+        // >= 200 this fails the build, so the "many" fixture above always stays
+        // large enough to actually exercise the over-cap scenario elsewhere.
+        const _: () = assert!(200 > MAX_MIGRATION_PREDECESSORS);
     }
 
     /// Caller delegate identity wins over a concurrently-supplied WebApp

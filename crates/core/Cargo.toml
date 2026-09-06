@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.2.123"
+version = "0.2.133"
 edition = "2024"
 rust-version = "1.85"
 publish = true
@@ -104,7 +104,9 @@ wasmtime = { workspace = true, optional = true }
 # PUT time must run regardless of which WASM execution backend is compiled in.
 wasmparser = { workspace = true }
 xz2 = { workspace = true }
-reqwest = { workspace = true }
+# `blocking` named explicitly (not just inherited via feature unification from
+# opentelemetry-http) because tracing::otel constructs reqwest::blocking::Client.
+reqwest = { workspace = true, features = ["blocking"] }
 # Hidden (no-echo) prompt for the `freenet secrets export/import` passphrase, so
 # secrets don't have to be passed on argv (where they leak via `ps`/history).
 rpassword = "7"
@@ -126,8 +128,38 @@ tracing-core = { workspace = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, features = ["json"], optional = true }
 tracing-appender = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
+# Non-optional: the SDK metrics pipeline (tracing::otel) ships in every build.
+# default-features = false + explicit list drops the logs exporter; only metrics
+# is a goal here (see docs/design/otel-metrics-exporter.md, non-goals). It does
+# NOT drop trace: `http-proto` mandates `trace`, `prost` and
+# opentelemetry-proto, so those stay in the graph regardless.
+# NO reqwest-*-client / reqwest-rustls feature on purpose: tracing::otel always
+# supplies its own HttpClient, so the exporter never builds one (it only does
+# when none was given — opentelemetry-otlp src/exporter/http/mod.rs). Enabling
+# them would pull opentelemetry-http's reqwest 0.13, whose `rustls` feature is
+# hardwired to aws-lc-rs + rustls-platform-verifier: a second reqwest major, a
+# second TLS root store, a C/asm build (aws-lc-sys via cc+cmake) on every
+# release target, and two crypto providers in one rustls, which makes
+# `CryptoProvider::get_default_or_install_from_crate_features` panic.
+# Our client rides the workspace reqwest 0.12, which already has rustls-tls, so
+# https:// collector endpoints work with nothing new in the graph.
+# Direct dep so tracing::otel can implement HttpClient (per-request auth
+# headers); the crate is already in the graph via opentelemetry-otlp.
+opentelemetry-http = { workspace = true }
+async-trait = { workspace = true }
+http = { workspace = true }
+# XEdDSA collector auth: sign with the x25519 transport key (see
+# transport::crypto::TransportKeypair::auth_token_signer). rand10/rand_core10
+# exist only because xeddsa's rng bound is rand 0.10 (workspace rand is 0.9).
+xeddsa = { workspace = true }
+rand10 = { workspace = true }
+rand_core10 = { workspace = true }
+opentelemetry-otlp = { workspace = true, features = [
+    "http-proto",
+    "metrics",
+    "internal-logs",
+] }
+opentelemetry_sdk = { workspace = true }
 
 hkdf = { workspace = true }
 keyring = { workspace = true }
@@ -150,7 +182,7 @@ tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { workspace = true, features = ["shellapi", "sysinfoapi", "wincon", "winuser", "synchapi", "handleapi", "errhandlingapi", "winerror", "winnt", "minwindef"] }
+winapi = { workspace = true, features = ["shellapi", "sysinfoapi", "wincon", "winuser", "synchapi", "handleapi", "errhandlingapi", "winerror", "winnt", "minwindef", "psapi", "processthreadsapi"] }
 serde = { workspace = true }
 zip = { workspace = true }
 tray-icon = { workspace = true }
@@ -163,6 +195,19 @@ winreg = { workspace = true }
 tray-icon = { workspace = true }
 muda = { workspace = true }
 tao = { workspace = true }
+# Live memory-pressure signals for the resident-overhead hosting budget
+# (#5333) — `host_statistics64` (system-wide available memory) and
+# `task_info` (this process's own resident size) — are read via `libc`
+# (already a `cfg(unix)` dependency above), not a separate Mach-specific
+# crate: an earlier revision of this comment pinned `mach2 = "0.4"` here on
+# the theory that a purpose-built crate would avoid struct-layout mistakes,
+# but that version of `mach2` does not export `mach_host`, `HOST_VM_INFO64`,
+# or a `mach_task_basic_info` struct at all — a #5333-review-caught compile
+# break the "real macOS CI compiles this" claim in the same removed comment
+# had not actually been confirmed by (the job was still pending). `libc`
+# has every symbol needed, including the `_COUNT` size constants that avoid
+# hand-rolled `size_of` arithmetic — see `wasm_runtime::module_cache`'s
+# `read_macos_available_bytes`/`read_macos_own_rss_bytes`.
 
 [dev-dependencies]
 arbitrary = { workspace = true }
@@ -172,6 +217,13 @@ criterion = { workspace = true }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
 freenet-macros = { path = "../freenet-macros" }
 httptest = { workspace = true }
+# Test-only: proves the collector can verify XEdDSA tokens with a stock
+# ed25519 library after Montgomery->Edwards conversion (4.1.3 = xeddsa's).
+curve25519-dalek = "4.1.3"
+# Test-only: `InMemoryMetricExporter`, so the OTel instrument callbacks can be
+# collected and asserted on without a collector. Dev-only on purpose — the
+# `testing` feature must not reach the shipped binary.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 libc = { workspace = true }  # For sendmmsg syscall batching benchmarks
 parking_lot = { workspace = true, features = ["deadlock_detection"] }
 # Used by tests/in_process_restart.rs to directly probe the redb file lock as a
@@ -185,6 +237,7 @@ testresult = { workspace = true }
 tokio-tungstenite = { workspace = true }
 # console-subscriber = { version = "0.4" }
 which = { workspace = true }
+wat = { workspace = true }
 regex = { workspace = true }
 serial_test = { workspace = true }
 url = "2"
@@ -230,7 +283,7 @@ winres = "0.1"
 default = ["redb", "trace", "websocket", "wasmtime-backend"]
 sqlite = ["sqlx"]
 trace = ["tracing-subscriber", "tracing-appender"]
-trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry", "opentelemetry-otlp"]
+trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry"]
 websocket = ["axum/ws"]
 testing = ["freenet-stdlib/testing", "parking_lot/deadlock_detection"]
 console-subscriber = ["dep:console-subscriber"]
@@ -267,6 +320,23 @@ unsafe_op_in_unsafe_fn = "deny"
 [lints.clippy]
 # Disallow `let _ = expr` when `expr` is #[must_use].
 # Forces explicit handling or an intentional `drop()` call.
+#
+# CAVEAT, learned the hard way (#5292): the suggested `drop()` escape hatch is
+# NOT always available, and then the two lints forbid opposite spellings of the
+# same statement. If the discarded value is `#[must_use]` AND `Copy` (e.g. a
+# `Result<(), SendError<T>>` where `T: Copy`), `let _ = x` is denied here while
+# `drop(x)` is denied by rustc's `dropping_copy_types` -- the drop genuinely
+# does nothing, so the lint is right. The same applies to a `#[must_use]` type
+# with no `Drop` glue, via `clippy::drop_non_drop`.
+#
+# When that happens, the resolution is a PER-SITE
+# `#[allow(clippy::let_underscore_must_use)]` with a comment saying why the
+# value is ignorable -- see `broadcast_queue.rs` in `mod observation_tests`.
+# Do NOT widen this to a module-level allow (it un-gates every future discard in
+# that module) and do NOT disable `dropping_copy_types`/`drop_non_drop`
+# crate-wide to make `drop()` work everywhere: both catch real mistakes, and
+# suppressing a lint to make a fix convenient is what produced the test-code
+# blind spot #5292 had to close.
 let_underscore_must_use = "deny"
 
 # Flag `_ =>` catch-all arms on non-exhaustive enums.

@@ -105,7 +105,7 @@ pub(crate) fn pending_prompts() -> PendingPrompts {
 /// Maximum concurrent pending prompts to prevent memory exhaustion.
 const MAX_PENDING_PROMPTS: usize = 32;
 
-/// Snapshot of a prompt's display fields, sufficient for the SSE handler to
+/// Snapshot of a prompt's display fields, sufficient for the event handlers to
 /// render an `Added` event without holding the DashMap entry. Cloned out of
 /// the registry so the broadcast path doesn't pin the entry's lock.
 #[derive(Clone, Debug)]
@@ -117,7 +117,8 @@ pub(crate) struct PromptSnapshot {
     pub caller: CallerIdentity,
 }
 
-/// Lifecycle event for a permission prompt. Consumed by the SSE endpoint to
+/// Lifecycle event for a permission prompt. Consumed by the permission-event
+/// endpoints (WebSocket, and the retained SSE route) to
 /// push state changes to every open Freenet tab in real time. The polling
 /// endpoint at `/permission/pending` is retained as a fallback and is not
 /// driven by this stream.
@@ -129,8 +130,9 @@ pub(crate) enum PromptEvent {
 
 /// Broadcast capacity. Each lifecycle is two events (Added + Removed), and
 /// MAX_PENDING_PROMPTS caps concurrent in-flight prompts at 32, so 128 leaves
-/// healthy headroom even if a transient SSE subscriber lags briefly. On
-/// `RecvError::Lagged`, the SSE handler resyncs from the DashMap snapshot.
+/// healthy headroom even if a transient subscriber lags briefly. On
+/// `RecvError::Lagged`, the handler emits `resync` and the client
+/// re-bootstraps from `/permission/pending`.
 const PROMPT_EVENT_CAPACITY: usize = 128;
 
 /// Global lifecycle broadcast for permission prompts.
@@ -210,7 +212,8 @@ impl DashboardPrompter {
     }
 
     /// Alert the user out-of-band when a freshly-created prompt has no dashboard
-    /// tab to display it. `subscriber_count` is the number of live SSE
+    /// tab to display it. `subscriber_count` is the number of live
+    /// permission-event
     /// subscribers to the prompt-event broadcast
     /// ([`prompt_events()`]`.receiver_count()`); each connected gateway tab
     /// holds exactly one. Zero means every tab is closed, so the prompt would
@@ -400,7 +403,7 @@ impl UserInputPrompter for DashboardPrompter {
             },
         );
 
-        // Fire the broadcast Added event AFTER the DashMap insert so any SSE
+        // Fire the broadcast Added event AFTER the DashMap insert so any
         // subscriber that wakes up on the event can immediately find the entry
         // if it falls back to a registry lookup.
         emit_prompt_event(PromptEvent::Added(PromptSnapshot {
@@ -414,7 +417,8 @@ impl UserInputPrompter for DashboardPrompter {
         // #3820: if no dashboard tab is connected to display this prompt, the
         // user would never see it and it would silently auto-deny after
         // USER_INPUT_TIMEOUT. A connected gateway tab subscribes to the
-        // prompt-event broadcast (one receiver per SSE connection), so zero
+        // prompt-event broadcast (one receiver per WebSocket or legacy SSE
+        // subscriber), so zero
         // receivers means every tab is closed -- open the standalone permission
         // page in the user's browser so the prompt stays actionable. On a
         // headless service (no DISPLAY/WAYLAND_DISPLAY) the browser-open is a
@@ -436,7 +440,7 @@ impl UserInputPrompter for DashboardPrompter {
         // Always emit Removed so subscribers can hide their overlay
         // regardless of which path retired the prompt; a duplicate Removed
         // (when both the HTTP handler and this cleanup fire) is harmless,
-        // because the SSE client's hide is idempotent on nonce.
+        // because the shell client's hide is idempotent on nonce.
         let was_present = self.pending.remove(&nonce).is_some();
         if was_present {
             emit_prompt_event(PromptEvent::Removed {
@@ -981,7 +985,8 @@ mod tests {
         // That path is only fired when the prompter's own cleanup
         // actually removes the entry (timeout / channel-dropped paths).
         // The HTTP `/respond` handler fires Removed in the success
-        // path; that's covered by the SSE endpoint integration tests.
+        // path; that's covered by the permission-endpoint integration tests
+        // (WebSocket and legacy SSE).
         assert!(
             !saw_removed,
             "this test exercises the manual-remove path; \
@@ -991,7 +996,7 @@ mod tests {
     }
 
     /// When the prompter's own timeout cleanup runs, it must emit Removed
-    /// so SSE subscribers dismiss the overlay.
+    /// so subscribers on either transport dismiss the overlay.
     #[tokio::test(start_paused = true)]
     async fn test_prompt_timeout_emits_removed() {
         let mut rx = prompt_events().subscribe();
@@ -1049,10 +1054,11 @@ mod tests {
     }
 
     // #3820: when a permission prompt is created and no dashboard tab is
-    // connected to display it (zero SSE subscribers), the prompter must open
+    // connected to display it (zero permission subscribers), the prompter must open
     // the standalone permission page in the user's browser so the prompt stays
     // actionable instead of silently auto-denying after the timeout. When a tab
-    // IS connected it receives the prompt via SSE and the browser must NOT be
+    // IS connected it receives the prompt over the permission channel and the
+    // browser must NOT be
     // opened. We drive `maybe_alert_no_tab` directly with a recording notifier
     // because the prompt-event broadcast is a process-global shared across
     // tests, so its live `receiver_count()` isn't deterministic here.

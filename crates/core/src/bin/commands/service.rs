@@ -11,12 +11,14 @@
 //! - `log_utils` – log file rotation helpers
 //! - `single_instance` – macOS wrapper single-instance lock (flock-based)
 //! - `launch_at_login` – macOS Launch at Login, plist helpers, legacy migration
+//! - `cli_symlinks` – macOS first-launch `freenet`/`fdev` PATH symlink setup
 //! - `wrapper` – process wrapper loop, state machine, log events
 //! - `purge` – data purge, doctor, process-reaping
 //! - `linux` – Linux/systemd service management
 //! - `macos` – macOS/launchd service management
 //! - `windows` – Windows registry/task service management
 
+mod cli_symlinks;
 mod launch_at_login;
 mod linux;
 mod log_utils;
@@ -43,15 +45,15 @@ pub enum ServiceCommand {
         /// servers, or environments without a user session bus.
         #[arg(long)]
         system: bool,
-        /// Do NOT enable systemd lingering for a user service.
+        /// Leave systemd lingering off for a user service.
         ///
         /// By default a user service enables lingering
-        /// (`loginctl enable-linger <user>`) so it keeps running without an
-        /// active login session — required for the auto-update self-heal to
-        /// work on a headless server (without it, a `--user` service is
+        /// (`loginctl enable-linger <user>`) so that it keeps running without
+        /// an active login session. That is what the auto-update self-heal
+        /// needs on a headless server: without it, a `--user` service is
         /// stopped at logout and never catches the node's exit-42 "update
-        /// needed" signal). Pass this to keep the service login-scoped
-        /// instead. Has no effect on a `--system` service.
+        /// needed" signal. Pass this to keep the service login-scoped instead.
+        /// Has no effect on a `--system` service.
         #[arg(long)]
         no_linger: bool,
     },
@@ -93,13 +95,12 @@ pub enum ServiceCommand {
     },
     /// Disable the background daemon so it stays stopped across restarts.
     ///
-    /// Writes a persistent marker in the config directory that the node checks
-    /// at startup: while it is present, `freenet network` refuses to run and
-    /// stays idle instead, so systemd, launchd, or the tray wrapper cannot
-    /// bring the node back on reboot or re-login. The still-running service is
-    /// restarted so the change takes effect immediately (the supervisor stays
-    /// alive; only the node stops doing work). Re-enable with
-    /// `freenet service enable`.
+    /// This writes a marker, kept across reboots, in the config directory that
+    /// the node checks at startup. While it is there, `freenet network` stays
+    /// idle rather than running, so systemd, launchd, or the tray wrapper
+    /// cannot bring the node back on reboot or re-login. The running service is restarted so the
+    /// change takes effect straight away: the supervisor stays alive and only
+    /// the node stops doing work. Re-enable with `freenet service enable`.
     Disable {
         /// Target the system-wide service instead of the user service
         #[arg(long)]
@@ -115,12 +116,15 @@ pub enum ServiceCommand {
         #[arg(long)]
         system: bool,
     },
-    /// Recover a wedged service install: re-template the wrapper/unit to the
-    /// current binary, reap stale orphaned `freenet network` processes (PPID=1,
-    /// holding the port on an old binary), and restart cleanly. Use when the
-    /// node appears frozen on an old version (see issue #3967). Unlike
-    /// `restart`, this kills detached orphans and refreshes the wrapper, so it
-    /// closes the bootstrap gap that `restart` alone cannot.
+    /// Repair a stuck service install: point the wrapper and unit file at the
+    /// current binary, kill orphaned `freenet network` processes still holding
+    /// the port on an old binary, and restart cleanly. An orphan shows up as a
+    /// `freenet network` process whose parent is init, so
+    /// `ps -o ppid= -p <pid>` reports 1.
+    /// Use this when the node looks frozen on an old version. `restart` on its
+    /// own neither kills detached orphans nor refreshes the wrapper, which is
+    /// why it cannot recover this state.
+    // Internal: #3967.
     Doctor {
         /// Repair the system-wide service instead of the user service
         #[arg(long)]
@@ -250,6 +254,19 @@ pub(super) fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
 #[allow(dead_code)]
 pub(super) fn legacy_migration_marker_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("freenet").join(".legacy-migration-complete"))
+}
+
+/// Path of the CLI-symlink setup marker (`freenet`/`fdev` on `PATH` via
+/// `/usr/local/bin`). Same reasoning as `legacy_migration_marker_path`: a
+/// user who already onboarded via an older DMG has the first-run marker set
+/// but never got a CLI symlink, so this cannot be gated on onboarding state
+/// either. Its own one-shot marker, so the (possibly password-prompting)
+/// symlink setup runs exactly once per install, whether the user is on their
+/// very first launch or upgrading from a build that predates this feature.
+/// See `service::cli_symlinks`.
+#[allow(dead_code)]
+pub(super) fn cli_symlinks_marker_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("freenet").join(".cli-symlinks-setup-attempted"))
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1365,6 +1382,23 @@ mod tests {
         // of a first-run flow that somehow re-ran shouldn't blow up).
         mark_first_run_complete_at(&marker).unwrap();
         assert!(!is_first_run_at(&marker));
+    }
+
+    #[test]
+    fn onboarding_markers_are_distinct_files() {
+        // The whole point of splitting cli_symlinks_marker_path (and
+        // legacy_migration_marker_path) out from first_run_marker_path is
+        // that an already-onboarded user — who has the first-run marker set
+        // — still needs the CLI-symlink one-shot (and the legacy migration)
+        // to run once on their next launch. If a future edit accidentally
+        // collapsed these onto the same path, that guarantee would silently
+        // break and this is the only thing that would catch it.
+        let first_run = first_run_marker_path().unwrap();
+        let legacy_migration = legacy_migration_marker_path().unwrap();
+        let cli_symlinks = cli_symlinks_marker_path().unwrap();
+        assert_ne!(first_run, legacy_migration);
+        assert_ne!(first_run, cli_symlinks);
+        assert_ne!(legacy_migration, cli_symlinks);
     }
 
     #[test]

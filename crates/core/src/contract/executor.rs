@@ -19,7 +19,6 @@ use freenet_stdlib::client_api::{
     RequestError,
 };
 use freenet_stdlib::prelude::*;
-use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -27,10 +26,10 @@ use super::storages::Storage;
 use crate::config::Config;
 use crate::node::OpManager;
 use crate::operations::get::GetResult;
+use crate::util::byte_bounded_lru::ByteBoundedLruCache;
 use crate::wasm_runtime::{
     ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface, DelegateStore, Runtime,
-    SecretsStore, SharedContractIndex, StateStorage, StateStore, StateStoreError,
-    UserSecretContext,
+    SecretsStore, SharedStores, StateStorage, StateStore, StateStoreError, UserSecretContext,
 };
 use crate::{
     client_events::{ClientId, HostResult},
@@ -45,7 +44,14 @@ mod pool_tests;
 pub(super) mod runtime;
 
 /// Notification sent when a subscribed contract's state changes.
-/// Delivered from `commit_state_update()` to the `contract_handling()` loop.
+///
+/// Delivered to the `contract_handling()` loop from
+/// `Executor::finalize_state_commit`, the single post-store fan-out site for
+/// every state-storing path: the initial-state install, the merge path, and
+/// both branches of `perform_contract_put`. It used to be sent from
+/// `commit_state_update` alone, so an install — including every
+/// ResyncResponse-driven recovery — notified no delegate at all (#5481).
+///
 /// Uses `Arc<WrappedState>` so multiple subscribers share one allocation.
 pub(crate) struct DelegateNotification {
     pub delegate_key: DelegateKey,
@@ -64,7 +70,35 @@ pub(crate) const MAX_SUBSCRIBERS_PER_CONTRACT: usize = 256;
 
 /// Maximum total subscriptions a single client may hold across all contracts.
 /// Prevents a single client from spreading thin across many contracts to exhaust resources.
-pub(crate) const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 50;
+///
+/// This is a hard-coded network-wide constant, not a per-node config option, and that is
+/// deliberate: a configurable cap would mean a dApp works on some peers and not others,
+/// which is exactly the non-uniformity Freenet must avoid (every node must enforce the
+/// same limit so client behavior is predictable network-wide). Do not make this
+/// configurable — that has been proposed and explicitly rejected (Ian, 2026-08-22).
+///
+/// Raised from 50 to 500 (2026-08-22): 50 was hit almost immediately by apps that
+/// subscribe to one contract per discoverable peer/user (e.g. Freebird's discovery
+/// pattern), and the cap was trivially bypassable by opening a second websocket
+/// connection (each connection mints a fresh `ClientId` with its own budget), so it
+/// penalized well-behaved clients while stopping no determined abuser.
+///
+/// This constant does not bound per-subscription memory, so raising it is safe by the
+/// same argument at any value: each subscription's notification channel
+/// (`SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE`) is bounded by message COUNT, not bytes, and
+/// is drained lossily (`try_send`, dropped when full) rather than growing unbounded. A
+/// queued message can itself carry a full contract-state clone up to `MAX_STATE_SIZE`
+/// (see `wasm_runtime::state_store`), so the per-subscription worst case is already
+/// governed by that channel depth and state-size cap, not by this constant — raising
+/// this value only scales an exposure that exists independently of it. See the PR that
+/// raised this constant to 500 for the full numeric worked example.
+///
+/// Note: the tokio mpsc channel behind each subscription eagerly allocates its first
+/// block (32 slots by default) at creation and allocates further blocks on demand — it
+/// is not fully preallocated to capacity, but an idle subscription is not literally
+/// zero-cost either. The order-of-magnitude conclusion (idle cost is negligible, on the
+/// order of a few hundred bytes per subscription) still holds.
+pub(crate) const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 500;
 
 /// Buffer size for per-subscriber notification channels.
 /// When full, notifications are dropped (lossy) rather than blocking the executor.
@@ -1150,6 +1184,16 @@ type SharedClientCounts = Arc<dashmap::DashMap<ClientId, usize>>;
 // In the normal case (summaries are small digests) the count target binds and the
 // byte budget has ample headroom, so coverage holds. Only a large-value contract
 // makes the byte budget bind, holding fewer entries but never OOMing.
+//
+// Both byte budgets are PER EXECUTOR, and the pool size is derived from CPU count
+// — which `MemoryMax` does not constrain. So the RAM-scaled clamps alone were not
+// a bound on what the node commits: a 20-core laptop inside the shipped 2 GiB
+// cgroup got 16 workers × (32 MiB summary + 64 MiB delta) = 1.5 GiB of declared
+// ceiling out of a 2 GiB limit, and no code anywhere composed the two (#5268
+// defect 3). Each budget is therefore additionally capped by its share of
+// `per_executor_cache_envelope_bytes`, the node-wide envelope divided by the pool
+// size. That cap binds only on memory-constrained many-core hosts; a single-worker
+// peer and a large gateway keep exactly the budgets they had.
 // ============================================================================
 
 /// Lower clamp for the summary/delta cache COUNT target (entries). Keeps
@@ -1186,25 +1230,6 @@ pub(crate) fn summary_cache_count_target(hosted: usize) -> usize {
         .min(SUMMARY_CACHE_COUNT_MAX)
 }
 
-/// Per-entry structural-overhead allowance (bytes) added to every summary/delta
-/// value's payload length when accounting for the byte budget.
-///
-/// Two jobs:
-///   - It covers the real per-entry overhead the payload length ignores — the key
-///     (`ContractKey` / `(ContractKey, u64, u64)`), the `LruCache` node's
-///     prev/next pointers and boxed entry, and the map slot (~100-250 B combined).
-///     Adding it on TOP of the payload makes the counted total a genuine upper
-///     bound on retained RAM, so the byte budget is a true hard cap (not the
-///     ~1.5x-of-budget story an un-floored weigher would give).
-///   - It floors each entry's weight so even EMPTY values still count. A contract
-///     legitimately returns an empty delta once a peer is current; without a
-///     floor an unbounded stream of distinct zero-weight keys would never be
-///     evicted and the entry count (with its uncounted overhead) would grow
-///     without bound — the #4565 OOM class this budget exists to close (same
-///     failure the closed PR #4794 fixed with its delta-cache floor). With the
-///     floor the entry COUNT is capped at `byte_budget / CACHE_ENTRY_OVERHEAD_BYTES`.
-pub(crate) const CACHE_ENTRY_OVERHEAD_BYTES: usize = 512;
-
 /// Fraction of "memory the node may use" that sizes the per-executor SUMMARY
 /// cache byte budget. Summaries are small digests, so a modest share holds far
 /// more small entries than any realistic hosted count while capping worst-case
@@ -1216,11 +1241,18 @@ const SUMMARY_CACHE_RAM_DIVISOR: usize = 64;
 /// a small node — so the count target (coverage) binds, never this floor.
 const SUMMARY_CACHE_MIN_BYTES: usize = 16 * 1024 * 1024;
 
-/// Upper clamp for the summary-cache byte budget (32 MiB). At the ~512 B floor
-/// this holds ~65k small summaries (≈ the count MAX), so coverage still holds at
-/// the count cap for small digests; a large-summary contract instead evicts down
-/// to whatever fits in 32 MiB. Per-executor × up to 16 pool workers → ≤ 512 MiB
-/// aggregate summary-cache RAM.
+/// Upper clamp for the summary-cache byte budget (32 MiB), which binds on a host
+/// with room for it: an unconstrained gateway, or any node whose pool is small
+/// enough that the envelope share is wider. At the ~512 B floor 32 MiB holds
+/// ~65k small summaries (≈ the count MAX), so coverage holds at the count cap for
+/// small digests; a large-summary contract instead evicts down to what fits.
+///
+/// This is a CEILING, not the resolved budget. On a memory-constrained many-core
+/// host `summary_budget_for` composes it down to a share of the node-wide
+/// envelope (#5268 defect 3): a 2 GiB peer with 16 workers resolves to ~5 MiB,
+/// which at the entry floor still holds ~10k small summaries. `pool_size ×
+/// (summary + delta)` is what the node actually commits, and that product is
+/// what `cache_byte_budgets_are_aggregate_safe` bounds.
 const SUMMARY_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// Fraction of "memory the node may use" that sizes the per-executor DELTA cache
@@ -1236,18 +1268,17 @@ const DELTA_CACHE_RAM_DIVISOR: usize = 16;
 const DELTA_CACHE_MIN_BYTES: usize = 8 * 1024 * 1024;
 
 /// Upper clamp for the delta-cache byte budget (64 MiB). Matches PR #4794's
-/// ceiling. Per-executor × up to 16 pool workers → ≤ 1 GiB aggregate delta-cache
-/// RAM. Combined with the summary cache (≤ 512 MiB aggregate) and the shared
-/// module cache (RAM/8, absolute max 4 GiB — but the divisor binds well below
-/// that on typical gateways: ~950 MiB on a 7.6 GiB box) the total cache
-/// commitment stays a safe fraction of a production gateway's memory (see
-/// `cache_byte_budgets_are_aggregate_safe`, which models the RAM-scaled budget
-/// rather than the absolute max). NOTE: this budget is PER-EXECUTOR; aggregate RAM is
-/// `pool_size × (summary_budget + delta_budget)`, not a single node-wide figure.
-/// `pool_size` tracks CPU count (core count), so a RAM-scaled per-executor budget
-/// is multiplied by cores: on an exotic high-core/low-RAM box the aggregate is a
-/// larger fraction of that box's RAM; production gateways have modest core counts
-/// and stay safe (asserted by `cache_byte_budgets_are_aggregate_safe`).
+/// ceiling.
+///
+/// Like [`SUMMARY_CACHE_MAX_BYTES`] this is a CEILING, not the resolved budget:
+/// it binds where the node has room for it, and `delta_budget_for` composes it
+/// down to a share of the node-wide envelope otherwise (#5268 defect 3). The
+/// budget is PER-EXECUTOR and `pool_size` tracks CPU COUNT, which `MemoryMax`
+/// does not constrain — multiplying a RAM-scaled per-executor budget by cores is
+/// exactly how a 2 GiB peer ended up declaring 1.5 GiB of summary+delta ceiling.
+/// `cache_byte_budgets_are_aggregate_safe` bounds the product, together with the
+/// module caches, the redb page cache, the Store arenas and the source-byte
+/// caches, on both a 2 GiB peer and a production gateway.
 const DELTA_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Per-executor SUMMARY-cache byte budget, scaled to the memory the node may use
@@ -1256,9 +1287,49 @@ const DELTA_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// SUMMARY_CACHE_MIN_BYTES, SUMMARY_CACHE_MAX_BYTES)`. Reuses the module cache's
 /// `read_total_ram_bytes()` so there is a single "memory the node may use" source.
 pub(crate) fn summary_cache_budget_bytes() -> usize {
-    let total_ram = crate::wasm_runtime::read_total_ram_bytes()
-        .unwrap_or(SUMMARY_CACHE_FALLBACK_TOTAL_RAM_BYTES);
-    (total_ram / SUMMARY_CACHE_RAM_DIVISOR).clamp(SUMMARY_CACHE_MIN_BYTES, SUMMARY_CACHE_MAX_BYTES)
+    summary_budget_for(live_total_ram_bytes(), live_pool_size())
+}
+
+/// Pure sizing math behind [`summary_cache_budget_bytes`], split out so
+/// aggregate-commitment tests can ask what a hypothetical host would get instead
+/// of depending on the test machine's own RAM and core count.
+pub(crate) fn summary_budget_for(total_ram: usize, pool_size: usize) -> usize {
+    let ram_scaled = (total_ram / SUMMARY_CACHE_RAM_DIVISOR)
+        .clamp(SUMMARY_CACHE_MIN_BYTES, SUMMARY_CACHE_MAX_BYTES);
+    compose_against_envelope(
+        ram_scaled,
+        SUMMARY_CACHE_ENVELOPE_SHARE,
+        total_ram,
+        pool_size,
+    )
+}
+
+fn live_total_ram_bytes() -> usize {
+    crate::wasm_runtime::read_total_ram_bytes().unwrap_or(SUMMARY_CACHE_FALLBACK_TOTAL_RAM_BYTES)
+}
+
+/// The pool size the node will actually create, from
+/// [`crate::config::runtime_pool_size`] — the same function `RuntimePool::new`
+/// sizes the pool with, so the divisor here can never drift from the multiplier.
+fn live_pool_size() -> usize {
+    crate::config::runtime_pool_size().into()
+}
+
+/// Cap a RAM-scaled per-executor budget at `share` of this executor's slice of
+/// the node-wide cache envelope, never dropping below
+/// [`CACHE_ABSOLUTE_FLOOR_BYTES`].
+fn compose_against_envelope(
+    ram_scaled: usize,
+    share: (usize, usize),
+    total_ram: usize,
+    pool_size: usize,
+) -> usize {
+    let (numerator, denominator) = share;
+    let per_executor_envelope =
+        total_ram / SUMMARY_DELTA_ENVELOPE_RAM_DIVISOR / pool_size.max(1) / denominator * numerator;
+    ram_scaled
+        .min(per_executor_envelope)
+        .max(CACHE_ABSOLUTE_FLOOR_BYTES)
 }
 
 /// Per-executor DELTA-cache byte budget, derived the same way as
@@ -1266,151 +1337,107 @@ pub(crate) fn summary_cache_budget_bytes() -> usize {
 /// larger and higher-cardinality): `clamp(total_ram / DELTA_CACHE_RAM_DIVISOR,
 /// DELTA_CACHE_MIN_BYTES, DELTA_CACHE_MAX_BYTES)`.
 pub(crate) fn delta_cache_budget_bytes() -> usize {
-    let total_ram = crate::wasm_runtime::read_total_ram_bytes()
-        .unwrap_or(SUMMARY_CACHE_FALLBACK_TOTAL_RAM_BYTES);
-    (total_ram / DELTA_CACHE_RAM_DIVISOR).clamp(DELTA_CACHE_MIN_BYTES, DELTA_CACHE_MAX_BYTES)
+    delta_budget_for(live_total_ram_bytes(), live_pool_size())
+}
+
+/// Pure sizing math behind [`delta_cache_budget_bytes`]; see
+/// [`summary_budget_for`].
+pub(crate) fn delta_budget_for(total_ram: usize, pool_size: usize) -> usize {
+    let ram_scaled =
+        (total_ram / DELTA_CACHE_RAM_DIVISOR).clamp(DELTA_CACHE_MIN_BYTES, DELTA_CACHE_MAX_BYTES);
+    compose_against_envelope(ram_scaled, DELTA_CACHE_ENVELOPE_SHARE, total_ram, pool_size)
+}
+
+/// Sum of every cache ceiling a node with `memory_limit` bytes and `pool_size`
+/// workers declares: the per-executor summary, delta, and Store-arena caches
+/// times the pool, plus the single shared contract and delegate module caches,
+/// the shared source-WASM byte caches, the interest manager's delta cache, and
+/// the redb page cache.
+///
+/// Module ceilings are sized to the RAM the host actually has, NOT the
+/// absolute MAX clamp: the 4 GiB module-cache MAX only binds above 32 GiB of
+/// RAM, so using it would model an impossible cache on a smaller box. (MAX-clamp
+/// safety on a >32 GiB host is guarded separately by
+/// `module_cache::tests::max_clamp_combined_ceiling_is_safe_at_binding_host`.)
+///
+/// Promoted from a `#[cfg(test)]`-only helper (originally written purely to
+/// verify [`cache_byte_budgets_are_aggregate_safe`] below) to a real
+/// production function (#5333 review): the resident-overhead hosting budget
+/// (`ring::hosting::cache::resident_overhead_budget_for`) needs the SAME
+/// real figure — what every OTHER memory consumer has already declared — to
+/// derive its own budget as a residual rather than an independently-clamped
+/// guess. Using this one function in both places means the aggregate-safety
+/// test now checks the ACTUAL formula the resident-overhead budget composes
+/// against, not a second, potentially-drifting re-derivation of it.
+pub(crate) fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> usize {
+    // PER-EXECUTOR — multiplied by the pool.
+    let summary = summary_budget_for(memory_limit, pool_size);
+    let delta = delta_budget_for(memory_limit, pool_size);
+    // One wasmtime Store per executor, each holding retired-instance bytes up
+    // to its arena budget between refreshes.
+    let arena = crate::wasm_runtime::engine::store_arena_budget_for(memory_limit, pool_size);
+
+    // NODE-WIDE — one of each, shared by every executor.
+    let contract_modules = crate::wasm_runtime::budget_for_ram(memory_limit);
+    let delegate_modules =
+        contract_modules / crate::wasm_runtime::DELEGATE_MODULE_CACHE_BUDGET_DIVISOR;
+    // The two source-WASM byte caches. Node-wide because #5268 made them
+    // shared; each executor used to build its own, so this term was
+    // `pool_size × 2 × 10 MiB` and counted nowhere.
+    let source_code = 2 * SOURCE_CODE_CACHE_MAX_BYTES as usize;
+    // The interest manager's delta memoization cache (#4805). Node-wide: there
+    // is one `InterestManager` per node, so this is NOT multiplied by the pool.
+    let interest_delta = crate::ring::interest::interest_delta_budget_for(memory_limit);
+    #[cfg(feature = "redb")]
+    let page_cache = crate::contract::storages::redb::page_cache_size_for(memory_limit);
+    #[cfg(not(feature = "redb"))]
+    let page_cache = 0;
+
+    pool_size * (summary + delta + arena)
+        + contract_modules
+        + delegate_modules
+        + source_code
+        + interest_delta
+        + page_cache
 }
 
 /// Fallback total-RAM estimate (1 GiB) when the OS query fails — mirrors the
 /// module cache's `FALLBACK_TOTAL_RAM_BYTES`, yielding a mid-range budget.
 const SUMMARY_CACHE_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
 
-/// A count-capped LRU cache with a hard total-byte backstop.
+/// Fraction of the memory the node may use that ALL summary and delta caches
+/// together may declare. An eighth leaves the other seven eighths for the module
+/// cache (also an eighth), the redb page cache, the state store, transport
+/// buffers, the WASM instance arenas and the base runtime — the aggregate that
+/// `cache_byte_budgets_are_aggregate_safe` checks.
+const SUMMARY_DELTA_ENVELOPE_RAM_DIVISOR: usize = 8;
+
+/// Summary's share of a worker's envelope slice, as `(numerator, denominator)`.
+/// A third, matching the 32:64 MiB ratio of the two caches' ceilings — summaries
+/// are small digests, deltas are larger and higher-cardinality.
+const SUMMARY_CACHE_ENVELOPE_SHARE: (usize, usize) = (1, 3);
+
+/// Delta's share of a worker's envelope slice — the remaining two thirds.
+const DELTA_CACHE_ENVELOPE_SHARE: (usize, usize) = (2, 3);
+
+/// Byte ceiling for each of the two source-WASM caches (`ContractStore`'s and
+/// `DelegateStore`'s), which memoize the raw `.wasm` bytes read off disk.
 ///
-/// Wraps [`lru::LruCache`] with running byte accounting so eviction is driven by
-/// EITHER bound, whichever binds first:
+/// Node-wide, not per-executor: pool executors share one cache each (see
+/// [`SharedStores`]). Before #5268 each executor built its own, so the node's
+/// real commitment was `pool_size × 10 MiB` per cache — 320 MiB across both at
+/// 16 workers, holding up to 16 copies of the same bytes, and counted by no
+/// budget anywhere.
+pub(crate) const SOURCE_CODE_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Hard floor for either cache's byte budget once the envelope has been applied.
 ///
-///   - the LRU's own COUNT cap (`inner.cap()`, grown via [`Self::grow`] to the
-///     live hosted count for coverage), and
-///   - a fixed BYTE budget (`byte_budget`): after every insert, LRU entries are
-///     popped until `total_bytes <= byte_budget`.
-///
-/// The values (`StateSummary` / `StateDelta`) are contract-controlled and
-/// variable-size, so the count cap ALONE cannot bound RAM and the byte budget
-/// ALONE would make coverage a contract-size assumption. Both together: small
-/// digests → count binds (coverage); large values → bytes bind (safety). See the
-/// module-level cache-sizing comment above.
-///
-/// A single value whose accounted weight alone exceeds the whole budget is NOT
-/// cached: [`Self::put`] returns early without inserting it. The values are
-/// contract-controlled and can reach the WASM memory limit, so retaining even one
-/// oversized entry (times every pool worker times both caches) would defeat the
-/// hard cap and is a real OOM vector (#4565). This deliberately does NOT match
-/// [`crate::wasm_runtime::ModuleCache`]'s "keep one oversized entry" handling:
-/// that cache's values are trusted operator-supplied modules; these are not, so
-/// they get no oversized exemption. Net: `total_bytes <= byte_budget` holds
-/// STRICTLY after every put.
-struct ByteBoundedLruCache<K: std::hash::Hash + Eq, V> {
-    inner: LruCache<K, V>,
-    /// Running sum of every resident entry's weight
-    /// (`weigh(value) + CACHE_ENTRY_OVERHEAD_BYTES`). Invariant: equals
-    /// the sum over all entries.
-    total_bytes: usize,
-    /// Hard eviction threshold in bytes.
-    byte_budget: usize,
-    /// Payload byte size of a value; the per-entry structural overhead is added
-    /// on top in [`Self::entry_weight`].
-    weigh: fn(&V) -> usize,
-}
-
-impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
-    fn new(count_cap: NonZeroUsize, byte_budget: usize, weigh: fn(&V) -> usize) -> Self {
-        Self {
-            inner: LruCache::new(count_cap),
-            total_bytes: 0,
-            byte_budget: byte_budget.max(1),
-            weigh,
-        }
-    }
-
-    /// Counted weight of one entry: payload length plus the per-entry structural
-    /// overhead allowance (which also floors empty values above zero).
-    fn entry_weight(&self, value: &V) -> usize {
-        (self.weigh)(value).saturating_add(CACHE_ENTRY_OVERHEAD_BYTES)
-    }
-
-    /// Look up a key, marking it most-recently-used on a hit.
-    fn get(&mut self, key: &K) -> Option<&V> {
-        self.inner.get(key)
-    }
-
-    /// Insert (or replace) a value, then evict LRU entries until within the byte
-    /// budget. A value whose accounted weight alone exceeds the budget is NOT
-    /// cached (early return): the values are contract-controlled, so caching one
-    /// would defeat the hard cap, and the caller already owns its own copy of the
-    /// result, so caching buys nothing. Any pre-existing entry under the same key
-    /// is left untouched (it was already within budget, so the invariant holds).
-    fn put(&mut self, key: K, value: V) {
-        let added = self.entry_weight(&value);
-        // Skip-oversized guard (#4565): a single value larger than the whole
-        // budget would otherwise stay resident (the pop-loop below keeps the MRU
-        // entry), leaving total_bytes > byte_budget and breaking the hard cap.
-        // StateSummary/StateDelta are contract-controlled and can reach the WASM
-        // memory limit, so refuse to cache such a value at all. The caller already
-        // owns its result; a later cache miss simply recomputes. Result:
-        // total_bytes <= byte_budget holds STRICTLY after every put.
-        if added > self.byte_budget {
-            return;
-        }
-        // `push` returns the displaced entry: the OLD value when `key` already
-        // existed, OR the LRU entry evicted to honor the COUNT cap. In BOTH cases
-        // subtract its weight so the running total stays exact (a replace does not
-        // grow the count, so it never also evicts — exactly one of the two).
-        if let Some((_, displaced)) = self.inner.push(key, value) {
-            self.total_bytes = self
-                .total_bytes
-                .saturating_sub(self.entry_weight(&displaced));
-        }
-        self.total_bytes = self.total_bytes.saturating_add(added);
-        // Byte backstop: pop LRU entries until within budget. With the
-        // skip-oversized guard above, the just-inserted entry alone is always
-        // within budget, so this converges to total_bytes <= byte_budget every
-        // time. The len() > 1 guard is kept as defense-in-depth but is no longer
-        // what bounds the total (no entry can alone exceed the budget now).
-        while self.total_bytes > self.byte_budget && self.inner.len() > 1 {
-            match self.inner.pop_lru() {
-                Some((_, evicted)) => {
-                    self.total_bytes = self.total_bytes.saturating_sub(self.entry_weight(&evicted));
-                }
-                None => break,
-            }
-        }
-    }
-
-    /// The current COUNT cap.
-    fn cap(&self) -> NonZeroUsize {
-        self.inner.cap()
-    }
-
-    /// Grow the COUNT cap. Only ever grows (callers guard on `new > cap`), so this
-    /// never evicts and the byte total stays exact. A shrink WOULD evict entries
-    /// via `lru::resize` WITHOUT byte accounting, drifting `total_bytes` high, so a
-    /// non-growing request is made a no-op in RELEASE too (not just a debug
-    /// assert): the early return below is the real guard against a future
-    /// non-monotonic caller.
-    fn grow(&mut self, cap: NonZeroUsize) {
-        debug_assert!(
-            cap >= self.inner.cap(),
-            "ByteBoundedLruCache::grow must not shrink (would leak byte accounting)"
-        );
-        // Release-safe guard: a shrink (or a no-op re-grow to the same cap) must
-        // not reach `lru::resize`, which would evict without updating `total_bytes`.
-        if cap <= self.inner.cap() {
-            return;
-        }
-        self.inner.resize(cap);
-    }
-
-    #[cfg(test)]
-    fn total_bytes(&self) -> usize {
-        self.total_bytes
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
+/// At the `CACHE_ENTRY_OVERHEAD_BYTES` (512 B) per-entry floor this still holds
+/// ~2k small entries, above the `SUMMARY_CACHE_COUNT_MIN` count target, so even
+/// the most constrained node keeps a cache that covers its working set of small
+/// digests. It exists so an extreme memory limit cannot compose the budget down
+/// to something that caches nothing at all.
+const CACHE_ABSOLUTE_FLOOR_BYTES: usize = 1024 * 1024;
 
 /// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
@@ -1468,6 +1495,7 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
 
     /// Channel to send delegate notifications when subscribed contracts change state.
     /// Set when running in a pool via `set_delegate_notification_tx()`.
+    /// `Executor::finalize_state_commit` is what sends on it.
     delegate_notification_tx: Option<DelegateNotificationSender>,
 }
 
@@ -1586,20 +1614,47 @@ where
     pub(crate) fn get_runtime_stores(
         config: &Config,
         db: Storage,
-        shared_contract_index: Option<SharedContractIndex>,
+        shared: Option<SharedStores>,
     ) -> Result<(ContractStore, DelegateStore, SecretsStore), anyhow::Error> {
-        const MAX_SIZE: u64 = 10 * 1024 * 1024;
+        // Tell the conformance machinery where contract WASM lives. Shadow-mode
+        // probing replays captured samples against the real contract, and the only
+        // component that knows the path is the one building the store. Idempotent and
+        // free when capture is off: nothing reads it unless a probe runs.
+        crate::conformance::capture::set_contract_store(config.contracts_dir());
 
-        let contract_store = match shared_contract_index {
-            Some(index) => ContractStore::new_with_shared_index(
-                config.contracts_dir(),
-                MAX_SIZE,
-                db.clone(),
-                index,
-            )?,
-            None => ContractStore::new(config.contracts_dir(), MAX_SIZE, db.clone())?,
+        let (contract_store, delegate_store) = match shared {
+            // Pool executors: adopt the node's shared indexes AND byte caches, so
+            // one contract/delegate registered anywhere is visible everywhere and
+            // the node holds ONE copy of each WASM blob rather than `pool_size`
+            // copies (#4218 for the index, #5268 for the byte cache).
+            Some(shared) => (
+                ContractStore::new_with_shared(
+                    config.contracts_dir(),
+                    db.clone(),
+                    shared.contract_index,
+                    shared.contract_code,
+                )?,
+                DelegateStore::new_with_shared(
+                    config.delegates_dir(),
+                    db.clone(),
+                    shared.delegate_index,
+                    shared.delegate_code,
+                )?,
+            ),
+            // Standalone / mock executors own their state.
+            None => (
+                ContractStore::new(
+                    config.contracts_dir(),
+                    SOURCE_CODE_CACHE_MAX_BYTES,
+                    db.clone(),
+                )?,
+                DelegateStore::new(
+                    config.delegates_dir(),
+                    SOURCE_CODE_CACHE_MAX_BYTES,
+                    db.clone(),
+                )?,
+            ),
         };
-        let delegate_store = DelegateStore::new(config.delegates_dir(), MAX_SIZE, db.clone())?;
         // Thread the operator-configured per-user secret quota (#4561, P5 of
         // #4381) into the store at construction. `0` = disabled (the default).
         // Every pooled executor passes the SAME limit (same Config), while the
@@ -1669,261 +1724,198 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::*;
 
-    /// Tests for [`ByteBoundedLruCache`] — the count-target + byte-backstop wrapper
-    /// that bounds the summary/delta fast-path caches.
-    mod byte_bounded_lru_cache_tests {
-        use super::*;
-
-        fn vec_len(v: &Vec<u8>) -> usize {
-            v.len()
-        }
-
-        /// P1 regression: a contract-controlled cache VALUE is variable-size, so the
-        /// COUNT cap alone cannot bound RAM. With a huge count cap but a modest byte
-        /// budget, inserting many LARGE values must keep total retained bytes under
-        /// the byte budget (holding far fewer than the count cap) — otherwise a
-        /// large-summary/large-delta contract could pin gigabytes and OOM the node
-        /// (#4565 class). Without the byte backstop the count cap would let all 200
-        /// one-MiB values (~200 MiB) stay resident.
-        #[test]
-        fn byte_budget_bounds_ram_for_large_values() {
-            let byte_budget = 8 * 1024 * 1024; // 8 MiB
-            let count_cap = NonZeroUsize::new(65_536).unwrap(); // effectively unbounded here
-            let mut cache: ByteBoundedLruCache<u64, Vec<u8>> =
-                ByteBoundedLruCache::new(count_cap, byte_budget, vec_len);
-
-            // Insert 200 distinct 1-MiB values (200 MiB total if unbounded).
-            for i in 0..200u64 {
-                cache.put(i, vec![0u8; 1024 * 1024]);
-                assert!(
-                    cache.total_bytes() <= byte_budget,
-                    "total_bytes {} exceeded byte_budget {} after insert {}",
-                    cache.total_bytes(),
-                    byte_budget,
-                    i
-                );
-            }
-
-            // At ~1 MiB/entry an 8 MiB budget holds <= 8 entries — nowhere near the
-            // 65_536 count cap. The byte backstop, not the count cap, bound the RAM.
-            assert!(
-                cache.len() <= 8,
-                "byte budget must hold far fewer than the count cap; held {}",
-                cache.len()
-            );
-            assert!(
-                cache.total_bytes() <= byte_budget,
-                "final total_bytes {} must be within byte_budget {}",
-                cache.total_bytes(),
-                byte_budget
-            );
-        }
-
-        /// P1 skip-oversized: a value whose accounted weight alone exceeds the
-        /// byte budget is NOT cached at all, so `total_bytes` stays 0 and the
-        /// cache stays empty. A within-budget value inserted afterward caches
-        /// normally and stays within budget. Pins the skip-oversized fix (#4565).
-        #[test]
-        fn oversized_value_is_not_cached() {
-            let byte_budget = 8 * 1024 * 1024; // 8 MiB
-            let count_cap = NonZeroUsize::new(65_536).unwrap();
-            let mut cache: ByteBoundedLruCache<u64, Vec<u8>> =
-                ByteBoundedLruCache::new(count_cap, byte_budget, vec_len);
-
-            // A 16-MiB value alone exceeds the 8-MiB budget, so it must be refused.
-            cache.put(1, vec![0u8; 16 * 1024 * 1024]);
-            assert!(
-                cache.get(&1).is_none(),
-                "an over-budget value must not be cached"
-            );
-            assert_eq!(
-                cache.len(),
-                0,
-                "cache must stay empty after an over-budget put"
-            );
-            assert_eq!(
-                cache.total_bytes(),
-                0,
-                "total_bytes must stay 0 when nothing was cached"
-            );
-
-            // A normal-sized value still caches and stays within budget.
-            cache.put(2, vec![0u8; 1024]);
-            assert!(cache.get(&2).is_some(), "a within-budget value must cache");
-            assert_eq!(cache.len(), 1);
-            assert!(
-                cache.total_bytes() <= byte_budget,
-                "total_bytes {} must stay within budget {}",
-                cache.total_bytes(),
-                byte_budget
-            );
-        }
-
-        /// The per-entry overhead floor means even ZERO-length values count toward
-        /// the budget, so an unbounded stream of distinct empty-value keys cannot
-        /// accumulate without bound (the empty-delta failure PR #4794 fixed). Entry
-        /// count is capped at `byte_budget / CACHE_ENTRY_OVERHEAD_BYTES`.
-        #[test]
-        fn empty_values_stay_entry_bounded() {
-            // Budget for exactly 32 entries at the overhead floor.
-            let byte_budget = 32 * CACHE_ENTRY_OVERHEAD_BYTES;
-            let count_cap = NonZeroUsize::new(65_536).unwrap();
-            let mut cache: ByteBoundedLruCache<u64, Vec<u8>> =
-                ByteBoundedLruCache::new(count_cap, byte_budget, vec_len);
-
-            for i in 0..2000u64 {
-                cache.put(i, Vec::new()); // empty value → weigh == 0, floored to overhead
-            }
-            assert!(
-                cache.len() <= 32,
-                "empty values must still be evicted at the overhead floor; held {} (expected <= 32)",
-                cache.len()
-            );
-        }
-
-        /// In the normal case (small values, generous budget) the COUNT cap binds —
-        /// this is the coverage guarantee at the unit level. With small values that
-        /// never approach the byte budget, the cache holds exactly up to its count
-        /// cap and evicting-by-count keeps the byte total exact.
-        #[test]
-        fn count_cap_binds_for_small_values() {
-            let byte_budget = 32 * 1024 * 1024; // ample
-            let count_cap = NonZeroUsize::new(4).unwrap();
-            let mut cache: ByteBoundedLruCache<u64, Vec<u8>> =
-                ByteBoundedLruCache::new(count_cap, byte_budget, vec_len);
-
-            for i in 0..10u64 {
-                cache.put(i, vec![7u8; 8]);
-            }
-            assert_eq!(cache.len(), 4, "count cap must bind for small values");
-            // Byte total must match the 4 resident entries exactly (each 8 + overhead).
-            assert_eq!(
-                cache.total_bytes(),
-                4 * (8 + CACHE_ENTRY_OVERHEAD_BYTES),
-                "byte accounting must stay exact across count-cap evictions"
-            );
-            // Only the 4 most-recently-inserted keys survive.
-            for i in 0..6u64 {
-                assert!(cache.get(&i).is_none(), "key {i} should have been evicted");
-            }
-            for i in 6..10u64 {
-                assert!(cache.get(&i).is_some(), "key {i} should be resident");
-            }
-        }
-
-        /// Replacing an existing key must not double-count its bytes: the running
-        /// total reflects the NEW value's size, not old + new.
-        #[test]
-        fn replacing_a_key_keeps_byte_total_exact() {
-            let mut cache: ByteBoundedLruCache<u64, Vec<u8>> =
-                ByteBoundedLruCache::new(NonZeroUsize::new(16).unwrap(), 32 * 1024 * 1024, vec_len);
-            cache.put(1, vec![0u8; 100]);
-            cache.put(1, vec![0u8; 300]);
-            assert_eq!(cache.len(), 1);
-            assert_eq!(
-                cache.total_bytes(),
-                300 + CACHE_ENTRY_OVERHEAD_BYTES,
-                "replace must account only the new value, not old + new"
-            );
-        }
-
-        /// Growing the count cap must not disturb byte accounting (it never evicts).
-        #[test]
-        fn grow_preserves_byte_total() {
-            let mut cache: ByteBoundedLruCache<u64, Vec<u8>> =
-                ByteBoundedLruCache::new(NonZeroUsize::new(2).unwrap(), 32 * 1024 * 1024, vec_len);
-            cache.put(1, vec![0u8; 10]);
-            cache.put(2, vec![0u8; 20]);
-            let before = cache.total_bytes();
-            cache.grow(NonZeroUsize::new(1024).unwrap());
-            assert_eq!(cache.cap().get(), 1024);
-            assert_eq!(
-                cache.total_bytes(),
-                before,
-                "grow must not change byte total"
-            );
-            assert_eq!(cache.len(), 2, "grow must not evict");
-        }
-
-        /// The `cap <= inner.cap()` no-shrink guard in [`Self::grow`] makes a
-        /// repeated grow to the SAME cap a no-op: it returns before
-        /// `lru::resize`, so no entry is evicted and byte accounting is
-        /// untouched. Pins the guard that stops a non-monotonic (equal-cap)
-        /// caller from corrupting `total_bytes` via an un-accounted resize
-        /// eviction. An equal cap also satisfies the no-shrink `debug_assert`,
-        /// so this exercises the early return without tripping it.
-        #[test]
-        fn grow_with_equal_cap_is_noop() {
-            let count_cap = NonZeroUsize::new(4).unwrap();
-            let mut cache: ByteBoundedLruCache<u64, Vec<u8>> =
-                ByteBoundedLruCache::new(count_cap, 32 * 1024 * 1024, vec_len);
-            cache.put(1, vec![0u8; 10]);
-            cache.put(2, vec![0u8; 20]);
-            cache.put(3, vec![0u8; 30]);
-            let len_before = cache.len();
-            let bytes_before = cache.total_bytes();
-            let cap_before = cache.cap().get();
-
-            // Grow to the SAME cap the cache already has: the `cap <= inner.cap()`
-            // guard returns early (equal cap also satisfies the no-shrink
-            // debug_assert), so this is a pure no-op (no resize, hence no
-            // un-accounted eviction).
-            cache.grow(count_cap);
-
-            assert_eq!(cache.len(), len_before, "equal-cap grow must not evict");
-            assert_eq!(
-                cache.total_bytes(),
-                bytes_before,
-                "equal-cap grow must not change the byte total"
-            );
-            assert_eq!(
-                cache.cap().get(),
-                cap_before,
-                "equal-cap grow must not change the count cap"
-            );
-        }
-    }
-
-    /// The default per-executor byte budgets stay within their documented clamps,
-    /// and the worst-case aggregate across the max pool size (16 workers) plus the
-    /// shared module-cache ceiling stays a safe fraction of a production gateway's
-    /// memory (the 7600 MiB = 7.42 GiB gateway limit the review flagged).
+    /// The per-executor byte budgets stay within their documented clamps, and the
+    /// aggregate of EVERY declared cache ceiling stays a safe fraction of the
+    /// node's memory — on a production gateway AND on a peer running under the
+    /// shipped 2 GiB `MemoryMax`.
+    ///
+    /// REGRESSION (issue #5268 defect 3): this test previously modelled only a
+    /// 7600 MiB gateway and multiplied the per-executor budgets by a hardcoded
+    /// worst-case pool size, so it never asked what a 2 GiB peer commits. It
+    /// commits ~2.9 GiB: 16 workers (a 20-core laptop, since `MemoryMax` does not
+    /// constrain CPU count) × (32 MiB summary + 64 MiB delta) = 1.5 GiB, plus
+    /// 256 MiB + 64 MiB of module cache, plus redb's uncounted 1 GiB default page
+    /// cache — against a 2 GiB hard limit. Nothing in the code composed the
+    /// CPU-derived multiplier against the memory limit.
     #[test]
     fn cache_byte_budgets_are_aggregate_safe() {
         let summary = summary_cache_budget_bytes();
         let delta = delta_cache_budget_bytes();
         assert!(
-            (SUMMARY_CACHE_MIN_BYTES..=SUMMARY_CACHE_MAX_BYTES).contains(&summary),
-            "summary budget {summary} must be within [{SUMMARY_CACHE_MIN_BYTES}, {SUMMARY_CACHE_MAX_BYTES}]"
+            (CACHE_ABSOLUTE_FLOOR_BYTES..=SUMMARY_CACHE_MAX_BYTES).contains(&summary),
+            "summary budget {summary} must be within \
+             [{CACHE_ABSOLUTE_FLOOR_BYTES}, {SUMMARY_CACHE_MAX_BYTES}]"
         );
         assert!(
-            (DELTA_CACHE_MIN_BYTES..=DELTA_CACHE_MAX_BYTES).contains(&delta),
-            "delta budget {delta} must be within [{DELTA_CACHE_MIN_BYTES}, {DELTA_CACHE_MAX_BYTES}]"
+            (CACHE_ABSOLUTE_FLOOR_BYTES..=DELTA_CACHE_MAX_BYTES).contains(&delta),
+            "delta budget {delta} must be within \
+             [{CACHE_ABSOLUTE_FLOOR_BYTES}, {DELTA_CACHE_MAX_BYTES}]"
         );
 
-        // Worst case: every one of the (up to 16) pool workers at the MAX budget.
+        // Worst case is the MAXIMUM pool size, because every per-executor budget
+        // is multiplied by it.
         const MAX_POOL_SIZE: usize = 16;
-        let summary_aggregate = MAX_POOL_SIZE * SUMMARY_CACHE_MAX_BYTES; // <= 512 MiB
-        let delta_aggregate = MAX_POOL_SIZE * DELTA_CACHE_MAX_BYTES; // <= 1 GiB
+        // The shipped systemd `MemoryMax=2G`, which 87.5% of peers report.
+        let peer_limit: usize = 2 * 1024 * 1024 * 1024;
         // Reference gateway RAM (7600 MiB ≈ 7.42 GiB; 7_600 * 1024 * 1024 is
         // 7600 MiB, not 7.6 GiB).
         let gateway_limit: usize = 7_600 * 1024 * 1024;
-        // Shared module cache ceiling (single, not per-worker), sized to the RAM
-        // this gateway actually has — NOT the absolute MAX clamp. The 4 GiB MAX
-        // only binds on hosts with >32 GiB RAM; on a 7.6 GiB gateway the
-        // `total_ram / 8` divisor binds at ~950 MiB, so using the MAX here would
-        // model an impossible 4 GiB module cache on a 7.6 GiB box. (MAX-clamp
-        // aggregate safety on a >32 GiB host is guarded separately by
-        // `module_cache::tests::max_clamp_combined_ceiling_is_safe_at_binding_host`.)
-        let module_ceiling = crate::wasm_runtime::budget_for_ram(gateway_limit);
-        let total = summary_aggregate + delta_aggregate + module_ceiling;
-        // Keep total cache commitment under half the gateway RAM.
-        assert!(
-            total <= gateway_limit / 2,
-            "worst-case cache aggregate {total} (summary {summary_aggregate} + delta \
-             {delta_aggregate} + module {module_ceiling}) must stay under half the \
-             gateway limit {gateway_limit}"
+
+        // A 1 GiB VPS is the smallest limit at which the node's own floors still
+        // leave room; below that the pre-existing 64 MiB module-cache MINIMUM
+        // dominates any budget this PR composes (see the small-host note below).
+        let small_vps: usize = 1024 * 1024 * 1024;
+
+        for (label, limit) in [
+            ("1 GiB VPS", small_vps),
+            ("2 GiB peer", peer_limit),
+            ("gateway", gateway_limit),
+        ] {
+            for pool_size in [1, 4, MAX_POOL_SIZE] {
+                let total = declared_cache_ceiling(limit, pool_size);
+                assert!(
+                    total <= limit / 2,
+                    "{label} with {pool_size} workers declares {total} bytes of cache \
+                     ceiling, which must stay under half its {limit}-byte limit"
+                );
+            }
+        }
+    }
+
+    /// `declared_cache_ceiling` must keep naming EVERY declared ceiling.
+    ///
+    /// The bound it feeds is an inequality, so dropping a term does not
+    /// necessarily break it — at the 2 GiB / 16-worker shape the total sits at
+    /// roughly 45% of the limit, with room to lose a 256 MiB term and still pass.
+    /// That is exactly how the original version of this test came to omit the
+    /// Store arena and the per-executor source-byte caches while its doc comment
+    /// claimed to sum "every declared ceiling" (#5268 review, Must Fix 2).
+    ///
+    /// So pin the composition itself: every budget that consumes node memory has
+    /// to appear in the sum, and a new one is added here at the same time it is
+    /// added there.
+    #[test]
+    fn declared_cache_ceiling_names_every_budget() {
+        const FULL: &str = include_str!("executor.rs");
+        // Built by concatenation so this pin's own copy of the anchor is NOT a
+        // verbatim match for it. A scrape whose anchor can match its own source
+        // silently re-scopes to a later occurrence and passes vacuously — the
+        // failure mode `.claude/rules/bug-prevention-patterns.md` records twice
+        // (#5102). The uniqueness assertion below is what makes that fail loudly
+        // instead: if the signature ever appears twice, or not at all, this stops.
+        let anchor = format!(
+            "fn declared_cache_ceiling(memory_limit: usize, {}",
+            "pool_size: usize) -> usize {"
         );
+        assert_eq!(
+            FULL.matches(&anchor).count(),
+            1,
+            "the scrape anchor must occur EXACTLY once in this file; a second \
+             occurrence would let the pin scope itself to the wrong region"
+        );
+        let after = FULL.split(&anchor).nth(1).expect("anchor just counted");
+        // `declared_cache_ceiling` is a top-level (0-indent) function — #5333
+        // promoted it out of `mod tests` into production code — so it closes
+        // with `\n}` at column 0, not a nested method's `\n    }`. Require it,
+        // rather than letting a missing end anchor widen the region to EOF.
+        let body = after
+            .split_once("\n}")
+            .expect("could not locate the end of declared_cache_ceiling")
+            .0;
+        assert!(
+            !body.contains("\npub") && !body.contains("\nfn ") && !body.contains("\nconst "),
+            "the scoped region escaped past declared_cache_ceiling into a \
+             sibling item — this pin would pass vacuously"
+        );
+
+        for required in [
+            // per-executor, multiplied by the pool
+            "summary_budget_for",
+            "delta_budget_for",
+            "store_arena_budget_for",
+            // node-wide
+            "budget_for_ram",
+            "DELEGATE_MODULE_CACHE_BUDGET_DIVISOR",
+            "SOURCE_CODE_CACHE_MAX_BYTES",
+            "interest_delta_budget_for",
+            "page_cache_size_for",
+        ] {
+            assert!(
+                body.contains(required),
+                "declared_cache_ceiling must include `{required}` in the aggregate \
+                 it claims to sum; without it the bound passes while measuring less \
+                 than the node actually commits"
+            );
+        }
+        assert!(
+            body.contains("pool_size * (summary + delta + arena)"),
+            "the per-executor terms must be multiplied by the pool size — that \
+             product IS defect 3"
+        );
+    }
+
+    /// Below roughly a 1 GiB limit the aggregate is dominated by floors this PR
+    /// does not own — chiefly the 64 MiB module-cache MINIMUM, which alone is the
+    /// whole budget on a 128 MiB host.
+    ///
+    /// Asserted rather than omitted so the boundary is a stated property instead
+    /// of an untested gap: a future change that lowers those floors should see
+    /// this test and extend the matrix above, and one that RAISES a per-worker
+    /// floor will trip the multiplier bound here.
+    #[test]
+    fn small_host_ceiling_is_dominated_by_floors_this_pr_does_not_own() {
+        let tiny: usize = 128 * 1024 * 1024;
+        let module_floor = crate::wasm_runtime::budget_for_ram(tiny);
+        assert!(
+            module_floor >= tiny / 2,
+            "the module-cache floor ({module_floor}) is already half a {tiny}-byte              host — no composition of the budgets around it can bring the              aggregate under half the limit"
+        );
+
+        // What this PR DOES own on such a host stays proportionate: the
+        // per-worker terms it introduces or composes must not, multiplied by the
+        // pool, exceed the memory limit on their own.
+        for pool_size in [1, 4, 16] {
+            let per_worker = summary_budget_for(tiny, pool_size)
+                + delta_budget_for(tiny, pool_size)
+                + crate::wasm_runtime::engine::store_arena_budget_for(tiny, pool_size);
+            assert!(
+                pool_size * per_worker <= tiny,
+                "per-worker terms at {pool_size} workers total {} bytes, which must                  not exceed the {tiny}-byte limit by themselves",
+                pool_size * per_worker
+            );
+        }
+    }
+
+    /// The per-executor budgets must shrink as the pool grows, because the pool
+    /// size is CPU-derived and the memory limit does not constrain CPU count.
+    ///
+    /// Pins the actual mechanism rather than only its aggregate consequence: a
+    /// future change that restored a flat per-executor budget would still satisfy
+    /// `cache_byte_budgets_are_aggregate_safe` if the envelope happened to be
+    /// generous, but would fail here.
+    #[test]
+    fn per_executor_budgets_shrink_as_the_pool_grows() {
+        let peer_limit: usize = 2 * 1024 * 1024 * 1024;
+        let one = summary_budget_for(peer_limit, 1) + delta_budget_for(peer_limit, 1);
+        let sixteen = summary_budget_for(peer_limit, 16) + delta_budget_for(peer_limit, 16);
+        assert!(
+            sixteen < one,
+            "a 16-worker 2 GiB peer must get a smaller per-executor budget ({sixteen}) \
+             than a 1-worker one ({one})"
+        );
+
+        // An unconstrained host keeps exactly the ceilings it had: the envelope
+        // is wide enough there that the RAM-scaled clamps still bind.
+        let big: usize = 125 * 1024 * 1024 * 1024;
+        assert_eq!(summary_budget_for(big, 16), SUMMARY_CACHE_MAX_BYTES);
+        assert_eq!(delta_budget_for(big, 16), DELTA_CACHE_MAX_BYTES);
+        // So does a single-worker 2 GiB peer (vega's shape: 2 cores → 1 worker).
+        assert_eq!(summary_budget_for(peer_limit, 1), SUMMARY_CACHE_MAX_BYTES);
+        assert_eq!(delta_budget_for(peer_limit, 1), DELTA_CACHE_MAX_BYTES);
+
+        // Never composed away to nothing.
+        assert!(summary_budget_for(64 * 1024 * 1024, 16) >= CACHE_ABSOLUTE_FLOOR_BYTES);
+        assert!(delta_budget_for(64 * 1024 * 1024, 16) >= CACHE_ABSOLUTE_FLOOR_BYTES);
     }
 
     /// Boundary coverage for [`summary_cache_count_target`], the clamp + round-up
@@ -2471,20 +2463,23 @@ mod tests {
                 !put_err.is_contract_exec_rejection(),
                 "a Put variant is NOT an UPDATE-side exec rejection"
             );
-            match put_err.unwrap_request() {
-                RequestError::ContractError(StdContractError::Put { .. }) => {}
-                other => panic!("fresh-PUT validation error must be a Put variant, got {other:?}"),
-            }
+            let put_request_err = put_err.unwrap_request();
+            let RequestError::ContractError(StdContractError::Put { .. }) = &put_request_err else {
+                panic!("fresh-PUT validation error must be a Put variant, got {put_request_err:?}");
+            };
 
             // UPDATE op → Update variant, is_contract_exec_rejection true, timeout true.
             let upd_err =
                 ExecutorError::execution(mk(), Some(super::super::InnerOpError::Upsert(key)));
             assert!(upd_err.is_wasm_timeout());
             assert!(upd_err.is_contract_exec_rejection());
-            match upd_err.unwrap_request() {
-                RequestError::ContractError(StdContractError::Update { .. }) => {}
-                other => panic!("UPDATE validation error must be an Update variant, got {other:?}"),
-            }
+            let upd_request_err = upd_err.unwrap_request();
+            let RequestError::ContractError(StdContractError::Update { .. }) = &upd_request_err
+            else {
+                panic!(
+                    "UPDATE validation error must be an Update variant, got {upd_request_err:?}"
+                );
+            };
         }
 
         /// Source-scrape pin (#4864 round-7 Codex P1, updated round-9 item 4): the

@@ -88,8 +88,43 @@ actors (clients, network peers) can influence.
 
 1. Per-key collections (subscribers per contract, peers per resource)
    MUST have a maximum size enforced at insertion time.
-   → Reject new entries when the limit is reached
    → Return an error or false so callers know registration was rejected
+
+   BUT: how you enforce it depends on whether entries are REFRESHED BY
+   ORDINARY USE. Get this wrong and the bound starves newcomers forever.
+
+   → Entries that only AGE OUT (a TTL nothing resets): reject new
+     entries at the cap. Incumbents roll off on their own, so a
+     newcomer's wait is bounded.
+
+   → Entries REFRESHED ON EVERY USE (a `last_seen`/`last_refill` stamp
+     that ordinary traffic restamps): reject-at-cap is WRONG — you MUST
+     EVICT the least-recently-used entry instead. A busy entry refreshes
+     its own TTL forever, so the cap is held permanently by whoever got
+     in first and stayed active, and every newcomer is refused with no
+     recovery path. That is the permanently-refreshable GC exemption
+     AGENTS.md forbids, and this rule's earlier "reject new entries when
+     the limit is reached" wording is what produced it.
+
+     #4981: the UPDATE limiter's 16,384 `(sender, contract)` slots were
+     held by whoever got in first, and every new pair's UPDATE was
+     silently dropped — and dropped at `debug!`, which
+     `release_max_level_info` compiles out, so a production node
+     discarding legitimate relayed traffic left no greppable evidence.
+     Fixed in #4997 by LRU eviction.
+
+     Two things that make eviction safe rather than a new hole:
+       a. Eviction can remove an incidental ceiling. If refusing-at-cap
+          was also (accidentally) throttling attacker-chosen keys, you
+          need an explicit replacement — #4997 added a per-sender
+          new-pair token bucket, charged BEFORE any slot is reserved so
+          a throttled peer cannot evict anyone on its way to refusal.
+       b. The scan is linear in the cap and cannot run under a shard
+          guard. Evict a BATCH, not one entry, or a persistently-full
+          map means a full scan per admission on the receive path.
+
+   → Whichever you pick, saturation must be visible in RELEASE builds:
+     `info!` or a counter, never `debug!` alone.
 
 2. Per-client/per-peer resource counts MUST be bounded.
    → A single client must not hold unbounded subscriptions across all keys
@@ -99,6 +134,21 @@ actors (clients, network peers) can influence.
    → Cap expensive per-recipient work (e.g., WASM calls) to a fixed limit
    → Fall back to cheaper alternatives (e.g., full state vs computed delta)
    → Log warnings when fan-out exceeds a threshold
+
+4. A cap on the ENTRY COUNT is not a cap on BYTES when the VALUE is
+   contract- or peer-controlled and variable-size.
+   → Multiply the count cap by the largest value the other side may send.
+     `StateDelta`/`StateSummary`/`WrappedState` reach MAX_STATE_SIZE (50 MiB),
+     so a "bounded" 1024-entry cache is a ~51 GiB worst case (#4805).
+   → Reuse crate::util::byte_bounded_lru::ByteBoundedLruCache (count target
+     for coverage + hard byte budget + per-entry overhead floor); do not
+     hand-roll byte accounting a third time (#4804 wrote it, #4805 shared it)
+   → Name any new cache byte budget in
+     contract::executor::declared_cache_ceiling. The hosting budget
+     (ring::hosting::cache::resident_overhead_budget_for) is a RESIDUAL of
+     that sum, so an unnamed budget silently over-grants hosted contracts
+     against memory already committed. Pinned by
+     declared_cache_ceiling_names_every_budget.
 
 WHY: Unbounded collections are amplification vectors.
 An attacker who can register N subscribers or open N channels can

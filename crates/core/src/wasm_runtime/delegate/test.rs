@@ -80,7 +80,10 @@ async fn setup_runtime(
             &vec![].into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
 
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
@@ -869,13 +872,6 @@ async fn test_delegate_cache_evicts_by_bytes() -> Result<(), Box<dyn std::error:
 
     // Probe one delegate's compiled size with a generous budget.
     let code = super::super::tests::get_test_module(TEST_DELEGATE_2)?;
-    let mk_delegate = |params: Vec<u8>| {
-        DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
-            &code.clone().into(),
-            &params.into(),
-        ))))
-    };
-
     let mut runtime = Runtime::build_with_config(
         contract_store,
         delegate_store,
@@ -887,7 +883,10 @@ async fn test_delegate_cache_evicts_by_bytes() -> Result<(), Box<dyn std::error:
         },
     )?;
 
-    // Register + run 6 distinct-param delegates so each is a distinct key.
+    // Register + run 6 delegates over genuinely DISTINCT code. Distinct
+    // PARAMETERS over one code would no longer produce 6 cache entries — that
+    // duplication is the #5268 bug — so eviction has to be driven by real
+    // distinct modules or this test measures nothing.
     let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::IncrementCounter)?;
     let run = |runtime: &mut Runtime, d: &DelegateContainer| -> RuntimeResult<()> {
         let msg = ApplicationMessage::new(payload.clone());
@@ -901,9 +900,14 @@ async fn test_delegate_cache_evicts_by_bytes() -> Result<(), Box<dyn std::error:
         Ok(())
     };
 
-    let delegates: Vec<DelegateContainer> = (0..6)
-        .map(|i| mk_delegate(format!("param-{i}").into_bytes()))
-        .collect();
+    let mk_variant = |i: usize| {
+        let variant = super::super::tests::code_variant(&code, &format!("variant-{i}"));
+        DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+            &variant.into(),
+            &Vec::new().into(),
+        ))))
+    };
+    let delegates: Vec<DelegateContainer> = (0..6).map(mk_variant).collect();
     for d in &delegates {
         runtime.delegate_store.store_delegate(d.clone()).unwrap();
         let key = XChaCha20Poly1305::generate_key(&mut OsRng);
@@ -955,6 +959,178 @@ async fn test_delegate_cache_evicts_by_bytes() -> Result<(), Box<dyn std::error:
         "final delegate cache total_bytes {} must be within budget {}",
         cache.total_bytes(),
         cache.budget_bytes()
+    );
+
+    std::mem::drop(temp_dir);
+    Ok(())
+}
+
+/// REGRESSION (issue #5268): delegates whose code is identical and whose
+/// parameters differ MUST share ONE compiled module.
+///
+/// The delegate sibling of the contract-side defect: `prepare_delegate_call`
+/// compiles `delegate.code()` alone, but `DelegateKey`'s identity covers
+/// `key = BLAKE3(code_hash ‖ params)`, so keying the cache by it compiled and
+/// retained one copy of identical machine code per parameter set. Per-user and
+/// per-room parameterized delegates are exactly that shape.
+///
+/// Before the fix this sees 6 entries; after it, 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn same_code_different_params_share_one_delegate_module()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::super::{ContractStore, SecretsStore, delegate_store::DelegateStore};
+    use crate::contract::storages::Storage;
+
+    let temp_dir = get_temp_dir();
+    let db = Storage::new(temp_dir.path()).await?;
+    let contract_store = ContractStore::new(temp_dir.path().join("c"), 10_000, db.clone())?;
+    let delegate_store = DelegateStore::new(temp_dir.path().join("d"), 10_000, db.clone())?;
+    let secret_store = SecretsStore::new(temp_dir.path().join("s"), Default::default(), db)?;
+
+    let code = super::super::tests::get_test_module(TEST_DELEGATE_2)?;
+    let mut runtime = Runtime::build_with_config(
+        contract_store,
+        delegate_store,
+        secret_store,
+        false,
+        super::super::runtime::RuntimeConfig {
+            module_cache_budget_bytes: 512 * 1024 * 1024,
+            ..Default::default()
+        },
+    )?;
+
+    // Six parameterizations of ONE delegate's code.
+    let delegates: Vec<DelegateContainer> = (0..6)
+        .map(|i| {
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+                &code.clone().into(),
+                &format!("param-{i}").into_bytes().into(),
+            ))))
+        })
+        .collect();
+
+    let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::IncrementCounter)?;
+    for d in &delegates {
+        runtime.delegate_store.store_delegate(d.clone()).unwrap();
+        let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+        let cipher = XChaCha20Poly1305::new(&key);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        runtime
+            .secret_store
+            .register_delegate(d.key().clone(), cipher, nonce)
+            .unwrap();
+        let msg = ApplicationMessage::new(payload.clone());
+        runtime.inbound_app_message(
+            d.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+    }
+
+    let cache = runtime.delegate_modules.lock().unwrap();
+    assert_eq!(
+        cache.len(),
+        1,
+        "6 parameterizations of one delegate's code must share ONE compiled \
+         module, got {} entries",
+        cache.len()
+    );
+
+    std::mem::drop(temp_dir);
+    Ok(())
+}
+
+/// Unregistering one delegate must NOT evict the compiled module its
+/// still-registered siblings share.
+///
+/// The cache is keyed by code hash now, so the old unconditional
+/// `delegate_modules.remove(key)` in `unregister_delegate` would take out the
+/// module every other parameterization of that WASM is running on. Removal is
+/// therefore gated on no remaining indexed delegate referencing the code —
+/// mirroring the check `remove_delegate` already applies to the `.wasm` blob.
+#[tokio::test(flavor = "multi_thread")]
+async fn unregister_keeps_a_module_a_sibling_delegate_still_runs()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::super::{ContractStore, SecretsStore, delegate_store::DelegateStore};
+    use crate::contract::storages::Storage;
+
+    let temp_dir = get_temp_dir();
+    let db = Storage::new(temp_dir.path()).await?;
+    let contract_store = ContractStore::new(temp_dir.path().join("c"), 10_000, db.clone())?;
+    let delegate_store = DelegateStore::new(temp_dir.path().join("d"), 10_000, db.clone())?;
+    let secret_store = SecretsStore::new(temp_dir.path().join("s"), Default::default(), db)?;
+
+    let code = super::super::tests::get_test_module(TEST_DELEGATE_2)?;
+    let mut runtime = Runtime::build_with_config(
+        contract_store,
+        delegate_store,
+        secret_store,
+        false,
+        super::super::runtime::RuntimeConfig {
+            module_cache_budget_bytes: 512 * 1024 * 1024,
+            ..Default::default()
+        },
+    )?;
+
+    let delegates: Vec<DelegateContainer> = (0..2)
+        .map(|i| {
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+                &code.clone().into(),
+                &format!("sibling-{i}").into_bytes().into(),
+            ))))
+        })
+        .collect();
+
+    let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::IncrementCounter)?;
+    let run = |runtime: &mut Runtime, d: &DelegateContainer| -> RuntimeResult<()> {
+        let msg = ApplicationMessage::new(payload.clone());
+        runtime.inbound_app_message(
+            d.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+        Ok(())
+    };
+
+    for d in &delegates {
+        runtime.delegate_store.store_delegate(d.clone()).unwrap();
+        let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+        let cipher = XChaCha20Poly1305::new(&key);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        runtime
+            .secret_store
+            .register_delegate(d.key().clone(), cipher, nonce)
+            .unwrap();
+    }
+    run(&mut runtime, &delegates[0])?;
+    assert_eq!(runtime.delegate_modules.lock().unwrap().len(), 1);
+
+    // Unregister the FIRST: the second still runs this code, so the module stays.
+    runtime.unregister_delegate(delegates[0].key())?;
+    assert_eq!(
+        runtime.delegate_modules.lock().unwrap().len(),
+        1,
+        "a sibling delegate still runs this code — its module must not be evicted"
+    );
+    // ...and the surviving sibling still executes.
+    run(&mut runtime, &delegates[1])?;
+
+    // Unregister the last one: now nothing references the code, so it goes.
+    runtime.unregister_delegate(delegates[1].key())?;
+    let cache = runtime.delegate_modules.lock().unwrap();
+    assert_eq!(
+        cache.len(),
+        0,
+        "with no delegate left running this code the module must be dropped"
+    );
+    assert_eq!(
+        cache.total_bytes(),
+        0,
+        "dropping the last reference must decrement total_bytes (no byte leak)"
     );
 
     std::mem::drop(temp_dir);
@@ -2216,7 +2392,10 @@ async fn test_v1_delegate_detected_as_v1_with_state_store() -> Result<(), Box<dy
             &vec![].into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
 
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
@@ -2349,7 +2528,10 @@ async fn test_v2_delegate_reads_contract_state() -> Result<(), Box<dyn std::erro
             &vec![].into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
 
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
@@ -2446,7 +2628,10 @@ async fn test_v2_delegate_contract_not_found() -> Result<(), Box<dyn std::error:
             &vec![].into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
 
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
@@ -2552,7 +2737,10 @@ async fn setup_v2_runtime_with_contract(
             &vec![].into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
 
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
@@ -3146,7 +3334,10 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
             &vec![].into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
 
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
@@ -3393,7 +3584,10 @@ async fn test_notification_application_message_routed_to_registered_app()
             &vec![].into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
@@ -3654,7 +3848,10 @@ async fn setup_runtime_with_params(
             &params.into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
 
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);

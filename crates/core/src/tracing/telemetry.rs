@@ -612,7 +612,7 @@ fn try_enqueue_event(
 ///
 /// Best-effort: if `current_exe()` fails we return `false` and fall back to the
 /// compile-time guards, which already cover unit tests and CI.
-fn running_under_cargo_test() -> bool {
+pub(crate) fn running_under_cargo_test() -> bool {
     std::env::current_exe()
         .ok()
         .and_then(|exe| {
@@ -808,6 +808,15 @@ impl NetEventRegister for TelemetryReporter {
                 // consumes the per-event stream (topology / rejection panels).
                 // Retiring here (skip the two variants) would make net telemetry
                 // volume NEGATIVE.
+                //
+                // BEFORE retiring connect_rejected, read #5335. The terminus-
+                // rejection log lines in operations/connect.rs are `debug!`,
+                // which `release_max_level_info` compiles out of release
+                // builds, so this per-event stream's `reason` field is now the
+                // ONLY thing that distinguishes those causes in production.
+                // The snapshot counters have no reason dimension, so retiring
+                // the per-event stream without adding one would silently
+                // delete that signal entirely rather than relocate it.
                 match event_type.as_str() {
                     "connect_connected" => {
                         crate::node::network_status::record_connect_accept_emitted()
@@ -2716,6 +2725,81 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "network_efficiency_v1".to_string(),
                     serde_json::json!(snapshot.network_efficiency_v1),
                 );
+                // Contract-exec WASM counters: the cache-hit / WASM-miss split
+                // that makes a summarize or delta rate interpretable at all.
+                // Same hand-mirroring footgun as everything else in this block —
+                // a new `RouterSnapshotInfo` field is invisible to the collector
+                // unless added here. Pinned by
+                // `router_snapshot_json_includes_contract_exec_counters`, which
+                // asserts the FULL set so a partially-mirrored addition fails.
+                for (name, value) in [
+                    (
+                        "contract_exec_summarize_fast_hits_total",
+                        snapshot.contract_exec_summarize_fast_hits_total,
+                    ),
+                    (
+                        "contract_exec_summarize_reload_hits_total",
+                        snapshot.contract_exec_summarize_reload_hits_total,
+                    ),
+                    (
+                        "contract_exec_summarize_wasm_calls_total",
+                        snapshot.contract_exec_summarize_wasm_calls_total,
+                    ),
+                    (
+                        "contract_exec_summarize_wasm_uncached_total",
+                        snapshot.contract_exec_summarize_wasm_uncached_total,
+                    ),
+                    (
+                        "contract_exec_delta_fast_hits_total",
+                        snapshot.contract_exec_delta_fast_hits_total,
+                    ),
+                    (
+                        "contract_exec_delta_reload_hits_total",
+                        snapshot.contract_exec_delta_reload_hits_total,
+                    ),
+                    (
+                        "contract_exec_delta_wasm_calls_total",
+                        snapshot.contract_exec_delta_wasm_calls_total,
+                    ),
+                    (
+                        "contract_exec_delta_wasm_uncached_total",
+                        snapshot.contract_exec_delta_wasm_uncached_total,
+                    ),
+                    (
+                        "contract_exec_summarize_fast_hits_last_snapshot",
+                        snapshot.contract_exec_summarize_fast_hits_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_summarize_reload_hits_last_snapshot",
+                        snapshot.contract_exec_summarize_reload_hits_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_summarize_wasm_calls_last_snapshot",
+                        snapshot.contract_exec_summarize_wasm_calls_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_summarize_wasm_uncached_last_snapshot",
+                        snapshot.contract_exec_summarize_wasm_uncached_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_delta_fast_hits_last_snapshot",
+                        snapshot.contract_exec_delta_fast_hits_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_delta_reload_hits_last_snapshot",
+                        snapshot.contract_exec_delta_reload_hits_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_delta_wasm_calls_last_snapshot",
+                        snapshot.contract_exec_delta_wasm_calls_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_delta_wasm_uncached_last_snapshot",
+                        snapshot.contract_exec_delta_wasm_uncached_last_snapshot,
+                    ),
+                ] {
+                    obj.insert(name.to_string(), serde_json::json!(value));
+                }
                 obj.insert(
                     "hosted_contracts_count".to_string(),
                     serde_json::json!(snapshot.hosted_contracts_count),
@@ -3362,8 +3446,46 @@ mod tests {
 
         const BUSY_FLEET_COUNTER: u64 = 999_999;
         const MAX_EMPTY_JSON_BYTES: usize = 2_048;
-        const MAX_BUSY_JSON_BYTES: usize = 5_120;
-        const MAX_WORST_CASE_JSON_BYTES: usize = 14_336;
+        // Raised from 5_120 to admit TWO independently-developed blocks that
+        // landed together on this soak branch:
+        //
+        //  * the hosting-observability counters (#4642): `host_begin`
+        //    (7 causes) + `host_reads` (6 buckets) + `host_recency`
+        //    (5 buckets) = 18 counters, +173 JSON bytes at busy-fleet values
+        //    (5095 -> 5268, measured on that branch alone);
+        //  * the shadow-mode futile-repair block
+        //    (`crate::ring::futile_repair`): `futile` (14 scalars) +
+        //    `futile_ladder` (an 8-rung survival ladder) = 22 counters,
+        //    +183 JSON bytes at busy-fleet values (5095 -> 5278, measured on
+        //    that branch alone).
+        //
+        // The two costs are ADDITIVE and each branch had independently raised
+        // this budget to 5_376, which merges without a conflict marker because
+        // both sides are the same text. The merged busy-fleet block is
+        // MEASURED at 5451 bytes (5095 base + 173 + 183), which OVERFLOWS
+        // 5_376 by 75, so the budget is raised one further 256-byte step.
+        //
+        //   40 new counters
+        //   +356 JSON bytes at busy-fleet values
+        //   emitted once per ~30 min per peer, ~2000 reporting peers
+        //   => 48 * 2000 * ~356 B ~= 34 MB/day
+        //
+        // against a collector ingesting ~88.8 GB/day: about 0.04%. Both blocks
+        // are already the minimum that answers their question — the hosting
+        // rows are the ONLY record of why a peer hosts anything plus the only
+        // fleet-wide view of `read_count` / `last_genuine_access` (the demand
+        // signals the eviction ranking is built on, previously reaching the
+        // node's own HTML dashboard and nothing else), and the futile ladder is
+        // 8 rungs rather than a per-value histogram. Neither carries a
+        // per-contract or per-peer label: contract keys are attacker-chosen, so
+        // labelling would hand an attacker control of collector cardinality.
+        // Do NOT raise this again without redoing the arithmetic.
+        const MAX_BUSY_JSON_BYTES: usize = 5_632;
+        // Raised from 14_336 alongside the busy budget, same 40 counters. This
+        // is the MATHEMATICAL ceiling (every counter at u64::MAX, 20 digits),
+        // measured 15195; no fleet value approaches it, so it constrains
+        // schema shape rather than real bytes.
+        const MAX_WORST_CASE_JSON_BYTES: usize = 15_360;
         const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_048;
         // Raised from 5_120 (2026-08-07) to admit `ms_size` + `ms_unt_age`,
         // the two counters added for #5153. The budget exists to force this
@@ -3379,12 +3501,20 @@ mod tests {
         // of 10 classes (the other 6 are a measured zero) and 6 size buckets
         // rather than 8. Do NOT raise this again without redoing the
         // arithmetic; the JSON-bytes budgets above are deliberately unchanged.
-        const MAX_BUSY_OTLP_MARGINAL_BYTES: usize = 5_376;
+        // Raised again from 5_376 for the 40 counters of the two blocks merged
+        // onto this soak branch (hosting observability + futile repair); see
+        // the arithmetic on MAX_BUSY_JSON_BYTES above. Measured 5523. Note
+        // the OTLP marginal is NOT the JSON figure plus a constant — it is a
+        // different axis (the JSON block re-encoded as an escaped OTLP string
+        // body), so it is measured separately rather than inferred.
+        const MAX_BUSY_OTLP_MARGINAL_BYTES: usize = 5_632;
         // Raised from 14_336 alongside the busy budget above, same 30 new
-        // counters, same #5153 rationale. This bound is the MATHEMATICAL
-        // ceiling (every counter at u64::MAX, 20 digits); no fleet value
-        // approaches it, so it constrains schema shape rather than real bytes.
-        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 14_592;
+        // counters, same #5153 rationale, then again for the 40 counters of the
+        // two blocks merged onto this soak branch — measured 15267. This
+        // bound is the MATHEMATICAL ceiling (every counter at u64::MAX, 20
+        // digits); no fleet value approaches it, so it constrains schema shape
+        // rather than real bytes.
+        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 15_360;
         const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
 
         let diagnostic = |value| crate::router::NetworkEfficiencyV1 {
@@ -3421,6 +3551,11 @@ mod tests {
             tel: [value; 15],
             shadow: [[value; 9]; 7],
             eff: [value; 8],
+            host_begin: [value; 7],
+            host_reads: [value; 6],
+            host_recency: [value; 5],
+            futile: [value; crate::ring::futile_repair::SNAPSHOT_SCALARS],
+            futile_ladder: [value; crate::ring::futile_repair::LADDER_LEN],
         };
 
         let mut u = arbitrary::Unstructured::new(&[0_u8; 32_768]);
@@ -3434,7 +3569,7 @@ mod tests {
         let object = block
             .as_object()
             .expect("network_efficiency_v1 must remain a JSON object");
-        assert_eq!(object.len(), 33, "schema must remain fixed-cardinality");
+        assert_eq!(object.len(), 38, "schema must remain fixed-cardinality");
         let encoded = serde_json::to_vec(block).expect("serialize diagnostic block");
         assert!(
             encoded.len() <= MAX_BUSY_JSON_BYTES,
@@ -3512,6 +3647,50 @@ mod tests {
         assert!(
             worst_otlp <= MAX_WORST_OTLP_MARGINAL_BYTES,
             "worst-case OTLP marginal {worst_otlp} > {MAX_WORST_OTLP_MARGINAL_BYTES}"
+        );
+    }
+
+    /// The hosting-observability rows must survive SERIALIZATION into the
+    /// `router_snapshot` body, not merely exist as struct fields.
+    ///
+    /// `network_efficiency_v1` is the only telemetry family that bypasses both
+    /// the node-side rate limiter (which drops ~69-77% of operational events,
+    /// load-proportionally) and the collector's 5% sampler, so a field that
+    /// silently fails to serialize is not "degraded" — it is absent, with no
+    /// second path to notice by. Each row is given a DISTINCT value so a
+    /// transposed assignment (`host_reads` fed from `host_recency`, say) fails
+    /// here instead of quietly publishing the wrong series.
+    #[test]
+    fn router_snapshot_json_carries_hosting_observability_rows() {
+        use arbitrary::Arbitrary;
+
+        let mut u = arbitrary::Unstructured::new(&[0_u8; 32_768]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        let mut block_bytes = arbitrary::Unstructured::new(&[0_u8; 32_768]);
+        let mut block = crate::router::NetworkEfficiencyV1::arbitrary(&mut block_bytes)
+            .expect("construct NetworkEfficiencyV1 for test");
+        block.host_begin = [11, 12, 13, 14, 15, 16, 17];
+        block.host_reads = [21, 22, 23, 24, 25, 26];
+        block.host_recency = [31, 32, 33, 34, 35];
+        info.network_efficiency_v1 = Some(block);
+
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        let efficiency = &json["network_efficiency_v1"];
+        assert_eq!(
+            efficiency["host_begin"],
+            serde_json::json!([11, 12, 13, 14, 15, 16, 17]),
+            "hosting-begin causes must reach the OTLP body"
+        );
+        assert_eq!(
+            efficiency["host_reads"],
+            serde_json::json!([21, 22, 23, 24, 25, 26]),
+            "the read_count gauge must reach the OTLP body"
+        );
+        assert_eq!(
+            efficiency["host_recency"],
+            serde_json::json!([31, 32, 33, 34, 35]),
+            "the genuine-access recency gauge must reach the OTLP body"
         );
     }
 
@@ -4073,6 +4252,64 @@ mod tests {
             ("broadcast_stream_attempts_total", 37),
             ("broadcast_stream_failures_total", 41),
             ("broadcast_stream_failures_last_snapshot", 43),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// The contract-exec WASM counters must reach the hand-mirrored OTLP body.
+    ///
+    /// These are the fields that make a summarize/delta rate interpretable —
+    /// without them, the only production signal is a handler-entry span that
+    /// counts cache hits and WASM invocations identically, which is how five
+    /// consecutive storm fixes were sized against an undifferentiated number.
+    /// Losing one to the hand-mirroring footgun would re-blind us in exactly the
+    /// way this change exists to fix, so the assertion covers the FULL set: a
+    /// partially-mirrored addition fails here rather than shipping half-visible.
+    ///
+    /// Every value below is DISTINCT, so a copy-paste slip that mirrors one
+    /// field's value under another field's key fails too — an all-`Some(1)`
+    /// fixture would pass under that mutation.
+    #[test]
+    fn router_snapshot_json_includes_contract_exec_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.contract_exec_summarize_fast_hits_total = Some(101);
+        info.contract_exec_summarize_reload_hits_total = Some(102);
+        info.contract_exec_summarize_wasm_calls_total = Some(103);
+        info.contract_exec_summarize_wasm_uncached_total = Some(104);
+        info.contract_exec_delta_fast_hits_total = Some(105);
+        info.contract_exec_delta_reload_hits_total = Some(106);
+        info.contract_exec_delta_wasm_calls_total = Some(107);
+        info.contract_exec_delta_wasm_uncached_total = Some(108);
+        info.contract_exec_summarize_fast_hits_last_snapshot = Some(109);
+        info.contract_exec_summarize_reload_hits_last_snapshot = Some(110);
+        info.contract_exec_summarize_wasm_calls_last_snapshot = Some(111);
+        info.contract_exec_summarize_wasm_uncached_last_snapshot = Some(112);
+        info.contract_exec_delta_fast_hits_last_snapshot = Some(113);
+        info.contract_exec_delta_reload_hits_last_snapshot = Some(114);
+        info.contract_exec_delta_wasm_calls_last_snapshot = Some(115);
+        info.contract_exec_delta_wasm_uncached_last_snapshot = Some(116);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("contract_exec_summarize_fast_hits_total", 101),
+            ("contract_exec_summarize_reload_hits_total", 102),
+            ("contract_exec_summarize_wasm_calls_total", 103),
+            ("contract_exec_summarize_wasm_uncached_total", 104),
+            ("contract_exec_delta_fast_hits_total", 105),
+            ("contract_exec_delta_reload_hits_total", 106),
+            ("contract_exec_delta_wasm_calls_total", 107),
+            ("contract_exec_delta_wasm_uncached_total", 108),
+            ("contract_exec_summarize_fast_hits_last_snapshot", 109),
+            ("contract_exec_summarize_reload_hits_last_snapshot", 110),
+            ("contract_exec_summarize_wasm_calls_last_snapshot", 111),
+            ("contract_exec_summarize_wasm_uncached_last_snapshot", 112),
+            ("contract_exec_delta_fast_hits_last_snapshot", 113),
+            ("contract_exec_delta_reload_hits_last_snapshot", 114),
+            ("contract_exec_delta_wasm_calls_last_snapshot", 115),
+            ("contract_exec_delta_wasm_uncached_last_snapshot", 116),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
