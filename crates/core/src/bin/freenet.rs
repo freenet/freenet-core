@@ -1008,34 +1008,121 @@ const EXIT_CODE_ALREADY_RUNNING: i32 = 43;
 #[error("another freenet instance is already running")]
 struct AlreadyRunningError;
 
+/// How many times to probe the WS API port, and how long to wait between
+/// probes, before concluding it is genuinely held by a live process.
+///
+/// A process that was just OOM-killed can keep its listening socket
+/// answering for a short window while the kernel finishes tearing it down.
+/// Before this retry loop existed, a single 500ms probe treated that corpse
+/// exactly like a live instance and exited 43 immediately — and because
+/// `Restart=always` retried within milliseconds, every restart attempt hit
+/// the same still-answering corpse, burning systemd's `StartLimitBurst`
+/// before the socket was actually released and leaving the gateway down
+/// with no self-heal (#4565, 2026-07-17 vega outage).
+const EXISTING_PROCESS_PROBE_ATTEMPTS: u32 = 6;
+const EXISTING_PROCESS_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn check_for_existing_process(config: &Config) -> anyhow::Result<()> {
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
 
     let addr = SocketAddr::from((config.ws_api.address, config.ws_api.port));
-    if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
-        let pid = find_process_on_port(config.ws_api.port);
-        if let Some(pid) = pid {
-            tracing::warn!(
-                port = config.ws_api.port,
-                pid = pid,
-                "Another process (PID {pid}) is already listening on port {}. \
-                 If freenet is installed as a service, use 'freenet service stop' before \
-                 running manually. Otherwise use 'kill {pid}' to stop it.",
-                config.ws_api.port
-            );
-        } else {
-            tracing::warn!(
-                port = config.ws_api.port,
-                "Port {} is already in use by another process. \
-                 If freenet is installed as a service, use 'freenet service stop' before \
-                 running manually.",
-                config.ws_api.port
-            );
+    check_for_existing_process_with(
+        config.ws_api.port,
+        EXISTING_PROCESS_PROBE_ATTEMPTS,
+        EXISTING_PROCESS_PROBE_INTERVAL,
+        || TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok(),
+        find_process_on_port,
+        pid_is_alive,
+    )
+}
+
+/// Core retry/liveness logic behind [`check_for_existing_process`], with the
+/// socket probe, PID lookup, and PID-liveness check injected so the retry
+/// behavior can be unit-tested without real sockets or `/proc`.
+///
+/// This is a one-time, bounded startup gate that runs before any shutdown
+/// signal handling is wired up (there is nothing to interrupt against yet),
+/// so a plain blocking sleep between attempts is used rather than routing
+/// through a cancellable async retry loop.
+fn check_for_existing_process_with(
+    port: u16,
+    max_attempts: u32,
+    retry_interval: std::time::Duration,
+    mut port_is_occupied: impl FnMut() -> bool,
+    mut find_owning_pid: impl FnMut(u16) -> Option<u32>,
+    mut pid_is_alive: impl FnMut(u32) -> bool,
+) -> anyhow::Result<()> {
+    for attempt in 1..=max_attempts {
+        if !port_is_occupied() {
+            return Ok(());
         }
-        return Err(AlreadyRunningError.into());
+
+        match find_owning_pid(port) {
+            Some(pid) if pid_is_alive(pid) => {
+                tracing::warn!(
+                    port = port,
+                    pid = pid,
+                    "Another process (PID {pid}) is already listening on port {port}. \
+                     If freenet is installed as a service, use 'freenet service stop' before \
+                     running manually. Otherwise use 'kill {pid}' to stop it."
+                );
+                return Err(AlreadyRunningError.into());
+            }
+            Some(pid) => {
+                // The PID that owned the port no longer exists: a corpse
+                // whose socket the kernel hasn't finished tearing down yet.
+                // Keep retrying rather than exiting 43 for a transient.
+                tracing::debug!(
+                    port = port,
+                    pid = pid,
+                    attempt = attempt,
+                    max_attempts = max_attempts,
+                    "Port answering but owning PID is no longer alive; retrying (#4565)"
+                );
+            }
+            None => {
+                // Could not identify an owning PID (non-Linux, permissions,
+                // or the socket disappeared between the probe and the
+                // lookup). Retry — if it's still occupied on the last
+                // attempt we bail out below.
+                tracing::debug!(
+                    port = port,
+                    attempt = attempt,
+                    max_attempts = max_attempts,
+                    "Port answering but owning PID could not be determined; retrying (#4565)"
+                );
+            }
+        }
+
+        if attempt < max_attempts {
+            std::thread::sleep(retry_interval);
+        }
     }
-    Ok(())
+
+    tracing::warn!(
+        port = port,
+        "Port {port} is still occupied after {max_attempts} attempts. \
+         If freenet is installed as a service, use 'freenet service stop' before \
+         running manually."
+    );
+    Err(AlreadyRunningError.into())
+}
+
+/// Whether the process identified as owning a listening socket is still
+/// alive. Distinguishes a genuinely running instance from a corpse whose
+/// socket the kernel hasn't finished tearing down yet after a kill (e.g. an
+/// OOM kill, #4565).
+#[cfg(target_os = "linux")]
+fn pid_is_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// We can't cheaply determine PID liveness off Linux; `find_process_on_port`
+/// already returns `None` there, so this is unreachable in practice.
+#[cfg(not(target_os = "linux"))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
 }
 
 /// Try to find the PID of the process listening on the given port.
@@ -2030,6 +2117,121 @@ mod tests {
    0: 00000000:1D55 00000000:0000 0A";
 
         assert_eq!(parse_listening_inode(content, "1D55"), None);
+    }
+
+    /// Regression test for #4565 (2026-07-17 vega outage): a corpse process
+    /// whose socket the kernel hasn't finished tearing down yet must not be
+    /// treated as a live instance. The port answers on the first two probes
+    /// (simulating the OOM-killed process's still-bound socket), then frees
+    /// once the kernel finishes reclaiming it.
+    #[test]
+    fn check_for_existing_process_with_retries_past_a_dying_corpse() {
+        use super::check_for_existing_process_with;
+
+        let mut probes = 0u32;
+        let result = check_for_existing_process_with(
+            1234,
+            5,
+            std::time::Duration::ZERO,
+            || {
+                probes += 1;
+                probes <= 2
+            },
+            |_port| Some(999),
+            |_pid| false, // PID 999 no longer exists: a corpse.
+        );
+
+        assert!(
+            result.is_ok(),
+            "must succeed once the corpse's socket clears, not exit 43 on the first probe"
+        );
+        assert_eq!(probes, 3, "must stop probing as soon as the port frees");
+    }
+
+    /// A genuinely live process holding the port must fail immediately —
+    /// retrying against a real conflict would only delay a correct exit 43,
+    /// and (per #4565) burn part of the retry budget for no benefit.
+    #[test]
+    fn check_for_existing_process_with_fails_fast_on_a_live_process() {
+        use super::check_for_existing_process_with;
+
+        let mut probes = 0u32;
+        let result = check_for_existing_process_with(
+            1234,
+            5,
+            std::time::Duration::ZERO,
+            || {
+                probes += 1;
+                true
+            },
+            |_port| Some(42),
+            |_pid| true, // Genuinely alive.
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            probes, 1,
+            "must not keep retrying once a live owning process is confirmed"
+        );
+    }
+
+    /// If the port never frees and no PID can be identified (e.g. non-Linux,
+    /// or a permissions gap), the retry loop must still terminate and report
+    /// AlreadyRunningError rather than looping forever.
+    #[test]
+    fn check_for_existing_process_with_exhausts_retries_when_never_freed() {
+        use super::{AlreadyRunningError, check_for_existing_process_with};
+
+        let mut probes = 0u32;
+        let result = check_for_existing_process_with(
+            1234,
+            3,
+            std::time::Duration::ZERO,
+            || {
+                probes += 1;
+                true
+            },
+            |_port| None, // Can't identify an owning PID.
+            |_pid| false,
+        );
+
+        assert!(
+            result
+                .expect_err("port stays occupied the whole time")
+                .downcast_ref::<AlreadyRunningError>()
+                .is_some()
+        );
+        assert_eq!(probes, 3, "must attempt exactly max_attempts probes");
+    }
+
+    /// A corpse on the first attempt followed by a DIFFERENT, genuinely live
+    /// process taking the port (e.g. some other service raced to bind it
+    /// during the retry window) must still be caught and reported as
+    /// AlreadyRunningError rather than retried away.
+    #[test]
+    fn check_for_existing_process_with_recognizes_liveness_over_multiple_attempts() {
+        use super::check_for_existing_process_with;
+        use std::cell::Cell;
+
+        let find_pid_calls: Cell<u32> = Cell::new(0);
+        let result = check_for_existing_process_with(
+            1234,
+            5,
+            std::time::Duration::ZERO,
+            || true,
+            |_port| {
+                find_pid_calls.set(find_pid_calls.get() + 1);
+                if find_pid_calls.get() == 1 {
+                    Some(999) // corpse
+                } else {
+                    Some(42) // live process
+                }
+            },
+            |pid| pid == 42,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(find_pid_calls.get(), 2);
     }
 
     /// Regression test for issue #4196: a plain `File::create` from
