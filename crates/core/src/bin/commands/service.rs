@@ -1480,8 +1480,10 @@ mod tests {
         );
         // #4073 / #4551: ExecStopPost must fire `freenet update` for ANY
         // non-graceful exit — every status except 0 (graceful) and 43 (another
-        // instance) — so it covers the voluntary update-needed 42, the fast-crash
-        // 45, AND the panic/signal/early-error codes the watchdog never produces.
+        // instance), and, since #5227, except a deliberate stop identified by
+        // $SERVICE_RESULT ahead of this case — so it covers the voluntary
+        // update-needed 42, the fast-crash 45, AND the panic/signal/early-error
+        // codes the watchdog never produces.
         // Firing broadly preserves the #4549 self-heal AND enables crash-loop
         // rollback (#4073); 45 and the crash codes staying out of
         // SuccessExitStatus still count toward StartLimitBurst. A `case` (not
@@ -1490,7 +1492,10 @@ mod tests {
             service_content.contains("case \"$$EXIT_STATUS\" in 0|43) ;; *)")
                 && service_content.contains("update --quiet"),
             "ExecStopPost must run `freenet update` for any non-graceful exit via a \
-             case that skips only 0 and 43 (#4073 broadened crash coverage; #4551)"
+             case that skips 0 and 43 (#4073 broadened crash coverage; #4551). Since \
+             #5227 a deliberate stop is skipped as well, by a separate \
+             $SERVICE_RESULT guard ahead of this case — see \
+             service::linux::tests::exec_stop_post_counts_crashes_and_skips_deliberate_stops"
         );
         assert!(
             !service_content.contains("42|45)"),
@@ -1589,12 +1594,16 @@ mod tests {
             "ExecStopPost must use the doubled $$EXIT_STATUS (single-$ revert breaks auto-update)"
         );
         // #4073 / #4551: ExecStopPost fires `freenet update` for ANY non-graceful
-        // exit (every status except 0 and 43) — system unit too.
+        // exit (every status except 0 and 43, and since #5227 except a deliberate
+        // stop identified by $SERVICE_RESULT) — system unit too.
         assert!(
             service_content.contains("case \"$$EXIT_STATUS\" in 0|43) ;; *)")
                 && service_content.contains("update --quiet"),
             "ExecStopPost must run `freenet update` for any non-graceful exit via a \
-             case that skips only 0 and 43 (#4073 broadened crash coverage; #4551)"
+             case that skips 0 and 43 (#4073 broadened crash coverage; #4551). Since \
+             #5227 a deliberate stop is skipped as well, by a separate \
+             $SERVICE_RESULT guard ahead of this case — see \
+             service::linux::tests::exec_stop_post_counts_crashes_and_skips_deliberate_stops"
         );
         assert!(
             !service_content.contains("42|45)"),
