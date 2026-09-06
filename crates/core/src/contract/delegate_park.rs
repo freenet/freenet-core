@@ -1814,13 +1814,18 @@ mod tests {
         })
     }
 
+    // `InboundDelegateMsg` is `#[non_exhaustive]`, so the wildcard is required
+    // rather than lazy, and this helper genuinely wants only `UserResponse`.
+    // The attribute has to sit on the EXPRESSION, not on the arm: on the arm it
+    // does not suppress the lint, which is only visible in CI because the crate
+    // warns on this locally and denies it under `-D warnings`.
+    #[allow(clippy::wildcard_enum_match_arm)]
     fn answered_ids(resume: &DelegateResume) -> Vec<u32> {
         resume
             .inbound
             .iter()
             .filter_map(|m| match m {
                 InboundDelegateMsg::UserResponse(r) => Some(r.request_id),
-                #[allow(clippy::wildcard_enum_match_arm)]
                 _ => None,
             })
             .collect()
