@@ -154,8 +154,10 @@ fn note_v2_broadcast_drain_dropped(key: &freenet_stdlib::prelude::ContractKey) {
              loop being held by the delegate that made this write — a delegate awaiting user \
              input holds it for a human-scale time and will not be recovered by retries \
              (#5544/#5554 remove that precondition). The write is committed locally; a peer \
-             hosting or using this contract re-learns it within one anti-entropy round \
-             (INTEREST_HEARTBEAT_INTERVAL, 300s), or sooner on the delegate's next write. \
+             hosting or using this contract re-learns it within about one anti-entropy \
+             round — up to INTEREST_HEARTBEAT_INTERVAL (300s), and STAGGERED rather than \
+             swept, since the heartbeat spreads its sends across the interval — or sooner \
+             on the delegate's next write. \
              Logged at power-of-two milestones (#4238)."
         );
     }

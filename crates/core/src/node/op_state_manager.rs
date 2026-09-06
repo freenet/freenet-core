@@ -482,7 +482,8 @@ fn note_v2_broadcast_enqueue_dropped(key: &ContractKey, err: &OpError) {
             dropped_total = dropped,
             "V2 delegate state-change broadcast dropped: notification channel would block. \
              The write is committed locally; the network learns of it on the next write or \
-             within one anti-entropy round (300s). Logged at power-of-two milestones (#4238)."
+             within about one anti-entropy round (up to 300s, staggered across peers rather \
+             than swept). Logged at power-of-two milestones (#4238)."
         );
     }
 }
@@ -1125,10 +1126,25 @@ impl OpManager {
     ///
     /// That case is bounded, not silent: it is counted and WARNed at the drain
     /// site, and a peer hosting or actively using the contract re-learns the
-    /// state within one anti-entropy round (`INTEREST_HEARTBEAT_INTERVAL`,
-    /// 300 s), because the heartbeat summarize and the broadcast fan-out are
-    /// gated on the SAME `should_summarize_or_broadcast` predicate — see
+    /// state within about one anti-entropy round — up to
+    /// `INTEREST_HEARTBEAT_INTERVAL` (300 s), staggered rather than swept,
+    /// since the heartbeat spreads its sends across the interval
+    /// (`spread_delay = INTEREST_HEARTBEAT_INTERVAL / num_peers`).
+    ///
+    /// That recovery covers the right PEERS, not merely the right contracts,
+    /// and the two are not the same claim. The heartbeat enumerates every
+    /// CONNECTED peer (`get_connections_by_location`), while a broadcast target
+    /// must be an advertised co-host resolved through the same connection
+    /// table — so the heartbeat's peer set is a strict SUPERSET of the
+    /// broadcast's, and no peer that would have received the fan-out is
+    /// missed. The contract-level gate matches too: the heartbeat summarize and
+    /// the broadcast fan-out share the one `should_summarize_or_broadcast`
+    /// predicate, deliberately, so they cannot drift — see
     /// `broadcast_queue::should_broadcast_contract`, which says so explicitly.
+    /// The comparison that drives the repair reads FACT on both sides (our real
+    /// summary against the peer's real digest, never our cached belief about
+    /// that peer), which is what makes it a repair rather than a re-assertion
+    /// of the same stale view.
     /// The real fix is #5544/#5554, which parks delegates off this loop and
     /// removes the precondition entirely.
     pub(crate) async fn read_state_for_broadcast_drain(
