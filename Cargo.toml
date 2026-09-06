@@ -7,7 +7,9 @@ members = [
 	"apps/freenet-ping/contracts/ping",
 	"tests/test-contract-integration",
 	"tests/test-contract-update-nochange",
-	"tests/test-contract-mock-aligned"
+	"tests/test-contract-mock-aligned",
+	"tests/test-contract-requires-related",
+	"tests/test-contract-delta-trap"
 ]
 
 [workspace.dependencies]
@@ -88,10 +90,21 @@ chrono = { version = "0.4", default-features = true }
 rand = "0.9"
 rand_chacha = "0.9"
 
+# XEdDSA (Signal's construction): signs with the x25519 transport key so the
+# OTel collector can verify node identity against the SAME public key peers
+# and UIs see. Its rand 0.10 dep is exposed as `rand10` for the sign nonce.
+xeddsa = "1.1"
+rand10 = { package = "rand", version = "0.10", default-features = false, features = ["sys_rng"] }
+rand_core10 = { package = "rand_core", version = "0.10" }
+
 # Observability
+async-trait = "0.1"
 opentelemetry = "0.32"
+# Trait/types only (HttpClient for the per-request auth wrapper); its reqwest
+# integration targets reqwest 0.13 and the workspace is on 0.12, so no features.
+opentelemetry-http = "0.32"
 opentelemetry-jaeger = "0.22"
-opentelemetry-otlp = "0.32.0"
+opentelemetry-otlp = { version = "0.32.0", default-features = false }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 tracing = "0.1"
 # Bumping this? Re-read `rolling.rs`'s `impl io::Write for

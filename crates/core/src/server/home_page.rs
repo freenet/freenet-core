@@ -4023,14 +4023,75 @@ mod tests {
         );
     }
 
+    /// A converging idempotence finding must not read the same as a
+    /// non-convergent one.
+    ///
+    /// Severity cannot separate them — since #5462 both are `Severity::Violation`,
+    /// deliberately — so the panel has to read `settling`. For a whole review round
+    /// `MergeFinding` carried that field while the only code that tells an operator
+    /// what a row means ignored it, and the field's own rustdoc said to consult it.
+    /// A test asserting the field is populated would have passed throughout; this
+    /// asserts what the operator actually sees.
+    #[test]
+    fn the_panel_separates_a_settling_finding_from_a_non_convergent_one() {
+        use crate::conformance::property::IdempotenceSettling;
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let rendered = |settling| {
+            let key_id = ContractInstanceId::new([7u8; 32]);
+            let key = key_id.to_string();
+            let mut status = MergeCheckStatus::default();
+            status.record(
+                [checked_record(
+                    key_id,
+                    40,
+                    0,
+                    vec![MergeFinding {
+                        contract: key_id,
+                        property: "state_idempotence",
+                        severity: Severity::Violation,
+                        settling,
+                        would_remove: true,
+                    }],
+                )],
+                1,
+                0,
+                tokio::time::Instant::now(),
+            );
+            let snap = hosted_snap(&key);
+            let view = merge_view(&status, &key_id);
+            let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+            merge_panel(&html)
+        };
+
+        let settled = rendered(Some(IdempotenceSettling::SettledAfter(1)));
+        let never = rendered(Some(IdempotenceSettling::NeverSettled));
+
+        assert_ne!(
+            settled, never,
+            "a contract that converges after one rewrite and one that never settles \
+             must not render identically — that is the misreading #5462 exists to \
+             prevent:\nsettled:\n{settled}\nnever:\n{never}"
+        );
+        assert!(
+            settled.contains("converges"),
+            "the settling case must say so in words the operator reads:\n{settled}"
+        );
+    }
+
     /// State 4: checked, with findings — the state the whole card exists for.
     ///
     /// Each finding must show its property, and a `Violation` must read as
-    /// visibly more serious than a `Diagnostic`: the former means the
-    /// contract cannot converge (peers disagree and retry indefinitely), the
-    /// latter is legal but wasteful. A panel that only printed the bare enum
-    /// name would satisfy "shows severity" without making the distinction an
-    /// operator actually needs.
+    /// visibly more serious than a `Diagnostic`: the former is removal-eligible
+    /// under enforcement, the latter is legal but wasteful. A panel that only
+    /// printed the bare enum name would satisfy "shows severity" without making
+    /// the distinction an operator actually needs.
+    ///
+    /// This asserted the panel said "cannot converge" until #5462. That stopped
+    /// being true of every `Violation`: `state_idempotence` now reports a
+    /// canonicalizing contract, which breaks idempotence and still converges. The
+    /// assertion is retargeted rather than dropped, because the property it
+    /// guards — an explanation rather than a bare enum name — is unchanged.
     #[test]
     fn merge_card_lists_findings_with_severity_and_removal_distinguished() {
         use freenet_stdlib::prelude::ContractInstanceId;
@@ -4048,12 +4109,14 @@ mod tests {
                         contract: key_id,
                         property: "state_commutativity",
                         severity: Severity::Violation,
+                        settling: None,
                         would_remove: true,
                     },
                     MergeFinding {
                         contract: key_id,
                         property: "self_delta_empty",
                         severity: Severity::Diagnostic,
+                        settling: None,
                         would_remove: false,
                     },
                 ],
@@ -4072,9 +4135,21 @@ mod tests {
             "both findings for this contract must be listed — got:\n{panel}"
         );
         assert!(
-            panel.contains("cannot converge"),
+            panel.contains("removal-eligible"),
             "a Violation must be explained, not just labelled with the bare \
              enum name — got:\n{panel}"
+        );
+        // The negative half, and the reason it is needed: `merge_panel` slices the
+        // WHOLE card, so the legend explaining the pill is inside the string this
+        // assertion inspects. Checking only that the new wording is present passed
+        // happily while the legend two lines below still explained it with the old
+        // claim — the page contradicting itself, in a commit titled "stop the
+        // strings lying".
+        assert!(
+            !panel.contains("cannot converge"),
+            "the card still claims every Violation cannot converge; since #5462 a \
+             settling idempotence finding converges and is still a Violation — \
+             got:\n{panel}"
         );
         assert!(
             panel.contains("legal but wasteful"),
@@ -4155,6 +4230,7 @@ mod tests {
                     contract: key_id,
                     property: "state_commutativity",
                     severity: Severity::Violation,
+                    settling: None,
                     would_remove: true,
                 }],
             )],
@@ -4173,6 +4249,7 @@ mod tests {
                         contract: other,
                         property: "state_idempotence",
                         severity: Severity::Violation,
+                        settling: None,
                         would_remove: true,
                     }],
                 )],
@@ -4341,6 +4418,7 @@ mod tests {
                     contract: key_id,
                     property: "state_commutativity",
                     severity: Severity::Violation,
+                    settling: None,
                     would_remove: true,
                 }],
             )],

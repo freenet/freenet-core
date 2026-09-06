@@ -223,7 +223,7 @@ pub(crate) fn interest_delta_budget_for(total_ram: usize) -> usize {
 ///
 /// `pub(crate)` so the UPDATE queue-full retry (#4857 P2) can size its own
 /// tokio-clock liveness backstop to exactly one reservation window — see
-/// `operations::update::op_ctx_task::resend_queue_full_resync_request`.
+/// `operations::update::op_ctx_task::resend_dropped_broadcast_resync_request`.
 pub(crate) const RESYNC_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Bound on the number of (contract, peer) entries in the queue-full

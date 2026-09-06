@@ -1,7 +1,20 @@
 name: CI
 
 # Cost optimization strategy (Ubicloud runners ~$0.13/run):
-# 1. Skip CI entirely for docs-only changes (paths-ignore)
+# 1. Skip CI entirely for docs-only changes on PUSH TO MAIN only (paths-ignore).
+#    NOT on `pull_request` — see the `on:` block below and #5451. A
+#    workflow-level path filter is the one optimization that can make a PR
+#    permanently unmergeable, so it is confined to the trigger where no
+#    required check is at stake.
+#    This is a REAL cost increase, not a relocation: since #5571 a docs-only PR
+#    pays the full PR suite (Clippy on ubicloud-standard-8; Unit & Integration,
+#    Simulation and NAT Validation on ubicloud-standard-16; the macOS/Windows
+#    unit jobs) PLUS a paid Claude rule review, on top of the merge_group run it
+#    already paid. That was accepted because docs-only merges are rare (15 in
+#    the year to 2026-09-05) and the alternative — gating each expensive STEP on
+#    a changed-files check — is a large, subtle diff on required checks, where a
+#    mistake makes them pass unconditionally. If docs-only PRs ever become
+#    frequent, that step-level version is the right answer, with data behind it.
 # 2. Skip expensive jobs on main push — PR already validated
 # 3. Skip NAT validation for dependabot PRs — Test is sufficient for version bumps
 # 4. Run fast checks (Fmt, Clippy) in parallel for quick fail-fast
@@ -25,13 +38,25 @@ on:
       - 'LICENSE'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/FUNDING.yml'
+  # DO NOT add `paths-ignore:` (or `paths:`) here. Six of the eight required
+  # status contexts come from this workflow (Fmt, Clippy, Rule Lint, Unit &
+  # Integration, Simulation, NAT Validation). A workflow skipped by a path
+  # filter reports NOTHING, and GitHub treats a never-reported required context
+  # as "expected", not as satisfied — so the merge queue refuses entry forever.
+  # A docs-only PR was therefore structurally unmergeable; #5322 sat blocked
+  # from 2026-08-14 until #5571 removed this. The `merge_group:` trigger below
+  # does not rescue it: that only runs for a PR already ADMITTED to the queue.
+  #
+  # This was easy to miss because `*.md` does not match at depth in GitHub path
+  # filters, so a PR touching `.claude/rules/foo.md` always ran full CI and
+  # merged normally (#5375). It bit only a PR whose EVERY file matched one of
+  # the removed patterns — `docs/**`, a ROOT-level `*.md`, `LICENSE`,
+  # `.github/ISSUE_TEMPLATE/**` or `.github/FUNDING.yml`. A PR touching just
+  # `LICENSE`, or just an issue template, was equally stuck.
+  #
+  # Enforced by .github/scripts/check_required_check_path_filters.py, run from
+  # the Rule Lint job below.
   pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-      - 'LICENSE'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/FUNDING.yml'
   merge_group:
 
 # Cancel in-progress runs when a new commit is pushed to the same branch.
@@ -184,6 +209,19 @@ jobs:
       # still wired into rule_lint.
       - name: Self-test merge-queue concurrency guard
         run: bash scripts/merge_group_concurrency_test.sh
+
+      # Regression gate for #5451: a `paths-ignore` on the pull-request trigger
+      # of a workflow that provides a required status context makes every PR the
+      # filter excludes permanently unmergeable — the context is never reported,
+      # and GitHub reads never-reported as "expected" rather than satisfied.
+      # #5322 sat blocked by exactly this from 2026-08-14 until #5571. Pins that
+      # the linter still fires on the real pre-fix `on:` blocks (which #5571
+      # deletes from the repo, so nothing else records them), that it fires on
+      # the one-line flow form, that this repo satisfies both halves of the
+      # invariant, and that the linter is still wired into rule_lint with its
+      # coverage half enabled.
+      - name: Self-test required-check path-filter guard
+        run: bash scripts/required_check_path_filters_test.sh
 
       # Regression gate for the release driver's cross-compile wait: under
       # `set -euo pipefail` a bare `var=$(gh ...)` aborts the whole driver on a
@@ -370,6 +408,17 @@ jobs:
 
       - name: Check merge_group workflows vary their concurrency group
         run: python3 .github/scripts/check_merge_group_concurrency.py .github/workflows
+
+      # Self-test the required-check path-filter linter, then run it. Like the
+      # concurrency linter above it is NOT diff-scoped — the invariant is a
+      # property of each workflow file as it stands. Guards #5451: a workflow
+      # skipped by a path filter reports NOTHING, and a required context that
+      # never reports is "expected" forever, so the merge queue refuses entry.
+      - name: Required-check path-filter linter self-test
+        run: python3 .github/scripts/check_required_check_path_filters.py --self-test
+
+      - name: Check required-check workflows carry no PR path filter
+        run: python3 .github/scripts/check_required_check_path_filters.py .github/workflows
 
       - name: Check for banned patterns in new code
         env:

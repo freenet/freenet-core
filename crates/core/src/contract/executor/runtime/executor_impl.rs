@@ -1,5 +1,25 @@
 use super::*;
 
+/// What [`Executor::commit_state_update`] actually did.
+///
+/// It used to return `Result<(), _>`, which made "stored the state and ran the
+/// full fan-out" and "suppressed the whole thing because the contract is
+/// flagged as violating a CRDT invariant" indistinguishable at every call
+/// site. A caller that reads a bare `Ok` as "committed" then acts on a state
+/// that was never written — and the initial-install branch's replay loop did
+/// exactly that, concluding a replay had fanned out and skipping its own
+/// fan-out, so the state it HAD stored reached nobody. That is #5481 again,
+/// relocated to the install-plus-flagged-contract corner. The outcome is
+/// explicit so the compiler makes the next caller choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::contract::executor) enum StateCommitOutcome {
+    /// The state was stored and `finalize_state_commit` ran.
+    Committed,
+    /// Nothing was stored and nothing was fanned out: the contract is flagged
+    /// in `ring::broken_invariants` (#4279).
+    SuppressedBrokenContract,
+}
+
 // ============================================================================
 // Single Executor Implementation
 // ============================================================================
@@ -598,6 +618,26 @@ where
                             }
 
                             let completion_now = now_nanos();
+                            // The state this node ends up holding. Starts as
+                            // the incoming state and advances as queued
+                            // operations replay onto it below, so the fan-out
+                            // at the end of this branch reports what was
+                            // actually installed. Before this was hoisted, the
+                            // branch fanned out the PRE-replay state AFTER each
+                            // replay had already fanned out a newer one, so the
+                            // last thing a subscriber saw was the oldest state
+                            // (harmless for peers, which CRDT-merge, but not
+                            // for a delegate handed a full state).
+                            let mut installed_state = incoming_state.clone();
+                            // Set when a queued-operation replay commits. Each
+                            // replay goes through `commit_state_update`, which
+                            // runs the full fan-out itself, so the finalize at
+                            // the end of this branch would emit `installed_state`
+                            // a SECOND time — re-running every subscribed
+                            // delegate on a state that did not change, and
+                            // duplicating the WS and network notifications
+                            // (found by the external review pass).
+                            let mut replay_committed = false;
                             if let Some(completion_info) = self
                                 .init_tracker
                                 .complete_initialization(&key, completion_now)
@@ -624,7 +664,6 @@ where
                                 // These were UPDATE operations that couldn't proceed while the
                                 // contract was being initialized. Now that initialization is
                                 // complete, we apply them in order to the stored state.
-                                let mut current = incoming_state.clone();
                                 for op in completion_info.queued_ops {
                                     let queue_time = ContractInitTracker::queue_wait_duration(
                                         &op,
@@ -650,7 +689,7 @@ where
                                     match self
                                         .attempt_state_update(
                                             &params,
-                                            &current,
+                                            &installed_state,
                                             &key,
                                             &replay_updates,
                                         )
@@ -669,18 +708,41 @@ where
                                                 .map(|r| r == ValidateResult::Valid)
                                                 .unwrap_or(false);
 
-                                            if valid && new_state.as_ref() != current.as_ref() {
-                                                if let Err(e) = self
+                                            if valid
+                                                && new_state.as_ref() != installed_state.as_ref()
+                                            {
+                                                match self
                                                     .commit_state_update(&key, &params, &new_state)
                                                     .await
                                                 {
-                                                    tracing::warn!(
-                                                        contract = %key,
-                                                        error = %e,
-                                                        "Failed to commit replayed queued operation"
-                                                    );
-                                                } else {
-                                                    current = new_state;
+                                                    Ok(StateCommitOutcome::Committed) => {
+                                                        installed_state = new_state;
+                                                        replay_committed = true;
+                                                    }
+                                                    Ok(
+                                                        StateCommitOutcome::SuppressedBrokenContract,
+                                                    ) => {
+                                                        // Nothing stored, nothing fanned out. The
+                                                        // state must NOT advance and the trailing
+                                                        // fan-out must NOT be skipped — treating
+                                                        // this as a commit would leave the state
+                                                        // this branch DID store reaching nobody,
+                                                        // which is #5481 again at the
+                                                        // install-plus-flagged-contract corner.
+                                                        tracing::debug!(
+                                                            contract = %key,
+                                                            "Replayed operation suppressed \
+                                                             (contract flagged broken); \
+                                                             install fan-out still owed"
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            contract = %key,
+                                                            error = %e,
+                                                            "Failed to commit replayed queued operation"
+                                                        );
+                                                    }
                                                 }
                                             } else if !valid {
                                                 tracing::warn!(
@@ -706,45 +768,48 @@ where
                                 }
                             }
 
-                            self.broadcast_state_change(key, incoming_state.clone())
-                                .await;
-
-                            // Notify locally-subscribed WS clients of the
-                            // new state. Without this, the very first state
-                            // install for a contract on this node never
-                            // reaches `register_contract_notifier` consumers
-                            // — only the merge path at the end of this
-                            // function calls `commit_state_update`, which
-                            // is the only other site that fans out to the
-                            // local notifier map. ResyncResponse-driven
-                            // applies hit this branch when the state_store
-                            // entry is missing, so subscribers would miss
-                            // every cross-node delivery that recovers via
-                            // resync.
                             tracing::info!(
                                 contract = %key,
-                                new_size_bytes = incoming_state.as_ref().len(),
+                                new_size_bytes = installed_state.as_ref().len(),
                                 phase = "update_complete",
                                 event = "initial_state_installed",
                                 "Contract initial state installed"
                             );
-                            // Dashboard "last updated" telemetry; no-op if
-                            // we're not subscribed to this contract.
-                            if let Some(op_manager) = &self.op_manager {
-                                op_manager.ring.record_contract_update(&key);
-                            }
-                            if let Err(err) = self
-                                .send_update_notification(&key, &params, &incoming_state)
-                                .await
-                            {
-                                tracing::error!(
+                            // The very first state install for a contract on
+                            // this node owes the SAME post-store fan-out the
+                            // merge path performs, and this branch is the one
+                            // a ResyncResponse-driven apply takes whenever the
+                            // `state_store` entry is missing — so a consumer
+                            // dropped here misses every cross-node delivery
+                            // that recovers via resync. Hand-inlining a subset
+                            // is how #5481 happened (delegates were the
+                            // dropped leg, after WS clients had already been
+                            // the dropped leg once before). Call the helper;
+                            // do not re-inline.
+                            if replay_committed {
+                                // The last successful replay already ran the
+                                // full fan-out with exactly this state via
+                                // `commit_state_update`. Emitting it again
+                                // would run every subscribed delegate twice on
+                                // an unchanged state.
+                                tracing::debug!(
                                     contract = %key,
-                                    error = %err,
-                                    phase = "notification_failed",
-                                    "Failed to send initial-state notification"
+                                    event = "install_fan_out_skipped_after_replay",
+                                    "Queued-operation replay already fanned out the \
+                                     installed state; not emitting it twice"
                                 );
+                            } else {
+                                self.finalize_state_commit(&key, &params, &installed_state)
+                                    .await;
                             }
 
+                            // NOTE: the RETURN value stays `incoming_state`
+                            // rather than `installed_state` — that is
+                            // pre-existing behaviour with its own callers
+                            // (PUT-response summary), and changing it is a
+                            // separate, client-visible decision. The fan-out
+                            // above is what subscribers observe, and that is
+                            // now the state this node actually holds.
                             return Ok(UpsertResult::Updated(incoming_state));
                         }
                     }
@@ -1187,7 +1252,11 @@ where
                 return Ok(UpsertResult::NoChange);
             }
 
-            self.commit_state_update(&key, &params, &updated_state)
+            // Outcome discarded deliberately: a broken-contract suppression
+            // here is already reported to the caller as the `NoChange` above,
+            // and this path has no trailing fan-out to gate on it.
+            let _ = self
+                .commit_state_update(&key, &params, &updated_state)
                 .await?;
             Ok(UpsertResult::Updated(updated_state))
         }
@@ -2122,7 +2191,7 @@ where
         key: &ContractKey,
         parameters: &Parameters<'_>,
         new_state: &WrappedState,
-    ) -> Result<(), ExecutorError> {
+    ) -> Result<StateCommitOutcome, ExecutorError> {
         // Blanket gate: a contract flagged as violating a CRDT invariant
         // (e.g. non-idempotent merge) must not have its state extended
         // OR broadcast from this node. The merge in
@@ -2140,7 +2209,12 @@ where
                     event = "commit_suppressed_broken_contract",
                     "Skipping commit_state_update for contract flagged as broken"
                 );
-                return Ok(());
+                // NOT `Ok(())`. This path stores nothing and fans out
+                // nothing, and a caller that reads a bare `Ok` as "committed"
+                // will act on a state that was never written — which is
+                // exactly what happened to the initial-install branch's
+                // replay loop before the outcome was made explicit.
+                return Ok(StateCommitOutcome::SuppressedBrokenContract);
             }
         }
 
@@ -2209,13 +2283,80 @@ where
             "Contract state updated"
         );
 
-        // Record update timestamp for dashboard display. No-op if we're
-        // not subscribed (e.g., a relay forwarding an UPDATE for a
-        // contract this peer doesn't track).
+        self.finalize_state_commit(key, parameters, new_state).await;
+
+        Ok(StateCommitOutcome::Committed)
+    }
+
+    /// The complete post-store fan-out for a contract state this node has
+    /// just committed. **Every storing path in `runtime/executor_impl.rs` and
+    /// `runtime/contract_ops.rs` MUST call this** rather than hand-inlining a
+    /// subset of its legs.
+    ///
+    /// Those two files are the scope, not the whole crate.
+    /// `executor/mock_runtime.rs` stores and broadcasts directly, on a
+    /// different type, and is compiled unconditionally — so the audit grep in
+    /// `.claude/rules/bug-prevention-patterns.md` returns hits from it that are
+    /// NOT violations. Stated here so the first person to run that grep does
+    /// not have to rediscover it.
+    ///
+    /// One storing path in `contract_ops.rs` deliberately does NOT call this:
+    /// the related-contract install in `get_updated_state`, which writes back a
+    /// value it read from the local store moments earlier and so announces no
+    /// transition. Its justification is at the site, and a behavioural test
+    /// (`related_contract_install_does_not_fan_out_the_get_path_already_did`)
+    /// goes red if a call is added there.
+    ///
+    /// The four legs, in order:
+    ///
+    /// 1. `Ring::record_contract_update` — dashboard "last updated"
+    ///    telemetry. No-op when this peer does not track the contract
+    ///    (e.g. a relay forwarding an UPDATE).
+    /// 2. `send_update_notification` — locally-subscribed WebSocket
+    ///    clients.
+    /// 3. `send_delegate_contract_notifications` — locally-subscribed
+    ///    delegates. Best-effort and lossy by design (`try_send`); see
+    ///    that method.
+    /// 4. `broadcast_state_change` — the network. Suppressed for a
+    ///    contract flagged as violating a CRDT invariant, and emitted
+    ///    non-blocking (#4145).
+    ///
+    /// This exists because the legs kept getting dropped one at a time.
+    /// All FOUR storing paths — the initial-state install in
+    /// `bridged_upsert_contract_state_inner`, `commit_state_update` (the
+    /// merge path), and both branches of `contract_ops::perform_contract_put`
+    /// (the local re-PUT merge and the fresh store) — re-inlined their own
+    /// subset. The initial-install branch omitted the WS-client leg once, then
+    /// the delegate leg (#5481); both `perform_contract_put` branches omitted
+    /// the telemetry AND delegate legs. Each time silently: the subscription
+    /// is still registered, the delegate is still healthy, and no error is
+    /// produced anywhere. That is the "manually-inlined originator side
+    /// effects" row in `.claude/rules/bug-prevention-patterns.md`. The
+    /// source-scrape pin
+    /// `pool_tests::delegate_notification_tests::finalize_state_commit_is_the_only_post_store_fan_out_site`
+    /// scrapes BOTH files and fails if a leg leaves this helper or a second
+    /// site starts calling one directly.
+    ///
+    /// Every leg is best-effort: none of them can fail the commit, which
+    /// has already landed on disk by the time this runs. Note this is a
+    /// deliberate change for `perform_contract_put`, which previously
+    /// propagated a `send_update_notification` error as a `Put` failure —
+    /// i.e. reported a PUT as failed after its state had already been stored
+    /// and metered, over a WASM `get_state_delta` trap for some OTHER
+    /// client's subscription. The merge path has always logged and continued
+    /// in exactly that situation; this makes the two agree.
+    pub(super) async fn finalize_state_commit(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters<'_>,
+        new_state: &WrappedState,
+    ) {
+        // 1. Dashboard "last updated" telemetry.
         if let Some(op_manager) = &self.op_manager {
             op_manager.ring.record_contract_update(key);
         }
 
+        // 2. Locally-subscribed WebSocket clients.
         if let Err(err) = self
             .send_update_notification(key, parameters, new_state)
             .await
@@ -2228,56 +2369,11 @@ where
             );
         }
 
-        // Notify subscribed delegates about the state change
+        // 3. Locally-subscribed delegates.
         self.send_delegate_contract_notifications(key, new_state);
 
-        if let Some(op_manager) = &self.op_manager {
-            // Skip the broadcast entirely if this contract has been flagged
-            // as violating a CRDT invariant (e.g. non-idempotent
-            // `update_state`). The idempotency probe in
-            // `bridged_upsert_contract_state` sets this flag when it
-            // catches `update_state(update_state(S, U), U) != update_state(S, U)`.
-            // Once flagged, propagating this contract's state changes
-            // re-engages the broadcast storm we are trying to suppress.
-            // See `crate::ring::broken_invariants`.
-            if op_manager.ring.is_contract_broken(key) {
-                tracing::debug!(
-                    contract = %key,
-                    event = "broadcast_suppressed_broken_contract",
-                    "Skipping BroadcastStateChange for contract flagged as broken"
-                );
-            } else if let Err(err) =
-                op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
-                    key: *key,
-                    new_state: new_state.clone(),
-                    is_retry: false,
-                    is_reemit: false,
-                })
-            {
-                // Non-blocking emit: a 30-second `notify_node_event(...).await`
-                // on this commit path was the primary back-pressure source
-                // that wedged both gateways on 2026-05-24 (#4145). Missed
-                // broadcasts heal via the next UPDATE or via summary-mismatch
-                // SyncStateToPeer rounds — the executor must not stall here.
-                //
-                // Best-effort by design (see comment block above and
-                // #4145): a missed broadcast heals via the next UPDATE
-                // or summary-mismatch SyncStateToPeer round. Per-
-                // occurrence WARN here flooded gateways under fan-out
-                // at the same rate as the helper-internal log it
-                // mirrored (#4238). The rate-limited `notify_node_event:
-                // Notification channel full for too long` ERROR in
-                // op_state_manager.rs is the sustained-back-pressure
-                // alert operators should grep for.
-                tracing::debug!(
-                    contract = %key,
-                    error = %err,
-                    "Failed to broadcast state change to network peers (best-effort)"
-                );
-            }
-        }
-
-        Ok(())
+        // 4. The network.
+        self.broadcast_state_change(*key, new_state.clone()).await;
     }
 
     /// Send notifications to delegates subscribed to a contract's state changes.
@@ -2693,9 +2789,14 @@ where
 
     pub(super) async fn broadcast_state_change(&self, key: ContractKey, new_state: WrappedState) {
         if let Some(op_manager) = &self.op_manager {
-            // Mirror the broken-invariant gate in `commit_state_update`
-            // above. Same rationale: a contract flagged as non-idempotent
-            // must not be propagated.
+            // Skip the broadcast entirely if this contract has been flagged
+            // as violating a CRDT invariant (e.g. non-idempotent
+            // `update_state`). The idempotency probe in
+            // `bridged_upsert_contract_state` sets this flag when it
+            // catches `update_state(update_state(S, U), U) != update_state(S, U)`.
+            // Once flagged, propagating this contract's state changes
+            // re-engages the broadcast storm we are trying to suppress.
+            // See `crate::ring::broken_invariants`.
             if op_manager.ring.is_contract_broken(&key) {
                 tracing::debug!(
                     contract = %key,
@@ -2704,8 +2805,11 @@ where
                 );
                 return;
             }
-            // Non-blocking emit — see comment in the update path above
-            // and #4145 for the wedge this prevents.
+            // Non-blocking emit: a 30-second `notify_node_event(...).await`
+            // on the commit path was the primary back-pressure source that
+            // wedged both gateways on 2026-05-24 (#4145). Missed broadcasts
+            // heal via the next UPDATE or via summary-mismatch
+            // SyncStateToPeer rounds — the executor must not stall here.
             if let Err(err) =
                 op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                     key,
@@ -2714,10 +2818,14 @@ where
                     is_reemit: false,
                 })
             {
-                // Best-effort by design — see #4145 and the sibling
-                // commit path above. Per-occurrence WARN here re-
-                // introduced the #4238 spam at the caller layer even
-                // after the helper-internal downgrade.
+                // Best-effort by design (see #4145): a missed broadcast
+                // heals via the next UPDATE or summary-mismatch
+                // SyncStateToPeer round. Per-occurrence WARN here flooded
+                // gateways under fan-out at the same rate as the
+                // helper-internal log it mirrored (#4238). The
+                // rate-limited `notify_node_event: Notification channel
+                // full for too long` ERROR in op_state_manager.rs is the
+                // sustained-back-pressure alert operators should grep for.
                 tracing::debug!(
                     contract = %key,
                     error = %err,

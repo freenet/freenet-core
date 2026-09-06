@@ -237,7 +237,7 @@ mod tests {
     /// keep working — a rename that silently breaks a released command is worse than
     /// the naming it fixes. `verify-merge` is the name going forward because
     /// "conformance" never said what was being checked: it is the merge laws, and a
-    /// contract that breaks them cannot converge.
+    /// contract that breaks them usually cannot converge.
     #[test]
     fn both_the_new_and_released_subcommand_names_parse() {
         use clap::Parser;

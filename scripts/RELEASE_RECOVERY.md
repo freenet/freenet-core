@@ -204,14 +204,34 @@ failure`, `Upload freenet binary => skipped`, `Upload fdev binary => skipped`.)
 **If this job fails at signing, the failure is Azure-side and cannot be fixed
 from the repo.** Unlike every other release secret, Windows signing is
 fail-closed: the `Verify signatures` step throws if either binary is unsigned,
-invalid, or missing its RFC3161 timestamp, and `attach-to-release` needs this
-job, so the release stops as a draft rather than shipping unsigned binaries.
+invalid, missing its RFC3161 timestamp, or signed by a publisher other than
+`CN=Freenet Project Inc`, and `attach-to-release` needs this job, so the
+release stops as a draft rather than shipping unsigned binaries.
 Read the `Verify signatures` step output first — it prints each binary's status
 and signer subject. Expect:
 
 ```
 CN=Freenet Project Inc, O=Freenet Project Inc, L=Austin, S=Texas, C=US
 ```
+
+**If the failure is `Unexpected signer`** rather than unsigned/untimestamped,
+the binary WAS signed, just not by us. Three possibilities, in the order worth
+checking: the Azure certificate profile was repointed (misconfiguration); the
+certificate was legitimately reissued under a changed name (e.g. the company
+name changed) — in which case update the expected CN deliberately and in a
+reviewed PR, in BOTH the comparison and the thrown message in the `Verify
+signatures` step, and in its pin in
+`crates/core/tests/windows_signing_order.rs`; or, least likely and most
+serious, someone else signed it. Never delete the check to get a release out:
+that is the one action that converts a blocked release into an unsigned one
+shipped to users whose Windows auto-update has no canary (#5341).
+
+Note that a repoint is not guaranteed to surface as `Unexpected signer`. If the
+profile it was repointed to does not chain to a root the runner trusts — an
+Azure Trusted Signing *test* profile, or a private-trust profile — then
+`$sig.Status` is not `Valid` and the step throws `Unsigned or invalid` first, on
+an earlier line. A repoint is therefore worth checking under either message,
+not only this one.
 
 Common causes, in the order worth checking: the `release` environment or the
 `AZURE_*` secrets were changed (the Entra federated credential is pinned to the

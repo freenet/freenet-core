@@ -36,7 +36,22 @@ use super::verifier::ConformanceCase;
 /// Bump when the meaning of a field changes. A peer that does not understand a
 /// schema version rejects the evidence rather than guessing: misinterpreting a
 /// reproducer is exactly how a false positive would spread.
-pub const EVIDENCE_SCHEMA_VERSION: u16 = 1;
+pub const EVIDENCE_SCHEMA_VERSION: u16 = 2;
+
+/// Magic prefix so a truncated, raw, or unrelated file fails fast with a clear message
+/// rather than as a confusing deserialization error deep in bincode.
+pub const EVIDENCE_MAGIC: &[u8; 8] = b"FRNTEVD1";
+
+/// Errors encountered when encoding or decoding conformance evidence.
+#[derive(Debug, thiserror::Error)]
+pub enum EvidenceError {
+    #[error("not conformance evidence (bad magic)")]
+    BadMagic,
+    #[error("evidence uses schema version {found}, this build understands {supported}")]
+    UnsupportedSchema { found: u16, supported: u16 },
+    #[error("decode: {0}")]
+    Decode(String),
+}
 
 /// Hard ceiling on one evidence object's input bytes.
 ///
@@ -353,6 +368,35 @@ impl ConformanceEvidence {
             summary: self.summary.as_ref().map(|s| Arc::from(s.as_slice())),
             related,
         })
+    }
+
+    /// Encode with framing: 8-byte magic (`FRNTEVD1`), 2-byte schema version (LE),
+    /// followed by the bincode-serialized payload.
+    pub fn encode(&self) -> Result<Vec<u8>, EvidenceError> {
+        let mut out = Vec::with_capacity(self.input_bytes() + 128);
+        out.extend_from_slice(EVIDENCE_MAGIC);
+        out.extend_from_slice(&self.schema_version.to_le_bytes());
+        let body = bincode::serialize(self).map_err(|e| EvidenceError::Decode(e.to_string()))?;
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Decode an evidence file, verifying magic and schema version *before*
+    /// attempting bincode deserialization.
+    pub fn decode(bytes: &[u8]) -> Result<Self, EvidenceError> {
+        if bytes.len() < EVIDENCE_MAGIC.len() + 2
+            || &bytes[..EVIDENCE_MAGIC.len()] != EVIDENCE_MAGIC
+        {
+            return Err(EvidenceError::BadMagic);
+        }
+        let version = u16::from_le_bytes([bytes[8], bytes[9]]);
+        if version != EVIDENCE_SCHEMA_VERSION {
+            return Err(EvidenceError::UnsupportedSchema {
+                found: version,
+                supported: EVIDENCE_SCHEMA_VERSION,
+            });
+        }
+        bincode::deserialize(&bytes[10..]).map_err(|e| EvidenceError::Decode(e.to_string()))
     }
 }
 

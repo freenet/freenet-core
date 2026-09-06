@@ -6,6 +6,16 @@ paths:
 
 # Operations Module Rules
 
+> **Originator side effects after a task-per-tx migration.** A driver that
+> replaces a legacy terminal-reply handler must run the FULL side-effect
+> sequence, not a hand-inlined subset — the omitted call is silent (the op
+> reports success and every test stays green). #3851 and #4223 are the
+> precedents, the second costing ~37% of GETs through subscriber peers for
+> months. The pattern, the fix shape (`finalize_*` helper plus a
+> mutation-verified source pin) and the audit grep are in
+> `.claude/rules/bug-prevention-patterns.md` — read that row before migrating
+> an op.
+
 ## Execution Model
 
 Every operation runs as a task-per-transaction driver: each `Transaction`

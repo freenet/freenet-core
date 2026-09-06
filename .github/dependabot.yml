@@ -148,6 +148,21 @@ updates:
           - "patch"
 
   - package-ecosystem: "docker"
+    directory: "/docker/freenet-node"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 20
+    groups:
+      docker-freenet-node-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "docker"
     directory: "/docker/test-runner"
     schedule:
       interval: "monthly"

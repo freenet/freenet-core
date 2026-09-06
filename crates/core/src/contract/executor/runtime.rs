@@ -878,6 +878,34 @@ pub(crate) fn set_test_network_fetch_override(stub: Option<NetworkFetchStub>) {
     TEST_NETWORK_FETCH_OVERRIDE.with(|cell| *cell.borrow_mut() = stub);
 }
 
+/// Test hook for the OTHER network-fetch leg: `local_state_or_from_network`.
+///
+/// Distinct from [`NetworkFetchStub`] because the two legs return different
+/// things and only this one can install a contract. `fetch_related_via_network`
+/// resolves a bare state; `local_state_or_from_network` resolves a whole
+/// `GetResult`, and it is the `GetResult::contract` half that lets
+/// `get_updated_state` install a SECOND contract mid-UPDATE — the site whose
+/// post-store fan-out #5481 is about. Returning `None` stands for
+/// `SubOpGetOutcome::NotFound`.
+#[cfg(test)]
+pub(crate) type SubOpGetStub =
+    std::rc::Rc<dyn Fn(ContractInstanceId) -> Option<crate::operations::get::GetResult>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook used by `local_state_or_from_network` to bypass the real
+    /// network sub-op driver. Set with [`set_test_sub_op_get_override`]
+    /// inside a `#[tokio::test(flavor = "current_thread")]` so the
+    /// thread-local lookup hits the same task that ran the test setup.
+    static TEST_SUB_OP_GET_OVERRIDE: std::cell::RefCell<Option<SubOpGetStub>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_sub_op_get_override(stub: Option<SubOpGetStub>) {
+    TEST_SUB_OP_GET_OVERRIDE.with(|cell| *cell.borrow_mut() = stub);
+}
+
 #[cfg(test)]
 mod executor_pin_tests {
     /// Pin: `local_state_or_from_network` MUST use the sub-op GET
@@ -2194,6 +2222,13 @@ mod remove_contract_tests {
     /// origin-record write on demand.
     #[cfg(feature = "redb")]
     #[tokio::test(flavor = "multi_thread")]
+    // Shares the process-global `POISON_RECOVERY_TRIGGERED` counter with the
+    // poison-recovery tests in `contract::storages::redb`, because driving the
+    // fault injector trips it through `route_txn_error`/`route_redb_error`/
+    // `commit_guarded` whether or not this test looks at it. The key is
+    // cross-module by design: `serial_test` serializes on the key, not the
+    // module. Pinned by `every_test_using_the_failure_injector_is_serialized`.
+    #[serial_test::serial(redb_poison_recovery)]
     async fn register_aborts_when_origin_record_fails_then_recovers() {
         use crate::contract::storages::redb::{FailingBackend, open_redb_with_backend};
         use crate::wasm_runtime::SecretScope;

@@ -25,8 +25,8 @@ use parking_lot::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 pub use hosting::{
-    AddClientSubscriptionResult, AddSubscriberOutcome, ClientDisconnectResult, SubscribeResult,
-    SubscribedContractSnapshot,
+    AddClientSubscriptionResult, AddSubscriberOutcome, ClientDisconnectResult, HostingReason,
+    HostingReasonStats, SubscribeResult, SubscribedContractSnapshot,
 };
 
 use crate::message::TransactionType;
@@ -690,7 +690,14 @@ impl Ring {
             broken_invariants: BrokenInvariantsTracker::new(time_source.clone()),
             governance,
             update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
-                time_source.clone(),
+                // Production passes `None` and gets `time_source` (the real
+                // clock). The override exists so a test can decide the
+                // limiter's verdict instead of racing MIN_UPDATE_INTERVAL —
+                // see `NodeConfig::update_rate_limit_time_source_override`.
+                config
+                    .update_rate_limit_time_source_override
+                    .clone()
+                    .unwrap_or_else(|| time_source.clone()),
                 max_connections,
             )),
             merge_backoff: Arc::new(merge_backoff::MergeBackoff::new(time_source.clone())),
@@ -4420,6 +4427,14 @@ impl Ring {
     /// This is the actual count of contracts this node is caching/hosting.
     pub fn hosting_contracts_count(&self) -> usize {
         self.hosting_manager.hosting_contracts_count()
+    }
+
+    /// The same hosted set as [`Self::hosting_contracts_count`], partitioned by
+    /// WHY each contract is held, with state bytes per bucket. Backs the
+    /// `freenet.node.contracts.hosted{,.bytes}` OTel gauges. See
+    /// [`HostingReason`].
+    pub fn hosted_by_reason(&self) -> HostingReasonStats {
+        self.hosting_manager.hosted_by_reason()
     }
 
     /// Number of active network subscription leases this node currently holds.
