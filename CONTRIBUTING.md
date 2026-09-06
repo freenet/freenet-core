@@ -32,6 +32,27 @@ When in doubt about which bucket you're in, file an issue first. It costs you a 
 - **Read the codebase conventions.** See [AGENTS.md](AGENTS.md) for project structure, coding standards, and testing requirements.
 - **Ask questions.** If something is unclear, ask on the issue or in our [Matrix channel](https://matrix.to/#/#freenet:matrix.org) before writing code.
 
+## Building with Nix (optional)
+
+An alternative to a local rustup install, not a requirement.
+
+```bash
+nix develop                  # dev shell: pinned toolchain, nextest, shellcheck, …
+nix build .#freenet          # build the node binary (result/bin/freenet)
+nix run .                    # run the auto-updating wrapper
+```
+
+The shell's toolchain is pinned to [`rust-toolchain.toml`](rust-toolchain.toml),
+so `cargo fmt` and `cargo clippy -- -D warnings` inside it agree with CI. Builds
+are reproducible: the same source gives a bit-identical binary, since
+`BUILD_TIMESTAMP` comes from `SOURCE_DATE_EPOCH` and the git provenance from the
+flake rather than a `.git` directory.
+
+Packagers building outside Nix can supply that provenance with
+`FREENET_GIT_COMMIT_HASH` (≤40 hex characters) and `FREENET_GIT_IS_DIRTY`
+(`1`/`true`, `0`/`false`, or empty to detect it with `git`). The latter gates
+auto-update — a build marked dirty will never update itself.
+
 ## Quality Standards
 
 - PR titles must follow [Conventional Commits](https://www.conventionalcommits.org/) format (`feat:`, `fix:`, `docs:`, etc.) — CI enforces this.
