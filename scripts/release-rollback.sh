@@ -43,12 +43,17 @@ record_failure() {
 # `pipefail`, under which a producer piped into a short-circuiting reader dies
 # of SIGPIPE and takes the pipeline's status with it (see
 # .claude/rules/bug-prevention-patterns.md).
-indent_output() {
+indent_note() {
     [[ -n "$1" ]] || return 0
     local line
     while IFS= read -r line; do
-        echo "      $line" >&2
+        echo "      $line"
     done <<<"$1"
+}
+
+# The same, on stderr, for a step's error text.
+indent_output() {
+    indent_note "$1" >&2
 }
 
 show_help() {
@@ -64,16 +69,22 @@ show_help() {
     echo "Options:"
     echo "  --version X.Y.Z      Version to rollback (required)"
     echo "  --yank-crates        Yank crates from crates.io (optional, use with caution)"
-    echo "  --fdev-version X.Y.Z fdev version to yank. Only needed when the release tag"
-    echo "                       is no longer available locally or on origin; otherwise"
-    echo "                       it is read from crates/fdev/Cargo.toml at the tag."
+    echo "  --fdev-version X.Y.Z fdev version to yank. Normally read from"
+    echo "                       crates/fdev/Cargo.toml at ORIGIN's release tag. Needed"
+    echo "                       whenever origin cannot supply it: the tag is gone from"
+    echo "                       origin, origin is unreachable, or origin is not"
+    echo "                       freenet/freenet-core. A LOCAL tag is only ever a hint --"
+    echo "                       an aborted release leaves stale ones, and a near-miss"
+    echo "                       yanks a good release's fdev."
     echo "  --dry-run            Show what would be done without executing"
     echo "  --help               Show this help"
     echo
     echo "Example: $0 --version 0.1.32"
     echo
     echo "⚠️  WARNING: This is a destructive operation!"
-    echo "    Use with caution. Yanking from crates.io cannot be undone."
+    echo "    Use with caution. A yank is reversible (\`cargo yank --undo --version"
+    echo "    X.Y.Z <crate>\`), but while it stands it breaks dependency resolution"
+    echo "    for everyone building against that version."
 }
 
 require_value() {
@@ -183,15 +194,55 @@ fdev_version_from_ref() {
 # ORIGIN'S tag wins over a local tag of the same name. The local one can be
 # stale -- release.sh skips tag creation when a tag of that name already exists,
 # so an aborted run leaves one behind, while the tag that actually shipped is
-# the one CI pushed. Reading a stale local tag would name a different release's
-# fdev, and a yank cannot be undone. `git fetch <remote> refs/tags/<tag>` writes
-# FETCH_HEAD only; it does not create or move the local tag.
+# the one CI pushed. Reading a stale local tag names a DIFFERENT release's fdev,
+# and yanking a good release's crate breaks every build that resolves it until
+# somebody notices and undoes it. `git fetch <remote> refs/tags/<tag>` writes
+# FETCH_HEAD only; it does not create or move the local tag -- but only with
+# --no-tags, because `remote.origin.tagOpt = --tags` otherwise turns even this
+# single-ref fetch into a full tag download (demonstrated: a DRY RUN created a
+# local v9.9.9).
+#
+# The resolution's PROVENANCE is recorded alongside the number, because the two
+# sources are not interchangeable. Origin's tag (or the operator's own
+# --fdev-version) is evidence; a local tag is a hint that may be stale, and this
+# number is handed to an irreversible-in-practice `cargo yank`.
+RESOLVED_FDEV=""
+RESOLVED_FDEV_SOURCE=""
+
+# Is `origin` really freenet/freenet-core?
+#
+# Steps 2 and 3 delete from whatever origin happens to be, and from a HARDCODED
+# --repo freenet/freenet-core -- but the version this resolves is passed to
+# `cargo yank`, which always reaches the REAL crates.io. So with origin pointed
+# at a fork, a tag naming a different fdev would take a good release's crate off
+# the real registry while every other step operated on the fork. Origin is a
+# version source only when it is the project's own repository.
+origin_is_freenet_core() {
+    local url
+    url="$(git -C "$PROJECT_ROOT" remote get-url origin 2>/dev/null)" || return 1
+    url="${url%.git}"
+    url="${url%/}"
+    [[ "$url" == *"github.com/freenet/freenet-core" || "$url" == *"github.com:freenet/freenet-core" ]]
+}
+
+# Why origin did not supply a version: "unusable" (refused -- not freenet-core)
+# or "unreadable" (fetch failed / no such tag). The distinction matters in the
+# message, because "could not read origin" sends an operator to check the
+# network when the actual answer is that their remote points somewhere else.
+ORIGIN_SOURCE_PROBLEM=""
+
 resolve_fdev_version() {
     local from_origin="" from_local=""
 
-    if git -C "$PROJECT_ROOT" fetch --quiet origin "refs/tags/$TAG" 2>/dev/null; then
+    if ! origin_is_freenet_core; then
+        ORIGIN_SOURCE_PROBLEM="unusable"
+        echo "warning: origin is not freenet/freenet-core, so its tags are not used as a" >&2
+        echo "         source for the fdev version to yank (a yank always reaches the" >&2
+        echo "         real crates.io, whatever origin points at)." >&2
+    elif git -C "$PROJECT_ROOT" fetch --quiet --no-tags origin "refs/tags/$TAG" 2>/dev/null; then
         from_origin="$(fdev_version_from_ref FETCH_HEAD)" || from_origin=""
     fi
+    [[ -n "$from_origin" || -n "$ORIGIN_SOURCE_PROBLEM" ]] || ORIGIN_SOURCE_PROBLEM="unreadable"
     from_local="$(fdev_version_from_ref "refs/tags/$TAG")" || from_local=""
 
     if [[ -n "$from_origin" ]]; then
@@ -199,14 +250,21 @@ resolve_fdev_version() {
             echo "warning: local $TAG names fdev $from_local, origin's names $from_origin." >&2
             echo "         Using origin's -- that is the tag the release was cut from." >&2
         fi
-        echo "$from_origin"
+        RESOLVED_FDEV="$from_origin"
+        RESOLVED_FDEV_SOURCE="origin"
         return 0
     fi
 
     if [[ -n "$from_local" ]]; then
-        echo "warning: could not read $TAG from origin; using the LOCAL tag, which may" >&2
-        echo "         be stale. Pass --fdev-version to be certain." >&2
-        echo "$from_local"
+        if [[ "$ORIGIN_SOURCE_PROBLEM" == "unusable" ]]; then
+            echo "warning: origin cannot be used as a version source (above). The LOCAL $TAG" >&2
+        else
+            echo "warning: could not read $TAG from origin. The LOCAL $TAG" >&2
+        fi
+        echo "         names fdev $from_local, but a local tag can be stale, so that is a" >&2
+        echo "         HINT only -- not a version this script will yank on." >&2
+        RESOLVED_FDEV="$from_local"
+        RESOLVED_FDEV_SOURCE="local"
         return 0
     fi
 
@@ -217,23 +275,38 @@ resolve_fdev_version() {
 # release this reads from, so a version that cannot be established afterwards
 # cannot be established at all. Done even without --yank-crates, so the hints at
 # the end of a tag-only rollback can carry the number the next run will need.
-RESOLVED_FDEV=""
-if RESOLVED_FDEV="$(resolve_fdev_version)"; then
-    [[ "$RESOLVED_FDEV" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || RESOLVED_FDEV=""
-else
+resolve_fdev_version || true
+if [[ ! "$RESOLVED_FDEV" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     RESOLVED_FDEV=""
+    RESOLVED_FDEV_SOURCE=""
 fi
 
-if [[ -n "$FDEV_VERSION" && -n "$RESOLVED_FDEV" && "$FDEV_VERSION" != "$RESOLVED_FDEV" ]]; then
-    # Not fatal -- an operator may deliberately be yanking a version the tag does
-    # not name -- but said loudly, above the confirmation prompt, because
-    # adjacent fdev patch versions all exist on crates.io and a near-miss yanks
-    # a GOOD release.
-    echo "⚠️  --fdev-version $FDEV_VERSION does not match $TAG, which names fdev $RESOLVED_FDEV."
-    echo "    Yanking $FDEV_VERSION as instructed."
-    echo
+# Where the number that reaches `cargo yank` actually came from: "operator",
+# "origin", "local", or empty. Everything downstream that either ACTS on the
+# number or hands it back to the operator for a re-run consults this, so a
+# local-tag guess can never be laundered into something that reads as fact.
+FDEV_VERSION_SOURCE=""
+if [[ -n "$FDEV_VERSION" ]]; then
+    FDEV_VERSION_SOURCE="operator"
+    if [[ -n "$RESOLVED_FDEV" && "$FDEV_VERSION" != "$RESOLVED_FDEV" ]]; then
+        # Not fatal -- an operator may deliberately be yanking a version the tag
+        # does not name -- but said loudly, above the confirmation prompt,
+        # because adjacent fdev patch versions all exist on crates.io and a
+        # near-miss yanks a GOOD release.
+        if [[ "$RESOLVED_FDEV_SOURCE" == "local" ]]; then
+            echo "⚠️  --fdev-version $FDEV_VERSION does not match the LOCAL $TAG, which names"
+            echo "    fdev $RESOLVED_FDEV. Origin could not be read, so the local tag may itself"
+            echo "    be the stale one. Yanking $FDEV_VERSION as instructed."
+        else
+            echo "⚠️  --fdev-version $FDEV_VERSION does not match $TAG, which names fdev $RESOLVED_FDEV."
+            echo "    Yanking $FDEV_VERSION as instructed."
+        fi
+        echo
+    fi
+else
+    FDEV_VERSION="$RESOLVED_FDEV"
+    FDEV_VERSION_SOURCE="$RESOLVED_FDEV_SOURCE"
 fi
-[[ -n "$FDEV_VERSION" ]] || FDEV_VERSION="$RESOLVED_FDEV"
 
 if [[ "$YANK_CRATES" == "true" && -z "$FDEV_VERSION" ]]; then
     echo "Error: cannot determine which fdev version shipped with $TAG."
@@ -248,6 +321,36 @@ if [[ "$YANK_CRATES" == "true" && -z "$FDEV_VERSION" ]]; then
     exit 1
 fi
 
+# A LOCAL tag is never enough to yank on.
+#
+# Both preconditions are routine and they compose: release.sh skips tag creation
+# when a local tag of that name exists, so an aborted run leaves a stale one
+# behind, and an origin that cannot be reached mid-incident is ordinary. With
+# only the local tag readable the script would otherwise print a stale number as
+# fact and yank a GOOD release's fdev -- adjacent fdev patch versions all exist
+# on crates.io, so the yank succeeds. Stop and make the operator name it.
+if [[ "$YANK_CRATES" == "true" && "$FDEV_VERSION_SOURCE" == "local" ]]; then
+    echo "Error: cannot determine which fdev version shipped with $TAG."
+    echo
+    if [[ "$ORIGIN_SOURCE_PROBLEM" == "unusable" ]]; then
+        echo "  Origin is not freenet/freenet-core, so it is not a version source, and"
+        echo "  the only thing left is the LOCAL $TAG, which names fdev $FDEV_VERSION."
+    else
+        echo "  Origin could not be read, so the only source left is the LOCAL $TAG,"
+        echo "  which names fdev $FDEV_VERSION."
+    fi
+    echo "  That is a hint, not evidence:"
+    echo "  release.sh skips tag creation when a local tag already exists, so an"
+    echo "  aborted run leaves one pointing at a different release -- and yanking"
+    echo "  on it takes a GOOD release's fdev off crates.io."
+    echo
+    echo "  Fix origin and re-run, or confirm the version by hand"
+    echo "  (https://crates.io/crates/fdev/versions, and the release announcement"
+    echo "  for freenet $VERSION) and pass it explicitly:"
+    echo "    $0 --version $VERSION --yank-crates --fdev-version X.Y.Z"
+    exit 1
+fi
+
 echo "Freenet Release Rollback"
 echo "========================"
 echo "Version:     $VERSION"
@@ -257,7 +360,13 @@ if [[ "$DRY_RUN" == "true" ]]; then
 fi
 if [[ "$YANK_CRATES" == "true" ]]; then
     echo "Yank crates: YES"
-    echo "fdev:        $FDEV_VERSION"
+    # Never a bare number: the whole point of the gate above is that where this
+    # came from decides whether it may be acted on.
+    case "$FDEV_VERSION_SOURCE" in
+        origin)   echo "fdev:        $FDEV_VERSION (read from origin's $TAG)" ;;
+        operator) echo "fdev:        $FDEV_VERSION (given on the command line)" ;;
+        *)        echo "fdev:        $FDEV_VERSION" ;;
+    esac
 fi
 echo
 
@@ -265,7 +374,10 @@ echo
 if [[ "$DRY_RUN" == "false" ]]; then
     echo "⚠️  WARNING: This will rollback release $VERSION"
     if [[ "$YANK_CRATES" == "true" ]]; then
-        echo "⚠️  This includes YANKING crates from crates.io (cannot be undone)"
+        echo "⚠️  This includes YANKING crates from crates.io."
+        echo "    A yank is reversible (\`cargo yank --undo --version X.Y.Z <crate>\`), but"
+        echo "    until it is undone it breaks dependency resolution for anyone building"
+        echo "    against that version."
     fi
     echo
     # An `if`, because a bare `read` that hits EOF (a non-interactive caller, or
@@ -291,7 +403,12 @@ if git -C "$PROJECT_ROOT" rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "[DRY RUN]"
     elif step_output="$(git -C "$PROJECT_ROOT" tag -d "$TAG" 2>&1)"; then
+        # `git tag -d` prints "Deleted tag 'vX.Y.Z' (was <sha>)". That SHA is the
+        # only record of where the tag pointed, and the next two steps delete the
+        # tag from origin and delete the release page -- so print it on SUCCESS,
+        # not only when something goes wrong.
         echo "✓"
+        indent_note "$step_output"
     else
         echo "✗ (failed)"
         indent_output "$step_output"
@@ -467,11 +584,22 @@ if [[ $FAILURE_COUNT -gt 0 ]]; then
     echo
     echo "The release is only partially rolled back. Fix the cause and re-run, or"
     echo "finish the failed steps by hand (see scripts/RELEASE_RECOVERY.md)."
-    if [[ -n "$FDEV_VERSION" ]]; then
+    # Only a version that came from origin or from the operator is echoed back
+    # as something to re-run with. A local-tag reading is a hint, and printing it
+    # inside a ready-to-paste command turns it into an instruction -- which on
+    # the second run also silences the mismatch warning, because the operator is
+    # now "explicitly" passing the very guess this script produced.
+    if [[ -n "$FDEV_VERSION" && "$FDEV_VERSION_SOURCE" != "local" ]]; then
         echo
         echo "A re-run may no longer be able to read the fdev version from $TAG,"
         echo "so pass it explicitly:"
         echo "  $0 --version $VERSION --yank-crates --fdev-version $FDEV_VERSION"
+    elif [[ "$FDEV_VERSION_SOURCE" == "local" ]]; then
+        echo
+        echo "The local $TAG names fdev $FDEV_VERSION, but origin did not confirm it,"
+        echo "so that is a hint and not a version to yank on. Confirm which fdev shipped"
+        echo "with freenet $VERSION (https://crates.io/crates/fdev/versions, and the"
+        echo "release announcement) before re-running with --yank-crates."
     fi
     exit 1
 fi
@@ -482,11 +610,21 @@ echo "Next steps:"
 echo "  • Verify the tag and release are gone: gh release list --repo freenet/freenet-core"
 echo "  • Check crates.io: https://crates.io/crates/freenet"
 if [[ "$YANK_CRATES" == "false" ]]; then
-    if [[ -n "$FDEV_VERSION" ]]; then
+    if [[ -n "$FDEV_VERSION" && "$FDEV_VERSION_SOURCE" != "local" ]]; then
         # --fdev-version is included because THIS run deleted the tag the number
         # is read from; without it the suggested command stops with an error.
         echo "  • To yank crates, run: $0 --version $VERSION --yank-crates --fdev-version $FDEV_VERSION"
     else
-        echo "  • To yank crates, run: $0 --version $VERSION --yank-crates"
+        # No version this run is willing to stand behind -- either nothing
+        # resolved, or only a local tag did. A bare --yank-crates re-run would
+        # hard-error (the tag it reads from was just deleted), so do not suggest
+        # one: name the lookup and the placeholder instead.
+        if [[ "$FDEV_VERSION_SOURCE" == "local" ]]; then
+            echo "  • The local $TAG named fdev $FDEV_VERSION, but origin did not confirm it,"
+            echo "    so treat that as a hint only."
+        fi
+        echo "  • To yank crates, look up the fdev version that shipped with freenet $VERSION"
+        echo "    (https://crates.io/crates/fdev/versions, or the release announcement) and run:"
+        echo "      $0 --version $VERSION --yank-crates --fdev-version X.Y.Z"
     fi
 fi

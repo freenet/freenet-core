@@ -67,6 +67,9 @@ TAG_FDEV="0.3.291"
 MAIN_FDEV="0.3.300"
 STALE_FDEV="0.3.100"
 ARITHMETIC_FDEV="0.4.129"
+# What a FORK's tag of the same name claims, for the case where `origin` is not
+# freenet/freenet-core. The yank always reaches the real crates.io regardless.
+FORK_FDEV="0.3.999"
 
 SANDBOX_ROOT="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX_ROOT"' EXIT
@@ -88,18 +91,29 @@ make_sandbox() {
     SANDBOX="$(mktemp -d -p "$SANDBOX_ROOT")"
     BIN="$SANDBOX/bin"
     REPO="$SANDBOX/repo"
-    ORIGIN="$SANDBOX/origin.git"
+    # The script refuses to take the fdev version from an origin that is not
+    # freenet/freenet-core (the yank reaches the real crates.io whatever origin
+    # is). Give the sandbox's bare repo a path the real matcher accepts, rather
+    # than adding a test-only backdoor to a destructive script.
+    ORIGIN="$SANDBOX/github.com/freenet/freenet-core.git"
     STUB_LOG="$SANDBOX/stub.log"
     OUT="$SANDBOX/out.txt"
     REPLY_INPUT="yes"
     mkdir -p "$BIN"
     : > "$STUB_LOG"
 
+    mkdir -p "$(dirname "$ORIGIN")"
     git init --quiet --bare "$ORIGIN"
     git init --quiet -b main "$REPO"
     git -C "$REPO" config user.email "test@example.invalid"
     git -C "$REPO" config user.name "Rollback Test"
     git -C "$REPO" remote add origin "$ORIGIN"
+    # The hostile-but-legal config the resolution fetch has to survive: with
+    # `tagOpt = --tags` a fetch of ONE ref also downloads every tag, so a
+    # resolution -- including one inside a DRY RUN -- creates local tags as a
+    # side effect. Set on every sandbox so the --no-tags guard is exercised by
+    # the whole suite rather than by one case that remembers to opt in.
+    git -C "$REPO" config remote.origin.tagOpt --tags
 
     mkdir -p "$REPO/scripts" "$REPO/crates/fdev"
     cp "$ROLLBACK_SH" "$REPO/scripts/release-rollback.sh"
@@ -127,6 +141,21 @@ make_sandbox() {
     fi
 
     write_stubs
+}
+
+# What an aborted release attempt leaves behind: a LOCAL tag pointing at a
+# commit naming STALE_FDEV, while origin's tag of the same name still points at
+# the commit that actually shipped (TAG_FDEV). release.sh skips tag creation
+# when a local tag of that name exists, which is how the two diverge.
+make_local_tag_stale() {
+    local shipped_sha
+    shipped_sha="$(git -C "$REPO" rev-parse "refs/tags/v$FREENET_VERSION")"
+    write_fdev_manifest "$STALE_FDEV"
+    git -C "$REPO" add crates >/dev/null
+    git -C "$REPO" commit --quiet -m "aborted release attempt"
+    git -C "$REPO" tag -d "v$FREENET_VERSION" >/dev/null
+    git -C "$REPO" tag -a "v$FREENET_VERSION" -m "stale local tag"
+    git -C "$REPO" push --quiet --force origin "$shipped_sha:refs/tags/v$FREENET_VERSION"
 }
 
 write_fdev_manifest() {
@@ -233,16 +262,26 @@ assert_stubs_intercept() {
 # core.hooksPath would neutralise the pre-receive hook case below), and no
 # registry or GitHub credentials, so a stub that somehow failed to intercept
 # cannot authenticate against production either.
+_invoke_rollback() {
+    cd "$REPO" || exit 99
+    PATH="$BIN:$PATH" STUB_LOG="$STUB_LOG" \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        CARGO_HOME="$SANDBOX/cargo-home" CARGO_REGISTRY_TOKEN='' \
+        GH_TOKEN='' GITHUB_TOKEN='' GH_CONFIG_DIR="$SANDBOX/gh-config" \
+        bash scripts/release-rollback.sh "$@"
+}
+
 run_rollback() {
     assert_stubs_intercept
-    (
-        cd "$REPO" || exit 99
-        PATH="$BIN:$PATH" STUB_LOG="$STUB_LOG" \
-            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-            CARGO_HOME="$SANDBOX/cargo-home" CARGO_REGISTRY_TOKEN='' \
-            GH_TOKEN='' GITHUB_TOKEN='' GH_CONFIG_DIR="$SANDBOX/gh-config" \
-            bash scripts/release-rollback.sh "$@" <<<"$REPLY_INPUT"
-    ) > "$OUT" 2>&1
+    ( _invoke_rollback "$@" <<<"$REPLY_INPUT" ) > "$OUT" 2>&1
+    RC=$?
+}
+
+# As run_rollback, but with stdin at EOF -- what cron, CI, a systemd unit or a
+# `< /dev/null` invocation actually look like to the confirmation prompt.
+run_rollback_no_stdin() {
+    assert_stubs_intercept
+    ( _invoke_rollback "$@" </dev/null ) > "$OUT" 2>&1
     RC=$?
 }
 
@@ -301,6 +340,16 @@ test_fdev_version_comes_from_the_release_tag() {
         pass "the local and origin tags are actually deleted"
     else
         fail "a tag survived the rollback (local: $(local_tag_exists && echo yes || echo no), origin: $(origin_tag_exists && echo yes || echo no))" "$(dump)"
+    fi
+
+    # `git tag -d` prints "Deleted tag 'vX' (was <sha>)" -- the only record of
+    # where the tag pointed, printed immediately before the script deletes that
+    # tag from origin and deletes the release page. Capturing it and showing it
+    # only on FAILURE loses it on the path that actually destroys things.
+    if printed "Deleted tag 'v$FREENET_VERSION' (was "; then
+        pass "the deleted tag's SHA is reported on success, not only on failure"
+    else
+        fail "the deleted tag's SHA was swallowed on the successful path" "$(dump)"
     fi
 
     if logged "gh release delete v$FREENET_VERSION"; then
@@ -590,18 +639,30 @@ test_dry_run_shows_the_fdev_version_without_yanking() {
 test_fdev_version_resolves_from_origin_when_the_local_tag_is_gone() {
     make_sandbox
     git -C "$REPO" tag -d "v$FREENET_VERSION" >/dev/null
+
+    # A DRY RUN first, and that is the whole point of the ordering: a dry run
+    # deletes nothing, so a local tag created by the RESOLUTION FETCH is still
+    # there to be seen. After a real run step 1 deletes the tag either way, so
+    # the same check there would pass whether or not the fetch created it.
+    #
+    # This is the --no-tags guard. The sandbox sets `tagOpt = --tags`, under
+    # which `git fetch origin refs/tags/<tag>` also downloads every other tag --
+    # so a dry run, whose contract is to touch nothing, silently creates local
+    # tags.
+    run_rollback --version "$FREENET_VERSION" --yank-crates --dry-run
+
+    if local_tag_exists; then
+        fail "a DRY RUN's resolution fetch created a local tag" "$(dump)"
+    else
+        pass "the resolution fetch creates no local tag, not even under --dry-run"
+    fi
+
     run_rollback --version "$FREENET_VERSION" --yank-crates
 
     if logged "cargo yank --version $TAG_FDEV fdev"; then
         pass "the fdev version is read from origin when the local tag is gone"
     else
         fail "resolution failed with the tag still on origin" "$(dump)"
-    fi
-
-    if local_tag_exists; then
-        fail "the resolution fetch recreated the local tag" "$(dump)"
-    else
-        pass "the resolution fetch does not recreate the local tag"
     fi
 }
 
@@ -610,19 +671,7 @@ test_fdev_version_resolves_from_origin_when_the_local_tag_is_gone() {
 # behind pointing somewhere else. Origin's tag is what shipped.
 test_stale_local_tag_does_not_win_over_origin() {
     make_sandbox
-
-    # Rewrite history under the tag's name: the local tag keeps pointing at a
-    # commit naming STALE_FDEV while origin's tag of the same name names
-    # TAG_FDEV.
-    local shipped_sha
-    shipped_sha="$(git -C "$REPO" rev-parse "refs/tags/v$FREENET_VERSION")"
-    write_fdev_manifest "$STALE_FDEV"
-    git -C "$REPO" add crates >/dev/null
-    git -C "$REPO" commit --quiet -m "aborted release attempt"
-    git -C "$REPO" tag -d "v$FREENET_VERSION" >/dev/null
-    git -C "$REPO" tag -a "v$FREENET_VERSION" -m "stale local tag"
-    git -C "$REPO" push --quiet --force origin "$shipped_sha:refs/tags/v$FREENET_VERSION"
-
+    make_local_tag_stale
     run_rollback --version "$FREENET_VERSION" --yank-crates
 
     if logged "cargo yank --version $TAG_FDEV fdev"; then
@@ -735,6 +784,181 @@ EOF
     fi
 }
 
+# 16. The confirmation prompt is the last thing standing between an UNATTENDED
+# caller -- cron, CI, a systemd unit, anything with stdin closed -- and an
+# irreversible-in-practice yank. At EOF `read` must abort, never fall through
+# with an empty or defaulted REPLY.
+#
+# Found by mutation: making EOF set REPLY=yes left all 45 other assertions in
+# this file green. Case 13 pipes "no", which such a mutant also rejects, so
+# nothing else here separates "declined" from "never asked".
+test_no_stdin_aborts_before_anything_destructive() {
+    make_sandbox
+    GH_RELEASE_EXISTS=1 run_rollback_no_stdin --version "$FREENET_VERSION" --yank-crates
+
+    if [[ $RC -ne 0 ]]; then
+        pass "a run with no stdin exits non-zero rather than auto-confirming"
+    else
+        fail "a run with no stdin exited 0 -- the prompt was not a gate" "$(dump)"
+    fi
+
+    if printed "Aborted (no answer given)"; then
+        pass "the abort says the prompt was never answered"
+    else
+        fail "an EOF on the prompt was not reported as an unanswered prompt" "$(dump)"
+    fi
+
+    if logged "cargo yank" || logged "gh release delete" || ! local_tag_exists || ! origin_tag_exists; then
+        fail "something destructive ran with nobody there to confirm it" "$(dump)"
+    else
+        pass "no tag, release or crate was touched with stdin at EOF"
+    fi
+}
+
+# 17. The re-run this script's own summary steers the operator into: it has just
+# deleted the tag locally AND on origin, so a second run has nothing left to read
+# the fdev version from. The --no-tag fixture is that state.
+test_missing_tag_everywhere_demands_an_explicit_fdev_version() {
+    make_sandbox --no-tag
+    GH_RELEASE_EXISTS=1 run_rollback --version "$FREENET_VERSION" --yank-crates
+
+    if [[ $RC -ne 0 ]] && printed "cannot determine which fdev version"; then
+        pass "with no tag locally or on origin, the rollback stops instead of guessing"
+    else
+        fail "a missing tag on both sides did not stop the rollback" "$(dump)"
+    fi
+
+    if logged "cargo yank"; then
+        fail "cargo yank ran with no tag to read the fdev version from" "$(dump)"
+    else
+        pass "nothing is yanked when there is no tag to resolve from"
+    fi
+
+    # ... and the documented escape hatch has to carry that re-run through.
+    make_sandbox --no-tag
+    GH_RELEASE_EXISTS=1 run_rollback --version "$FREENET_VERSION" --yank-crates --fdev-version "$TAG_FDEV"
+
+    if [[ $RC -eq 0 ]] && logged "cargo yank --version $TAG_FDEV fdev"; then
+        pass "--fdev-version carries the tagless re-run through"
+    else
+        fail "--fdev-version did not rescue a re-run with no tag anywhere" "$(dump)"
+    fi
+
+    # And a SUCCESSFUL tag-only rollback in the same state must not suggest a
+    # command that cannot run. It used to print "run: ... --yank-crates" and
+    # exit 0 -- but that command hard-errors, because the tag it would read the
+    # fdev version from is exactly what this run just deleted.
+    make_sandbox --no-tag
+    GH_RELEASE_EXISTS=1 run_rollback --version "$FREENET_VERSION"
+
+    if [[ $RC -ne 0 ]]; then
+        fail "the tag-only rollback did not succeed, so the follow-up hint was never reached" "$(dump)"
+    elif printed "--yank-crates --fdev-version X.Y.Z"; then
+        pass "the follow-up hint names the version lookup, not a command that would fail"
+    else
+        fail "the follow-up hint omits --fdev-version, so the suggested re-run hard-errors" "$(dump)"
+    fi
+
+    # ... and specifically not the BARE ready-to-run form, which is what exits
+    # 0 here and then stops with an error on the re-run.
+    if printed "To yank crates, run: "; then
+        fail "the follow-up hint still offers a ready-to-run command it has no version for" "$(dump)"
+    else
+        pass "no ready-to-run re-run command is offered with no version to put in it"
+    fi
+}
+
+# 18. THE COMPOSED FAILURE: a stale LOCAL tag plus an origin that cannot be
+# reached. Both halves are routine -- release.sh skips tag creation when a local
+# tag exists, so an aborted run leaves one behind, and a dead origin mid-incident
+# is ordinary -- and together they used to yank whatever the local tag named.
+test_local_tag_alone_never_decides_the_yank() {
+    make_sandbox
+    make_local_tag_stale
+    mv "$ORIGIN" "$SANDBOX/origin-gone.git"
+
+    GH_RELEASE_EXISTS=1 run_rollback --version "$FREENET_VERSION" --yank-crates
+
+    if [[ $RC -ne 0 ]] && printed "cannot determine which fdev version"; then
+        pass "a local-tag-only resolution is a hard stop, not a yank"
+    else
+        fail "the rollback proceeded on a local tag alone" "$(dump)"
+    fi
+
+    if logged "cargo yank"; then
+        fail "cargo yank ran on a version read from a possibly-stale local tag" "$(dump)"
+    else
+        pass "nothing is yanked from a local-tag reading"
+    fi
+
+    if printed "--fdev-version X.Y.Z"; then
+        pass "the stop names the escape hatch"
+    else
+        fail "the stop does not tell the operator how to supply the version" "$(dump)"
+    fi
+
+    # The banner used to reprint the local reading as though it were the fact of
+    # the matter ("fdev: 0.3.100"), one line above the confirmation prompt.
+    if printed "fdev:        $STALE_FDEV"; then
+        fail "the banner presented a local-tag guess as the fdev version" "$(dump)"
+    else
+        pass "the banner never states a local-tag guess as fact"
+    fi
+
+    # And the tag-only rollback must not hand that guess back inside a
+    # ready-to-paste command: pasted, it becomes an "explicit" --fdev-version,
+    # which on the next run also silences the mismatch warning.
+    make_sandbox
+    make_local_tag_stale
+    mv "$ORIGIN" "$SANDBOX/origin-gone.git"
+    run_rollback --version "$FREENET_VERSION"
+
+    if printed "--fdev-version $STALE_FDEV"; then
+        fail "the summary handed back a local-tag guess as a command to run" "$(dump)"
+    else
+        pass "no local-tag guess is laundered into the follow-up command"
+    fi
+}
+
+# 19. `origin` decides which tag is read, but `cargo yank` always reaches the
+# REAL crates.io and step 3 deletes from a hardcoded --repo freenet/freenet-core.
+# With origin pointed at a fork, a tag of the same name naming a different fdev
+# would therefore take a GOOD release's crate off the real registry.
+test_fork_origin_is_not_a_version_source() {
+    make_sandbox
+
+    local fork="$SANDBOX/github.com/somebody/freenet-core.git"
+    mkdir -p "$(dirname "$fork")"
+    git init --quiet --bare "$fork"
+    write_fdev_manifest "$FORK_FDEV"
+    git -C "$REPO" add crates >/dev/null
+    git -C "$REPO" commit --quiet -m "fork's release"
+    git -C "$REPO" tag -a "fork-tag" -m "fork" >/dev/null
+    git -C "$REPO" push --quiet "$fork" "refs/tags/fork-tag:refs/tags/v$FREENET_VERSION"
+    git -C "$REPO" tag -d "fork-tag" >/dev/null
+    git -C "$REPO" remote set-url origin "$fork"
+
+    GH_RELEASE_EXISTS=1 run_rollback --version "$FREENET_VERSION" --yank-crates
+
+    if printed "origin is not freenet/freenet-core"; then
+        pass "a non-freenet origin is called out rather than trusted"
+    else
+        fail "origin being a fork passed without comment" "$(dump)"
+    fi
+
+    if logged "$FORK_FDEV"; then
+        fail "a fork's tag chose the version yanked from the real crates.io" "$(dump)"
+    else
+        pass "a fork's tag is never the source of the version to yank"
+    fi
+
+    if [[ $RC -ne 0 ]] && ! logged "cargo yank"; then
+        pass "the run stops instead of yanking on a fork's say-so"
+    else
+        fail "the rollback yanked with origin pointed at a fork" "$(dump)"
+    fi
+}
+
 test_fdev_version_comes_from_the_release_tag
 test_failed_yank_is_not_reported_as_success
 test_absent_crate_version_is_not_a_failure
@@ -753,6 +977,10 @@ test_stale_local_tag_does_not_win_over_origin
 test_declining_the_prompt_does_nothing
 test_parses_the_repositorys_real_fdev_manifest
 test_workspace_inherited_version_is_refused_not_misparsed
+test_no_stdin_aborts_before_anything_destructive
+test_missing_tag_everywhere_demands_an_explicit_fdev_version
+test_local_tag_alone_never_decides_the_yank
+test_fork_origin_is_not_a_version_source
 
 echo
 if [[ $FAILURES -eq 0 ]]; then
