@@ -194,3 +194,85 @@ fn the_update_arm_installs_the_cli_logger_at_warn_and_not_a_file_logger() {
          {code}"
     );
 }
+
+/// The two safety-state reports must NOT be gated on `--quiet`.
+///
+/// These are the "two safety states going unrecorded" this PR is named for:
+/// `download_and_install` failing to snapshot the known-good binary, and
+/// failing to arm the crash-loop probation marker. Both mean #4073's
+/// brick-safety machinery is OFF for this update — a release that then
+/// crash-loops cannot be reverted — and the supervisor runs the installer as
+/// `--quiet`, so a `!quiet` gate makes them produce nothing anywhere.
+///
+/// **Why a source pin rather than a behavioural test.** Both sites live deep
+/// inside `download_and_install`, past a real GitHub fetch and a real binary
+/// swap; reaching them needs the whole install path stubbed, which is
+/// disproportionate. Review correctly observed that WITHOUT this pin, re-adding
+/// `if !self.quiet` around either `eprintln!` would pass every other test in
+/// this file — so the property the PR is named for was unguarded.
+///
+/// **Why it is not vacuous.** It scrapes a DIFFERENT file from the one it lives
+/// in, so it cannot be satisfied by its own assertion text. It is bounded to
+/// `download_and_install`'s brace-matched body rather than the whole file. And
+/// it asserts on the region immediately preceding each marker: the nearest
+/// legitimate `!self.quiet` is 2113 and 4676 bytes away respectively, while a
+/// re-added gate would sit directly against the `eprintln!`, so the window is
+/// wide enough to catch the mutation and far too narrow to collide with the
+/// chatty-output gates that legitimately exist.
+#[test]
+fn the_two_safety_state_reports_are_not_gated_on_quiet() {
+    const SRC: &str = include_str!("../src/bin/commands/update.rs");
+    const SIG: &str = "async fn download_and_install(";
+    // Wide enough to contain a re-added `if !self.quiet {` and its brace,
+    // narrow enough that the nearest real gate (2113 bytes back) cannot drift in.
+    const WINDOW: usize = 600;
+
+    let at = SRC
+        .find(SIG)
+        .expect("download_and_install not found — if it was renamed, update this pin deliberately");
+    let after = &SRC[at + SIG.len()..];
+    let open = after
+        .find('{')
+        .expect("no opening brace after the signature");
+    let mut depth = 0usize;
+    let mut end = None;
+    for (i, c) in after[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &after[open..=end.expect("unbalanced braces in download_and_install")];
+    assert!(
+        !body.contains("\nasync fn ") && !body.contains("\n    pub fn "),
+        "the brace match ran past download_and_install; this pin would be measuring more \
+         than one function"
+    );
+
+    for marker in [
+        "failed to snapshot the known-good binary",
+        "FAILED TO ARM crash-loop rollback",
+    ] {
+        let i = body.find(marker).unwrap_or_else(|| {
+            panic!(
+                "safety-state message not found: {marker:?}. If the wording changed, update \
+                 this pin deliberately — do NOT delete it; it is the only guard that the \
+                 message is emitted regardless of --quiet."
+            )
+        });
+        let window = &body[i.saturating_sub(WINDOW)..i];
+        assert!(
+            !window.contains("!self.quiet"),
+            "the safety-state report {marker:?} is gated on --quiet. The supervisor runs \
+             `freenet update --quiet`, so gating it means #4073's brick-safety machinery \
+             reports that it is OFF to nobody. See #5244."
+        );
+    }
+}
