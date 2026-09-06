@@ -469,10 +469,20 @@ jobs:
           # unauthenticated call from a shared runner IP moments after a push.
           # A transient 5xx or an anonymous rate limit must not turn a healthy
           # release red — a release check that fails on a blip stops being read.
+          # DOCKER_CLI_EXPERIMENTAL is belt-and-braces. `docker manifest` was
+          # historically gated by the `experimental` key in the CLI config, and
+          # emptying DOCKER_CONFIG removes that key along with the credentials —
+          # which would fail every invocation and be indistinguishable from
+          # "package is private", reintroducing the false failure this job
+          # exists to remove. Measured on Docker CLI 28.5.1 the gate is gone (it
+          # was dropped in CLI 23, and runners are well past that), so this is
+          # insurance rather than a fix. It is free, and the step cannot be
+          # exercised in CI before a real release, so take the insurance.
           anon_ok=0
           anon_home=$(mktemp -d)
           for attempt in 1 2 3; do
-            if DOCKER_CONFIG="$anon_home" docker manifest inspect "${IMAGE}:${RELEASE_TAG}" >/dev/null 2>&1; then
+            if DOCKER_CONFIG="$anon_home" DOCKER_CLI_EXPERIMENTAL=enabled \
+              docker manifest inspect "${IMAGE}:${RELEASE_TAG}" >/dev/null 2>&1; then
               anon_ok=1
               break
             fi
