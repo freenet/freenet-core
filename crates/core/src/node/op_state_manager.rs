@@ -1071,6 +1071,34 @@ impl OpManager {
     /// WASM host call on the V2 delegate write path, where blocking would be
     /// worse than a dropped broadcast. A drop is recoverable — the next write
     /// or a summary-mismatch resync re-announces the state.
+    ///
+    /// # The marker insert and the enqueue are not atomic
+    ///
+    /// `insert` and `try_notify_node_event` are two steps, and the rollback
+    /// below reads the marker a third time. Nothing here is a transaction, so
+    /// this is safe only because the write path is SERIAL: the sole caller is a
+    /// WASM host call executing on `contract_handling`, one delegate at a time.
+    ///
+    /// Recorded because that is the THIRD safety argument on this path resting
+    /// on the same serial loop — the other two are the drain's bounded read and
+    /// the coalescing contract — and #5544/#5554 are actively removing the loop
+    /// as a stall point. Parking does NOT remove the serialisation (one
+    /// `process()` still runs at a time, and the parked task holds no
+    /// `ContractHandler`, which the borrow checker enforces), so the argument
+    /// survives that change. It would not survive a genuinely concurrent
+    /// writer, and the failure would be silent rather than loud:
+    ///
+    /// * writer A inserts the marker and is preempted before its enqueue;
+    /// * writer B sees the id present, coalesces, and returns `false` — the
+    ///   correct answer only if A's broadcast actually happens;
+    /// * A's enqueue then fails, so A clears the marker and logs ONE drop.
+    ///
+    /// B's write is now unannounced with nothing recorded about it, and the
+    /// drop counter under-reports by exactly the number of coalesced writers.
+    /// Anyone making this path concurrent must replace the pair with a single
+    /// atomic transition (e.g. keep the marker owned by the enqueuer and clear
+    /// it only at the drain, per `clear_v2_delegate_broadcast_pending`), not
+    /// add a lock around the two steps as they stand.
     pub(crate) fn queue_v2_delegate_broadcast(&self, key: ContractKey) -> bool {
         // `insert` returns false when the id was already present, i.e. a
         // broadcast is queued and undrained: coalesce into it and enqueue
