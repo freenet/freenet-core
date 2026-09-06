@@ -1438,12 +1438,17 @@ mod error_filter_tests {
             // Next top-level or nested `fn ` declaration ends the body well
             // enough for a call-site count; an over-long slice would only make
             // this pin STRICTER, never laxer.
-            let end = rest.find("\n    fn ").or_else(|| rest.find("\npub fn ")).unwrap_or(rest.len());
+            let end = rest
+                .find("\n    fn ")
+                .or_else(|| rest.find("\npub fn "))
+                .unwrap_or(rest.len());
             rest[..end].to_string()
         };
 
         assert_eq!(
-            body_of("fn build_filter(").matches(".from_env_lossy()").count(),
+            body_of("fn build_filter(")
+                .matches(".from_env_lossy()")
+                .count(),
             1,
             "build_filter is the node's console filter and must read RUST_LOG"
         );
