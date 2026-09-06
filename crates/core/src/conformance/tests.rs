@@ -2824,14 +2824,16 @@ fn a_foreign_file_is_not_mistaken_for_evidence() {
         ConformanceEvidence::decode(b""),
         Err(EvidenceError::BadMagic)
     ));
-    // Length guard boundary tests: exactly 8 bytes (magic only) and 9 bytes (truncated version)
+    // A file whose magic matched but was cut off mid-write is Truncated, not BadMagic.
+    // The distinction matters: a user seeing "not conformance evidence" hunts for the
+    // wrong file; "truncated" tells them to regenerate.
     assert!(matches!(
         ConformanceEvidence::decode(b"FRNTEVD1"),
-        Err(EvidenceError::BadMagic)
+        Err(EvidenceError::Truncated { len: 8 })
     ));
     assert!(matches!(
         ConformanceEvidence::decode(b"FRNTEVD1\x02"),
-        Err(EvidenceError::BadMagic)
+        Err(EvidenceError::Truncated { len: 9 })
     ));
 }
 
@@ -2894,10 +2896,11 @@ fn evidence_encode_decode_roundtrip() {
 }
 
 #[test]
-fn legacy_unframed_evidence_is_detected_and_reported_politely() {
+fn legacy_unframed_schema_1_is_refused() {
     use super::evidence::{ConformanceEvidence, EVIDENCE_SCHEMA_VERSION, EvidenceError};
 
-    // Legacy schema 1 unframed file: starts with LE u16 for 1 (0x01, 0x00)
+    // Schema 1 legacy files: struct layout changed when `settling` was added, so
+    // deserializing them would silently produce garbage. Always refused.
     let legacy_schema_1 = [1u8, 0u8, 0xff, 0xff, 0xff];
     match ConformanceEvidence::decode(&legacy_schema_1) {
         Err(EvidenceError::UnsupportedSchema { found, supported }) => {
@@ -2906,15 +2909,44 @@ fn legacy_unframed_evidence_is_detected_and_reported_politely() {
         }
         other => panic!("expected schema 1 refusal for legacy file, got {other:?}"),
     }
+}
 
-    // Legacy schema 2 unframed file (pre-0.2.134): starts with LE u16 for 2 (0x02, 0x00)
-    let legacy_schema_2 = [2u8, 0u8, 0xff, 0xff, 0xff];
-    match ConformanceEvidence::decode(&legacy_schema_2) {
-        Err(EvidenceError::LegacyUnframed { schema_version }) => {
-            assert_eq!(schema_version, 2);
-        }
-        other => panic!("expected legacy unframed refusal, got {other:?}"),
-    }
+#[test]
+fn legacy_unframed_schema_2_decodes_if_the_payload_is_valid() {
+    use super::evidence::ConformanceEvidence;
+
+    // v0.2.133 evidence: no framing header, raw bincode payload. The struct layout
+    // is byte-identical to the current schema 2, so decode must succeed rather than
+    // returning an error. This is the regression Ian's review caught.
+    let idem_case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &idem_case, None);
+
+    // Encode as raw bincode (no framing header) — exactly what pre-0.2.134 wrote.
+    let raw = bincode::serialize(&evidence).expect("serialize");
+    assert_eq!(
+        &raw[..2],
+        &[2u8, 0u8],
+        "first field must be schema_version = 2 in LE"
+    );
+
+    let decoded = ConformanceEvidence::decode(&raw).expect("legacy schema 2 must decode cleanly");
+    assert_eq!(decoded, evidence);
+}
+
+#[test]
+fn legacy_sniff_02_00_with_garbage_payload_is_bad_magic() {
+    use super::evidence::{ConformanceEvidence, EvidenceError};
+
+    // A file that happens to start with `02 00` but whose bincode deserialization fails
+    // is not evidence at all; fall through to BadMagic rather than a confusing decode error.
+    let not_evidence = [2u8, 0u8, 0xff, 0xff, 0xff];
+    assert!(
+        matches!(
+            ConformanceEvidence::decode(&not_evidence),
+            Err(EvidenceError::BadMagic)
+        ),
+        "a garbage file starting with 02 00 must not produce a decode error"
+    );
 }
 
 #[test]
