@@ -5075,11 +5075,48 @@ mod tests {
         let json = event_kind_to_json(&event);
         assert_eq!(json["outcome"], "timeout_exhausted");
         assert_eq!(json["exhaustion_reason"], "no_routing_candidates");
-        // `attempts` (driver.requests_sent) is the accurate peer count on
-        // the exhaustion path — see the field's doc comment on
-        // GetEvent::ClientTerminal for why a separate retries-derived
-        // counter was dropped (it overcounts by one on this exact path).
+        // `attempts` is REQUESTS SENT (driver.requests_sent), NOT a peer
+        // count — the infra-retry arm re-sends to the same peer without an
+        // advance, so it over-reports peers. See the field's doc comment on
+        // GetEvent::ClientTerminal; a retries-derived `peer_advancements`
+        // field was dropped in review for the mirror-image bias.
         assert_eq!(json["attempts"], 2);
+    }
+
+    /// The addressless-candidate exhaustion is a DIFFERENT cause from an
+    /// empty candidate set — the ring returned a peer, it just had no wire
+    /// address (a local ring defect, `warn!`-logged) — so it must export its
+    /// own string rather than collapsing into `no_routing_candidates`.
+    /// Without the split, a spike of ring defects is indistinguishable from
+    /// a genuine topology dead-end in the collector.
+    #[test]
+    fn test_event_kind_to_json_get_terminal_addressless_candidate() {
+        use crate::message::Transaction;
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::{GetEvent, GetExhaustionReason, GetTerminalOutcome};
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        let event = EventKind::Get(GetEvent::ClientTerminal {
+            id: tx,
+            requester: PeerKeyLocation::random(),
+            instance_id: ContractInstanceId::new([9u8; 32]),
+            key: None,
+            outcome: GetTerminalOutcome::TimeoutExhausted,
+            streamed: false,
+            is_sub_op: false,
+            attempts: 1,
+            hop_count: None,
+            fragments_received: None,
+            total_fragments: None,
+            stream_abort_cause: None,
+            exhaustion_reason: Some(GetExhaustionReason::AddresslessCandidate),
+            elapsed_ms: 500,
+            timestamp: 1,
+        });
+
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["exhaustion_reason"], "addressless_candidate");
     }
 
     /// A terminal that reached a real reply (success) never carries an

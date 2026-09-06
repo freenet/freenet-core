@@ -1159,11 +1159,24 @@ pub(crate) enum GetExhaustionReason {
     /// `advance_to_next_peer` hit `MAX_RETRIES` peer advancements — the
     /// retry budget, not candidate supply, ended the search.
     RetryBudget,
-    /// `advance_to_next_peer` had budget remaining but
-    /// `k_closest_potentially_hosting` (and the bootstrap-gateway fallback)
-    /// returned no usable candidate — the search ran out of distinct peers
-    /// to ask before it ran out of retries.
+    /// `advance_to_next_peer` had budget remaining but neither
+    /// `k_closest_potentially_hosting` nor the bootstrap-gateway fallback
+    /// produced a candidate — the search ran out of distinct peers to ask
+    /// before it ran out of retries. A TOPOLOGY signal: this node has no
+    /// (further) usable routing option for the key.
     NoRoutingCandidates,
+    /// The ring DID return a candidate, but it carried no socket address, so
+    /// it was unusable as a wire target. A LOCAL RING DEFECT, not a topology
+    /// problem — `k_closest_potentially_hosting` deliberately admits
+    /// addressless candidates (they bypass every addr-keyed filter: skip
+    /// list, dedup, transient, readiness) in the hope they gain an address by
+    /// send time, and the router only ranks them once it has left the
+    /// distance-only regime, which drops them. Split out of
+    /// `NoRoutingCandidates` because a spike here needs a DIFFERENT
+    /// investigation: the peer set is not empty, its entries are malformed.
+    /// Emitted alongside a `warn!` at the return site in
+    /// `get::op_ctx_task::advance_to_next_peer`.
+    AddresslessCandidate,
 }
 
 impl GetExhaustionReason {
@@ -1172,6 +1185,7 @@ impl GetExhaustionReason {
         match self {
             GetExhaustionReason::RetryBudget => "retry_budget",
             GetExhaustionReason::NoRoutingCandidates => "no_routing_candidates",
+            GetExhaustionReason::AddresslessCandidate => "addressless_candidate",
         }
     }
 }
@@ -1415,15 +1429,29 @@ pub(crate) enum GetEvent {
         /// is `NotFound` or `TimeoutExhausted`); `None` when a terminal reply
         /// was actually received (`outcome = Success`, or a streaming
         /// failure that still reached a terminal header). See
-        /// [`GetExhaustionReason`]. Pair with `attempts` for the peer count
-        /// on the exhaustion path — NOT a separate `retries`-derived field:
-        /// an earlier version of this field pair also carried
-        /// `peer_advancements` from `advance_to_next_peer`'s `retries`
-        /// counter, but `retries` increments BEFORE the candidate lookup,
-        /// so it overcounts by one whenever `NoRoutingCandidates` fires
-        /// (review caught this; the field was dropped). `attempts`
-        /// (`driver.requests_sent`, documented in `op_ctx_task.rs` as the
-        /// accurate count for exactly this reason) has no such bias.
+        /// [`GetExhaustionReason`].
+        ///
+        /// **This event carries NO distinct-peer count, and `attempts` is not
+        /// one.** `attempts` is `driver.requests_sent` — REQUESTS SENT, one
+        /// per `build_request` — and two mechanisms send more than one
+        /// request to the SAME peer without an intervening peer advance:
+        /// the infra-retry arm in `operations::op_ctx` (`OpError::`
+        /// `NotificationError`) `continue`s WITHOUT calling
+        /// `driver.advance()`, adding up to `MAX_INFRA_RETRIES` = 3 extra
+        /// requests to the peer already being asked, and
+        /// `drive_get_with_assembly_retry` re-enters the loop after a
+        /// streaming-assembly failure. So `attempts = 6` can mean as few as
+        /// ~4 distinct peers were contacted, and the shortfall is not
+        /// derivable from this event. Do not quote it as a peer count; the
+        /// per-peer breakdown lives in the node's route events, not here.
+        ///
+        /// (An earlier revision did carry a `peer_advancements` field taken
+        /// from `advance_to_next_peer`'s `retries` counter, but `retries`
+        /// increments BEFORE the candidate lookup, so it overcounted by one
+        /// whenever the search ended without a candidate — review caught
+        /// this and the field was dropped rather than shipped with a
+        /// footnote. Mis-stating a peer count is the exact error #5252
+        /// exists to prevent.)
         exhaustion_reason: Option<GetExhaustionReason>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
