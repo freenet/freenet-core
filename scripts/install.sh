@@ -335,32 +335,54 @@ should_refresh_system_unit() {
 #   $1 = am_root       ("1"/"0")
 #   $2 = can_elevate   ("1"/"0" - root, or sudo available)
 #   $3 = install_dir   (path to the install directory, to detect user-local dirs)
-# Echoes "system" or "user". A system service is preferred when we can elevate
-# AND the binary is NOT in a user-local directory (e.g. ~/.local/bin). A binary
-# under $HOME should use a user service: the binary's SELinux context is
-# correct for user execution, and a system service running it would inherit
-# init_t and trigger SELinux denials (#4924).
+#   $4 = selinux       ("1"/"0" - SELinux enabled; passed in, not probed, so
+#                       this stays a pure function and stays unit-testable)
+# Echoes "system" or "user". A system service is preferred whenever we can
+# elevate, EXCEPT on an SELinux system where the binary lives under $HOME: there
+# the binary's context is correct for user execution, and a system service
+# running it would inherit init_t and trigger denials (#4924). Off SELinux the
+# behaviour is exactly what it was before.
 decide_linux_service_mode() {
-    # A binary in a user-local directory (e.g. ~/.local/bin, ~/projects)
-    # should use a user service: the binary's SELinux context is correct for
-    # user execution, and a system service running it would inherit init_t
-    # and trigger SELinux denials (#4924).
-    case "$3" in
-        */.local/*) echo "user"; return ;;
-    esac
-    # The `case` in the && condition is deliberate: "${HOME}/"* requires a
-    # path separator after $HOME. A plain "$HOME"* prefix match would also
-    # match siblings like /home/aliceproject when HOME=/home/alice (see the
-    # prefix-match regression tests in scripts/test-install-sh.sh).
-    if [ -n "${HOME:-}" ] && case "$3" in "${HOME}/"*) true;; *) false;; esac; then
-        echo "user"
-        return
+    # A binary in a user-local directory (e.g. ~/.local/bin, ~/projects) uses a
+    # user service ON SELINUX SYSTEMS ONLY: the binary's context there is
+    # correct for user execution, and a system service running it would inherit
+    # init_t and trigger denials (#4924).
+    #
+    # The SELinux condition is what makes this a bug fix rather than a policy
+    # change. $install_dir defaults to $HOME/.local/bin for everyone, so
+    # applying the rule unconditionally would silently flip every ordinary
+    # Linux install from a system service to a user service — losing start-at-
+    # boot and survive-logout for the large majority of users who have no
+    # SELinux at all. Gate first, then decide.
+    if [ "$4" = "1" ]; then
+        case "$3" in
+            */.local/*) echo "user"; return ;;
+        esac
+        # The `case` in the && condition is deliberate: "${HOME}/"* requires a
+        # path separator after $HOME. A plain "$HOME"* prefix match would also
+        # match siblings like /home/aliceproject when HOME=/home/alice (see the
+        # prefix-match regression tests in scripts/test-install-sh.sh).
+        if [ -n "${HOME:-}" ] && case "$3" in "${HOME}/"*) true;; *) false;; esac; then
+            echo "user"
+            return
+        fi
     fi
     if [ "$1" = "1" ] || [ "$2" = "1" ]; then
         echo "system"
     else
         echo "user"
     fi
+}
+
+# Is SELinux actually in force on this machine?
+#
+# `selinuxenabled` exits 0 only when SELinux is enabled, and is absent
+# entirely on the systems that never had it — so the common case answers "no"
+# without running anything. Permissive counts as enabled on purpose: the
+# denials are logged rather than enforced, and an install that only works
+# until someone runs `setenforce 1` is not an install that works.
+selinux_active() {
+    has_cmd selinuxenabled && selinuxenabled 2>/dev/null
 }
 
 # Restore SELinux context on installed binaries (no-op on non-SELinux systems).
@@ -407,7 +429,12 @@ resolve_service_action() {
         can_elevate=1
     fi
 
-    decide_linux_service_mode "$am_root" "$can_elevate" "$install_dir"
+    selinux=0
+    if selinux_active; then
+        selinux=1
+    fi
+
+    decide_linux_service_mode "$am_root" "$can_elevate" "$install_dir" "$selinux"
 }
 
 # Loud warning printed whenever a node is left unsupervised.

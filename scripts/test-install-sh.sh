@@ -41,33 +41,41 @@ check_eq() {
     fi
 }
 
-# Call the pure decide function: decide_linux_service_mode AM_ROOT CAN_ELEVATE [INSTALL_DIR]
+# Call the pure decide function:
+#   decide AM_ROOT CAN_ELEVATE [INSTALL_DIR] [SELINUX]
+# SELINUX defaults to 0 — the overwhelmingly common case, and the one whose
+# behaviour must be unchanged by #4924.
 decide() {
     FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
         . "$INSTALL"
-        decide_linux_service_mode "$1" "$2" "$3"
-    ' _ "$1" "$2" "${3:-/usr/local/bin}"
+        decide_linux_service_mode "$1" "$2" "$3" "$4"
+    ' _ "$1" "$2" "${3:-/usr/local/bin}" "${4:-0}"
 }
 
 # Call decide with a custom HOME so ${HOME:-} matching can be exercised.
-#   $1: am_root, $2: can_elevate, $3: install_dir, $4: HOME override
+#   $1: am_root, $2: can_elevate, $3: install_dir, $4: HOME override,
+#   $5: selinux ("1"/"0", default 1 — these cases exist to exercise the
+#       user-local routing, which only applies under SELinux)
 decide_with_home() {
     HOME="$4" FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
         export HOME
         . "$INSTALL"
-        decide_linux_service_mode "$1" "$2" "$3"
-    ' _ "$1" "$2" "$3"
+        decide_linux_service_mode "$1" "$2" "$3" "$4"
+    ' _ "$1" "$2" "$3" "${5:-1}"
 }
 
 # Call resolve_service_action with a snippet of helper overrides applied first.
 #   $1: override snippet (shell code), $2: interactive flag ("1"/"0"),
 #   $3: install_dir (optional, defaults to /usr/local/bin)
+# `selinux_active` is stubbed to false first, so the default is the non-SELinux
+# machine; a snippet that wants the other case overrides it after.
 resolve_with() {
     overrides=$1
     inter=$2
     install_dir=${3:-/usr/local/bin}
     FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
         . "$INSTALL"
+        selinux_active() { return 1; }
         '"$overrides"'
         resolve_service_action "$1" "'"$install_dir"'"
     ' _ "$inter"
@@ -80,26 +88,37 @@ check_eq "decide: root, no-elevate + system dir -> system"    "system" "$(decide
 check_eq "decide: non-root + elevate + system dir -> system"  "system" "$(decide 0 1 /usr/local/bin)"
 check_eq "decide: non-root, no-elevate + system dir -> user"  "user"   "$(decide 0 0 /usr/local/bin)"
 
-# User-local directories (e.g. ~/.local/bin) should always use user service
-# to avoid SELinux init_t denials (#4924).
-check_eq "decide: root + elevate + ~/.local/bin -> user"      "user"   "$(decide 1 1 /home/alice/.local/bin)"
-check_eq "decide: non-root + elevate + ~/.local/bin -> user"  "user"   "$(decide 0 1 /home/alice/.local/bin)"
-check_eq "decide: root + elevate + ~/projects -> user"        "user"   "$(decide_with_home 1 1 /home/alice/projects /home/alice)"
+# ON SELINUX, user-local directories (e.g. ~/.local/bin) use a user service to
+# avoid init_t denials (#4924).
+check_eq "decide: selinux + root + elevate + ~/.local/bin -> user"      "user"   "$(decide 1 1 /home/alice/.local/bin 1)"
+check_eq "decide: selinux + non-root + elevate + ~/.local/bin -> user"  "user"   "$(decide 0 1 /home/alice/.local/bin 1)"
+check_eq "decide: selinux + root + elevate + ~/projects -> user"        "user"   "$(decide_with_home 1 1 /home/alice/projects /home/alice 1)"
+
+# OFF SELinux the routing must be exactly what it was before #4924. These are
+# the regression cases for the scope concern: $install_dir defaults to
+# $HOME/.local/bin for everyone, so an ungated rule would have flipped every
+# ordinary Linux install to a user service and quietly cost it start-at-boot.
+check_eq "decide: no selinux + root + elevate + ~/.local/bin -> system"     "system" "$(decide 1 1 /home/alice/.local/bin 0)"
+check_eq "decide: no selinux + non-root + elevate + ~/.local/bin -> system" "system" "$(decide 0 1 /home/alice/.local/bin 0)"
+check_eq "decide: no selinux + root + elevate + ~/projects -> system"       "system" \
+    "$(decide_with_home 1 1 /home/alice/projects /home/alice 0)"
+# ...and a user with no elevation still gets a user service off SELinux.
+check_eq "decide: no selinux + non-root + no-elevate + ~/.local/bin -> user" "user"  "$(decide 0 0 /home/alice/.local/bin 0)"
 
 # Path must require a separator after $HOME: /home/aliceproject should NOT
 # match $HOME=/home/alice (prefix-only match bug, fixed with "${HOME}/"*).
-check_eq "decide: /home/aliceproject/bin with HOME=/home/alice -> system" "system" \
-    "$(decide_with_home 1 1 /home/aliceproject/bin /home/alice)"
-check_eq "decide: /home/alice/project with HOME=/home/alice -> user"     "user" \
-    "$(decide_with_home 1 1 /home/alice/project /home/alice)"
+check_eq "decide: selinux + /home/aliceproject/bin with HOME=/home/alice -> system" "system" \
+    "$(decide_with_home 1 1 /home/aliceproject/bin /home/alice 1)"
+check_eq "decide: selinux + /home/alice/project with HOME=/home/alice -> user"     "user" \
+    "$(decide_with_home 1 1 /home/alice/project /home/alice 1)"
 
 # HOME unset: should NOT match-everything — fall through to elevate logic.
-check_eq "decide: root + elevate + /usr/local/bin, HOME unset -> system" "system" \
-    "$(HOME= FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
+check_eq "decide: selinux + root + elevate + /usr/local/bin, HOME unset -> system" "system" \
+    "$(FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
         unset HOME
         . "$INSTALL"
-        decide_linux_service_mode "$1" "$2" "$3"
-    ' _ 1 1 /usr/local/bin)"
+        decide_linux_service_mode "$1" "$2" "$3" "$4"
+    ' _ 1 1 /usr/local/bin 1)"
 
 # ── restore_install_context: SELinux restorecon integration ────────────────
 
@@ -217,15 +236,42 @@ check_eq "resolve: fresh + interactive + sudo present + system dir -> system" "s
 
 # ── resolve_service_action: user-local directory prefers user service ──────
 
-# Even with elevation available, a user-local install dir should use user
-# service to avoid SELinux init_t denials (#4924).
-check_eq "resolve: fresh + root + ~/.local/bin -> user" "user" \
+# On SELinux, even with elevation available, a user-local install dir uses a
+# user service to avoid init_t denials (#4924).
+check_eq "resolve: selinux + fresh + root + ~/.local/bin -> user" "user" \
     "$(resolve_with '
         is_root() { return 0; }
         sudo_noninteractive_ok() { return 1; }
         has_cmd() { return 1; }
         has_system_unit() { return 1; }
         has_user_unit() { return 1; }
+        selinux_active() { return 0; }
+    ' 0 /home/alice/.local/bin)"
+
+# Off SELinux the same install goes to a system service, as it always did.
+# This is the end-to-end companion to the decide-level regression cases above:
+# it pins that resolve_service_action really does consult selinux_active,
+# rather than the gating being bypassed somewhere on the way through.
+check_eq "resolve: no selinux + fresh + root + ~/.local/bin -> system" "system" \
+    "$(resolve_with '
+        is_root() { return 0; }
+        sudo_noninteractive_ok() { return 1; }
+        has_cmd() { return 1; }
+        has_system_unit() { return 1; }
+        has_user_unit() { return 1; }
+    ' 0 /home/alice/.local/bin)"
+
+# An existing system unit still wins over the SELinux user-local rule: a re-run
+# must refresh what is already installed rather than silently create the other
+# kind and leave two.
+check_eq "resolve: selinux + existing system unit + ~/.local/bin -> system" "system" \
+    "$(resolve_with '
+        is_root() { return 0; }
+        sudo_noninteractive_ok() { return 1; }
+        has_cmd() { return 1; }
+        has_system_unit() { return 0; }
+        has_user_unit() { return 1; }
+        selinux_active() { return 0; }
     ' 0 /home/alice/.local/bin)"
 
 # ── should_refresh_system_unit: same-user refresh guard ────────────────────
