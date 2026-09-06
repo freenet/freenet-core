@@ -157,11 +157,14 @@ pub(super) const MAX_PARKED_DELEGATES: usize = 64;
 
 /// Cap on requests queued behind a single parked delegate.
 ///
-/// Overflow is REJECTED with a visible error, never silently dropped: the
-/// caller gets `ContractHandlerEvent::DelegateResponse` carrying nothing, which
-/// surfaces to the client as an empty response rather than a hang. A delegate
-/// with 8 requests already queued behind a prompt is not going to be helped by
-/// a ninth.
+/// Overflow is REJECTED, and the caller's responder is DROPPED so the client
+/// sees an error. It must NOT be answered with an empty `DelegateResponse`:
+/// that is what a delegate which ran and said nothing returns, so it would
+/// report success for work `process()` never performed. An earlier version of
+/// this comment described exactly that rejected behaviour — the code, and
+/// `a_request_refused_behind_a_full_pending_queue_errors_not_succeeds`, do the
+/// opposite. A delegate with 8 requests already queued behind a prompt is not
+/// going to be helped by a ninth.
 pub(super) const MAX_PENDING_PER_DELEGATE: usize = 8;
 
 /// Cap on DISTINCT contracts with a coalesced notification pending behind one
@@ -305,55 +308,69 @@ fn delegate_container_bytes(delegate: &freenet_stdlib::prelude::DelegateContaine
 }
 
 fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
-    // Charged OUTSIDE the match, for every variant, via the stdlib accessor.
-    // `DelegateContext` runs to nearly 400 KiB, and a client can queue
-    // small-payload messages carrying large contexts behind a park while
-    // `parked_bytes` barely moves. Doing it here rather than in each arm is
-    // deliberate: this budget has now been wrong in six distinct ways, and a
-    // per-arm charge is a seventh spot to forget. A new variant cannot omit it.
-    let context = msg.get_context().map_or(0, |c| c.as_ref().len());
-    context
-        + match msg {
-            InboundDelegateMsg::ApplicationMessage(m) => m.payload.len(),
-            InboundDelegateMsg::GetContractResponse(r) => {
-                r.state.as_ref().map_or(0, |s| s.as_ref().len())
-            }
-            InboundDelegateMsg::ContractNotification(n) => n.new_state.as_ref().len(),
-            InboundDelegateMsg::UserResponse(r) => r.response.len(),
-            InboundDelegateMsg::DelegateMessage(m) => m.payload.len(),
-            // Put/Update/Subscribe responses carry only a small Result. The
-            // wildcard is required by `#[non_exhaustive]`; a future variant
-            // carrying bytes must be added above or it goes uncounted.
-            InboundDelegateMsg::PutContractResponse(_)
-            | InboundDelegateMsg::UpdateContractResponse(_)
-            | InboundDelegateMsg::SubscribeContractResponse(_)
-            | _ => 0,
+    // EXHAUSTIVE, PER VARIANT, IN THIS CRATE'S OWN MATCH.
+    //
+    // An earlier version routed the context charge through
+    // `InboundDelegateMsg::get_context()` on the theory that a stdlib accessor
+    // covering every variant made the charge impossible to forget. IT DOES NOT:
+    // that accessor ends in `_ => None`, and it does not list `UserResponse` at
+    // all — whose `context` is CLIENT-SUPPLIED and bounded only by
+    // `DelegateContext::MAX_SIZE` (~400 KiB). So the omission moved from an arm
+    // here into an arm in another crate, where it is invisible from this file
+    // and no compiler error can point at it.
+    //
+    // The lesson is narrow and worth keeping: delegating exhaustiveness to
+    // someone else's match is not a structural guarantee, it is the same hole
+    // one indirection away. Only a match the compiler checks HERE, against the
+    // variants this code actually retains, is one.
+    match msg {
+        InboundDelegateMsg::ApplicationMessage(m) => m.payload.len() + ctx_len(&m.context),
+        InboundDelegateMsg::GetContractResponse(r) => {
+            r.state.as_ref().map_or(0, |s| s.as_ref().len()) + ctx_len(&r.context)
         }
+        InboundDelegateMsg::ContractNotification(n) => {
+            n.new_state.as_ref().len() + ctx_len(&n.context)
+        }
+        // `response` is the client's answer bytes; `context` is separate and
+        // was charged zero until #5544 H2.
+        InboundDelegateMsg::UserResponse(r) => r.response.len() + ctx_len(&r.context),
+        InboundDelegateMsg::DelegateMessage(m) => m.payload.len() + ctx_len(&m.context),
+        // Small `Result` payloads, but their contexts are not small.
+        InboundDelegateMsg::PutContractResponse(r) => ctx_len(&r.context),
+        InboundDelegateMsg::UpdateContractResponse(r) => ctx_len(&r.context),
+        InboundDelegateMsg::SubscribeContractResponse(r) => ctx_len(&r.context),
+        // Required by `#[non_exhaustive]`. A new variant that carries bytes
+        // MUST be added above; this arm is the only thing between it and going
+        // uncounted, which is why the list is written out rather than delegated.
+        _ => 0,
+    }
 }
 
 fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
-    // Same structural charge as `inbound_bytes`: context first, for every
-    // variant, so it cannot be forgotten by an arm.
-    let context = msg.get_context().map_or(0, |c| c.as_ref().len());
-    context + outbound_payload_bytes(msg)
+    // Exhaustive per variant, for the same reason as `inbound_bytes`:
+    // `OutboundDelegateMsg::get_context()` also ends in `_ => None`, and the
+    // wildcard swallows `ContextUpdated` — whose entire payload IS a context,
+    // so routing through the accessor charged it 0 + 0. It accumulates across
+    // parks via `RunSeed.accumulated` for up to MAX_CONTRACT_REQUEST_ITERATIONS
+    // (#5544 H1).
+    match msg {
+        OutboundDelegateMsg::ApplicationMessage(m) => m.payload.len() + ctx_len(&m.context),
+        OutboundDelegateMsg::SendDelegateMessage(m) => m.payload.len() + ctx_len(&m.context),
+        OutboundDelegateMsg::ContextUpdated(c) => ctx_len(c),
+        OutboundDelegateMsg::RequestUserInput(r) => {
+            r.message.bytes().len() + r.responses.iter().map(|resp| resp.len()).sum::<usize>()
+        }
+        OutboundDelegateMsg::GetContractRequest(r) => ctx_len(&r.context),
+        OutboundDelegateMsg::PutContractRequest(r) => r.state.as_ref().len() + ctx_len(&r.context),
+        OutboundDelegateMsg::UpdateContractRequest(r) => ctx_len(&r.context),
+        OutboundDelegateMsg::SubscribeContractRequest(r) => ctx_len(&r.context),
+    }
 }
 
-fn outbound_payload_bytes(msg: &OutboundDelegateMsg) -> usize {
-    // The request variants never appear in `accumulated` — they are consumed by
-    // the run that produced them — and the rest carry no contract-controlled
-    // payload. Listed rather than wildcarded so a future payload-bearing
-    // variant has to be considered here.
-    match msg {
-        OutboundDelegateMsg::ApplicationMessage(m) => m.payload.len(),
-        OutboundDelegateMsg::SendDelegateMessage(m) => m.payload.len(),
-        // `ContextUpdated`'s payload IS its context, already charged above.
-        OutboundDelegateMsg::ContextUpdated(_)
-        | OutboundDelegateMsg::RequestUserInput(_)
-        | OutboundDelegateMsg::GetContractRequest(_)
-        | OutboundDelegateMsg::PutContractRequest(_)
-        | OutboundDelegateMsg::UpdateContractRequest(_)
-        | OutboundDelegateMsg::SubscribeContractRequest(_) => 0,
-    }
+/// Bytes a `DelegateContext` pins. Bounded by `DelegateContext::MAX_SIZE`
+/// (~400 KiB), which is why omitting it was worth two High findings.
+fn ctx_len(ctx: &DelegateContext) -> usize {
+    ctx.as_ref().len()
 }
 
 /// Backstop lifetime for a park.
@@ -650,19 +667,31 @@ struct ParkGuardPayload {
     resume_tx: tokio::sync::mpsc::UnboundedSender<DelegateResume>,
     delegate_key: DelegateKey,
     epoch: u64,
-    /// Prompt request ids this park owes a `UserResponse` for.
+    /// Prompt request ids this park owes a `UserResponse` for. A MULTISET:
+    /// `request_id` is chosen by delegate WASM, so `[7, 7]` is reachable.
     owed_prompts: Vec<u32>,
-    /// Upserts this park owes a Put/Update response for: `(contract, is_put)`.
+    /// Upserts this park owes a response for, as `(contract, is_put)`. Also a
+    /// MULTISET: `deferred_upserts` is built by two independent loops (PUTs and
+    /// UPDATEs) with no de-duplication, so `[(X,true),(X,false)]` and
+    /// `[(X,true),(X,true)]` are both reachable.
     owed_upserts: Vec<(ContractInstanceId, bool)>,
+    /// Where the off-loop task deposits results AS THEY COMPLETE. Shared with
+    /// the task rather than created inside it, so `Drop` can see work that
+    /// finished before a panic or cancellation (#5544 F2).
+    answers: std::sync::Arc<std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>>,
+    fetches: std::sync::Arc<std::sync::Mutex<Vec<ResolvedUpsert>>>,
 }
 
 impl ParkGuard {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         resume_tx: tokio::sync::mpsc::UnboundedSender<DelegateResume>,
         delegate_key: DelegateKey,
         epoch: u64,
         owed_prompts: Vec<u32>,
         owed_upserts: Vec<(ContractInstanceId, bool)>,
+        answers: std::sync::Arc<std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>>,
+        fetches: std::sync::Arc<std::sync::Mutex<Vec<ResolvedUpsert>>>,
     ) -> Self {
         Self {
             payload: Some(ParkGuardPayload {
@@ -671,35 +700,37 @@ impl ParkGuard {
                 epoch,
                 owed_prompts,
                 owed_upserts,
+                answers,
+                fetches,
             }),
         }
     }
 
-    /// Deliver the resolved work. Consumes the payload so a later `Drop` is a
-    /// no-op (exactly-once).
-    pub(super) fn send(
-        mut self,
-        inbound: Vec<InboundDelegateMsg<'static>>,
-        upserts: Vec<ResolvedUpsert>,
-    ) {
+    /// Deliver whatever the task completed. Consumes the payload so a later
+    /// `Drop` is a no-op (exactly-once).
+    ///
+    /// Takes NO results: they are read from the shared sinks, so this path and
+    /// `Drop` see the same data by construction. An earlier version passed them
+    /// in, which is why `Drop` saw none (#5544 F2).
+    pub(super) fn send(mut self) {
         if let Some(p) = self.payload.take() {
-            Self::deliver(p, ResumeCause::Completed, inbound, upserts);
+            Self::deliver(p, ResumeCause::Completed);
         }
     }
 
-    fn deliver(
-        p: ParkGuardPayload,
-        cause: ResumeCause,
-        mut inbound: Vec<InboundDelegateMsg<'static>>,
-        upserts: Vec<ResolvedUpsert>,
-    ) {
+    fn deliver(p: ParkGuardPayload, cause: ResumeCause) {
         let ParkGuardPayload {
             resume_tx,
             delegate_key,
             epoch,
             owed_prompts,
             owed_upserts,
+            answers,
+            fetches,
         } = p;
+
+        let mut inbound = std::mem::take(&mut *answers.lock().unwrap());
+        let upserts = std::mem::take(&mut *fetches.lock().unwrap());
 
         // TERMINAL RESULTS ARE PRODUCED HERE, not in the task body, so that
         // EVERY exit produces them — including a panic or a cancellation, which
@@ -718,57 +749,46 @@ impl ParkGuard {
         // QUESTION NEEDS RE-ASKING IS INVISIBLE FROM EITHER SIDE OF IT. Nothing
         // at this `Drop` impl announces "you are now at a different level of
         // the same question", and nothing at the task body announced it either.
-        // Both the author and the reviewer would have caught it had the boundary
-        // been visible; neither did, because it was not. Keeping the synthesis
-        // inside this guard removes the need to see the boundary at all.
         //
-        // #5544 P1b/P2. A delegate left
-        // without a response for work it requested keeps a continuation the
-        // exclusion has already released, and if nothing else is delivered it
-        // is never re-entered at all.
-        //
-        // An empty `ClientResponse` is exactly what a dismissed or timed-out
-        // prompt yields on the normal path, so the delegate sees a shape it
-        // already handles.
-        let answered: std::collections::HashSet<u32> = inbound
-            .iter()
-            .filter_map(|m| match m {
-                InboundDelegateMsg::UserResponse(r) => Some(r.request_id),
-                // Only `UserResponse` carries a request id to reconcile
-                // against `owed_prompts`. Listed rather than wildcarded so a
-                // future variant that carries one has to be considered here.
-                InboundDelegateMsg::ApplicationMessage(_)
-                | InboundDelegateMsg::GetContractResponse(_)
-                | InboundDelegateMsg::PutContractResponse(_)
-                | InboundDelegateMsg::UpdateContractResponse(_)
-                | InboundDelegateMsg::SubscribeContractResponse(_)
-                | InboundDelegateMsg::ContractNotification(_)
-                | InboundDelegateMsg::DelegateMessage(_)
-                | _ => None,
-            })
-            .collect();
+        // RECONCILED BY COUNT, NOT BY SET (#5544 F1/F3). Both owed lists are
+        // multisets — `request_id` is delegate-chosen, and two upserts can name
+        // one contract — so filtering by membership let ONE completion cancel
+        // the obligation for BOTH, and the delegate waited forever for a
+        // response nothing remained to produce. That is reachable on the
+        // ordinary budget-expiry path too, not just on panic, because partial
+        // results are delivered by design.
+        let mut answered: HashMap<u32, usize> = HashMap::new();
+        for msg in &inbound {
+            if let InboundDelegateMsg::UserResponse(r) = msg {
+                *answered.entry(r.request_id).or_default() += 1;
+            }
+        }
         for request_id in owed_prompts {
-            if !answered.contains(&request_id) {
-                inbound.push(InboundDelegateMsg::UserResponse(
+            match answered.get_mut(&request_id) {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => inbound.push(InboundDelegateMsg::UserResponse(
                     freenet_stdlib::prelude::UserInputResponse {
                         request_id,
                         response: freenet_stdlib::prelude::ClientResponse::new(Vec::new()),
                         context: DelegateContext::default(),
                     },
-                ));
+                )),
             }
         }
 
-        // Upserts cannot be synthesized here — a `ResolvedUpsert` needs the
-        // `PendingUpsert` the task owns, which is gone by the time `Drop` runs.
-        // The unresolved ids travel instead, and `handle_delegate_resume` turns
-        // them into failure responses where it has `upsert_response_msg`.
-        let resolved: std::collections::HashSet<ContractInstanceId> =
-            upserts.iter().map(|r| *r.pending.key.id()).collect();
-        let unresolved_upserts: Vec<(ContractInstanceId, bool)> = owed_upserts
-            .into_iter()
-            .filter(|(id, _)| !resolved.contains(id))
-            .collect();
+        let mut resolved: HashMap<(ContractInstanceId, bool), usize> = HashMap::new();
+        for r in &upserts {
+            *resolved
+                .entry((*r.pending.key.id(), r.pending.is_put))
+                .or_default() += 1;
+        }
+        let mut unresolved_upserts = Vec::new();
+        for (id, is_put) in owed_upserts {
+            match resolved.get_mut(&(id, is_put)) {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => unresolved_upserts.push((id, is_put)),
+            }
+        }
         if !unresolved_upserts.is_empty() {
             tracing::warn!(
                 delegate = %delegate_key,
@@ -778,6 +798,7 @@ impl ParkGuard {
                  waiting (#5544)"
             );
         }
+
         if resume_tx
             .send(DelegateResume {
                 delegate_key: delegate_key.clone(),
@@ -806,7 +827,7 @@ impl Drop for ParkGuard {
                  empty resume so the park terminates, its pending queue drains \
                  and the parked client is answered exactly once (#5544)"
             );
-            Self::deliver(p, ResumeCause::TimedOut, Vec::new(), Vec::new());
+            Self::deliver(p, ResumeCause::TimedOut);
         }
     }
 }
@@ -1640,6 +1661,89 @@ mod tests {
         );
     }
 
+    /// H1/H2: EVERY variant that can carry a context is charged for it.
+    ///
+    /// One test per variant, deliberately. The previous single test used
+    /// `ApplicationMessage` — the one variant the stdlib `get_context()`
+    /// accessor DOES cover — so it asserted the property on the only case that
+    /// already worked, while `UserResponse` (client-supplied, ~400 KiB) and
+    /// `ContextUpdated` (whose payload IS a context) were charged zero through
+    /// that accessor's `_ => None`.
+    ///
+    /// FALSIFY: drop any single `ctx_len(..)` term and its row here fails.
+    #[tokio::test]
+    async fn every_context_carrying_variant_is_charged() {
+        const N: usize = 64 * 1024;
+        let ctx = DelegateContext::new(vec![0u8; N]);
+        let cid = ContractInstanceId::new([1; 32]);
+
+        let inbound: Vec<(&str, InboundDelegateMsg<'static>)> = vec![
+            (
+                "ApplicationMessage",
+                InboundDelegateMsg::ApplicationMessage(
+                    freenet_stdlib::prelude::ApplicationMessage::new(Vec::new())
+                        .with_context(ctx.clone()),
+                ),
+            ),
+            (
+                // The one the accessor does not even list.
+                "UserResponse",
+                InboundDelegateMsg::UserResponse(freenet_stdlib::prelude::UserInputResponse {
+                    request_id: 1,
+                    response: freenet_stdlib::prelude::ClientResponse::new(Vec::new()),
+                    context: ctx.clone(),
+                }),
+            ),
+            (
+                "GetContractResponse",
+                InboundDelegateMsg::GetContractResponse(
+                    freenet_stdlib::prelude::GetContractResponse {
+                        contract_id: cid,
+                        state: None,
+                        context: ctx.clone(),
+                    },
+                ),
+            ),
+            (
+                "ContractNotification",
+                InboundDelegateMsg::ContractNotification(
+                    freenet_stdlib::prelude::ContractNotification {
+                        contract_id: cid,
+                        new_state: WrappedState::new(Vec::new()),
+                        context: ctx.clone(),
+                    },
+                ),
+            ),
+        ];
+        for (name, msg) in inbound {
+            let mut cont = continuation();
+            cont.inbound_so_far = vec![msg];
+            assert!(
+                continuation_bytes(&cont) >= N,
+                "{name}: its context must be charged; payload was empty, so only \
+                 the context makes this a real cost"
+            );
+        }
+
+        // Outbound: `ContextUpdated` is the accessor's other blind spot, and it
+        // accumulates across parks via `RunSeed.accumulated`.
+        let mut cont = continuation();
+        cont.accumulated = vec![OutboundDelegateMsg::ContextUpdated(ctx.clone())];
+        assert!(
+            continuation_bytes(&cont) >= N,
+            "ContextUpdated's payload IS a context and must be charged"
+        );
+
+        let mut cont = continuation();
+        cont.accumulated = vec![OutboundDelegateMsg::ApplicationMessage(
+            freenet_stdlib::prelude::ApplicationMessage::new(Vec::new()).with_context(ctx),
+        )];
+        assert!(
+            continuation_bytes(&cont) >= N,
+            "an outbound ApplicationMessage's context must be charged"
+        );
+    }
+
     /// P1a: the byte cap must charge what is actually RETAINED, including the
     /// payloads the off-loop task holds, not just what `Continuation` points at.
     ///
@@ -1693,25 +1797,155 @@ mod tests {
         );
     }
 
+    type Sinks = (
+        std::sync::Arc<std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<ResolvedUpsert>>>,
+    );
+
+    fn sinks() -> Sinks {
+        (Default::default(), Default::default())
+    }
+
+    fn answer(request_id: u32) -> InboundDelegateMsg<'static> {
+        InboundDelegateMsg::UserResponse(freenet_stdlib::prelude::UserInputResponse {
+            request_id,
+            response: freenet_stdlib::prelude::ClientResponse::new(b"allow".to_vec()),
+            context: DelegateContext::default(),
+        })
+    }
+
+    fn answered_ids(resume: &DelegateResume) -> Vec<u32> {
+        resume
+            .inbound
+            .iter()
+            .filter_map(|m| match m {
+                InboundDelegateMsg::UserResponse(r) => Some(r.request_id),
+                #[allow(clippy::wildcard_enum_match_arm)]
+                _ => None,
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn guard_delivers_exactly_one_resume_on_success() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let guard = ParkGuard::new(tx, key(1), 0, Vec::new(), Vec::new());
-        guard.send(Vec::new(), Vec::new());
+        let (answers, fetches) = sinks();
+        let guard = ParkGuard::new(tx, key(1), 0, Vec::new(), Vec::new(), answers, fetches);
+        guard.send();
         let resume = rx.recv().await.expect("one resume");
         assert_eq!(resume.cause, ResumeCause::Completed);
         assert!(rx.try_recv().is_err(), "must not deliver twice");
     }
 
+    /// The `Drop` path must SYNTHESIZE the terminal results it owes.
+    ///
+    /// The previous version of this test built the guard with EMPTY owed lists
+    /// and then asserted `resume.inbound.is_empty()`. That is correct for the
+    /// case it constructed and the exact OPPOSITE of what the code must do when
+    /// prompts are owed — so it pinned the ABSENCE of the behaviour, and a
+    /// reader took the assertion as the contract. Mutation testing found the
+    /// whole synthesis block could be deleted with the suite still green.
     #[tokio::test]
-    async fn guard_delivers_a_resume_when_dropped_before_sending() {
+    async fn drop_synthesizes_denials_for_everything_it_owes() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        // Simulates the spawned task being cancelled/panicking before it
-        // finished its work. Without this the park would never end: the
-        // pending queue would never drain and the client would hang.
-        drop(ParkGuard::new(tx, key(1), 0, Vec::new(), Vec::new()));
+        let (answers, fetches) = sinks();
+        drop(ParkGuard::new(
+            tx,
+            key(1),
+            0,
+            vec![1, 2],
+            vec![(ContractInstanceId::new([3; 32]), true)],
+            answers,
+            fetches,
+        ));
         let resume = rx.recv().await.expect("drop must still resume the park");
         assert_eq!(resume.cause, ResumeCause::TimedOut);
-        assert!(resume.inbound.is_empty());
+        assert_eq!(
+            answered_ids(&resume),
+            vec![1, 2],
+            "every owed prompt must get a synthesized response, or the delegate \
+             waits forever for one nothing remains to produce"
+        );
+        assert_eq!(
+            resume.unresolved_upserts,
+            vec![(ContractInstanceId::new([3; 32]), true)],
+            "every owed upsert must be reported unresolved"
+        );
+    }
+
+    /// F2: answers a human ALREADY GAVE must survive the `Drop` path.
+    ///
+    /// The sinks used to be created inside the spawned future, so `Drop` saw
+    /// none of them and rewrote every owed prompt as a denial. The user clicks
+    /// Allow, the task panics, and the delegate is told denied.
+    #[tokio::test]
+    async fn drop_keeps_answers_already_given_rather_than_denying_them() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (answers, fetches) = sinks();
+        answers.lock().unwrap().push(answer(1)); // the human said allow
+        drop(ParkGuard::new(
+            tx,
+            key(1),
+            0,
+            vec![1, 2],
+            Vec::new(),
+            answers,
+            fetches,
+        ));
+        let resume = rx.recv().await.expect("resume");
+        let kept: Vec<&InboundDelegateMsg<'static>> = resume
+            .inbound
+            .iter()
+            .filter(|m| matches!(m, InboundDelegateMsg::UserResponse(r) if r.request_id == 1))
+            .collect();
+        assert_eq!(kept.len(), 1, "exactly one response for request 1");
+        let InboundDelegateMsg::UserResponse(r) = kept[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            &r.response[..],
+            b"allow".as_slice(),
+            "the answer the human gave must survive, not be replaced by a denial"
+        );
+        assert_eq!(
+            answered_ids(&resume),
+            vec![1, 2],
+            "the unanswered one is still synthesized"
+        );
+    }
+
+    /// F1/F3: the reconciliation is over a MULTISET, not a set.
+    ///
+    /// `request_id` is chosen by delegate WASM, and `deferred_upserts` is built
+    /// by two independent loops with no de-duplication, so duplicates on both
+    /// lists are reachable. Filtering by membership let ONE completion cancel
+    /// the obligation for BOTH, and the second waited forever.
+    #[tokio::test]
+    async fn reconciliation_counts_duplicates_rather_than_matching_by_membership() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (answers, fetches) = sinks();
+        answers.lock().unwrap().push(answer(7)); // only ONE of the two owed
+        let contract = ContractInstanceId::new([9; 32]);
+        drop(ParkGuard::new(
+            tx,
+            key(1),
+            0,
+            vec![7, 7],
+            vec![(contract, true), (contract, true)],
+            answers,
+            fetches,
+        ));
+        let resume = rx.recv().await.expect("resume");
+        assert_eq!(
+            answered_ids(&resume),
+            vec![7, 7],
+            "two owed prompts with the SAME id need two responses; matching by \
+             membership would have cancelled both obligations with one answer"
+        );
+        assert_eq!(
+            resume.unresolved_upserts.len(),
+            2,
+            "two owed upserts on one contract need two outcomes"
+        );
     }
 }
