@@ -303,12 +303,15 @@ Current wire-gated floors:
   gateway, and the release cascade upgrades the gateways FIRST.
 
   Guarded by a marker exactly like `HASH_FIRST_SHIPPED_IN`:
-  `ACK_VERSION_SHIPPED_IN: Option<(u8, u8, u16)>`, currently `None`, checked by
+  `ACK_VERSION_SHIPPED_IN: Option<(u8, u8, u16)>`, now `Some((0, 2, 120))`
+  (this feature shipped in 0.2.120), checked by
   `version_cmp.rs::ack_version_floor_tracks_the_shipping_release`. When a
-  release bump raises `CARGO_PKG_VERSION` to `(0, 2, 120)`, that test fails
+  release bump raises `CARGO_PKG_VERSION` to a new floor, that test fails
   until the releaser consciously either sets
   `ACK_VERSION_SHIPPED_IN = Some(GATEWAY_ACK_VERSION_MIN_VERSION)` (this release
   carries it) or raises the floor (it does not).
+  `ack_version_floor_stays_above_every_release_without_the_variants` is the
+  companion that catches the floor being *lowered*.
 
   Note the emission gate reads the peer's version from the intro packet it just
   parsed, never from a cached value, so unlike the floors above there is no
