@@ -4415,6 +4415,123 @@ mod tests {
         ContractKey::from_params_and_code(&params, &code)
     }
 
+    /// PIN: the NODE-WIDE "one delegate `process()` at a time" invariant, held
+    /// by the shape of the call graph and by nothing else.
+    ///
+    /// Three separate things now rest on this property:
+    ///  1. `DelegateContextCache`'s last-write-wins keying (per-delegate, and
+    ///     `DelegateParkCtx`'s exclusion supplies that half — see
+    ///     `a_parked_delegate_is_not_re_entered_until_it_resumes`);
+    ///  2. `queue_v2_delegate_broadcast`'s non-atomic marker insert/enqueue/
+    ///     rollback triple (#5490);
+    ///  3. `native_api::state_content_changed`'s non-atomic read-then-write,
+    ///     whose racing pair is two DIFFERENT delegates writing the SAME
+    ///     contract — per-CONTRACT, which per-delegate exclusion permits by
+    ///     construction, so only the node-wide property covers it.
+    ///
+    /// The third is the reason this pin exists. There is **no lock**: no
+    /// per-delegate mutex, no executor affinity, nothing in
+    /// `wasm_runtime::delegate` enforcing it. The property is supplied entirely
+    /// by every route to `process()` being awaited from the one
+    /// `contract_handling` task. That is exactly the shape a later performance
+    /// change breaks silently, and the breakage is state corruption rather than
+    /// a crash — so it gets a guard rather than a comment.
+    ///
+    /// Anchored on the PROPERTY, not on a helper's name: it asserts the
+    /// chokepoint is still a chokepoint, and that the set of functions allowed
+    /// to enter it is still the documented on-loop set. Adding a caller is not
+    /// forbidden — it fails this test, which asks you to confirm the new caller
+    /// is awaited from `contract_handling` and then to say so here.
+    ///
+    /// FALSIFY: add a call to `handle_delegate_with_contract_requests` in a new
+    /// function (for instance inside a `GlobalExecutor::spawn` body), or call
+    /// `execute_delegate_request` from anywhere but the chokepoint. Either
+    /// fails. Verified by doing both.
+    #[test]
+    fn every_delegate_run_is_reached_from_the_serial_loop() {
+        // Production text only, comments stripped. Both needles occur in this
+        // test's own prose and in the module's doc comments, and a scrape that
+        // counted those would report a true fact about the wrong text (#5450).
+        let full = include_str!("contract.rs");
+        let prod = full.split("\nmod tests {").next().unwrap_or(full);
+        let code: String = prod
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(i) => &line[..i],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The nearest preceding `fn` declaration at statement position.
+        fn enclosing_fn(code: &str, idx: usize) -> &str {
+            code[..idx]
+                .rmatch_indices("\nfn ")
+                .next()
+                .into_iter()
+                .chain(code[..idx].rmatch_indices("\nasync fn ").next())
+                .max_by_key(|(i, _)| *i)
+                .map(|(i, m)| {
+                    let after = &code[i + m.len()..];
+                    after
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .next()
+                        .unwrap_or("")
+                })
+                .unwrap_or("")
+        }
+
+        // 1. The executor call is reached through ONE chokepoint.
+        let chokepoint = "handle_delegate_with_contract_requests";
+        for (idx, _) in code.match_indices(".execute_delegate_request(") {
+            let owner = enclosing_fn(&code, idx);
+            assert_eq!(
+                owner, chokepoint,
+                "`execute_delegate_request` must be reached only from `{chokepoint}`, \
+                 which is what makes the node-wide serialization argument checkable. \
+                 Found a call in `{owner}`. If that function is genuinely awaited \
+                 from `contract_handling`, widen this pin deliberately and say why."
+            );
+        }
+        assert_eq!(
+            code.matches(".execute_delegate_request(").count(),
+            2,
+            "expected exactly the main call and the inter-delegate hop"
+        );
+
+        // 2. Only the documented on-loop functions enter the chokepoint.
+        //    Every one of these is awaited from `contract_handling`.
+        let allowed = [
+            "handle_delegate_notification",
+            "dispatch_delegate_request",
+            "handle_delegate_resume",
+            "run_queued_notification",
+        ];
+        let mut callers: Vec<&str> = code
+            .match_indices(&format!("{chokepoint}("))
+            .map(|(idx, _)| enclosing_fn(&code, idx))
+            .filter(|owner| *owner != chokepoint)
+            .collect();
+        callers.sort_unstable();
+        callers.dedup();
+        for caller in &callers {
+            assert!(
+                allowed.contains(caller),
+                "`{caller}` calls `{chokepoint}`, and it is not one of the \
+                 functions known to be awaited from the serial `contract_handling` \
+                 loop: {allowed:?}. At most one delegate `process()` may execute \
+                 node-wide at any instant; a call from a spawned task, a pooled \
+                 executor or a second loop breaks that, and with it #5490's \
+                 broadcast marker and `state_content_changed`'s read-then-write. \
+                 If this caller IS on the loop, add it here with the reason."
+            );
+        }
+        assert!(
+            !callers.is_empty(),
+            "the scrape found no callers at all, so it is measuring nothing"
+        );
+    }
+
     /// Pin: a wrong response variant must NOT be reported to the client as a
     /// success.
     ///
