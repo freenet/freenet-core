@@ -427,17 +427,18 @@ impl Executor<Runtime> {
                 // WebSocket disconnect path in `client_events.rs`, including
                 // its upstream-collapse decision.
                 //
-                // NO OWNERSHIP CHECK ON THE KEY, and this PR widens what that
-                // costs. `UnregisterDelegate` takes a client-supplied
-                // `DelegateKey` and nothing verifies the caller owns it, so any
-                // client that knows a public delegate key can unregister it.
-                // Before #4669 that dropped notification hooks; it now ALSO
-                // drops that delegate's ring demand and can send `Unsubscribe`
-                // upstream for contracts another app was keeping alive. The
-                // authorization gap is pre-existing and architectural — see the
-                // module header of `contract::delegate_demand` for the matching
-                // gap on which contracts a delegate may PIN — but the blast
-                // radius is larger now and should not be discovered later.
+                // AUTHORIZATION, PRE-EXISTING AND UNFIXED. There is an
+                // authorization gap on this teardown path, and this PR WIDENS
+                // WHAT IT COSTS: the same teardown now drops the delegate's
+                // ring demand as well as its notification hooks, so the reach
+                // is larger than it was before #4669.
+                //
+                // The mechanism is deliberately not stated here. It is tracked
+                // in a private advisory together with the related gap noted in
+                // `contract::delegate_demand`'s module header, and it stays
+                // there until there is a fix — a public repo is not where an
+                // open hole gets its method written down, in a comment or in a
+                // commit message. See `no-public-disclosure-before-fix`.
                 //
                 // SCOPE MISMATCH, unfixed: the retain above walks the
                 // process-global `DELEGATE_SUBSCRIPTIONS`, so it clears this

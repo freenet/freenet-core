@@ -83,18 +83,20 @@
 //!   per-contract cap in [`register_subscription`]) and no TIME bound, which is
 //!   the distinction that matters for the GC-exemption rule.
 //!
-//!   **There is no AUTHORIZATION bound at all, and the earlier wording here was
-//!   wrong about it.** It said a delegate "can still pin everything its own app
-//!   has PUT locally". The gate is the node's HOSTED set, not the app's PUT
-//!   set, and a node hosts other people's contracts by ring proximity — very
-//!   different collections. Nothing checks that the contract belongs to the
-//!   delegate's app, was PUT by it, or shares an origin: both resolution paths
-//!   (`resolve_contract_key`, `lookup_key`) are bare code-index lookups with no
-//!   owner concept. **A delegate may pin any contract this node hosts,
-//!   belonging to anyone.** No enumeration is needed either, since the
-//!   interesting ids are published — River room ids, Delta site ids — and
-//!   `get_contract_state_len` answers "does this node hold X". Architectural,
-//!   not fixable here; stated so it is not discovered later.
+//!   **There is no AUTHORIZATION bound at all, and the earlier wording here
+//!   was wrong about it** — it claimed a delegate "can still pin everything its
+//!   own app has PUT locally", and that is not the bound that exists. The size
+//!   bounds above are therefore the only ones this module imposes.
+//!
+//!   Delegate-to-contract authorization is UNFIXED and tracked separately in a
+//!   private advisory. It is architectural and not fixable here. The mechanism
+//!   is deliberately not stated in this file: the fact is what a maintainer
+//!   needs in order to know the bound is missing and to go and read the
+//!   advisory, whereas the detail would be an exploit recipe in a public repo
+//!   for a hole that is still open. Do not add it back here, and do not put it
+//!   in a commit message either — see `no-public-disclosure-before-fix`. Once
+//!   there is a fix, this becomes an ordinary comment and should say
+//!   everything.
 //! - **Invariant 2 (demand-driven hosting).** A delegate subscription is real
 //!   demand from a real resident component. It is not holding-driven: nothing
 //!   here makes a peer host a contract it was not already holding.
