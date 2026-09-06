@@ -4468,6 +4468,13 @@ impl Ring {
             .client_and_reserved_range_counts(client_id, reserved_id_floor)
     }
 
+    /// Whether `contract` carries an abandonment stamp. Test-only; see
+    /// `HostingManager::abandoned_at_is_set`.
+    #[cfg(test)]
+    pub(crate) fn abandoned_at_is_set(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager.abandoned_at_is_set(contract)
+    }
+
     /// `(non-delegate local subscribers, downstream)` — the split the
     /// cost-pressure sweep uses. See
     /// `HostingManager::non_delegate_local_and_downstream_counts`.

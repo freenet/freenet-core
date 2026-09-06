@@ -1093,6 +1093,25 @@ pub(crate) fn drop_delegate_demand(op_manager: &std::sync::Arc<OpManager>, deleg
 mod tests {
     use super::*;
 
+    /// Strip `//` comment text from a scraped window before matching.
+    ///
+    /// Without this every call-guarding pin in this module can be defeated by
+    /// COMMENTING OUT the call it guards: `contains` is just as happy inside a
+    /// comment, so the guard reports the invariant holds while the call is
+    /// inert. That is the same "true answer about the wrong text" shape
+    /// `.claude/rules/testing.md` describes, reached from a direction the
+    /// window guards do not cover.
+    fn code_only(window: &str) -> String {
+        window
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(ix) => &line[..ix],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn delegate_key(seed: u8) -> DelegateKey {
         DelegateKey::new(
             [seed; 32],
@@ -2103,7 +2122,7 @@ mod tests {
         let arm_end = SOURCE[arm..]
             .find("self.runtime.unregister_delegate(")
             .expect("the UnregisterDelegate arm must still end in unregister_delegate");
-        let body = &SOURCE[arm..arm + arm_end];
+        let body = code_only(&SOURCE[arm..arm + arm_end]);
         assert!(
             body.contains("delegate_demand::drop_delegate_demand("),
             "`UnregisterDelegate` cleanup must drop the delegate's demand as \
@@ -2226,7 +2245,7 @@ mod tests {
         let insert = body
             .find("add_client_subscription(contract.id(), client_id)")
             .expect("the demand insert must still exist");
-        let after = &body[insert..];
+        let after = code_only(&body[insert..]);
 
         assert!(
             after.contains("is_hosting_contract(contract)"),
@@ -2312,7 +2331,7 @@ mod tests {
         let closed = body
             .find("TrySendError::Closed(")
             .expect("the channel-closed arm must still exist");
-        let arm = &body[closed..];
+        let arm = code_only(&body[closed..]);
 
         assert!(
             arm.contains("DELEGATE_SUBSCRIPTIONS.remove("),

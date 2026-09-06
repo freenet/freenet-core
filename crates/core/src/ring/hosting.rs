@@ -2119,6 +2119,19 @@ impl HostingManager {
     /// entries (no lease filter, matching `has_downstream_subscribers`) so the
     /// count equals `contract_in_use` exactly; the periodic
     /// `expire_stale_downstream_subscribers` sweep keeps the map fresh.
+    /// Whether `contract` currently carries an abandonment stamp.
+    ///
+    /// Test-only. Exists because `Ring::remove_client_subscription`'s reason to
+    /// exist is that it records abandonment, and that was asserted nowhere: two
+    /// mutations of it survived the whole suite.
+    #[cfg(test)]
+    pub(crate) fn abandoned_at_is_set(&self, contract: &ContractKey) -> bool {
+        self.hosting_cache
+            .read()
+            .get(contract)
+            .is_some_and(|entry| entry.abandoned_at.is_some())
+    }
+
     /// As [`Self::local_and_downstream_counts`], but the local count EXCLUDES
     /// delegate pins (`contract::delegate_demand`'s reserved `ClientId` range).
     ///
