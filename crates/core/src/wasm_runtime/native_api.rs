@@ -1094,6 +1094,121 @@ pub(super) mod rand {
 pub(super) mod time {
     use super::*;
     use chrono::{DateTime, Utc as UtcOriginal};
+    use std::cell::RefCell;
+
+    use crate::util::time_source::DynTimeSource;
+
+    thread_local! {
+        /// Overrides the wall clock handed to a contract by [`utc_now`], for this
+        /// thread only. `None` — the production state — means the real clock.
+        ///
+        /// Contract WASM execution runs on a dedicated blocking thread (see
+        /// `execute_wasm_blocking` in `engine/wasmtime_engine.rs`), never on the
+        /// caller's thread, so this slot is only ever populated by that funnel
+        /// carrying an override captured from the calling thread across the
+        /// `spawn_blocking` boundary — never set directly from contract-call code.
+        static CONTRACT_CLOCK: RefCell<Option<DynTimeSource>> = const { RefCell::new(None) };
+    }
+
+    /// The wall-clock instant a contract sees.
+    ///
+    /// Routed through [`DynTimeSource`] rather than calling `Utc::now()` directly
+    /// so that a test CAN control what a contract believes the time to be.
+    /// `.claude/rules/testing.md` requires a `TimeSource` rather than a bare
+    /// `now()`; this was the one call reachable from WASM guest code that still
+    /// called the real clock directly.
+    ///
+    /// Why it matters beyond the rule: `update_determinism` detects a
+    /// clock-reading contract by calling merge twice and comparing bytes, so it
+    /// only fires when an expiry boundary happens to fall inside the few hundred
+    /// milliseconds between those two calls. Against a contract with hour-scale
+    /// windows nothing crosses a boundary and it reads clean — so a clean verdict
+    /// could not be told apart from "we did not catch it". With an injectable
+    /// clock the two calls can be placed an hour apart deliberately and any
+    /// clock reader is caught by construction. See #5465 and #5462.
+    fn contract_now() -> DateTime<UtcOriginal> {
+        // Read the override out before falling back, so the `RefCell` borrow has
+        // ended by the time anything else runs.
+        let overridden = CONTRACT_CLOCK.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|source| DateTime::<UtcOriginal>::from(source.system_time_now()))
+        });
+        overridden.unwrap_or_else(UtcOriginal::now)
+    }
+
+    /// Restores the previous contract clock when dropped.
+    ///
+    /// Restores the PREVIOUS value rather than clearing, so nesting is safe and an
+    /// inner override cannot silently unset an outer one.
+    ///
+    /// **Must be dropped on the thread it was created on.** The override is a
+    /// THREAD-LOCAL, so this guard is only sound when created and dropped on the
+    /// same OS thread — e.g. held across synchronous calls only, never across an
+    /// `.await` point on a multi-thread runtime, where tokio's work-stealing
+    /// scheduler may resume the task on a different worker thread. `Drop` checks
+    /// this and refuses to restore across a thread change (see below) rather
+    /// than silently corrupting whichever thread's clock it lands on.
+    #[must_use = "the override is reverted as soon as this guard is dropped"]
+    pub(crate) struct ContractClockGuard {
+        previous: Option<DynTimeSource>,
+        installed_on: std::thread::ThreadId,
+    }
+
+    impl Drop for ContractClockGuard {
+        fn drop(&mut self) {
+            if std::thread::current().id() != self.installed_on {
+                // Restoring `previous` here would write it into THIS thread's
+                // slot, not the thread that installed it — corrupting whatever
+                // this thread's own clock state was, while the installing
+                // thread's override is never restored at all. Neither thread can
+                // be made correct from here, so refuse and surface it loudly
+                // instead of silently corrupting one of them.
+                tracing::error!(
+                    "ContractClockGuard dropped on a different thread than it was \
+                     installed on — the override was NOT restored on either \
+                     thread. This guard must not be held across an .await point \
+                     on a multi-thread runtime."
+                );
+                return;
+            }
+            let previous = self.previous.take();
+            CONTRACT_CLOCK.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+
+    /// Make contracts executed ON THIS THREAD read `source` instead of the real
+    /// clock, until the returned guard drops.
+    ///
+    /// This is the low-level primitive `execute_wasm_blocking` uses to carry an
+    /// override across the `spawn_blocking`/dedicated-thread boundary — see
+    /// [`current_contract_clock_override`]. Test code should call this on
+    /// whichever thread actually invokes the contract call (e.g. the test's own
+    /// thread when driving a `RuntimeOracle` synchronously); the funnel then
+    /// propagates it to the worker thread that runs the WASM. See
+    /// [`ContractClockGuard`]'s docs for why the guard must not cross threads.
+    pub(crate) fn override_contract_clock(source: DynTimeSource) -> ContractClockGuard {
+        let previous = CONTRACT_CLOCK.with(|slot| slot.borrow_mut().replace(source));
+        ContractClockGuard {
+            previous,
+            installed_on: std::thread::current().id(),
+        }
+    }
+
+    /// Read this thread's current override, if any, so it can be carried across
+    /// to the thread that will actually execute the contract.
+    ///
+    /// Contract execution deliberately runs on a different thread from the
+    /// caller (`spawn_blocking` on a multi-thread runtime, a dedicated
+    /// `std::thread` otherwise — `execute_wasm_blocking`, the #4441 whole-node
+    /// hang fix), so a thread-local override installed on the calling thread
+    /// never reaches `utc_now` on its own. `execute_wasm_blocking` calls this on
+    /// the calling thread, then re-installs the result on the worker thread for
+    /// the duration of that one call, so production (which never overrides)
+    /// forwards `None` and pays nothing.
+    pub(crate) fn current_contract_clock_override() -> Option<DynTimeSource> {
+        CONTRACT_CLOCK.with(|slot| slot.borrow().clone())
+    }
 
     pub(crate) fn utc_now(id: i64, ptr: i64) {
         if id == -1 {
@@ -1104,7 +1219,7 @@ pub(super) mod time {
             return;
         }
         let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
-        let now = UtcOriginal::now();
+        let now = contract_now();
         let Some(ptr) = validate_and_compute_ptr::<DateTime<UtcOriginal>>(
             ptr,
             info.start_ptr,
@@ -1119,6 +1234,88 @@ pub(super) mod time {
         unsafe {
             ptr.write(now);
         };
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::util::time_source::SharedMockTimeSource;
+
+        /// Cheap, no-wasmtime pin for the claim in [`ContractClockGuard`]'s doc
+        /// comment: nesting restores the PREVIOUS value, not `None` — an inner
+        /// override cannot silently unset an outer one.
+        #[test]
+        fn nested_overrides_restore_in_lifo_order() {
+            assert!(
+                current_contract_clock_override().is_none(),
+                "test thread must start with no override, or this test proves nothing"
+            );
+
+            let outer = Arc::new(SharedMockTimeSource::new()) as DynTimeSource;
+            let outer_guard = override_contract_clock(Arc::clone(&outer));
+            assert!(Arc::ptr_eq(
+                &current_contract_clock_override().expect("outer override missing"),
+                &outer
+            ));
+
+            {
+                let inner = Arc::new(SharedMockTimeSource::new()) as DynTimeSource;
+                let _inner_guard = override_contract_clock(Arc::clone(&inner));
+                assert!(Arc::ptr_eq(
+                    &current_contract_clock_override().expect("inner override missing"),
+                    &inner
+                ));
+            } // inner guard drops here
+
+            assert!(
+                Arc::ptr_eq(
+                    &current_contract_clock_override().expect("outer override was not restored"),
+                    &outer
+                ),
+                "dropping the inner guard must restore the outer override, not clear it"
+            );
+
+            drop(outer_guard);
+            assert!(
+                current_contract_clock_override().is_none(),
+                "dropping the outermost guard must restore the real-clock state (None)"
+            );
+        }
+
+        /// A guard dropped on a different thread than it was created on must NOT
+        /// restore its `previous` value into that thread's slot — doing so would
+        /// silently corrupt whichever thread's clock state it lands on. Pins the
+        /// refusal added to `ContractClockGuard::drop`.
+        #[test]
+        fn guard_dropped_on_a_different_thread_does_not_corrupt_that_threads_clock() {
+            let creator_clock = Arc::new(SharedMockTimeSource::new()) as DynTimeSource;
+            let guard = override_contract_clock(Arc::clone(&creator_clock));
+
+            let other_thread_clock = Arc::new(SharedMockTimeSource::new()) as DynTimeSource;
+            std::thread::spawn(move || {
+                assert!(
+                    current_contract_clock_override().is_none(),
+                    "a fresh OS thread must start with no override"
+                );
+                let other_guard = override_contract_clock(Arc::clone(&other_thread_clock));
+
+                // Drop the OTHER thread's guard here, on THIS thread — the misuse
+                // this test exists to catch.
+                drop(guard);
+
+                assert!(
+                    Arc::ptr_eq(
+                        &current_contract_clock_override()
+                            .expect("this thread's own override must survive"),
+                        &other_thread_clock
+                    ),
+                    "a cross-thread drop must not overwrite this thread's own override"
+                );
+                drop(other_guard);
+            })
+            .join()
+            .unwrap();
+        }
     }
 }
 

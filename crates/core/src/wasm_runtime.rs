@@ -80,6 +80,14 @@ pub(crate) use native_api::{
     new_delegate_context_cache, new_delegate_counter, new_inherited_origins,
     release_created_delegate_slot,
 };
+// Narrow re-export rather than making `native_api` crate-visible: only the
+// conformance test driver (outside the `wasm_runtime` subtree) needs the
+// clock-override primitive, and widening the whole module would also expose
+// unrelated delegate-context/inherited-origins internals crate-wide. Gated to
+// test builds — production code that needs it (`execute_wasm_blocking`) is a
+// descendant of `wasm_runtime` and reaches `native_api::time` directly.
+#[cfg(test)]
+pub(crate) use native_api::time::override_contract_clock;
 // Only constructed by name in test code (e.g. resolve_message_origin tests);
 // production read/write paths access the entry through the DashMap without
 // naming the type, so gate the re-export to avoid an unused-import warning.
