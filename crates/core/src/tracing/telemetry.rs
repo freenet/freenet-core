@@ -3532,7 +3532,7 @@ mod tests {
             removed: [value; 7],
             current: [value; 5],
             recreated: [value; 7],
-            populated: [[value; 4]; 6],
+            populated: [[value; 4]; 7],
             corr_ovf: [value; 2],
             queue: [value; 15],
             recv_n: [[value; 9]; 4],

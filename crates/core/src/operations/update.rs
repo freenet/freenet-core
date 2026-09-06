@@ -1069,10 +1069,16 @@ pub(crate) async fn update_contract(
 /// — the fan-out and heartbeat already behaved this way — and this gate makes
 /// the third path match them rather than introducing it. Tracked with the rest
 /// of the #4440 advertisement-hygiene work; deliberately not papered over here.
+///
+/// `origin` MUST be the one this fan-out registered. It is not used to choose
+/// recipients — the #4965 co-host exclusion below is unchanged — but to DERIVE
+/// the covered peers' summaries without sending them anything. See
+/// [`seed_covered_peer_summaries`].
 pub(crate) async fn send_proactive_summary_notification(
     op_manager: &OpManager,
     key: &ContractKey,
     sender_addr: SocketAddr,
+    origin: &BroadcastOrigin,
 ) {
     use crate::message::{SummariesEmitter, SummaryEntry};
     use crate::ring::interest::contract_hash;
@@ -1153,6 +1159,13 @@ pub(crate) async fn send_proactive_summary_notification(
     // reply in the rollup.
     let hash = contract_hash(key);
     let full_entry = SummaryEntry::from_summary(hash, Some(&summary));
+
+    // #5190, and the reason this function takes an `origin` at all.
+    //
+    // Derive the covered peers' summaries rather than mailing ours to them.
+    // This costs nothing and is what makes the co-host exclusion below sound
+    // again for peers the #5147 target list suppressed.
+    seed_covered_peer_summaries(op_manager, key, origin, &summary);
 
     // Get interested peers and resolve them to addresses. Peers that don't
     // resolve to a live socket address are dropped here, as before.
@@ -1265,6 +1278,74 @@ pub(crate) async fn send_proactive_summary_notification(
         peer_count = targets.len(),
         "Sent proactive summary notifications after state change"
     );
+}
+
+/// Derive the summaries of peers the originator already delivered to, instead
+/// of transmitting ours to them (#5190).
+///
+/// # The bug this replaces a message with
+///
+/// #5147 lets a relayer skip fan-out legs the originator already covered. But
+/// a fan-out leg is also how a peer LEARNS our summary — it rides along as
+/// `sender_summary_bytes`. Suppressing the leg therefore starved the covered
+/// peer's cached summary of us, and #4965 separately excluded advertised
+/// co-hosts from the standalone `Summaries` fan-out, so it received neither
+/// and stayed stale until the ~5-minute InterestSync heartbeat.
+///
+/// # Why the summary does not need to be sent
+///
+/// Being on the originator's covered list MEANS that peer received and applied
+/// this same update from the same originator. If its prior state matched ours,
+/// its post-merge state equals ours, so its summary equals OUR post-merge
+/// summary — which we are holding. Nothing has to be asked for or answered.
+///
+/// The originator sends the same list to everyone on it, so this is symmetric:
+/// every covered peer derives OUR summary from its own copy at the same
+/// moment. That is what repairs the direction #5190 is actually about (their
+/// model of us), even though each node only ever writes its own map.
+///
+/// # Why not just notify them
+///
+/// Because it was measured. Restoring a standalone `Summaries` to each
+/// suppressed peer cost 429 extra messages to save 13 sends in the #5147 A/B,
+/// on the per-peer messages/s axis `hosting-invariants.md` calls the
+/// load-bearing storm signal. A digest would not have helped either: the cost
+/// is one message per destination regardless of its size. Deriving is the only
+/// option that is free on both axes.
+///
+/// # When it is wrong
+///
+/// If a covered peer's prior state had diverged from ours, the derived summary
+/// is wrong and we may skip a send it needed, leaving it stale until
+/// anti-entropy corrects it. That is the same optimistic-cache trust model
+/// already in use: #4442 caches a summary on DELIVERED, which is sender-side
+/// completion rather than a receiver ack, and relies on the same heartbeat and
+/// the delta-apply-failure resync to correct it. This adds a new *population*
+/// to that model, not a new assumption about it — and the over-suppression
+/// risk it shares with #5147 is what #5186 exists to measure.
+///
+/// Returns how many peers were seeded, for the caller's telemetry.
+pub(crate) fn seed_covered_peer_summaries(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    origin: &BroadcastOrigin,
+    our_summary: &StateSummary<'static>,
+) -> usize {
+    let mut seeded = 0usize;
+    for peer in origin.covered_peers() {
+        // `upsert_*` inserts the peer if we are not already tracking it, under
+        // MAX_INTERESTED_PEERS_PER_CONTRACT. That is deliberate: a covered peer
+        // demonstrably holds this contract, so it is a real co-host whether or
+        // not we had registered interest for it yet.
+        op_manager.interest_manager.upsert_peer_summary_from(
+            key,
+            peer,
+            our_summary.clone(),
+            crate::ring::interest::SummaryPopulationSource::CoveredListInference,
+        );
+        seeded += 1;
+    }
+    seeded
 }
 
 /// Choose which interested peers still need a standalone `Summaries`
@@ -3438,6 +3519,96 @@ mod tests {
     /// the weakest statement that still rules out vacuity. The strict form
     /// ("A specifically is a target") would fire first under a narrowing
     /// mutation and hide the fact that the subset property is what detects it.
+    /// #5190: a covered peer's summary is DERIVED, not requested.
+    ///
+    /// #5147 suppresses the fan-out leg to a covered peer, and that leg is how
+    /// the peer would have learned our summary; #4965 separately excludes
+    /// advertised co-hosts from the standalone notification. So it received
+    /// neither and stayed stale until the ~5-minute heartbeat.
+    ///
+    /// What this test must prove is BOTH halves: the model is populated, AND
+    /// no message was sent to populate it. Asserting only the first would pass
+    /// equally for the transmit-based fix that was measured at 429 extra
+    /// messages to save 13 sends.
+    ///
+    /// The read-back goes through `begin_peer_summary_broadcast`, the same
+    /// accessor the broadcast path uses, so this asserts the value is visible
+    /// to the code that actually consumes it rather than to a test-only peek.
+    #[tokio::test]
+    async fn covered_peer_summary_is_derived_without_sending_anything() {
+        use crate::ring::interest::PeerSummaryForBroadcast;
+
+        let (op_manager, mut rx, _guard) =
+            build_notification_test_node("notif-covered-inference-5190").await;
+        let key = crate::operations::test_utils::make_contract_key(12);
+        op_manager
+            .ring
+            .host_contract(key, 1024, crate::ring::AccessType::Put);
+
+        // A: advertised co-host the originator says it already delivered to.
+        // B: advertised co-host NOT on the list. B is the control — it stops
+        //    this passing under a mutation that seeds every peer regardless.
+        let (a_pk, _a_addr) = connect_peer(&op_manager, 19301, 0.31);
+        let (b_pk, _b_addr) = connect_peer(&op_manager, 19302, 0.32);
+        let (_d_pk, sender_addr) = connect_peer(&op_manager, 19304, 0.34);
+        advertise_cohost(&op_manager, &a_pk, &key);
+        advertise_cohost(&op_manager, &b_pk, &key);
+
+        let a_key = crate::ring::PeerKey::from(a_pk.clone());
+        let b_key = crate::ring::PeerKey::from(b_pk.clone());
+        let origin = BroadcastOrigin::relayed(
+            sender_addr,
+            [a_key.clone()].into_iter().collect::<HashSet<_>>(),
+        );
+
+        // Premise: A has no cached summary yet, so a Known result below is
+        // attributable to this call rather than to prior state.
+        assert!(
+            matches!(
+                op_manager
+                    .interest_manager
+                    .begin_peer_summary_broadcast(&key, &a_key),
+                PeerSummaryForBroadcast::Missing { .. }
+            ),
+            "premise: A must start with no cached summary"
+        );
+
+        // Through the REAL entry point, not `seed_covered_peer_summaries`
+        // directly: calling the helper leaves the CALL SITE unguarded, and
+        // deleting that one line is the whole regression class #5190 belongs
+        // to. An earlier draft of this test called the helper and stayed green
+        // under exactly that deletion.
+        send_proactive_summary_notification(&op_manager, &key, sender_addr, &origin).await;
+
+        match op_manager
+            .interest_manager
+            .begin_peer_summary_broadcast(&key, &a_key)
+        {
+            PeerSummaryForBroadcast::Known(_) => {}
+            PeerSummaryForBroadcast::Missing { reason, .. } => panic!(
+                "covered peer A was not seeded (missing reason {reason:?}); the \
+                 derivation did not happen, so #5190 is unfixed"
+            ),
+        }
+
+        assert!(
+            matches!(
+                op_manager
+                    .interest_manager
+                    .begin_peer_summary_broadcast(&key, &b_key),
+                PeerSummaryForBroadcast::Missing { .. }
+            ),
+            "B was NOT on the originator's list, so nothing is known about what \
+             it holds and nothing may be assumed"
+        );
+
+        // The whole point: none of that cost a message.
+        assert!(
+            drain_interest_targets(&mut rx).is_empty(),
+            "deriving the summary must cost ZERO messages"
+        );
+    }
+
     #[tokio::test]
     async fn notification_exclusion_is_a_subset_of_broadcast_targets() {
         let (op_manager, mut rx, _guard) =
@@ -3487,7 +3658,13 @@ mod tests {
             .filter_map(|pkl| pkl.socket_addr())
             .collect();
 
-        send_proactive_summary_notification(&op_manager, &key, sender_addr).await;
+        send_proactive_summary_notification(
+            &op_manager,
+            &key,
+            sender_addr,
+            &BroadcastOrigin::relayed(sender_addr, Default::default()),
+        )
+        .await;
         let notified: HashSet<SocketAddr> = drain_interest_targets(&mut rx).into_iter().collect();
 
         // Premise 1: the scenario really produced a broadcast fan-out.
@@ -3574,7 +3751,13 @@ mod tests {
         // `broadcast_single_peer_gates_summarize_on_hosted_or_in_use_pin`.
         // It is `pub(super)` so it cannot be called from here directly.
 
-        send_proactive_summary_notification(&op_manager, &key, sender_addr).await;
+        send_proactive_summary_notification(
+            &op_manager,
+            &key,
+            sender_addr,
+            &BroadcastOrigin::relayed(sender_addr, Default::default()),
+        )
+        .await;
 
         assert!(
             drain_interest_targets(&mut rx).is_empty(),
