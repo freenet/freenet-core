@@ -1047,11 +1047,34 @@ fn get_update_failure_count() -> u32 {
 ///
 /// * Missing file → `0` (legitimate "no failures yet").
 /// * Present but unparseable, OR unreadable for any reason other than being
-///   absent → `MAX_UPDATE_FAILURES` (defensive: if the counter file has been
-///   truncated, corrupted, or made unreadable we must NOT silently reset the
-///   lockout — that would be an amplification vector for any process that can
-///   partially overwrite or chmod the file, defeating the #3934 fix. Users can
-///   recover by explicitly deleting the file).
+///   absent → `MAX_UPDATE_FAILURES` (defensive: a truncated, corrupted or
+///   unreadable counter must not READ as zero, because that would silently
+///   reset the #3934 lockout on the strength of damage to the file).
+///
+/// Note the asymmetry with [`next_failure_count`], which is deliberate and was
+/// easy to mistake for an inconsistency, so it is written down here too: this
+/// function makes an unparseable counter read as fully-failed, while recording
+/// the next failure REWRITES an unparseable counter as `1` rather than as
+/// `MAX + 1`.
+///
+/// Both directions are the safe one for their own side:
+///
+/// * Reading MAX keeps the gate shut while the file is damaged, and heals by
+///   itself because the gate re-reads every time.
+/// * Writing `1` bounds the damage. `fs::write` is not atomic, so a power cut
+///   during [`record_update_failure_at`] can leave a truncated — hence
+///   unparseable — counter. Persisting `MAX + 1` for that would turn one
+///   ill-timed crash into a PERMANENT auto-update lockout needing manual file
+///   deletion, which is the failure this whole subsystem exists to avoid.
+///   Rewriting it as `1` costs at most two extra attempts before the gate
+///   closes again.
+///
+/// This is not an amplification vector, which is the objection it invites. To
+/// reach the rewrite at all something must record a failure, and that requires
+/// an update attempt; while the counter is unparseable the gate is shut, so no
+/// automatic attempt happens. And a process that can choose the file's contents
+/// does not need any of this — it writes `0`. Corruption alone only ever shuts
+/// the gate.
 pub(crate) fn get_update_failure_count_at(dir: &std::path::Path) -> u32 {
     match fs::read_to_string(dir.join("update_failures")) {
         Ok(s) => s.trim().parse().unwrap_or(MAX_UPDATE_FAILURES),
@@ -1106,6 +1129,10 @@ pub fn record_update_failure() {
 /// disk and lock the node out of auto-update PERMANENTLY on one transient read
 /// error (a flaky network mount, an EIO). That is a worse failure than the
 /// fail-open it replaced, so an unreadable counter writes nothing.
+///
+/// The unparseable-but-readable case is different and is answered differently:
+/// it restarts the count at `1`. See [`get_update_failure_count_at`] for why
+/// the two functions disagree about the same damaged file on purpose.
 fn next_failure_count(existing: std::io::Result<String>) -> Option<u32> {
     match existing {
         Ok(s) => Some(s.trim().parse::<u32>().unwrap_or(0).saturating_add(1)),

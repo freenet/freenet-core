@@ -1418,14 +1418,48 @@ mod error_filter_tests {
             "the WARN floor must live in build_error_filter and nowhere else"
         );
 
-        // `build_filter` (main + console) is the only remaining
-        // `from_env_lossy` caller. A second one means an error layer
-        // regressed to the unfloored inline shape this fix removed.
+        // `from_env_lossy` belongs to CONSOLE filters only, because RUST_LOG is
+        // the operator's console knob. An error layer using it would inherit
+        // RUST_LOG's level and lose the WARN floor again (#5015).
+        //
+        // There are exactly two console filters: `build_filter` (the node's
+        // main + console layers) and `init_cli_stderr_tracer` (the CLI's own
+        // stderr layer, added for #5244 so `freenet update` is not mute).
+        //
+        // Counting is not enough on its own — two callers could be the wrong
+        // two — so each is pinned to its own function body below, and the total
+        // is then pinned so a THIRD caller anywhere fails here rather than
+        // sliding in unnoticed.
+        let body_of = |sig: &str| -> String {
+            let start = source.find(sig).unwrap_or_else(|| {
+                panic!("{sig} not found; if it was renamed, update this pin deliberately")
+            });
+            let rest = &source[start + sig.len()..];
+            // Next top-level or nested `fn ` declaration ends the body well
+            // enough for a call-site count; an over-long slice would only make
+            // this pin STRICTER, never laxer.
+            let end = rest.find("\n    fn ").or_else(|| rest.find("\npub fn ")).unwrap_or(rest.len());
+            rest[..end].to_string()
+        };
+
+        assert_eq!(
+            body_of("fn build_filter(").matches(".from_env_lossy()").count(),
+            1,
+            "build_filter is the node's console filter and must read RUST_LOG"
+        );
+        assert_eq!(
+            body_of("pub fn init_cli_stderr_tracer(")
+                .matches(".from_env_lossy()")
+                .count(),
+            1,
+            "init_cli_stderr_tracer is the CLI's console filter and must read RUST_LOG \
+             (#5244)"
+        );
         assert_eq!(
             count(".from_env_lossy()"),
-            1,
-            "only the main/console filter may use from_env_lossy(); an error layer \
-             using it would inherit RUST_LOG's level again (#5015)"
+            2,
+            "only the two console filters may use from_env_lossy(); a third caller is \
+             an error layer inheriting RUST_LOG's level again (#5015)"
         );
     }
 }
