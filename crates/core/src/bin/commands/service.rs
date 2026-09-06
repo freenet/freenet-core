@@ -1516,16 +1516,15 @@ mod tests {
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
 
-        // Regression for #3967: stale-orphan self-heal pre-flight. Because
+        // Regression for #3967: orphan self-heal pre-flight. Because
         // RestartPreventExitStatus=43 blocks restart on exit 43, the
-        // version-compare-and-kill must run as an ExecStartPre before the main
-        // ExecStart so a stale orphan can't hold the port forever.
+        // orphan-reap must run as an ExecStartPre before the main
+        // ExecStart so an init-adopted orphan can't hold the port forever.
         assert!(
             service_content.contains("ExecStartPre=")
-                && service_content.contains("Freenet version:")
                 && service_content.contains("kill -TERM")
                 && service_content.contains("kill -KILL"),
-            "systemd unit must run a stale-orphan version-compare-and-kill pre-flight (#3967)"
+            "systemd unit must run an orphan-reap pre-flight (#3967)"
         );
 
         // Verify graceful shutdown timeout is set. 45s = 30s drain
@@ -1617,13 +1616,12 @@ mod tests {
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
 
-        // Regression for #3967: stale-orphan self-heal pre-flight (system unit).
+        // Regression for #3967: orphan self-heal pre-flight (system unit).
         assert!(
             service_content.contains("ExecStartPre=")
-                && service_content.contains("Freenet version:")
                 && service_content.contains("kill -TERM")
                 && service_content.contains("kill -KILL"),
-            "system systemd unit must run a stale-orphan version-compare-and-kill pre-flight (#3967)"
+            "system systemd unit must run an orphan-reap pre-flight (#3967)"
         );
 
         // Logging routes to journal (same reasoning as the user-unit test).
@@ -1936,7 +1934,7 @@ mod tests {
 
             // Post-render the file on disk MUST carry the systemd-level `$$`
             // form for the shell identifiers the pre-flight relies on.
-            for needle in ["$$pid", "$$exe", "$$ondisk", "$$self", "$$(id -u)"] {
+            for needle in ["$$pid", "$$ppid", "$$self", "$$(id -u)"] {
                 assert!(
                     pre.contains(needle),
                     "{which} ExecStartPre must double shell dollars (missing `{needle}`); \
@@ -1951,13 +1949,7 @@ mod tests {
             // NB: we cannot blanket-assert absence of `$(id -u)` because the
             // VALID doubled form `$$(id -u)` contains it as a substring; the
             // `$$(id -u)` presence check above covers that identifier instead.
-            for bad in [
-                "/proc/$pid/",
-                "\"$pid\"",
-                "\"$exe\"",
-                "\"$ondisk\"",
-                "\"$self\"",
-            ] {
+            for bad in ["/proc/$pid/", "\"$pid\"", "\"$ppid\"", "\"$self\""] {
                 assert!(
                     !pre.contains(bad),
                     "{which} ExecStartPre contains bare single-`$` `{bad}` that systemd \
@@ -2001,11 +1993,18 @@ mod tests {
                  (#3967 round-2 RE-REVIEW)"
             );
 
-            // MUST-FIX #3/#4: kill is gated on PPID==1 AND (readable-version
-            // mismatch OR unreadable holder version). Render-level check.
+            // MUST-FIX #3: kill is gated on PPID==1 (init-adopted orphan).
+            // The former version-compare gate is deliberately GONE: sparing a
+            // current-version orphan wedges the unit into success-but-dead
+            // with the node unsupervised. Render-level check.
             assert!(
-                pre.contains("[ \"$$ppid\" = \"1\" ] &&"),
+                pre.contains("if [ \"$$ppid\" = \"1\" ]; then"),
                 "{which} ExecStartPre must require PPID==1 before killing (#3967 MUST-FIX 3)"
+            );
+            assert!(
+                !pre.contains("$$ondisk") && !pre.contains("$$hv"),
+                "{which} ExecStartPre must not version-gate the orphan kill — a \
+                 same-version orphan wedges the unit into unsupervised mode"
             );
 
             // Now emulate systemd's `$$` -> `$` collapse and confirm the body
@@ -2266,30 +2265,31 @@ echo "RC=$?"
         );
     }
 
-    /// Behavioral regression for the SYSTEMD inline self-heal DECISION (#3967,
-    /// round-2 RE-REVIEW). The render + `sh -n` test proves the inline body
-    /// PARSES; this proves it DECIDES correctly. Crucially it locks the round-2
-    /// fix: the round-1 unit anchored the holder loop on
-    /// `[ "$exe" != "$bin" ] && continue`, which skipped every holder whose exe
-    /// differed from the unit's on-disk binary — i.e. exactly the stale orphan
-    /// (running an OLD binary) the self-heal exists to kill. Here the fake
-    /// holder's exe path is DIFFERENT from the on-disk binary, and we assert it
-    /// IS killed.
+    /// Shared harness for the systemd ExecStartPre self-heal DECISION tests
+    /// (#3967). The render + `sh -n` test proves the inline body PARSES; the
+    /// tests built on this harness prove it DECIDES correctly.
     ///
-    /// We extract the `ExecStartPre` `/bin/sh -c '...'` body from the rendered
-    /// unit, collapse systemd's `$$` -> `$`, and run it under `sh` with
-    /// PATH-shimmed `pgrep`/`readlink`/`timeout` and a `kill` shell function
-    /// (functions beat the builtin) that records targets to a marker.
+    /// Extracts the `ExecStartPre` `/bin/sh -c '...'` body from the rendered
+    /// user unit, collapses systemd's `$$` -> `$`, and returns the on-disk
+    /// binary path plus a `run(holder_version, holder_ppid, pgrep_pid)`
+    /// closure that executes the body under `sh` with PATH-shimmed
+    /// `pgrep`/`readlink`/`timeout` and a `kill` shell function (functions
+    /// beat the builtin) recording kills to a marker; it returns whether the
+    /// holder was killed. The version machinery is deliberately kept even
+    /// though the current pre-flight is version-blind: if a version gate is
+    /// ever reintroduced, the same-version regression test below fails.
     ///
     /// Linux-only because it exercises the `/proc`-based systemd inline path
     /// and the unit generators are `#[cfg(target_os = "linux")]`.
-    #[test]
     #[cfg(target_os = "linux")]
-    fn test_systemd_execstartpre_heal_decision_behavior() {
+    fn systemd_heal_harness(
+        dir: &std::path::Path,
+    ) -> (
+        std::path::PathBuf,
+        impl Fn(&str, &str, Option<&str>) -> bool,
+    ) {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
         let chmod_x = |p: &std::path::Path| {
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
         };
@@ -2367,11 +2367,12 @@ echo "RC=$?"
         // shim's */proc/*/exe arm fires.
 
         let killed_marker = dir.join("killed");
+        let harness_path = dir.join("harness.sh");
         let path_env = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
 
         // Returns (holder_was_killed). HOLDER_PPID drives the fake stat file's
         // PPID field; HOLDER_VER drives the holder binary's version.
-        let run = |holder_ver: &str, holder_ppid: &str, pgrep_pid: Option<&str>| -> bool {
+        let run = move |holder_ver: &str, holder_ppid: &str, pgrep_pid: Option<&str>| -> bool {
             std::fs::remove_file(&killed_marker).ok();
             std::fs::write(
                 &stat_file,
@@ -2386,7 +2387,6 @@ echo "RC=$?"
                 marker = killed_marker.display(),
                 body = body,
             );
-            let harness_path = dir.join("harness.sh");
             std::fs::write(&harness_path, harness).unwrap();
             let mut cmd = std::process::Command::new("sh");
             cmd.arg(&harness_path)
@@ -2398,6 +2398,19 @@ echo "RC=$?"
             cmd.output().expect("failed to run systemd heal harness");
             killed_marker.exists()
         };
+        (ondisk_bin, run)
+    }
+
+    /// Behavioral regression for the systemd self-heal decision (#3967,
+    /// round-2 RE-REVIEW): an init-adopted orphan (PPID==1) is killed, a
+    /// user-parented holder (PPID!=1) is deferred to.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_systemd_execstartpre_heal_decision_behavior() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (ondisk_bin, run) = systemd_heal_harness(tmp.path());
 
         // (a) ROUND-2 CORE: orphan (PPID==1) running an OLD version at a
         // DIFFERENT exe path than the on-disk binary -> MUST be KILLED. The
@@ -2409,11 +2422,8 @@ echo "RC=$?"
              exe==bin anchor wrongly skipped it)"
         );
 
-        // (b) orphan (PPID==1) running the SAME current version -> DEFER.
-        assert!(
-            !run("1.0.0 (current)", "1", None),
-            "systemd self-heal must DEFER to a same-version holder (polite path)"
-        );
+        // (b) same-version PPID==1 orphan -> KILLED; covered by the dedicated
+        // regression test test_systemd_execstartpre_kills_same_version_orphan.
 
         // (c) version-mismatched but USER-parented (PPID!=1) -> DEFER.
         assert!(
@@ -2421,21 +2431,33 @@ echo "RC=$?"
             "systemd self-heal must DEFER to a user-parented (PPID!=1) holder (#3967 MUST-FIX 3)"
         );
 
-        // (d) on-disk binary version UNREADABLE (`$ondisk` empty) -> DEFER even for
-        // a PPID==1 orphan whose own version IS readable. With no trustworthy
-        // baseline we must not version-compare; killing here would reap a healthy
-        // current node during an update window when the binary is momentarily
-        // unreadable. Mirrors the macOS test's chmod-644 case (#3967 MUST-FIX 4),
-        // which the systemd path's `[ -n "$$ondisk" ]` guard implements but had no
-        // behavioral coverage on Linux (rule-review Info on #4408).
+        // (d) on-disk binary UNREADABLE -> still KILLED. The pre-flight no
+        // longer reads any version (the version gate was exactly the #3967
+        // same-version wedge), so an unreadable on-disk binary cannot spare a
+        // PPID==1 orphan.
         std::fs::set_permissions(&ondisk_bin, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
-            !run("0.9.0 (old)", "1", None),
-            "systemd self-heal must DEFER when the on-disk version is unreadable, even \
-             for a readable-version PPID==1 orphan (#3967 MUST-FIX 4: empty $ondisk \
-             must not drive a kill)"
+            run("0.9.0 (old)", "1", None),
+            "systemd self-heal must KILL a PPID==1 orphan even when the on-disk \
+             version is unreadable — the pre-flight is version-blind"
         );
-        chmod_x(&ondisk_bin); // restore for any later use
+    }
+
+    /// Regression for the same-version orphan wedge (#3967 follow-up): a
+    /// SAME-VERSION init-adopted orphan (PPID==1) MUST be killed. The earlier
+    /// pre-flight version-compared and deferred to a same-version holder,
+    /// which wedged the unit into success-but-dead (ExecStart exits 43, no
+    /// restart) with the node running unsupervised forever.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_systemd_execstartpre_kills_same_version_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_ondisk_bin, run) = systemd_heal_harness(tmp.path());
+        assert!(
+            run("1.0.0 (current)", "1", None),
+            "systemd self-heal must KILL a same-version PPID==1 orphan — sparing \
+             it wedges the unit into success-but-dead / unsupervised mode (#3967)"
+        );
     }
 
     #[test]
