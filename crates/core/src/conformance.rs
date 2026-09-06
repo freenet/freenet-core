@@ -28,6 +28,8 @@
 //! - [`evidence`] — the self-contained, bounded reproducer that travels between peers.
 //! - [`bundle`] — the offline replay corpus format.
 //! - [`generator`] — turns a corpus of observed states into cases to check.
+//! - [`host_clock`] — whether a contract reads the host wall clock, which makes the
+//!   laws below ill-formed rather than merely broken. Deprecated; see #5465.
 //! - [`minimize`] — shrinks a failing case to the smallest witness that still fails,
 //!   so evidence fits its size bound and reads as a usable bug report.
 //! - [`capture`] — operator-enabled recording of real contract traffic for replay.
@@ -101,6 +103,7 @@ pub mod capture;
 pub mod evidence;
 pub mod focus;
 pub mod generator;
+pub mod host_clock;
 pub mod minimize;
 pub mod oracle;
 pub mod policy;
@@ -120,15 +123,21 @@ mod wasm_tests;
 
 pub use bundle::{ReplayBundle, Transition};
 pub use capture::{CaptureHandle, Observation};
-pub use evidence::{ConformanceEvidence, EVIDENCE_SCHEMA_VERSION, EvidenceId, EvidenceRejected};
+pub use evidence::{
+    ConformanceEvidence, EVIDENCE_MAGIC, EVIDENCE_SCHEMA_VERSION, EvidenceError, EvidenceId,
+    EvidenceRejected,
+};
 pub use focus::FocusSelector;
 pub use generator::{GeneratorConfig, generate_cases};
+pub use host_clock::{
+    HOST_CLOCK_DEPRECATION_DOC, HOST_CLOCK_IMPORT, HOST_CLOCK_NAMESPACE, imports_host_clock,
+};
 pub use minimize::{MinimizeConfig, MinimizeReport, minimize};
 pub use oracle::{ConformanceOracle, OracleError, OracleErrorKind};
 pub use policy::{ConformanceAction, EnforcementMode, decide};
 pub use property::{
-    ConformanceProperty, Inconclusive, OutputDigest, PremiseSource, PropertyOutcome, Severity,
-    Violation,
+    ConformanceProperty, IdempotenceSettling, Inconclusive, OutputDigest, PremiseSource,
+    PropertyOutcome, Severity, Violation,
 };
 pub use runtime_oracle::{OracleBuildError, RuntimeOracle};
 pub use sampler::{Admission, ContractSampler, SamplerConfig, Stratum};

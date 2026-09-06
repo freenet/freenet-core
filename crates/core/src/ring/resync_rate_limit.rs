@@ -99,6 +99,19 @@ impl Bucket {
     }
 }
 
+/// Outcome of a [`TokenBucketLimiter::check_and_record_detailed`] check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BucketOutcome {
+    /// A token was consumed; the event is allowed.
+    Allowed,
+    /// The key's bucket is empty: it is over its rate.
+    RateLimited,
+    /// The key is not tracked and the map has no room for it, so nothing
+    /// is known about its rate. Distinct from `RateLimited` because it
+    /// says nothing about THIS key — it is a statement about the map.
+    Untracked,
+}
+
 /// A token-bucket rate limiter keyed by `K`. One token per key is consumed per
 /// allowed event; the bucket holds up to `capacity` and refills one token per
 /// `refill_interval`.
@@ -136,6 +149,19 @@ impl<K: Eq + Hash + Clone> TokenBucketLimiter<K> {
     /// allowed (a token was consumed), `false` when rate-limited or the tracking
     /// map is at capacity for a new key.
     pub fn check_and_record(&self, key: K) -> bool {
+        matches!(self.check_and_record_detailed(key), BucketOutcome::Allowed)
+    }
+
+    /// [`Self::check_and_record`] without collapsing "this key is over its
+    /// rate" and "the tracking map has no room for this key" into one
+    /// `false`.
+    ///
+    /// The distinction matters to any caller whose keys are NOT
+    /// attacker-chosen: for those, a full map is a sizing accident rather
+    /// than evidence about the key, and refusing on it starves a
+    /// newcomer for someone else's behaviour. `check_and_record` keeps
+    /// the collapsed form so existing callers are unchanged.
+    pub fn check_and_record_detailed(&self, key: K) -> BucketOutcome {
         let now = self.time_source.now();
         use dashmap::mapref::entry::Entry;
         match self.buckets.entry(key) {
@@ -145,10 +171,10 @@ impl<K: Eq + Hash + Clone> TokenBucketLimiter<K> {
                 if bucket.tokens >= 1.0 {
                     bucket.tokens -= 1.0;
                     self.allowed_total.fetch_add(1, Ordering::Relaxed);
-                    true
+                    BucketOutcome::Allowed
                 } else {
                     self.suppressed_total.fetch_add(1, Ordering::Relaxed);
-                    false
+                    BucketOutcome::RateLimited
                 }
             }
             Entry::Vacant(vac) => {
@@ -157,7 +183,7 @@ impl<K: Eq + Hash + Clone> TokenBucketLimiter<K> {
                 if prev >= self.max_tracked {
                     self.size.fetch_sub(1, Ordering::Relaxed);
                     self.suppressed_total.fetch_add(1, Ordering::Relaxed);
-                    return false;
+                    return BucketOutcome::Untracked;
                 }
                 // A brand-new key starts with a full bucket and spends one token.
                 vac.insert(Bucket {
@@ -165,7 +191,7 @@ impl<K: Eq + Hash + Clone> TokenBucketLimiter<K> {
                     last_refill: now,
                 });
                 self.allowed_total.fetch_add(1, Ordering::Relaxed);
-                true
+                BucketOutcome::Allowed
             }
         }
     }

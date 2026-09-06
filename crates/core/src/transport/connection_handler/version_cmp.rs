@@ -287,6 +287,29 @@ mod tests {
         }
     }
 
+    /// Companion to the marker guard: the floor must never drop to or below a
+    /// release known NOT to carry `AckConnectionV2`.
+    ///
+    /// Kept alongside the marker test rather than replaced by it, because the
+    /// two catch different mistakes: this one catches the floor being
+    /// LOWERED (e.g. someone "fixing" a gate that seems not to fire), the
+    /// marker one catches the RELEASE advancing past a stationary floor. Once
+    /// `ACK_VERSION_SHIPPED_IN` is `Some(...)`, the marker test's only
+    /// remaining assertion is `shipped == floor` — trivially true forever —
+    /// so without this companion nothing catches the floor being lowered.
+    /// Mirrors `hash_first_floor_stays_above_every_release_without_the_variants`.
+    #[test]
+    fn ack_version_floor_stays_above_every_release_without_the_variants() {
+        /// Last release that does NOT carry the `AckConnectionV2` variant.
+        const LAST_RELEASE_WITHOUT_VARIANTS: (u8, u8, u16) = (0, 2, 119);
+        assert!(
+            GATEWAY_ACK_VERSION_MIN_VERSION > LAST_RELEASE_WITHOUT_VARIANTS,
+            "GATEWAY_ACK_VERSION_MIN_VERSION ({GATEWAY_ACK_VERSION_MIN_VERSION:?}) dropped to \
+             or below {LAST_RELEASE_WITHOUT_VARIANTS:?}, a release with no AckConnectionV2 \
+             variant index. Sending it to those peers means the handshake never completes.",
+        );
+    }
+
     #[test]
     fn test_parse_semver() {
         assert_eq!(parse_semver("0.1.152"), (0, 1, 152));

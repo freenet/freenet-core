@@ -912,6 +912,12 @@ async fn run_writer(
                     cases = report.cases,
                     inconclusive = report.inconclusive,
                     would_remove = report.would_remove,
+                    // Emitted beside the total, never instead of it. The
+                    // subset that CONVERGES is the part of `would_remove` an
+                    // enforcement gate must not read as removal-worthy, and a
+                    // counter that never leaves the process cannot inform the
+                    // decision it was collected for.
+                    would_remove_settled = report.would_remove_settled,
                     reported = report.reported,
                     skipped_no_code = report.skipped_no_code,
                     skipped_no_samples = report.skipped_no_samples,

@@ -928,9 +928,11 @@ impl WasmEngine for WasmtimeEngine {
     fn create_instance(
         &mut self,
         module: &Module,
-        id: i64,
         req_bytes: usize,
     ) -> Result<InstanceHandle, WasmError> {
+        // Ids come from the one process-global allocator, never from the
+        // caller. See `native_api::NEXT_INSTANCE_ID` for why (#4213 / #5023).
+        let id = native_api::next_instance_id();
         {
             let store = self
                 .store
@@ -1869,11 +1871,22 @@ impl WasmtimeEngine {
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
-        // Time namespace
+        // Time namespace.
+        //
+        // The two names come from `conformance::host_clock` rather than being
+        // written out here, because that module's detector — which decides
+        // whether a contract gets the #5465 deprecation warning, and what
+        // `fdev verify-merge` reports — matches on exactly these strings.
+        // Import resolution is byte-exact, so a literal here that drifted from
+        // the constants would leave the detector returning `false` forever: the
+        // node would warn about nothing and `fdev` would hand clean bills of
+        // health to contracts that do read the clock, with every test green.
+        // Sharing the constant is what makes that failure impossible rather
+        // than merely tested for.
         linker
             .func_wrap(
-                "freenet_time",
-                "__frnt__time__utc_now",
+                crate::conformance::HOST_CLOCK_NAMESPACE,
+                crate::conformance::HOST_CLOCK_IMPORT,
                 |mut caller: Caller<'_, HostState>, id: i64, ptr: i64| {
                     refresh_mem_addr_from_caller(&mut caller, id);
                     native_api::time::utc_now(id, ptr);
@@ -2345,12 +2358,21 @@ where
     let started_at_ms = Arc::new(AtomicU64::new(0));
     let started_for_guest = Arc::clone(&started);
     let started_at_for_guest = Arc::clone(&started_at_ms);
+    // Contract WASM runs on a dedicated blocking thread (spawn_blocking, or a
+    // plain std::thread — see the match below), never on the calling thread, so
+    // a contract-clock override set by a test on the CALLER's thread would not
+    // otherwise be visible to `native_api::time::utc_now`. Capture it here, on
+    // the calling thread, and re-install it for the guest's thread only, for
+    // the duration of this one call. Production never overrides the clock, so
+    // this reads and forwards `None` — a no-op.
+    let clock_override = native_api::time::current_contract_clock_override();
     let f = move || {
         // Record started_at BEFORE flipping `started`, so the poll loop that
         // observes started==true (SeqCst) is guaranteed to read a valid
         // started_at.
         started_at_for_guest.store(start.elapsed().as_millis() as u64, Ordering::SeqCst);
         started_for_guest.store(true, Ordering::SeqCst);
+        let _clock_guard = clock_override.map(native_api::time::override_contract_clock);
         f()
     };
 
@@ -2546,7 +2568,7 @@ mod tests {
         let module = engine
             .compile(SIMPLE_WASM)
             .expect("offloaded compile should succeed");
-        let handle = engine.create_instance(&module, 0, 1024).unwrap();
+        let handle = engine.create_instance(&module, 1024).unwrap();
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
     }
@@ -2565,7 +2587,7 @@ mod tests {
         let module = engine
             .compile(SIMPLE_WASM)
             .expect("inline compile should succeed");
-        let handle = engine.create_instance(&module, 0, 1024).unwrap();
+        let handle = engine.create_instance(&module, 1024).unwrap();
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
     }
@@ -2782,7 +2804,7 @@ mod tests {
         let start = std::time::Instant::now();
         // create_instance runs the start function via instantiate_async; the
         // global epoch ticker preempts it once the armed 3-tick deadline elapses.
-        let result = engine.create_instance(&module, 1, 0);
+        let result = engine.create_instance(&module, 0);
         let elapsed = start.elapsed();
 
         // `InstanceHandle` is not Debug, so match rather than `{result:?}`.
@@ -2870,6 +2892,58 @@ mod tests {
         }
     }
 
+    /// Source pin (#4213 / #5023): `create_instance` MUST allocate its instance
+    /// id from the one process-global allocator.
+    ///
+    /// The signature stops a CALLER passing an id, but nothing stops this
+    /// method itself from reverting to a per-engine counter, which is exactly
+    /// the shape that made ids collide across engines in one process. The
+    /// bounded-region scrape follows the `fn_body` convention used by
+    /// `create_instance_recovers_store_on_guest_entry_failure` below, including
+    /// the test-module cutoff that keeps either pin from scraping its own
+    /// source.
+    #[test]
+    fn create_instance_allocates_its_own_instance_id() {
+        // Cut the test module off BEFORE scraping. `include_str!` pulls in the
+        // whole file, this module included, and the needle below occurs here as
+        // a string literal. Without the cut, renaming `create_instance` would
+        // not panic: `find` would fall through to this function's own source,
+        // and the region would then be this test's tail -- whose assertion
+        // message contains `native_api::next_instance_id()`, so the pin would
+        // scrape its own error string and PASS while guarding nothing.
+        // Same remedy as `contract_ops.rs::production_source`; see #5450.
+        let full = include_str!("wasmtime_engine.rs");
+        let cutoff = full
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("wasmtime_engine.rs must have a top-level #[cfg(test)] mod tests");
+        let src = &full[..cutoff];
+        let start = src
+            .find("    fn create_instance(")
+            .expect("create_instance not found");
+        let body = &src[start..];
+        // `+ 1` because this `find` searches `body[1..]`, so its index is one
+        // short of the position in `body`. Without it the slice drops the byte
+        // before the next method -- harmless today (it is the ASCII newline
+        // closing this method), but `&body[..end]` would then slice at an
+        // arbitrary byte, and this file is full of multi-byte em dashes: one
+        // landing there turns the pin into a "byte index is not a char
+        // boundary" panic that says nothing about what it guards. Matches
+        // `create_instance_recovers_store_on_guest_entry_failure` below, which
+        // this test's rustdoc claims to follow.
+        let end = body[1..]
+            .find("\n    fn ")
+            .map(|i| i + 1)
+            .expect("create_instance body must end at the next method");
+        let body = &body[..end];
+        assert!(
+            body.contains("native_api::next_instance_id()"),
+            "create_instance must draw its instance id from \
+             native_api::next_instance_id(); a per-engine counter lets two \
+             engines in one process issue the same id, and drop_instance then \
+             evicts the other engine's live MEM_ADDR entry (#4213 / #5023)"
+        );
+    }
+
     /// #4864 round-9 item 2 pin: `create_instance` MUST recover the store on a
     /// guest-entry (instantiate / `__frnt_set_id`) failure. Without it, a timeout
     /// that returns before `instances.insert` / `lifetime_instances += 1` leaves
@@ -2878,7 +2952,16 @@ mod tests {
     /// memory that never triggers a count-based refresh.
     #[test]
     fn create_instance_recovers_store_on_guest_entry_failure() {
-        let src = include_str!("wasmtime_engine.rs");
+        // Same cutoff as `create_instance_allocates_its_own_instance_id` above,
+        // and for the same reason: `include_str!` pulls in this test module,
+        // whose source contains `fn create_instance(` as a string literal. With
+        // the whole file in scope, renaming the production method would let
+        // `find` fall through into the test module rather than panicking.
+        let full = include_str!("wasmtime_engine.rs");
+        let cutoff = full
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("wasmtime_engine.rs must have a top-level #[cfg(test)] mod tests");
+        let src = &full[..cutoff];
         let start = src
             .find("fn create_instance(")
             .expect("create_instance not found");
@@ -3027,7 +3110,7 @@ mod tests {
             .compile(SIMPLE_WASM)
             .expect("compile under current_thread+offload must succeed (no panic)");
         let handle = engine
-            .create_instance(&module, 0, 1024)
+            .create_instance(&module, 1024)
             .expect("module must be instantiable");
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
@@ -3077,7 +3160,7 @@ mod tests {
             .compile(SIMPLE_WASM)
             .expect("compile with no runtime + offload must succeed inline");
         let handle = engine
-            .create_instance(&module, 0, 1024)
+            .create_instance(&module, 1024)
             .expect("module must be instantiable");
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
@@ -3247,7 +3330,7 @@ mod tests {
         // default 10,000 limit. Without our ResourceLimiter override this would fail.
         for i in 0..10_001 {
             let handle = engine
-                .create_instance(&module, i, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -3598,7 +3681,7 @@ mod tests {
         );
 
         let handle = engine
-            .create_instance(&module, 999, 1024)
+            .create_instance(&module, 1024)
             .expect("create instance");
 
         let result = engine.call_3i64_async_imports(&handle, "process", 0, 0, 0);
@@ -3609,6 +3692,84 @@ mod tests {
         );
 
         engine.drop_instance(&handle);
+    }
+
+    /// Regression test for #4213 / #5023: instance ids are a PROCESS-GLOBAL
+    /// namespace, so one engine's instance churn must never disturb another
+    /// engine's LIVE instance.
+    ///
+    /// `MEM_ADDR` (and `DELEGATE_ENV`, `CONTRACT_IO`) are process-global maps
+    /// keyed by instance id, and `drop_instance` removes the entry for the id
+    /// it is handed. While `create_instance` took a caller-supplied id, the
+    /// engine tests in this module passed hand-picked ones: `0..10_001` in
+    /// `test_instance_limit_override_allows_many_instances`, and
+    /// `0..STORE_REFRESH_THRESHOLD` in the store-refresh tests. Their
+    /// `drop_instance` calls removed the `MEM_ADDR` entry of whatever LIVE
+    /// delegate or contract instance in a concurrently-running test had been
+    /// issued the same id. Every host function on the victim then returned
+    /// `ERR_NOT_IN_PROCESS`, which the stdlib collapses into "not found":
+    /// `SecretResult(None)` from `test_large_secret_data` and
+    /// `test_store_and_retrieve_secret`, `error_code: -1` from
+    /// `test_v2_delegate_update_existing_state`.
+    ///
+    /// Ids now come from `native_api::next_instance_id`, so a `create_instance`
+    /// CALLER can no longer pass one -- that surface is closed by the signature.
+    /// It is not closed everywhere: `InstanceHandle.id` is `pub(super)`, so code
+    /// inside `wasm_runtime` can still hand `drop_instance` a fabricated handle
+    /// (`delegate/test.rs` builds `InstanceHandle { id: 0 }` twice today, inert
+    /// only because `process_outbound` ignores it). What this test pins is the
+    /// one property still expressible at runtime, and the one a future change
+    /// could quietly break: the allocator is process-global, not per-engine. Two
+    /// live engines are never issued the same id, so B's churn leaves A's entry
+    /// intact.
+    #[test]
+    fn instance_ids_are_globally_unique_across_engines() {
+        use crate::wasm_runtime::runtime::{InstanceInfo, Key};
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let config = RuntimeConfig::default();
+
+        let mut engine_a = WasmtimeEngine::new(&config, false).unwrap();
+        let module_a = engine_a.compile(SIMPLE_WASM).unwrap();
+        let live = engine_a
+            .create_instance(&module_a, 1024)
+            .expect("engine A instance");
+        // `RunningInstance::new` is what records the MEM_ADDR entry in
+        // production; stand in for it so an eviction would be observable.
+        let (ptr, size) = engine_a.memory_info(&live).unwrap();
+        MEM_ADDR.insert(
+            live.id,
+            InstanceInfo::new(
+                ptr as i64,
+                size,
+                Key::Contract(ContractInstanceId::new([0u8; 32])),
+            ),
+        );
+
+        // A second engine churns instances the way the store-refresh and
+        // instance-limit tests do, while A's instance stays live.
+        let mut engine_b = WasmtimeEngine::new(&config, false).unwrap();
+        let module_b = engine_b.compile(SIMPLE_WASM).unwrap();
+        for _ in 0..64 {
+            let churn = engine_b
+                .create_instance(&module_b, 1024)
+                .expect("engine B instance");
+            assert_ne!(
+                churn.id, live.id,
+                "engine B was issued engine A's LIVE instance id; instance ids \
+                 must come from the one process-global allocator"
+            );
+            engine_b.drop_instance(&churn);
+        }
+
+        assert!(
+            MEM_ADDR.get(&live.id).is_some(),
+            "another engine's instance churn evicted a LIVE instance's MEM_ADDR \
+             entry; every host function on that instance would now return \
+             ERR_NOT_IN_PROCESS"
+        );
+
+        engine_a.drop_instance(&live);
     }
 
     /// Deterministic regression test for #3248: stale memory base pointer.
@@ -3647,10 +3808,12 @@ mod tests {
         "#;
 
         let module = engine.compile(wat.as_bytes()).unwrap();
-        let instance_id: i64 = 42_000;
         let handle = engine
-            .create_instance(&module, instance_id, 1024)
+            .create_instance(&module, 1024)
             .expect("create instance");
+        // The engine issues the id; `RunningInstance::new` is what normally
+        // records the MEM_ADDR entry, so stand in for it here.
+        let instance_id = handle.id;
 
         let (init_ptr, init_size) = engine.memory_info(&handle).unwrap();
         MEM_ADDR.insert(
@@ -3726,7 +3889,7 @@ mod tests {
 
         // Charge one instance to learn what the arena actually retains per
         // instance, then set a budget only a few instances wide.
-        let handle = engine.create_instance(&module, 0, 1024).unwrap();
+        let handle = engine.create_instance(&module, 1024).unwrap();
         engine.drop_instance(&handle);
         let per_instance = engine.retired_instance_bytes;
         assert!(
@@ -3742,8 +3905,8 @@ mod tests {
         // here is attributable to the byte bound alone.
         let creations = 40;
         assert!(creations < STORE_REFRESH_THRESHOLD);
-        for i in 1..=creations {
-            let handle = engine.create_instance(&module, i as i64, 1024).unwrap();
+        for _ in 1..=creations {
+            let handle = engine.create_instance(&module, 1024).unwrap();
             engine.drop_instance(&handle);
             if engine.lifetime_instances <= previous {
                 refreshes += 1;
@@ -3769,7 +3932,7 @@ mod tests {
             "engine must stay healthy across byte-budget refreshes"
         );
         let handle = engine
-            .create_instance(&module, 999_999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after byte-budget refresh");
         engine.drop_instance(&handle);
     }
@@ -3802,7 +3965,7 @@ mod tests {
 
         for i in 0..12 {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} must still be creatable: {e}"));
             assert_eq!(
                 engine.lifetime_instances, 1,
@@ -3885,7 +4048,7 @@ mod tests {
         // The last drop_instance should trigger a store refresh.
         for i in 0..STORE_REFRESH_THRESHOLD {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -3902,7 +4065,7 @@ mod tests {
             "engine should be healthy after refresh"
         );
         let handle = engine
-            .create_instance(&module, 999_999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after refresh");
         engine.drop_instance(&handle);
     }
@@ -3924,7 +4087,7 @@ mod tests {
         let burn = STORE_REFRESH_THRESHOLD - 3;
         for i in 0..burn {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -3934,7 +4097,7 @@ mod tests {
         let mut handles = Vec::new();
         for i in burn..STORE_REFRESH_THRESHOLD {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             handles.push(handle);
         }
@@ -3970,9 +4133,9 @@ mod tests {
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
         // Create some instances to bump the counter
-        for i in 0..10 {
+        for _ in 0..10 {
             let handle = engine
-                .create_instance(&module, i, 1024)
+                .create_instance(&module, 1024)
                 .expect("should succeed");
             engine.drop_instance(&handle);
         }
@@ -3987,7 +4150,7 @@ mod tests {
 
         // Engine should still work after recovery
         let handle = engine
-            .create_instance(&module, 999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after recovery");
         engine.drop_instance(&handle);
     }
@@ -4010,7 +4173,7 @@ mod tests {
         // Create and drop enough instances to trigger refresh
         for i in 0..STORE_REFRESH_THRESHOLD {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -4020,7 +4183,7 @@ mod tests {
         // Verify that instance creation and WASM execution still work after
         // refresh — the replacement store must have fuel set correctly.
         let handle = engine
-            .create_instance(&module, 999_999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after metered refresh");
         engine.drop_instance(&handle);
     }
@@ -4088,7 +4251,7 @@ mod tests {
         // Create and drop instances just below the threshold (no refresh yet).
         for i in 0..STORE_REFRESH_THRESHOLD - 1 {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -4103,7 +4266,7 @@ mod tests {
 
         // One more instance hits the threshold and triggers refresh.
         let handle = engine
-            .create_instance(&module, STORE_REFRESH_THRESHOLD as i64, 1024)
+            .create_instance(&module, 1024)
             .expect("final instance should succeed");
         engine.drop_instance(&handle);
 
@@ -4198,7 +4361,7 @@ mod tests {
         "#;
         let module = engine.compile(wat.as_bytes()).unwrap();
 
-        let result = engine.create_instance(&module, 0, 1024);
+        let result = engine.create_instance(&module, 1024);
         assert!(
             result.is_err(),
             "Module declaring 5000 initial pages (>cap of 4096) must be \
@@ -4279,7 +4442,7 @@ mod tests {
         // taking the baseline so they don't get charged to the per-instance
         // measurement.
         {
-            let h = engine.create_instance(&module, -1, 1024).unwrap();
+            let h = engine.create_instance(&module, 1024).unwrap();
             engine.drop_instance(&h);
         }
         let baseline = read_vm_size_bytes();
@@ -4289,15 +4452,13 @@ mod tests {
         const N_INSTANCES: i64 = 4;
         let mut handles = Vec::with_capacity(N_INSTANCES as usize);
         for i in 0..N_INSTANCES {
-            let h = engine
-                .create_instance(&module, i, 1024)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "instance {i} should succeed (regression: wasmtime memory \
+            let h = engine.create_instance(&module, 1024).unwrap_or_else(|e| {
+                panic!(
+                    "instance {i} should succeed (regression: wasmtime memory \
                      reservation may be too large for the host's overcommit \
                      limit, see #3986): {e}"
-                    )
-                });
+                )
+            });
             handles.push(h);
         }
         let after = read_vm_size_bytes();

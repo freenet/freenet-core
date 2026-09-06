@@ -79,9 +79,29 @@ pub struct RingStatsSnapshot {
     /// may be getting dropped — operators should watch this.
     pub updates_rate_limited: u64,
     /// Total relayed UPDATEs dropped because the limiter's tracking map
-    /// was at capacity (`MAX_TRACKED_PAIRS`). A non-zero value suggests
-    /// identity churn / admission pressure, distinct from per-pair rate.
+    /// was at capacity (`MAX_TRACKED_PAIRS`) and eviction could not free
+    /// a slot. Since #4981 this means the map is full *and* contended;
+    /// ordinary saturation shows up in `updates_capacity_evicted`.
     pub updates_capacity_dropped: u64,
+    /// Total tracked `(sender, contract)` pairs evicted to admit new
+    /// ones at capacity. This is the saturation signal: a busy node
+    /// relaying for more pairs than `MAX_TRACKED_PAIRS` shows this
+    /// climbing while `updates_capacity_dropped` stays flat, and no
+    /// legitimate UPDATE is dropped for it.
+    pub updates_capacity_evicted: u64,
+    /// Total relayed UPDATEs dropped because the sending peer was over
+    /// its budget for introducing brand-new `(sender, contract)` pairs.
+    /// This is the fresh-contract-id churn signal: unlike the counters
+    /// above it never counts a peer's traffic for contracts already
+    /// being tracked, so a non-zero value really does mean one peer is
+    /// presenting unfamiliar contract ids faster than the budget allows.
+    pub updates_sender_budget_dropped: u64,
+    /// Total relayed UPDATEs admitted for a brand-new pair WITHOUT a
+    /// budget check, because the per-sender budget's own map was full.
+    /// Should be zero. A non-zero value means the budget map is
+    /// undersized for this node's peer churn, so those senders are not
+    /// actually being bounded — the safety valve is firing.
+    pub updates_sender_budget_unmetered: u64,
     /// Nearest-neighbor ring lattice completeness (the "is greedy routing's base
     /// lattice present" signal). `lattice_has_successor` / `_predecessor` are
     /// whether this peer currently HOLDS (a side is FILLED with) its
@@ -111,6 +131,88 @@ pub struct RingStatsSnapshot {
     /// lattice and the improvement rate falls toward zero.
     pub lattice_probes_issued: u64,
     pub lattice_probe_improvements: u64,
+}
+
+/// The scalars this module owns directly, for the OTel metrics callbacks.
+///
+/// Deliberately NOT [`get_snapshot`]: that builds per-peer and per-contract
+/// vectors and formats failure HTML, and the SDK has no batch-callback API in
+/// 0.32 — every observable instrument gets its own callback, so the exporter
+/// would pay that cost once per instrument per collection cycle.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OtelStatusScalars {
+    pub connection_attempts: u32,
+    pub op_stats: OperationStats,
+}
+
+/// Read this module's own scalars, or `None` before [`init`] has run.
+///
+/// One accessor per SOURCE, not one snapshot over all of them. An observable
+/// instrument that skips a collection cycle exports nothing, which reads as
+/// "not known yet", while a zero is a real datapoint —
+/// `freenet.ring.connections = 0` before the ring provider registers is
+/// indistinguishable from a node that has lost every connection. But that
+/// decision has to be per-source: an earlier version `?`-chained all of them
+/// into one snapshot, so an unregistered ring provider silently zeroed the
+/// queue metrics too, which do not depend on it at all.
+pub(crate) fn otel_status_scalars() -> Option<OtelStatusScalars> {
+    let status = NETWORK_STATUS.get()?;
+    // Poison tolerance matches the writers in this module, which already keep
+    // going field-by-field. Propagating it instead would make every metric
+    // sourced here vanish permanently, silently, for the process's life.
+    let status = status.read().unwrap_or_else(|poisoned| {
+        POISON_REPORTED.call_once(|| {
+            tracing::warn!(
+                "network status lock is poisoned; metrics continue against \
+                 the last consistent state"
+            )
+        });
+        poisoned.into_inner()
+    });
+    Some(OtelStatusScalars {
+        connection_attempts: status.connection_attempts,
+        op_stats: status.op_stats.clone(),
+    })
+}
+
+/// Logged at most once — a poisoned lock stays poisoned, so this would
+/// otherwise fire on every collection cycle forever.
+static POISON_REPORTED: std::sync::Once = std::sync::Once::new();
+
+/// Live ring stats, or `None` before the provider is registered.
+pub(crate) fn otel_ring_stats() -> Option<RingStatsSnapshot> {
+    RING_STATS_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())
+}
+
+/// Hosted contracts partitioned by why they are held, or `None` before the
+/// provider is registered.
+///
+/// Its own accessor, read by exactly the two gauges that need it: this is an
+/// O(hosted) walk under the hosting-cache read lock, and folding it into a
+/// shared snapshot ran it once per observable callback — eighteen times a
+/// cycle to serve two of them.
+pub(crate) fn otel_hosting_reasons() -> Option<crate::ring::HostingReasonStats> {
+    HOSTING_REASON_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())
+}
+
+/// Source of the per-reason hosted-contract breakdown
+/// (`Ring::hosted_by_reason`). OTel-only; see [`otel_hosting_reasons`].
+pub type HostingReasonProvider =
+    Arc<dyn Fn() -> crate::ring::HostingReasonStats + Send + Sync + 'static>;
+
+static HOSTING_REASON_PROVIDER: parking_lot::RwLock<Option<HostingReasonProvider>> =
+    parking_lot::RwLock::new(None);
+
+/// Register the hosting-reason data source. Replaces any previously-registered
+/// provider.
+pub fn set_hosting_reason_provider(provider: HostingReasonProvider) {
+    *HOSTING_REASON_PROVIDER.write() = Some(provider);
 }
 
 static GOVERNANCE_PROVIDER: parking_lot::RwLock<Option<GovernanceProvider>> =
@@ -518,7 +620,7 @@ pub struct ConnectedPeer {
 }
 
 /// Counters for each operation type: (success, failure).
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct OperationStats {
     pub gets: (u32, u32),
     pub puts: (u32, u32),

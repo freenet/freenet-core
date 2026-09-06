@@ -1,0 +1,14 @@
+[package]
+name = "test-contract-delta-trap"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+freenet-stdlib = { workspace = true, features = ["contract"] }
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []

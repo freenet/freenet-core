@@ -1,5 +1,17 @@
 # Cutting a Freenet release
 
+> **The AWS gateway was retired in September 2026.** References to it below that
+> remain are historical incident records (notably the v0.2.71 half-applied
+> rollout that motivated the post-deploy verify) and are kept deliberately —
+> they explain why a check exists. It is no longer a rollout target: the release
+> matrix, the manual SSH driver in `release.sh`, and `RELEASE_AGENT_HMAC_VEGA`
+> have all been removed. nova now runs two gateway processes; the second,
+> `freenet-gateway-2`, has no release-agent of its own and is brought up by the
+> primary's stop/start cycle, with `gateway-auto-update.sh` verifying it via the
+> `.wants` symlinks so a companion that fails to start is not reported as a
+> successful update.
+
+
 The release pipeline is fully automated. Any maintainer with workflow-run access
 can cut a release by triggering one workflow; everything else cascades:
 crates.io publish, GitHub release with binaries, gateway updates, and the
@@ -47,7 +59,7 @@ Within ~30–60 minutes you should see:
    crates.io → undraft.
 6. The undraft fires `release.published` → `Gateway Update` and
    `Release Announcements` both auto-trigger.
-7. nova and vega gateways converge to the new version (verified by the
+7. nova's gateways converge to the new version (verified by the
    workflow polling `/version` after the update).
 8. A Matrix message lands in `#freenet-locutus:matrix.org`. A River chat
    announcement is sent via nova's release-agent.
@@ -66,7 +78,6 @@ a `::warning::` annotation telling you what to fix.
 | `MATRIX_HOMESERVER_URL` | release-announce.yml | Matrix job warns + skips (success, no post). |
 | `MATRIX_ACCESS_TOKEN` | release-announce.yml | Matrix job warns + skips. |
 | `RELEASE_AGENT_HMAC_NOVA` | gateway-update.yml, release-announce.yml | nova update + River announce fail (HTTP 401). |
-| `RELEASE_AGENT_HMAC_VEGA` | gateway-update.yml | vega update fails (HTTP 401). |
 | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | cross-compile.yml `build-x86_64-windows` (Authenticode signing) | **Does NOT degrade gracefully — this one fails the release.** See "Windows code signing" below. |
 | `FREENET_RELEASE_SIGNING_KEY` | cross-compile.yml (`Sign SHA256SUMS.txt`) | Releases are UNSIGNED (no `SHA256SUMS.txt.sig` attached). Clients accept unsigned releases during the transition window (`REQUIRE_RELEASE_SIGNATURE = false`), but once that flag is flipped to `true` in a future release, unsigned releases are REFUSED by the auto-updater. PEM-encoded ed25519 private key whose public half is baked into the updater (`update.rs` `FREENET_RELEASE_PUBKEY`). |
 
@@ -99,7 +110,11 @@ CN=Freenet Project Inc, O=Freenet Project Inc, L=Austin, S=Texas, C=US
 
 **Unlike every other secret in the table above, this path is fail-closed.** The
 `Verify signatures` step runs `Get-AuthenticodeSignature` on the runner and
-throws if a binary is unsigned, invalid, or missing its RFC3161 timestamp. A
+throws if a binary is unsigned, invalid, missing its RFC3161 timestamp, or
+**signed by a publisher other than `CN=Freenet Project Inc`**. That last check
+matters because `Valid` on its own only means "chains to a trusted root and is
+timestamped" — it says nothing about who signed it, so without an explicit
+subject assertion a binary signed by a different certificate profile would pass. A
 broken Azure configuration therefore fails `build-x86_64-windows`, and because
 `attach-to-release` needs that job, the release stops as a draft rather than
 shipping unsigned binaries. That is deliberate — but it means Azure-side
@@ -288,12 +303,15 @@ Current wire-gated floors:
   gateway, and the release cascade upgrades the gateways FIRST.
 
   Guarded by a marker exactly like `HASH_FIRST_SHIPPED_IN`:
-  `ACK_VERSION_SHIPPED_IN: Option<(u8, u8, u16)>`, currently `None`, checked by
+  `ACK_VERSION_SHIPPED_IN: Option<(u8, u8, u16)>`, now `Some((0, 2, 120))`
+  (this feature shipped in 0.2.120), checked by
   `version_cmp.rs::ack_version_floor_tracks_the_shipping_release`. When a
-  release bump raises `CARGO_PKG_VERSION` to `(0, 2, 120)`, that test fails
+  release bump raises `CARGO_PKG_VERSION` to a new floor, that test fails
   until the releaser consciously either sets
   `ACK_VERSION_SHIPPED_IN = Some(GATEWAY_ACK_VERSION_MIN_VERSION)` (this release
   carries it) or raises the floor (it does not).
+  `ack_version_floor_stays_above_every_release_without_the_variants` is the
+  companion that catches the floor being *lowered*.
 
   Note the emission gate reads the peer's version from the intro packet it just
   parsed, never from a cached value, so unlike the floors above there is no
@@ -316,10 +334,10 @@ Current wire-gated floors:
   did nothing.
 
   Guarded by a marker exactly like `HASH_FIRST_SHIPPED_IN`:
-  `BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)>`, currently `None`,
-  checked by
+  `BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)>`, now
+  `Some((0, 2, 120))` (this feature shipped in 0.2.120), checked by
   `connection_manager.rs::broadcast_target_list_floor_tracks_the_shipping_release`.
-  When a release bump raises `CARGO_PKG_VERSION` to `(0, 2, 120)`, that test
+  When a release bump raises `CARGO_PKG_VERSION` to a new floor, that test
   fails until the releaser consciously either sets
   `BROADCAST_TARGET_LIST_SHIPPED_IN = Some(BROADCAST_TARGET_LIST_MIN_VERSION)`
   (this release carries it) or raises the floor (it does not).
@@ -378,7 +396,6 @@ gh workflow run release.yml
                     └─→ fires release.published event
                             └─→ gateway-update.yml fires
                                     └─→ POST /update to nova (HTTPS)
-                                    └─→ POST /update to vega (HTTPS:8443)
                             └─→ release-announce.yml fires
                                     └─→ Matrix message
                                     └─→ POST /announce/river to nova
@@ -393,7 +410,6 @@ gh workflow run release.yml
   show up here in rough chronological order.
 - **Gateway versions**:
   - `curl https://nova.locut.us/release-agent/version`
-  - `curl https://vega.locut.us:8443/release-agent/version`
 - **Bump PR**:
   `gh pr list --repo freenet/freenet-core --search "build: release"` —
   there should be exactly one open per release, gone within a few minutes.
@@ -599,7 +615,7 @@ Recovery:
    --force'`.
 3. Re-run the gateway-update workflow against just the failed gateway:
    `gh workflow run gateway-update.yml --field version=X.Y.Z --field
-   gateways=vega`.
+   gateways=nova`.
 
 ### River announcement failed but Matrix worked
 
@@ -908,8 +924,10 @@ curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
 
    A clean run here is **not** evidence that the harness is sound. CI stages
    the binary differently — `cross-compile.yml` puts it at `/tmp/freenet`,
-   which used to collide with a directory the node creates under `$TMPDIR` and
-   blocked v0.2.124 on a healthy binary. Running from `./target/release/` is
+   which used to collide with a directory the node created under `$TMPDIR` and
+   blocked v0.2.124 on a healthy binary. That mkdir is gone (#5291), but the
+   staging-environment difference it exposed is not, so the warning stands.
+   Running from `./target/release/` is
    precisely the environment where that class of fault cannot occur, which is
    why local validation went 4/4 green while CI blocked. If local reproduces
    nothing, suspect the staging environment before the binary.
@@ -1015,9 +1033,12 @@ verification skill if you have it):
 1. <https://crates.io/crates/freenet> shows the new version.
 2. <https://github.com/freenet/freenet-core/releases/tag/vX.Y.Z> is
    published (not draft) with 14 assets.
-3. `curl https://nova.locut.us/release-agent/version` and
-   `curl https://vega.locut.us:8443/release-agent/version` both return the
-   new version.
+3. `curl https://nova.locut.us/release-agent/version` returns the new version,
+   and `systemctl is-active freenet-gateway freenet-gateway-2` on nova reports
+   both units `active`. These are two separate checks: the first confirms the
+   binary was swapped, the second that BOTH gateway processes came back up —
+   the second gateway follows the first via `WantedBy=`, and a companion that
+   fails to start is the case `verify_service_active` now catches.
 4. Matrix room shows the announcement.
 5. `sudo journalctl -u freenet-gateway --since "30 min ago"` on each
    gateway shows no errors.

@@ -1,6 +1,6 @@
 //! `fdev verify-merge`: check a contract's merge laws offline (RFC #5320).
 //!
-//! A contract that breaks them cannot converge — peers given the same updates
+//! A contract that breaks them usually cannot converge — peers given the same updates
 //! in different orders end up with different state and never agree.
 //!
 //! This is a thin CLI wrapper around `freenet::conformance` and does not
@@ -22,18 +22,19 @@
 //! fdev verify-merge --wasm contract.wasm --transition before.bin after.bin
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use freenet::conformance::ConformanceOracle;
+use freenet::conformance::bundle::BundleError;
 use freenet::conformance::generator::Corpus;
+use freenet::conformance::host_clock;
 use freenet::conformance::verifier::Bytes;
 use freenet::conformance::{
-    ConformanceCase, ConformanceEvidence, ConformanceProperty, EVIDENCE_SCHEMA_VERSION,
-    EvidenceRejected, GeneratorConfig, Inconclusive, MinimizeConfig, OracleBuildError,
-    PropertyOutcome, ReplayBundle, RuntimeOracle, Severity, Transition, generate_cases, minimize,
-    verify_case,
+    ConformanceCase, ConformanceEvidence, ConformanceProperty, EvidenceRejected, GeneratorConfig,
+    IdempotenceSettling, Inconclusive, MinimizeConfig, OracleBuildError, PropertyOutcome,
+    ReplayBundle, RuntimeOracle, Severity, Transition, generate_cases, minimize, verify_case,
 };
 use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId, State, UpdateData};
 use serde::Serialize;
@@ -49,6 +50,14 @@ use serde::Serialize;
 pub struct ConformanceConfig {
     /// Path to the compiled contract WASM. Required unless `--bundle` supplies
     /// its own code; when both are given, this overrides the bundle's code.
+    ///
+    /// Also accepts a node's contract-store entry (a version header ahead of
+    /// the code, not raw WASM) when paired with `--bundle` or `--evidence`:
+    /// if the raw bytes do not already match what the bundle or evidence
+    /// names, unwrapping it as a store entry is tried automatically before
+    /// giving up. Without either of those there is nothing to check an
+    /// unwrapped candidate against, so a bare `--wasm --state` invocation is
+    /// read as raw WASM only.
     #[arg(long)]
     pub(crate) wasm: Option<PathBuf>,
 
@@ -155,7 +164,18 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
         hand_supplied_steps,
     } = load_inputs(&config)?;
 
+    // Computed as soon as the code is in hand, and BEFORE the two guards below
+    // that abort without building a `Report`. "Your contract reads the host
+    // clock" is the cheapest answer this command has and it does not depend on
+    // having a workable corpus, so gating it behind one meant an author whose
+    // corpus was too thin to generate a case — the common state early in
+    // development, and exactly when this is most useful — was told nothing.
+    // The normal path prints it as part of the report; the guards print it
+    // themselves, since they never reach one.
+    let code_diagnostics = code_diagnostics(&wasm);
+
     if corpus.is_empty() {
+        report_code_diagnostics_standalone(&code_diagnostics);
         anyhow::bail!("no states to check: the corpus is empty");
     }
 
@@ -173,6 +193,7 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
     // idempotence with no captured deltas) otherwise prints "0 cases run" and exits
     // 0, which any automation reads as "this contract passed".
     if cases.is_empty() {
+        report_code_diagnostics_standalone(&code_diagnostics);
         anyhow::bail!(
             "no cases could be generated from this corpus: {} state(s), {} delta(s), \
              {} summary/summaries for the selected properties. Nothing was checked, \
@@ -216,7 +237,7 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
         None => None,
     };
 
-    let report = Report::build(&corpus, &outcomes, evidence);
+    let report = Report::build(&corpus, &outcomes, evidence, code_diagnostics);
     if config.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -390,8 +411,11 @@ fn write_bundle(
 /// distinction CI needs and a single exit code cannot express.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "{count} merge-law violation(s) found: this contract cannot converge, so peers \
-     holding it will disagree and keep retrying"
+    "{count} merge-law violation(s) found. A violation is removal-eligible under \
+     enforcement; see each finding for what it means. NOTE: `state_idempotence` \
+     reporting `settled_after` is a real break whose harm is redundant anti-entropy \
+     rather than divergence \u{2014} expected against correct canonicalizing \
+     contracts until the PUT install path canonicalizes"
 )]
 pub struct ConformanceViolations {
     pub count: usize,
@@ -451,18 +475,8 @@ fn parse_properties(names: &[String]) -> anyhow::Result<Vec<ConformanceProperty>
 /// differ, and both are worth knowing.
 async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::Result<()> {
     let bytes = read_file(path)?;
-    let evidence: ConformanceEvidence = bincode::deserialize(&bytes)
+    let evidence = ConformanceEvidence::decode(&bytes)
         .with_context(|| format!("decoding evidence {}", path.display()))?;
-
-    // Refuse a schema this build does not know, rather than reading fields that may
-    // have changed meaning. Silently misreading evidence is worse than declining.
-    if evidence.schema_version != EVIDENCE_SCHEMA_VERSION {
-        anyhow::bail!(
-            "evidence uses schema version {}, this build understands {}",
-            evidence.schema_version,
-            EVIDENCE_SCHEMA_VERSION
-        );
-    }
 
     // Bounds-check with the same function a receiving peer uses, so this command
     // never accepts evidence the network itself would reject, and do it BEFORE
@@ -483,20 +497,80 @@ async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::
         ),
     };
 
-    let mut oracle = RuntimeOracle::standalone(code, evidence.parameters.clone())
-        .await
-        .map_err(describe_oracle_build_error)?;
-
-    // The contract must be the one the evidence names. Checking this is what stops
-    // a finding being replayed against a different contract and appearing to
-    // confirm or clear it.
-    if oracle.instance_id() != evidence.contract {
-        anyhow::bail!(
-            "the contract supplied is {} but the evidence is about {}",
-            oracle.instance_id(),
-            evidence.contract
-        );
+    // Build the runtime and confirm the contract is the one the evidence
+    // names. Checking this is what stops a finding being replayed against a
+    // different contract and appearing to confirm or clear it. Nested so this
+    // one definition serves both attempts below: a bare `--wasm` file may
+    // need it run once against the raw bytes and once against a
+    // contract-store form of the same bytes.
+    async fn oracle_matching_evidence(
+        code: Vec<u8>,
+        evidence: &ConformanceEvidence,
+    ) -> anyhow::Result<RuntimeOracle> {
+        let oracle = RuntimeOracle::standalone(code, evidence.parameters.clone())
+            .await
+            .map_err(describe_oracle_build_error)?;
+        if oracle.instance_id() != evidence.contract {
+            anyhow::bail!(
+                "the contract supplied is {} but the evidence is about {}",
+                oracle.instance_id(),
+                evidence.contract
+            );
+        }
+        Ok(oracle)
     }
+
+    let raw_result = oracle_matching_evidence(code.clone(), &evidence).await;
+    // Only a bare `--wasm` file is worth retrying as a contract-store entry:
+    // `--contract-store` already unwraps inside `find_code_for_instance`, and
+    // there is nothing left to retry when neither was given (caught above).
+    // The unwrapped candidate goes through the exact same identity check the
+    // raw bytes did — this widens what `--wasm` ACCEPTS, never what is
+    // TRUSTED. Matched by value (rather than `.is_err()` / `.unwrap_err()`)
+    // because `RuntimeOracle` carries a live wasmtime instance and does not
+    // implement `Debug`.
+    let (code, oracle_result) = match raw_result {
+        Ok(oracle) => (code, Ok(oracle)),
+        Err(raw_err) if config.wasm.is_some() => match try_unwrap_store_form(&code) {
+            Some(unwrapped) => {
+                match oracle_matching_evidence(unwrapped.clone(), &evidence).await {
+                    Ok(oracle) => {
+                        // Only NOW: the unwrapped candidate has actually
+                        // passed the identity check, not merely parsed as a
+                        // store entry.
+                        note_accepted_as_store_form();
+                        (unwrapped, Ok(oracle))
+                    }
+                    Err(store_err) => {
+                        // Evidence identifies contracts by INSTANCE, which
+                        // `store_err` already names — but a node's contract
+                        // store is addressed by CODE hash, so an operator
+                        // comparing an instance id against store filenames
+                        // finds no match anywhere. Name the code hash too.
+                        let inner_hash = ContractCode::from(unwrapped.clone()).hash_str();
+                        (
+                            unwrapped,
+                            Err(anyhow::anyhow!(
+                                "{raw_err}\n(read as a contract-store entry instead: \
+                                 {store_err}; its code hash is {inner_hash})"
+                            )),
+                        )
+                    }
+                }
+            }
+            None => (code, Err(raw_err)),
+        },
+        Err(raw_err) => (code, Err(raw_err)),
+    };
+
+    // Same reasoning as in `conformance()`: this is a fact about the code, it is
+    // free, and this path has the code in hand. It is reported BEFORE the
+    // result of the identity check above, because a contract that reads the
+    // clock is worth saying so about even when it turns out not to be the one
+    // the evidence accuses.
+    report_code_diagnostics_standalone(&code_diagnostics(&code));
+
+    let mut oracle = oracle_result?;
 
     let case = evidence
         .to_case()
@@ -506,10 +580,16 @@ async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::
     println!("evidence {}", evidence.id());
     println!("  contract : {}", evidence.contract);
     println!("  property : {}", evidence.property);
+    // `v.detail` is deserialized from an evidence file ANOTHER PEER produced, and
+    // this function's own stated contract is that `evidence.observed` is never
+    // trusted. It was nonetheless interpolated raw into the operator's terminal, so
+    // a sender could embed a newline and forge a `verdict  :` line in the exact
+    // format the real one uses - on the one command here built to consume hostile
+    // input. `v.property` is an enum and carries no free text.
     println!(
         "  claimed  : {}",
         match &evidence.observed {
-            Some(v) => format!("{} ({})", v.property, v.detail),
+            Some(v) => format!("{} ({})", v.property, present_detail(&v.detail)),
             None => "nothing recorded by the sender".to_string(),
         }
     );
@@ -542,7 +622,14 @@ async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::
             Ok(())
         }
         PropertyOutcome::Inconclusive(reason) => {
-            println!("  verdict  : INCONCLUSIVE \u{2014} {reason}");
+            // `Display for Inconclusive` interpolates the contract's own error text
+            // raw, so this is the same untrusted-text-to-terminal path the report
+            // side escapes. Escaping the rendered line whole is safe: the static
+            // prefixes it adds contain nothing escapable.
+            println!(
+                "  verdict  : INCONCLUSIVE \u{2014} {}",
+                present_detail(&reason.to_string())
+            );
             Ok(())
         }
     }
@@ -621,6 +708,50 @@ fn find_code_in_store(store: &Path, bundle: &ReplayBundle) -> anyhow::Result<Vec
     Ok(code.data().to_vec())
 }
 
+/// Try `raw` as a node's contract-store entry rather than raw WASM.
+///
+/// Same versioned encoding as `find_code_in_store` reads from disk — a version
+/// header ahead of the code, not raw WASM — except here the bytes already came
+/// from `--wasm` and failed to match as-is. Call this only AFTER that identity
+/// check has already failed: the unwrapped candidate must be handed back to the
+/// SAME check the caller just ran, so this widens what `--wasm` ACCEPTS and
+/// never what is TRUSTED. `None` means the bytes are not a store entry either,
+/// in which case the original failure is the whole story.
+///
+/// Deliberately silent. Parsing successfully only says the bytes LOOK like a
+/// store entry, not that they are the RIGHT contract — printing here told an
+/// operator handing over the WRONG contract in store form "it matched"
+/// moments before reporting a mismatch. The caller prints
+/// [`note_accepted_as_store_form`] itself, and only once the unwrapped
+/// candidate has actually passed its own identity check.
+fn try_unwrap_store_form(raw: &[u8]) -> Option<Vec<u8>> {
+    let (code, _version) = ContractCode::load_versioned_from_bytes(raw.to_vec()).ok()?;
+    Some(code.data().to_vec())
+}
+
+/// Tell the operator their `--wasm` file was accepted as a contract-store
+/// entry, not raw WASM. Call only once the unwrapped candidate from
+/// [`try_unwrap_store_form`] has actually passed the caller's own identity
+/// check — never on a successful PARSE alone, which says nothing about
+/// whether the code is the right one.
+///
+/// Prints to stderr, never stdout: `--json` puts exactly one document on
+/// stdout and a stray line ahead of it corrupts the stream for anything
+/// parsing it. `load_inputs_never_writes_to_stdout` is scoped to
+/// `load_inputs`'s own body and cannot see inside a separate function it
+/// merely calls — the exact gap that once let `report_code_diagnostics_standalone`
+/// ship a stdout regression that left every fdev test green (see
+/// `the_standalone_report_writes_to_stderr_only`).
+/// `helper_functions_never_write_to_stdout` below is this function's own copy
+/// of that same guard.
+fn note_accepted_as_store_form() {
+    eprintln!(
+        "note: --wasm did not match as supplied; it matched after unwrapping it as \
+         a contract-store entry (version header + code), which is how a node's own \
+         contract store saves it"
+    );
+}
+
 /// Load the WASM, parameters and corpus, either from `--bundle` or from
 /// `--wasm` / `--params` / `--state`.
 fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<LoadedInputs> {
@@ -632,7 +763,52 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<LoadedInputs> {
         // replaying it: the run looks authoritative and means nothing, whether it
         // reports findings or a clean bill of health.
         let supplied = match (&config.wasm, &config.contract_store) {
-            (Some(path), _) => Some(read_file(path)?),
+            (Some(path), _) => {
+                let raw = read_file(path)?;
+                // Try the raw bytes first, so nothing that already matches
+                // changes meaning. Only on a MISMATCH — never on some other
+                // failure, like the bundle naming no contract at all — is it
+                // worth asking whether the file is a contract-store entry
+                // instead of raw WASM, and the unwrapped candidate goes
+                // through the exact same `resolve_code` the raw bytes did.
+                let code = match bundle.resolve_code(Some(raw.clone())) {
+                    Ok(code) => code,
+                    Err(raw_err @ BundleError::CodeMismatch { .. }) => {
+                        match try_unwrap_store_form(&raw) {
+                            Some(unwrapped) => {
+                                match bundle.resolve_code(Some(unwrapped.clone())) {
+                                    Ok(code) => {
+                                        // Only NOW: the unwrapped candidate
+                                        // has actually passed the identity
+                                        // check, not merely parsed as a
+                                        // store entry.
+                                        note_accepted_as_store_form();
+                                        code
+                                    }
+                                    Err(store_err) => {
+                                        // `store_err`'s own hash comes from
+                                        // `BundleError::CodeMismatch`, which
+                                        // is truncated hex — not the base58
+                                        // `CodeHash` encoding a store file is
+                                        // actually named by on disk. Report
+                                        // that explicitly, same as the
+                                        // evidence site.
+                                        let inner_hash = ContractCode::from(unwrapped).hash_str();
+                                        return Err(anyhow::anyhow!(
+                                            "{raw_err}\n(read as a contract-store \
+                                             entry instead: {store_err}; its code \
+                                             hash is {inner_hash})"
+                                        ));
+                                    }
+                                }
+                            }
+                            None => return Err(raw_err.into()),
+                        }
+                    }
+                    Err(raw_err) => return Err(raw_err.into()),
+                };
+                Some(code)
+            }
             (None, Some(store)) => Some(find_code_in_store(store, &bundle)?),
             (None, None) => None,
         };
@@ -679,12 +855,30 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<LoadedInputs> {
             .wasm
             .as_ref()
             .context("--wasm is required unless --bundle is given")?;
+        // Read as raw WASM ONLY — no `try_unwrap_store_form` retry here, unlike
+        // the `--bundle` and `--evidence` branches. Both of those hold an
+        // unwrapped candidate to an identity check they already have (the
+        // bundle's code hash, the evidence's instance id); this plain
+        // invocation has no hash to check one against, so silently accepting
+        // a contract-store entry here would widen what is TRUSTED, not just
+        // what is accepted, and a mismatched contract would run undetected.
         let wasm = read_file(wasm_path)?;
         let parameters = match &config.params {
             Some(path) => read_file(path)?,
             None => Vec::new(),
         };
         if config.states.is_empty() && config.transitions.is_empty() {
+            // `fdev verify-merge --wasm mycontract.wasm` — no corpus — is the
+            // FIRST thing an author runs, and this bail is the third and
+            // earliest of the three that abort before a `Report` exists. The
+            // other two are guarded in `conformance()`, but this one short
+            // circuits `load_inputs(&config)?` so that guard is never reached,
+            // which left the single most likely early-development invocation
+            // saying nothing about the clock. The WASM is already read above,
+            // so the answer costs nothing here.
+            //
+            // To stderr, so `load_inputs_never_writes_to_stdout` still holds.
+            report_code_diagnostics_standalone(&code_diagnostics(&wasm));
             anyhow::bail!(
                 "at least one --state or --transition is required unless --bundle is given"
             );
@@ -851,8 +1045,9 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
         if !written.insert(id) {
             continue;
         }
-        let bytes =
-            bincode::serialize(&evidence).with_context(|| format!("encoding evidence {id}"))?;
+        let bytes = evidence
+            .encode()
+            .with_context(|| format!("encoding evidence {id}"))?;
         let path = dir.join(format!("{id}.bin"));
         std::fs::write(&path, bytes)
             .with_context(|| format!("writing evidence to {}", path.display()))?;
@@ -979,6 +1174,90 @@ struct EvidenceSummary {
     input_bytes_after_shrinking: usize,
 }
 
+/// A finding about the contract's CODE rather than about the outcome of checking
+/// a merge law.
+///
+/// [`Finding`] cannot express one. Its `property`, `left` and `right` fields are
+/// the law that was checked and the digests of the two states that disagreed, and
+/// there is no honest value for any of them here: nothing was executed, no state
+/// was produced, and no law was violated — the contract simply contains something
+/// worth telling its author about. Forcing it into a `Finding` would mean inventing
+/// a property name that `--property` cannot select and `ConformanceProperty::ALL`
+/// does not list, and stamping two empty digests on it. So this is a separate,
+/// deliberately small channel alongside the findings, and it is
+/// **never removal-eligible**: [`exit_code`] reads `PropertyOutcome`s only, so a
+/// code diagnostic cannot fail the command however it is worded.
+#[derive(Serialize, Clone, PartialEq, Eq, Debug)]
+struct CodeDiagnostic {
+    /// Stable machine-readable name, for a `--json` consumer.
+    diagnostic: &'static str,
+    /// What the author needs to know, in one paragraph.
+    detail: String,
+}
+
+/// Code-level diagnostics for the contract under check.
+///
+/// Kept as its own function, taking bytes and returning values, so the DECISION
+/// is testable without a WASM runtime, a corpus, or a running `conformance()`.
+fn code_diagnostics(wasm: &[u8]) -> Vec<CodeDiagnostic> {
+    let mut diagnostics = Vec::new();
+    if host_clock::imports_host_clock(wasm) {
+        diagnostics.push(CodeDiagnostic {
+            diagnostic: "host_clock_import",
+            detail: format!(
+                "this contract imports the host wall clock ({}::{}), which is \
+                 DEPRECATED for contracts. update_state must be a function of its \
+                 inputs or replicas cannot be guaranteed to converge, so the merge \
+                 laws checked above are not well-formed statements about a contract \
+                 that reads the clock. In a future release the call will TRAP \
+                 (issue #5465): the contract will still load, but any actual call \
+                 to the clock will fail that operation. Trapping is per-call, so a \
+                 contract that imports the symbol without reaching it keeps working \
+                 and needs no re-key. Carry a client-signed timestamp in the state \
+                 and enforce only monotonicity (new > current) instead. Delegates \
+                 are unaffected. See {}",
+                host_clock::HOST_CLOCK_NAMESPACE,
+                host_clock::HOST_CLOCK_IMPORT,
+                host_clock::HOST_CLOCK_DEPRECATION_DOC,
+            ),
+        });
+    }
+    diagnostics
+}
+
+/// The standalone rendering of code diagnostics, for the paths that never build
+/// a [`Report`], or `None` when there is nothing to say.
+///
+/// Pure, so the decision is testable without running the command.
+fn render_code_diagnostics_standalone(diagnostics: &[CodeDiagnostic]) -> Option<String> {
+    if diagnostics.is_empty() {
+        return None;
+    }
+    let mut out =
+        String::from("code diagnostics (about the contract's code, not about a law it broke):\n");
+    for d in diagnostics {
+        out.push_str(&format!("  - {}: {}\n", d.diagnostic, d.detail));
+    }
+    Some(out)
+}
+
+/// Print code diagnostics on a path that aborts before a [`Report`] exists.
+///
+/// To STDERR deliberately. These call sites either precede an `anyhow::bail!`
+/// (so the run is failing and stdout may be a `--json` document a consumer is
+/// parsing) or sit in `verify_evidence`, whose stdout is its own fixed
+/// `key : value` report. In neither case may this be allowed to appear in the
+/// middle of stdout.
+///
+/// Note the node-side WARN does not cover these paths either:
+/// `conformance_log_level` returns `LevelFilter::OFF` for any `--json` run, so
+/// without this the answer exists nowhere.
+fn report_code_diagnostics_standalone(diagnostics: &[CodeDiagnostic]) {
+    if let Some(text) = render_code_diagnostics_standalone(diagnostics) {
+        eprint!("{text}");
+    }
+}
+
 #[derive(Serialize)]
 struct Report {
     /// What the cases were drawn FROM.
@@ -1000,6 +1279,9 @@ struct Report {
     findings: Vec<Finding>,
     inconclusive_reasons: Vec<InconclusiveReason>,
     evidence: Option<EvidenceSummary>,
+    /// See [`CodeDiagnostic`]. Separate from `findings` because these are not
+    /// property outcomes and must never be counted as violations.
+    code_diagnostics: Vec<CodeDiagnostic>,
 }
 
 /// One violated case, at full per-case granularity: exactly the digests that
@@ -1013,12 +1295,86 @@ struct Finding {
     detail: String,
     left: String,
     right: String,
+    /// Machine-readable settling classification for `state_idempotence`; `null`
+    /// for every other property.
+    ///
+    /// `detail` states it in prose, but `Violation::detail` is documented as
+    /// diagnostic and never parsed, and this distinction is exactly what an
+    /// eventual removal policy branches on (#5462). Carrying it only as text
+    /// would leave the tool discarding structure it was handed — the defect
+    /// #5461 fixed, one field over.
+    settling: Option<IdempotenceSettling>,
 }
+
+/// How many distinct detail texts the HUMAN report shows per inconclusive reason.
+///
+/// The texts come from contract code, so their number is bounded only by the case
+/// count: a contract that embeds a state hash in its error message produces a
+/// distinct string per case, and listing 435 of those would bury the question the
+/// reader actually has ("is this one bug, or eight?") rather than answer it. Five
+/// separates those two cases comfortably.
+///
+/// This is a READABILITY bound and so it applies to the human report alone. `--json`
+/// carries every distinct message: a machine consumer has no width constraint, the
+/// tally already holds them all so nothing is saved by dropping them, and a capped
+/// machine format would hand a hostile contract a cheap way to bury its real failure
+/// behind five high-frequency decoys. The human report says how much it is not
+/// showing, in both messages and cases, and points at `--json` for the rest.
+const MAX_INCONCLUSIVE_EXAMPLES: usize = 5;
+
+/// Longest detail text reported, in characters after escaping.
+///
+/// Contract-authored strings have no length bound and this text is copied into bug
+/// reports, so it is capped. Deduplication happens on the presented (escaped and
+/// truncated) form, so two messages sharing a long prefix count as one — which is
+/// why the overflow count below says "distinct message(s)" rather than "distinct
+/// error(s)".
+const MAX_INCONCLUSIVE_EXAMPLE_CHARS: usize = 200;
 
 #[derive(Serialize)]
 struct InconclusiveReason {
     reason: &'static str,
     occurrences: usize,
+    /// Every distinct text behind this reason, most frequent first. Empty for the
+    /// reasons that carry no text at all (`RoundLimit`, `RelatedRequired`, ...).
+    ///
+    /// Complete here on purpose; only the human report trims it. See
+    /// [`MAX_INCONCLUSIVE_EXAMPLES`].
+    examples: Vec<InconclusiveExample>,
+}
+
+/// One distinct detail text and how many cases produced it.
+///
+/// The text is written by the CONTRACT, so it can carry real application state - a
+/// rejected value, a member key, a room id - and the corpora these runs replay are
+/// captured from live peers. `bundle.rs` and `capture.rs` both mark that material
+/// sensitive; this is the path that lifts it out of those files and onto a terminal,
+/// from which it is easily pasted into a bug report. The human report says so where
+/// it prints them; treat `--json` containing them the same way.
+#[derive(Serialize)]
+struct InconclusiveExample {
+    text: String,
+    occurrences: usize,
+}
+
+/// "1 case" / "N cases". The findings section already reads this way; the
+/// inconclusive examples printed "1 case(s)".
+fn case_count(n: usize) -> String {
+    if n == 1 {
+        "1 case".to_string()
+    } else {
+        format!("{n} cases")
+    }
+}
+
+/// Running tally for one inconclusive reason while a report is being built.
+#[derive(Default)]
+struct ReasonTally {
+    occurrences: usize,
+    /// `BTreeMap` so equally-frequent texts order deterministically: two runs over
+    /// the same corpus must produce byte-identical reports, or diffing them (the
+    /// normal way to see whether a contract change helped) is worthless.
+    details: BTreeMap<String, usize>,
 }
 
 impl Report {
@@ -1030,6 +1386,7 @@ impl Report {
         corpus: &Corpus,
         outcomes: &[(ConformanceCase, PropertyOutcome)],
         evidence: Option<EvidenceSummary>,
+        code_diagnostics: Vec<CodeDiagnostic>,
     ) -> Self {
         let mut holds = 0usize;
         let mut violations = 0usize;
@@ -1038,7 +1395,7 @@ impl Report {
         let mut inconclusive = 0usize;
 
         let mut findings: Vec<Finding> = Vec::new();
-        let mut inconclusive_reasons: HashMap<&'static str, usize> = HashMap::new();
+        let mut inconclusive_reasons: HashMap<&'static str, ReasonTally> = HashMap::new();
 
         for (_, outcome) in outcomes {
             match outcome {
@@ -1058,25 +1415,47 @@ impl Report {
                         detail: v.detail.clone(),
                         left: v.left.to_string(),
                         right: v.right.to_string(),
+                        settling: v.settling,
                     });
                 }
                 PropertyOutcome::Inconclusive(reason) => {
                     inconclusive += 1;
-                    *inconclusive_reasons
+                    let tally = inconclusive_reasons
                         .entry(inconclusive_label(reason))
-                        .or_insert(0) += 1;
+                        .or_default();
+                    tally.occurrences += 1;
+                    if let Some(detail) = inconclusive_detail(reason) {
+                        *tally.details.entry(present_detail(detail)).or_insert(0) += 1;
+                    }
                 }
             }
         }
 
         let mut inconclusive_reasons: Vec<InconclusiveReason> = inconclusive_reasons
             .into_iter()
-            .map(|(reason, occurrences)| InconclusiveReason {
-                reason,
-                occurrences,
+            .map(|(reason, tally)| {
+                let mut details: Vec<(String, usize)> = tally.details.into_iter().collect();
+                // Most frequent first, then lexicographic. The frequency order makes
+                // the first line the representative case; the lexicographic tiebreak
+                // is what keeps the choice from depending on hash iteration order.
+                details.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                InconclusiveReason {
+                    reason,
+                    occurrences: tally.occurrences,
+                    examples: details
+                        .into_iter()
+                        .map(|(text, occurrences)| InconclusiveExample { text, occurrences })
+                        .collect(),
+                }
             })
             .collect();
-        inconclusive_reasons.sort_by(|a, b| b.occurrences.cmp(&a.occurrences));
+        // Ties broken by label for the same reason as above: a report that reorders
+        // between identical runs cannot be diffed.
+        inconclusive_reasons.sort_by(|a, b| {
+            b.occurrences
+                .cmp(&a.occurrences)
+                .then_with(|| a.reason.cmp(b.reason))
+        });
 
         Report {
             corpus_states: corpus.states.len(),
@@ -1091,6 +1470,7 @@ impl Report {
             findings,
             inconclusive_reasons,
             evidence,
+            code_diagnostics,
         }
     }
 
@@ -1153,8 +1533,60 @@ impl Report {
                 "\ninconclusive ({} total \u{2014} NOT passes: these cases reached no verdict, so they say nothing about the contract):",
                 self.inconclusive
             )?;
+            // Said once, above the messages rather than beside each one: these
+            // strings mostly come from the contract - a contract error routinely
+            // names what it rejected - but a runtime/harness failure's text comes
+            // from the WASM runtime executing an attacker-influenceable module
+            // instead, so it is untrusted for the same reason and gets the same
+            // treatment below. The corpora replayed here are captured from live
+            // peers, and `bundle.rs` and `capture.rs` both mark that material
+            // sensitive - this is the path that brings it to a terminal.
+            if self
+                .inconclusive_reasons
+                .iter()
+                .any(|r| !r.examples.is_empty())
+            {
+                writeln!(
+                    out,
+                    "  (quoted messages come from the contract or the WASM runtime \
+                     executing it, and may contain application state)"
+                )?;
+            }
             for r in &self.inconclusive_reasons {
                 writeln!(out, "  {}: {}", r.reason, r.occurrences)?;
+                // The text the contract actually produced. Without it the largest
+                // text-carrying bucket is a number and nothing else, and a reader
+                // cannot tell one recurring bug from many unrelated ones.
+                //
+                // Quoted because `escape_debug` escapes `"`, so the quotes mark the
+                // exact extent of contract-authored text. Without them a message of
+                // wide or combining characters can wrap past the terminal width and
+                // its tail reads like a line of the report.
+                for example in r.examples.iter().take(MAX_INCONCLUSIVE_EXAMPLES) {
+                    writeln!(
+                        out,
+                        "      {} \u{2014} \"{}\"",
+                        case_count(example.occurrences),
+                        example.text
+                    )?;
+                }
+                let hidden = r.examples.len().saturating_sub(MAX_INCONCLUSIVE_EXAMPLES);
+                if hidden > 0 {
+                    // Both numbers, because "3 further messages" alone cannot
+                    // distinguish 3 stray cases from 300, and the reader needs to
+                    // know whether what is hidden is the bulk of the bucket.
+                    let hidden_cases: usize = r
+                        .examples
+                        .iter()
+                        .skip(MAX_INCONCLUSIVE_EXAMPLES)
+                        .map(|e| e.occurrences)
+                        .sum();
+                    writeln!(
+                        out,
+                        "      \u{2026} and {hidden} further distinct message(s), \
+                         {hidden_cases} case(s), not shown \u{2014} --json has all of them"
+                    )?;
+                }
             }
         }
 
@@ -1193,6 +1625,16 @@ impl Report {
             }
         }
 
+        if !self.code_diagnostics.is_empty() {
+            writeln!(
+                out,
+                "\ncode diagnostics (about the contract's code, not about a law it broke; these never fail this command):"
+            )?;
+            for d in &self.code_diagnostics {
+                writeln!(out, "  [{}] {}", d.diagnostic, d.detail)?;
+            }
+        }
+
         if self.enforceable_violations == 0 {
             writeln!(out, "\nno enforceable violations found.")?;
             if self.diagnostic_violations > 0 {
@@ -1200,6 +1642,16 @@ impl Report {
                     out,
                     "({} diagnostic finding(s) above are efficiency notes, not merge-law breaks, and do not fail this command.)",
                     self.diagnostic_violations
+                )?;
+            }
+            // Without this the line above is the last thing a reader sees, and
+            // "no enforceable violations found." reads as a clean bill of health
+            // for a contract whose clock call will trap in a future release.
+            if !self.code_diagnostics.is_empty() {
+                writeln!(
+                    out,
+                    "({} code diagnostic(s) above are about the contract's code rather than a merge law, so they do not fail this command, but they still need addressing.)",
+                    self.code_diagnostics.len()
                 )?;
             }
         }
@@ -1244,6 +1696,11 @@ fn inconclusive_label(reason: &Inconclusive) -> &'static str {
         Inconclusive::InputNotValid => "input not valid",
         Inconclusive::RelatedRequired => "requires related contract state",
         Inconclusive::ContractError(_) => "contract error",
+        // Deliberately a distinct label from `ContractError`, not merely a distinct
+        // variant: the two mean opposite things about who is at fault (a contract
+        // rejecting its input vs. the host/WASM runtime itself failing), and sharing
+        // the label is what lost that distinction in the first place (#5509).
+        Inconclusive::RuntimeError(_) => "runtime/harness failure",
         Inconclusive::NoOutputState => "update produced no output state",
         Inconclusive::ResourceLimit(_) => "resource limit hit",
         Inconclusive::RoundLimit => "reconciliation round budget exhausted",
@@ -1253,6 +1710,66 @@ fn inconclusive_label(reason: &Inconclusive) -> &'static str {
         Inconclusive::NotReproducible => "finding did not reproduce",
         _ => "other",
     }
+}
+
+/// The text an [`Inconclusive`] carries, where its variant carries one.
+///
+/// [`inconclusive_label`] deliberately collapses to a fixed set of buckets so the
+/// summary stays countable. This is the other half of the same answer, and without
+/// it the buckets that DO carry text are undiagnosable from the tool's own output:
+/// measured on a 64-bundle live corpus, 435 of 2,622 inconclusive cases were
+/// `contract error` and not one of them could be read (#5461).
+///
+/// Delegates to [`Inconclusive::detail`] rather than matching here. This crate
+/// cannot match `#[non_exhaustive]` exhaustively, so any match written at this end
+/// needs a wildcard arm - and the wildcard is exactly how the text was lost the
+/// first time. Owning the answer in the defining crate makes the compiler refuse a
+/// new variant that has not declared whether it carries text.
+fn inconclusive_detail(reason: &Inconclusive) -> Option<&str> {
+    reason.detail()
+}
+
+/// Make an `Inconclusive` detail string safe and bounded for the report.
+///
+/// Two hazards, both from one fact: this text comes from the contract under test or
+/// the WASM runtime executing it, neither of which we are entitled to trust — the
+/// runtime's own error text can embed detail (an export name, a trap message) drawn
+/// from the same attacker-influenceable module.
+///
+/// Control characters are escaped first. A message containing a newline would
+/// otherwise forge report lines - a fabricated `violation:` line is one `\n` away -
+/// and a bare carriage return would overwrite the line the reader just saw. Escaping
+/// before truncating also means the cap bounds what is actually printed rather than
+/// what was parsed.
+fn present_detail(text: &str) -> String {
+    // `str::escape_debug`, not `char::escape_debug` in a loop: the former escapes a
+    // LEADING grapheme-extend character and leaves one mid-string alone, and driving
+    // it per character would silently lose that distinction.
+    //
+    // Bounded by [`take_presented`] BEFORE anything is collected, because the
+    // iterator is lazy: only as much of the message is read as the cap needs.
+    // Escaping the whole string and truncating afterwards bounds the OUTPUT while
+    // leaving the WORK unbounded - escaping expands a control character roughly
+    // sixfold, this runs once per inconclusive CASE (deduplication happens on the
+    // result, not before it), and the contract chooses both length and content. That
+    // is a wall-clock denial of service against the tool, not merely an allocation
+    // spike.
+    take_presented(text.escape_debug())
+}
+
+/// The bounded half of [`present_detail`], taken over an iterator rather than a
+/// `&str` so that the laziness above is testable: a test can hand this a source that
+/// panics the moment it is read past the cap, which is the only way to assert that
+/// the work is bounded rather than merely the output.
+fn take_presented(escaped: impl Iterator<Item = char>) -> String {
+    // One char past the cap is enough to know whether anything was dropped, and is
+    // all that is ever read.
+    let mut chars: Vec<char> = escaped.take(MAX_INCONCLUSIVE_EXAMPLE_CHARS + 1).collect();
+    if chars.len() > MAX_INCONCLUSIVE_EXAMPLE_CHARS {
+        chars.truncate(MAX_INCONCLUSIVE_EXAMPLE_CHARS);
+        chars.push('\u{2026}');
+    }
+    chars.into_iter().collect()
 }
 
 /// Source pin on `load_inputs`' output stream.
@@ -1304,8 +1821,18 @@ mod stdout_purity_pin {
         }
         let after = &src[start..];
         let open = after.find('{').expect("signature has no body");
+        // Count braces over a copy with literals and comments blanked out, then
+        // slice the ORIGINAL at the offset that finds. Counting over raw source
+        // treats a brace inside a string literal as structure, so a
+        // `format!("...{...")` added to a scraped function later would silently
+        // widen its region into the next function — and both the `count() == 1`
+        // assertion and its vacuity anchor would still pass, so the pin would
+        // weaken quietly instead of failing. That is the exact failure mode
+        // these pins exist to prevent. `blank_literals` panics on syntax it
+        // cannot mask, so the failure direction is loud.
+        let masked = blank_literals(&after[open..]);
         let mut depth = 0usize;
-        for (offset, ch) in after[open..].char_indices() {
+        for (offset, ch) in masked.char_indices() {
             match ch {
                 '{' => depth += 1,
                 '}' => {
@@ -1320,6 +1847,295 @@ mod stdout_purity_pin {
         panic!("{signature}'s body is not brace-balanced");
     }
 
+    /// `src` with the CONTENTS of string literals, char literals and comments
+    /// replaced by spaces, so brace counting sees structure only. Byte offsets
+    /// are preserved exactly, so an offset found in the result indexes the
+    /// original.
+    ///
+    /// Panics on raw strings and block comments rather than guessing at them:
+    /// a masker that silently mishandles syntax it does not know is the same
+    /// defect as not masking at all. If this fires, extend it — do not delete
+    /// the call. (Kept in step with the twin in
+    /// `freenet::wasm_runtime::runtime`'s call-site pin; they cannot be shared
+    /// across the crate boundary without making test-only helpers public.)
+    fn blank_literals(src: &str) -> String {
+        // Kept BYTE-IDENTICAL with its twin; see the divergence pin in `fdev`'s
+        // `stdout_purity_pin::the_two_blank_literals_have_not_drifted`.
+        fn excerpt(src: &str, at: usize) -> &str {
+            let end = (at + 48).min(src.len());
+            src.get(at..end).unwrap_or("<not a char boundary>")
+        }
+        /// Length in bytes of the char literal starting at `at` (which must be
+        /// the opening `'`), or `None` when this is not a char literal — a
+        /// lifetime, or a label. Handles `'x'` and `'\x'`; a multi-byte char is
+        /// measured by finding the closing quote rather than assuming one byte.
+        fn char_literal_len(bytes: &[u8], at: usize) -> Option<usize> {
+            let escaped = bytes.get(at + 1) == Some(&b'\\');
+            let body_start = if escaped { at + 2 } else { at + 1 };
+            // A char literal's body is one char, so the close quote is within a
+            // few bytes; bounding the search is what stops a lifetime followed
+            // by an unrelated quote from being swallowed.
+            for (end, byte) in bytes.iter().enumerate().skip(body_start).take(4) {
+                if *byte == b'\'' {
+                    return (end > body_start).then_some(end - at + 1);
+                }
+            }
+            None
+        }
+        let bytes = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'r' if bytes[i + 1..].starts_with(b"\"") || bytes[i + 1..].starts_with(b"#") => {
+                    panic!(
+                        "blank_literals cannot mask a raw string, so the brace count \
+                         it feeds would be wrong and the scrape would silently cover \
+                         the wrong region. EXTEND this function to handle raw strings; \
+                         do not delete the call. At byte {i} of the scraped region: {:?}",
+                        excerpt(src, i)
+                    );
+                }
+                b'/' if bytes[i + 1..].starts_with(b"*") => {
+                    panic!(
+                        "blank_literals cannot mask a block comment, so the brace count \
+                         it feeds would be wrong and the scrape would silently cover \
+                         the wrong region. EXTEND this function to handle block \
+                         comments; do not delete the call. At byte {i} of the scraped \
+                         region: {:?}",
+                        excerpt(src, i)
+                    );
+                }
+                b'/' if bytes[i + 1..].starts_with(b"/") => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        out.push(' ');
+                        i += 1;
+                    }
+                }
+                b'"' => {
+                    out.push(' ');
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        if bytes[i] == b'\\' {
+                            out.push(' ');
+                            i += 1;
+                        }
+                        if i < bytes.len() {
+                            out.push(' ');
+                            i += 1;
+                        }
+                    }
+                    assert!(i < bytes.len(), "unterminated string literal");
+                    out.push(' ');
+                    i += 1;
+                }
+                // A char literal, `'x'` or `b'x'`, for ANY x — not just a brace.
+                //
+                // Matching only `'{'`/`'}'` here was a real bug with exactly the
+                // shape this function exists to prevent: `'"'` fell through to
+                // the `_` arm, its quote was pushed, and the NEXT iteration read
+                // that quote as a string opener and blanked everything to the
+                // following `"` in the file. Measured on `'"'` inserted into
+                // `prepare_contract_call_inner`: the scraped region grew from
+                // 5,389 to 21,441 bytes, swallowing three later functions, with
+                // every assertion still green.
+                //
+                // `\\`-escaped forms (`'\''`, `'\\'`, `'\n'`) are covered by the
+                // escape branch. A LIFETIME (`'a`, `'static`) is not matched,
+                // because it has no closing quote in the checked position.
+                b'\'' if char_literal_len(bytes, i).is_some() => {
+                    let len = char_literal_len(bytes, i).expect("just checked");
+                    for _ in 0..len {
+                        out.push(' ');
+                    }
+                    i += len;
+                }
+                _ => {
+                    let ch = src[i..].chars().next().expect("in bounds");
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+        debug_assert_eq!(out.len(), src.len(), "blank_literals must preserve offsets");
+        out
+    }
+
+    /// A brace inside a string or char literal is not structure.
+    #[test]
+    fn braces_inside_literals_are_not_counted_as_structure() {
+        let masked = blank_literals("{ f(\"}}}{\"); g('{'); }");
+        assert_eq!(
+            masked.matches('{').count(),
+            1,
+            "a brace inside a literal was counted as structure: {masked}"
+        );
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert_eq!(
+            masked.len(),
+            "{ f(\"}}}{\"); g('{'); }".len(),
+            "the mask changed byte offsets, so they no longer index the original"
+        );
+    }
+
+    /// A brace in a comment is not structure, and an escaped quote does not end
+    /// the literal it is inside.
+    #[test]
+    fn comments_and_escaped_quotes_are_handled() {
+        let masked = blank_literals("{ // }}}\n f(\"a\\\"}\"); }");
+        assert_eq!(masked.matches('{').count(), 1, "{masked}");
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+    }
+
+    /// A lifetime is not a char literal.
+    #[test]
+    fn a_lifetime_is_not_mistaken_for_a_char_literal() {
+        let src = "{ fn f<'a>(x: &'a str) -> &'a str { x } }";
+        assert_eq!(blank_literals(src), src);
+    }
+
+    /// A char literal holding a QUOTE is masked, not treated as a string opener.
+    ///
+    /// The arm used to match only `'{'` and `'}'`; `'"'` fell through to `_`,
+    /// its quote was pushed, and the next iteration read that quote as a string
+    /// opener and blanked everything to the following `"` in the file. Measured
+    /// before the fix: inserting `let _q = '"';` into `prepare_contract_call_inner`
+    /// grew its scraped region from 5,389 to 21,441 bytes — three whole functions
+    /// — with all 26 tests still green. Precisely the silent widening this
+    /// function exists to prevent.
+    #[test]
+    fn a_char_literal_holding_a_quote_does_not_open_a_string() {
+        let masked = blank_literals("{ let _q = '\"'; f(); }");
+        assert_eq!(
+            masked.matches('{').count(),
+            1,
+            "structure was lost after a quote char literal: {masked}"
+        );
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert!(
+            masked.contains("f()"),
+            "the code after a quote char literal was blanked as if it were \
+             inside a string: {masked}"
+        );
+        assert_eq!(masked.len(), "{ let _q = '\"'; f(); }".len());
+    }
+
+    /// The byte-string form of the same trap.
+    #[test]
+    fn a_byte_char_literal_holding_a_quote_does_not_open_a_string() {
+        let masked = blank_literals("{ if c == b'\"' { g(); } }");
+        assert_eq!(
+            masked.matches('{').count(),
+            2,
+            "structure was lost after a byte quote literal: {masked}"
+        );
+        assert_eq!(masked.matches('}').count(), 2, "{masked}");
+    }
+
+    /// Escaped char literals are masked whole, so the escaped quote in `'\''`
+    /// does not leak either.
+    #[test]
+    fn escaped_char_literals_are_masked_whole() {
+        let masked = blank_literals("{ a('\\''); b('\\\\'); c('\\n'); d(); }");
+        assert_eq!(masked.matches('{').count(), 1, "{masked}");
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert!(masked.contains("d()"), "code after was blanked: {masked}");
+    }
+
+    /// Char literals other than braces and quotes are masked too, and masking
+    /// them must not disturb the surrounding structure.
+    #[test]
+    fn ordinary_char_literals_are_masked_without_losing_structure() {
+        let src = "{ m(' '); n('x'); o('é'); }";
+        let masked = blank_literals(src);
+        assert_eq!(masked.matches('{').count(), 1, "{masked}");
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert_eq!(
+            masked.len(),
+            src.len(),
+            "masking a multi-byte char literal changed byte offsets"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "raw string")]
+    fn a_raw_string_fails_closed() {
+        blank_literals("{ let s = r\"}{\"; }");
+    }
+
+    #[test]
+    #[should_panic(expected = "block comment")]
+    fn a_block_comment_fails_closed() {
+        blank_literals("{ /* } */ }");
+    }
+
+    /// The two copies of `blank_literals` have not drifted apart.
+    ///
+    /// It exists in this crate and in `freenet`'s call-site pin. Sharing one
+    /// copy is not available: both live in `#[cfg(test)]` modules, and
+    /// `#[cfg(test)]` code is not compiled into the library `fdev` links, so
+    /// sharing would mean exposing a test-only helper on `freenet`'s public
+    /// surface (or gating it behind the `testing` feature and adding that edge
+    /// to `fdev`'s dev-dependencies) purely to avoid a duplicate.
+    ///
+    /// Duplication is the lesser cost, but only with this pin — because the way
+    /// two maskers drift is that one stops masking something, which makes its
+    /// scrape silently cover the wrong region while its own tests still pass.
+    /// That is precisely the failure class both pins exist to prevent, so it
+    /// must not become the failure class of the pins themselves.
+    ///
+    /// This crate is the right home for the check: it can read `freenet`'s
+    /// source, whereas a test inside `freenet` scraping its own file could be
+    /// satisfied by this very assertion's text. Byte equality is the assertion,
+    /// so an edit applied to BOTH copies passes — that is the correct
+    /// remediation, not a hole.
+    #[test]
+    fn the_two_blank_literals_have_not_drifted() {
+        const START: &str = "    fn blank_literals(src: &str) -> String {\n";
+        const END: &str = "        out\n    }\n";
+
+        fn extract(src: &str, whose: &str) -> String {
+            let start = src.find(START).unwrap_or_else(|| {
+                panic!(
+                    "{whose} has no `blank_literals`; if it was renamed or removed, \
+                     this pin must be updated, not deleted"
+                )
+            });
+            let rest = &src[start..];
+            let end = rest
+                .find(END)
+                .unwrap_or_else(|| panic!("{whose}'s `blank_literals` does not end as expected"))
+                + END.len();
+            rest[..end].to_string()
+        }
+
+        let ours = extract(include_str!("conformance.rs"), "fdev");
+        let theirs = extract(
+            include_str!("../../core/src/wasm_runtime/runtime.rs"),
+            "freenet's runtime.rs",
+        );
+
+        // Non-vacuity: whatever was extracted must be the real function, so a
+        // mis-anchored scrape cannot compare two empty strings and pass.
+        for (whose, body) in [("fdev", &ours), ("freenet", &theirs)] {
+            assert!(
+                body.contains("cannot mask a raw string")
+                    && body.contains("cannot mask a block comment")
+                    && body.contains("unterminated string literal"),
+                "the extracted `blank_literals` from {whose} is not the real \
+                 function:\n{body}"
+            );
+        }
+
+        assert_eq!(
+            ours, theirs,
+            "the two copies of `blank_literals` have drifted. One of them now \
+             masks something the other does not, which means one of the two \
+             source scrapes is silently covering the wrong region while its own \
+             tests still pass. Re-sync them byte for byte."
+        );
+    }
+
     /// A function's body with whole-line comments stripped, so a comment mentioning
     /// the searched-for token can neither satisfy nor defeat the assertion. The
     /// comment above the `eprintln!` call names both macros; the comment above the
@@ -1327,7 +2143,7 @@ mod stdout_purity_pin {
     ///
     /// Takes the signature rather than hard-coding one, so that the comment-stripping
     /// version is the ONLY way to scrape a body in this file.
-    fn code_only(signature: &str) -> String {
+    pub(super) fn code_only(signature: &str) -> String {
         fn_body(signature)
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
@@ -1342,19 +2158,111 @@ mod stdout_purity_pin {
     /// never pass while the correct `eprintln!` call was present. It failed on correct
     /// code, which is the harmless direction; the same trap the other way is how a pin
     /// passes vacuously forever.
-    fn stdout_macros_only() -> String {
-        code_only("fn load_inputs(")
+    fn stdout_macros_only(signature: &str) -> String {
+        code_only(signature)
             .replace("eprintln!", "")
             .replace("eprint!", "")
     }
 
     #[test]
     fn load_inputs_never_writes_to_stdout() {
-        let body = stdout_macros_only();
+        let body = stdout_macros_only("fn load_inputs(");
         assert!(
             !body.contains("println!") && !body.contains("print!("),
             "load_inputs writes to stdout, which lands ahead of the --json document \
              and corrupts it for every consumer that parses stdout"
+        );
+    }
+
+    /// `load_inputs_never_writes_to_stdout` is scoped to `load_inputs`'s OWN
+    /// body and cannot see inside a function it merely calls.
+    /// `note_accepted_as_store_form` is exactly that: a separate function both
+    /// `load_inputs` and `verify_evidence` call to explain a `--wasm` file
+    /// accepted as a contract-store entry, with its own new stderr note. This
+    /// is the same gap `the_standalone_report_writes_to_stderr_only` exists
+    /// to close for `report_code_diagnostics_standalone` — a scoped pin
+    /// proved nothing about code outside its own scrape once already.
+    ///
+    /// Both halves matter, same reasoning as that pin: the negative half
+    /// alone would pass if the note were deleted outright, which silences it
+    /// instead of misplacing it.
+    #[test]
+    fn helper_functions_never_write_to_stdout() {
+        let raw = code_only("fn note_accepted_as_store_form(");
+        assert!(
+            raw.contains("eprintln!"),
+            "note_accepted_as_store_form no longer writes anything, so a \
+             `--wasm` file accepted in store form is accepted silently:\n{raw}"
+        );
+        let body = stdout_macros_only("fn note_accepted_as_store_form(");
+        assert!(
+            !body.contains("println!") && !body.contains("print!("),
+            "note_accepted_as_store_form writes to stdout, which lands ahead \
+             of the --json document and corrupts it for every consumer that \
+             parses stdout"
+        );
+    }
+
+    /// The standalone code-diagnostic report goes to stderr, never stdout.
+    ///
+    /// Its own rustdoc states the invariant — stdout may be a `--json` document
+    /// a consumer is parsing — but nothing enforced it: changing `eprint!` to
+    /// `print!` left all 101 fdev tests green. `load_inputs_never_writes_to_stdout`
+    /// is scoped to `fn load_inputs(` and does not reach this function.
+    ///
+    /// Both halves matter. The negative half alone would pass if the output
+    /// were deleted outright, which silences the diagnostic instead of
+    /// misplacing it.
+    #[test]
+    fn the_standalone_report_writes_to_stderr_only() {
+        let raw = code_only("fn report_code_diagnostics_standalone(");
+        assert!(
+            raw.contains("eprint!"),
+            "the standalone report no longer writes anything, so the paths that \
+             abort before a Report exists say nothing at all:\n{raw}"
+        );
+        // `eprint!`/`eprintln!` CONTAIN `print!`/`println!` as substrings, so
+        // they must be removed before the negative assertion — the same trap
+        // `stdout_macros_only` documents just above.
+        let stdout_only = raw.replace("eprintln!", "").replace("eprint!", "");
+        assert!(
+            !stdout_only.contains("print!") && !stdout_only.contains("println!"),
+            "the standalone report writes to stdout, which lands in the middle \
+             of a --json document and corrupts it for every consumer that parses \
+             stdout:\n{raw}"
+        );
+    }
+
+    /// The no-corpus bail reports code diagnostics BEFORE it aborts.
+    ///
+    /// `fdev verify-merge --wasm mycontract.wasm` is the invocation this is
+    /// about; see
+    /// `tests::the_plain_wasm_only_invocation_bails_on_a_contract_that_has_something_to_report`
+    /// for the behavioural half. The guards in `conformance()` cannot cover it,
+    /// because this bail short-circuits `load_inputs(&config)?` before any of
+    /// them run.
+    ///
+    /// Mutation this exists for: move the report call below the `bail!`, or
+    /// delete it. Every other test in both crates stays green.
+    #[test]
+    fn the_no_corpus_bail_reports_diagnostics_first() {
+        let body = code_only("fn load_inputs(");
+        let reported = body.find("report_code_diagnostics_standalone(").expect(
+            "the no-corpus bail no longer reports code diagnostics, so \
+                     `--wasm` with no corpus tells an author nothing about the clock",
+        );
+        let bail = body
+            .find("at least one --state or --transition")
+            .expect("the no-corpus bail is gone; re-check what this pin guards");
+        assert!(
+            reported < bail,
+            "code diagnostics are reported after the bail that aborts the run, \
+             so they are never reached:\n{body}"
+        );
+        assert_eq!(
+            body.matches("report_code_diagnostics_standalone(").count(),
+            1,
+            "expected exactly one report call in `load_inputs`:\n{body}"
         );
     }
 
@@ -1365,6 +2273,89 @@ mod stdout_purity_pin {
             body.contains("eprintln!"),
             "the bundle note is no longer surfaced at all; a corpus whose related \
              state was refused would replay as a clean bill of health"
+        );
+    }
+}
+
+/// Source pin: the host-clock code diagnostic is actually computed by the command.
+///
+/// `code_diagnostics` is unit-tested above, but a diagnostic nothing calls is a
+/// diagnostic nobody sees — and deleting the call leaves every one of those unit
+/// tests green. Running the real command in a test needs a compiled contract, a
+/// corpus and a WASM runtime, which is a large fixture to guard one call, so the
+/// call is pinned at the source level instead.
+#[cfg(test)]
+mod host_clock_diagnostic_pin {
+    use super::stdout_purity_pin::code_only;
+
+    #[test]
+    fn the_command_computes_code_diagnostics() {
+        let body = code_only("pub async fn conformance(");
+        assert_eq!(
+            body.matches("code_diagnostics(&wasm)").count(),
+            1,
+            "`fdev verify-merge` no longer computes code diagnostics from the \
+             contract's WASM, so a clock-reading contract is reported as clean:\n{body}"
+        );
+    }
+
+    /// The pin above is only worth anything if its scrape can fail. An empty or
+    /// mis-anchored region would make it vacuous rather than false.
+    #[test]
+    fn the_scrape_sees_real_code() {
+        let body = code_only("pub async fn conformance(");
+        assert!(
+            body.contains("Report::build("),
+            "the scraped region is not `conformance`'s body any more:\n{body}"
+        );
+    }
+
+    /// The diagnostic must be computed BEFORE the guards that abort without a
+    /// report, or the cheapest answer the command has stays gated behind having
+    /// a workable corpus — which is exactly what an author early in development
+    /// does not have.
+    ///
+    /// Mutation this exists for: move `let code_diagnostics = ...` back below
+    /// the corpus/cases guards. Every other test in this file stays green.
+    #[test]
+    fn diagnostics_are_computed_before_the_guards_that_abort() {
+        let body = code_only("pub async fn conformance(");
+        let computed = body
+            .find("code_diagnostics(&wasm)")
+            .expect("conformance no longer computes code diagnostics");
+        let corpus_guard = body
+            .find("corpus.is_empty()")
+            .expect("the empty-corpus guard is gone; re-check what this pin is guarding");
+        let cases_guard = body
+            .find("cases.is_empty()")
+            .expect("the no-cases guard is gone; re-check what this pin is guarding");
+        assert!(
+            computed < corpus_guard && computed < cases_guard,
+            "code diagnostics are computed after a guard that aborts, so an author \
+             whose corpus cannot produce a case is told nothing about the clock"
+        );
+        assert_eq!(
+            body.matches("report_code_diagnostics_standalone(").count(),
+            2,
+            "both aborting guards must report the diagnostics they are about to \
+             skip past; found a different number of call sites:\n{body}"
+        );
+    }
+
+    /// `--evidence` returns before any of the above runs, and
+    /// `conformance_log_level` returns `OFF` for `--json`, so without this call
+    /// that mode reports the clock nowhere at all.
+    #[test]
+    fn verifying_evidence_also_reports_code_diagnostics() {
+        let body = code_only("async fn verify_evidence(");
+        assert_eq!(
+            body.matches("report_code_diagnostics_standalone(").count(),
+            1,
+            "`--evidence` no longer reports code diagnostics:\n{body}"
+        );
+        assert!(
+            body.contains("RuntimeOracle::standalone("),
+            "the scraped region is not `verify_evidence`'s body any more:\n{body}"
         );
     }
 }
@@ -1806,6 +2797,7 @@ mod tests {
             inconclusive: 0,
             findings: Vec::new(),
             inconclusive_reasons: Vec::new(),
+            code_diagnostics: Vec::new(),
             evidence: Some(EvidenceSummary {
                 directory: "/tmp/evidence".to_string(),
                 files_written: 0,
@@ -1911,6 +2903,7 @@ mod tests {
             inconclusive: 0,
             findings: Vec::new(),
             inconclusive_reasons: Vec::new(),
+            code_diagnostics: Vec::new(),
             evidence: Some(EvidenceSummary {
                 directory: "/tmp/evidence".to_string(),
                 files_written: 0,
@@ -1992,6 +2985,189 @@ mod tests {
         );
     }
 
+    /// The smallest module `RuntimeOracle::standalone` will accept as a contract:
+    /// a memory export plus the four entry points `missing_contract_exports_for`
+    /// checks for (`validate_state`, `update_state`, `summarize_state`,
+    /// `get_state_delta`). The tests using this DO reach `verify_case`, which
+    /// calls into these — but each export's signature doesn't match what the
+    /// real ABI expects, so the typed-function lookup fails before the body
+    /// would ever run, and that failure classifies as `Inconclusive` rather
+    /// than panicking. The bodies (`i32.const 0`) are consequently never
+    /// meaningfully exercised; they only need to exist and export the right
+    /// names for identity resolution. `seed` varies the memory size so two
+    /// calls produce genuinely different code (and therefore different
+    /// instance ids).
+    fn minimal_contract_wasm(seed: u32) -> Vec<u8> {
+        // Deliberately NOT a raw string: `blank_literals` (see `stdout_purity_pin`)
+        // masks every literal from here to the end of the file for every source
+        // scrape earlier in it, and cannot mask raw-string syntax. A plain,
+        // escaped string is what `module_importing` in `wasm_tests` already uses
+        // for the same reason.
+        let wat = format!(
+            "(module\n  \
+               (memory (export \"memory\") {seed})\n  \
+               (func (export \"validate_state\") (result i32) i32.const 0)\n  \
+               (func (export \"update_state\") (result i32) i32.const 0)\n  \
+               (func (export \"summarize_state\") (result i32) i32.const 0)\n  \
+               (func (export \"get_state_delta\") (result i32) i32.const 0)\n\
+             )\n"
+        );
+        wat::parse_str(&wat).expect("minimal contract fixture is valid wat")
+    }
+
+    /// `--wasm` accepts a node's contract-store entry for `--evidence`, not just
+    /// raw WASM, when the unwrapped form is the contract the evidence names.
+    ///
+    /// Regression for #5508. Site 2 (`verify_evidence`) is the one the issue
+    /// calls out as mattering most: its own `--help` text says the contract
+    /// comes "via `--wasm` or `--contract-store`", so it is exactly where an
+    /// operator thinking in store paths hands over a store file — and it used
+    /// to fail more opaquely than the bundle case, because the versioned blob
+    /// reached `RuntimeOracle::standalone` and failed to load as WASM at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evidence_wasm_accepts_a_contract_store_file_for_the_right_contract() {
+        let code = minimal_contract_wasm(1);
+        let params = Vec::new();
+        let instance = ContractInstanceId::from_params_and_code(
+            freenet_stdlib::prelude::Parameters::from(params.clone()),
+            ContractCode::from(code.clone()),
+        );
+        let case = ConformanceCase::new(
+            ConformanceProperty::StateIdempotence,
+            vec![Bytes::from(vec![1u8, 2, 3])],
+        );
+        let evidence = ConformanceEvidence::new(instance, params, &case, None);
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let evidence_path = dir.path().join("evidence.bin");
+        std::fs::write(&evidence_path, evidence.encode().expect("encode evidence"))
+            .expect("write evidence");
+
+        let store_file = dir.path().join("contract.wasm");
+        let encoded = ContractCode::from(code.clone())
+            .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
+            .expect("encode versioned");
+        assert!(
+            encoded != code,
+            "the fixture must actually wrap the code, or this test cannot tell \
+             the fix apart from doing nothing"
+        );
+        std::fs::write(&store_file, &encoded).expect("write store file");
+
+        let config = wasm_only_config(Some(store_file));
+        let result = verify_evidence(&config, &evidence_path).await;
+        assert!(
+            result.is_ok(),
+            "a contract-store file for the RIGHT contract must be accepted, not \
+             rejected as a mismatch: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+    }
+
+    /// The store-file retry widens what `--wasm` ACCEPTS, never what the
+    /// evidence's identity check TRUSTS: a store file for a DIFFERENT contract
+    /// than the evidence names must still be rejected, in either form.
+    ///
+    /// The error must also name the inner CODE hash, not just the instance id
+    /// the identity check itself compares: evidence identifies contracts by
+    /// instance, but a node's contract store is addressed by code hash, so an
+    /// operator comparing an instance id against store filenames finds no
+    /// match anywhere (#5506's review, finding M4, generalized past the bundle
+    /// case this issue splits out).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evidence_wasm_still_rejects_a_contract_store_file_for_the_wrong_contract() {
+        let right_code = minimal_contract_wasm(1);
+        let wrong_code = minimal_contract_wasm(2);
+        assert_ne!(right_code, wrong_code, "fixtures must actually differ");
+
+        let params = Vec::new();
+        let instance = ContractInstanceId::from_params_and_code(
+            freenet_stdlib::prelude::Parameters::from(params.clone()),
+            ContractCode::from(right_code),
+        );
+        let case = ConformanceCase::new(
+            ConformanceProperty::StateIdempotence,
+            vec![Bytes::from(vec![1u8, 2, 3])],
+        );
+        let evidence = ConformanceEvidence::new(instance, params, &case, None);
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let evidence_path = dir.path().join("evidence.bin");
+        std::fs::write(&evidence_path, evidence.encode().expect("encode evidence"))
+            .expect("write evidence");
+
+        let store_file = dir.path().join("contract.wasm");
+        let encoded = ContractCode::from(wrong_code.clone())
+            .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
+            .expect("encode versioned");
+        std::fs::write(&store_file, &encoded).expect("write store file");
+
+        let config = wasm_only_config(Some(store_file));
+        let err = verify_evidence(&config, &evidence_path)
+            .await
+            .expect_err("a store file for the WRONG contract must stay rejected");
+
+        let inner_hash = ContractCode::from(wrong_code).hash_str();
+        assert!(
+            err.to_string().contains(&inner_hash),
+            "the error must name the INNER code hash so an operator can compare \
+             it against store filenames; got: {err}"
+        );
+    }
+
+    /// An evidence file from an unsupported schema version must be refused politely
+    /// with an explicit version message rather than an opaque deserialization error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_evidence_rejects_unsupported_schema_politely() {
+        let code = minimal_contract_wasm(1);
+        let params = Vec::new();
+        let instance = ContractInstanceId::from_params_and_code(
+            freenet_stdlib::prelude::Parameters::from(params.clone()),
+            ContractCode::from(code.clone()),
+        );
+        let case = ConformanceCase::new(
+            ConformanceProperty::StateIdempotence,
+            vec![Bytes::from(vec![1u8, 2, 3])],
+        );
+        let evidence = ConformanceEvidence::new(instance, params, &case, None);
+        let mut bytes = evidence.encode().expect("encode");
+
+        // Set the schema version to 1 in the framing header.
+        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let evidence_path = dir.path().join("evidence.bin");
+        std::fs::write(&evidence_path, &bytes).expect("write evidence");
+
+        let config = wasm_only_config(None);
+        let err = verify_evidence(&config, &evidence_path)
+            .await
+            .expect_err("unsupported schema must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("evidence uses schema version 1, this build understands 2"),
+            "error should state schema version mismatch cleanly; got: {msg}"
+        );
+    }
+
+    /// A file with bad magic is rejected fast as not conformance evidence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_evidence_rejects_bad_magic() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let evidence_path = dir.path().join("evidence.bin");
+        std::fs::write(&evidence_path, b"not evidence content here").expect("write file");
+
+        let config = wasm_only_config(None);
+        let err = verify_evidence(&config, &evidence_path)
+            .await
+            .expect_err("bad magic must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not conformance evidence (bad magic)"),
+            "error should indicate bad magic; got: {msg}"
+        );
+    }
+
     /// A contract store holds a VERSIONED encoding, not raw WASM: a header
     /// precedes the code. Resolving a bundle against it therefore has two ways to
     /// fail quietly — addressing the file by the wrong name, and reading its bytes
@@ -2039,6 +3215,120 @@ mod tests {
         );
     }
 
+    /// A `ConformanceConfig` with only `--wasm` set (plus whatever the caller
+    /// overrides via struct-update syntax). Every other field is the same
+    /// "not given" value `an_odd_number_of_transition_paths_is_an_error_not_a_panic`
+    /// spells out by hand; collected here so the `--wasm`-as-store-file tests below
+    /// do not each repeat the whole struct for the one or two fields they vary.
+    fn wasm_only_config(wasm: Option<PathBuf>) -> ConformanceConfig {
+        ConformanceConfig {
+            wasm,
+            params: None,
+            states: Vec::new(),
+            transitions: Vec::new(),
+            bundle: None,
+            contract_store: None,
+            max_cases: None,
+            properties: Vec::new(),
+            json: false,
+            evidence_out: None,
+            evidence_in: None,
+            bundle_out: None,
+        }
+    }
+
+    /// `--wasm` accepts a node's contract-store entry for `--bundle`, not just raw
+    /// WASM, when the unwrapped form is the contract the bundle actually names.
+    ///
+    /// Regression for #5508: `find_code_in_store`'s own rustdoc already explained
+    /// that a store file is a versioned encoding and reading it raw "can never
+    /// match, and that failure is quiet" — but that knowledge was never applied to
+    /// `--wasm` itself, so an operator handing over the right contract in the form
+    /// their own node stores it got "contract code does not match the bundle" and
+    /// went looking for the wrong problem.
+    #[test]
+    fn bundle_wasm_accepts_a_contract_store_file_for_the_right_contract() {
+        let code = b"stand-in wasm for the right contract".to_vec();
+        let bundle = ReplayBundle::new(code.clone(), Vec::new());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bundle_path = dir.path().join("bundle.bin");
+        bundle.write_to(&bundle_path).expect("write bundle");
+
+        // The store-file form: a version header ahead of the code, exactly what
+        // `ContractStore::store_contract` writes to disk — NOT raw WASM.
+        let store_file = dir.path().join("contract.wasm");
+        let encoded = ContractCode::from(code.clone())
+            .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
+            .expect("encode versioned");
+        assert!(
+            encoded != code,
+            "the fixture must actually wrap the code, or this test cannot tell \
+             the fix apart from doing nothing"
+        );
+        std::fs::write(&store_file, &encoded).expect("write store file");
+
+        let config = ConformanceConfig {
+            bundle: Some(bundle_path.clone()),
+            ..wasm_only_config(Some(store_file))
+        };
+        let loaded = load_inputs(&config).unwrap_or_else(|e| {
+            panic!(
+                "a contract-store file for the RIGHT contract must be accepted, \
+                 not rejected as a mismatch: {e}"
+            )
+        });
+        assert_eq!(
+            loaded.wasm, code,
+            "the code returned must be the unwrapped, raw form"
+        );
+    }
+
+    /// The store-file retry widens what `--wasm` ACCEPTS, never what the bundle's
+    /// identity check TRUSTS: a store file for a DIFFERENT contract than the
+    /// bundle names must still be rejected, in either form.
+    ///
+    /// The error must name the INNER code hash — the one a store file is actually
+    /// named by on disk — not just the wrapper bytes' hash, or an operator
+    /// comparing the reported hash against store filenames finds no match
+    /// anywhere, which is the same "hunting for the wrong problem" failure #5508
+    /// is about, displaced one case over (see #5506's review, finding M4).
+    #[test]
+    fn bundle_wasm_still_rejects_a_contract_store_file_for_the_wrong_contract() {
+        let right_code = b"stand-in wasm for the right contract".to_vec();
+        let wrong_code = b"stand-in wasm for a DIFFERENT contract entirely".to_vec();
+        let bundle = ReplayBundle::new(right_code, Vec::new());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bundle_path = dir.path().join("bundle.bin");
+        bundle.write_to(&bundle_path).expect("write bundle");
+
+        let store_file = dir.path().join("contract.wasm");
+        let encoded = ContractCode::from(wrong_code.clone())
+            .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
+            .expect("encode versioned");
+        std::fs::write(&store_file, &encoded).expect("write store file");
+
+        let config = ConformanceConfig {
+            bundle: Some(bundle_path),
+            ..wasm_only_config(Some(store_file))
+        };
+        let err = load_inputs(&config)
+            .expect_err("a store file for the WRONG contract must stay rejected");
+
+        // Computed straight from the fixture, in the exact form a store file
+        // is actually named by on disk (base58 `CodeHash::encode()`) — NOT
+        // derived from `resolve_code`'s own error, whose `actual` field is
+        // truncated hex from a different comparison and would let this
+        // assertion pass even if the production code reported the wrong
+        // hash entirely.
+        let inner_hash = ContractCode::from(wrong_code).hash_str();
+        assert!(
+            err.to_string().contains(&inner_hash),
+            "the error must name the INNER code hash, in the form store \
+             filenames actually use, so an operator can compare it against \
+             them; got: {err}"
+        );
+    }
+
     /// Every `ConformanceProperty::ALL` variant must round-trip through
     /// `as_str()` -> `parse_properties()`, so a property added later cannot
     /// silently become unparseable from the CLI.
@@ -2078,6 +3368,7 @@ mod tests {
             left: digest(),
             right: digest(),
             detail: "test".to_string(),
+            settling: None,
         }
     }
 
@@ -2113,6 +3404,7 @@ mod tests {
             detail: detail.to_string(),
             left: left.to_string(),
             right: right.to_string(),
+            settling: None,
         }
     }
 
@@ -2155,5 +3447,877 @@ mod tests {
         let groups = group_findings(&findings);
         assert_eq!(groups.len(), 3);
         assert!(groups.iter().all(|(_, count)| *count == 1));
+    }
+
+    /// Assemble a module importing one function per `(namespace, name)` pair.
+    fn module_importing(imports: &[(&str, &str)]) -> Vec<u8> {
+        let mut wat = String::from("(module\n");
+        for (i, (namespace, name)) in imports.iter().enumerate() {
+            wat.push_str(&format!(
+                "  (import \"{namespace}\" \"{name}\" (func $f{i} (param i64 i64)))\n"
+            ));
+        }
+        wat.push_str(")\n");
+        wat::parse_str(&wat).expect("test fixture is valid wat")
+    }
+
+    fn report_with_code_diagnostics(diagnostics: Vec<CodeDiagnostic>) -> Report {
+        Report {
+            corpus_states: 2,
+            corpus_deltas: 0,
+            corpus_summaries: 0,
+            cases_run: 4,
+            holds: 4,
+            violations: 0,
+            enforceable_violations: 0,
+            diagnostic_violations: 0,
+            inconclusive: 0,
+            findings: Vec::new(),
+            inconclusive_reasons: Vec::new(),
+            evidence: None,
+            code_diagnostics: diagnostics,
+        }
+    }
+
+    /// A contract that reads the host clock must be reported (issue #5465): its
+    /// merge is not a function of its inputs, so the laws checked above are not
+    /// well-formed statements about it.
+    #[test]
+    fn a_clock_importing_contract_draws_a_code_diagnostic() {
+        let wasm = module_importing(&[(
+            host_clock::HOST_CLOCK_NAMESPACE,
+            host_clock::HOST_CLOCK_IMPORT,
+        )]);
+        let diagnostics = code_diagnostics(&wasm);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].diagnostic, "host_clock_import");
+    }
+
+    /// The counterpart. Without this, emitting the diagnostic unconditionally
+    /// passes the test above while telling every contract author that their
+    /// contract reads a clock it never touches.
+    #[test]
+    fn a_contract_that_reads_no_clock_draws_no_code_diagnostic() {
+        let wasm = module_importing(&[("freenet_log", "__frnt__logger__info")]);
+        assert_eq!(code_diagnostics(&wasm), Vec::new());
+    }
+
+    /// Build a report whose only outcomes are the given inconclusive reasons.
+    fn report_from_inconclusive(reasons: Vec<Inconclusive>) -> Report {
+        let outcomes: Vec<(ConformanceCase, PropertyOutcome)> = reasons
+            .into_iter()
+            .map(|reason| {
+                (
+                    ConformanceCase::new(
+                        ConformanceProperty::StateCommutativity,
+                        vec![Bytes::from(vec![1u8]), Bytes::from(vec![2u8])],
+                    ),
+                    PropertyOutcome::Inconclusive(reason),
+                )
+            })
+            .collect();
+        Report::build(&Corpus::default(), &outcomes, None, Vec::new())
+    }
+
+    /// Build a report whose only outcomes are inconclusive contract errors.
+    fn report_from_contract_errors(messages: &[&str]) -> Report {
+        report_from_inconclusive(
+            messages
+                .iter()
+                .map(|m| Inconclusive::ContractError((*m).to_string()))
+                .collect(),
+        )
+    }
+
+    use super::stdout_purity_pin::code_only;
+
+    fn contract_error_bucket(report: &Report) -> &InconclusiveReason {
+        report
+            .inconclusive_reasons
+            .iter()
+            .find(|r| r.reason == "contract error")
+            .expect("the contract-error bucket vanished from the report")
+    }
+
+    /// The text behind `contract error` must reach the report.
+    ///
+    /// It was carried on the variant, printed by `Inconclusive`'s own `Display`, and
+    /// then discarded at the reporting layer — so the second-largest inconclusive
+    /// class was undiagnosable from the tool's own output. Measured on a 64-bundle
+    /// live corpus: 435 of 2,622 inconclusive cases were `contract error`, and
+    /// nothing in `--json`, the human report or `RUST_LOG=debug` could say what any
+    /// of them said (#5461). A reader saw a count and nothing else, which is exactly
+    /// the information needed to tell one recurring bug from eight unrelated ones.
+    #[test]
+    fn contract_error_text_reaches_the_report() {
+        let report = report_from_contract_errors(&[
+            "signature verification failed",
+            "signature verification failed",
+            "signature verification failed",
+            "stale nonce",
+        ]);
+
+        let reason = contract_error_bucket(&report);
+        assert_eq!(reason.occurrences, 4);
+        assert_eq!(
+            reason
+                .examples
+                .iter()
+                .map(|e| (e.text.as_str(), e.occurrences))
+                .collect::<Vec<_>>(),
+            vec![("signature verification failed", 3), ("stale nonce", 1)],
+            "distinct messages must carry their own counts, most frequent first: \
+             that breakdown is the whole answer to 'is this one bug or several'"
+        );
+
+        let rendered = render_human(&report);
+        assert!(
+            rendered.contains("signature verification failed"),
+            "the human report still hides the contract's own error text:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("stale nonce"),
+            "only the most common message survived, so a second distinct failure \
+             stays invisible:\n{rendered}"
+        );
+    }
+
+    /// A host/WASM failure must land in its own bucket, under its own text, never
+    /// folded into `contract error` (#5509).
+    ///
+    /// `Inconclusive::ContractError` and `Inconclusive::RuntimeError` name opposite
+    /// culprits — the contract rejecting its input vs. the runtime executing it
+    /// failing — and sharing a label is the exact defect this test exists to catch:
+    /// a report that could not tell "many contracts misbehave" from "our own harness
+    /// has a bug" (#5461, answered for the text but not the taxonomy by #5506).
+    #[test]
+    fn runtime_failure_is_a_separate_bucket_from_contract_error() {
+        let report = report_from_inconclusive(vec![
+            Inconclusive::ContractError("signature does not chain to the owner".to_string()),
+            Inconclusive::RuntimeError("missing contract export: update_state".to_string()),
+            Inconclusive::RuntimeError("missing contract export: update_state".to_string()),
+        ]);
+
+        let contract_bucket = contract_error_bucket(&report);
+        assert_eq!(contract_bucket.occurrences, 1);
+        assert_eq!(
+            contract_bucket.examples[0].text,
+            "signature does not chain to the owner"
+        );
+
+        let runtime_bucket = report
+            .inconclusive_reasons
+            .iter()
+            .find(|r| r.reason == "runtime/harness failure")
+            .expect("the runtime/harness bucket is missing from the report");
+        assert_eq!(runtime_bucket.occurrences, 2);
+        assert_eq!(
+            runtime_bucket
+                .examples
+                .iter()
+                .map(|e| (e.text.as_str(), e.occurrences))
+                .collect::<Vec<_>>(),
+            vec![("missing contract export: update_state", 2)]
+        );
+
+        let rendered = render_human(&report);
+        assert!(
+            rendered.contains("runtime/harness failure"),
+            "the human report never names the runtime/harness bucket:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("missing contract export: update_state"),
+            "the runtime failure's own text never reaches the report:\n{rendered}"
+        );
+        assert_ne!(
+            contract_bucket.reason, runtime_bucket.reason,
+            "a contract rejection and a runtime trap must never share a label"
+        );
+    }
+
+    /// A reason that carries no text is still counted, and grows no example lines.
+    ///
+    /// Two properties, because they fail in opposite directions. Most inconclusive
+    /// reasons carry nothing (`RoundLimit`, `RelatedRequired`) and are the bulk of a
+    /// real run: if the new example lines fired for them, every report would gain
+    /// blank noise; if the tally were moved inside the has-text branch, every one of
+    /// them would report `: 0` and the majority of the summary would read as empty.
+    #[test]
+    fn a_textless_reason_is_counted_and_reports_no_examples() {
+        let report = report_from_inconclusive(vec![
+            Inconclusive::RoundLimit,
+            Inconclusive::RoundLimit,
+            Inconclusive::RoundLimit,
+        ]);
+
+        let reason = &report.inconclusive_reasons[0];
+        assert_eq!(
+            reason.occurrences, 3,
+            "a reason that carries no text must still be counted; counting only \
+             text-carrying cases empties the majority of a real run's summary"
+        );
+        assert!(reason.examples.is_empty());
+
+        let rendered = render_human(&report);
+        assert!(
+            !rendered.contains("further distinct message(s)"),
+            "the hidden-tail line fired for a reason with nothing to hide:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("may contain application state"),
+            "the sensitivity note fired for a report with no contract text in it:\n{rendered}"
+        );
+    }
+    /// The readability cap trims the HUMAN report only, and says what it hid.
+    ///
+    /// The cap exists because the count of distinct texts is bounded only by the
+    /// case count: a contract that embeds a state hash in its error produces one per
+    /// case, and a wall of them buries the question the reader has. But that is a
+    /// terminal-width concern, so `--json` keeps everything - a machine consumer has
+    /// no width limit, the tally already holds them all, and a capped machine format
+    /// would let a hostile contract bury its real failure behind five high-frequency
+    /// decoys.
+    ///
+    /// Capping without saying so, in either format, would reintroduce this issue's
+    /// own defect in miniature: output that looks complete and is not.
+    #[test]
+    fn the_cap_trims_the_human_report_only_and_says_what_it_hid() {
+        // Frequencies chosen so the hidden tail is a KNOWN number of cases: the
+        // first five messages appear twice each, the last three once each.
+        let mut messages: Vec<String> = Vec::new();
+        for i in 0..MAX_INCONCLUSIVE_EXAMPLES {
+            messages.push(format!("frequent failure {i}"));
+            messages.push(format!("frequent failure {i}"));
+        }
+        for i in 0..3 {
+            messages.push(format!("rare failure {i}"));
+        }
+        let refs: Vec<&str> = messages.iter().map(String::as_str).collect();
+        let report = report_from_contract_errors(&refs);
+
+        let reason = contract_error_bucket(&report);
+        assert_eq!(
+            reason.examples.len(),
+            MAX_INCONCLUSIVE_EXAMPLES + 3,
+            "--json must carry every distinct message; trimming it there loses data \
+             that no machine consumer needed trimmed"
+        );
+
+        let rendered = render_human(&report);
+        assert_eq!(
+            rendered.matches("frequent failure").count(),
+            MAX_INCONCLUSIVE_EXAMPLES,
+            "the human report must show exactly the cap:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("rare failure"),
+            "the human report showed past its own cap:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("3 further distinct message(s), 3 case(s), not shown"),
+            "the hidden tail must be reported in BOTH messages and cases: '3 further \
+             messages' alone cannot distinguish 3 stray cases from 300:\n{rendered}"
+        );
+    }
+
+    /// Equal counts must order deterministically, for messages and for reasons.
+    ///
+    /// The reason tally is drained through a `HashMap` whose iteration order is
+    /// randomly seeded, so equally-frequent reasons came out differently on each run
+    /// over the same corpus. Comparing two runs is the normal way to check whether a
+    /// contract fix helped, and it is worthless against a report that reshuffles
+    /// itself.
+    ///
+    /// FOUR equal-count reasons, rebuilt twenty times, deliberately. An earlier
+    /// version used two, which a stable sort orders correctly by luck about half the
+    /// time - so on a single CI run a regression had even odds of merging. Four
+    /// reasons give twenty-four permutations, and each rebuild draws a fresh
+    /// `HashMap` seed, so an unordered implementation has no realistic chance of
+    /// passing.
+    ///
+    /// The message half is belt-and-braces: those come from a `BTreeMap` through a
+    /// stable sort, so they were already ordered. The reason half was the unstable
+    /// one.
+    #[test]
+    fn equal_counts_order_deterministically() {
+        let message_report = report_from_contract_errors(&["b failure", "a failure"]);
+        let texts: Vec<&str> = contract_error_bucket(&message_report)
+            .examples
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["a failure", "b failure"]);
+
+        let expected = vec![
+            "contract error",
+            "input not valid",
+            "reconciliation round budget exhausted",
+            "requires related contract state",
+        ];
+        for round in 0..20 {
+            let report = report_from_inconclusive(vec![
+                Inconclusive::RoundLimit,
+                Inconclusive::RelatedRequired,
+                Inconclusive::ContractError("boom".to_string()),
+                Inconclusive::InputNotValid,
+            ]);
+            let reasons: Vec<&str> = report
+                .inconclusive_reasons
+                .iter()
+                .map(|r| r.reason)
+                .collect();
+            assert_eq!(
+                reasons, expected,
+                "round {round}: reasons with equal counts must order by label, not \
+                 by whatever the hash map yielded this time"
+            );
+        }
+    }
+    /// A contract-authored message must not be able to forge report lines.
+    ///
+    /// This text is written by the contract under test, which is the thing we are
+    /// least entitled to trust, and it is now printed into a report people read to
+    /// decide whether a contract is sound. A bare newline would let it fabricate a
+    /// `[violation]` line; a carriage return would let it overwrite the line above.
+    #[test]
+    fn a_contract_message_cannot_forge_report_lines() {
+        let report =
+            report_from_contract_errors(&["boom\n  [violation] StateCommutativity: forged"]);
+        let rendered = render_human(&report);
+
+        assert!(
+            !rendered.contains("\n  [violation]"),
+            "a newline in the contract's error text forged a findings line:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("\\n"),
+            "the newline was neither escaped nor stripped:\n{rendered}"
+        );
+    }
+
+    /// The work is bounded, not merely the output.
+    ///
+    /// `present_detail` originally collected the WHOLE escaped string and truncated
+    /// afterwards. Escaping expands a control character roughly sixfold and this runs
+    /// once per inconclusive CASE (deduplication happens on the result), so a hostile
+    /// multi-megabyte message meant gigabytes of escaping across a run for output
+    /// that was thrown away: a wall-clock denial of service against the tool.
+    ///
+    /// Asserted by handing the bounded half a source that panics the moment it is
+    /// read past the cap. That is the only way to test laziness - the finished string
+    /// looks identical either way, which is exactly why the original passed every
+    /// test while doing unbounded work.
+    #[test]
+    fn presenting_a_detail_reads_no_further_than_the_cap() {
+        let mut read = 0usize;
+        let watched = std::iter::from_fn(|| {
+            read += 1;
+            assert!(
+                read <= MAX_INCONCLUSIVE_EXAMPLE_CHARS + 1,
+                "read {read} characters for a {MAX_INCONCLUSIVE_EXAMPLE_CHARS}-character \
+                 cap; the escaping must stop at the cap, or an oversized contract \
+                 message is expanded in full before being discarded"
+            );
+            Some('x')
+        });
+
+        let presented = take_presented(watched);
+        assert_eq!(
+            presented.chars().count(),
+            MAX_INCONCLUSIVE_EXAMPLE_CHARS + 1
+        );
+        assert!(presented.ends_with('\u{2026}'));
+    }
+
+    /// Every text-carrying reason reaches the report, not just `ContractError`.
+    ///
+    /// `ResourceLimit` and `MalformedCase` carry text for the same reason and had no
+    /// behavioural coverage at all: dropping them from the accessor left every test
+    /// green. `ContractError` is merely the one that dominates a real corpus.
+    #[test]
+    fn resource_limit_and_malformed_case_text_reaches_the_report_too() {
+        for (reason, label, text) in [
+            (
+                Inconclusive::ResourceLimit("fuel exhausted".to_string()),
+                "resource limit hit",
+                "fuel exhausted",
+            ),
+            (
+                Inconclusive::MalformedCase("needs two states".to_string()),
+                "malformed case",
+                "needs two states",
+            ),
+        ] {
+            let report = report_from_inconclusive(vec![reason]);
+            let bucket = report
+                .inconclusive_reasons
+                .iter()
+                .find(|r| r.reason == label)
+                .unwrap_or_else(|| panic!("no {label} bucket in the report"));
+
+            assert_eq!(
+                bucket
+                    .examples
+                    .iter()
+                    .map(|e| e.text.as_str())
+                    .collect::<Vec<_>>(),
+                vec![text],
+                "{label} carries text that never reached the report"
+            );
+            assert!(render_human(&report).contains(text));
+        }
+    }
+
+    /// Each message is printed under the reason it belongs to.
+    ///
+    /// Every other rendering test builds a report with ONE inconclusive reason, so
+    /// the association between a bucket and its texts was never exercised - and that
+    /// association is the entire point of the change. Moving the example loop out of
+    /// the reason loop, so all messages print together at the end, passed the whole
+    /// suite.
+    #[test]
+    fn each_message_prints_under_its_own_reason() {
+        let report = report_from_inconclusive(vec![
+            Inconclusive::ContractError("rejected by contract".to_string()),
+            Inconclusive::ResourceLimit("fuel exhausted".to_string()),
+        ]);
+        let rendered = render_human(&report);
+
+        let position = |needle: &str| {
+            rendered
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing from:\n{rendered}"))
+        };
+        let contract_header = position("contract error:");
+        let resource_header = position("resource limit hit:");
+        let contract_text = position("rejected by contract");
+        let resource_text = position("fuel exhausted");
+
+        // Each message must sit between its own header and the next one, which is
+        // what "attributed to its bucket" means in a flat text report.
+        assert!(
+            contract_header < contract_text && contract_text < resource_header,
+            "the contract-error message is not under the contract-error \
+             heading:\n{rendered}"
+        );
+        assert!(
+            resource_header < resource_text,
+            "the resource-limit message is not under its heading:\n{rendered}"
+        );
+    }
+
+    /// `--json` must carry the settling classification, not just its prose.
+    ///
+    /// `Violation::detail` says the same thing in words, but it is documented as
+    /// diagnostic and never parsed, and this distinction is what an eventual
+    /// removal policy branches on (#5462): a contract that normalises once is a
+    /// different animal from one that mutates on every redelivery. Dropping the
+    /// structured field here would leave the tool discarding information it was
+    /// handed, which is the defect #5461 fixed one field over.
+    #[test]
+    fn the_json_report_carries_the_settling_classification() {
+        let outcomes = vec![
+            (
+                ConformanceCase::new(
+                    ConformanceProperty::StateIdempotence,
+                    vec![Bytes::from(vec![1u8])],
+                ),
+                PropertyOutcome::Violated(Violation {
+                    property: ConformanceProperty::StateIdempotence,
+                    severity: Severity::Violation,
+                    left: digest(),
+                    right: digest(),
+                    detail: "merge(A, A) != A".to_string(),
+                    settling: Some(IdempotenceSettling::NeverSettled),
+                }),
+            ),
+            (
+                ConformanceCase::new(
+                    ConformanceProperty::StateIdempotence,
+                    vec![Bytes::from(vec![2u8])],
+                ),
+                PropertyOutcome::Violated(Violation {
+                    property: ConformanceProperty::StateIdempotence,
+                    severity: Severity::Violation,
+                    left: digest(),
+                    right: digest(),
+                    detail: "merge(A, A) != A, settles".to_string(),
+                    // A SECOND finding with a DIFFERENT class. One fixture value can
+                    // always be satisfied by hardcoding that value: this test used
+                    // `SettledAfter` until a mutation hardcoded `SettledAfter`, and
+                    // switching to `NeverSettled` only moved which constant passed.
+                    // Two classes in one report mean no constant can.
+                    settling: Some(IdempotenceSettling::SettledAfter(1)),
+                }),
+            ),
+        ];
+        let report = Report::build(&Corpus::default(), &outcomes, None, Vec::new());
+        let json = serde_json::to_string(&report).expect("the report must serialize");
+
+        assert!(
+            json.contains("\"settling\""),
+            "the settling field never reached --json: {json}"
+        );
+        // `NeverSettled` deliberately, and asserting the OTHER variant is absent.
+        // Found by mutation: with a `SettledAfter` fixture, hardcoding the forwarded
+        // value to `SettledAfter(1)` passed — the test proved the field was present,
+        // not that it carried what the verifier decided. `NeverSettled` is also the
+        // classification an enforcement policy can act on, so silently substituting
+        // the benign one is the direction that matters.
+        assert!(
+            json.contains("NeverSettled"),
+            "--json must forward the classification the verifier made: {json}"
+        );
+        assert!(
+            json.contains("SettledAfter"),
+            "the second finding's class must be forwarded too — with a single \
+             class in the fixture, hardcoding that class passes: {json}"
+        );
+    }
+
+    /// `--json` must actually carry the examples.
+    ///
+    /// Only the human half was asserted, so a `#[serde(skip)]` on `examples` passed
+    /// the suite. That matters more now the two formats deliberately DIFFER - human
+    /// capped, JSON complete - because a reader cannot otherwise tell the design
+    /// from a bug.
+    #[test]
+    fn the_json_report_carries_the_examples() {
+        let report = report_from_contract_errors(&["signature check failed"]);
+        let json = serde_json::to_string(&report).expect("the report must serialize");
+
+        assert!(
+            json.contains("\"examples\""),
+            "the examples field never reached --json: {json}"
+        );
+        assert!(
+            json.contains("signature check failed"),
+            "--json carries the field but not the text: {json}"
+        );
+        assert!(
+            json.contains("\"occurrences\":1"),
+            "--json dropped the per-message count: {json}"
+        );
+    }
+
+    /// The human report prints the per-message case count, not just the text.
+    ///
+    /// The counts were asserted on the struct and only `contains(text)` on the
+    /// rendering, so the breakdown that answers "one bug or eight" could vanish from
+    /// what a human actually reads while the test protecting it stayed green.
+    #[test]
+    fn the_human_report_prints_each_messages_case_count() {
+        let report = report_from_contract_errors(&["twice", "twice", "once"]);
+        let rendered = render_human(&report);
+
+        assert!(
+            rendered.contains("2 cases \u{2014} \"twice\""),
+            "the per-message case count is missing from the rendering:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("1 case \u{2014} \"once\""),
+            "a single case must read \"1 case\", not \"1 case(s)\":\n{rendered}"
+        );
+    }
+
+    /// Escaping happens BEFORE truncation, so the cap bounds what is printed.
+    ///
+    /// Truncating the raw text first and escaping after leaves the cap describing
+    /// what was parsed rather than what appears: 200 control characters would print
+    /// as 1,200. The rustdoc claimed this ordering with nothing asserting it.
+    #[test]
+    fn the_cap_bounds_what_is_printed_not_what_was_parsed() {
+        let presented = present_detail(&"\u{7}".repeat(MAX_INCONCLUSIVE_EXAMPLE_CHARS));
+
+        assert_eq!(
+            presented.chars().count(),
+            MAX_INCONCLUSIVE_EXAMPLE_CHARS + 1,
+            "each bell character escapes to six, so truncating before escaping \
+             would print far past the cap: {presented}"
+        );
+        assert!(presented.starts_with("\\u{7}"));
+    }
+
+    /// Pin: `present_detail` hands `take_presented` a LAZY iterator.
+    ///
+    /// The test above proves `take_presented` reads no further than the cap. It says
+    /// nothing about its caller, and a mutation that restores
+    /// `text.escape_debug().collect::<Vec<char>>().into_iter()` survives it with
+    /// every test green - the finished string is identical, only the work differs.
+    /// That is the whole defect: unbounded work behind bounded-looking output.
+    ///
+    /// Sourced-scraped because laziness leaves no trace in the return value, and
+    /// timing or allocation assertions would be flaky. Any `collect` in this body
+    /// re-materialises the escaped string in full, so its absence is the property.
+    #[test]
+    fn present_detail_does_not_collect_before_bounding() {
+        let body = code_only("fn present_detail(");
+
+        assert!(
+            body.contains("take_presented(text.escape_debug())"),
+            "the scraped region is not present_detail's body any more:\n{body}"
+        );
+        assert!(
+            !body.contains("collect"),
+            "present_detail collects before bounding, so the whole escaped string is \
+             built and thrown away: escaping expands a control character roughly \
+             sixfold and this runs once per inconclusive CASE:\n{body}"
+        );
+    }
+
+    /// Escapes and direction overrides are neutralised, not just newlines.
+    ///
+    /// `a_contract_message_cannot_forge_report_lines` checks `\n` alone, so replacing
+    /// the escaping with `text.replace('\n', "\\n")` would keep it green while ESC
+    /// and RLO leaked. ESC lets a contract recolour or erase the report around it;
+    /// U+202E reverses the visual order of everything after it, which is enough to
+    /// make a message read as a different one.
+    #[test]
+    fn escapes_and_direction_overrides_are_neutralised() {
+        let presented = present_detail("red\u{1b}[31m and reversed \u{202e}drawrkcab");
+
+        assert!(
+            !presented.contains('\u{1b}'),
+            "a raw ESC survived into the report: {presented}"
+        );
+        assert!(
+            !presented.contains('\u{202e}'),
+            "a raw right-to-left override survived into the report: {presented}"
+        );
+        assert!(
+            presented.contains("\\u{1b}") && presented.contains("\\u{202e}"),
+            "both should appear in escaped form rather than be dropped: {presented}"
+        );
+    }
+
+    /// Pin: `verify_evidence` routes both untrusted strings through the escaper.
+    ///
+    /// This command exists to consume evidence ANOTHER PEER produced, and its own
+    /// rustdoc says `evidence.observed` is never trusted - yet it interpolated the
+    /// sender's `detail` straight into the terminal, and printed `Inconclusive`
+    /// through a `Display` impl that embeds the contract's raw error text. A newline
+    /// in either forges a `verdict  :` line in the exact format of the real one.
+    ///
+    /// A source pin rather than a behavioural test because reaching this function
+    /// needs a WASM runtime and a real evidence file, which is a large fixture for a
+    /// one-call property. It is scoped tightly and fails closed: if the function is
+    /// renamed or the prints move, the scrape stops matching and the test fails.
+    #[test]
+    fn verify_evidence_escapes_the_text_it_does_not_trust() {
+        let body = code_only("async fn verify_evidence(");
+
+        assert!(
+            body.contains("claimed  :") && body.contains("INCONCLUSIVE"),
+            "the scraped region is not verify_evidence's body any more:\n{body}"
+        );
+        assert!(
+            body.contains("present_detail(&v.detail)"),
+            "the SENDER's `detail` is interpolated raw again:\n{body}"
+        );
+        assert!(
+            body.contains("present_detail(&reason.to_string())"),
+            "the `Inconclusive` rendering embeds the contract's own error text and \
+             must be escaped too:\n{body}"
+        );
+        // The REPRODUCED branch deliberately does NOT escape: that `Violation` is
+        // built locally by `verify_case`, whose `detail` values are static strings
+        // plus lengths (`verifier.rs:329-482`), never contract-authored text.
+        // Asserting it stays raw keeps this pin honest about which of the two is
+        // trusted, so a future reader does not "fix" the wrong one.
+        assert!(
+            body.contains("v.property, v.detail"),
+            "the locally-computed REPRODUCED line changed shape; re-check whether \
+             its `detail` can now carry contract text:\n{body}"
+        );
+    }
+
+    /// Truncation slices on a character boundary.
+    ///
+    /// Slicing a `String` at a byte offset panics when a multi-byte character
+    /// straddles it, and the bytes here are chosen by the contract under test - so a
+    /// byte-offset cap would be a contract-triggerable crash of the entire run,
+    /// taking every other case's result with it.
+    ///
+    /// The fixture's sensitivity is load-bearing and non-obvious: `str::escape_debug`
+    /// escapes a grapheme-extending character only when it BEGINS the string, so
+    /// `"e\u{301}"` repeated stays multi-byte all the way through escaping and the
+    /// byte at the cap lands mid-character. Lead with the combining mark, or pick a
+    /// character that escaping turns into ASCII, and this silently becomes an
+    /// all-ASCII test that still passes while guarding nothing. The assertion below
+    /// pins that the escaped form really is still multi-byte.
+    #[test]
+    fn a_long_multibyte_message_is_truncated_without_panicking() {
+        let message = "e\u{301}".repeat(MAX_INCONCLUSIVE_EXAMPLE_CHARS * 2);
+        let escaped: String = message.escape_debug().collect();
+        assert!(
+            escaped.len() > escaped.chars().count(),
+            "the fixture stopped being multi-byte after escaping, so it no longer \
+             exercises a byte-offset slice at all"
+        );
+
+        let presented = present_detail(&message);
+        assert_eq!(
+            presented.chars().count(),
+            MAX_INCONCLUSIVE_EXAMPLE_CHARS + 1,
+            "expected exactly the cap plus one ellipsis: {presented}"
+        );
+        assert!(presented.ends_with('\u{2026}'));
+    }
+    /// A message at or under the cap is reported whole, with no ellipsis.
+    ///
+    /// The counterpart to the test above: a cap that fired on everything would
+    /// satisfy it while making every message unreadable.
+    #[test]
+    fn a_short_message_is_not_truncated() {
+        assert_eq!(present_detail("stale nonce"), "stale nonce");
+    }
+
+    /// The whole point of the channel: a code diagnostic is DIAGNOSTIC. It must
+    /// not be counted as a violation, and it must not fail the command — a
+    /// deprecation notice that broke every affected author's build in release
+    /// *n* would make the two-release notice period meaningless.
+    #[test]
+    fn a_code_diagnostic_is_never_removal_eligible() {
+        let outcomes = vec![(
+            ConformanceCase::new(
+                ConformanceProperty::StateCommutativity,
+                vec![Bytes::from(vec![1u8]), Bytes::from(vec![2u8])],
+            ),
+            PropertyOutcome::Holds,
+        )];
+        let report = Report::build(
+            &Corpus::default(),
+            &outcomes,
+            None,
+            vec![CodeDiagnostic {
+                diagnostic: "host_clock_import",
+                detail: "reads the clock".to_string(),
+            }],
+        );
+        assert_eq!(
+            (report.violations, report.enforceable_violations),
+            (0, 0),
+            "a code diagnostic was counted as a merge-law violation; it is about \
+             the contract's code, no law was checked, and counting it here makes \
+             it removal-eligible"
+        );
+        assert_eq!(report.code_diagnostics.len(), 1);
+        // `exit_code` reads outcomes, never the report, so no code diagnostic can
+        // reach it however it is worded.
+        let just_outcomes: Vec<&PropertyOutcome> = outcomes.iter().map(|(_, o)| o).collect();
+        assert_eq!(exit_code(just_outcomes), 0);
+    }
+
+    /// The diagnostic has to reach a human who did not ask for `--json`, and it
+    /// has to reach one who did.
+    #[test]
+    fn the_human_report_shows_a_code_diagnostic() {
+        let report = report_with_code_diagnostics(vec![CodeDiagnostic {
+            diagnostic: "host_clock_import",
+            detail: "this contract imports the host wall clock".to_string(),
+        }]);
+
+        let rendered = render_human(&report);
+        assert!(
+            rendered.contains("host_clock_import")
+                && rendered.contains("this contract imports the host wall clock"),
+            "the code diagnostic never reached the default (non-json) output:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("code diagnostic(s) above"),
+            "'no enforceable violations found.' is the last thing this report \
+             says, so a contract whose clock call will trap in a future release \
+             reads as a clean bill of health:\n{rendered}"
+        );
+
+        let json = serde_json::to_string(&report).expect("the report serializes");
+        assert!(
+            json.contains("host_clock_import"),
+            "--json dropped the code diagnostic, so no automation can see it:\n{json}"
+        );
+    }
+
+    /// And a contract with nothing to say must not be told it has something to
+    /// say. Without this the pin above is satisfied by printing the section
+    /// unconditionally.
+    #[test]
+    fn a_report_with_no_code_diagnostics_prints_no_section() {
+        let rendered = render_human(&report_with_code_diagnostics(Vec::new()));
+        assert!(
+            !rendered.contains("code diagnostic"),
+            "a clean run was told about code diagnostics it does not have:\n{rendered}"
+        );
+    }
+
+    /// The standalone rendering used by the paths that abort before a `Report`
+    /// exists carries the diagnostic's own detail, not just its name — that
+    /// detail is the whole message (what is wrong, what to do instead, and the
+    /// docs link).
+    #[test]
+    fn the_standalone_rendering_carries_the_detail() {
+        let wasm = module_importing(&[(
+            host_clock::HOST_CLOCK_NAMESPACE,
+            host_clock::HOST_CLOCK_IMPORT,
+        )]);
+        let rendered = render_code_diagnostics_standalone(&code_diagnostics(&wasm))
+            .expect("a clock-importing contract must render a standalone diagnostic");
+        assert!(
+            rendered.contains("host_clock_import"),
+            "the standalone rendering omits the diagnostic's machine-readable \
+             name:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(freenet::conformance::HOST_CLOCK_DEPRECATION_DOC),
+            "the standalone rendering omits the docs link, which is the only part \
+             that tells an author what to do:\n{rendered}"
+        );
+    }
+
+    /// And says nothing when there is nothing to say, so a clean contract's
+    /// aborted run does not grow a spurious section.
+    #[test]
+    fn the_standalone_rendering_is_silent_when_there_is_nothing_to_say() {
+        assert_eq!(render_code_diagnostics_standalone(&[]), None);
+    }
+
+    /// `fdev verify-merge --wasm mycontract.wasm` — the plain invocation with no
+    /// corpus — reaches the bail that the diagnostic must be reported before.
+    ///
+    /// This is the exact case the reachability work was written for and the one
+    /// it originally missed: `load_inputs` bails on a missing corpus, which
+    /// short-circuits `load_inputs(&config)?` in `conformance()` and skips the
+    /// guards there entirely. This test fixes the invocation and establishes
+    /// both halves of the problem — that it bails, and that the contract it
+    /// bailed on genuinely has something to report. The ordering itself is
+    /// pinned by `the_no_corpus_bail_reports_diagnostics_first`.
+    #[test]
+    fn the_plain_wasm_only_invocation_bails_on_a_contract_that_has_something_to_report() {
+        use clap::Parser;
+
+        let wasm = module_importing(&[(
+            host_clock::HOST_CLOCK_NAMESPACE,
+            host_clock::HOST_CLOCK_IMPORT,
+        )]);
+        assert!(
+            !code_diagnostics(&wasm).is_empty(),
+            "the fixture must have something to report, or this test proves nothing"
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("mycontract.wasm");
+        std::fs::write(&path, &wasm).expect("write fixture");
+
+        let config = ConformanceConfig::parse_from([
+            "verify-merge",
+            "--wasm",
+            path.to_str().expect("utf-8 temp path"),
+        ]);
+        let err = load_inputs(&config)
+            .expect_err("--wasm with no --state must not silently succeed")
+            .to_string();
+        assert!(
+            err.contains("at least one --state or --transition is required"),
+            "this test is no longer exercising the no-corpus bail: {err}"
+        );
     }
 }

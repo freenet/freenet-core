@@ -565,6 +565,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // by a gesture in the shell: a click inside the sandboxed iframe does not
   // reliably grant the shell the transient activation the browser requires for
   // Notification.requestPermission().
+  // notify-offer:BEGIN (extracted verbatim by shell_bridge_notifications.test.mjs)
+  // Like showAppNotification, every `notification_enable_prompt` gets exactly
+  // one status reply — including the already-showing case, which would
+  // otherwise answer with silence a client can't tell from a lost message.
   function maybeOfferNotifications() {
     if (typeof Notification === 'undefined') {
       notifyStatusToIframe('unsupported');
@@ -588,7 +592,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
       notifyStatusToIframe('dismissed');
       return;
     }
-    if (notifyAffordanceShown) return;
+    if (notifyAffordanceShown) {
+      // The bar is already on screen awaiting a click: the prompt is pending,
+      // not lost. Reply so a client can tell "still deciding" from "dropped".
+      notifyStatusToIframe('default');
+      return;
+    }
     notifyAffordanceShown = true;
 
     var bar = document.createElement('div');
@@ -663,6 +672,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
     bar.appendChild(dismiss);
     document.body.appendChild(bar);
   }
+  // notify-offer:END
 
   // --- Service-worker fallback for notifications (mobile) ----------------
   // Desktop browsers show notifications with the page-level `new
@@ -805,10 +815,46 @@ function freenetBridge(authToken, userToken, hostedMode) {
     });
   }
 
+  // notify-show:BEGIN (extracted verbatim by shell_bridge_notifications.test.mjs)
+  // Every well-formed `notification` message gets exactly one status reply:
+  // EVERY path out of this function posts one, whether it displayed or dropped.
+  // The display paths re-affirm 'granted', and that re-affirmation is what
+  // retracts an earlier 'undeliverable' — e.g. the first notification of a
+  // session racing the service worker's activation — which otherwise stuck for
+  // the whole session (#5043). Two bounds on the guarantee: a `notification`
+  // whose `title` isn't a string never reaches here (the dispatcher's type
+  // check drops it), and delivery of the status itself is best-effort, since
+  // sendToIframe no-ops when the iframe is gone.
   function showAppNotification(msg) {
-    if (typeof Notification === 'undefined') return;
+    if (typeof Notification === 'undefined') {
+      notifyStatusToIframe('unsupported');
+      return;
+    }
     // Gate on BOTH the browser permission and this contract's own consent.
-    if (Notification.permission !== 'granted' || !contractHasConsent()) return;
+    // A framed app can't read Notification.permission itself (opaque origin),
+    // so a permission revoked in site settings after a 'granted' is only
+    // visible to it if we report it here.
+    if (Notification.permission !== 'granted') {
+      notifyStatusToIframe(
+        Notification.permission === 'denied' ? 'denied' : 'default',
+      );
+      return;
+    }
+    if (!contractConsentKey()) {
+      // No contract key to gate consent on: permanent for this page, and
+      // re-prompting can never fix it. maybeOfferNotifications reports the same
+      // condition as 'undeliverable'; keep the two in agreement rather than
+      // sending the app into a prompt loop it cannot win.
+      notifyStatusToIframe('undeliverable');
+      return;
+    }
+    if (!contractHasConsent()) {
+      // Browser-granted but this contract isn't opted in. Reported as 'default'
+      // — the same client-visible meaning as a browser 'default': not enabled
+      // yet, and the next notification_enable_prompt can still fix it.
+      notifyStatusToIframe('default');
+      return;
+    }
     // Notification renders text only (no markup), so no HTML-injection risk;
     // still cap length to prevent oversized/abusive content.
     var title = String(msg.title).slice(0, 128);
@@ -822,7 +868,16 @@ function freenetBridge(authToken, userToken, hostedMode) {
       ckey + ':' + (typeof msg.tag === 'string' ? msg.tag.slice(0, 64) : 'msg');
     // Per-tag throttle + rolling global cap: distinct rooms aren't dropped, but
     // a consented contract can't flood with unique tags.
-    if (!notifyLimiter.ok(opts.tag, Date.now())) return;
+    if (!notifyLimiter.ok(opts.tag, Date.now())) {
+      // Coalesced by the shell's own flood policy, NOT a delivery problem:
+      // permission and consent are both intact. Report 'granted' so the app
+      // can't confuse a throttled message with a lost one — and so a throttled
+      // message still retracts a stale 'undeliverable'. Reporting
+      // 'undeliverable' here would be the #5043 bug in reverse: a working,
+      // deliberately-throttled setup made to look broken.
+      notifyStatusToIframe('granted');
+      return;
+    }
     // Cap the routing tag like opts.tag — it's attacker-controlled (the app
     // supplies msg.tag) and is echoed back into the iframe on click.
     var routeTag = typeof msg.tag === 'string' ? msg.tag.slice(0, 64) : null;
@@ -841,8 +896,13 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // Desktop: use the page-level constructor, UNCHANGED. Mobile: it throws
     // (unsupported), so we fall through to the service-worker path below — the
     // only way to show a notification on mobile.
+    var shownByConstructor = false;
     try {
       var n = new Notification(title, opts);
+      // Set the instant the constructor returns: it has ALREADY displayed, so a
+      // throw from anything below (an exotic onclick setter) must not fall
+      // through to the worker path and display the same notification twice.
+      shownByConstructor = true;
       n.onclick = function () {
         try {
           window.focus();
@@ -857,30 +917,60 @@ function freenetBridge(authToken, userToken, hostedMode) {
           n.close();
         } catch (e) {}
       };
-      return;
     } catch (e) {
-      // Mobile Chrome/Firefox: the non-persistent `new Notification()`
-      // constructor is unsupported and throws. Deliver via the service worker.
+      // EXPECTED on mobile Chrome/Firefox: the non-persistent `new
+      // Notification()` constructor is unsupported and throws, so we deliver via
+      // the service worker below. Logged because on DESKTOP this same throw
+      // means a real bug (malformed opts, permission lost between the check and
+      // the call) and is otherwise indistinguishable from the mobile path.
+      try {
+        console.debug('freenet: Notification constructor threw', e);
+      } catch (e2) {}
+    }
+    // Report OUTSIDE the try: the try must contain only the display attempt, so
+    // its catch means "constructor unsupported" and nothing else. A throw from
+    // the status post inside it would look like a constructor failure and fall
+    // through to a second, duplicate delivery.
+    if (shownByConstructor) {
+      notifyStatusToIframe('granted');
+      return;
     }
 
-    notifyRegistrationReady(1500).then(function (reg) {
-      if (reg && typeof reg.showNotification === 'function') {
-        reg.showNotification(title, opts).then(
-          function () {},
-          function () {
-            // The worker exists but the show failed — nothing else can display
-            // it; tell the app so it can rely on the in-app unread badge.
-            notifyStatusToIframe('undeliverable');
-          },
-        );
-      } else {
+    // Post at most once from the async chain: the .catch below is a backstop for
+    // the whole chain, INCLUDING a throw from a status post in the success
+    // branch, which would otherwise turn one reply into two.
+    var swReplied = false;
+    function swReply(status) {
+      if (swReplied) return;
+      swReplied = true;
+      notifyStatusToIframe(status);
+    }
+
+    notifyRegistrationReady(1500)
+      .then(function (reg) {
+        if (reg && typeof reg.showNotification === 'function') {
+          // Return the inner promise so a rejection (or a synchronous throw, or
+          // a non-thenable return) lands in the single .catch below.
+          return reg.showNotification(title, opts).then(function () {
+            // Delivered: re-affirm, retracting any earlier 'undeliverable'.
+            swReply('granted');
+          });
+        }
         // No usable service worker (e.g. an insecure-context http origin) AND
         // the page-level constructor threw: nothing can display it. Tell the app
         // so it need not keep sending; the in-app unread badge is the fallback.
-        notifyStatusToIframe('undeliverable');
-      }
-    });
+        swReply('undeliverable');
+      })
+      .catch(function () {
+        // Anything else the worker path can throw or reject with — a
+        // SecurityError from a sandboxed service-worker property read (the
+        // #4945 getter hazard, see serviceWorkerOrNull), a showNotification
+        // that throws or returns a non-promise. Nothing was
+        // displayed, so the app must hear about it rather than wait forever.
+        swReply('undeliverable');
+      });
   }
+  // notify-show:END
 
   // Install the click-forward listener eagerly on every shell load (see
   // installNotifyClickListener) so a click on a persistent notification that

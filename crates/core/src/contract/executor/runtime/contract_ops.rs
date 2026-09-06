@@ -53,6 +53,14 @@ impl Executor<Runtime> {
                     WrappedState::new(s.into_bytes())
                 }
                 _ => {
+                    // Uncached WASM `summarize_state`: this PUT/UPSERT response
+                    // site has no summary cache in front of it, so it is counted
+                    // on the `uncached` arm — keeping the cached path's
+                    // hit/miss partition exact while the WASM TOTAL stays
+                    // honest. See `ring::contract_exec_metrics`.
+                    if let Some(m) = self.contract_exec_metrics() {
+                        m.record_summarize_wasm_uncached();
+                    }
                     let summary = self
                         .runtime
                         .summarize_state(&key, &params, &current_state)
@@ -114,17 +122,16 @@ impl Executor<Runtime> {
                 op_manager.ring.commit_state_write(&key, written_bytes);
             }
 
-            self.send_update_notification(&key, &params, &new_state)
-                .await
-                .map_err(|_| {
-                    ExecutorError::request(StdContractError::Put {
-                        key,
-                        cause: "failed while sending notifications".into(),
-                    })
-                })?;
+            // Full post-store fan-out (telemetry + WS clients + subscribed
+            // delegates + network). Before #5481 this site hand-inlined two of
+            // the four legs and silently dropped the other two; see
+            // `Executor::finalize_state_commit`.
+            self.finalize_state_commit(&key, &params, &new_state).await;
 
-            self.broadcast_state_change(key, new_state.clone()).await;
-
+            // Uncached WASM `summarize_state` (PUT response summary).
+            if let Some(m) = self.contract_exec_metrics() {
+                m.record_summarize_wasm_uncached();
+            }
             let summary = self
                 .runtime
                 .summarize_state(&key, &params, &new_state)
@@ -135,16 +142,11 @@ impl Executor<Runtime> {
         self.verify_and_store_contract(state.clone(), contract, related_contracts)
             .await?;
 
-        self.send_update_notification(&key, &params, &state)
-            .await
-            .map_err(|_| {
-                ExecutorError::request(StdContractError::Put {
-                    key,
-                    cause: "failed while sending notifications".into(),
-                })
-            })?;
-
-        self.broadcast_state_change(key, state.clone()).await;
+        // Full post-store fan-out — see the sibling call above and
+        // `Executor::finalize_state_commit`. This branch is a FRESH contract
+        // install, so before #5481 it dropped the delegate leg in exactly the
+        // shape the issue describes, one file over from where it was fixed.
+        self.finalize_state_commit(&key, &params, &state).await;
 
         Ok(ContractResponse::PutResponse { key }.into())
     }
@@ -154,6 +156,26 @@ impl Executor<Runtime> {
         key: ContractKey,
         update: UpdateData<'_>,
     ) -> Response {
+        // #4978: resolve the code hash from the instance id, the same way
+        // `bridged_upsert_contract_state_inner` does for the network path. Local
+        // mode never hit the `code_blob_stored` gate, so this is not about
+        // letting the UPDATE through — it is about what the unresolved key
+        // DURABLY writes. `commit_state_update` below reaches
+        // `StateStore::update` → the backend `store()`, and both backends
+        // persist `key.code_hash()` into the hosting-metadata row used to
+        // reconstruct the `ContractKey` on restart (`storages/redb.rs`,
+        // `storages/sqlite.rs`). A placeholder hash there yields a hosting-cache
+        // key whose code half is zeros, so a later `remove_contract` computes
+        // the blob path from zeros and never reclaims the real `.wasm`.
+        //
+        // `unwrap_or` keeps the caller's key when nothing resolves, which does
+        // NOT fully close that hole: local mode has no `code_blob_stored` gate
+        // downstream, and `state_store.get_params` is instance-keyed, so a
+        // contract with state and params but no contract-index row still writes
+        // the placeholder. That divergence is pre-existing (`load_from_storage`
+        // already logs it as a failed migration), and the load-side resolution
+        // added for #4978 repairs such a row once the index does know it.
+        let key = self.bridged_lookup_key(key.id()).unwrap_or(key);
         let parameters = {
             self.state_store
                 .get_params(&key)
@@ -183,6 +205,10 @@ impl Executor<Runtime> {
             let new_state = self
                 .get_updated_state(&parameters, current_state, key, updates)
                 .await?;
+            // Uncached WASM `summarize_state` (local-mode UPDATE response).
+            if let Some(m) = self.contract_exec_metrics() {
+                m.record_summarize_wasm_uncached();
+            }
             let summary = self
                 .runtime
                 .summarize_state(&key, &parameters, &new_state)
@@ -257,6 +283,59 @@ impl Executor<Runtime> {
                                             }),
                                         ));
                                     };
+                                    // DELIBERATELY NO FAN-OUT HERE, and the
+                                    // reason is NOT "the GET path already
+                                    // announced it".
+                                    //
+                                    // The load-bearing fact is narrower and
+                                    // more durable: `GetResult.state` is not
+                                    // the network's reply. The sub-op driver
+                                    // discards the terminal and rebuilds the
+                                    // `GetResult` by RE-QUERYING THE LOCAL
+                                    // STORE (`operations/get/op_ctx_task.rs`,
+                                    // "Resolve a GetResult by re-querying the
+                                    // local store"). `verify_and_store_contract`
+                                    // below then raw-`store`s that value. So
+                                    // this arm can only ever write back what
+                                    // the store already holds: no state
+                                    // transition happens here, and nothing is
+                                    // owed to anyone.
+                                    //
+                                    // An earlier version of this comment said
+                                    // the sub-op's `cache_contract_locally`
+                                    // had already stored and fanned out. That
+                                    // is USUALLY true and is not a safe
+                                    // justification, because there are at
+                                    // least four reachable ways to arrive here
+                                    // with no fan-out having happened: the
+                                    // `state_matches` short-circuit (a
+                                    // concurrent op stored identical bytes
+                                    // first), `Terminal::LocalCompletion`
+                                    // (never calls it), an orphan-stream
+                                    // `AlreadyClaimed` early return, and a
+                                    // `PutQuery` the executor rejects. The
+                                    // re-query argument covers all four; the
+                                    // fan-out argument covers none of them.
+                                    //
+                                    // WHY THIS MATTERS TO #5549. The obvious
+                                    // fix there — hand `Terminal::InlineFound`'s
+                                    // network-delivered state straight to the
+                                    // caller and skip the re-query round trip —
+                                    // DESTROYS the invariant above without
+                                    // touching this file. This arm would then
+                                    // install a state the store does not hold,
+                                    // silently and with no fan-out. If you are
+                                    // changing how `GetResult` is sourced, this
+                                    // site owes a fan-out again; see #5549.
+                                    //
+                                    // Two known warts, both pre-existing and
+                                    // deliberately not fixed here: the re-store
+                                    // re-charges the disk budget and
+                                    // `StateBytesWritten` (#5553), and it is a
+                                    // BLIND overwrite — between the re-query
+                                    // and this `store` another operation may
+                                    // have advanced the state, and this clobbers
+                                    // it rather than merging.
                                     self.verify_and_store_contract(
                                         state.clone(),
                                         contract.clone(),
@@ -310,7 +389,10 @@ impl Executor<Runtime> {
             return Err(Self::validation_error(key, result));
         }
         if new_state.as_ref() != current_state.as_ref() {
-            self.commit_state_update(&key, parameters, &new_state)
+            // Outcome discarded deliberately: nothing after this depends on
+            // whether the commit was suppressed for a flagged contract.
+            let _ = self
+                .commit_state_update(&key, parameters, &new_state)
                 .await?;
         }
         Ok(new_state)
@@ -845,5 +927,79 @@ impl Executor<Runtime> {
         }
 
         Ok(retry_result)
+    }
+}
+
+/// Source-scrape pin for the UNCACHED WASM `summarize_state` counters.
+///
+/// These three sites live in `impl Executor<Runtime>` — a real compiled WASM
+/// runtime — so the `MockWasmRuntime` harness that covers every other arm in
+/// `pool_tests::summarize_delta_cache_tests` cannot reach them, and a runtime
+/// test would need the full `wasm_conformance_tests` fixture. Pinned from
+/// source instead, which is the cheaper guard against the failure that actually
+/// threatens them: a copy-paste slip recording `record_summarize_wasm_call`
+/// here would inflate the CACHED path's miss count with work that never had a
+/// cache in front of it, making a healthy cache look like it was thrashing.
+#[cfg(test)]
+mod uncached_summarize_counter_pins {
+    /// The file's production source, with comment lines removed so a needle
+    /// cannot match the prose that describes the code (the same guard as in
+    /// `executor_impl::contract_exec_counter_pins`, where that trap was
+    /// actually hit), and truncated before this test module so a needle cannot
+    /// match its own assertion strings.
+    fn production_source() -> String {
+        let src = include_str!("contract_ops.rs");
+        let cutoff = src
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("contract_ops.rs must have a top-level #[cfg(test)] mod section");
+        src[..cutoff]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_uncached_summarize_site_is_counted_as_uncached() {
+        let src = production_source();
+        let norm = src.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert_eq!(
+            norm.matches(".summarize_state(").count(),
+            3,
+            "expected exactly 3 WASM summarize_state sites in contract_ops; a new one \
+             needs its own record_summarize_wasm_uncached() call, or the WASM total \
+             silently under-reports"
+        );
+        assert_eq!(
+            norm.matches("m.record_summarize_wasm_uncached();").count(),
+            3,
+            "each of the 3 uncached summarize_state sites must record the UNCACHED arm"
+        );
+        assert_eq!(
+            norm.matches("record_summarize_wasm_call()").count(),
+            0,
+            "no site here may record the CACHED-path arm — these calls have no cache \
+             in front of them, and counting them there would make a healthy cache \
+             look like it was thrashing"
+        );
+
+        // Each recorder must PRECEDE its own call, not trail the previous one.
+        let mut cursor = 0usize;
+        for i in 0..3 {
+            let rec = norm[cursor..]
+                .find("m.record_summarize_wasm_uncached();")
+                .unwrap_or_else(|| panic!("uncached recorder #{i} not found"))
+                + cursor;
+            let call = norm[rec..]
+                .find(".summarize_state(")
+                .unwrap_or_else(|| panic!("summarize_state call #{i} not found after recorder"))
+                + rec;
+            assert!(
+                !norm[rec + 1..call].contains("m.record_summarize_wasm_uncached();"),
+                "recorder #{i} is not the one guarding its own summarize_state call"
+            );
+            cursor = call;
+        }
     }
 }

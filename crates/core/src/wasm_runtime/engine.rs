@@ -158,10 +158,20 @@ pub(crate) trait WasmEngine: Send {
     ///
     /// Sets up imports, calls `__frnt_set_id`, records memory address,
     /// and ensures sufficient memory for `req_bytes`.
+    ///
+    /// The instance id is NOT a parameter: it is issued by
+    /// `native_api::next_instance_id` and returned in the [`InstanceHandle`].
+    /// Instance ids key the process-global `MEM_ADDR` / `DELEGATE_ENV` /
+    /// `CONTRACT_IO` maps, so a caller-chosen id could collide with a LIVE
+    /// instance belonging to another engine in the same process and make
+    /// [`Self::drop_instance`] evict that instance's entry (#4213 / #5023).
+    ///
+    /// Any future backend implementing this trait MUST allocate the same way;
+    /// `create_instance_allocates_its_own_instance_id` in the wasmtime backend
+    /// pins that for the one implementation that exists today.
     fn create_instance(
         &mut self,
         module: &Self::Module,
-        id: i64,
         req_bytes: usize,
     ) -> Result<InstanceHandle, WasmError>;
 
