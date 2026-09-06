@@ -217,12 +217,50 @@ RESOLVED_FDEV_SOURCE=""
 # at a fork, a tag naming a different fdev would take a good release's crate off
 # the real registry while every other step operated on the fork. Origin is a
 # version source only when it is the project's own repository.
-origin_is_freenet_core() {
-    local url
-    url="$(git -C "$PROJECT_ROOT" remote get-url origin 2>/dev/null)" || return 1
+#
+# The string half is split out so it can be table-tested. It has to be: an
+# end-to-end case whose origin is the real `git@github.com:freenet/freenet-core`
+# would have step 2 `ls-remote` and `push --delete` against the REAL repository,
+# so the only branch production ever takes (the colon form -- the sandbox's
+# origin is a filesystem path, which is the slash form) is untestable any other
+# way. Verified by deletion: dropping the colon branch left the whole suite
+# green before `url_is_freenet_core` existed.
+#
+# The match is a SUFFIX, deliberately: the test fixture's origin is a bare repo
+# at `<sandbox>/github.com/freenet/freenet-core.git`, which is what lets the
+# suite exercise this matcher instead of a test-only backdoor in a destructive
+# script. Do not anchor it to the start of the string without also rebuilding
+# that fixture. It IS anchored on the delimiter -- the character before
+# `github.com` must be `/` or `@` -- so a lookalike host like
+# `evilgithub.com/freenet/freenet-core` does not match. That is tidiness, not a
+# security boundary: anyone who can rewrite your git config can do worse.
+url_is_freenet_core() {
+    local url="$1"
+    # Trailing slash first, so a URL ending `.git/` still loses its `.git`.
+    url="${url%/}"
     url="${url%.git}"
     url="${url%/}"
-    [[ "$url" == *"github.com/freenet/freenet-core" || "$url" == *"github.com:freenet/freenet-core" ]]
+    # The leading "/" gives a bare `github.com:freenet/freenet-core` (a valid
+    # scp-like URL with no user) the delimiter the pattern requires.
+    local delimited="/$url"
+    [[ "$delimited" == *[/@]"github.com/freenet/freenet-core" \
+        || "$delimited" == *[/@]"github.com:freenet/freenet-core" ]]
+}
+
+origin_is_freenet_core() {
+    local url
+    # `git remote get-url` EXPANDS `url.<base>.insteadOf`, so an operator using
+    # a host alias (`fnalias:core` rewritten to the real repository) is not
+    # refused on the genuine repo. Measured on git 2.43.0, since the obvious
+    # reading is the opposite and this was queried in review: with
+    # `url.git@github.com:freenet/freenet-core.git.insteadOf = fnalias:core`,
+    # `remote get-url origin` returns the REWRITTEN url, identical to
+    # `ls-remote --get-url`. Do NOT "fix" this to `git config --get
+    # remote.origin.url`, which returns the raw configured string and would
+    # refuse the genuine repository mid-incident.
+    url="$(git -C "$PROJECT_ROOT" remote get-url origin 2>/dev/null)" || return 1
+    [[ -n "$url" ]] || return 1
+    url_is_freenet_core "$url"
 }
 
 # Why origin did not supply a version: "unusable" (refused -- not freenet-core)
@@ -294,9 +332,19 @@ if [[ -n "$FDEV_VERSION" ]]; then
         # because adjacent fdev patch versions all exist on crates.io and a
         # near-miss yanks a GOOD release.
         if [[ "$RESOLVED_FDEV_SOURCE" == "local" ]]; then
+            # Same fork as the hard stop below. Saying "origin could not be
+            # read" over the top of the "origin is not freenet/freenet-core"
+            # warning printed three lines earlier gives an operator two
+            # contradictory explanations directly above a yank confirmation.
             echo "⚠️  --fdev-version $FDEV_VERSION does not match the LOCAL $TAG, which names"
-            echo "    fdev $RESOLVED_FDEV. Origin could not be read, so the local tag may itself"
-            echo "    be the stale one. Yanking $FDEV_VERSION as instructed."
+            echo "    fdev $RESOLVED_FDEV."
+            if [[ "$ORIGIN_SOURCE_PROBLEM" == "unusable" ]]; then
+                echo "    Origin is not freenet/freenet-core, so it could not confirm either"
+                echo "    number, and the local tag may itself be the stale one."
+            else
+                echo "    Origin could not be read, so the local tag may itself be the stale one."
+            fi
+            echo "    Yanking $FDEV_VERSION as instructed."
         else
             echo "⚠️  --fdev-version $FDEV_VERSION does not match $TAG, which names fdev $RESOLVED_FDEV."
             echo "    Yanking $FDEV_VERSION as instructed."

@@ -607,7 +607,13 @@ test_explicit_fdev_version_overrides_the_tag() {
 # here, given the number used to be wrong) and probe crates.io, without yanking.
 test_dry_run_shows_the_fdev_version_without_yanking() {
     make_sandbox
-    run_rollback --version "$FREENET_VERSION" --yank-crates --dry-run
+    # GH_RELEASE_EXISTS=1 is load-bearing. Without it the `gh` stub answers
+    # "release not found" and step 3 takes its absent-release arm, so the
+    # DRY_RUN branch inside step 3 is never reached and replacing that guard
+    # with `if false` leaves the whole suite green. Deleting a release and its
+    # assets is the least reversible thing this script does -- a yank comes back
+    # with `cargo yank --undo`; release binaries do not.
+    GH_RELEASE_EXISTS=1 run_rollback --version "$FREENET_VERSION" --yank-crates --dry-run
 
     if [[ $RC -eq 0 ]] && printed "Yanking fdev v$TAG_FDEV"; then
         pass "a dry run names the fdev version it would yank"
@@ -625,6 +631,12 @@ test_dry_run_shows_the_fdev_version_without_yanking() {
         fail "a dry run invoked cargo yank" "$(dump)"
     else
         pass "a dry run does not invoke cargo yank"
+    fi
+
+    if logged "gh release delete"; then
+        fail "a dry run deleted the GitHub release" "$(dump)"
+    else
+        pass "a dry run does not delete the GitHub release"
     fi
 
     if local_tag_exists && origin_tag_exists; then
@@ -957,6 +969,127 @@ test_fork_origin_is_not_a_version_source() {
     else
         fail "the rollback yanked with origin pointed at a fork" "$(dump)"
     fi
+
+    # With --fdev-version supplied the run is NOT stopped -- it proceeds to a
+    # yank -- so the mismatch warning is the last thing an operator reads before
+    # confirming. It must not say "origin could not be read" three lines under a
+    # warning saying origin is not freenet/freenet-core: two contradictory
+    # explanations at exactly the wrong moment.
+    GH_RELEASE_EXISTS=1 run_rollback --version "$FREENET_VERSION" \
+        --yank-crates --fdev-version 0.3.777
+
+    if printed "Origin is not freenet/freenet-core, so it could not confirm"; then
+        pass "the mismatch warning gives the fork the same explanation the hard stop does"
+    else
+        fail "the mismatch warning did not account for origin being a fork" "$(dump)"
+    fi
+
+    if printed "Origin could not be read"; then
+        fail "the mismatch warning claims origin was unreadable when it was refused" "$(dump)"
+    else
+        pass "the mismatch warning does not contradict the refusal printed above it"
+    fi
+}
+
+# 21. `url.<base>.insteadOf` and host aliases. An operator whose git config
+# rewrites `fnalias:core` to the real repository IS on freenet/freenet-core, and
+# refusing them would hard-stop a `--yank-crates` run mid-incident.
+#
+# `git remote get-url` expands the rewrite, so the script is already correct
+# here -- but the obvious-looking "simplification", `git config --get
+# remote.origin.url`, returns the raw configured string and does not. That is
+# the mutation this case is written against, and it is the realistic edit: the
+# raw-config form is shorter and reads as equivalent.
+test_origin_rewritten_by_insteadof_is_still_freenet_core() {
+    make_sandbox
+    git -C "$REPO" config "url.$ORIGIN.insteadOf" "fnalias:core"
+    git -C "$REPO" remote set-url origin "fnalias:core"
+
+    run_rollback --version "$FREENET_VERSION" --yank-crates
+
+    if printed "origin is not freenet/freenet-core"; then
+        fail "an insteadOf-rewritten origin was refused as though it were a fork" "$(dump)"
+    else
+        pass "an insteadOf-rewritten origin is recognised as freenet/freenet-core"
+    fi
+
+    if logged "cargo yank --version $TAG_FDEV fdev"; then
+        pass "the rewritten origin still supplies the fdev version"
+    else
+        fail "the fdev version was not resolved through a rewritten origin" "$(dump)"
+    fi
+}
+
+# 20. The origin matcher's URL forms -- including the ONLY branch production
+# takes.
+#
+# `origin_is_freenet_core` accepts both `github.com/freenet/freenet-core` and
+# `github.com:freenet/freenet-core`. The real repository's origin is
+# `git@github.com:freenet/freenet-core.git`, the COLON form; every sandbox in
+# this file uses a filesystem path, which is the SLASH form. So the branch that
+# matters in production was exercised by nothing -- deleting it outright left
+# all 62 assertions green -- and a later tidy-up of the matcher would hard-stop
+# every real `--yank-crates` run, during an incident.
+#
+# This cannot be covered end to end: a sandbox whose origin is the real URL
+# would have step 2 `ls-remote` and `push --delete` against freenet/freenet-core
+# itself. So extract the pure string half and drive it directly. The extraction
+# fails LOUDLY if the function is renamed or the colon branch disappears, rather
+# than silently testing nothing.
+test_origin_url_matcher_covers_the_real_repositorys_url_forms() {
+    local body
+    body="$(awk '/^url_is_freenet_core\(\) \{$/,/^\}$/' "$ROLLBACK_SH")"
+
+    if [[ -z "$body" ]]; then
+        fail "could not extract url_is_freenet_core() from $ROLLBACK_SH (renamed?)"
+        return
+    fi
+    if [[ "$body" != *"github.com:freenet/freenet-core"* ]]; then
+        fail "the extracted matcher has no colon (scp-like) branch -- the one production uses"
+        return
+    fi
+    eval "$body"
+
+    # The colon form first: it is the real repository's own origin.
+    local accept=(
+        "git@github.com:freenet/freenet-core.git"
+        "git@github.com:freenet/freenet-core"
+        "github.com:freenet/freenet-core.git"
+        "ssh://git@github.com/freenet/freenet-core.git"
+        "https://github.com/freenet/freenet-core.git"
+        "https://github.com/freenet/freenet-core"
+        "https://github.com/freenet/freenet-core/"
+        "https://github.com/freenet/freenet-core.git/"
+        # The shape this suite's own fixture relies on. Asserted so a future
+        # tightening of the matcher fails here instead of silently voiding
+        # every origin-resolution case in the file.
+        "/tmp/sandbox/github.com/freenet/freenet-core.git"
+    )
+    local reject=(
+        "git@github.com:somebody/freenet-core.git"
+        "https://github.com/somebody/freenet-core.git"
+        "https://github.com/freenet/freenet-core-fork.git"
+        "https://github.com/freenet/river.git"
+        "https://gitlab.com/freenet/freenet-core.git"
+        # A lookalike host: the match is a suffix, but it is anchored on the
+        # delimiter before "github.com", so this is not accepted.
+        "https://evilgithub.com/freenet/freenet-core.git"
+        # What `ls-remote --get-url` prints when there is no `origin` at all.
+        "origin"
+        ""
+    )
+
+    local url bad=0
+    for url in "${accept[@]}"; do
+        url_is_freenet_core "$url" || { fail "matcher REJECTED the real repo URL form: '$url'"; bad=1; }
+    done
+    for url in "${reject[@]}"; do
+        if url_is_freenet_core "$url"; then
+            fail "matcher ACCEPTED a URL that is not freenet/freenet-core: '$url'"
+            bad=1
+        fi
+    done
+    [[ $bad -ne 0 ]] || pass "the origin matcher accepts every real freenet-core URL form and rejects the rest"
 }
 
 test_fdev_version_comes_from_the_release_tag
@@ -981,6 +1114,8 @@ test_no_stdin_aborts_before_anything_destructive
 test_missing_tag_everywhere_demands_an_explicit_fdev_version
 test_local_tag_alone_never_decides_the_yank
 test_fork_origin_is_not_a_version_source
+test_origin_url_matcher_covers_the_real_repositorys_url_forms
+test_origin_rewritten_by_insteadof_is_still_freenet_core
 
 echo
 if [[ $FAILURES -eq 0 ]]; then
