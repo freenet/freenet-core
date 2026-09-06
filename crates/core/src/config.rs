@@ -566,6 +566,24 @@ impl ConfigArgs {
             }
         }
 
+        // toml now wins over json deterministically, where the old fuzzy scan
+        // took whichever `read_dir` yielded first. That is the point of the
+        // fix, but it has a sharp edge worth saying out loud: `build()` writes
+        // `config.toml` unconditionally, so a `config.json` operator gets one
+        // created beside theirs on first boot and from then on their json is
+        // never read again. Silently preferring one of two present configs is
+        // the same invisible-config failure this fix exists to remove, so say
+        // which one won.
+        if matches!(config_args.as_ref(), Some((name, _)) if name == "config.toml")
+            && dir.join("config.json").is_file()
+        {
+            tracing::warn!(
+                "both config.toml and config.json are present in {}; loading config.toml \
+                 and IGNORING config.json. Remove whichever is not the one you edit.",
+                dir.display()
+            );
+        }
+
         if config_args.is_none() {
             let mut read_dir = std::fs::read_dir(dir)?;
             config_args = read_dir.find_map(|e| {
@@ -579,7 +597,16 @@ impl ConfigArgs {
                         if filename.starts_with("config") {
                             match ext.as_str() {
                                 "toml" => {
-                                    tracing::debug!(filename = %filename, "Found configuration file (fuzzy)");
+                                    // `warn`, not `debug`: #5038 is about a
+                                    // config that is invisibly not the one you
+                                    // edited. Loading `config.bak.toml` because
+                                    // no `config.toml` exists is exactly that,
+                                    // and at debug level nobody sees it.
+                                    tracing::warn!(
+                                        filename = %filename,
+                                        "no exact config.toml/config.json found; falling back to this \
+                                         config* file. Rename it to config.toml if it is the one you edit."
+                                    );
                                     return Some((filename, ext));
                                 }
                                 "json" => {
@@ -6131,6 +6158,14 @@ shutdown-drain-secs = 42
              log level and the assertion below could not distinguish them"
         );
 
+        // `config.toml` is written FIRST on purpose. ext4 orders entries by a
+        // hash seed, so write order is irrelevant there — but tmpfs is
+        // insertion-ordered, and with the exact name written LAST the unfixed
+        // code returned it 400/400 on /dev/shm, i.e. this test passed against
+        // the bug. `tempfile::tempdir()` honours TMPDIR, so a runner with
+        // TMPDIR on tmpfs would silently neuter it. Writing it first makes the
+        // unfixed code pick a decoy on both filesystems.
+        fs::write(dir.join("config.toml"), &exact_toml).unwrap();
         for decoy in [
             "config.bak.toml",
             "config.aaa.toml",
@@ -6140,7 +6175,6 @@ shutdown-drain-secs = 42
         ] {
             fs::write(dir.join(decoy), &decoy_toml).unwrap();
         }
-        fs::write(dir.join("config.toml"), &exact_toml).unwrap();
 
         let cfg = ConfigArgs::read_config(&dir.to_path_buf())
             .expect("read_config should succeed")
@@ -6198,12 +6232,30 @@ shutdown-drain-secs = 42
 
         fs::set_permissions(&dir, original).unwrap();
 
+        // Root bypasses POSIX permission checks, so under `euid == 0` the setup
+        // cannot produce the fault and this test cannot assert anything.
+        //
+        // It SKIPS rather than failing, deliberately. `docker/test-runner`
+        // (what `/freenet:linux-test` drives) runs `cargo test --workspace` as
+        // root with no `--user`, so a hard assert breaks a supported local
+        // workflow — and the obvious "fix" for a broken test is to delete the
+        // assertion, which is the one real regression guard in this PR. The
+        // skip is loud rather than silent, and GitHub CI runs `test_unit` as a
+        // non-root runner user, so the guard is live where it actually gates.
+        if listing.is_ok() {
+            eprintln!(
+                "SKIPPING read_config_finds_exact_config_without_listing_the_directory: \
+                 readdir succeeded on a --x--x--x directory, so this is running as root \
+                 (euid 0) and the fault this test depends on cannot be produced. This \
+                 guard is exercised by the non-root GitHub CI run."
+            );
+            return;
+        }
         assert_eq!(
             listing.map_err(|e| e.kind()),
             Err(std::io::ErrorKind::PermissionDenied),
-            "the setup did not produce the fault this test depends on (running \
-             as root?), so it would pass without exercising the exact-match \
-             pass at all"
+            "readdir failed for a reason other than the permission fault this test \
+             sets up, so it is not exercising the exact-match pass"
         );
         let cfg = read
             .expect("read_config must not list the directory when config.toml exists")
