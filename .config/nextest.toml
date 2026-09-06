@@ -80,6 +80,21 @@ slow-timeout = { period = "300s", terminate-after = 2 }
 filter = "test(test_placement_migration_at_scale_renewal_load_stays_bounded) | test(test_connection_growth_plateau_diagnostic) | test(test_connection_growth_stall_regression)"
 slow-timeout = { period = "150s", terminate-after = 2 }
 
+# The post-update probation tests (#5232) spawn the real `freenet` binary and
+# wait out the rollback machinery's own 60s commit window, which is a hard-coded
+# constant in the binary under test — so ~65s of the runtime is a deliberate
+# sleep, not slack, and the default 120s period leaves little room for a cold
+# debug-build node start on a loaded runner.
+#
+# retries = 0 for the same reason as the canary above: this is brick-safety
+# equipment, and an intermittent failure here is a finding, not noise to absorb.
+# A retry would turn "the commit sometimes does not happen" — the exact bug class
+# #5232 was filed about — back into a green run.
+[[profile.ci.overrides]]
+filter = "test(/probation_(is_committed|survives)/)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+retries = 0
+
 [profile.nightly]
 # Nightly tests run longer by design; no retries since failures need investigation.
 retries = 0

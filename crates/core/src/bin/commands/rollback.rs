@@ -479,27 +479,147 @@ fn write_probation_at(dir: &Path, state: &ProbationState) -> Result<()> {
     atomic_write(&dir.join(PROBATION_FILE), &raw)
 }
 
-fn remove_probation_at(dir: &Path) {
-    let _rm = std::fs::remove_file(dir.join(PROBATION_FILE));
+/// Remove the probation marker, reporting whether it is actually gone.
+///
+/// The result is NOT decorative: every caller has just decided that rollback
+/// should no longer fire, and a failed unlink leaves the marker ARMED. A caller
+/// that announces the decision must not announce it when this failed (#5232).
+///
+/// "Already absent" is success — the post-condition is "no marker", not "I
+/// deleted something".
+fn remove_probation_at(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(dir.join(PROBATION_FILE)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// The operator-facing line for a marker-clearing outcome, or `None` when
+/// nothing happened. Split out from [`commit_probation`] so both branches are
+/// unit-testable: `commit_probation` itself reads the process-global `$HOME`
+/// through [`state_dir`] and so cannot be driven from a test.
+///
+/// ## Why these go to stderr and not only to `tracing` (#5232)
+///
+/// **This is the canonical explanation; the other comments point here.** Under
+/// the shipped systemd deployment the node's `tracing` output goes to the
+/// rolling log files under the log dir (`tracing::tracer::init_tracer` adds the
+/// console layer only when stdout is a terminal, which it is not under a service
+/// manager), while the unit records `StandardOutput=journal` /
+/// `StandardError=journal`. So `tracing` does not reach the journal and
+/// stdout/stderr does. The three other decisions in this flow — the crash count,
+/// the rollback, and rollback-unavailable — are all `eprintln!` in
+/// [`super::update`], so `journalctl -u freenet` showed strikes accumulating
+/// against a probationary version and never once showed the commit that disarms
+/// them. #5232 was filed reading exactly that asymmetry. This puts the
+/// marker-clearing decisions on the same channel as the decisions they cancel.
+///
+/// (The fallback tracer — used when no log dir resolves, or when
+/// `FREENET_LOG_TO_STDERR` is set — does write to stdout, so on those paths the
+/// `tracing` line reaches the journal too and the operator sees both.)
+///
+/// Volume is bounded: at most one line per node start, and only when a probation
+/// marker actually exists.
+pub(crate) fn commit_announcement(
+    outcome: &CommitOutcome,
+    current_version: &str,
+) -> Option<String> {
+    match outcome {
+        CommitOutcome::Committed => Some(format!(
+            "Freenet {current_version}: post-update probation passed (ran healthily for \
+             {COMMIT_HEALTHY_UPTIME_SECS}s); committed, auto-rollback disarmed."
+        )),
+        // Deliberately as loud as the commit. This branch drops rollback
+        // protection for `marker_version` WITHOUT committing anything, it is the
+        // branch a version-comparison regression would take, and it is
+        // indistinguishable from a healthy commit by the state directory alone
+        // (both just delete the marker).
+        CommitOutcome::ClearedStale { marker_version } => Some(format!(
+            "Freenet {current_version}: discarded a post-update probation marker belonging to \
+             {marker_version} (not the running version); auto-rollback protection for \
+             {marker_version} is gone."
+        )),
+        // The state change did NOT happen, so this must not read like the two
+        // above. The marker is still on disk and still inside its TTL, so an
+        // ordinary crash in the next hour can still roll this node back off a
+        // version that just proved itself — and the commit timer fires once per
+        // process, so nothing retries.
+        CommitOutcome::ClearFailed {
+            marker_version,
+            error,
+        } => Some(format!(
+            "Freenet {current_version}: ran healthily for {COMMIT_HEALTHY_UPTIME_SECS}s, but the \
+             post-update probation marker for {marker_version} could NOT be removed ({error}); \
+             auto-rollback is STILL ARMED and a crash within the next hour can still roll this \
+             node back. Check the permissions and free space on the Freenet state directory."
+        )),
+        CommitOutcome::Nothing => None,
+    }
 }
 
 /// Clear probation if the running version matches the marker (it has proven
-/// healthy). A marker for a DIFFERENT version is stale (e.g. left over after a
-/// rollback or external install) and is also removed.
+/// healthy). A marker for a DIFFERENT version is stale (e.g. an external install
+/// replaced the binary, or two binaries share a `$HOME`) and is also removed.
+///
+/// Both outcomes DISARM rollback for the marker's version, so both are announced
+/// on stderr as well as through `tracing` — see [`commit_announcement`] for why
+/// stderr specifically.
+///
+/// Reached only from the node's commit timer, so "survived the window ⇒
+/// committed" holds for a process that actually ran the network. A node parked
+/// by `freenet service disable` (`run_disabled_idle`) never reaches it and keeps
+/// its marker until the [`PROBATION_MAX_AGE_SECS`] TTL retires it. That is
+/// deliberate: a process that never joined the network has not demonstrated the
+/// health this probation tests for, so committing there would disarm rollback on
+/// evidence the mechanism does not have.
 pub fn commit_probation(current_version: &str) {
     if let Some(dir) = state_dir() {
-        match commit_probation_at(dir.as_path(), current_version) {
+        // `eprintln!` is the ONLY fallible step here, so it goes last.
+        //
+        // It panics on a write error (EPIPE once the supervisor's reader is
+        // gone; a Windows child that inherited invalid standard handles), and a
+        // panic unwinds this whole task. So anything sequenced after it is lost
+        // when stderr is broken:
+        //
+        //  - Before the removal, a panic would leave a healthy node's marker
+        //    armed — an observability line turned into a rollback bug.
+        //  - Before the `tracing` record, a panic would take that record with
+        //    it, leaving the operator with NEITHER channel on exactly the node
+        //    whose stderr is already broken. That is strictly worse than before
+        //    this announcement existed, when the record always got written.
+        //
+        // Hence: transition, then log, then announce. The message is built up
+        // front because the `match` below consumes `outcome`; building a string
+        // cannot fail, so doing it early costs nothing.
+        let outcome = commit_probation_at(dir.as_path(), current_version);
+        let announcement = commit_announcement(&outcome, current_version);
+        match outcome {
             CommitOutcome::Committed => tracing::info!(
                 version = current_version,
                 "Auto-update probation passed: new version ran healthily for \
                  {COMMIT_HEALTHY_UPTIME_SECS}s; committing (rollback disarmed)."
             ),
-            CommitOutcome::ClearedStale { marker_version } => tracing::debug!(
+            // Was `debug!`, which a release build compiles out entirely
+            // (`release_max_level_info`), so this branch was completely silent
+            // in the field. See `commit_announcement` for why that matters.
+            CommitOutcome::ClearedStale { marker_version } => tracing::warn!(
                 running = current_version,
                 marker = %marker_version,
                 "Cleared stale auto-update probation marker for a different version."
             ),
+            CommitOutcome::ClearFailed {
+                marker_version,
+                error,
+            } => tracing::error!(
+                running = current_version,
+                marker = %marker_version,
+                error = %error,
+                "Probation passed but the marker could not be removed; rollback is STILL armed."
+            ),
             CommitOutcome::Nothing => {}
+        }
+        if let Some(line) = announcement {
+            eprintln!("{line}");
         }
     }
 }
@@ -510,22 +630,37 @@ pub(crate) enum CommitOutcome {
     Committed,
     /// A marker for a different version was found and removed as stale.
     ClearedStale { marker_version: String },
+    /// The marker could NOT be removed, so rollback is still ARMED even though
+    /// this version has proven healthy. Kept distinct from the two success
+    /// outcomes so the announcement cannot claim a disarm that did not happen.
+    ClearFailed {
+        marker_version: String,
+        error: String,
+    },
     /// No probation marker present.
     Nothing,
 }
 
 pub(crate) fn commit_probation_at(dir: &Path, current_version: &str) -> CommitOutcome {
     match read_probation_at(dir) {
-        Some(state) if state.new_version == current_version => {
-            remove_probation_at(dir);
-            CommitOutcome::Committed
-        }
+        Some(state) if state.new_version == current_version => match remove_probation_at(dir) {
+            Ok(()) => CommitOutcome::Committed,
+            Err(e) => CommitOutcome::ClearFailed {
+                marker_version: state.new_version,
+                error: e.to_string(),
+            },
+        },
         Some(state) => {
             // Running a different version healthily than the marker describes:
             // the marker can no longer protect anything, so drop it.
-            remove_probation_at(dir);
-            CommitOutcome::ClearedStale {
-                marker_version: state.new_version,
+            match remove_probation_at(dir) {
+                Ok(()) => CommitOutcome::ClearedStale {
+                    marker_version: state.new_version,
+                },
+                Err(e) => CommitOutcome::ClearFailed {
+                    marker_version: state.new_version,
+                    error: e.to_string(),
+                },
             }
         }
         None => CommitOutcome::Nothing,
@@ -751,7 +886,12 @@ pub(crate) fn handle_post_stop_at(
         // The marker describes a different version than the one that just
         // stopped — stale (e.g. an external install changed the binary). Drop
         // it and fall through to the normal flow rather than acting on it.
-        remove_probation_at(dir);
+        //
+        // A failed unlink is tolerable HERE, unlike in `commit_probation_at`:
+        // nothing is announced, and the next stop re-reads the marker and takes
+        // this same branch again, so the removal effectively retries. Reporting
+        // it would need an output channel this process does not have — see #5244.
+        let _retried_next_stop = remove_probation_at(dir);
         return PostStopOutcome::Proceed;
     }
 
@@ -759,7 +899,8 @@ pub(crate) fn handle_post_stop_at(
     // been around far longer than any boot-wedge would survive. Treat as
     // committed/stale so a much-later transient crash can't trigger a rollback.
     if now_unix().saturating_sub(state.installed_at_unix) > PROBATION_MAX_AGE_SECS {
-        remove_probation_at(dir);
+        // Same as above: not announced, and re-attempted on the next stop.
+        let _retried_next_stop = remove_probation_at(dir);
         return PostStopOutcome::Proceed;
     }
 
@@ -795,7 +936,7 @@ pub(crate) fn handle_post_stop_at(
         // Never delete the only working binary: with no retained known-good we
         // cannot restore. Stop counting (the supervisor's own bound takes over)
         // and surface the situation for the operator.
-        remove_probation_at(dir);
+        let _retried_next_stop = remove_probation_at(dir);
         return PostStopOutcome::RollbackUnavailable {
             reason: format!(
                 "no retained known-good binary at {}",
@@ -813,7 +954,7 @@ pub(crate) fn handle_post_stop_at(
             // Definitively corrupt: this rollback target is unusable. Drop the
             // marker so we stop re-attempting it; the next crash falls through
             // to the normal update flow (which may self-heal forward).
-            remove_probation_at(dir);
+            let _retried_next_stop = remove_probation_at(dir);
             return PostStopOutcome::RollbackUnavailable {
                 reason: format!(
                     "known-good integrity check failed (size {size} vs expected {}, or SHA-256 \
@@ -843,7 +984,10 @@ pub(crate) fn handle_post_stop_at(
 
     match restore_binary(&state.rollback_binary, &state.target_binary) {
         Ok(()) => {
-            remove_probation_at(dir);
+            // If this fails the marker names the version we just replaced, so
+            // the restored binary's next stop sees a version mismatch and takes
+            // the stale branch above. Self-healing, hence not surfaced here.
+            let _cleared_by_version_mismatch = remove_probation_at(dir);
             PostStopOutcome::RolledBack {
                 restored_version: state.previous_version.clone(),
                 bad_version: state.new_version.clone(),
@@ -1017,6 +1161,176 @@ mod tests {
         assert!(read_probation_at(dir).is_none());
         // Idempotent.
         assert_eq!(commit_probation_at(dir, "0.2.84"), CommitOutcome::Nothing);
+    }
+
+    /// Both marker-clearing outcomes MUST announce themselves, and `Nothing`
+    /// must stay silent.
+    ///
+    /// The end-to-end test `tests/post_update_probation_commit.rs` greps the
+    /// node's stderr for a substring of the Committed line; these assertions are
+    /// what make a reword of either line fail in microseconds instead of after
+    /// that test's 60s window (and they are the only coverage the ClearedStale
+    /// line has, since reaching it end-to-end needs a second 60s node boot).
+    /// A commit announcement must never claim a disarm that did not happen.
+    ///
+    /// `remove_probation_at` can fail (read-only or full state dir — the same
+    /// condition that breaks the rest of the update machinery, see #5244). The
+    /// marker then stays on disk and stays inside its TTL, so a crash within the
+    /// hour can still roll the node back. Announcing "rollback disarmed" there
+    /// would reintroduce, at the moment of fixing it, exactly the misleading-
+    /// journal problem this whole change exists to remove (#5232).
+    #[test]
+    fn a_failed_clear_is_never_announced_as_a_pass() {
+        let line = commit_announcement(
+            &CommitOutcome::ClearFailed {
+                marker_version: "0.2.123".to_string(),
+                error: "Permission denied (os error 13)".to_string(),
+            },
+            "0.2.123",
+        )
+        .expect("a marker that could not be cleared must be reported");
+
+        assert!(
+            line.contains("STILL ARMED"),
+            "the operator must be told rollback is still live: {line}"
+        );
+        assert!(
+            line.contains("Permission denied (os error 13)"),
+            "the cause is what makes this actionable: {line}"
+        );
+        assert!(
+            !line.contains("disarmed"),
+            "MUST NOT claim a disarm that did not happen: {line}"
+        );
+        // `tests/post_update_probation_commit.rs` greps stderr for the success
+        // line's needle to conclude the node committed. If a FAILED clear also
+        // contained that substring, the end-to-end guard would pass while
+        // rollback was still armed — the exact false-green this PR exists to
+        // prevent. Assert the two are disjoint, in both directions.
+        let committed = commit_announcement(&CommitOutcome::Committed, "0.2.123")
+            .expect("a commit must be announced");
+        let needle = "committed, auto-rollback disarmed";
+        assert!(committed.contains(needle), "{committed}");
+        assert!(
+            !line.contains(needle),
+            "a failed clear must not contain the committed-branch needle: {line}"
+        );
+    }
+
+    /// "Already absent" is the post-condition we want, so it is success — not a
+    /// spurious ClearFailed warning on every idempotent re-commit.
+    #[test]
+    fn removing_an_absent_marker_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            remove_probation_at(dir.path()).is_ok(),
+            "a missing marker means the post-condition already holds"
+        );
+        assert_eq!(
+            commit_probation_at(dir.path(), "0.2.123"),
+            CommitOutcome::Nothing
+        );
+    }
+
+    /// End-to-end through `commit_probation_at`: an unremovable marker yields
+    /// ClearFailed rather than a false Committed.
+    ///
+    /// Unlink permission lives on the DIRECTORY, so the marker is made
+    /// unremovable by dropping write permission on its parent. Root bypasses
+    /// that check entirely, so the test skips rather than failing when it would
+    /// be testing nothing (containers commonly run tests as root).
+    #[test]
+    #[cfg(unix)]
+    fn an_unremovable_marker_reports_clear_failed_not_committed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: `geteuid` reads the calling process's effective uid. It takes
+        // no arguments, touches no memory, and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, which bypasses directory write permissions");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("freenet");
+        write_dummy_binary(&live, b"NEWER");
+        let meta = KnownGoodMeta {
+            size: 5,
+            sha256: "x".repeat(64),
+        };
+        begin_probation_at(dir.path(), "0.2.123", "0.2.122", &live, &meta).unwrap();
+
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        let original = perms.mode();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        let outcome = commit_probation_at(dir.path(), "0.2.123");
+
+        // Restore before asserting so a failure cannot leave an undeletable
+        // tempdir behind.
+        let mut restore = std::fs::metadata(dir.path()).unwrap().permissions();
+        restore.set_mode(original);
+        std::fs::set_permissions(dir.path(), restore).unwrap();
+
+        match outcome {
+            CommitOutcome::ClearFailed { marker_version, .. } => {
+                assert_eq!(marker_version, "0.2.123");
+            }
+            // Enumerated, not `other =>`: `wildcard_enum_match_arm` exists so a
+            // new `CommitOutcome` variant breaks every match site rather than
+            // silently falling through here — and this test's own PR is what
+            // added `ClearFailed`, so a wildcard would have swallowed exactly
+            // the kind of variant it is meant to catch.
+            other @ (CommitOutcome::Committed
+            | CommitOutcome::ClearedStale { .. }
+            | CommitOutcome::Nothing) => panic!(
+                "an unremovable marker must NOT report as committed — rollback is still armed. \
+                 Got: {other:?}"
+            ),
+        }
+        assert!(
+            read_probation_at(dir.path()).is_some(),
+            "premise check: the marker really did survive"
+        );
+    }
+
+    #[test]
+    fn both_marker_clearing_outcomes_are_announced() {
+        let committed = commit_announcement(&CommitOutcome::Committed, "0.2.123")
+            .expect("a commit must be announced");
+        assert!(
+            committed.contains("post-update probation passed"),
+            "the e2e test greps for this substring; keep them in step: {committed}"
+        );
+        assert!(committed.contains("0.2.123"), "{committed}");
+
+        let stale = commit_announcement(
+            &CommitOutcome::ClearedStale {
+                marker_version: "0.2.122".to_string(),
+            },
+            "0.2.123",
+        )
+        .expect("discarding a marker disarms rollback and must be announced");
+        assert!(
+            stale.contains("discarded a post-update probation marker"),
+            "{stale}"
+        );
+        // Both versions have to appear: which marker was dropped is the whole
+        // diagnostic value, and the running version is what distinguishes this
+        // from a healthy commit.
+        assert!(stale.contains("0.2.122"), "{stale}");
+        assert!(stale.contains("0.2.123"), "{stale}");
+        assert!(
+            !stale.contains("post-update probation passed"),
+            "a discarded marker must NOT read as a passed probation: {stale}"
+        );
+
+        assert_eq!(
+            commit_announcement(&CommitOutcome::Nothing, "0.2.123"),
+            None,
+            "no marker means no decision was made, so there is nothing to report"
+        );
     }
 
     #[test]
