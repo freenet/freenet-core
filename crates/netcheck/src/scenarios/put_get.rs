@@ -285,8 +285,6 @@ fn interleave_seed(run_id: &str) -> u64 {
 /// end of a run could not be told apart from a failure of the oldest
 /// contracts — which is exactly the question this check exists to answer.
 fn interleave<T>(ops: &mut [T], seed: u64) {
-    use rand::RngCore;
-
     // Everything the permutation depends on is pinned here on purpose, because
     // a replay that is only usually reproducible is not reproducible.
     //
@@ -312,12 +310,13 @@ fn interleave<T>(ops: &mut [T], seed: u64) {
     // only compares one build against itself.
     let mut seed_bytes = [0u8; 32];
     seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
-    let mut rng = <rand_chacha::ChaCha8Rng as rand::SeedableRng>::from_seed(seed_bytes);
+    let mut rng = <rand_chacha::ChaCha8Rng as rand_core10::SeedableRng>::from_seed(seed_bytes);
 
     // Fisher-Yates. The modulo bias is bounded by `len / 2^64` and `len` here
     // is at most a few dozen ops, so it is many orders of magnitude below the
     // point where it could shape a diagnosis.
     for i in (1..ops.len()).rev() {
+        use rand_core10::Rng as _;
         let j = (rng.next_u64() % (i as u64 + 1)) as usize;
         ops.swap(i, j);
     }

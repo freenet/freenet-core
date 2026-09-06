@@ -4252,6 +4252,7 @@ dependencies = [
  "hex",
  "rand 0.9.4",
  "rand_chacha 0.10.0",
+ "rand_core 0.10.1",
  "reqwest",
  "serde",
  "serde_json",
