@@ -560,9 +560,66 @@ If you need to rollback a release:
 ```bash
 ./scripts/release-rollback.sh --version 0.1.X
 
-# To also yank from crates.io (cannot be undone!)
+# To also yank from crates.io
 ./scripts/release-rollback.sh --version 0.1.X --yank-crates
 ```
+
+A yank is reversible — `cargo yank --undo --version X.Y.Z <crate>` puts the
+version back — but while it stands it breaks dependency resolution for everyone
+building against it, and yanking the WRONG version does that to a good release.
+So the script is deliberately strict about where the fdev version comes from.
+
+`--yank-crates` yanks BOTH crates, and the fdev version is read from
+`crates/fdev/Cargo.toml` **at the release tag on ORIGIN** — fdev's version is
+independent of freenet's (0.3.x against 0.2.x), and the working tree has usually
+bumped it again by the time anyone is rolling a release back.
+
+**Only origin's tag, or your own `--fdev-version`, is good enough to yank on.**
+A local tag of the same name is read as a HINT and never acted on:
+`release.sh` skips tag creation when a local tag already exists, so an aborted
+run leaves a stale one pointing at a different release, and adjacent fdev patch
+versions all exist on crates.io — so a near-miss succeeds and takes a good
+release's fdev down. When origin's tag and a local one disagree, origin wins and
+the disagreement is printed. When origin cannot be read at all, the script stops
+and asks, quoting the local tag's number only as something to check.
+
+For the same reason `origin` must actually BE `freenet/freenet-core`. Steps 2
+and 3 delete from whatever origin points at (and from a hardcoded
+`--repo freenet/freenet-core`), but `cargo yank` always reaches the real
+crates.io — so with origin on a fork, its tag could name a version that belongs
+to a live release. The script refuses to use a non-freenet origin as a version
+source and says so.
+
+If the tag is gone both locally and on origin — or it is readable only locally,
+or the manifest at it cannot be parsed — the script stops **before deleting
+anything** and asks for the version:
+
+```bash
+./scripts/release-rollback.sh --version 0.1.X --yank-crates --fdev-version 0.Y.Z
+```
+
+That is also why a run **without** `--yank-crates` prints the fdev version in
+its follow-up suggestion: the run has just deleted the tag (and the release
+page) the number would have been read from, so the second invocation needs it
+passed in. It prints a ready-to-paste command only when the number came from
+origin or from you — never a local-tag reading, which pasted would become an
+"explicit" `--fdev-version` and silence the very check that questioned it. When
+there is no such number it names the lookup and an `X.Y.Z` placeholder instead
+of a bare `--yank-crates` re-run, which would only stop with the same error.
+
+The script exits **non-zero** if any step fails, and says which. A yank is
+attempted only for a version crates.io reports as published (200); a 404 is
+reported as "not published, skipping" and is not a failure, while any other
+status is UNKNOWN and IS a failure — the 403-without-a-User-Agent trap
+described in the Quick Reference, which a two-state check reads as "not
+published" for every version ever released. There is deliberately no override
+for that: if crates.io is rate-limiting or down and the yank has to happen now,
+run it by hand once you have confirmed the version's state (`cargo yank
+--version X.Y.Z freenet`, `cargo yank --version 0.Y.Z fdev`).
+
+`--dry-run` resolves and prints the fdev version and asks crates.io whether both
+versions are actually published, without yanking or deleting anything. Worth
+running first.
 
 ## Verification Checklist
 
