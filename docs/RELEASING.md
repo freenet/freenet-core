@@ -334,10 +334,10 @@ Current wire-gated floors:
   did nothing.
 
   Guarded by a marker exactly like `HASH_FIRST_SHIPPED_IN`:
-  `BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)>`, currently `None`,
-  checked by
+  `BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)>`, now
+  `Some((0, 2, 120))` (this feature shipped in 0.2.120), checked by
   `connection_manager.rs::broadcast_target_list_floor_tracks_the_shipping_release`.
-  When a release bump raises `CARGO_PKG_VERSION` to `(0, 2, 120)`, that test
+  When a release bump raises `CARGO_PKG_VERSION` to a new floor, that test
   fails until the releaser consciously either sets
   `BROADCAST_TARGET_LIST_SHIPPED_IN = Some(BROADCAST_TARGET_LIST_MIN_VERSION)`
   (this release carries it) or raises the floor (it does not).
