@@ -486,7 +486,11 @@ jobs:
               anon_ok=1
               break
             fi
-            [ "$attempt" = 3 ] || sleep 10
+            # Jittered. A fixed backoff against a rate-limited third-party
+            # endpoint puts every retrying job at the same offset after
+            # publish; the point of retrying is to miss the thing that
+            # produced the first failure.
+            [ "$attempt" = 3 ] || sleep $(( 10 + RANDOM % 5 ))
           done
           rm -rf "$anon_home"
           echo "anonymous manifest fetch: ${anon_ok}"
