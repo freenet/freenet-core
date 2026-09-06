@@ -512,7 +512,7 @@ async fn a_contract_sees_the_overridden_clock_through_real_wasm()
 
     use super::oracle::ConformanceOracle;
     use crate::util::time_source::{DynTimeSource, SharedMockTimeSource};
-    use crate::wasm_runtime::native_api::time::override_contract_clock;
+    use crate::wasm_runtime::override_contract_clock;
 
     let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
     let mut oracle = RuntimeOracle::standalone(wasm, vec![NONDETERMINISTIC_SUMMARY]).await?;
