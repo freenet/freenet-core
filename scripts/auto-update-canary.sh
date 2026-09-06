@@ -59,9 +59,9 @@
 # outside it is touched.
 #
 # TMPDIR is in that list for a reason and must stay there, and the reason is not
-# the one it looks like. `client_api.rs` unconditionally `create_dir_all`s
-# `std::env::temp_dir()/freenet/webs` (`let contract_web_path =`) when it builds
-# the router. That directory is VESTIGIAL: nothing in the tree reads or writes
+# the one it looks like. `client_api.rs` (through v0.2.124) unconditionally
+# `create_dir_all`s `std::env::temp_dir()/freenet/webs` (`let contract_web_path
+# =`) when it builds the router. That directory is VESTIGIAL: nothing in the tree reads or writes
 # it, and web contracts are unpacked elsewhere (`default_webapp_cache_dir`). Its
 # one surviving effect is the panic when the mkdir FAILS -- `$TMPDIR/freenet`
 # being a FILE, or a directory owned by another user. Through v0.2.124 this file
@@ -69,6 +69,13 @@
 # `/tmp/freenet`, which is exactly that path: ENOTDIR, panic (exit 101) before
 # the update task spawned, and Gate A blocked a release whose binary was
 # perfectly healthy. See `run_node_until_check`.
+#
+# The mkdir itself is GONE from the tree as of #5291. The isolation stays, and
+# deleting it on the strength of that fix would be a mistake: this canary gates
+# RELEASED binaries, and every release up to and including v0.2.124 still
+# carries the panicking mkdir. The isolation is what lets the gate run them at
+# all. It is also still doing the ordinary job of keeping a throwaway node's
+# files out of the caller's temp dir.
 #
 # PORTS are the exception, and an earlier version of this header overstated it
 # by calling the runs "safe to run on a machine already running a node". They
@@ -202,6 +209,38 @@ MARKER_LATEST_SEEN='Startup update check: GitHub reports latest release'
 # REWORDED and this constant was not moved with it (fix it here).
 MARKER_LATEST_SEEN_SINCE='0.2.125'
 
+# p2p_impl.rs -- the two OTHER ways a node exits 42, and the reason Gate A cannot
+# read an exit 42 as "it asked to be updated" on its own.
+#
+# 42 is OVERLOADED. It is `FATAL_LISTENER_EXIT_CODE` (`crates/core/src/node/
+# p2p_impl.rs`) as well as the update-requested code, and BOTH producers are
+# enabled in the real binary: `enable_abort_on_fatal_listener_exit` and
+# `enable_abort_on_redb_poison` are called unconditionally at the top of
+# `freenet.rs`'s node path. The distinct `FAST_CRASH_EXIT_CODE` (45) is opted
+# into only when `SYSTEMD_FAST_CRASH_ENV_VAR` is set, which the canary does not
+# export -- so `fatal_listener_exit_code` returns 42 at EVERY uptime here,
+# including the ~40s window a canary run occupies.
+#
+# So a perfectly healthy binary that declines the update and then loses its
+# network event listener (a CI-runner transport error, a monitored task exiting)
+# or poisons redb (disk EIO) exits 42 for a reason that has nothing to do with
+# the updater. Without these markers the gate would BLOCK that release and send
+# the operator to `compare_versions_for_startup`, which is fine.
+#
+# The overlap is not incidental to the exit-42 assertion, it is exactly
+# coincident with it: when the comparator IS inverted the trigger line is in the
+# log and `assert_gate_a_decision` already blocks, so exit 42 adds nothing there.
+# Exit 42 is load-bearing ONLY when there is no trigger line -- and "42 with no
+# trigger line" is precisely the fatal-listener / redb signature. Hence the
+# corroboration rather than a bare code test.
+#
+# Both are `eprintln!`, so they land in `node.out` (the subshell in
+# `run_node_until_check` redirects stdout+stderr there) and NOT in the log dir.
+# That is why the predicate below takes a WORKDIR and the log predicates take a
+# log dir.
+MARKER_FATAL_LISTENER='CRITICAL: Network event listener exited (fatal)'
+MARKER_REDB_POISONED='CRITICAL: contract storage (redb) is poisoned'
+
 MUSL_ASSET='freenet-x86_64-unknown-linux-musl.tar.gz'
 RELEASE_BASE='https://github.com/freenet/freenet-core/releases/download'
 # The endpoint the NODE uses for its startup check (the 302 from
@@ -334,6 +373,14 @@ fail() { printf '::error::%s\n' "$*" >&2; }
 # annotating an unreachable GitHub as a workflow error trains people to ignore
 # the annotation, and the caller decides whether to retry or fail.
 note() { printf '%s\n' "$*" >&2; }
+# A real GitHub ANNOTATION for something that is not a failure but must not be
+# scrolled past. `note` is plain text, and a release job's log runs to several
+# thousand lines -- which is fine for a line the caller is about to act on
+# (a retry, a classification) and not fine for one saying an ASSERTION WAS
+# SKIPPED. A skipped assertion that only whispers is the vacuous-pass shape this
+# file keeps having to remove; `::warning::` puts it in the run summary where
+# somebody sees it without reading the log.
+warn() { printf '::warning::%s\n' "$*" >&2; }
 
 # True when the logs show the node DECIDED to update. See the marker comments
 # above for why this is a subtraction rather than a single grep.
@@ -351,6 +398,48 @@ node_decided_to_update() {
   hits="$(grep -ahE "$MARKER_TRIGGERED_RE" "$logdir"/freenet.*.log 2>/dev/null \
     | grep -vF "$MARKER_NOT_TRIGGERED")"
   [ -n "$hits" ]
+}
+
+# True when the node REFUSED to update because the newer version is locally
+# blocked -- the #4073 gate (`is_version_pinned_bad` / `is_version_install_gated`,
+# crates/core/src/bin/commands/rollback.rs).
+#
+# A named predicate rather than an inline `log_has`, for the reason
+# `prev_emits_latest_seen` is one: the DECISION it feeds is what a mutation would
+# break, and a decision that has no name has nothing to test.
+#
+# WHY THIS IS A FAULT SIGNAL AND NOT MERELY INFORMATION. Both gates run the node
+# under a HOME created fresh by `run_node_until_check` and wiped between
+# attempts, and both of those #4073 predicates read their state from under
+# `$HOME/.local/state`. A canary node therefore has no crash-loop pin and no
+# install-failure history by construction, so neither predicate has anything it
+# could legitimately match. If this line appears, the gating logic matched
+# something that is not there -- which strands a node exactly as effectively as
+# a parse bug, and looks identical to a healthy run in every marker the gate
+# read before.
+#
+# No pipe, for the SIGPIPE reason documented on `node_decided_to_update`.
+node_refused_locally_gated() {
+  local logdir="$1"
+  grep -aqF -- "$MARKER_NOT_TRIGGERED" "$logdir"/freenet.*.log 2>/dev/null
+}
+
+# True when the node exited 42 for one of the two NON-UPDATE reasons -- a fatal
+# network-event-listener exit, or a poisoned redb. See the marker comments above
+# for why 42 cannot be read as "an update was requested" without this.
+#
+# Takes the WORKDIR, not the log dir: both are `eprintln!`, so they are in
+# `node.out`. A `pure` function still -- file in, boolean out -- so
+# `auto-update-canary_test.sh` drives it from fixtures like its neighbours.
+#
+# Reads BOTH markers rather than one: the redb path was added separately
+# (#4604) and reuses the listener path's exit-code decision, so a version of
+# this that knew only about the listener would hard-block a healthy release on
+# a disk error. No pipe, for the SIGPIPE reason on `node_decided_to_update`.
+node_exited_on_fatal_abort() {
+  local work="$1"
+  grep -aqF -- "$MARKER_FATAL_LISTENER" "$work/node.out" 2>/dev/null && return 0
+  grep -aqF -- "$MARKER_REDB_POISONED" "$work/node.out" 2>/dev/null
 }
 
 # True when the startup check reached a TERMINAL outcome -- any outcome, healthy
@@ -629,6 +718,160 @@ assert_detection_healthy() {
 }
 
 # ---------------------------------------------------------------------------
+# gate_a_expected_decision <shipping-version> <observed-latest>
+#
+# WHICH DECISION a healthy updater is obliged to reach, given the two versions
+# it is comparing. Echoes exactly one of:
+#
+#   decline  -- shipping >= latest. Nothing newer exists, so the only correct
+#               outcome is to stay put. This is the normal release path: Gate A
+#               runs while its own release is still a DRAFT, so the binary under
+#               test is newer than `/releases/latest` by construction.
+#   update   -- shipping <  latest. Something newer really does exist, so the
+#               only correct outcome is to request it. RARE, and worth being
+#               exact about how rare, because the obvious framing overstates
+#               it: `cross-compile.yml` sparse-checks-out this script at the
+#               TAG being gated ("the script version matches the release it is
+#               gating"), so re-running an OLDER release's workflow runs THAT
+#               tag's copy of this file, which does not contain this code at
+#               all. What is actually left is a hotfix branch cut on an older
+#               line and tagged after a newer release has published (the branch
+#               carries this script, and its binary really is behind
+#               `/releases/latest`), a re-run of a tag cut after this landed,
+#               and a manual `preflight` run on an older binary -- the
+#               local-debugging path this file's header invites.
+#   unknown  -- one of the two is not a bare dotted version, so the direction
+#               cannot be established.
+#
+# THE DIRECTION IS THE WHOLE REASON THIS EXISTS. Asserting "must have declined"
+# unconditionally would be right on the normal path and WRONG on the paths
+# above, where it would block a release for the correct behaviour of a healthy
+# updater. A blocking gate that false-fails does not merely cost one release: it
+# teaches people to override it, and an overridden gate catches nothing. That
+# those paths are narrow is a reason to keep the conditional cheap, not a reason
+# to drop it -- the cost of getting it wrong is paid on a release nobody expected
+# to be blocked, which is the worst moment to be debugging the gate.
+#
+# `version_at_least` is the comparator because it is `sort -V` (0.2.9 < 0.2.10,
+# which a lexical compare gets wrong) and because it is already tested. The
+# `is_dotted_version` guard runs FIRST so the `unknown` case is decided here
+# rather than by `version_at_least`'s own refusal, which would also emit its
+# malformed-input note for an input we are choosing to handle.
+#
+# EQUAL counts as `decline`, matching `compare_versions_for_startup`: it returns
+# Some(latest) only for latest STRICTLY greater than current.
+# ---------------------------------------------------------------------------
+gate_a_expected_decision() {
+  if ! is_dotted_version "$1" || ! is_dotted_version "$2"; then
+    printf 'unknown'
+  elif version_at_least "$1" "$2"; then
+    printf 'decline'
+  else
+    printf 'update'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# assert_gate_a_decision <log-dir> <expected-decision>
+#
+# WHICH DECISION the updater actually reached, asserted positively.
+#
+# `assert_detection_healthy` deliberately does not do this, and the gap is not
+# an oversight there -- it is shared by both gates, which require OPPOSITE
+# decisions, so it can only assert the parts common to both. What it leaves
+# uncovered is the decision itself:
+#
+#   * `node_check_settled` accepts a completion line OR a trigger, so a node
+#     that decided to UPDATE counts as settled;
+#   * the positive-equality check validates the version the node compared
+#     AGAINST, not what it did with it;
+#   * the #4073 refusal reaches the completion line too, so it reads as an
+#     ordinary healthy ending.
+#
+# So a shipping binary with an inverted comparison passes all seven checks and
+# ships. That is the mirror image of #5221 and strands peers identically:
+# `latest < current` is TRUE for a Gate A run, so an inverted comparator returns
+# the OLDER release and the node requests a self-DOWNGRADE. `docs/RELEASING.md`
+# has described this hole since #5236.
+#
+# PURE, like `assert_detection_healthy` and for the same reason: log dir and a
+# decision word in, verdict out, so it is driven by fixtures in
+# `auto-update-canary_test.sh`. The expected decision is passed in rather than
+# computed here because computing it needs the shipping binary's version, which
+# is caller state. `NODE_EXIT` is caller state too, and its assertion therefore
+# lives in `cmd_preflight`.
+#
+# Exit: 0 the node reached the decision it had to, 1 it did not.
+# There is deliberately no 2: this runs only after `assert_detection_healthy`
+# has returned 0, so the check is already KNOWN to have started, parsed and
+# settled. Nothing left here is indeterminate, and a wrong decision is not a
+# thing a re-run fixes.
+# ---------------------------------------------------------------------------
+assert_gate_a_decision() {
+  local logdir="$1" expect="$2"
+
+  # DIRECTION-INDEPENDENT, and checked first because it is the sharper finding.
+  # It rests only on the canary's fresh isolated HOME (see
+  # `node_refused_locally_gated`), which holds in every arm, so no version
+  # relationship can make this refusal legitimate.
+  #
+  # WHERE IT ACTUALLY EARNS ITS KEEP, stated honestly rather than sold: the
+  # `update` and `unknown` arms, plus Gate B (which names it separately). In the
+  # `decline` arm it is close to unreachable, because the node only reaches the
+  # #4073 branch at all from inside
+  # `if let Some(new_version) = startup_update_check(...)` -- so entering it on
+  # the normal path already requires an inverted comparator, and with a fresh
+  # HOME the pin/gate would then not match either, so the TRIGGER fires and the
+  # decline arm below catches it first. Two independent defects, not one. It is
+  # kept in every arm regardless because it is free, it cannot false-positive
+  # (the premise holds unconditionally), and it is genuinely reached where it
+  # matters: the refusal falls through to the completion line, so
+  # `assert_detection_healthy` returns 0 and this function runs.
+  if node_refused_locally_gated "$logdir"; then
+    fail "the node REFUSED to update because it treated the newer version as locally blocked (#4073) -- but this canary node has a fresh, isolated HOME with no crash-loop pin and no install-failure history, so there is nothing for that gate to have matched. The locally-blocked check (is_version_pinned_bad / is_version_install_gated in crates/core/src/bin/commands/rollback.rs) is matching wrongly. A node that refuses every release it is offered is stranded exactly as thoroughly as one that cannot parse the tag."
+    log_lines "$logdir" "$MARKER_NOT_TRIGGERED" | head -2 >&2
+    return 1
+  fi
+
+  case "$expect" in
+    decline)
+      if node_decided_to_update "$logdir"; then
+        fail "the shipping binary DECIDED TO UPDATE, and there is nothing for it to update to: its own release is still a draft, so it is at or ahead of everything GitHub publishes. A healthy updater stays put here. This is the mirror image of #5221 -- detection did not fail, it reached the WRONG ANSWER, which is why every other check passed. An inverted comparison in compare_versions_for_startup (crates/core/src/bin/commands/auto_update.rs) produces exactly this, and it makes the node request a self-DOWNGRADE to the older release, then exit 42 and do it again on every restart. If you are running \`preflight\` by hand on a binary that really IS older than the latest release, that is the other explanation, and the log line above this one says which versions were compared."
+        grep -ahE "$MARKER_TRIGGERED_RE" "$logdir"/freenet.*.log 2>/dev/null \
+          | grep -vF "$MARKER_NOT_TRIGGERED" | head -2 >&2
+        return 1
+      fi
+      log "OK: the node declined to update, which is the only correct outcome when nothing newer than the shipping binary is published."
+      ;;
+    update)
+      if ! node_decided_to_update "$logdir"; then
+        fail "the binary under test is genuinely OLDER than GitHub's latest release and did NOT decide to update to it. A node in that position must request the update; one that stays put can never leave the version it is on, which is the #5221 outcome reached by a different route. (Gate A is running in its off-normal arm here -- a re-run of an older release's workflow, or a hotfix cut on an older line -- and the log line above says which versions were compared.)"
+        return 1
+      fi
+      log "OK: the node decided to update, which is the correct outcome for a binary older than GitHub's latest release."
+      ;;
+    *)
+      # LOUD, and never silent. A skipped arm that printed nothing would be the
+      # vacuous escape hatch this gate family keeps having to remove: a reader
+      # of a green log could not tell an asserted decision from an unasserted
+      # one. The refusal check above still ran, so this is a partial skip, not
+      # a skipped function.
+      #
+      # `warn`, not `note`, and the difference is the whole point of the branch.
+      # This arm disables the decision check AND (because that check is scoped to
+      # the `decline` arm in `cmd_preflight`) the exit-42 check with it, so
+      # reaching it silently reverts Gate A to its pre-decision-check strength
+      # while the job stays green. One change to the shape of `--version`'s
+      # output is all it takes. `::warning::` surfaces in the run summary rather
+      # than in line 4,000 of a release log; the source pin on the `--version`
+      # format in auto-update-canary_test.sh is the other half.
+      warn "the canary could not establish whether the shipping binary is newer or older than GitHub's latest release, so it did NOT assert which decision the updater had to reach, and the exit-42 check is skipped with it. The #4073 refusal check above still ran. This run does not prove the comparator answered correctly -- see the version line logged by cmd_preflight for the two values it could not compare."
+      ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # run_node_until_check <binary> <workdir>
 #
 # Boot the node in an isolated tree and stop as soon as the startup check has
@@ -638,9 +881,24 @@ NODE_EXIT=""
 run_node_until_check() {
   local binary="$1" work="$2"
   # `$work/tmp` is created HERE, with the rest of the tree, rather than inside
-  # the subshell next to the `export TMPDIR` that uses it. Gate A would not
-  # care -- the node's own `create_dir_all` builds its parents -- but Gate B
-  # does: the real updater stages through `tempfile::tempdir()` (`update.rs`),
+  # the subshell next to the `export TMPDIR` that uses it. Do NOT scope it to
+  # the Gate B path.
+  #
+  # Gate A used to have a node-side backstop: the vestigial `create_dir_all`
+  # built `$TMPDIR` on its way past (it builds missing parents, so the
+  # directory did not have to pre-exist). #5291 deleted it, so on a main-built
+  # binary this `mkdir` is now the ONLY thing that creates `$TMPDIR` -- the
+  # RELEASED binaries this gate runs (through v0.2.124) still bring their own.
+  # Do not read that as "Gate A needs it": Gate A works either way today. The
+  # point is that the backstop is gone, so scoping this line to Gate B leaves
+  # nothing creating the directory for anything else that may want it. (A
+  # node built from main does still create `$TMPDIR/freenet/webapp_cache` in
+  # one case, the `ProjectDirs`-returns-None fallback in
+  # `resolve_webapp_cache_dir`; the canary excludes it by exporting HOME,
+  # XDG_CACHE_HOME and FREENET_WEBAPP_CACHE_DIR below. Do not rely on it.)
+  #
+  # Gate B needs it independently anyway: the
+  # real updater stages through `tempfile::tempdir()` (`update.rs`),
   # which requires TMPDIR to EXIST and will not create it. A `mkdir` inside the
   # backgrounded subshell also fails invisibly (no `set -e`, and its output
   # goes to `node.out`), so a broken workdir would surface as a mystery
@@ -688,12 +946,19 @@ run_node_until_check() {
     # var removes the class outright for the cost of one line. Only the
     # canary's own throwaway node is affected.
     export FREENET_DISABLE_LOG_RATE_LIMIT=1
-    # `client_api.rs` unconditionally `create_dir_all`s
+    # #5291 DELETED the mkdir described below, so a node built from current
+    # main no longer has this failure mode. Keep the isolation anyway: the
+    # binaries this canary gates are RELEASES, and everything up to and
+    # including v0.2.124 still panics exactly as described. The measurements
+    # below were taken against those artifacts and still stand for them.
+    #
+    # `client_api.rs` (through v0.2.124) unconditionally `create_dir_all`s
     # `std::env::temp_dir()/freenet/webs` (`let contract_web_path =`) when it
     # builds the router, and that path does NOT follow `--data-dir`. The
-    # directory itself is VESTIGIAL -- nothing reads or writes it (`"webs"` has
-    # exactly one occurrence in `crates/`, the mkdir), and unpacked web
-    # contracts live under `default_webapp_cache_dir` instead. So the only thing
+    # directory itself is VESTIGIAL -- nothing reads or writes it (at the time,
+    # `"webs"` had exactly one occurrence in `crates/`, the mkdir itself; after
+    # #5291 it has none), and unpacked web contracts live under
+    # `default_webapp_cache_dir` instead. So the only thing
     # it can still do is PANIC when the mkdir fails, which it does two ways:
     #
     #   1. `$TMPDIR/freenet` is a FILE. `cross-compile.yml` stages the binary it
@@ -1063,7 +1328,27 @@ cmd_preflight() {
   mkdir -p "$work"
 
   log "=== Gate A: auto-update pre-flight on the binary about to ship ==="
-  "$binary" --version
+  # Captured rather than just printed: the version is now an INPUT to the gate
+  # (it decides which decision the updater is obliged to reach), not decoration.
+  local version_output version_line shipping_version gate_a_expect
+  version_output="$("$binary" --version)"
+  log "$version_output"
+  # Selected BY ITS MARKER, not by line position, and that is deliberate.
+  # `--version` already prints a second line (`Build timestamp: ...`), so the
+  # output is not one line and never was; taking `head -1` would make the gate's
+  # input depend on nothing more than the ORDER of two `println!`s. Add a banner
+  # line ahead of the version -- a deprecation notice, a build warning -- and a
+  # positional read silently yields an unparseable field, which sends the whole
+  # gate down the `unknown` arm and skips both new assertions while the job stays
+  # green. Matching the line that identifies itself costs nothing and removes
+  # that class outright.
+  #
+  # `| head -1` is used for its stdout, not its status, which is what keeps it
+  # clear of the SIGPIPE ban documented in auto-update-canary_test.sh.
+  version_line="$(printf '%s\n' "$version_output" | grep -F 'Freenet version:' | head -1)"
+  # Field 3 of `Freenet version: 0.2.127 (deadbeefcafe)`, the same split
+  # cmd_selfupdate uses on the same output.
+  shipping_version="$(printf '%s' "$version_line" | awk '{print $3}')"
 
   # Resolve what the node SHOULD see before booting it, so the log assertion can
   # be a positive equality rather than an absence-of-error. Failing to resolve
@@ -1093,10 +1378,33 @@ cmd_preflight() {
   export CANARY_EXPECTED_LATEST
   log "GitHub's latest published release is '$CANARY_EXPECTED_LATEST'; the node must compare against exactly that."
 
+  # Which DECISION the updater is obliged to reach, decided once here because
+  # neither version changes across attempts. Logged in every arm, so a reader of
+  # a green job can tell which assertion actually ran -- an unstated arm is how
+  # a gate comes to be trusted for something it did not check.
+  gate_a_expect="$(gate_a_expected_decision "$shipping_version" "$CANARY_EXPECTED_LATEST")"
+  case "$gate_a_expect" in
+    decline)
+      log "the binary under test (v$shipping_version) is at or ahead of GitHub's latest (v$CANARY_EXPECTED_LATEST) -- the normal Gate A shape, since this release is still a draft. A healthy updater MUST decline to update, and that is what is asserted."
+      ;;
+    update)
+      log "the binary under test (v$shipping_version) is BEHIND GitHub's latest (v$CANARY_EXPECTED_LATEST). This is NOT the normal release path -- a re-run of an older release's workflow, or a hotfix cut on an older line, produces it. A healthy updater MUST decide to update, so that is what is asserted instead."
+      ;;
+    *)
+      warn "could not compare the shipping version ('$shipping_version') with GitHub's latest ('$CANARY_EXPECTED_LATEST') -- at least one is not a bare dotted version. Gate A will NOT assert which decision the updater reached, nor check its exit code. Every other check still runs; the arms skipped are the ones that catch an inverted comparator."
+      ;;
+  esac
+
   # Retry only the INDETERMINATE case. A parse failure is deterministic and
   # retrying it just burns release time; a GitHub blip is worth a second look
   # before we stall a release on it.
-  local attempt rc
+  # `saw_fatal_abort` LATCHES, for the reason Gate B's `saw_unexplained` does:
+  # it changes only the WORDING of the final blocking message, and a run where
+  # one attempt died on a fatal abort must not be described as "GitHub
+  # unreachable, or the check never logged an outcome" just because a later
+  # attempt was. It never makes the gate greener -- every path below is still a
+  # blocked release.
+  local attempt rc saw_fatal_abort=0
   for attempt in $(seq 1 "$CANARY_ATTEMPTS"); do
     log "--- attempt $attempt/$CANARY_ATTEMPTS ---"
     # Wipe the WHOLE tree, not just the logs. The node persists its GitHub
@@ -1128,6 +1436,98 @@ cmd_preflight() {
     else
       assert_detection_healthy "$work/logs"
       rc=$?
+      # WHICH DECISION, asserted only once the log assertion is happy: that one
+      # localises the failure, and a node whose parse failed reaches no decision
+      # worth reporting on. See `assert_gate_a_decision` for why the seven
+      # checks above cannot see this.
+      if [ "$rc" -eq 0 ]; then
+        assert_gate_a_decision "$work/logs" "$gate_a_expect"
+        rc=$?
+      fi
+      # The SECOND, independent observer of the same decision, and the reason it
+      # is worth having both: the log check reads a phrase this repo chooses,
+      # while exit 42 is the supervisor contract itself (see "NOTE ON
+      # AUTO-UPDATE" at the top of crates/core/src/bin/freenet.rs) -- what
+      # actually makes the fleet restart onto another binary.
+      #
+      # `-ne 1`, NOT `-eq 0`, AND THAT IS THE WHOLE POINT OF THE OBSERVER.
+      # It was `-eq 0`, which made the observer unreachable on precisely the
+      # input it exists for. A trigger site whose wording `MARKER_TRIGGERED_RE`
+      # misses -- or a dropped trigger line -- means the node logs NO matched
+      # trigger, and `freenet.rs` `return`s immediately after `update_tx.send`,
+      # so the completion line is never emitted either. `node_check_settled` is
+      # then false, `assert_detection_healthy` returns 2, and an `-eq 0` gate
+      # skips. Gate A burned both attempts and reported "produced no verdict --
+      # GitHub unreachable, or the check never logged an outcome" for a
+      # deterministic self-downgrade. Reproduced on both variants.
+      #
+      # rc=1 is deliberately left alone: `assert_detection_healthy` has already
+      # found a definite fault (an unparseable tag, a disabled updater, a node
+      # that never started), and those localise better than "it exited 42". That
+      # is also what keeps this off the "check never started" case the exit code
+      # alone cannot explain.
+      #
+      # `-ne 1` ADMITS TWO rc=2 ROUTES, not one, and the second is worth naming.
+      # `assert_detection_healthy` also returns 2 for `MARKER_FETCH_FAIL`. If the
+      # node could not reach GitHub it cannot have learned of a newer release, so
+      # a 42 on that run must be the fatal listener -- which
+      # `node_exited_on_fatal_abort` catches, giving rc=2 and a retry. The gap is
+      # narrow but real: if the CRITICAL wording drifts, this branch hard-blocks
+      # with a message asserting "the only release available is OLDER than
+      # itself" about a run where the node never learned what was available. It
+      # needs BOTH conditions at once and the wording is pinned, so it is
+      # recorded rather than guarded. Under `-eq 0` it was unreachable.
+      #
+      # It covers ONE of the log check's two blind directions, not both, and the
+      # OTHER one is worth stating exactly because the obvious guess is wrong.
+      # In the `decline` arm a reworded or missing trigger is caught here. In the
+      # `update` arm it is NOT caught, and it does NOT surface as "did NOT decide
+      # to update": every trigger site `return`s straight after `update_tx.send`,
+      # so a node that triggered emits no completion line either, `rc` is 2, and
+      # `assert_gate_a_decision` is never reached at all (it is gated on rc=0
+      # above). The run burns both attempts and blocks as UNVERIFIED with
+      # "produced no verdict" -- the same wrong-subsystem diagnosis this observer
+      # removes from the `decline` arm, on a node that behaved correctly. Still a
+      # false BLOCK, so still fail-closed; the mechanism is just not the decision
+      # check. Not fixed here because the exit-42 observer must stay scoped to
+      # `decline` (exiting 42 is CORRECT in the update arm, so the code cannot
+      # discriminate), and that arm is off the normal release route.
+      # Latent rather than live -- `run_node_until_check` exports
+      # FREENET_DISABLE_LOG_RATE_LIMIT=1 for exactly this class, and Gate B
+      # depends on the same line anyway -- but the asymmetry is worth knowing
+      # before treating the pair as a full cross-check.
+      #
+      # Only in the `decline` arm. In the `update` arm exiting 42 is the CORRECT
+      # behaviour, and asserting it there instead would add a false-block risk
+      # (a node that triggers late may still be alive when the canary stops it)
+      # for a path that is off the normal release route anyway.
+      #
+      # AND ONLY WITH CORROBORATION, because 42 is overloaded: it is also
+      # `FATAL_LISTENER_EXIT_CODE` (see the marker comments at the top of this
+      # file), which a HEALTHY binary emits when its network event listener dies
+      # or redb is poisoned -- neither of which says anything about the updater.
+      # Blocking a release on that would send the operator to
+      # `compare_versions_for_startup`, code that is fine, which is how a
+      # blocking gate earns the reputation that gets it overridden.
+      #
+      # So the node's own CRITICAL line decides which it was:
+      #   present -> ENVIRONMENTAL. rc=2, retried on a fresh tree, and a run
+      #              that only ever produces this fails as UNVERIFIED rather
+      #              than as an updater fault.
+      #   absent  -> the updater really did ask to be replaced. rc=1, no retry:
+      #              deterministic, and no re-run changes it.
+      # Both messages name the other cause. A gate that confidently blames the
+      # wrong subsystem is worse than one that says it is unsure.
+      if [ "$rc" -ne 1 ] && [ "$gate_a_expect" = "decline" ] && [ "$NODE_EXIT" = "42" ]; then
+        if node_exited_on_fatal_abort "$work"; then
+          note "INDETERMINATE: the node exited 42, but its output carries a CRITICAL fatal-abort line (network event listener exited, or redb poisoned). 42 is ALSO FATAL_LISTENER_EXIT_CODE (crates/core/src/node/p2p_impl.rs), and the canary does not set SYSTEMD_FAST_CRASH_ENV_VAR, so that path uses 42 at every uptime. This is NOT an auto-update fault and NOT evidence the updater is healthy -- the node died for an unrelated reason. Retrying on a fresh tree."
+          saw_fatal_abort=1
+          rc=2
+        else
+          fail "the shipping binary exited 42 (the update-requested code the supervisor acts on) -- it asked its supervisor to replace it, and the only release available is OLDER than itself. A healthy Gate A run ends at 143, because the canary SIGTERMs a node that is still going; reaching 42 means this node exited on its own. Publishing this strands the fleet in a downgrade-and-restart loop: the supervisor installs the older binary, that binary detects this one as newer, and the cycle repeats. Check compare_versions_for_startup in crates/core/src/bin/commands/auto_update.rs for an inverted comparison. (42 is also FATAL_LISTENER_EXIT_CODE, but the canary looked for the CRITICAL fatal-abort line in the node output below and did not find one, so this is not a listener or redb exit.) If you cannot find a 'triggering auto-update' line in the log below, that is expected and is NOT evidence against this verdict: a trigger site whose wording MARKER_TRIGGERED_RE no longer matches produces exactly this shape -- no matched trigger, and no completion line either, because freenet.rs returns as soon as it sends. Check MARKER_TRIGGERED_RE against the trigger sites in freenet.rs before concluding the exit code is wrong."
+          rc=1
+        fi
+      fi
     fi
     # Keep the evidence before the next attempt wipes the tree, or the EXIT trap
     # deletes it. Only on a non-zero verdict, so a healthy release stays quiet.
@@ -1139,6 +1539,10 @@ cmd_preflight() {
     fi
   done
 
+  if [ "$saw_fatal_abort" -eq 1 ]; then
+    fail "the shipping binary's update check produced no verdict in $CANARY_ATTEMPTS attempts, and on at least one of them the node exited 42 after a CRITICAL fatal abort (network event listener exited, or redb poisoned -- see the node output above). That is NOT the update-requested exit and NOT an auto-update fault: 42 is also FATAL_LISTENER_EXIT_CODE (crates/core/src/node/p2p_impl.rs), and the canary does not opt into the distinct code 45. Nothing was learned about the updater, so this is an UNVERIFIED result rather than a detected bug: re-run this job, and if it recurs look at why the node's listener or storage is dying on this runner. Do NOT un-draft the release by hand -- an unverified gate is not a passed gate."
+    return 1
+  fi
   fail "the shipping binary's update check produced no verdict in $CANARY_ATTEMPTS attempts -- GitHub unreachable, or the check never logged an outcome. Cannot confirm its updater works. This is an UNVERIFIED result, not a detected bug: re-run this job. Do NOT un-draft the release by hand to work around it -- an unverified gate is not a passed gate."
   return 1
 }
@@ -1384,7 +1788,18 @@ cmd_selfupdate() {
   fi
   [ "$rc" -eq 0 ] || return 1
 
+  # Gate B needs no mirror of `assert_gate_a_decision`: it already asserts its own
+  # direction, here and at the exit-42 check below, and its direction is fixed
+  # (the release IS published by now, so the previous binary must always decide
+  # to update). What it did not do is say WHY it stayed put when the node told
+  # it -- so the #4073 refusal, the one non-obvious cause, gets named. Message
+  # only; the verdict is unchanged either way.
   if ! node_decided_to_update "$work/logs"; then
+    if node_refused_locally_gated "$work/logs"; then
+      fail "v$prev_version saw v$expected_version and REFUSED it as locally blocked (#4073: crash-loop known-bad pin or repeated install failures). The canary runs it under a fresh, isolated HOME with no such history, so there is nothing for that gate to have matched -- is_version_pinned_bad / is_version_install_gated (crates/core/src/bin/commands/rollback.rs) is matching wrongly, and every node on v$prev_version will refuse this release the same way. Do NOT read this as the ordinary 'stayed put' case."
+      log_lines "$work/logs" "$MARKER_NOT_TRIGGERED" | head -2 >&2
+      return 1
+    fi
     fail "v$prev_version parsed GitHub's response but did NOT decide to update to v$expected_version. The release is published and visible, so a node on the previous version is choosing to stay put -- the fleet will not converge."
     return 1
   fi

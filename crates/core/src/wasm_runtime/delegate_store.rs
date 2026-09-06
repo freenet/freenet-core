@@ -13,6 +13,47 @@ use super::RuntimeResult;
 /// Registration record version for .reg files
 const REG_FILE_VERSION: u8 = 1;
 
+/// Delegate instance index (`DelegateKey -> CodeHash`) shared across every pool
+/// executor's [`DelegateStore`], so a delegate registered or removed via one
+/// executor is immediately visible to all of them.
+///
+/// The contract side has had this since #4218; the delegate side did not, so each
+/// executor's index froze at whatever ReDb held when it was constructed. That was
+/// survivable only because a warm (shared) compiled-module cache let a sibling
+/// executor run a delegate its own index had never heard of — which stops being
+/// true once the module cache is keyed by an index-resolved code hash (#5268), so
+/// the divergence has to be closed rather than relied upon.
+pub type SharedDelegateIndex = Arc<DashMap<DelegateKey, CodeHash>>;
+
+/// Source-WASM byte cache shared across every pool executor's [`DelegateStore`].
+/// See [`crate::wasm_runtime::SharedCodeCache`] for why these are shared rather
+/// than built per executor.
+pub type SharedDelegateCodeCache = MokaCache<CodeHash, Arc<DelegateCode<'static>>>;
+
+/// Build a source-WASM byte cache bounded by `max_size` bytes.
+pub fn new_code_cache(max_size: u64) -> SharedDelegateCodeCache {
+    MokaCache::builder()
+        .max_capacity(max_size)
+        .weigher(
+            |key: &CodeHash, value: &Arc<DelegateCode<'static>>| -> u32 {
+                // Saturate to u32::MAX on overflow as moka recommends. A delegate
+                // WASM module larger than 4 GiB would indicate a bug in upstream
+                // size validation — log it loudly.
+                let len = value.as_ref().as_ref().len();
+                u32::try_from(len).unwrap_or_else(|_| {
+                    tracing::warn!(
+                        code_hash = %key,
+                        size_bytes = len,
+                        "Delegate code exceeds u32::MAX in cache weigher; \
+                         saturating. This should be impossible."
+                    );
+                    u32::MAX
+                })
+            },
+        )
+        .build()
+}
+
 pub struct DelegateStore {
     delegates_dir: PathBuf,
     delegate_cache: MokaCache<CodeHash, Arc<DelegateCode<'static>>>,
@@ -29,12 +70,30 @@ impl DelegateStore {
     /// - max_size: max size in bytes of the delegates being cached
     /// - db: ReDb storage for persistent index
     pub fn new(delegates_dir: PathBuf, max_size: u64, db: Storage) -> RuntimeResult<Self> {
+        Self::new_with_shared(
+            delegates_dir,
+            db,
+            SharedDelegateIndex::default(),
+            new_code_cache(max_size),
+        )
+    }
+
+    /// Like [`Self::new`] but adopting a caller-owned index and source-byte cache
+    /// so every pool executor's store shares one of each. Both are populated
+    /// idempotently, so it does not matter which executor is constructed first.
+    /// See [`SharedDelegateIndex`] and [`SharedDelegateCodeCache`].
+    pub fn new_with_shared(
+        delegates_dir: PathBuf,
+        db: Storage,
+        shared_index: SharedDelegateIndex,
+        shared_code_cache: SharedDelegateCodeCache,
+    ) -> RuntimeResult<Self> {
         std::fs::create_dir_all(&delegates_dir).map_err(|err| {
             tracing::error!("error creating delegate dir: {err}");
             err
         })?;
 
-        let key_to_code_part = Arc::new(DashMap::new());
+        let key_to_code_part = shared_index;
 
         // Phase 1: Load index from ReDb (primary store)
         match db.load_all_delegate_index() {
@@ -129,30 +188,22 @@ impl DelegateStore {
         }
 
         Ok(Self {
-            delegate_cache: MokaCache::builder()
-                .max_capacity(max_size)
-                .weigher(
-                    |key: &CodeHash, value: &Arc<DelegateCode<'static>>| -> u32 {
-                        // Saturate to u32::MAX on overflow as moka recommends.
-                        // A delegate WASM module larger than 4 GiB would indicate
-                        // a bug in upstream size validation — log it loudly.
-                        let len = value.as_ref().as_ref().len();
-                        u32::try_from(len).unwrap_or_else(|_| {
-                            tracing::warn!(
-                                code_hash = %key,
-                                size_bytes = len,
-                                "Delegate code exceeds u32::MAX in cache weigher; \
-                                 saturating. This should be impossible."
-                            );
-                            u32::MAX
-                        })
-                    },
-                )
-                .build(),
+            delegate_cache: shared_code_cache,
             delegates_dir,
             key_to_code_part,
             db,
         })
+    }
+
+    /// Whether any delegate this node still has indexed runs `code_hash`.
+    ///
+    /// Mirrors the reference check [`Self::remove_delegate`] already applies
+    /// before deleting a shared `.wasm` blob; callers use it to decide whether a
+    /// compiled module keyed by that code hash is still needed.
+    pub fn code_still_referenced(&self, code_hash: &CodeHash) -> bool {
+        self.key_to_code_part
+            .iter()
+            .any(|entry| entry.value() == code_hash)
     }
 
     // Returns a copy of the delegate bytes if available, none otherwise.
@@ -457,6 +508,14 @@ impl DelegateStore {
             .with_extension("wasm"))
     }
 
+    /// The code hash this node recorded for `key`, or `None` when it never
+    /// registered that delegate.
+    ///
+    /// The authoritative resolution the compiled-module cache keys on (#5268),
+    /// for exactly the reason [`Self::fetch_delegate`] documents: the `code_hash`
+    /// a caller's `DelegateKey` carries is unverified serde data, so trusting it
+    /// would let a caller name a delegate while choosing which cached module ran
+    /// for it.
     pub fn code_hash_from_key(&self, key: &DelegateKey) -> Option<CodeHash> {
         self.key_to_code_part.get(key).map(|r| *r.value())
     }

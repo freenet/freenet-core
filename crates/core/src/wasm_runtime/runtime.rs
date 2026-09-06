@@ -15,7 +15,7 @@ use freenet_stdlib::{
     },
     prelude::*,
 };
-use std::sync::atomic::AtomicI64;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use super::ModuleCache;
@@ -39,9 +39,237 @@ use super::ModuleCache;
 ///   *count* cap did (the eviction-recompilation cycle behind issue #4441).
 /// - It bounds the cache's absolute memory footprint regardless of contract
 ///   count, which a count cap could not (1024 large modules ≫ 1024 small ones).
+///
+/// The contract cache is keyed by [`CodeHash`], NOT by `ContractKey`. Compilation
+/// only ever sees the WASM code (`engine.compile(code)`); parameters are written
+/// into linear memory at call time. Keying by `ContractKey` — whose `Hash`/`Eq`
+/// compare `instance = blake3(code_hash ‖ params)` — therefore compiled and
+/// retained one copy of identical machine code per PARAMETER SET: a measured
+/// ~17x duplication on a production gateway (3,746 cached modules for 215
+/// distinct `.wasm` files), which is issue #5268's largest single contributor to
+/// peers being OOM-killed at the shipped 2 GiB `MemoryMax`. The source-bytes
+/// cache one layer down (`ContractStore::contract_cache`) already keys this way.
 pub(crate) type SharedModuleCache<K> = Arc<Mutex<ModuleCache<K, <Engine as WasmEngine>::Module>>>;
 
-static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
+/// Content hash of a contract container's WASM code, derived from the bytes
+/// themselves rather than from the container's self-declared `code` field
+/// (`ContractCode::hash()` returns a stored field; nothing recomputes it on
+/// deserialization — see `ContractStore::verify_contract_identity`).
+/// Returns an error rather than `unimplemented!()` on the catch-all, matching
+/// `ContractStore::store_contract`'s reasoning for the identical situation:
+/// unreachable today (V1 is `ContractWasmAPIVersion`'s only variant), but the
+/// enum is `#[non_exhaustive]`, and this now runs on the common PUT path, so a
+/// future variant would make that panic reachable from ordinary traffic.
+fn wasm_code_hash(contract: &ContractContainer) -> RuntimeResult<CodeHash> {
+    match contract {
+        ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
+            Ok(CodeHash::from_code(contract_v1.code().data()))
+        }
+        ContractContainer::Wasm(_) | _ => {
+            Err(anyhow::anyhow!("unsupported contract container version").into())
+        }
+    }
+}
+
+/// Warn, at most once per contract code hash per process, that a contract reads
+/// the host wall clock.
+///
+/// Returns whether this call emitted the warning, so the once-per-contract
+/// DECISION can be unit-tested cheaply, without a subscriber and without a
+/// compiled contract.
+///
+/// That return value is a convenience, not the guard. A return value cannot
+/// distinguish `warn!` from `debug!`, so on its own it leaves the whole
+/// operator-facing deliverable removable by one token with every test green.
+/// The emission itself is pinned behaviourally by
+/// `tests::host_clock::a_clock_reading_contract_warns_at_load`, which drives a
+/// real stdlib-built clock importer through `prepare_contract_call` and asserts
+/// a WARN line. Log capture is safe to do that with:
+/// [`crate::util::test_log_capture::install`] exists precisely to defuse the
+/// process-global callsite-`Interest` problem (#5314/#4927) that an earlier
+/// version of this comment cited as the reason to avoid it.
+///
+/// # Why the load path rather than the store path
+///
+/// `ContractStore::store_contract` is the obvious hook and is the wrong one for
+/// this warning. It returns early whenever the code blob is already cached or
+/// already on disk, so it fires once per code hash per node's DISK lifetime and
+/// never again — which means it would never fire for any of the deployed
+/// clock-reading contracts found by the #5465 census, because those are already
+/// in every affected node's store. An operator upgrading into the deprecation
+/// would see nothing. Warning where the module is COMPILED fires for a contract
+/// that was already stored before the upgrade, and only for contracts the node
+/// actually runs.
+///
+/// # Why it is not noisy
+///
+/// The call site is the module-cache MISS branch, so it is already bounded by
+/// Cranelift compiles rather than by operations — a hosted contract executes
+/// constantly and compiles approximately once. The `SEEN` set then makes it
+/// exactly once per code hash for the life of the process, so module-cache
+/// thrash (#4441) cannot turn a deprecation notice into a log flood.
+///
+/// # Why `SEEN` is capped
+///
+/// The key is remotely influenced: a PUT decides what code hash gets inserted.
+/// An earlier version of this comment justified leaving the set unbounded on the
+/// grounds that every entry requires a WASM blob in the node's own store, which
+/// is wrong twice. The store EVICTS and `SEEN` does not, so the set outlives
+/// what it was claimed to be bounded by; and the insert happens BEFORE
+/// `engine.compile()` at the call site while [`crate::conformance::imports_host_clock`] returns as
+/// soon as it sees the import pair, so roughly 70 bytes of otherwise-malformed
+/// WASM buys a permanent entry with no compile at all.
+///
+/// The practical severity is low — reaching ~100 MB of node RSS takes on the
+/// order of 2M entries and 0.5-2 GB of upload, so the amplification is under 1x
+/// and the same PUTs would surface as store writes long before memory did — but
+/// `.claude/rules/code-style.md` forbids unbounded per-key collections keyed on
+/// externally-influenced data, and the justification for the exception was
+/// false. So it is capped.
+///
+/// Past the cap the warning still fires; only the dedup stops. Be explicit about
+/// what that trades: a process holding 4096+ DISTINCT clock-importing code
+/// hashes re-warns for any further contract on every module-cache miss, so the
+/// log gets noisier. Three reasons that is the right side to fail on:
+///
+/// - the alternative — stop warning past the cap — would silently exempt every
+///   clock-reading contract after the 4096th from a deprecation notice, which is
+///   the one outcome this must not have. Noise is recoverable; silence is not;
+/// - the noise is bounded by COMPILES, not by requests. The call site is the
+///   module-cache miss branch, so a hosted contract that executes constantly
+///   still warns about once. Losing the dedup raises the rate from once-ever to
+///   once-per-compile, not to once-per-operation;
+/// - the census found dozens of such contracts network-wide (37, itself a
+///   floor), so no honest node comes within two orders of magnitude of the cap.
+///   Reaching it means either an attack, in which case the cap is doing its job
+///   and the extra log lines are the signal, or an assumption here has gone
+///   badly stale and the noise is how we find out.
+///
+/// Do NOT instead move the insert after `compile`: a module that fails to
+/// compile would then be re-warned on every retry.
+/// Ceiling on the `SEEN` dedup set in [`warn_on_host_clock_import`].
+///
+/// Enough for every clock-importing contract the network is known to carry,
+/// several orders over. See that function's "Why `SEEN` is capped".
+///
+/// Module-level rather than function-local so a test can assert on it: as a
+/// local it was invisible to the test module, and `SEEN_CAP = usize::MAX` — the
+/// mutation that restores the unbounded remotely-keyed collection this cap
+/// exists to prevent — left the whole suite green.
+const SEEN_CAP: usize = 4096;
+
+/// Compile-time guard on the value above.
+///
+/// A `#[test]` cannot do this job: clippy rejects a runtime assertion on a
+/// constant, and the two cap tests exercise `decide_host_clock_warning` with a
+/// LOCAL cap, so they say nothing about `SEEN_CAP` itself — measured,
+/// `SEEN_CAP = usize::MAX` left the entire suite green, restoring exactly the
+/// unbounded remotely-keyed collection the cap was added to prevent. As a
+/// `const` assertion a bad value fails the BUILD, which is stronger.
+///
+/// The upper bound is deliberately loose: this pins that the constant is a
+/// BOUND, not that it is 4096, so retuning it stays a one-line change.
+const _: () = assert!(
+    SEEN_CAP > 0 && SEEN_CAP <= 65_536,
+    "SEEN_CAP must be a real bound: `SEEN` is keyed on a contract code hash a \
+     remote PUT chooses, and .claude/rules/code-style.md forbids an unbounded \
+     per-key collection on externally-influenced data. A zero cap is also wrong \
+     — it records nothing, so every clock-reading contract re-warns on every \
+     module-cache miss."
+);
+
+fn warn_on_host_clock_import(key: &ContractKey, code_hash: &CodeHash, code: &[u8]) -> bool {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<CodeHash>>> =
+        std::sync::OnceLock::new();
+
+    // Parse BEFORE the lock, and take the lock only for a contract that
+    // actually imports the clock.
+    //
+    // Restores the ordering this function had before `decide_host_clock_warning`
+    // was extracted. The extraction was for testability and never needed the
+    // parse under the mutex; leaving it there meant EVERY module-cache miss took
+    // a process-global lock, including the overwhelming majority of contracts
+    // that import no clock. (It did not serialise compiles — the guard is
+    // dropped before `engine.compile` runs in the caller — but a global lock
+    // held across a parse for no reason is the wrong shape.)
+    //
+    // `decide_host_clock_warning` re-checks. That is deliberate: it is the
+    // tested unit and has to stand alone, the check is pure, and it
+    // short-circuits at the import section, so for the ~dozens of
+    // clock-importing contracts network-wide the duplicate is sub-microsecond
+    // against a Cranelift compile in the hundreds of milliseconds.
+    if !crate::conformance::imports_host_clock(code) {
+        return false;
+    }
+    let seen = SEEN.get_or_init(Default::default);
+    if !decide_host_clock_warning(seen, SEEN_CAP, code_hash, code) {
+        return false;
+    }
+    tracing::warn!(
+        contract = %key,
+        %code_hash,
+        namespace = crate::conformance::HOST_CLOCK_NAMESPACE,
+        function = crate::conformance::HOST_CLOCK_IMPORT,
+        docs = crate::conformance::HOST_CLOCK_DEPRECATION_DOC,
+        "this contract imports the host wall clock, which is DEPRECATED for \
+         contracts: a merge that reads the clock is not a function of its \
+         inputs, so replicas of this contract are not guaranteed to converge. \
+         In a future release the call will TRAP (issue #5465) — the contract \
+         will still load, but any actual call to the clock will fail that \
+         operation. A contract that imports the symbol without reaching it \
+         keeps working and needs no re-key. Delegates are unaffected. See the \
+         docs link for what to do instead"
+    );
+    true
+}
+
+/// Whether this load should warn, given what has already been warned about.
+///
+/// Split out from [`warn_on_host_clock_import`] so the dedup, its cap and its
+/// concurrency can be tested against a LOCAL set. The real set is a
+/// process-global static shared by every test in the binary, so a test that
+/// filled it to the cap would leave every later test's contract un-deduped —
+/// the process-global cross-test coupling `.claude/rules/testing.md` exists
+/// about, and one `cargo nextest` cannot see.
+///
+/// Takes the `Mutex` rather than a `&mut` to the set it guards, so the
+/// check-then-insert atomicity is this function's own property and a test can
+/// hold it to it. See the comment on the guard below.
+fn decide_host_clock_warning(
+    seen: &Mutex<std::collections::HashSet<CodeHash>>,
+    cap: usize,
+    code_hash: &CodeHash,
+    code: &[u8],
+) -> bool {
+    if !crate::conformance::imports_host_clock(code) {
+        return false;
+    }
+    // ONE guard across the membership check AND the insert. The two must be
+    // atomic with respect to each other: `RuntimePool`'s worker threads reach
+    // this concurrently for the same code hash whenever a burst of first-touch
+    // requests races to compile a freshly-PUT contract, and a check-then-insert
+    // split across two acquisitions lets every racer observe "absent" and warn.
+    //
+    // The lock is taken HERE rather than by the caller so that this is the
+    // tested unit's own property rather than an unwritten obligation on
+    // whoever calls it — `concurrent_callers_for_one_contract_warn_exactly_once`
+    // drives this function from many threads and goes red if the guard is
+    // split. Taking `&mut HashSet` instead would make the race impossible to
+    // express, and therefore impossible to test for: the borrow checker would
+    // enforce atomicity here while the real regression moved to the call site,
+    // where nothing was watching.
+    let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(code_hash) {
+        return false;
+    }
+    // Past the cap, stop recording but keep warning. Under-deduping is noisy;
+    // over-deduping would silently drop the deprecation notice for every
+    // contract after the cap, which is the one outcome this must not have.
+    if seen.len() < cap {
+        seen.insert(*code_hash);
+    }
+    true
+}
 
 /// A live WASM instance with RAII cleanup.
 ///
@@ -65,12 +293,16 @@ impl RunningInstance {
         key: Key,
         req_bytes: usize,
     ) -> RuntimeResult<Self> {
-        let id = INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Route the guest-entry call through classify_result so an epoch interrupt
         // during a runaway module start function normalizes to
         // MaxComputeTimeExceeded (Timeout class), not the generic "execution
         // timeout" that is_wasm_timeout misses (#4864 round-5).
-        let handle = super::classify_result(engine.create_instance(module, id, req_bytes))?;
+        //
+        // The engine issues the instance id from the single process-global
+        // allocator (`native_api::next_instance_id`) and hands it back in the
+        // handle. See that allocator's docs for why no caller may pick one.
+        let handle = super::classify_result(engine.create_instance(module, req_bytes))?;
+        let id = handle.id;
 
         // Record memory address and size for host function pointer arithmetic
         let (ptr, size) = engine.memory_info(&handle)?;
@@ -171,6 +403,13 @@ pub enum ContractExecError {
     /// peers). See `ExecutorError::host_timeout` in `contract/executor.rs`.
     #[error("The operation was queued too long on a saturated execution pool and never ran")]
     SchedulerOverloaded,
+
+    /// The module loaded but does not export the contract entry points.
+    ///
+    /// Distinct from a contract that errors: this is not a contract at all, and the
+    /// difference matters to any caller that treats "could not judge" as benign.
+    #[error("module is not a contract: missing required export(s): {missing}")]
+    MissingContractExports { missing: String },
 }
 
 pub struct RuntimeConfig {
@@ -210,8 +449,9 @@ pub struct RuntimeConfig {
     /// overrides wasmtime's 512 MiB default via
     /// `CacheConfig::with_files_total_size_soft_limit`; `None` keeps the default.
     /// Production resolves it from
-    /// [`default_wasmtime_cache_size_bytes`], which scales it to the memory the
-    /// node may use instead of pinning a flat constant.
+    /// [`default_wasmtime_cache_size_bytes_for_dir`], which scales it to BOTH
+    /// the memory the node may use AND the disk actually free on the cache's
+    /// mount, instead of pinning a flat constant or a RAM-only figure.
     pub wasmtime_cache_size_bytes: Option<u64>,
 }
 
@@ -311,12 +551,15 @@ pub(crate) const MAX_WASMTIME_CACHE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 /// defaults* stay ordered at every host size. Do not restate this as a
 /// system-level invariant.
 ///
-/// Note also that a RAM signal is not the right shape for this cache's real
-/// constraint: the compile cache is charged against the aggregate **disk** budget
-/// (`DiskUsageTracker::total_bytes()` sums state + wasm + compile-cache bytes and
-/// gates `admit_state_write` / `admit_wasm_write`), so a disk-tight but RAM-rich
-/// host is not protected by any RAM-derived bound. Tracked separately in #5014;
-/// this constant narrows the exposure on RAM-poor hosts without closing it.
+/// Note also that a RAM signal ALONE is not the right shape for this cache's
+/// real constraint: the compile cache is charged against the aggregate
+/// **disk** budget (`DiskUsageTracker::total_bytes()` sums state + wasm +
+/// compile-cache bytes and gates `admit_state_write` / `admit_wasm_write`), so
+/// a disk-tight but RAM-rich host is not protected by a RAM-derived bound on
+/// its own. This divisor narrows the exposure on RAM-poor hosts; the disk-tight
+/// case is closed by composing this RAM term with a disk-derived term via
+/// `min()` — see [`combine_wasmtime_cache_size`] / [`wasmtime_cache_size_for_disk`]
+/// (#5014).
 const WASMTIME_CACHE_RAM_DIVISOR: u64 = 8;
 
 /// Fallback "memory the node may use" estimate (1 GiB) when the OS query fails.
@@ -371,22 +614,327 @@ const WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES: u64 = 1024 * 1024 * 1024;
 /// [`default_module_cache_budget_bytes`](super::default_module_cache_budget_bytes)
 /// and overridable via `--module-cache-budget-bytes`). The two are separate
 /// caches with separate budgets; this one has no operator override today (it
-/// never had one — it was a private constant), so this derived default is its
-/// only source.
-pub(crate) fn default_wasmtime_cache_size_bytes() -> u64 {
-    let total_ram = super::read_total_ram_bytes()
-        .map(|v| v as u64)
-        .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
-    wasmtime_cache_size_for_ram(total_ram)
-}
-
-/// Pure clamp math behind [`default_wasmtime_cache_size_bytes`], split out so the
-/// small-box / large-box / cgroup boundary behavior is unit-testable without
-/// depending on the test host's real RAM. Mirrors the `budget_for_ram` /
-/// `disk_budget_for_clamped` pattern used by the sibling budgets.
+/// never had one — it was a private constant), so this derived default (see
+/// [`default_wasmtime_cache_size_bytes_for_dir`]) is its only source.
+///
+/// # Pure clamp math behind the RAM-side term
+///
+/// Split out so the small-box / large-box / cgroup boundary behavior is
+/// unit-testable without depending on the test host's real RAM. Mirrors the
+/// `budget_for_ram` / `disk_budget_for_clamped` pattern used by the sibling
+/// budgets.
 pub(crate) fn wasmtime_cache_size_for_ram(total_ram: u64) -> u64 {
     (total_ram / WASMTIME_CACHE_RAM_DIVISOR)
         .clamp(MIN_WASMTIME_CACHE_SIZE_BYTES, MAX_WASMTIME_CACHE_SIZE_BYTES)
+}
+
+/// Fraction of the disk space *available* on the compile-cache's mount that
+/// sizes the on-disk compile cache's disk-side term (#5014): 1/8, the SAME
+/// fraction [`WASMTIME_CACHE_RAM_DIVISOR`] applies on the RAM side, so this
+/// stays one story ("an eighth of the resource, floored and ceilinged the
+/// same way") rather than two unrelated fractions.
+const WASMTIME_CACHE_DISK_DIVISOR: u64 = 8;
+
+/// Lower clamp for the compile cache's DISK-side term ONLY (#5328 review) —
+/// deliberately LOWER than [`MIN_WASMTIME_CACHE_SIZE_BYTES`] (the RAM-side
+/// floor, also the aggregate hosting-disk budget's own floor,
+/// `MIN_DEFAULT_HOSTING_BUDGET_BYTES` in `ring/hosting/cache.rs`).
+///
+/// If the disk-side term shared the 128 MiB RAM-side floor, the two floors
+/// would COLLIDE on a genuinely small disk: `wasmtime_cache_size_for_disk`
+/// would floor at 128 MiB at the exact same reachable-disk size
+/// (256 MiB) where the aggregate disk budget ALSO floors at 128 MiB,
+/// leaving EXACTLY ZERO headroom for actual contract state — the compile
+/// cache alone would consume the entire disk-budget floor, on any host with
+/// <= 256 MiB reachable disk. That is a narrower, but still real, residual
+/// instance of the wedge #5014 exists to fix.
+///
+/// Set to `MIN_WASMTIME_CACHE_SIZE_BYTES / 4` (32 MiB) so the two floors'
+/// breakeven points coincide exactly (`32 MiB * WASMTIME_CACHE_DISK_DIVISOR
+/// == 256 MiB == MIN_DEFAULT_HOSTING_BUDGET_BYTES /
+/// DEFAULT_HOSTING_DISK_PCT`), which makes the headroom function
+/// `disk_budget - disk_term` CONTINUOUS and strictly positive across every
+/// reachable-disk size, not just the one worked example in the issue —
+/// verified by `disk_term_never_exceeds_a_quarter_of_the_aggregate_disk_budget_floor`
+/// and `headroom_is_always_positive_across_reachable_disk_sizes` below. 32 MiB
+/// still buys ~40 entries at the measured p90 on-disk artifact size (811 KiB,
+/// see [`MIN_WASMTIME_CACHE_SIZE_BYTES`]'s doc) — reduced from the RAM
+/// floor's ~161, but a host this disk-constrained also hosts far fewer
+/// distinct contracts, so a smaller working set is the right trade rather
+/// than zero state headroom.
+const MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK: u64 = MIN_WASMTIME_CACHE_SIZE_BYTES / 4;
+
+/// Pure clamp math for the compile cache's DISK-side term (#5014), the disk
+/// analogue of [`wasmtime_cache_size_for_ram`]. Same ceiling
+/// (`MAX_WASMTIME_CACHE_SIZE_BYTES`) as the RAM side but its OWN, lower floor
+/// ([`MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK`] — see that constant's doc for
+/// why sharing the RAM-side floor would leave zero state-budget headroom on
+/// a small disk).
+///
+/// `available_disk_bytes` is deliberately just the free-space reading, NOT
+/// `used + available` the way [`crate::ring::hosting::cache::disk_budget_for_clamped`]
+/// sizes the aggregate hosting-disk budget: that basis exists so the OVERALL
+/// budget doesn't shrink as a node fills with its OWN legitimately-admitted
+/// state. Here we want the opposite bias — a fresh `statvfs` read of "what's
+/// free right now" is the more conservative (safer) signal for a cache that
+/// is about to compete with state/wasm writes for that same headroom, and it
+/// needs no pre-seeded "used" figure, which isn't available yet at the point
+/// in startup this sizing runs (see [`default_wasmtime_cache_size_bytes_for_dir`]).
+/// The caller is responsible for making `available_disk_bytes` itself stable
+/// across restarts (folding the cache's OWN current footprint back in) — see
+/// that function's "Why `available_disk_bytes` folds the cache's own size
+/// back in" section; this function only applies the clamp.
+pub(crate) fn wasmtime_cache_size_for_disk(available_disk_bytes: u64) -> u64 {
+    (available_disk_bytes / WASMTIME_CACHE_DISK_DIVISOR).clamp(
+        MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK,
+        MAX_WASMTIME_CACHE_SIZE_BYTES,
+    )
+}
+
+/// Combine the RAM-side and disk-side terms into the compile cache's actual
+/// soft limit (#5014): `min(ram_term, disk_term)`, so a disk-tight host is
+/// bounded even when RAM is ample. `available_disk_bytes` is `None` when the
+/// mount's free-space signal could not be read (statvfs failure or an
+/// unsupported platform) — mirrors
+/// [`crate::ring::hosting::disk_usage::available_bytes`]'s own rule that an
+/// unreadable signal must not silently shrink a budget: fall back to the
+/// RAM-only figure (today's shipped behavior) rather than invent a possibly-
+/// wrong tight cap from a signal we don't trust.
+///
+/// Split out from [`default_wasmtime_cache_size_bytes_for_dir`] as pure
+/// function so the RAM/disk interaction (which one binds, the `None`
+/// fallback) is unit-testable without a real host's RAM or a real mount.
+pub(crate) fn combine_wasmtime_cache_size(
+    total_ram: u64,
+    available_disk_bytes: Option<u64>,
+) -> u64 {
+    let ram_term = wasmtime_cache_size_for_ram(total_ram);
+    match available_disk_bytes {
+        Some(available) => ram_term.min(wasmtime_cache_size_for_disk(available)),
+        None => ram_term,
+    }
+}
+
+/// The wasmtime on-disk compile cache's soft limit, bounded by BOTH the
+/// memory the node may use AND the disk space actually free on the cache
+/// directory's mount (#5014). This is the function the production path
+/// (`Executor::from_config_with_shared_modules`) calls; the non-production
+/// `Runtime::build` path never relocates the cache and has no directory to
+/// probe, so it keeps wasmtime's own default location + flat 512 MiB limit,
+/// unchanged.
+///
+/// # Callers MUST gate this on actually building a new backend engine
+///
+/// This does real filesystem work (a `statvfs` call and, via
+/// [`reconcile_existing_cache_dir`], a full recursive directory walk and
+/// possibly a `remove_dir_all`), so a caller must call it only for the ONE
+/// executor per node that actually builds a fresh `wasmtime::Engine` /
+/// `Cache` (`shared_backend.is_none()` in `from_config_with_shared_modules`
+/// — every other pool worker, and every mid-life
+/// `create_replacement_executor` panic-recovery call, reuses the already-built
+/// shared engine and never reads the value this returns). Calling it
+/// unconditionally would, on a live node, run the reconciliation's
+/// `remove_dir_all` against a directory the shared engine is actively
+/// reading/writing — exactly the kind of already-populated, in-use cache the
+/// reconciliation is meant to only ever touch once, at boot, before anything
+/// is using it (#5328 review).
+///
+/// # Why this needs the directory, not just a number
+///
+/// Wasmtime applies its soft limit once, at `Cache::new`, with no live
+/// re-application path — so this is a start-time-only value, and the
+/// filesystem probe (`statvfs` on `dir`) has to happen HERE, synchronously,
+/// before the engine is built. It cannot go through the aggregate
+/// [`crate::ring::hosting::disk_usage::DiskUsageTracker`] instead: that
+/// tracker is seeded lazily on the first ~60s sweep tick, well after this
+/// function's caller needs an answer, and seeding it here would mean walking
+/// every persisted contract-state row before the node can even build its WASM
+/// engine.
+///
+/// # Immediate relief for an already-oversized cache
+///
+/// A node upgrading from an older build (or one that just got less disk) can
+/// already have MORE on disk than the limit computed here. Wasmtime's own
+/// cleanup is gated by a marker file compared against a ~1h interval, and
+/// that marker persists across restarts — so a node that hasn't cleaned up
+/// recently often DOES prune promptly on its first post-restart cache write
+/// (#5328 review), not after a fixed wait. But there is no GUARANTEE of
+/// that (a node that restarts often, or restarts shortly after its own
+/// cleanup ran, waits out the rest of the interval either way), and while
+/// waiting the wedge persists. Reconciling here, once, at startup, gives
+/// the fix effect on the very next restart unconditionally, rather than
+/// depending on wasmtime's internal cleanup timing (see
+/// [`reconcile_existing_cache_dir`]).
+///
+/// # Why `available_disk_bytes` folds the cache's own current size back in
+///
+/// A naive `statvfs` read of raw free space makes the computed limit a
+/// function of the cache's OWN current footprint — the cache occupies disk,
+/// so a bigger cache means less "available," means a SMALLER computed limit
+/// next boot, which (if it now reads as an overshoot) triggers
+/// [`reconcile_existing_cache_dir`] to wipe the cache, which makes MORE disk
+/// "available" next boot, computing a LARGER limit, letting the cache regrow
+/// toward it, shrinking "available" again on the boot after that — a
+/// feedback loop that (#5328 review, verified by hand) converges to
+/// wiping-every-other-restart in steady state for an actively-used node,
+/// defeating the entire point of a persistent on-disk compile cache. Adding
+/// the cache's OWN current on-disk size back to the raw `statvfs` reading
+/// makes the basis `raw_free + current_cache_bytes` — the disk capacity
+/// reachable if the cache were empty — which does NOT depend on the cache's
+/// current size, so the computed limit is STABLE across restarts as long as
+/// other disk usage (state, wasm, unrelated files) doesn't change. This
+/// mirrors the SAME `used + available` stability rationale
+/// [`crate::ring::hosting::cache::disk_budget_for_clamped`] already documents
+/// for the aggregate hosting-disk budget.
+///
+/// # Why the operator's configured disk budget also has to bind
+///
+/// Bounding purely by PHYSICAL disk availability closes the accidental case
+/// (a small physical disk) but not the deliberate one: an operator who sets
+/// `--max-hosting-disk` below the disk's physical capacity (e.g. to reserve
+/// room for other services on a large shared disk) still has physical
+/// availability read as large, so the physical term alone would still
+/// resolve to the RAM ceiling — reproducing #5014's wedge against the
+/// operator's OWN configured budget instead of against physical scarcity.
+/// This was the ORIGINAL issue's own suggested direction (reuse
+/// [`crate::ring::hosting::cache::disk_budget_for_clamped`], the exact
+/// function the live aggregate budget uses), not an addition beyond its
+/// scope. See [`bound_by_configured_disk_budget`].
+pub(crate) fn default_wasmtime_cache_size_bytes_for_dir(
+    dir: &Path,
+    hosting_disk_pct: f64,
+    max_hosting_disk: u64,
+) -> u64 {
+    let total_ram = super::read_total_ram_bytes()
+        .map(|v| v as u64)
+        .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
+    // Walk ONCE, share the result between the stabilized availability signal
+    // and the reconciliation threshold check below — no need to re-walk.
+    let current_cache_bytes = crate::ring::disk_directory_size_bytes(dir);
+    let raw_available_disk_bytes = crate::ring::disk_available_bytes(dir);
+    let stabilized_available_disk_bytes =
+        stabilize_available_disk_bytes(raw_available_disk_bytes, current_cache_bytes);
+    let physical_term = combine_wasmtime_cache_size(total_ram, stabilized_available_disk_bytes);
+    let limit = bound_by_configured_disk_budget(
+        physical_term,
+        current_cache_bytes,
+        raw_available_disk_bytes,
+        hosting_disk_pct,
+        max_hosting_disk,
+    );
+    reconcile_existing_cache_dir(dir, current_cache_bytes, limit);
+    limit
+}
+
+/// Fraction of the operator's CONFIGURED aggregate disk budget the compile
+/// cache may consume on its own (#5328 review) — 1/4, the SAME fraction
+/// [`MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK`] uses relative to the RAM-side
+/// floor, so the two mechanisms agree at their shared worst case: when the
+/// configured budget is itself at ITS OWN floor
+/// (`MIN_DEFAULT_HOSTING_BUDGET_BYTES` = 128 MiB), a quarter of it is exactly
+/// 32 MiB — [`MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK`]'s own value — so this
+/// term never re-opens the floor-collision headroom gap that constant was
+/// added to close.
+const CONFIGURED_DISK_BUDGET_ALLOWANCE_DIVISOR: u64 = 4;
+
+/// Further bound `physical_term` (already sized from RAM + raw physical disk)
+/// by a fraction of what the AGGREGATE hosting-disk budget will project to,
+/// using the operator's configured `hosting_disk_pct` / `max_hosting_disk`
+/// (#5328 review — see [`default_wasmtime_cache_size_bytes_for_dir`]'s "Why
+/// the operator's configured disk budget also has to bind"). Computed via
+/// the SAME [`crate::ring::hosting::cache::disk_budget_for_clamped`] function
+/// the live aggregate budget uses, fed `(used = current_cache_bytes,
+/// available = raw_available_disk_bytes)` — the same `used + available`
+/// identity [`stabilize_available_disk_bytes`] already relies on, so this
+/// projection is STABLE across restarts for the same reason that function
+/// is (a pure function of total reachable capacity, not of how much the
+/// cache itself currently occupies).
+///
+/// `raw_available_disk_bytes: None` (unreadable signal) skips this bound
+/// entirely — the physical term's own `None`-fallback already applies, and
+/// there is no available/used basis to project a budget from.
+fn bound_by_configured_disk_budget(
+    physical_term: u64,
+    current_cache_bytes: u64,
+    raw_available_disk_bytes: Option<u64>,
+    hosting_disk_pct: f64,
+    max_hosting_disk: u64,
+) -> u64 {
+    let Some(raw_available) = raw_available_disk_bytes else {
+        return physical_term;
+    };
+    let configured_budget = crate::ring::disk_budget_for_clamped(
+        current_cache_bytes,
+        raw_available,
+        hosting_disk_pct,
+        crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+        max_hosting_disk,
+    );
+    physical_term.min(configured_budget / CONFIGURED_DISK_BUDGET_ALLOWANCE_DIVISOR)
+}
+
+/// Fold a directory's own current on-disk size back into a raw free-space
+/// reading, so the result represents "disk reachable if this directory were
+/// empty" rather than "disk free right now" — see
+/// [`default_wasmtime_cache_size_bytes_for_dir`]'s "Why `available_disk_bytes`
+/// folds the cache's own current size back in" doc for the boot-to-boot
+/// oscillation this prevents (#5328 review). `None` (unreadable raw signal)
+/// stays `None` — folding must never turn an untrusted signal into a trusted
+/// one.
+///
+/// Split out as a pure function so the stabilization property is testable
+/// deterministically: a real end-to-end test through actual `statvfs` cannot
+/// reliably distinguish "fixed" from "buggy" on a host with generous free
+/// disk (the oscillation only manifests when the cache's own footprint is a
+/// non-negligible fraction of `available` — a real dev/CI machine's disk is
+/// typically hundreds of GB free, dwarfing even a full 512 MiB cache, so both
+/// versions land on the same ceiling-clamped answer and the test is vacuous).
+fn stabilize_available_disk_bytes(
+    raw_available: Option<u64>,
+    current_cache_bytes: u64,
+) -> Option<u64> {
+    raw_available.map(|raw| raw.saturating_add(current_cache_bytes))
+}
+
+/// If a PRIOR run already left more than `new_soft_limit_bytes` on disk under
+/// `dir` — a RAM-rich host whose disk tightened, an operator who moved to a
+/// smaller disk, or simply a node upgrading from before #5014 narrowed this
+/// limit — clear the directory rather than waiting on wasmtime's own ~1h
+/// internal prune cycle to catch up. `current_bytes` is the caller's ALREADY
+/// walked measurement (see [`default_wasmtime_cache_size_bytes_for_dir`]) —
+/// this function does no filesystem read of its own beyond the delete.
+///
+/// This is a pure cache of recompiled-from-WASM artifacts: clearing it is
+/// always safe (worst case, the next distinct contract blob recompiles once
+/// instead of hitting the cache) and is the only way to give an
+/// ALREADY-WEDGED node (#5014: the aggregate disk budget's `admit_state_write`
+/// / `admit_wasm_write` rejecting every write because the disk budget counts
+/// the oversized cache) relief on the very next restart, instead of an
+/// up-to-an-hour wait.
+///
+/// Best-effort: this is a startup optimization, not a correctness
+/// requirement, so a delete failure is logged and otherwise ignored — it must
+/// never fail node boot, and a directory that fails to clear just falls back
+/// to wasmtime's own prune cycle, the pre-#5014 behavior.
+fn reconcile_existing_cache_dir(dir: &Path, current_bytes: u64, new_soft_limit_bytes: u64) {
+    if current_bytes <= new_soft_limit_bytes {
+        return;
+    }
+    tracing::info!(
+        dir = %dir.display(),
+        current_bytes,
+        new_soft_limit_bytes,
+        "wasmtime compile cache exceeds the newly-computed disk-aware soft \
+         limit; clearing it for immediate relief (#5014)"
+    );
+    if let Err(error) = std::fs::remove_dir_all(dir) {
+        tracing::warn!(
+            dir = %dir.display(),
+            %error,
+            "failed to clear oversized wasmtime compile cache; falling back \
+             to wasmtime's own prune cycle"
+        );
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -467,8 +1015,10 @@ pub struct Runtime {
 
     pub(super) secret_store: SecretsStore,
     pub(super) delegate_store: DelegateStore,
-    /// LRU cache of compiled delegate modules (shared across pool executors).
-    pub(super) delegate_modules: SharedModuleCache<DelegateKey>,
+    /// LRU cache of compiled delegate modules (shared across pool executors),
+    /// keyed by the CODE hash rather than the delegate key — see
+    /// [`SharedModuleCache`] and `prepare_delegate_call`.
+    pub(super) delegate_modules: SharedModuleCache<CodeHash>,
     /// Persisted `ctx.write()` bytes per delegate, shared across pool
     /// executors so a prompt round-trip routed to a different `Runtime` still
     /// sees the pending state. See `native_api::DelegateContextCache`.
@@ -486,8 +1036,10 @@ pub struct Runtime {
 
     /// Local contract storage.
     pub(crate) contract_store: ContractStore,
-    /// LRU cache of compiled contract modules (shared across pool executors).
-    pub(super) contract_modules: SharedModuleCache<ContractKey>,
+    /// LRU cache of compiled contract modules (shared across pool executors),
+    /// keyed by the CODE hash rather than the contract instance — see
+    /// [`SharedModuleCache`] and `prepare_contract_call_inner`.
+    pub(super) contract_modules: SharedModuleCache<CodeHash>,
 
     /// Optional state storage backend for V2 delegate contract access.
     pub(crate) state_store_db: Option<crate::contract::storages::Storage>,
@@ -736,8 +1288,8 @@ impl Runtime {
         delegate_store: DelegateStore,
         secret_store: SecretsStore,
         host_mem: bool,
-        contract_modules: SharedModuleCache<ContractKey>,
-        delegate_modules: SharedModuleCache<DelegateKey>,
+        contract_modules: SharedModuleCache<CodeHash>,
+        delegate_modules: SharedModuleCache<CodeHash>,
         delegate_contexts: super::native_api::DelegateContextCache,
         created_delegates_count: super::native_api::SharedDelegateCounter,
         inherited_origins: super::native_api::SharedInheritedOrigins,
@@ -909,6 +1461,40 @@ impl Runtime {
         Ok(unsafe { WasmLinearMem::new(ptr, size as u64) })
     }
 
+    /// Compile and instantiate a stored contract without calling any of its exports.
+    ///
+    /// Used by the conformance tooling so that malformed WASM, or a module missing
+    /// the contract ABI, fails at the point the caller says "load this contract"
+    /// rather than surfacing later as an inconclusive check result. The distinction
+    /// matters because "the contract could not be loaded" and "the contract could
+    /// not be judged" look identical to a caller otherwise, and the first should be
+    /// a hard error while the second must never be one.
+    /// Compiling is not enough on its own: a module can compile and instantiate
+    /// while exporting none of the contract entry points, in which case every later
+    /// call fails and a conformance run reads that as "could not judge this
+    /// contract" instead of "this is not a contract". So the ABI is resolved here
+    /// too.
+    pub(crate) fn compile_check(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters<'_>,
+    ) -> RuntimeResult<()> {
+        let mut running = self.prepare_contract_call(key, parameters, 0)?;
+        let missing = self.engine.missing_contract_exports_for(&running.handle);
+        // Release the instance explicitly. Dropping `RunningInstance` alone only
+        // clears `MEM_ADDR`; the engine keeps the instance and its memory until the
+        // engine itself is dropped, so every oracle built would otherwise carry a
+        // leaked instance and log the cleanup warning.
+        self.drop_running_instance(&mut running);
+        if !missing.is_empty() {
+            return Err(ContractExecError::MissingContractExports {
+                missing: missing.join(", "),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     pub(super) fn prepare_contract_call(
         &mut self,
         key: &ContractKey,
@@ -950,15 +1536,46 @@ impl Runtime {
         req_bytes: usize,
         already_fetched: Option<&ContractContainer>,
     ) -> RuntimeResult<RunningInstance> {
+        // Resolve the CODE hash this instance runs, which is what the compiled
+        // module is keyed by (issue #5268). Compilation only ever sees the WASM
+        // code — parameters are written into linear memory at call time — so N
+        // instances of one contract share one compiled module.
+        //
+        // The hash must NOT come from `key.code_hash()`: that is an unverified
+        // serde field which `ContractKey`'s `Hash`/`Eq` never consult, so a
+        // caller naming an instance it is entitled to could otherwise choose
+        // WHICH cached module ran for it (the same reasoning as
+        // `ContractStore::fetch_contract`). Instead it comes from the node's own
+        // instance index, or — for a caller holding a not-yet-indexed container
+        // — from hashing the very bytes we are about to compile.
+        let code_hash = match already_fetched {
+            Some(contract) => wasm_code_hash(contract)?,
+            None => self
+                .contract_store
+                .code_hash_from_id(key.id())
+                .ok_or_else(|| {
+                    tracing::error!(
+                        contract = %key,
+                        phase = "prepare_contract_call_failed",
+                        "Contract not indexed in store during WASM execution"
+                    );
+                    RuntimeInnerError::ContractNotFound(*key)
+                })?,
+        };
         // Check shared cache first. The lock is held only for the duration of
         // the lookup + Module clone (an Arc bump) and is ALWAYS dropped before
         // the compile below — never held across the blocking compile.
-        let cached = self.contract_modules.lock().unwrap().get(key).cloned();
+        let cached = self
+            .contract_modules
+            .lock()
+            .unwrap()
+            .get(&code_hash)
+            .cloned();
         let module = if let Some(module) = cached {
-            tracing::debug!(contract = %key, "Module cache hit");
+            tracing::debug!(contract = %key, %code_hash, "Module cache hit");
             module
         } else {
-            tracing::info!(contract = %key, "Module cache miss — compiling");
+            tracing::info!(contract = %key, %code_hash, "Module cache miss — compiling");
             // Cache miss — obtain the code and compile with the lock released
             // so the (potentially multi-hundred-millisecond) Cranelift compile
             // never blocks other executors waiting on the shared cache. When
@@ -994,6 +1611,10 @@ impl Runtime {
                 }
                 ContractContainer::Wasm(_) | _ => unimplemented!(),
             };
+            // Deprecation notice for #5465. On the cache-MISS path on purpose;
+            // see `warn_on_host_clock_import` for why here and not
+            // `store_contract`, and for the once-per-code-hash bound.
+            warn_on_host_clock_import(key, &code_hash, &code);
             let module = self.engine.compile(&code)?;
             let compiled_size = self.engine.module_compiled_size(&module);
             // Re-check cache: the lock was released before compilation, so
@@ -1002,10 +1623,10 @@ impl Runtime {
             // duplicate Cranelift work, but two distinct misses can still race
             // to this insert). Prefer the already-cached clone if present.
             let mut cache = self.contract_modules.lock().unwrap();
-            if let Some(existing) = cache.get(key).cloned() {
+            if let Some(existing) = cache.get(&code_hash).cloned() {
                 existing
             } else {
-                cache.insert(*key, module.clone(), compiled_size);
+                cache.insert(code_hash, module.clone(), compiled_size);
                 module
             }
         };
@@ -1028,14 +1649,32 @@ impl Runtime {
         key: &DelegateKey,
         req_bytes: usize,
     ) -> RuntimeResult<(RunningInstance, DelegateApiVersion)> {
+        // Same defect and same fix as the contract cache above (#5268):
+        // `prepare_delegate_call` compiles `delegate.code()` alone, but
+        // `DelegateKey`'s identity covers `key = BLAKE3(code_hash ‖ params)`, so
+        // keying by it compiled and retained one copy of identical machine code
+        // per PARAMETER SET — the shape per-user / per-room parameterized
+        // delegates hit hardest. The hash is resolved through this node's own
+        // delegate index for the same trust reason: `key.code_hash()` is
+        // unverified serde data, so a caller could otherwise name a delegate
+        // while choosing which cached module ran for it.
+        let code_hash = self
+            .delegate_store
+            .code_hash_from_key(key)
+            .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
         // Lock held only for the lookup + Module clone; always dropped before
         // the compile below (never held across the blocking compile).
-        let cached = self.delegate_modules.lock().unwrap().get(key).cloned();
+        let cached = self
+            .delegate_modules
+            .lock()
+            .unwrap()
+            .get(&code_hash)
+            .cloned();
         let module = if let Some(module) = cached {
-            tracing::debug!(delegate = %key, "Module cache hit");
+            tracing::debug!(delegate = %key, %code_hash, "Module cache hit");
             module
         } else {
-            tracing::info!(delegate = %key, "Module cache miss — compiling");
+            tracing::info!(delegate = %key, %code_hash, "Module cache miss — compiling");
             let delegate = self
                 .delegate_store
                 .fetch_delegate(key, params)
@@ -1046,10 +1685,10 @@ impl Runtime {
             // Re-check cache: the lock was released before compilation, so
             // another executor may have compiled and cached this delegate.
             let mut cache = self.delegate_modules.lock().unwrap();
-            if let Some(existing) = cache.get(key).cloned() {
+            if let Some(existing) = cache.get(&code_hash).cloned() {
                 existing
             } else {
-                cache.insert(key.clone(), module.clone(), compiled_size);
+                cache.insert(code_hash, module.clone(), compiled_size);
                 module
             }
         };
@@ -1104,8 +1743,7 @@ impl super::contract::ContractRuntimeBridge for Runtime {}
 mod wasmtime_disk_cache_sizing_tests {
     use super::{
         MAX_WASMTIME_CACHE_SIZE_BYTES, MIN_WASMTIME_CACHE_SIZE_BYTES,
-        WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES, default_wasmtime_cache_size_bytes,
-        wasmtime_cache_size_for_ram,
+        WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES, wasmtime_cache_size_for_ram,
     };
     use crate::ring::hosting_budget_for_ram;
 
@@ -1267,52 +1905,50 @@ mod wasmtime_disk_cache_sizing_tests {
         );
     }
 
-    /// The live reader applies the pure clamp to the RAM signal rather than
-    /// carrying its own arithmetic.
-    ///
-    /// This is a consistency check, and on a host above the ceiling-binding
-    /// point (>= 4 GiB, i.e. most CI machines) it CANNOT distinguish a reader
-    /// that ignores RAM and returns the ceiling constant — both sides evaluate
-    /// to the ceiling. `default_soft_limit_reader_derives_from_the_ram_signal`
-    /// below covers that host-independently, which is why the previous
-    /// `(MIN..=MAX).contains(&resolved)` assertion was dropped: a function that
-    /// clamps by construction can never fail a containment check, so it tested
-    /// nothing at all.
+    /// Host-independent pin: the live reader (`default_wasmtime_cache_size_bytes_for_dir`,
+    /// #5014) must derive its value from the shared RAM signal AND the disk
+    /// availability signal, delegating to the pure combiner rather than
+    /// carrying its own arithmetic or re-hardcoding a flat constant. This is a
+    /// source-scrape pin (not a live-value comparison) because on a host above
+    /// the ceiling-binding point on BOTH axes a reader that ignores its inputs
+    /// entirely would still coincidentally return the ceiling — see
+    /// `wasmtime_disk_cache_disk_sizing_tests` for the live-value coverage that
+    /// exercises the RAM/disk interaction itself.
     #[test]
-    fn default_soft_limit_matches_the_pure_clamp_of_this_hosts_ram_signal() {
-        let signal = crate::wasm_runtime::read_total_ram_bytes()
-            .map(|v| v as u64)
-            .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
-        assert_eq!(
-            default_wasmtime_cache_size_bytes(),
-            wasmtime_cache_size_for_ram(signal),
-            "the live reader must apply the pure clamp to the RAM signal"
-        );
-    }
-
-    /// Host-independent pin: the live reader must derive its value from the
-    /// shared RAM signal and delegate to the pure clamp. Fails if a future edit
-    /// re-hardcodes the limit or introduces a second notion of machine size —
-    /// the mutation a runtime assertion cannot catch on a large CI host.
-    #[test]
-    fn default_soft_limit_reader_derives_from_the_ram_signal() {
+    fn default_soft_limit_reader_derives_from_ram_and_disk_signals() {
         let src = include_str!("runtime.rs");
         let body = src
-            .split("pub(crate) fn default_wasmtime_cache_size_bytes() -> u64 {")
+            .split("pub(crate) fn default_wasmtime_cache_size_bytes_for_dir(")
             .nth(1)
-            .expect("default_wasmtime_cache_size_bytes must exist")
+            .expect("default_wasmtime_cache_size_bytes_for_dir must exist")
             .split("\n}\n")
             .next()
-            .expect("end of default_wasmtime_cache_size_bytes");
+            .expect("end of default_wasmtime_cache_size_bytes_for_dir");
         assert!(
             body.contains("read_total_ram_bytes()"),
             "the reader must consult the shared read_total_ram_bytes() signal, not \
              a second notion of machine size"
         );
         assert!(
-            body.contains("wasmtime_cache_size_for_ram("),
-            "the reader must delegate to the pure clamp so the boundary math has \
-             exactly one implementation"
+            body.contains("disk_available_bytes("),
+            "the reader must consult a real disk-availability signal — a RAM-only \
+             reader is exactly the #5014 defect"
+        );
+        assert!(
+            body.contains("combine_wasmtime_cache_size("),
+            "the reader must delegate to the pure combiner so the RAM/disk \
+             interaction has exactly one implementation"
+        );
+        assert!(
+            body.contains("bound_by_configured_disk_budget("),
+            "the reader must ALSO bound the physical-disk term by the \
+             operator's configured hosting-disk budget — a physical-only \
+             bound leaves an operator-shrunk --max-hosting-disk wedged"
+        );
+        assert!(
+            body.contains("reconcile_existing_cache_dir("),
+            "the reader must reconcile an already-oversized cache directory, not \
+             just narrow the limit for future growth"
         );
     }
 
@@ -1337,5 +1973,1092 @@ mod wasmtime_disk_cache_sizing_tests {
         // only when this test happens to run.
         const _: () = assert!(MIN_WASMTIME_CACHE_SIZE_BYTES < MAX_WASMTIME_CACHE_SIZE_BYTES);
         assert_eq!(MAX_WASMTIME_CACHE_SIZE_BYTES, LEGACY_FLAT_SOFT_LIMIT_BYTES);
+    }
+}
+
+/// #5014: the disk-side term, the RAM/disk composition, and the startup
+/// reconciliation that gives an already-oversized cache immediate relief.
+#[cfg(test)]
+mod wasmtime_disk_cache_disk_sizing_tests {
+    use super::{
+        MAX_WASMTIME_CACHE_SIZE_BYTES, MIN_WASMTIME_CACHE_SIZE_BYTES,
+        WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES, bound_by_configured_disk_budget,
+        combine_wasmtime_cache_size, default_wasmtime_cache_size_bytes_for_dir,
+        reconcile_existing_cache_dir, stabilize_available_disk_bytes, wasmtime_cache_size_for_disk,
+        wasmtime_cache_size_for_ram,
+    };
+    use std::io::Write;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    /// Floor/ceiling boundary for the disk-side term, mirroring
+    /// `compile_cache_floor_binds_on_tiny_hosts` /
+    /// `compile_cache_ceiling_binds_on_large_hosts` for the RAM-side term.
+    /// Concrete byte values, not comparisons against the constants — see
+    /// those tests' doc comment for why a self-referential assertion would
+    /// pass even if the floor were mutated to 0.
+    #[test]
+    fn disk_term_floor_and_ceiling_bind() {
+        // The disk-side floor is 32 MiB — deliberately LOWER than the 128 MiB
+        // RAM-side/aggregate-budget floor, see
+        // `MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK`'s doc (#5328 review).
+        assert_eq!(wasmtime_cache_size_for_disk(0), 32 * MIB);
+        assert_eq!(wasmtime_cache_size_for_disk(1), 32 * MIB);
+        // Exactly at the binding point: 256 MiB / 8 == 32 MiB == the floor.
+        assert_eq!(wasmtime_cache_size_for_disk(256 * MIB), 32 * MIB);
+        // One divisor-step above it the derived value takes over.
+        assert_eq!(wasmtime_cache_size_for_disk(256 * MIB + 8), 32 * MIB + 1);
+        // Exactly at the binding point: 4 GiB / 8 == 512 MiB == the ceiling.
+        assert_eq!(wasmtime_cache_size_for_disk(4 * GIB), 512 * MIB);
+        assert_eq!(wasmtime_cache_size_for_disk(8 * GIB), 512 * MIB);
+        // u64::MAX must clamp, not wrap or panic.
+        assert_eq!(wasmtime_cache_size_for_disk(u64::MAX), 512 * MIB);
+    }
+
+    /// The exact shape from #5014's worked example: a 16 GiB VM (RAM ample —
+    /// the RAM term resolves to the historical 512 MiB ceiling) with only
+    /// 400 MiB free on the data-dir mount. Before this fix, ONLY the RAM term
+    /// existed, so this host got a 512 MiB compile cache while its whole disk
+    /// budget (`clamp(0.5 * (used + available), ...)`) sat far below that —
+    /// wedging `admit_state_write`/`admit_wasm_write` shut. The disk term
+    /// must now pull the combined result down from the RAM ceiling.
+    #[test]
+    fn ram_rich_disk_tight_host_is_bounded_by_the_disk_term() {
+        let ram_only = wasmtime_cache_size_for_ram(16 * GIB);
+        assert_eq!(
+            ram_only,
+            512 * MIB,
+            "16 GiB RAM must hit the RAM-side ceiling"
+        );
+
+        let available_disk = 400 * MIB;
+        let combined = combine_wasmtime_cache_size(16 * GIB, Some(available_disk));
+        assert!(
+            combined < ram_only,
+            "a disk-tight host (400 MiB free) must get LESS than the RAM-only \
+             figure ({ram_only}); got {combined}"
+        );
+        // 400 MiB / 8 == 50 MiB — above the disk-side floor (32 MiB), so the
+        // raw division binds here, not a floor (#5328 review: an earlier
+        // version of this test asserted the value landed exactly on the
+        // shared 128 MiB floor, which mutation-tested green even when the
+        // disk divisor was changed from 8 to 64 — it was pinning the floor,
+        // not the disk term. This value is a genuine division result.)
+        assert_eq!(combined, 50 * MIB);
+    }
+
+    /// The composition is `min(ram_term, disk_term)` — whichever signal is
+    /// tighter wins, in both directions.
+    #[test]
+    fn combine_takes_the_tighter_of_the_two_terms() {
+        // RAM-poor, disk-rich: the RAM term binds (unchanged from before #5014).
+        assert_eq!(
+            combine_wasmtime_cache_size(2 * GIB, Some(100 * GIB)),
+            wasmtime_cache_size_for_ram(2 * GIB),
+        );
+        // RAM-rich, disk-poor: the disk term binds (the #5014 fix).
+        assert_eq!(
+            combine_wasmtime_cache_size(100 * GIB, Some(2 * GIB)),
+            wasmtime_cache_size_for_disk(2 * GIB),
+        );
+        // Both ample: both clamp to the shared ceiling, so it's a no-op either way.
+        assert_eq!(
+            combine_wasmtime_cache_size(100 * GIB, Some(100 * GIB)),
+            MAX_WASMTIME_CACHE_SIZE_BYTES,
+        );
+    }
+
+    /// An unreadable disk signal (statvfs failure / unsupported platform)
+    /// must NOT invent a possibly-wrong tight cap — it falls back to the
+    /// RAM-only figure, i.e. today's shipped behavior, unchanged.
+    #[test]
+    fn unreadable_disk_signal_falls_back_to_ram_only() {
+        assert_eq!(
+            combine_wasmtime_cache_size(16 * GIB, None),
+            wasmtime_cache_size_for_ram(16 * GIB),
+        );
+    }
+
+    /// A directory already over the newly-computed limit (the "upgrading an
+    /// already-wedged gateway" case) is cleared immediately rather than left
+    /// for wasmtime's own ~1h prune cycle.
+    #[test]
+    fn reconcile_clears_a_directory_already_over_the_new_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("wasmtime-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let mut f = std::fs::File::create(cache_dir.join("big.bin")).unwrap();
+        f.write_all(&vec![0u8; 200 * 1024 * 1024]).unwrap(); // 200 MiB
+
+        reconcile_existing_cache_dir(&cache_dir, 200 * MIB, 128 * MIB);
+
+        assert!(
+            !cache_dir.exists(),
+            "an over-limit cache directory must be cleared, not left for the \
+             ~1h wasmtime prune cycle to catch up"
+        );
+    }
+
+    /// A directory already AT OR UNDER the limit must be left alone — this is
+    /// a startup optimization for the over-limit case, not an unconditional
+    /// wipe of the compile cache on every boot.
+    #[test]
+    fn reconcile_leaves_a_directory_under_the_limit_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("wasmtime-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let mut f = std::fs::File::create(cache_dir.join("small.bin")).unwrap();
+        f.write_all(&vec![0u8; 1024]).unwrap(); // 1 KiB
+
+        reconcile_existing_cache_dir(&cache_dir, 1024, 128 * MIB);
+
+        assert!(
+            cache_dir.join("small.bin").exists(),
+            "a directory already under the limit must not be touched"
+        );
+    }
+
+    /// A missing directory (fresh node, nothing written yet) must be a no-op,
+    /// not a panic or an error — `du_walk`'s own contract for a missing dir is
+    /// "contributes 0", so 0 is never `>` any real limit.
+    #[test]
+    fn reconcile_is_a_no_op_on_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist-yet");
+        reconcile_existing_cache_dir(&missing, 0, 128 * MIB); // must not panic
+        assert!(!missing.exists());
+    }
+
+    /// Smoke test for the impure entry point end-to-end against a real
+    /// directory: whatever this host's actual RAM/disk resolve to, the result
+    /// must stay within the shared clamp bounds, and it must not panic when
+    /// run against a directory that doesn't exist yet (the fresh-node case).
+    #[test]
+    fn default_for_dir_stays_within_bounds_when_the_directory_does_not_exist_yet() {
+        // Defensive-only: in production `config.rs` always `create_dir_all`s
+        // this directory before `Executor::from_config_with_shared_modules`
+        // ever runs, so this exact input never reaches this function on a real
+        // node. Kept as a "must not panic, must fall back sanely" guard, not
+        // as a stand-in for the real disk-derived path — see the sibling test
+        // below for that.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("wasmtime-cache");
+        let result = default_wasmtime_cache_size_bytes_for_dir(
+            &missing,
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES,
+        );
+        assert!(
+            (MIN_WASMTIME_CACHE_SIZE_BYTES..=MAX_WASMTIME_CACHE_SIZE_BYTES).contains(&result),
+            "result {result} must stay within [{MIN_WASMTIME_CACHE_SIZE_BYTES}, \
+             {MAX_WASMTIME_CACHE_SIZE_BYTES}] regardless of this host's real RAM/disk"
+        );
+    }
+
+    /// #5328 review: the fresh-directory test above never actually created the
+    /// directory, so `statvfs` returned ENOENT and it silently exercised the
+    /// SAME `None`-fallback path as `unreadable_disk_signal_falls_back_to_ram_only`
+    /// — never the real `Some(...)` disk-reading path a production node
+    /// actually takes (the cache dir always exists by the time this runs; see
+    /// the sibling test's comment). This test creates the directory first, so
+    /// `disk_available_bytes` succeeds, and cross-checks the live entry
+    /// point's result against the SAME real signals read independently
+    /// (`super::read_total_ram_bytes()`, `crate::ring::disk_available_bytes`)
+    /// and fed through the pure combiner — not a hardcoded expectation, since
+    /// this host's real RAM/disk are unknown to the test. A maximally
+    /// PERMISSIVE configured budget (pct=1.0, max=u64::MAX) is passed so the
+    /// configured-budget bound (#5328 review) cannot additionally constrain
+    /// the result — that mechanism gets its own dedicated test below.
+    #[test]
+    fn default_for_dir_uses_the_real_disk_reading_on_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("wasmtime-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let total_ram = crate::wasm_runtime::read_total_ram_bytes()
+            .map(|v| v as u64)
+            .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
+        let available_disk_bytes = crate::ring::disk_available_bytes(&cache_dir);
+        assert!(
+            available_disk_bytes.is_some(),
+            "statvfs on a directory that genuinely exists must succeed on this \
+             platform — if this fails, the test tempdir setup is wrong, not the \
+             production code"
+        );
+        let expected = combine_wasmtime_cache_size(total_ram, available_disk_bytes);
+
+        assert_eq!(
+            default_wasmtime_cache_size_bytes_for_dir(&cache_dir, 1.0, u64::MAX),
+            expected,
+            "the live entry point must match the pure combiner fed the SAME \
+             real RAM/disk signals — this pins that it actually reads a live \
+             Some(...) disk signal, not silently falling back to RAM-only"
+        );
+    }
+
+    /// #5328 review (rev-skeptical-2 finding): an operator who shrinks
+    /// `--max-hosting-disk` below physical disk capacity must ALSO be
+    /// protected — bounding only by raw physical availability leaves that
+    /// operator permanently wedged against their OWN configured budget. A
+    /// tiny `max_hosting_disk` must pull the result down from what physical
+    /// disk alone would allow, and the result must still respect the
+    /// documented headroom relationship (a quarter of what
+    /// `disk_budget_for_clamped` would compute for the SAME inputs).
+    #[test]
+    fn default_for_dir_is_bounded_by_a_tiny_configured_disk_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("wasmtime-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Permissive physical/RAM signals (pct=1.0 isn't physical/RAM — this
+        // is the operator's CONFIGURED knob under test): a tiny
+        // max_hosting_disk must bind regardless of how much physical disk or
+        // RAM this test host actually has.
+        let tiny_max_hosting_disk = 40 * MIB;
+        let result = default_wasmtime_cache_size_bytes_for_dir(
+            &cache_dir,
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            tiny_max_hosting_disk,
+        );
+
+        assert!(
+            result <= tiny_max_hosting_disk,
+            "a compile cache larger than the operator's OWN configured \
+             --max-hosting-disk ({tiny_max_hosting_disk}) defeats the whole \
+             point of the setting; got {result}"
+        );
+    }
+
+    /// #5328 review finding 1 (rev-domain, verified by hand): giving the
+    /// disk-side term the SAME floor as the aggregate hosting-disk budget's
+    /// own floor left EXACTLY ZERO headroom for real contract state on any
+    /// host with <= 256 MiB reachable disk — the compile cache alone would
+    /// consume the entire disk-budget floor, so #5014's wedge would persist
+    /// (narrower, but not closed) for small-disk hosts. This sweeps a wide
+    /// range of reachable-disk sizes and asserts the aggregate disk budget
+    /// (computed via the SAME `disk_budget_for_clamped` the real
+    /// eviction/admission path uses) always leaves STRICTLY positive headroom
+    /// over the compile-cache disk term — mirroring
+    /// `compile_cache_default_never_exceeds_hosting_default`'s sweep shape
+    /// for the RAM axis. `reachable_disk` models `used + available` at the
+    /// moment the disk term is computed (worst case: the compile cache is the
+    /// ONLY consumer, i.e. right after `reconcile_existing_cache_dir` clears
+    /// a stale cache — the scenario most likely to wedge).
+    #[test]
+    fn disk_term_always_leaves_positive_headroom_against_the_aggregate_disk_budget() {
+        for reachable_disk in [
+            0,
+            1,
+            MIB,
+            32 * MIB,
+            64 * MIB,
+            128 * MIB,
+            200 * MIB,
+            255 * MIB,
+            256 * MIB, // the exact breakeven point both floors share
+            257 * MIB,
+            300 * MIB,
+            400 * MIB, // the issue's worked example
+            912 * MIB, // the issue's worked example, post-reconcile
+            GIB,
+            2 * GIB,
+            4 * GIB,
+            8 * GIB,
+            32 * GIB,
+            100 * GIB,
+            u64::MAX,
+        ] {
+            let disk_term = wasmtime_cache_size_for_disk(reachable_disk);
+            let available = reachable_disk.saturating_sub(disk_term);
+            let disk_budget = crate::ring::disk_budget_for_clamped(
+                disk_term,
+                available,
+                crate::ring::DEFAULT_HOSTING_DISK_PCT,
+                crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+                crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES,
+            );
+            assert!(
+                disk_budget > disk_term,
+                "at reachable_disk={reachable_disk} the compile cache's disk \
+                 term ({disk_term}) must leave POSITIVE headroom under the \
+                 aggregate disk budget ({disk_budget}) for real contract \
+                 state — zero or negative headroom means the compile cache \
+                 alone wedges admission"
+            );
+        }
+    }
+
+    /// #5328 review (rev-skeptical-2 finding): `bound_by_configured_disk_budget`
+    /// must actually bind when the operator's configured budget is the
+    /// tighter constraint, must NOT bind when it's generous (physical term
+    /// wins), and must fall back to the physical term when the disk signal
+    /// is unreadable (no `used + available` basis to project a budget from).
+    #[test]
+    fn bound_by_configured_disk_budget_binds_only_when_tighter() {
+        // Ample physical term (RAM-ceiling-bound), tiny configured budget:
+        // the configured bound must win.
+        let physical_term = 512 * MIB;
+        let tight = bound_by_configured_disk_budget(
+            physical_term,
+            0,              // current_cache_bytes
+            Some(40 * MIB), // raw_available_disk_bytes
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES, // tiny max_hosting_disk
+        );
+        assert!(
+            tight < physical_term,
+            "a tiny configured max_hosting_disk must pull the result below \
+             the physical term; got {tight}"
+        );
+
+        // Generous configured budget: the physical term must win unchanged.
+        let generous = bound_by_configured_disk_budget(
+            physical_term,
+            0,
+            Some(100 * GIB),
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES,
+        );
+        assert_eq!(
+            generous, physical_term,
+            "a generous configured budget must not tighten the physical term"
+        );
+
+        // Unreadable disk signal: no used+available basis to project a
+        // budget from, so the physical term passes through unchanged.
+        let unreadable = bound_by_configured_disk_budget(
+            physical_term,
+            0,
+            None,
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+        );
+        assert_eq!(
+            unreadable, physical_term,
+            "an unreadable disk signal must fall back to the physical term, \
+             not invent a budget projection from nothing"
+        );
+    }
+
+    /// #5328 review: the configured-budget bound must ALSO leave positive
+    /// headroom against the real aggregate budget, across a sweep of
+    /// operator-configured `max_hosting_disk` values (not just the default) —
+    /// extending `disk_term_always_leaves_positive_headroom_against_the_aggregate_disk_budget`
+    /// to the axis that test doesn't cover.
+    #[test]
+    fn configured_budget_bound_always_leaves_positive_headroom() {
+        for reachable_disk in [0, MIB, 128 * MIB, 256 * MIB, GIB, 100 * GIB] {
+            for max_hosting_disk in [
+                crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES, // operator floors it
+                16 * GIB,
+                crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES,
+            ] {
+                let physical_term = wasmtime_cache_size_for_disk(reachable_disk);
+                let available = reachable_disk.saturating_sub(physical_term);
+                let bound = bound_by_configured_disk_budget(
+                    physical_term,
+                    physical_term, // current_cache_bytes: conservative, matches `used` below
+                    Some(available),
+                    crate::ring::DEFAULT_HOSTING_DISK_PCT,
+                    max_hosting_disk,
+                );
+                let real_budget = crate::ring::disk_budget_for_clamped(
+                    bound,
+                    available,
+                    crate::ring::DEFAULT_HOSTING_DISK_PCT,
+                    crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+                    max_hosting_disk,
+                );
+                assert!(
+                    real_budget > bound,
+                    "at reachable_disk={reachable_disk}, \
+                     max_hosting_disk={max_hosting_disk}: the configured-budget-\
+                     bound compile cache ({bound}) must leave POSITIVE headroom \
+                     under the real aggregate budget ({real_budget})"
+                );
+            }
+        }
+    }
+
+    /// #5328 review finding 2 (rev-domain, verified by hand): folding the
+    /// directory's own current size back into the raw free-space reading
+    /// must recover "total reachable capacity", independent of how big the
+    /// directory currently is. Deliberately host-independent (small,
+    /// hand-chosen numbers) — see [`stabilize_available_disk_bytes`]'s doc
+    /// for why a real end-to-end test through actual `statvfs` cannot
+    /// reliably distinguish fixed from buggy on a host with generous free
+    /// disk.
+    #[test]
+    fn stabilize_available_disk_bytes_recovers_total_reachable_capacity() {
+        // 400 MiB total; the cache currently occupies 50 MiB of it, so a raw
+        // statvfs read sees only 350 MiB free. Folding the cache's own 50 MiB
+        // back in must recover the full 400 MiB.
+        assert_eq!(
+            stabilize_available_disk_bytes(Some(350 * MIB), 50 * MIB),
+            Some(400 * MIB)
+        );
+        // An empty directory contributes nothing to fold back — a no-op.
+        assert_eq!(
+            stabilize_available_disk_bytes(Some(400 * MIB), 0),
+            Some(400 * MIB)
+        );
+        // An unreadable raw signal must stay unreadable — folding a KNOWN
+        // quantity into an UNKNOWN one must not manufacture a trusted result.
+        assert_eq!(stabilize_available_disk_bytes(None, 50 * MIB), None);
+        // Overflow-safe: saturating, never panics or wraps.
+        assert_eq!(
+            stabilize_available_disk_bytes(Some(u64::MAX), 50 * MIB),
+            Some(u64::MAX)
+        );
+    }
+
+    /// #5328 review finding 2 (rev-domain, verified by hand): a naive
+    /// `statvfs`-only availability reading makes the computed limit a
+    /// function of the cache's OWN current size (bigger cache -> less
+    /// "available" -> smaller next-boot limit -> wipe -> more "available" ->
+    /// bigger limit -> cache regrows -> repeat), which converges to wiping
+    /// the compile cache on roughly every OTHER restart for an actively-used
+    /// node — defeating the entire point of a persistent on-disk cache. This
+    /// simulates two successive "boots" against a FIXED total reachable disk
+    /// (deterministic, no real filesystem involved): boot 1 computes a limit
+    /// against an empty cache; the cache then regrows to fill exactly that
+    /// limit (the worst case — a busy node whose cache regrew to fill its
+    /// budget between restarts, so the raw free-space reading on boot 2 is
+    /// `total - limit1`); boot 2 must compute the SAME limit via
+    /// [`stabilize_available_disk_bytes`]'s fold-back — and the final
+    /// assertion demonstrates, on the SAME numbers, that WITHOUT the
+    /// fold-back the limit would have shrunk (the bug this fixes).
+    #[test]
+    fn folding_the_caches_own_size_back_in_makes_the_limit_stable_across_simulated_restarts() {
+        let total_ram = 100 * GIB; // ample — only the disk term can bind here
+        let total_reachable_disk = 2 * GIB; // fixed total capacity, both boots
+
+        // Boot 1: cache is empty, so raw free space IS the total.
+        let limit1 = combine_wasmtime_cache_size(
+            total_ram,
+            stabilize_available_disk_bytes(Some(total_reachable_disk), 0),
+        );
+
+        // Between boots: cache regrows to fill exactly limit1. Raw free space
+        // on boot 2 is reduced by exactly what the cache now occupies.
+        let raw_available_boot2 = total_reachable_disk - limit1;
+        let limit2 = combine_wasmtime_cache_size(
+            total_ram,
+            stabilize_available_disk_bytes(Some(raw_available_boot2), limit1),
+        );
+
+        assert_eq!(
+            limit1, limit2,
+            "the computed limit must be STABLE across restarts when nothing \
+             other than the cache's own regrowth changed on disk"
+        );
+
+        // Sanity: on these SAME numbers, the fold-back is load-bearing — a
+        // raw (unstabilized) reading on boot 2 computes a SMALLER limit,
+        // which is exactly what would trigger reconcile's wipe.
+        let unstabilized_limit2 = combine_wasmtime_cache_size(total_ram, Some(raw_available_boot2));
+        assert!(
+            unstabilized_limit2 < limit1,
+            "sanity check failed: this scenario no longer demonstrates the \
+             bug the fold-back fixes, so it's not exercising anything — \
+             unstabilized_limit2={unstabilized_limit2}, limit1={limit1}"
+        );
+    }
+}
+
+/// Tests for the #5465 host-clock deprecation warning.
+///
+/// Every fixture builds its OWN module bytes, so every test gets its own
+/// `CodeHash` and the process-global `SEEN` set in
+/// [`warn_on_host_clock_import`] cannot make one test's outcome depend on
+/// another's having run first.
+#[cfg(test)]
+mod host_clock_deprecation {
+    use super::*;
+
+    /// A module importing one function per `(namespace, name)` pair, plus a
+    /// unique marker export so distinct fixtures hash differently.
+    fn module_importing(marker: &str, imports: &[(&str, &str)]) -> Vec<u8> {
+        let mut wat = String::from("(module\n");
+        for (i, (namespace, name)) in imports.iter().enumerate() {
+            wat.push_str(&format!(
+                "  (import \"{namespace}\" \"{name}\" (func $f{i} (param i64 i64)))\n"
+            ));
+        }
+        wat.push_str(&format!("  (func (export \"{marker}\"))\n)\n"));
+        wat::parse_str(&wat).expect("test fixture is valid wat")
+    }
+
+    fn clock_module(marker: &str) -> Vec<u8> {
+        module_importing(
+            marker,
+            &[(
+                crate::conformance::HOST_CLOCK_NAMESPACE,
+                crate::conformance::HOST_CLOCK_IMPORT,
+            )],
+        )
+    }
+
+    fn key_for(code: &[u8]) -> (ContractKey, CodeHash) {
+        let contract = WrappedContract::new(
+            std::sync::Arc::new(ContractCode::from(code.to_vec())),
+            Parameters::from(vec![]),
+        );
+        let key = *contract.key();
+        let hash = *key.code_hash();
+        (key, hash)
+    }
+
+    #[test]
+    fn a_clock_importing_contract_warns() {
+        let code = clock_module("a_clock_importing_contract_warns");
+        let (key, hash) = key_for(&code);
+        assert!(
+            warn_on_host_clock_import(&key, &hash, &code),
+            "a contract importing the host clock must draw the deprecation warning"
+        );
+    }
+
+    #[test]
+    fn a_contract_that_does_not_read_the_clock_never_warns() {
+        let code = module_importing(
+            "a_contract_that_does_not_read_the_clock_never_warns",
+            &[("freenet_log", "__frnt__logger__info")],
+        );
+        let (key, hash) = key_for(&code);
+        assert!(
+            !warn_on_host_clock_import(&key, &hash, &code),
+            "warning on a contract that imports no clock would make the notice \
+             worthless: every contract would carry it"
+        );
+    }
+
+    /// The whole point of the `SEEN` set. Without it the warning fires on every
+    /// module-cache miss, and a node thrashing its module cache (#4441) turns a
+    /// deprecation notice into a log flood at WARN level.
+    #[test]
+    fn the_same_contract_warns_exactly_once_per_process() {
+        let code = clock_module("the_same_contract_warns_exactly_once_per_process");
+        let (key, hash) = key_for(&code);
+        assert!(warn_on_host_clock_import(&key, &hash, &code));
+        for _ in 0..5 {
+            assert!(
+                !warn_on_host_clock_import(&key, &hash, &code),
+                "the same contract warned more than once; the once-per-code-hash \
+                 bound is gone and a module-cache thrash now floods the log"
+            );
+        }
+    }
+
+    /// The dedup must be keyed on the CONTRACT, not on "have we warned at all".
+    /// A single global flag would pass the test above and silence every
+    /// clock-reading contract after the first one a node happens to run.
+    #[test]
+    fn a_second_distinct_contract_still_warns() {
+        let first = clock_module("a_second_distinct_contract_still_warns_1");
+        let second = clock_module("a_second_distinct_contract_still_warns_2");
+        assert_ne!(first, second, "fixtures must be byte-distinct");
+        let (key_a, hash_a) = key_for(&first);
+        let (key_b, hash_b) = key_for(&second);
+        assert!(warn_on_host_clock_import(&key_a, &hash_a, &first));
+        assert!(
+            warn_on_host_clock_import(&key_b, &hash_b, &second),
+            "a DIFFERENT clock-reading contract was silenced by the first one's \
+             warning; the dedup is keyed on the wrong thing"
+        );
+    }
+
+    /// The dedup set stops growing at its cap.
+    ///
+    /// The key is remotely influenced — a PUT decides what code hash reaches
+    /// this — and the insert happens before the module is compiled, so ~70 bytes
+    /// of malformed WASM that merely names the import buys a permanent entry.
+    /// `.claude/rules/code-style.md` forbids an unbounded per-key collection on
+    /// externally-influenced data.
+    ///
+    /// Mutation this exists for: drop the `seen.len() < cap` guard. The third
+    /// hash is then recorded, its second call dedups, and this goes red.
+    #[test]
+    fn the_dedup_set_stops_growing_at_its_cap() {
+        let seen = Mutex::new(std::collections::HashSet::new());
+        let first = clock_module("cap_1");
+        let second = clock_module("cap_2");
+        let third = clock_module("cap_3");
+        let (_, hash_a) = key_for(&first);
+        let (_, hash_b) = key_for(&second);
+        let (_, hash_c) = key_for(&third);
+
+        assert!(decide_host_clock_warning(&seen, 2, &hash_a, &first));
+        assert!(decide_host_clock_warning(&seen, 2, &hash_b, &second));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "the set did not fill as expected"
+        );
+
+        // At the cap: this one warns, and is deliberately NOT recorded.
+        assert!(decide_host_clock_warning(&seen, 2, &hash_c, &third));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "the dedup set grew past its cap, so it is unbounded on \
+             externally-influenced keys after all"
+        );
+    }
+
+    /// ...and past the cap it keeps WARNING rather than falling silent.
+    ///
+    /// Capping by refusing to warn would be the dangerous direction: every
+    /// clock-reading contract after the cap would be silently exempted from the
+    /// deprecation notice. Noise is the acceptable failure here; silence is not.
+    #[test]
+    fn past_the_cap_the_warning_still_fires() {
+        let seen = Mutex::new(std::collections::HashSet::new());
+        let recorded = clock_module("past_cap_recorded");
+        let overflow = clock_module("past_cap_overflow");
+        let (_, hash_recorded) = key_for(&recorded);
+        let (_, hash_overflow) = key_for(&overflow);
+
+        assert!(decide_host_clock_warning(
+            &seen,
+            1,
+            &hash_recorded,
+            &recorded
+        ));
+        for _ in 0..3 {
+            assert!(
+                decide_host_clock_warning(&seen, 1, &hash_overflow, &overflow),
+                "a contract past the dedup cap was silenced instead of merely \
+                 re-warned; the cap must never suppress the notice"
+            );
+        }
+        // The one that IS recorded still dedups, so the cap did not disable it.
+        assert!(!decide_host_clock_warning(
+            &seen,
+            1,
+            &hash_recorded,
+            &recorded
+        ));
+    }
+
+    /// Threads racing on the SAME contract warn exactly once between them.
+    ///
+    /// `RuntimePool`'s workers reach the module-cache miss path concurrently for
+    /// one code hash whenever a burst of first-touch requests races to compile a
+    /// freshly-PUT contract. Every other test here drives the decision from a
+    /// single thread, so none of them can see a check-then-insert that was split
+    /// across two lock acquisitions — each racer would observe "absent" and warn,
+    /// and the once-per-contract bound the whole design rests on would be gone.
+    ///
+    /// Mutation this exists for: release the guard between `contains` and
+    /// `insert` (the shape a future refactor produces by moving the
+    /// `imports_host_clock` recheck or the insert outside the lock).
+    ///
+    /// A racy guard is only worth having if it reliably goes red, so the loop
+    /// count is measured rather than guessed. Running the test binary directly
+    /// on this machine:
+    ///
+    /// - mutated, `ROUNDS = 64`: failed **199 / 200** runs. One run got through
+    ///   all 64 rounds without a collision, so a broken implementation would
+    ///   have passed about 1 time in 200. Not good enough for a guard.
+    /// - mutated, `ROUNDS = 256`: failed **300 / 300**, with the latest
+    ///   first-failing round observed at 75 — roughly 3.4x headroom.
+    /// - correct, `ROUNDS = 256`: failed **0 / 300**. No false positives.
+    ///
+    /// Per-round collision probability works out around 8%, so 256 rounds puts
+    /// the escape probability near 1e-9. If this ever does flake, the fix is
+    /// more rounds, not `#[ignore]` — a flaky guard here is a broken guard.
+    ///
+    /// `assert_eq!` on the count rather than `>= 1`, so a version that warns
+    /// twice fails rather than passing on the first success.
+    #[test]
+    fn concurrent_callers_for_one_contract_warn_exactly_once() {
+        // Enough racers to make the window easy to hit, and enough rounds that
+        // a split guard cannot get lucky across all of them.
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 256;
+
+        for round in 0..ROUNDS {
+            let code = clock_module(&format!("concurrent_round_{round}"));
+            let (_, hash) = key_for(&code);
+            let seen = Mutex::new(std::collections::HashSet::new());
+            // Start together, so the threads are actually contending rather
+            // than running one after another as they spawn.
+            let barrier = std::sync::Barrier::new(THREADS);
+
+            let warned = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            decide_host_clock_warning(&seen, SEEN_CAP, &hash, &code)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("no thread may panic"))
+                    .filter(|warned| *warned)
+                    .count()
+            });
+
+            assert_eq!(
+                warned, 1,
+                "round {round}: {THREADS} threads loading the SAME contract \
+                 produced {warned} warnings, not 1. The membership check and the \
+                 insert are no longer atomic with respect to each other, so every \
+                 racer sees the code hash as unseen and the once-per-contract \
+                 bound is gone."
+            );
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                1,
+                "round {round}: the dedup set holds more or fewer than the one \
+                 code hash these threads all shared"
+            );
+        }
+    }
+
+    /// The cap must not turn a non-clock contract into a warned one.
+    #[test]
+    fn a_full_dedup_set_does_not_warn_about_a_clockless_contract() {
+        let seen = Mutex::new(std::collections::HashSet::new());
+        let clock = clock_module("full_set_clock");
+        let (_, clock_hash) = key_for(&clock);
+        assert!(decide_host_clock_warning(&seen, 1, &clock_hash, &clock));
+
+        let clockless = module_importing(
+            "full_set_clockless",
+            &[("freenet_log", "__frnt__logger__info")],
+        );
+        let (_, clockless_hash) = key_for(&clockless);
+        assert!(
+            !decide_host_clock_warning(&seen, 1, &clockless_hash, &clockless),
+            "a contract that never reads the clock was warned about because the \
+             dedup set happened to be full"
+        );
+    }
+}
+
+/// Source pin: the deprecation warning is actually reachable from contract load.
+///
+/// The behavioural tests above cover the decision `warn_on_host_clock_import`
+/// makes, but not that anything calls it. Exercising the real call site needs a
+/// compiled contract, a `Runtime`, a contract store and a module cache: a large
+/// fixture to guard one call, and deleting the call is exactly the regression
+/// that would leave every unit test above green while the node warns about
+/// nothing. So the call site is pinned at the source level instead.
+#[cfg(test)]
+mod host_clock_warning_call_site_pin {
+    /// `src` with the CONTENTS of string literals, char literals and comments
+    /// replaced by spaces, so brace counting sees structure only.
+    ///
+    /// Byte offsets are preserved exactly (every replacement is one space per
+    /// byte), so an offset found in the result indexes the original.
+    ///
+    /// Panics on raw strings and block comments rather than guessing at them.
+    /// That is the whole point: a masker that silently mishandles syntax it does
+    /// not know is the same defect as not masking at all, one level up. If this
+    /// function ever fires, extend it — do not delete the call.
+    fn blank_literals(src: &str) -> String {
+        // Kept BYTE-IDENTICAL with its twin; see the divergence pin in `fdev`'s
+        // `stdout_purity_pin::the_two_blank_literals_have_not_drifted`.
+        fn excerpt(src: &str, at: usize) -> &str {
+            let end = (at + 48).min(src.len());
+            src.get(at..end).unwrap_or("<not a char boundary>")
+        }
+        /// Length in bytes of the char literal starting at `at` (which must be
+        /// the opening `'`), or `None` when this is not a char literal — a
+        /// lifetime, or a label. Handles `'x'` and `'\x'`; a multi-byte char is
+        /// measured by finding the closing quote rather than assuming one byte.
+        fn char_literal_len(bytes: &[u8], at: usize) -> Option<usize> {
+            let escaped = bytes.get(at + 1) == Some(&b'\\');
+            let body_start = if escaped { at + 2 } else { at + 1 };
+            // A char literal's body is one char, so the close quote is within a
+            // few bytes; bounding the search is what stops a lifetime followed
+            // by an unrelated quote from being swallowed.
+            for (end, byte) in bytes.iter().enumerate().skip(body_start).take(4) {
+                if *byte == b'\'' {
+                    return (end > body_start).then_some(end - at + 1);
+                }
+            }
+            None
+        }
+        let bytes = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'r' if bytes[i + 1..].starts_with(b"\"") || bytes[i + 1..].starts_with(b"#") => {
+                    panic!(
+                        "blank_literals cannot mask a raw string, so the brace count \
+                         it feeds would be wrong and the scrape would silently cover \
+                         the wrong region. EXTEND this function to handle raw strings; \
+                         do not delete the call. At byte {i} of the scraped region: {:?}",
+                        excerpt(src, i)
+                    );
+                }
+                b'/' if bytes[i + 1..].starts_with(b"*") => {
+                    panic!(
+                        "blank_literals cannot mask a block comment, so the brace count \
+                         it feeds would be wrong and the scrape would silently cover \
+                         the wrong region. EXTEND this function to handle block \
+                         comments; do not delete the call. At byte {i} of the scraped \
+                         region: {:?}",
+                        excerpt(src, i)
+                    );
+                }
+                b'/' if bytes[i + 1..].starts_with(b"/") => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        out.push(' ');
+                        i += 1;
+                    }
+                }
+                b'"' => {
+                    out.push(' ');
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        if bytes[i] == b'\\' {
+                            out.push(' ');
+                            i += 1;
+                        }
+                        if i < bytes.len() {
+                            out.push(' ');
+                            i += 1;
+                        }
+                    }
+                    assert!(i < bytes.len(), "unterminated string literal");
+                    out.push(' ');
+                    i += 1;
+                }
+                // A char literal, `'x'` or `b'x'`, for ANY x — not just a brace.
+                //
+                // Matching only `'{'`/`'}'` here was a real bug with exactly the
+                // shape this function exists to prevent: `'"'` fell through to
+                // the `_` arm, its quote was pushed, and the NEXT iteration read
+                // that quote as a string opener and blanked everything to the
+                // following `"` in the file. Measured on `'"'` inserted into
+                // `prepare_contract_call_inner`: the scraped region grew from
+                // 5,389 to 21,441 bytes, swallowing three later functions, with
+                // every assertion still green.
+                //
+                // `\\`-escaped forms (`'\''`, `'\\'`, `'\n'`) are covered by the
+                // escape branch. A LIFETIME (`'a`, `'static`) is not matched,
+                // because it has no closing quote in the checked position.
+                b'\'' if char_literal_len(bytes, i).is_some() => {
+                    let len = char_literal_len(bytes, i).expect("just checked");
+                    for _ in 0..len {
+                        out.push(' ');
+                    }
+                    i += len;
+                }
+                _ => {
+                    let ch = src[i..].chars().next().expect("in bounds");
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+        debug_assert_eq!(out.len(), src.len(), "blank_literals must preserve offsets");
+        out
+    }
+
+    /// `prepare_contract_call_inner`'s body with whole-line comments stripped.
+    ///
+    /// Stripping is load-bearing: the call site carries a comment naming
+    /// `warn_on_host_clock_import`, so a scrape over the raw body would be
+    /// satisfied by that comment alone and would stay green after the call
+    /// itself was deleted. This repo has shipped exactly that bug (see
+    /// `fdev`'s `code_only`).
+    fn call_site_code() -> String {
+        let src = include_str!("runtime.rs");
+        let signature = "fn prepare_contract_call_inner(";
+        let start = src
+            .find(signature)
+            .expect("prepare_contract_call_inner not found in runtime.rs");
+        let first_test_mod = src
+            .find("\n#[cfg(test)]")
+            .expect("runtime.rs has no test module");
+        assert!(
+            start < first_test_mod,
+            "the signature matched only inside a test module, so this pin would \
+             be scoped to a test rather than to production code"
+        );
+        let after = &src[start..];
+        let open = after.find('{').expect("signature has no body");
+        // Count braces over a copy with string/char literals and comments blanked
+        // out, then slice the ORIGINAL at the offset that finds. Counting over
+        // the raw source treats a brace inside a literal as structure, so a
+        // `format!("...{...")` added to this function later would silently widen
+        // the region past its closing brace into the next one — and
+        // `count() == 1` and the vacuity anchor below would BOTH still pass, so
+        // the pin would weaken quietly instead of failing. `blank_literals`
+        // panics on syntax it cannot mask, so the failure direction is loud.
+        let masked = blank_literals(&after[open..]);
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, ch) in masked.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        after[..end.expect("body is not brace-balanced")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn contract_load_calls_the_host_clock_warning() {
+        let body = call_site_code();
+        assert_eq!(
+            body.matches("warn_on_host_clock_import(").count(),
+            1,
+            "the host-clock deprecation warning is no longer called (exactly once) \
+             from the contract module-cache miss path, so no contract will ever \
+             draw the #5465 notice:\n{body}"
+        );
+    }
+
+    /// The pin above is only worth anything if the scrape it runs on can fail.
+    /// A signature that stopped matching, or a body that came back empty, would
+    /// make the assertion above vacuous rather than false.
+    #[test]
+    fn the_scrape_sees_real_code() {
+        let body = call_site_code();
+        assert!(
+            body.contains("self.engine.compile(&code)?"),
+            "the scraped region is not prepare_contract_call_inner's body any more"
+        );
+        assert!(
+            !body.contains("// Deprecation notice for #5465"),
+            "comment stripping stopped working, so the pin can be satisfied by a \
+             comment naming the function instead of by a call to it"
+        );
+    }
+
+    /// A brace inside a string literal is not structure.
+    ///
+    /// Without the mask, the `}` in the format string closes the body early and
+    /// the scraped region stops short; the `{` case widens it instead. Both make
+    /// the pin above report on the wrong text while still passing.
+    #[test]
+    fn braces_inside_literals_are_not_counted_as_structure() {
+        let masked = blank_literals("{ f(\"}}}{\"); g('{'); }");
+        assert_eq!(
+            masked.matches('{').count(),
+            1,
+            "a brace inside a string or char literal was counted as structure: {masked}"
+        );
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert_eq!(
+            masked.len(),
+            "{ f(\"}}}{\"); g('{'); }".len(),
+            "the mask changed byte offsets, so they no longer index the original"
+        );
+    }
+
+    /// A brace in a comment is not structure either, and an escaped quote does
+    /// not end the literal it is inside.
+    #[test]
+    fn comments_and_escaped_quotes_are_handled() {
+        let masked = blank_literals("{ // }}}\n f(\"a\\\"}\"); }");
+        assert_eq!(masked.matches('{').count(), 1, "{masked}");
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+    }
+
+    /// Real code the mask must leave alone: a lifetime is not a char literal.
+    #[test]
+    fn a_lifetime_is_not_mistaken_for_a_char_literal() {
+        let src = "{ fn f<'a>(x: &'a str) -> &'a str { x } }";
+        assert_eq!(blank_literals(src), src);
+    }
+
+    /// Syntax the mask does not handle must PANIC rather than be guessed at —
+    /// a masker that silently mishandles a construct is the same defect it
+    /// exists to prevent.
+    /// A char literal holding a QUOTE is masked, not treated as a string opener.
+    ///
+    /// The arm used to match only `'{'` and `'}'`; `'"'` fell through to `_`,
+    /// its quote was pushed, and the next iteration read that quote as a string
+    /// opener and blanked everything to the following `"` in the file. Measured
+    /// before the fix: inserting `let _q = '"';` into `prepare_contract_call_inner`
+    /// grew its scraped region from 5,389 to 21,441 bytes — three whole functions
+    /// — with all 26 tests still green. Precisely the silent widening this
+    /// function exists to prevent.
+    #[test]
+    fn a_char_literal_holding_a_quote_does_not_open_a_string() {
+        let masked = blank_literals("{ let _q = '\"'; f(); }");
+        assert_eq!(
+            masked.matches('{').count(),
+            1,
+            "structure was lost after a quote char literal: {masked}"
+        );
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert!(
+            masked.contains("f()"),
+            "the code after a quote char literal was blanked as if it were \
+             inside a string: {masked}"
+        );
+        assert_eq!(masked.len(), "{ let _q = '\"'; f(); }".len());
+    }
+
+    /// The byte-string form of the same trap.
+    #[test]
+    fn a_byte_char_literal_holding_a_quote_does_not_open_a_string() {
+        let masked = blank_literals("{ if c == b'\"' { g(); } }");
+        assert_eq!(
+            masked.matches('{').count(),
+            2,
+            "structure was lost after a byte quote literal: {masked}"
+        );
+        assert_eq!(masked.matches('}').count(), 2, "{masked}");
+    }
+
+    /// Escaped char literals are masked whole, so the escaped quote in `'\''`
+    /// does not leak either.
+    #[test]
+    fn escaped_char_literals_are_masked_whole() {
+        let masked = blank_literals("{ a('\\''); b('\\\\'); c('\\n'); d(); }");
+        assert_eq!(masked.matches('{').count(), 1, "{masked}");
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert!(masked.contains("d()"), "code after was blanked: {masked}");
+    }
+
+    /// Char literals other than braces and quotes are masked too, and masking
+    /// them must not disturb the surrounding structure.
+    #[test]
+    fn ordinary_char_literals_are_masked_without_losing_structure() {
+        let src = "{ m(' '); n('x'); o('é'); }";
+        let masked = blank_literals(src);
+        assert_eq!(masked.matches('{').count(), 1, "{masked}");
+        assert_eq!(masked.matches('}').count(), 1, "{masked}");
+        assert_eq!(
+            masked.len(),
+            src.len(),
+            "masking a multi-byte char literal changed byte offsets"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "raw string")]
+    fn a_raw_string_fails_closed() {
+        blank_literals("{ let s = r\"}{\"; }");
+    }
+
+    #[test]
+    #[should_panic(expected = "block comment")]
+    fn a_block_comment_fails_closed() {
+        blank_literals("{ /* } */ }");
     }
 }

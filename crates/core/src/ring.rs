@@ -25,8 +25,8 @@ use parking_lot::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 pub use hosting::{
-    AddClientSubscriptionResult, AddSubscriberOutcome, ClientDisconnectResult, SubscribeResult,
-    SubscribedContractSnapshot,
+    AddClientSubscriptionResult, AddSubscriberOutcome, ClientDisconnectResult, HostingReason,
+    HostingReasonStats, SubscribeResult, SubscribedContractSnapshot,
 };
 
 use crate::message::TransactionType;
@@ -85,6 +85,7 @@ mod broken_invariants;
 mod connection_backoff;
 mod connection_manager;
 pub(crate) mod contract_ban_list;
+pub(crate) mod contract_exec_metrics;
 pub(crate) mod delta_incompat;
 /// Shadow-mode detector for repairs that never converge (see the module docs).
 pub(crate) mod futile_repair;
@@ -114,11 +115,27 @@ pub(crate) use hosting::HostingCause;
 /// `config::ConfigArgs::build` so an upgraded node re-derives its hosting budget
 /// instead of keeping the historically-pinned default (#4565).
 pub(crate) use hosting::LEGACY_FLAT_HOSTING_BUDGET_BYTES;
+/// Clamp bound re-exported only for the config-default round-trip test.
+#[cfg(test)]
+pub(crate) use hosting::MAX_DEFAULT_HOSTING_BUDGET_BYTES;
+/// The aggregate hosting-disk budget's own floor — also the wasmtime
+/// compile-cache's configured-budget bound's floor (#5328 review), so this is
+/// a genuine production dependency now, not test-only.
+pub(crate) use hosting::MIN_DEFAULT_HOSTING_BUDGET_BYTES;
 /// Single source of truth for the default hosted-contract-state budget.
 /// `config::default_max_hosting_storage()` resolves to this so the
 /// operator-facing default and the in-code fallback can never drift. The
 /// default is RAM-scaled (capability-relative, A2) rather than a flat constant.
 pub(crate) use hosting::default_hosting_budget_bytes;
+/// The aggregate hosting-disk budget's own pure clamp math. A genuine
+/// production dependency (#5328 review): the wasmtime compile-cache's
+/// configured-budget bound (`wasm_runtime::runtime::bound_by_configured_disk_budget`)
+/// projects what the live aggregate budget will resolve to via this SAME
+/// function, so the compile cache respects an operator-shrunk
+/// `--max-hosting-disk` rather than only physical disk availability. Also
+/// used by the wasmtime disk-cache sizing tests to verify headroom against
+/// the real function rather than a duplicate.
+pub(crate) use hosting::disk_budget_for_clamped;
 /// The hosting budget's pure RAM clamp, re-exported (test-only) so the wasmtime
 /// on-disk compile-cache sizing test can pin that the compile cache never
 /// exceeds the contract-state budget it accelerates.
@@ -132,14 +149,19 @@ pub use hosting::{AccessType, RecordAccessResult};
 /// Aggregate disk-budget defaults (#4683). `config` resolves the persisted
 /// `hosting-disk-pct` / `max-hosting-disk` defaults from these so the operator-
 /// facing defaults and the in-code sizing math share one source of truth.
-pub(crate) use hosting::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES};
+pub(crate) use hosting::{
+    DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE,
+};
 /// Widths of the two hosted-set demand-signal histograms carried on the router
 /// snapshot, re-exported so `router` sizes its wire arrays from the same
 /// definition the bucketing code uses.
 pub(crate) use hosting::{GENUINE_ACCESS_RECENCY_BUCKETS, READ_COUNT_HIST_BUCKETS};
-/// Clamp bounds re-exported only for the config-default round-trip test.
-#[cfg(test)]
-pub(crate) use hosting::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
+/// The aggregate disk-usage tracker's mount-availability probe and directory
+/// walk, re-exported so the wasmtime on-disk compile-cache startup sizing
+/// (`wasm_runtime::runtime::default_wasmtime_cache_size_bytes_for_dir`, #5014)
+/// can bound itself by real disk headroom, not just RAM, without duplicating
+/// the `statvfs` FFI call or the walk.
+pub(crate) use hosting::{disk_available_bytes, disk_directory_size_bytes};
 pub mod interest;
 mod live_tx;
 mod location;
@@ -297,6 +319,15 @@ pub(crate) struct Ring {
     /// task *reads* it. Threading the `Arc` (rather than a process-global)
     /// keeps the gauges per-node so unit tests stay isolated (#4488).
     module_cache_metrics: Arc<crate::wasm_runtime::ModuleCacheMetrics>,
+    /// Per-node contract-exec WASM counters: how many `summarize_state` /
+    /// `get_state_delta` invocations this node actually ran, split from the
+    /// cache hits that elided them. Constructed once here and shared via `Arc`:
+    /// the executor increments it through `op_manager.ring`, while
+    /// `emit_router_snapshot_telemetry` reads it. Threading the `Arc` (rather
+    /// than a process-global) keeps the counters per-node so unit tests stay
+    /// isolated (#4488). See [`contract_exec_metrics`] for why an
+    /// undifferentiated span count could not answer the storm question.
+    contract_exec_metrics: Arc<contract_exec_metrics::ContractExecMetrics>,
     /// Per-node placement-migration activity counters (#4404 follow-up).
     /// Constructed once here and shared via `Arc`: the migration SEND site
     /// (`p2p_protoc::migration`) and the two RECEIVE sites (`node::process_message`)
@@ -635,6 +666,11 @@ impl Ring {
             governance_config,
             time_source.clone(),
         ));
+        // Read before `connection_manager` is moved into the literal.
+        // The UPDATE limiter's per-sender budget is keyed by the
+        // immediate upstream hop, so its map is sized from this node's
+        // OWN connection cap rather than a hardcoded default.
+        let max_connections = connection_manager.max_connections;
         let ring = Ring {
             max_hops_to_live,
             router,
@@ -654,7 +690,15 @@ impl Ring {
             broken_invariants: BrokenInvariantsTracker::new(time_source.clone()),
             governance,
             update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
-                time_source.clone(),
+                // Production passes `None` and gets `time_source` (the real
+                // clock). The override exists so a test can decide the
+                // limiter's verdict instead of racing MIN_UPDATE_INTERVAL —
+                // see `NodeConfig::update_rate_limit_time_source_override`.
+                config
+                    .update_rate_limit_time_source_override
+                    .clone()
+                    .unwrap_or_else(|| time_source.clone()),
+                max_connections,
             )),
             merge_backoff: Arc::new(merge_backoff::MergeBackoff::new(time_source.clone())),
             delta_incompat: Arc::new(delta_incompat::DeltaIncompat::new(time_source.clone())),
@@ -683,6 +727,7 @@ impl Ring {
             // (the `RuntimePool` reaches it through `op_manager.ring`). See
             // the field docs and #4488.
             module_cache_metrics: Arc::new(crate::wasm_runtime::ModuleCacheMetrics::new()),
+            contract_exec_metrics: Arc::new(contract_exec_metrics::ContractExecMetrics::default()),
             // One placement-migration counter sink per node, shared with the
             // migration send/receive sites via the `Arc` (reached through
             // `op_manager.ring`). See the field docs.
@@ -700,6 +745,29 @@ impl Ring {
         }
 
         let ring = Arc::new(ring);
+
+        // Conformance focus selects over the contracts this peer HOSTS (RFC #5320),
+        // so the ring - which owns the hosting cache - is what can answer that. A
+        // `Weak` deliberately: this closure is stored in a process-global that
+        // outlives the node, and holding a strong `Arc` there would keep an entire
+        // ring, its background tasks' handles and its caches alive past teardown. A
+        // dead ring reads as "no candidates", which surfaces as `focused=0` rather
+        // than as a stale set. Registration is a no-op unless capture is enabled.
+        {
+            let weak = Arc::downgrade(&ring);
+            crate::conformance::capture::set_hosted_contracts_source(Box::new(move || {
+                weak.upgrade()
+                    .map(|ring| {
+                        ring.hosting_manager
+                            .hosting_contract_keys()
+                            .into_iter()
+                            .map(|key| *key.id())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }));
+        }
+
         let current_span = tracing::Span::current();
         let span = if current_span.is_none() {
             tracing::info_span!("connection_maintenance")
@@ -829,6 +897,16 @@ impl Ring {
     /// this `Arc` is what replaced the old `MODULE_CACHE_METRICS` process-global.
     pub(crate) fn module_cache_metrics(&self) -> Arc<crate::wasm_runtime::ModuleCacheMetrics> {
         self.module_cache_metrics.clone()
+    }
+
+    /// Shared per-node contract-exec WASM counters. Returns a BORROW, not an
+    /// `Arc` clone: the increment sites sit on the contract-handling loop's hot
+    /// path (tens of calls/sec per node), where an `Arc` refcount bump would be
+    /// a needless atomic RMW on top of the counter's own. The snapshot reader
+    /// borrows the same way on its 5-minute cadence.
+    #[inline]
+    pub(crate) fn contract_exec_metrics(&self) -> &contract_exec_metrics::ContractExecMetrics {
+        &self.contract_exec_metrics
     }
 
     /// Shared per-node placement-migration counter sink (#4404 follow-up). The
@@ -1653,6 +1731,13 @@ impl Ring {
         let mut prev_broadcast_stream_failures_total: u64 = crate::node::BROADCAST_STREAM_METRICS
             .snapshot()
             .streaming_failures_total;
+        // Same shape for the contract-exec WASM counters: the monotonic totals
+        // are emitted for collector-side differencing, and these loop-local
+        // previous values turn the four headline arms into per-window deltas so
+        // a SINGLE snapshot says whether this node's summarize/delta load was
+        // cache hits or real WASM work. Seeded from the current values so the
+        // first emitted window covers only elapsed-since-start work.
+        let mut prev_exec = ring.contract_exec_metrics.snapshot();
         // The diagnostic block is substantially wider than the ordinary
         // snapshot gauges. Its counters are lifetime-monotonic, so collecting
         // locally on every event but exporting one in six snapshots preserves
@@ -2028,6 +2113,70 @@ impl Ring {
             snapshot.broadcast_stream_failures_last_snapshot =
                 Some(broadcast_stream_failures_delta);
 
+            // Contract-exec WASM counters: the split that makes a summarize rate
+            // interpretable. A high `fast_hits` rate with a low `wasm_calls` rate
+            // is a warm cache doing cheap work; the two converging means the
+            // change-detector has stopped covering the load and the storm class
+            // (#4473 / #4610 / #5040 / #5238) has re-armed.
+            //
+            // EVERY arm is windowed, not a chosen headline subset. Emitting some
+            // arms as a 5-minute delta and others as a lifetime total, under
+            // parallel names on one log line, invites reading them as comparable
+            // magnitudes — and the arm that would be understated that way is
+            // `delta_wasm_uncached`, the per-local-subscriber fan-out delta that
+            // has no cache in front of it at all and can dominate on a
+            // client-facing node. An overstated saving is worse than a missing
+            // one, because it terminates the investigation.
+            let ce = ring.contract_exec_metrics.snapshot();
+            let ce_d = ce.window_deltas(&mut prev_exec);
+            // Exhaustive destructure with no `..` rest pattern, on BOTH the
+            // lifetime snapshot and the window deltas. A 9th counter arm then
+            // fails to COMPILE here until it is exported, which is strictly
+            // stronger than the source-scrape pin below: a scrape that hardcodes
+            // today's eight names passes unchanged when a ninth is added, which
+            // is exactly how a counter ends up recorded but never exported.
+            let contract_exec_metrics::ContractExecSnapshot {
+                summarize_fast_hits: _,
+                summarize_reload_hits: _,
+                summarize_wasm_calls: _,
+                summarize_wasm_uncached: _,
+                delta_fast_hits: _,
+                delta_reload_hits: _,
+                delta_wasm_calls: _,
+                delta_wasm_uncached: _,
+            } = ce;
+            let contract_exec_metrics::ContractExecSnapshot {
+                summarize_fast_hits: _,
+                summarize_reload_hits: _,
+                summarize_wasm_calls: _,
+                summarize_wasm_uncached: _,
+                delta_fast_hits: _,
+                delta_reload_hits: _,
+                delta_wasm_calls: _,
+                delta_wasm_uncached: _,
+            } = ce_d;
+            snapshot.contract_exec_summarize_fast_hits_total = Some(ce.summarize_fast_hits);
+            snapshot.contract_exec_summarize_reload_hits_total = Some(ce.summarize_reload_hits);
+            snapshot.contract_exec_summarize_wasm_calls_total = Some(ce.summarize_wasm_calls);
+            snapshot.contract_exec_summarize_wasm_uncached_total = Some(ce.summarize_wasm_uncached);
+            snapshot.contract_exec_delta_fast_hits_total = Some(ce.delta_fast_hits);
+            snapshot.contract_exec_delta_reload_hits_total = Some(ce.delta_reload_hits);
+            snapshot.contract_exec_delta_wasm_calls_total = Some(ce.delta_wasm_calls);
+            snapshot.contract_exec_delta_wasm_uncached_total = Some(ce.delta_wasm_uncached);
+            snapshot.contract_exec_summarize_fast_hits_last_snapshot =
+                Some(ce_d.summarize_fast_hits);
+            snapshot.contract_exec_summarize_reload_hits_last_snapshot =
+                Some(ce_d.summarize_reload_hits);
+            snapshot.contract_exec_summarize_wasm_calls_last_snapshot =
+                Some(ce_d.summarize_wasm_calls);
+            snapshot.contract_exec_summarize_wasm_uncached_last_snapshot =
+                Some(ce_d.summarize_wasm_uncached);
+            snapshot.contract_exec_delta_fast_hits_last_snapshot = Some(ce_d.delta_fast_hits);
+            snapshot.contract_exec_delta_reload_hits_last_snapshot = Some(ce_d.delta_reload_hits);
+            snapshot.contract_exec_delta_wasm_calls_last_snapshot = Some(ce_d.delta_wasm_calls);
+            snapshot.contract_exec_delta_wasm_uncached_last_snapshot =
+                Some(ce_d.delta_wasm_uncached);
+
             // Placement-quality gauge (#4404 follow-up): host-to-hosted-key
             // ring-distance distribution. If the SubscribeHint placement
             // migration is working, hosting drifts toward each contract's key,
@@ -2263,6 +2412,20 @@ impl Ring {
                 broadcast_stream_attempts_total = bs.streaming_attempts_total,
                 broadcast_stream_failures_total = bs.streaming_failures_total,
                 broadcast_stream_failures_last_snapshot = broadcast_stream_failures_delta,
+                // The per-window arms are logged (not the lifetime totals) so a
+                // local operator reading `journalctl` gets the answer from ONE
+                // line, and ALL EIGHT are logged in the same unit — mixing
+                // 5-minute deltas with lifetime totals under parallel names
+                // would invite reading them as comparable magnitudes. `info!`
+                // survives `release_max_level_info`; `debug!` would not.
+                contract_exec_summarize_fast_hits_last_snapshot = ce_d.summarize_fast_hits,
+                contract_exec_summarize_reload_hits_last_snapshot = ce_d.summarize_reload_hits,
+                contract_exec_summarize_wasm_calls_last_snapshot = ce_d.summarize_wasm_calls,
+                contract_exec_summarize_wasm_uncached_last_snapshot = ce_d.summarize_wasm_uncached,
+                contract_exec_delta_fast_hits_last_snapshot = ce_d.delta_fast_hits,
+                contract_exec_delta_reload_hits_last_snapshot = ce_d.delta_reload_hits,
+                contract_exec_delta_wasm_calls_last_snapshot = ce_d.delta_wasm_calls,
+                contract_exec_delta_wasm_uncached_last_snapshot = ce_d.delta_wasm_uncached,
                 hosted_contracts_count = ?snapshot.hosted_contracts_count,
                 hosted_key_distance_median = ?snapshot.hosted_key_distance_median,
                 hosted_key_distance_p90 = ?snapshot.hosted_key_distance_p90,
@@ -3245,6 +3408,33 @@ impl Ring {
                 .disk_available_bytes()
                 .unwrap_or(u64::MAX);
             ring.hosting_manager.recompute_effective_budget(available);
+
+            // Resident-overhead (count-derived) budget (#5325, live-basis #5333):
+            // recomputed every tick so it tracks LIVE memory pressure rather than
+            // being fixed at startup — a peer that grows busy (or a `MemoryMax`
+            // cgroup that gets tightened externally) re-derives a smaller budget
+            // on the next tick, and one that goes idle re-derives a larger one.
+            // All three reads are cheap (a `/proc` parse or a single syscall on
+            // every platform), so unlike the disk-usage walk above these run
+            // inline rather than on a blocking thread.
+            // 1 GiB fallback mirrors `cache::FALLBACK_TOTAL_RAM_BYTES` (private to
+            // that module) for the rare case the RAM read itself fails.
+            let total_ram = crate::wasm_runtime::read_total_ram_bytes()
+                .map(|v| v as u64)
+                .unwrap_or(1024 * 1024 * 1024);
+            let pool_size = crate::config::runtime_pool_size().get();
+            let live_signals = match (
+                crate::wasm_runtime::read_own_rss_bytes(),
+                crate::wasm_runtime::read_available_memory_bytes(),
+            ) {
+                (Some(rss), Some(avail)) => Some((rss as u64, avail as u64)),
+                _ => None,
+            };
+            ring.hosting_manager.recompute_resident_overhead_budget(
+                total_ram,
+                pool_size,
+                live_signals,
+            );
         }
     }
 
@@ -3444,6 +3634,14 @@ impl Ring {
         // config is only reachable here). The 60s sweep's recompute reads them.
         self.hosting_manager
             .configure_disk_budget(hosting_disk_pct, max_hosting_disk);
+    }
+
+    /// Install the operator-configurable share of live host-wide surplus
+    /// memory the resident-overhead (count-derived) eviction budget may claim
+    /// (#5333). Called once at startup; the 60s sweep's recompute reads it.
+    pub fn configure_resident_overhead_mem_share(&self, mem_share: f64) {
+        self.hosting_manager
+            .configure_resident_overhead_mem_share(mem_share);
     }
 
     /// Drop the ring's clones of the redb `Storage` handle (hosting metadata +
@@ -3951,6 +4149,12 @@ impl Ring {
         self.hosting_manager.contract_in_use(contract)
     }
 
+    /// Instance ids of every contract [`Self::contract_in_use`] holds for. See
+    /// `HostingManager::in_use_contract_ids`.
+    pub(crate) fn in_use_contract_ids(&self) -> Vec<ContractInstanceId> {
+        self.hosting_manager.in_use_contract_ids()
+    }
+
     /// Single helper for every state-write chokepoint. Does the three
     /// things a chokepoint MUST do, in order:
     ///
@@ -4225,6 +4429,14 @@ impl Ring {
         self.hosting_manager.hosting_contracts_count()
     }
 
+    /// The same hosted set as [`Self::hosting_contracts_count`], partitioned by
+    /// WHY each contract is held, with state bytes per bucket. Backs the
+    /// `freenet.node.contracts.hosted{,.bytes}` OTel gauges. See
+    /// [`HostingReason`].
+    pub fn hosted_by_reason(&self) -> HostingReasonStats {
+        self.hosting_manager.hosted_by_reason()
+    }
+
     /// Number of active network subscription leases this node currently holds.
     ///
     /// Together with [`hosting_contracts_count`](Self::hosting_contracts_count)
@@ -4424,12 +4636,18 @@ impl Ring {
     }
 
     /// Snapshot of the demand-driven hosting state for the local-peer
-    /// dashboard (piece A, #4642). Reads the canonical hosting cache — the
-    /// capability-relative RAM budget + per-contract Greedy-Dual keep_score
-    /// that actually governs retention today, replacing the dormant MAD
-    /// governance detector (#4296). No mirror, no cache: the aggregate gauges
-    /// and per-contract rows come straight from the `HostingManager`, so the
-    /// panel can't drift the way a mirrored counter would.
+    /// dashboard (#4642). Reads the canonical hosting cache — the
+    /// capability-relative budget plus the per-contract rows. No mirror, no
+    /// cache: the aggregate gauges and per-contract rows come straight from
+    /// the `HostingManager`, so the panel can't drift the way a mirrored
+    /// counter would.
+    ///
+    /// The demoted telemetry-only estimator (`keep_score` /
+    /// `predicted_demand`) is deliberately NOT carried on these rows: eviction
+    /// does not read it, and rendering it implied a ranking it never governed.
+    /// Real eviction ordering is subscriber-primary (`victim_order`);
+    /// `recency_seq` is the one ranking input available here, and is what the
+    /// cache actually sorts these rows by.
     ///
     /// Per-contract rows are returned in EVICTION order (next victim first).
     /// The renderer bounds how many it displays; the full count is
@@ -4458,10 +4676,9 @@ impl Ring {
                 ns::HostedContractEntry {
                     key_full,
                     key_short,
-                    keep_score: row.keep_score,
-                    predicted_demand: row.predicted_demand,
                     size_bytes: row.size_bytes,
                     read_count: row.read_count,
+                    recency_seq: row.recency_seq,
                     eviction_eligible,
                 }
             })
@@ -4497,6 +4714,10 @@ impl Ring {
             disk_compile_cache_bytes,
             disk_total_bytes,
             disk_budget_bytes,
+            resident_overhead_budget_bytes: stats.resident_overhead_budget_bytes,
+            estimated_resident_overhead_bytes: stats.estimated_resident_overhead_bytes,
+            contract_slot_budget: stats.contract_slot_budget,
+            resident_overhead_evictions_total: stats.resident_overhead_evictions_total,
         }
     }
 
@@ -7428,6 +7649,68 @@ mod k_closest_source_tests {
             }
         }
         assert_eq!(checked, 24, "expected exactly 24 export assignments");
+    }
+
+    /// Same mirror seam, for the contract-exec WASM counters. The export block
+    /// hand-copies each `ContractExecSnapshot` field into its `RouterSnapshotInfo`
+    /// twin, so a swap — feeding `..._wasm_calls_total` from `fast_hits`, say —
+    /// compiles cleanly and emits a plausible number that is measuring the
+    /// opposite thing.
+    ///
+    /// That failure mode is not hypothetical here: mistaking cache hits for WASM
+    /// work is the exact blindness these counters exist to remove, and an
+    /// overstated saving is worse than a missing one because it terminates the
+    /// investigation. Assert every assignment reads its own field.
+    /// Whitespace-normalized so rustfmt line-wrapping is irrelevant.
+    #[test]
+    fn contract_exec_export_maps_each_field_to_its_own_counter() {
+        let src = production_source();
+        let block = extract_fn_body(src, "async fn emit_router_snapshot_telemetry(");
+        let norm = block.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let fields = [
+            "summarize_fast_hits",
+            "summarize_reload_hits",
+            "summarize_wasm_calls",
+            "summarize_wasm_uncached",
+            "delta_fast_hits",
+            "delta_reload_hits",
+            "delta_wasm_calls",
+            "delta_wasm_uncached",
+        ];
+        for field in fields {
+            // Every arm is exported in BOTH units. A lifetime total sitting on
+            // a line of otherwise-parallel `_last_snapshot` names reads as a
+            // comparable magnitude and understates nothing visibly — which is
+            // why the pin demands both rather than either.
+            for expected in [
+                format!("snapshot.contract_exec_{field}_total = Some(ce.{field});"),
+                format!("snapshot.contract_exec_{field}_last_snapshot = Some(ce_d.{field});"),
+            ] {
+                assert!(
+                    norm.contains(&expected),
+                    "mirror-seam: export must contain `{expected}` — a field swap here \
+                     silently reports one arm's count under another arm's name"
+                );
+            }
+        }
+
+        // The delta computation itself is NOT scraped: it is
+        // `ContractExecSnapshot::window_deltas`, one function whose field
+        // correspondence is structural and unit-tested by
+        // `each_field_differences_its_own_twin`. What must be pinned here is
+        // that the emitter uses it rather than re-deriving eight deltas by hand
+        // at the call site, which is where a cross-wiring hides.
+        assert!(
+            norm.contains("let ce_d = ce.window_deltas(&mut prev_exec);"),
+            "the emitter must delegate to ContractExecSnapshot::window_deltas, not \
+             hand-difference each arm at the call site"
+        );
+        assert!(
+            !norm.contains("window_delta(ce."),
+            "no hand-written per-arm window_delta call may remain — that is the \
+             shape in which one arm gets differenced against another's previous value"
+        );
     }
 }
 

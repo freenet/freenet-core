@@ -21,6 +21,98 @@ pub struct PoolHealthStatus {
     pub contracts_in_flight: usize,
 }
 
+/// How long an [`InUseCodeHashes`] snapshot is reused before it is recomputed.
+///
+/// Matches the module cache's own interest-shadow refresh throttle: the split it
+/// feeds is consumed at the 5-minute snapshot cadence and at admission-gate
+/// time, so bounded staleness is harmless, while an unthrottled recompute would
+/// run the O(in-use) scan once per cached entry during an eviction sweep.
+const IN_USE_CODE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Answers "is any contract this node currently has demand for running this
+/// WASM code?" — the module cache's interest predicate, restated at code-hash
+/// granularity because the cache is keyed by code hash rather than by contract
+/// instance (#5268).
+///
+/// `Ring::contract_in_use` is a per-instance question and the cache no longer
+/// holds instances, so the mapping has to run the other way: enumerate the
+/// in-use instances (a small set — live client subscriptions plus downstream
+/// subscribers) and resolve each through the shared contract index to the code
+/// it runs. The resulting set is memoized for
+/// [`IN_USE_CODE_REFRESH_INTERVAL`] so an eviction sweep over thousands of
+/// cached modules does not re-derive it per entry.
+struct InUseCodeHashes {
+    /// Yields the instance ids currently in use. A closure rather than an
+    /// `Arc<Ring>` so the memoization and the instance→code mapping can be
+    /// tested without standing up a Ring, and so a test can count how often the
+    /// source is consulted.
+    in_use_ids: Box<dyn Fn() -> Vec<ContractInstanceId> + Send + Sync>,
+    index: crate::wasm_runtime::SharedContractIndex,
+    refresh_interval: Duration,
+    /// `(computed_at, in-use code hashes)`. Real wall-clock `Instant` for the
+    /// same reason the cache's own throttles use one: this rate-limits a
+    /// telemetry/eviction-heuristic recompute, not node behavior.
+    snapshot: Mutex<Option<(Instant, HashSet<CodeHash>)>>,
+}
+
+impl InUseCodeHashes {
+    fn new(ring: Arc<crate::ring::Ring>, index: crate::wasm_runtime::SharedContractIndex) -> Self {
+        Self::with_source(
+            Box::new(move || ring.in_use_contract_ids()),
+            index,
+            IN_USE_CODE_REFRESH_INTERVAL,
+        )
+    }
+
+    fn with_source(
+        in_use_ids: Box<dyn Fn() -> Vec<ContractInstanceId> + Send + Sync>,
+        index: crate::wasm_runtime::SharedContractIndex,
+        refresh_interval: Duration,
+    ) -> Self {
+        Self {
+            in_use_ids,
+            index,
+            refresh_interval,
+            snapshot: Mutex::new(None),
+        }
+    }
+
+    /// # Lock ordering (do not invert)
+    ///
+    /// This runs as the module cache's interest predicate, so the caller already
+    /// holds the module-cache mutex. Nesting is therefore
+    /// `module cache → this snapshot mutex → the hosting DashMaps` (via
+    /// `in_use_ids`) and the contract-index DashMap.
+    ///
+    /// It is deadlock-free only because nothing on the other three ever reaches
+    /// BACK for the module cache: `Ring::in_use_contract_ids` and the index are
+    /// pure reads that call nothing in `wasm_runtime`. Adding a module-cache
+    /// touch to any hosting path — or calling `contains` while holding a hosting
+    /// lock — would close the cycle, so keep this the innermost consumer, not a
+    /// participant.
+    fn contains(&self, code: &CodeHash) -> bool {
+        let mut snapshot = match self.snapshot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let stale = snapshot
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= self.refresh_interval);
+        if stale {
+            let fresh: HashSet<CodeHash> = (self.in_use_ids)()
+                .into_iter()
+                .filter_map(|id| self.index.get(&id).map(|entry| *entry.value()))
+                .collect();
+            *snapshot = Some((Instant::now(), fresh));
+        }
+        snapshot
+            .as_ref()
+            .expect("just populated when stale")
+            .1
+            .contains(code)
+    }
+}
+
 /// A pool of executors that enables concurrent contract execution.
 ///
 /// This pool manages multiple `Executor<Runtime>` instances, allowing multiple
@@ -71,15 +163,20 @@ pub struct RuntimePool {
     shared_summaries: SharedSummaries,
     /// Per-client subscription count for O(1) limit enforcement.
     shared_client_counts: SharedClientCounts,
-    /// Shared compiled contract module cache (avoids 16x duplication across pool executors).
-    shared_contract_modules: SharedModuleCache<ContractKey>,
-    /// Shared contract instance index (`ContractInstanceId -> CodeHash`) so a
-    /// contract stored / indexed / removed via any executor is visible to all
-    /// the others (#4218). Cloned into every executor's `ContractStore` at
+    /// Shared compiled contract module cache (avoids 16x duplication across pool
+    /// executors), keyed by CODE hash so instances differing only in parameters
+    /// share one compiled module (#5268).
+    shared_contract_modules: SharedModuleCache<CodeHash>,
+    /// Per-node store state every executor's `ContractStore`/`DelegateStore`
+    /// shares: the instance indexes (so a contract or delegate stored / indexed
+    /// / removed via any executor is visible to all the others, #4218) and the
+    /// source-WASM byte caches (so the node holds ONE copy of each blob rather
+    /// than `pool_size` copies, #5268). Cloned into every executor at
     /// construction and into replacements.
-    shared_contract_index: SharedContractIndex,
-    /// Shared compiled delegate module cache.
-    shared_delegate_modules: SharedModuleCache<DelegateKey>,
+    shared_stores: SharedStores,
+    /// Shared compiled delegate module cache, keyed by CODE hash for the same
+    /// reason the contract one is (#5268).
+    shared_delegate_modules: SharedModuleCache<CodeHash>,
     /// Shared per-delegate `ctx.write()` cache (see `DelegateContextCache`).
     shared_delegate_contexts: crate::wasm_runtime::DelegateContextCache,
     /// This node's created-delegate count, shared by every executor so
@@ -327,25 +424,35 @@ impl RuntimePool {
         // process-global) keeps the gauges per-node. Both caches share one sink;
         // they're routed apart by their `"contract"` / `"delegate"` label.
         let module_cache_metrics = op_manager.ring.module_cache_metrics();
-        // Interest predicate for the CONTRACT cache only: a contract is "of
-        // interest" while `Ring::contract_in_use` holds (a live local client
-        // subscription OR a downstream peer subscriber — deliberately NOT an
-        // upstream-only subscription, which would be unbounded). This drives the
-        // interest-weighted (two-tier) eviction policy AND the always-on shadow
-        // metrics. The delegate cache has no interest concept, so it gets none
-        // and stays pure byte-LRU. Capturing a clone of the `Arc<Ring>` keeps
-        // `wasm_runtime` free of any `ring` dependency. See #4441 / #4534.
-        let ring_for_interest = op_manager.ring.clone();
-        let contract_interest: crate::wasm_runtime::InterestPredicate<ContractKey> =
-            Arc::new(move |key: &ContractKey| ring_for_interest.contract_in_use(key));
-        let shared_contract_modules: SharedModuleCache<ContractKey> =
+        // Pool-owned contract instance index shared by every executor's
+        // `ContractStore` (#4218). The first executor loads it from ReDb; the
+        // rest inherit the same live `Arc`. Created here (before the caches)
+        // because the contract cache's interest predicate resolves instances
+        // through it — see `InUseCodeHashes`.
+        let shared_stores = SharedStores::new(super::SOURCE_CODE_CACHE_MAX_BYTES);
+        // Interest predicate for the CONTRACT cache only: code is "of interest"
+        // while some contract running it satisfies `Ring::contract_in_use` (a
+        // live local client subscription OR a downstream peer subscriber —
+        // deliberately NOT an upstream-only subscription, which would be
+        // unbounded). This drives the interest-weighted (two-tier) eviction
+        // policy AND the always-on shadow metrics. The delegate cache has no
+        // interest concept, so it gets none and stays pure byte-LRU. Capturing a
+        // clone of the `Arc<Ring>` keeps `wasm_runtime` free of any `ring`
+        // dependency. See #4441 / #4534 / #5268.
+        let in_use_codes = Arc::new(InUseCodeHashes::new(
+            op_manager.ring.clone(),
+            shared_stores.contract_index.clone(),
+        ));
+        let contract_interest: crate::wasm_runtime::InterestPredicate<CodeHash> =
+            Arc::new(move |code: &CodeHash| in_use_codes.contains(code));
+        let shared_contract_modules: SharedModuleCache<CodeHash> =
             Arc::new(Mutex::new(ModuleCache::with_label_and_interest(
                 contract_cache_budget,
                 "contract",
                 Some(module_cache_metrics.clone()),
                 Some(contract_interest),
             )));
-        let shared_delegate_modules: SharedModuleCache<DelegateKey> =
+        let shared_delegate_modules: SharedModuleCache<CodeHash> =
             Arc::new(Mutex::new(ModuleCache::with_label(
                 delegate_cache_budget,
                 "delegate",
@@ -404,11 +511,6 @@ impl RuntimePool {
         let shared_recovery_guard: super::CorruptedStateRecoveryGuard =
             Arc::new(std::sync::Mutex::new(HashSet::new()));
 
-        // Pool-owned contract instance index shared by every executor's
-        // `ContractStore` (#4218). The first executor loads it from ReDb; the
-        // rest inherit the same live `Arc`.
-        let shared_contract_index: SharedContractIndex = Arc::new(DashMap::new());
-
         // Create the first executor to obtain a backend engine, then share it
         // with all subsequent executors. All executors MUST share the same backend
         // engine because compiled modules store references tied to the compiling
@@ -423,7 +525,7 @@ impl RuntimePool {
             shared_delegate_counter.clone(),
             shared_inherited_origins.clone(),
             None, // No shared backend yet — this executor creates the engine
-            shared_contract_index.clone(),
+            shared_stores.clone(),
         )
         .await?;
         let shared_backend_engine = first_executor.runtime.clone_backend_engine();
@@ -447,7 +549,7 @@ impl RuntimePool {
                 shared_delegate_counter.clone(),
                 shared_inherited_origins.clone(),
                 Some(shared_backend_engine.clone()),
-                shared_contract_index.clone(),
+                shared_stores.clone(),
             )
             .await?;
 
@@ -510,7 +612,7 @@ impl RuntimePool {
             shared_summaries,
             shared_client_counts,
             shared_contract_modules,
-            shared_contract_index,
+            shared_stores,
             shared_delegate_modules,
             shared_delegate_contexts,
             shared_delegate_counter,
@@ -700,7 +802,7 @@ impl RuntimePool {
             self.shared_delegate_counter.clone(),
             self.shared_inherited_origins.clone(),
             Some(self.shared_backend_engine.clone()),
-            self.shared_contract_index.clone(),
+            self.shared_stores.clone(),
         )
         .await?;
 
@@ -1112,8 +1214,11 @@ impl ContractExecutor for RuntimePool {
                     limit = super::MAX_SUBSCRIBERS_PER_CONTRACT,
                     "Subscriber limit reached for contract, rejecting registration"
                 );
+                let key = self
+                    .lookup_key(&instance_id)
+                    .unwrap_or_else(|| synthetic_key(instance_id));
                 return Err(subscriber_limit_error(
-                    instance_id,
+                    key,
                     &format!(
                         "subscriber limit ({}) reached for contract",
                         super::MAX_SUBSCRIBERS_PER_CONTRACT
@@ -1131,8 +1236,11 @@ impl ContractExecutor for RuntimePool {
                     current = client_sub_count,
                     "Per-client subscription limit reached, rejecting registration"
                 );
+                let key = self
+                    .lookup_key(&instance_id)
+                    .unwrap_or_else(|| synthetic_key(instance_id));
                 return Err(subscriber_limit_error(
-                    instance_id,
+                    key,
                     &format!(
                         "per-client subscription limit ({}) reached",
                         super::MAX_SUBSCRIPTIONS_PER_CLIENT
@@ -1406,6 +1514,162 @@ mod tests {
     };
     use std::num::NonZeroUsize;
     use std::sync::Arc;
+
+    /// The contract module cache is keyed by code hash, so its interest
+    /// predicate must answer "is ANY in-use instance running this code?" — a
+    /// many-to-one question `Ring::contract_in_use` cannot answer per key
+    /// (#5268). These pin that translation, the index gating, and the
+    /// memoization window.
+    mod in_use_code_hashes {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn index_of(entries: &[(ContractKey, u8)]) -> crate::wasm_runtime::SharedContractIndex {
+            let index = crate::wasm_runtime::SharedContractIndex::default();
+            for (key, code_seed) in entries {
+                index.insert(*key.id(), CodeHash::from_code(&[*code_seed; 64]));
+            }
+            index
+        }
+
+        /// Many instances, one code: ONE in-use instance is enough to make the
+        /// whole code hash interested, and a code hash no in-use instance runs
+        /// is not.
+        #[test]
+        fn any_in_use_instance_makes_its_code_interested() {
+            // Three parameterizations of code A, one of code B.
+            let (_, a0) = make_contract(1, 10);
+            let (_, a1) = make_contract(1, 11);
+            let (_, a2) = make_contract(1, 12);
+            let (_, b0) = make_contract(2, 10);
+            let index = index_of(&[(a0, 1), (a1, 1), (a2, 1), (b0, 2)]);
+            let code_a = CodeHash::from_code(&[1u8; 64]);
+            let code_b = CodeHash::from_code(&[2u8; 64]);
+
+            // Only the MIDDLE instance of code A is in use, and nothing of B.
+            let in_use = vec![*a1.id()];
+            let resolver = InUseCodeHashes::with_source(
+                Box::new(move || in_use.clone()),
+                index,
+                Duration::from_secs(10),
+            );
+
+            assert!(
+                resolver.contains(&code_a),
+                "one in-use instance must make its code interested — keeping the \
+                 module its siblings share resident"
+            );
+            assert!(
+                !resolver.contains(&code_b),
+                "code no in-use instance runs must not be interested"
+            );
+        }
+
+        /// Nothing in use, and an in-use instance the index has never heard of,
+        /// both resolve to "not interested" rather than panicking or admitting.
+        #[test]
+        fn unindexed_or_absent_demand_is_not_interested() {
+            let (_, indexed) = make_contract(1, 10);
+            let (_, unindexed) = make_contract(3, 10);
+            let code = CodeHash::from_code(&[1u8; 64]);
+
+            let empty = InUseCodeHashes::with_source(
+                Box::new(Vec::new),
+                index_of(&[(indexed, 1)]),
+                Duration::from_secs(10),
+            );
+            assert!(
+                !empty.contains(&code),
+                "no demand means nothing is interested"
+            );
+
+            // In use, but this node never indexed it, so it cannot be resolved to
+            // any code — the same gate `fetch_contract` applies.
+            let in_use = vec![*unindexed.id()];
+            let unresolvable = InUseCodeHashes::with_source(
+                Box::new(move || in_use.clone()),
+                index_of(&[(indexed, 1)]),
+                Duration::from_secs(10),
+            );
+            assert!(
+                !unresolvable.contains(&code),
+                "an in-use instance absent from the index resolves to no code"
+            );
+        }
+
+        /// The snapshot is reused within its window and recomputed after it, so
+        /// an eviction sweep over thousands of entries pays for one scan.
+        #[test]
+        fn snapshot_is_memoized_within_its_window() {
+            let (_, key) = make_contract(1, 10);
+            let code = CodeHash::from_code(&[1u8; 64]);
+            let index = index_of(&[(key, 1)]);
+            let calls = Arc::new(AtomicUsize::new(0));
+
+            let counted = {
+                let calls = calls.clone();
+                let id = *key.id();
+                move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    vec![id]
+                }
+            };
+            let resolver = InUseCodeHashes::with_source(
+                Box::new(counted.clone()),
+                index.clone(),
+                Duration::from_secs(3600),
+            );
+            for _ in 0..50 {
+                assert!(resolver.contains(&code));
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "50 lookups inside the window must cost ONE scan of the in-use set"
+            );
+
+            // A zero-length window recomputes every time — the same code path,
+            // proving the memoization is the interval and not a one-shot latch.
+            calls.store(0, Ordering::SeqCst);
+            let unthrottled =
+                InUseCodeHashes::with_source(Box::new(counted), index, Duration::ZERO);
+            for _ in 0..5 {
+                assert!(unthrottled.contains(&code));
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                5,
+                "an expired window must recompute rather than latch the first answer"
+            );
+        }
+
+        /// Demand that appears after a snapshot is picked up once the window
+        /// elapses — the staleness bound this design accepts, stated as a test.
+        #[test]
+        fn new_demand_is_visible_after_the_window() {
+            let (_, key) = make_contract(1, 10);
+            let code = CodeHash::from_code(&[1u8; 64]);
+            let live: Arc<Mutex<Vec<ContractInstanceId>>> = Arc::new(Mutex::new(Vec::new()));
+
+            let source = {
+                let live = live.clone();
+                move || live.lock().unwrap().clone()
+            };
+            let resolver = InUseCodeHashes::with_source(
+                Box::new(source),
+                index_of(&[(key, 1)]),
+                Duration::ZERO,
+            );
+            assert!(!resolver.contains(&code));
+
+            live.lock().unwrap().push(*key.id());
+            assert!(
+                resolver.contains(&code),
+                "demand appearing after a snapshot must be picked up on the next \
+                 refresh"
+            );
+        }
+    }
 
     /// Synthetic contract container. The bytes are never executed
     /// (`remove_contract` only deletes files / DB rows), so a fake blob is

@@ -15,8 +15,26 @@
     'Iosevka', 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono',
     monospace;
   --font-sans: 'Space Grotesk', 'DM Sans', system-ui, -apple-system, sans-serif;
+
+  /* Semantic status colours. These were referenced throughout as
+   * `var(--danger, #c0392b)` / `var(--warn, #b8860b)` but never DEFINED, so
+   * every call site silently rendered its hardcoded fallback — the same value
+   * in both themes, and #c0392b is poor contrast on the near-black ground.
+   * Defining them makes the fallbacks dead and lets each theme pick a value
+   * that actually reads against its own background. */
+  --danger: #ff6b6b;
+  --warn: #f0b653;
+  --ok: #34d399;
 }
-/* Light mode overrides */
+/* Light mode overrides.
+ *
+ * Three states, not two. `data-theme` is absent until the operator picks a
+ * theme; only then is it stamped, and it then wins over the OS in BOTH
+ * directions. Previously there was no way to record "I want dark" — the
+ * toggle just removed the attribute — so an explicit dark choice on a
+ * light-mode desktop was indistinguishable from having chosen nothing, and
+ * would have been overridden by the media query below. `[data-theme='dark']`
+ * exists to hold that choice. */
 [data-theme='light'] {
   --bg-primary: #f7f5f2;
   --bg-secondary: #eeebe6;
@@ -26,6 +44,30 @@
   --text-primary: #1a1816;
   --text-secondary: #5c5955;
   --text-muted: #8c8985;
+  /* Darker on a light ground: the dark-theme values wash out on #f7f5f2. */
+  --danger: #b3261e;
+  --warn: #8a5a00;
+  --ok: #1f6b3f;
+}
+
+/* Follow the OS when the operator has expressed no preference. Without this
+ * the dashboard was dark for everyone until they found the sun icon, no
+ * matter what their system was set to. Guarded on `:not([data-theme='dark'])`
+ * so an explicit dark choice survives a light-mode OS. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) {
+    --bg-primary: #f7f5f2;
+    --bg-secondary: #eeebe6;
+    --bg-tertiary: #e5e0d9;
+    --bg-panel: rgba(255, 255, 255, 0.88);
+    --border-color: rgba(180, 175, 168, 0.4);
+    --text-primary: #1a1816;
+    --text-secondary: #5c5955;
+    --text-muted: #8c8985;
+    --danger: #b3261e;
+    --warn: #8a5a00;
+    --ok: #1f6b3f;
+  }
 }
 * {
   box-sizing: border-box;
@@ -442,6 +484,57 @@ main {
   font-size: 0.8rem;
   margin-top: 0.4rem;
 }
+/* Filter + collapse strip above a long table. Laid out with flex-wrap so it
+ * collapses to two lines on a phone instead of pushing the page sideways —
+ * the failure the `.g-norms` grid above had. */
+.table-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.6rem;
+}
+.tf-input {
+  flex: 1 1 12rem;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  padding: 0.35rem 0.6rem;
+}
+.tf-input:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
+}
+.tf-status {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  /* Deliberately NOT `nowrap`. This string embeds three row counts, and the
+     tables it describes are unbounded — a peer hosting tens of thousands of
+     contracts renders a longer string than any fixed layout budgeted for.
+     Measured at 320px it currently fits (291px of 320px with four-digit
+     counts), so this is a latent overflow rather than a live one, but a
+     no-wrap rule on unbounded content is exactly what caused the horizontal
+     scrolling this change set out to fix. Let it wrap instead. */
+}
+.tf-toggle {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--accent-light);
+  background: rgba(94, 234, 212, 0.1);
+  border: 1px solid rgba(94, 234, 212, 0.25);
+  border-radius: 5px;
+  padding: 0.3rem 0.6rem;
+  cursor: pointer;
+}
+.tf-toggle:hover {
+  background: rgba(94, 234, 212, 0.18);
+}
+
 .table-wrap {
   overflow-x: auto;
 }
@@ -882,23 +975,14 @@ p:last-child {
   }
 
   /* Governance: stack verdict + norms vertically, let table scroll */
-  .g-verdict-row {
-    grid-template-columns: 1fr;
-  }
   .g-verdict {
     min-width: auto;
-  }
-  .g-norms {
-    grid-template-columns: repeat(3, 1fr);
   }
   .app-list li {
     padding: 0.4rem 0;
   }
 }
 @media (max-width: 400px) {
-  .g-norms {
-    grid-template-columns: repeat(2, 1fr);
-  }
   .header-title {
     font-size: 0.9rem;
   }
@@ -1131,6 +1215,21 @@ table.sortable thead th.sort-desc::after {
   gap: 0.75rem;
   margin: 0.5rem 0 0.75rem;
 }
+
+/* The first column's hard 280px minimum cannot share a ~318px phone viewport
+ * with a second column: the second gets laid out past the edge and the whole
+ * PAGE scrolls sideways. Collapse to one column below the breakpoint.
+ *
+ * This override MUST sit after the rule above. An identical block placed in
+ * the earlier `max-width: 768px` section had equal specificity and lost the
+ * cascade to the later definition — it computed to `280px 87.64px` at 390px
+ * and changed nothing. Browser validation caught both the original overflow
+ * and this silently-dead fix for it. */
+@media (max-width: 768px) {
+  .g-verdict-row {
+    grid-template-columns: 1fr;
+  }
+}
 .g-verdict {
   background: var(--bg-tertiary);
   border: 1px solid var(--border-color);
@@ -1193,10 +1292,53 @@ table.sortable thead th.sort-desc::after {
   background: #d33682;
 }
 
+/* Stat-tile grid. Was a hard `repeat(5, 1fr)`, which had two consequences:
+ * at 390px it forced five ~73px tiles past the viewport edge and made the
+ * whole PAGE scroll sideways (the tables are innocent — they sit in
+ * `.table-wrap`, which already scrolls internally), and on wide screens a
+ * row of 3 or 4 tiles left a ragged right edge with dead space beside it.
+ *
+ * `auto-fit` with a 130px floor keeps five columns at the 800px main width
+ * (5x130 + 4 gaps = 682 <= ~745 available) while collapsing to two on a
+ * phone, so both fall out of one rule. */
 .g-norms {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   gap: 0.5rem;
+}
+
+/* The narrow-viewport column counts. These already existed — at 768px and
+ * 400px, in the media blocks near the top of this file — and had NEVER once
+ * applied: the unconditional base rule above is later in source order at
+ * equal specificity, so it won at every width. That is not a side note, it is
+ * the ROOT CAUSE of the horizontal-overflow bug this change fixes. The
+ * responsive fix was written, shipped, and silently inert, and the page
+ * scrolled sideways on every phone regardless.
+ *
+ * Re-stated here, after the base rule, so they actually take effect. `auto-fit`
+ * alone cannot express the intent: at 768px it yields five ~130px columns
+ * because the tablet and desktop widths are close, which is too dense for
+ * labels like "CONTRACT-CAP REJECTS". Keep these AFTER the base rule; moving
+ * either one is what broke this the first time. */
+/* `.g-verdict-row` is a two-track grid (`minmax(280px, 0.85fr) 2fr`) built for
+ * a verdict box beside a stat grid. Three of the hosting card's rows contain
+ * ONLY the stat grid, which then sits in track 1 and gets 0.85/2.85 of the
+ * width — measured at 280px of a 726px row, with 446px left empty beside it.
+ * At that width `auto-fit` yields two columns, so five tiles wrapped into
+ * three rows with dead space alongside. Let a sole child span both tracks. */
+.g-verdict-row > .g-norms:only-child {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 768px) {
+  .g-norms {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+@media (max-width: 400px) {
+  .g-norms {
+    grid-template-columns: repeat(2, 1fr);
+  }
 }
 .g-norm {
   background: var(--bg-tertiary);
@@ -1288,6 +1430,71 @@ table.sortable thead th.sort-desc::after {
 
 /* Freshness / demand pills in the Subscribed Contracts table (replaces the
  * retired MAD-governance column). Same compact shape as `.gov-pill`. */
+/* A full contract key is ~60 characters of unbroken base58 in a monospace
+   font, which is wider than a phone viewport and has no space to break at.
+   Without an explicit break rule it forces the whole page to scroll sideways —
+   the same class of bug the responsive work above fixed for the stat grids.
+   `anywhere` rather than `break-all` so the browser still prefers a sensible
+   break point where one exists. */
+/* The abbreviated key in a contract table links to its detail page. Styled to
+   stay legible as a link without turning the table into a wall of blue: the
+   underline only appears on hover, so the column still reads as data. */
+.key-link {
+  color: inherit;
+  text-decoration: none;
+}
+.key-link:hover code {
+  color: var(--accent-light);
+  text-decoration: underline;
+}
+
+/* Measured GET success rate (#5370). Deliberately styled as a READING, not a
+   status: no green/red, no icon. The page replaced a healthy/unhealthy verdict
+   with this number precisely because a verdict asserts something the four
+   connectivity inputs behind it could not support, and colouring the number
+   would smuggle the verdict back in through the stylesheet. */
+.get-success-rate {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  margin: 0.5rem 0 0.25rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem;
+}
+.gsr-label {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+}
+.gsr-value {
+  color: var(--text-primary);
+  font-size: 1rem;
+  font-weight: 600;
+}
+.gsr-detail,
+.gsr-none {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+/* The caveat is deliberately quiet but always present. It exists so a low
+   share is not misread as "my node is broken" — an unanswered GET is often
+   the network failing to route rather than this node failing to serve. */
+.get-success-caveat {
+  margin: 0 0 0.4rem;
+  font-size: 0.7rem;
+  line-height: 1.35;
+  color: var(--text-muted);
+  max-width: 62ch;
+}
+
+.key-wrap {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .fresh-pill {
   display: inline-block;
   padding: 0.1rem 0.45rem;
@@ -1315,9 +1522,39 @@ table.sortable thead th.sort-desc::after {
   color: var(--text-muted, #8b949e);
 }
 
-/* "next to evict" badge on the front row of the Demand-driven eviction
- * table (the lowest keep-score contract, i.e. the next budget-pressure
- * victim). */
+/* "Closest limit" strip on the Demand-driven eviction card: the card shows
+ * several independent ceilings and this names the one nearest to binding,
+ * because three flat rows of identical tiles gave no clue which mattered. The
+ * fill is coloured only above 75% so the strip is ignorable until it isn't. */
+.hz-binding {
+  margin: 0 0.9rem 0.7rem;
+}
+.hz-binding-head {
+  font-size: 0.82rem;
+  color: var(--text-secondary, #8b949e);
+  margin-bottom: 0.3rem;
+}
+.hz-binding-head strong {
+  color: var(--text-primary, #e6edf3);
+  font-weight: 600;
+}
+.hz-bar {
+  display: block;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(139, 148, 158, 0.18);
+  overflow: hidden;
+}
+.hz-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  min-width: 2px;
+}
+
+/* "next to evict" badge on the first EVICTION-ELIGIBLE row of the
+ * Demand-driven eviction table — the contract the over-budget sweep would
+ * shed first among those no local client or downstream subscriber pins. */
 .hz-badge {
   display: inline-block;
   margin-left: 0.35rem;

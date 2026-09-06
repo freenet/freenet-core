@@ -194,8 +194,10 @@ impl ProximityPrior {
     ///
     /// `predict()` (and the whole distance-prior estimator) is therefore retained
     /// for **telemetry only** — it backs the demoted `predicted_demand` /
-    /// `keep_score` dashboard signal (see [`super::cache`]) and drives no retention
-    /// decision. The `min_ttl` cold-start floor that once bounded a distance-only
+    /// `keep_score` values on `HostedContract` (see [`super::cache`]) and drives
+    /// no retention decision. Since #4830 those are no longer surfaced on the
+    /// dashboard either, so this estimator currently has no reader outside the
+    /// `eviction_floor` ratchet. The `min_ttl` cold-start floor that once bounded a distance-only
     /// ordering was **dropped entirely** (2026-07-08): a fresh zero-subscriber
     /// PUT/GET is now protected by being the most-recently-accessed, not by an age
     /// floor. Do NOT re-wire this estimate back into the eviction sort — the whole

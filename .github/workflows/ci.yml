@@ -1,7 +1,20 @@
 name: CI
 
 # Cost optimization strategy (Ubicloud runners ~$0.13/run):
-# 1. Skip CI entirely for docs-only changes (paths-ignore)
+# 1. Skip CI entirely for docs-only changes on PUSH TO MAIN only (paths-ignore).
+#    NOT on `pull_request` — see the `on:` block below and #5451. A
+#    workflow-level path filter is the one optimization that can make a PR
+#    permanently unmergeable, so it is confined to the trigger where no
+#    required check is at stake.
+#    This is a REAL cost increase, not a relocation: since #5571 a docs-only PR
+#    pays the full PR suite (Clippy on ubicloud-standard-8; Unit & Integration,
+#    Simulation and NAT Validation on ubicloud-standard-16; the macOS/Windows
+#    unit jobs) PLUS a paid Claude rule review, on top of the merge_group run it
+#    already paid. That was accepted because docs-only merges are rare (15 in
+#    the year to 2026-09-05) and the alternative — gating each expensive STEP on
+#    a changed-files check — is a large, subtle diff on required checks, where a
+#    mistake makes them pass unconditionally. If docs-only PRs ever become
+#    frequent, that step-level version is the right answer, with data behind it.
 # 2. Skip expensive jobs on main push — PR already validated
 # 3. Skip NAT validation for dependabot PRs — Test is sufficient for version bumps
 # 4. Run fast checks (Fmt, Clippy) in parallel for quick fail-fast
@@ -25,13 +38,25 @@ on:
       - 'LICENSE'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/FUNDING.yml'
+  # DO NOT add `paths-ignore:` (or `paths:`) here. Six of the eight required
+  # status contexts come from this workflow (Fmt, Clippy, Rule Lint, Unit &
+  # Integration, Simulation, NAT Validation). A workflow skipped by a path
+  # filter reports NOTHING, and GitHub treats a never-reported required context
+  # as "expected", not as satisfied — so the merge queue refuses entry forever.
+  # A docs-only PR was therefore structurally unmergeable; #5322 sat blocked
+  # from 2026-08-14 until #5571 removed this. The `merge_group:` trigger below
+  # does not rescue it: that only runs for a PR already ADMITTED to the queue.
+  #
+  # This was easy to miss because `*.md` does not match at depth in GitHub path
+  # filters, so a PR touching `.claude/rules/foo.md` always ran full CI and
+  # merged normally (#5375). It bit only a PR whose EVERY file matched one of
+  # the removed patterns — `docs/**`, a ROOT-level `*.md`, `LICENSE`,
+  # `.github/ISSUE_TEMPLATE/**` or `.github/FUNDING.yml`. A PR touching just
+  # `LICENSE`, or just an issue template, was equally stuck.
+  #
+  # Enforced by .github/scripts/check_required_check_path_filters.py, run from
+  # the Rule Lint job below.
   pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-      - 'LICENSE'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/FUNDING.yml'
   merge_group:
 
 # Cancel in-progress runs when a new commit is pushed to the same branch.
@@ -185,6 +210,19 @@ jobs:
       - name: Self-test merge-queue concurrency guard
         run: bash scripts/merge_group_concurrency_test.sh
 
+      # Regression gate for #5451: a `paths-ignore` on the pull-request trigger
+      # of a workflow that provides a required status context makes every PR the
+      # filter excludes permanently unmergeable — the context is never reported,
+      # and GitHub reads never-reported as "expected" rather than satisfied.
+      # #5322 sat blocked by exactly this from 2026-08-14 until #5571. Pins that
+      # the linter still fires on the real pre-fix `on:` blocks (which #5571
+      # deletes from the repo, so nothing else records them), that it fires on
+      # the one-line flow form, that this repo satisfies both halves of the
+      # invariant, and that the linter is still wired into rule_lint with its
+      # coverage half enabled.
+      - name: Self-test required-check path-filter guard
+        run: bash scripts/required_check_path_filters_test.sh
+
       # Regression gate for the release driver's cross-compile wait: under
       # `set -euo pipefail` a bare `var=$(gh ...)` aborts the whole driver on a
       # transient GitHub blip, AFTER the release publishes but BEFORE the
@@ -194,9 +232,38 @@ jobs:
       - name: Self-test release wait_for_binaries gh resilience
         run: bash scripts/release_wait_for_binaries_test.sh
 
+      # Release-driver RESUME state. Two regressions, both of the shape where a
+      # resumed release is wrong in a way the operator cannot see: the v0.2.42
+      # FDEV_VERSION double-bump, and the CRATES_PUBLISHED flag being set on
+      # `freenet` alone (which makes `publish_crates`'s early return skip the
+      # per-crate branch and strand `fdev` after a partial publish, while the
+      # driver reports success).
+      #
+      # NOTE this file EXISTED and PASSED for a long time without ever being
+      # run here -- it was referenced only in a comment further down, so it was
+      # scored by the assertion counter and executed by nothing. A test that
+      # does not run is not a gate, which is the same class of defect as the
+      # assertions it now protects.
+      - name: Self-test release driver resume state
+        run: bash scripts/release_state_restore_test.sh
+
+      # BEHAVIOURAL cover for release.sh, as distinct from the source pins in
+      # release_canary_wiring_test.sh. Two mutations defeated those pins while
+      # leaving their text intact: an unreachable fdev branch (the `cargo
+      # publish -p fdev` line still present, so the source scan's floor was
+      # satisfied, while fdev was stranded on EVERY release) and a second
+      # `publish_crates` call in a conditional form before the tag (the bare
+      # call still matching `^publish_crates$`). Both are properties, not
+      # patterns, so both are asserted by running the driver against stubs.
+      - name: Self-test release driver behaviour
+        run: bash scripts/release_driver_test.sh
+
       # Pins the WIRING of the blocking pre-flight canary, which is what
       # makes it a gate at all: it must run inside attach-to-release, after
-      # the assets upload and BEFORE `gh release edit --draft=false`, and
+      # the assets upload, BEFORE the crates.io publish (the one irreversible
+      # step, moved here from release.yml so a blocked gate costs a deletable
+      # tag instead of a spent version number), and BEFORE
+      # `gh release edit --draft=false`, and
       # not be disabled in place. Also pins release.sh's ATTACH_JOB_NAME
       # against the job's name in cross-compile.yml -- the driver polls for
       # that string and a rename on either side is otherwise silent.
@@ -244,7 +311,15 @@ jobs:
       # clean when they landed but were not actually in this list, so nothing
       # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh
+        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh
+      # The PR-backlog sweep reports stalled PRs (see
+      # .github/workflows/pr-backlog-sweep.yml). Its self-test drives the ABORT
+      # paths -- failed query, empty listing the REST probe contradicts,
+      # truncated page -- which a healthy scheduled run never touches and which
+      # are the only thing standing between "nothing is stalled" and "the sweep
+      # is broken" looking identical.
+      - name: Self-test PR backlog sweep
+        run: bash scripts/pr-backlog-sweep_test.sh
       - name: Self-test install.sh service-mode decision
         run: sh scripts/test-install-sh.sh
       - name: Self-test uninstall.sh
@@ -333,6 +408,17 @@ jobs:
 
       - name: Check merge_group workflows vary their concurrency group
         run: python3 .github/scripts/check_merge_group_concurrency.py .github/workflows
+
+      # Self-test the required-check path-filter linter, then run it. Like the
+      # concurrency linter above it is NOT diff-scoped — the invariant is a
+      # property of each workflow file as it stands. Guards #5451: a workflow
+      # skipped by a path filter reports NOTHING, and a required context that
+      # never reports is "expected" forever, so the merge queue refuses entry.
+      - name: Required-check path-filter linter self-test
+        run: python3 .github/scripts/check_required_check_path_filters.py --self-test
+
+      - name: Check required-check workflows carry no PR path filter
+        run: python3 .github/scripts/check_required_check_path_filters.py .github/workflows
 
       - name: Check for banned patterns in new code
         env:
@@ -485,18 +571,35 @@ jobs:
             #
             # KNOWN FALSE NEGATIVES, left in rather than chased. All three are
             # real in this repo today:
-            #   1. `printf`-style success reporting. An earlier version of this
-            #      comment DELETED this entry, on the stated ground that
+            #   1. `printf`-style success reporting -- but ONLY the reporter's
+            #      DEFINITION line. An earlier version of this comment DELETED
+            #      this entry, on the stated ground that
             #      `grep -rnE "printf .*['\"](ok|PASS)"` over scripts/ returned
             #      nothing. It returns two:
             #      `scripts/test-install-sh.sh` and `scripts/test-uninstall-sh.sh`,
-            #      both `pass() { printf 'PASS  %s\\n' "$1"; }`. They escape this
-            #      counter only because the diff above is scoped to
-            #      `**/*_test.sh` and those are named `test-*.sh` -- a naming
-            #      accident, not the absence of the convention. The moment
-            #      someone writes that reporter in a `*_test.sh`, it scores zero.
-            #      `rule_lint_shell_assertion_counter_test.sh` now RECOMPUTES
-            #      this rather than trusting the sentence.
+            #      both `pass() { printf 'PASS  %s\\n' "$1"; }`.
+            #      Those two files used to escape this counter entirely, because
+            #      the diff above was scoped to `**/*_test.sh` and they are named
+            #      `test-*.sh` -- a naming accident, not the absence of the
+            #      convention. `'scripts/test-*.sh'` above closes that; PR #4958
+            #      was rejected by this gate for having no test while adding ten
+            #      `check_eq` assertions to `test-install-sh.sh`, which this job
+            #      RUNS.
+            #      SCOPED to `scripts/` rather than `'**/test-*.sh'`: `*` crosses
+            #      `/` in a git pathspec, so the unscoped form ALSO matches
+            #      `docker/test-runner/entrypoint.sh` and `.../run.sh` -- docker
+            #      plumbing, not tests, and outside the self-test's `find`, so
+            #      nothing would audit them. A `fix:` PR adding a plausible
+            #      `check_image_exists` line to a docker wrapper would then
+            #      satisfy this gate with no test at all.
+            #      What remains a blind spot is narrower than it looks, and was
+            #      measured rather than assumed: their `pass "..."` and
+            #      `check_eq "..."` CALL SITES both score (via the `pass` and
+            #      `check_`-prefix alternatives), so neither file is invisible.
+            #      Only `pass() { printf ... }` itself scores zero -- which is
+            #      correct, since declaring a helper is not adding a test.
+            #      `rule_lint_shell_assertion_counter_test.sh` RECOMPUTES this
+            #      rather than trusting the sentence.
             #   2. An assertion whose only added line is its FAIL branch.
             #      Deliberate: counting FAIL would let a PR score by adding an
             #      error message alone.
@@ -505,15 +608,47 @@ jobs:
             #      live instance. Adding a file there genuinely extends what is
             #      audited, and the added line is a bare string.
             # The error text below tells the contributor all three.
-            NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' \
+            NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' 'scripts/test-*.sh' \
               | grep -E '^\+' | grep -vF '+++' \
               | grep -cE '^\+[[:space:]]*(check|ok|pass|expect)[[:space:]]|^\+[[:space:]]*echo[[:space:]]+["'"'"'](ok[[:space:]]+-|PASS[[:space:]])|^\+[[:space:]]*(check|pin|assert|expect|test)_[a-z0-9_]*([[:space:]]|$)|^\+[[:space:]]*[a-z_][a-z0-9_]*_case[[:space:]]' || true)
-            if [ "$NEW_TESTS" -eq 0 ] && [ "$NEW_SHELL_TESTS" -eq 0 ]; then
+            # Browser-asset fixes have the SAME problem the shell escape hatch
+            # above exists for, and it bit this check the first time a
+            # dashboard fix reached it. The regression tests for
+            # `crates/core/src/server/**/assets/**` are Node `*.test.mjs` and
+            # Playwright `*.spec.ts` — they are never Rust `#[test]`s, because
+            # the code under test is JavaScript the Rust suite cannot execute.
+            # Without this a `fix:` PR carrying real, mutation-tested browser
+            # coverage scores zero and is rejected.
+            #
+            # VOCABULARY IS ENUMERATED, not guessed from the file in front of
+            # me — the comment above records that guessing is how the shell
+            # counter under-counted three times. Measured across all 17
+            # `*.test.mjs` / `*.spec.ts` in the repo at time of writing:
+            # `check` (213 call sites), `expect` (175), `test` (43), `ok` (25,
+            # update_check.test.mjs), `eq` (9, table_filter.test.mjs). Both
+            # `await expect(...)` and bare `expect(...)` occur, hence the
+            # optional `await`.
+            #
+            # RE-RUN THAT ENUMERATION when adding a test file in a new style,
+            # rather than assuming these five names are the whole vocabulary.
+            #
+            # Same known weakness as the shell counter, stated rather than
+            # implied: this counts an assertion's CALL SITE, so a decorative
+            # `test("x", () => {})` satisfies it. What stops a decorative test
+            # is review and mutation-testing, not this grep.
+            NEW_JS_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*.test.mjs' '**/*.spec.ts' \
+              | grep -E '^\+' | grep -vF '+++' \
+              | grep -cE '^\+[[:space:]]*(await[[:space:]]+)?(check|expect|test|ok|eq)[[:space:]]*\(' || true)
+            if [ "$NEW_TESTS" -eq 0 ] && [ "$NEW_SHELL_TESTS" -eq 0 ] && [ "$NEW_JS_TESTS" -eq 0 ]; then
               ERRORS="$ERRORS
           ERROR: fix: PR must include at least one new regression test
           Add a test that reproduces the bug (fails without fix, passes with fix).
           Either satisfies this:
             - a Rust #[test] / #[tokio::test] / etc.
+            - an added assertion in a Node *.test.mjs or Playwright *.spec.ts:
+              'check(...)', 'expect(...)', 'test(...)', 'ok(...)' or 'eq(...)'.
+              Browser-asset fixes have no Rust test to add — the Rust suite
+              cannot execute the JavaScript it serves.
             - an added assertion in a *_test.sh self-test, written with any of the
               conventions those files use: 'check ...', 'ok ...', 'pass ...',
               'expect ...', a 'check_'/'pin_'/'assert_'/'expect_'/'test_'-prefixed helper, a

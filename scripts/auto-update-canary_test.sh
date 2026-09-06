@@ -126,6 +126,31 @@ SEEN_CONSTANT='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check a
 2026-08-08T02:00:00.300000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.0.0
 2026-08-08T02:00:00.412000Z  INFO freenet: Startup update check complete: staying on the current version current="0.2.123"'
 
+# --- fixtures for the DECISION check ----------------------------------------
+#
+# All three pass every one of `assert_detection_healthy`'s seven checks. That is
+# the point: the decision the node reached is not one of the things those checks
+# look at, so these are the logs a broken comparator produces and the old gate
+# called healthy.
+#
+# The binary under test in Gate A is NEWER than `releases/latest` by
+# construction (its own release is still a draft), so this node found something
+# newer than itself that does not exist. An inverted `latest_ver > current_ver`
+# in compare_versions_for_startup produces exactly it, and the update requested
+# is a self-DOWNGRADE to 0.2.122 from 0.2.123.
+SEEN_TRIGGERED='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.123" jitter_secs=7
+2026-08-08T02:00:00.300000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.122
+2026-08-08T02:00:00.412000Z  INFO freenet: Startup check: newer version on GitHub, triggering auto-update new_version=0.2.122'
+
+# The #4073 refusal, verbatim from freenet.rs. It reaches the completion line
+# like every other non-triggering outcome, so before the decision check this log
+# was indistinguishable from an ordinary healthy one -- and it means the node
+# will refuse EVERY release it is ever offered.
+SEEN_REFUSED_4073='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.123" jitter_secs=7
+2026-08-08T02:00:00.300000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.122
+2026-08-08T02:00:00.350000Z  WARN freenet: Startup check: newer version is locally blocked (crash-loop known-bad pin or repeated install failures); not triggering auto-update (#4073)
+2026-08-08T02:00:00.412000Z  INFO freenet: Startup update check complete: staying on the current version current="0.2.123"'
+
 # --- the positive cases -----------------------------------------------------
 check "healthy: check ran, parsed, triggered -> pass" 0 "$HEALTHY"
 check "healthy: check ran and completed up-to-date -> pass" 0 "$HEALTHY_UP_TO_DATE"
@@ -353,6 +378,159 @@ $BULK"
 check "volume: #5221 parse failure behind >64KB of later output -> still fail" \
     1 "$BROKEN
 $BULK" "could not parse the version GitHub returned"
+
+# --- WHICH DECISION the updater reached -------------------------------------
+#
+# Every assertion above this point is satisfied by a node that reached the WRONG
+# DECISION. `assert_detection_healthy` never looks at one: `node_check_settled`
+# accepts a completion line OR a trigger, the equality check validates the
+# version compared AGAINST rather than what was done with it, and the #4073
+# refusal reaches the completion line like any other non-triggering outcome. So
+# a shipping binary with an inverted `latest_ver > current_ver` passes all seven
+# checks and ships -- and it does not quietly do nothing, it requests a
+# self-DOWNGRADE to the older release, exits 42, and the supervisor loop repeats
+# it forever. `docs/RELEASING.md` has described this hole since #5236.
+#
+# TWO functions, tested separately, because they fail differently:
+#   gate_a_expected_decision -- WHICH decision is obliged, from the two versions
+#   assert_gate_a_decision   -- whether the node reached it
+#
+# The split is what keeps the gate from false-BLOCKING. Gate A's subject is
+# newer than `releases/latest` on the normal release path, but `cross-compile.yml`
+# is checked out AT THE TAG, so re-running an older release's workflow (or a
+# hotfix cut on an older line) puts a genuinely older binary under the gate,
+# where deciding to update is CORRECT. A blocking gate that fails a healthy
+# release does not cost one release; it teaches people to override it.
+expect_case() {
+    # expect_case <shipping> <latest> <expected: decline|update|unknown>
+    local got
+    got="$(gate_a_expected_decision "$1" "$2")"
+    if [[ "$got" == "$3" ]]; then
+        echo "ok   - gate_a_expected_decision '$1' vs '$2' -> $3"
+    else
+        echo "FAIL - gate_a_expected_decision '$1' vs '$2' said '$got', expected '$3'" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+expect_case "0.2.127" "0.2.126" decline   # the normal release path: draft, so newer
+expect_case "0.2.126" "0.2.126" decline   # equal is NOT newer -- compare_versions_for_startup
+                                          # returns Some only for STRICTLY greater
+expect_case "0.2.126" "0.2.127" update    # a workflow re-run at an older tag
+# Numeric, not lexical, and this is the load-bearing pair: a lexical compare puts
+# 0.2.9 ABOVE 0.2.10, so it would demand a DECLINE from a node that must update
+# and block the release for being right.
+expect_case "0.2.9"   "0.2.10"  update
+expect_case "0.2.10"  "0.2.9"   decline
+# Undecidable rather than guessed. Guessing either way risks blocking a healthy
+# release on a version string nobody can read, with a message about auto-update.
+expect_case ""              "0.2.126" unknown
+expect_case "not-a-version" "0.2.126" unknown
+expect_case "0.2.126"       ""        unknown
+
+# The optional <want-stdout> is separate from <msg> because the two streams carry
+# different things and only one of them was ever asserted. Failures go to STDERR
+# via `fail`/`note`/`warn`; the `OK:` CONFIRMATIONS go to STDOUT via `log`.
+#
+# Those confirmations are what the PR describes as letting a reader of a green job
+# tell WHICH assertion actually ran -- and they were themselves unasserted:
+# deleting `log "OK: the node declined to update, ..."` outright left every suite
+# GREEN, because the green-side cases matched "MUST decline to update", which
+# `cmd_preflight` logs from its OWN arm-selection `case`. A borrowed neighbour
+# again, in the one direction that makes a blocking gate less legible rather than
+# less correct. Message-only severity, but the whole purpose of those lines is
+# that a human can see them, so they get an anchor at the site that emits them.
+decision_case() {
+    # decision_case <desc> <expected-decision-arg> <expected-exit> <log> [msg] [want-stdout]
+    local desc="$1" expect="$2" want_rc="$3" content="$4" want_msg="${5:-}" want_out="${6:-}"
+    local dir actual stderr stdout outfile
+    dir="$(mktemp -d "$TMPROOT/dec.XXXXXX")"
+    outfile="$(mktemp "$TMPROOT/decout.XXXXXX")"
+    if [[ -n "$content" ]]; then
+        printf '%s\n' "$content" > "$dir/freenet.2026-08-08-02.log"
+    fi
+    stderr="$(assert_gate_a_decision "$dir" "$expect" 2>&1 >"$outfile")"
+    actual=$?
+    stdout="$(cat "$outfile")"
+    rm -f "$outfile"
+    if [[ "$actual" != "$want_rc" ]]; then
+        echo "FAIL - decision: $desc (got exit $actual, expected $want_rc)" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if [[ -n "$want_msg" && "$stderr" != *"$want_msg"* ]]; then
+        echo "FAIL - decision: $desc (exit $actual correct, but diagnosis wrong)" >&2
+        echo "       wanted message containing: $want_msg" >&2
+        echo "       got: ${stderr:-<nothing on stderr>}" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if [[ -n "$want_out" && "$stdout" != *"$want_out"* ]]; then
+        echo "FAIL - decision: $desc (exit $actual correct, but the OK confirmation is missing)" >&2
+        echo "       wanted stdout containing: $want_out" >&2
+        echo "       got: ${stdout:-<nothing on stdout>}" >&2
+        echo "       These 'OK:' lines are how a reader of a GREEN job tells which assertion" >&2
+        echo "       ran. Without them a passing gate and a skipped one look identical." >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    echo "ok   - decision: $desc"
+}
+
+# The GREEN side first, and it matters as much as the red ones: this gate BLOCKS
+# publication, so a version of it that could only fail would stall the first
+# release that ran it and be indistinguishable from a working one until then.
+# The 6th argument anchors the OK: confirmation on STDOUT at the site that emits
+# it. Without it the green side asserted only cmd_preflight's arm-selection log,
+# and both `log "OK: ..."` lines could be deleted with every suite still green.
+decision_case "healthy Gate A run declines, as it must -> pass" \
+    decline 0 "$SEEN_OK" "" "OK: the node declined to update"
+# ...and the two red ones, which are the whole reason the check exists.
+decision_case "decided to UPDATE with nothing newer to update to -> fail" \
+    decline 1 "$SEEN_TRIGGERED" "DECIDED TO UPDATE"
+decision_case "refused via the #4073 local gate on a fresh HOME -> fail" \
+    decline 1 "$SEEN_REFUSED_4073" "locally blocked (#4073)"
+
+# The OTHER direction, so the conditional is tested rather than assumed. Here the
+# binary really is older than the latest release and updating is correct.
+decision_case "older binary decides to update, as it must -> pass" \
+    update 0 "$SEEN_TRIGGERED" "" "OK: the node decided to update"
+decision_case "older binary stays put on a published newer release -> fail" \
+    update 1 "$SEEN_OK" "did NOT decide to update"
+
+# The #4073 check is DIRECTION-INDEPENDENT: it rests only on the canary's fresh
+# isolated HOME, which holds in every arm. These two are what pin that -- delete
+# the refusal check and the `decline` case above still fails on the trigger, so
+# on its own it does not prove the refusal check runs at all.
+decision_case "the #4073 refusal is a fault in the update arm too" \
+    update 1 "$SEEN_REFUSED_4073" "locally blocked (#4073)"
+decision_case "the #4073 refusal is a fault even when the direction is unknown" \
+    unknown 1 "$SEEN_REFUSED_4073" "locally blocked (#4073)"
+
+# An undecidable direction skips ONE arm, and says so. Silence here would be the
+# vacuous escape hatch this gate family keeps having to remove: a reader of a
+# green log could not tell an asserted decision from an unasserted one.
+decision_case "an unknown direction skips the decision arm LOUDLY" \
+    unknown 0 "$SEEN_TRIGGERED" "did NOT assert which decision"
+# ...as a GitHub ANNOTATION, asserted HERE rather than only through cmd_preflight.
+# Measured: with the annotation pinned only on the end-to-end case, swapping this
+# arm's `warn` back to a plain `note` left the whole suite GREEN -- because
+# cmd_preflight emits its own `::warning::` when it picks the unknown arm, so the
+# end-to-end assertion was satisfied by the CALLER's annotation and never looked
+# at this one. The pure function has no such neighbour to borrow from, which is
+# what makes this the anchor that can actually fail.
+decision_case "the unknown-arm skip is a ::warning:: annotation, not a plain line" \
+    unknown 0 "$SEEN_TRIGGERED" "::warning::"
+
+# Volume-resistance, for the reason the block above this one exists: the real
+# Gate A log is megabytes, and a status-consuming pipe that short-circuits reads
+# a marker that IS present as ABSENT once it passes the 64 KB pipe buffer. Both
+# directions, because a false GREEN here ships the downgrade loop.
+decision_case "volume: a trigger behind >64KB of later output still fails" \
+    decline 1 "$SEEN_TRIGGERED
+$BULK" "DECIDED TO UPDATE"
+decision_case "volume: a healthy decline behind >64KB of later output still passes" \
+    decline 0 "$SEEN_OK
+$BULK"
 
 # --- numeric-override validation (review finding 36) ------------------------
 # A non-numeric CANARY_TIMEOUT_SECS reaches an arithmetic context and, under
@@ -610,25 +788,41 @@ eval "$real_runner_can_reach_github"
 # `curl`/`tar` are shadowed so the
 # download preamble is a no-op. Same shape as
 # `release_wait_for_binaries_test.sh`'s `check_call_count`.
-GATE_B_ATTEMPT=0
-GATE_B_SCRIPT=()
+#
+# The stub and its two globals are SHARED with the Gate A driver further down --
+# the gates differ in which command they drive, not in how a scripted sequence of
+# node boots is faked. Hence the neutral names.
+CANARY_STUB_ATTEMPT=0
+CANARY_STUB_SCRIPT=()
 run_node_until_check_stub() {
-    local work="$2" spec exit_code logvar
-    GATE_B_ATTEMPT=$((GATE_B_ATTEMPT + 1))
+    local work="$2" spec exit_code logvar rest outvar
+    CANARY_STUB_ATTEMPT=$((CANARY_STUB_ATTEMPT + 1))
     # Past the end of the script means the loop ran more times than the case
     # expects; repeat the last entry so the attempt-COUNT assertion is what
     # reports it, with a number, rather than an unbound-variable abort.
-    if [[ "$GATE_B_ATTEMPT" -le "${#GATE_B_SCRIPT[@]}" ]]; then
-        spec="${GATE_B_SCRIPT[$((GATE_B_ATTEMPT - 1))]}"
+    if [[ "$CANARY_STUB_ATTEMPT" -le "${#CANARY_STUB_SCRIPT[@]}" ]]; then
+        spec="${CANARY_STUB_SCRIPT[$((CANARY_STUB_ATTEMPT - 1))]}"
     else
-        spec="${GATE_B_SCRIPT[$((${#GATE_B_SCRIPT[@]} - 1))]}"
+        spec="${CANARY_STUB_SCRIPT[$((${#CANARY_STUB_SCRIPT[@]} - 1))]}"
     fi
+    # "<node-exit>:<log-fixture>" or "<node-exit>:<log-fixture>:<node.out-fixture>".
+    # The third field exists because `node.out` is a SEPARATE observation surface
+    # from the log dir: the node's fatal-abort CRITICAL lines are `eprintln!`, so
+    # they land there and nowhere else, and the exit-42 classification reads them.
     exit_code="${spec%%:*}"
-    logvar="${spec#*:}"
+    rest="${spec#*:}"
+    logvar="${rest%%:*}"
+    outvar="${rest#*:}"
+    # No colon in `rest` leaves it unchanged by the strip, which is how a
+    # two-field spec is told from a three-field one.
+    [[ "$outvar" == "$rest" ]] && outvar=""
     NODE_EXIT="$exit_code"
     mkdir -p "$work/logs"
     if [[ -n "$logvar" ]]; then
         printf '%s\n' "${!logvar}" > "$work/logs/freenet.2026-08-08-02.log"
+    fi
+    if [[ -n "$outvar" ]]; then
+        printf '%s\n' "${!outvar}" > "$work/node.out"
     fi
 }
 
@@ -652,12 +846,12 @@ gate_b_case() {
     # Each <spec> is "<node-exit>:<fixture-variable-name>" for one attempt.
     local desc="$1" want_rc="$2" want_attempts="$3" reachable="$4" want_msg="$5"
     shift 5
-    GATE_B_SCRIPT=("$@")
-    GATE_B_ATTEMPT=0
+    CANARY_STUB_SCRIPT=("$@")
+    CANARY_STUB_ATTEMPT=0
     local got_rc got_attempts out err errfile
     errfile="$(mktemp "$TMPROOT/gateb.XXXXXX")"
     out="$(
-        CANARY_ATTEMPTS="${#GATE_B_SCRIPT[@]}"
+        CANARY_ATTEMPTS="${#CANARY_STUB_SCRIPT[@]}"
         CANARY_RETRY_SLEEP=0
         curl() { :; }
         tar()  { :; }
@@ -672,7 +866,7 @@ gate_b_case() {
             > "$CANARY_WORKDIR/selfupdate/bin/freenet"
         chmod +x "$CANARY_WORKDIR/selfupdate/bin/freenet"
         cmd_selfupdate 0.2.121 0.2.122 2>"$errfile" >/dev/null
-        printf '%s %s' "$?" "$GATE_B_ATTEMPT"
+        printf '%s %s' "$?" "$CANARY_STUB_ATTEMPT"
     )"
     got_rc="${out%% *}"
     got_attempts="${out##* }"
@@ -753,6 +947,435 @@ gate_b_case "ports THEN github with the runner DOWN is quiet, and counts honestl
 gate_b_case "github THEN ports with the runner DOWN is quiet, and counts honestly" 75 2 no \
     "could not reach GitHub on 1 of 2 attempt(s), and this runner cannot reach it either" \
     "0:FETCH_FAIL" "43:"
+
+# --- Gate B's own decision assertion, past the log check --------------------
+# Gate B does NOT need Gate A's decision gate: its direction is fixed (the
+# release is published by the time it runs, so the previous binary must always
+# decide to update) and it already asserts that, plus exit 42. These two cases
+# reach that assertion for the first time -- every case above fails earlier --
+# and pin the ONE thing that was missing: which of the two causes it names.
+#
+# Both are a real failure and both are red. The distinction is the diagnosis,
+# and it is the same reason `check()` at the top of this file asserts messages:
+# "the node stayed put" sends the reader after the comparator, while the #4073
+# refusal is a wrongly-matching local gate in rollback.rs. Sending an on-call
+# reader at the wrong subsystem on a post-publish alarm is the cost.
+#
+# A spare attempt each, for the reason documented on `gate_a_case` below: these
+# are the only Gate B cases whose verdict comes from a loop that exited on rc=0,
+# so with one spec nothing would notice if that break stopped working. Asserting
+# one consumed attempt out of two available pins it.
+gate_b_case "the previous release simply stayed put -> loud, named as such" 1 1 yes \
+    "did NOT decide to update to v0.2.122" "0:SEEN_OK" "0:SEEN_OK"
+gate_b_case "the previous release refused via the #4073 local gate -> named as THAT" 1 1 yes \
+    "REFUSED it as locally blocked (#4073" "0:SEEN_REFUSED_4073" "0:SEEN_REFUSED_4073"
+
+# --- Gate A END TO END, driven per attempt ----------------------------------
+# The Gate A counterpart of the block above, sharing its stub. Two properties
+# cannot be observed anywhere else:
+#
+#   1. THE EXIT-CODE ASSERTION. `NODE_EXIT` is caller state, so it is asserted in
+#      `cmd_preflight` rather than in the pure function, and no fixture-driven
+#      test of `assert_gate_a_decision` can reach it. It is a SECOND, independent
+#      observer of the same decision: the log check reads a phrase this repo
+#      chooses, while exit 42 is the supervisor contract itself, so a trigger site
+#      worded past `MARKER_TRIGGERED_RE` is invisible to one and caught by the
+#      other.
+#   2. THAT THE CONDITIONAL IS WIRED AT ALL. The pure function is told which arm
+#      to take; only cmd_preflight decides it, from the shipping binary's
+#      `--version` and the resolved latest tag. A gate that always demanded a
+#      DECLINE would block a re-run of an older release's workflow -- healthy
+#      behaviour, blocked -- and nothing below the wiring can see that.
+#
+# The shipping version is given as a whole `--version` LINE so the unreadable
+# case is driven through the same field split the real gate uses, rather than
+# around it.
+# --- node.out fixtures: the OTHER two producers of exit 42 -------------------
+#
+# 42 is overloaded. `FATAL_LISTENER_EXIT_CODE` (crates/core/src/node/p2p_impl.rs)
+# is the same number, both of its producers are enabled unconditionally in the
+# real binary (`enable_abort_on_fatal_listener_exit` / `enable_abort_on_redb_poison`
+# at the top of freenet.rs's node path), and the distinct code 45 is opted into
+# only via SYSTEMD_FAST_CRASH_ENV_VAR, which the canary does not export -- so 42
+# is used at every uptime, including the ~40s a canary run lasts.
+#
+# These are `eprintln!`, so they appear in node.out and NOT in the log dir, which
+# is why the predicate that reads them takes a workdir.
+# shellcheck disable=SC2034
+FATAL_LISTENER_OUT='2026-08-08T02:00:05Z  INFO freenet: node running
+CRITICAL: Network event listener exited (fatal): transport error: connection reset by peer'
+# shellcheck disable=SC2034
+REDB_POISON_OUT='CRITICAL: contract storage (redb) is poisoned by an I/O error and cannot recover in-process: Io(Custom { kind: Other, error: "input/output error" }). Exiting with code 42 so the service manager restarts the node with a fresh database handle (#4604).'
+# The ordinary shape: a node that was stopped by the canary says nothing special.
+# shellcheck disable=SC2034
+CLEAN_OUT='2026-08-08T02:00:05Z  INFO freenet: node running
+2026-08-08T02:00:09Z  INFO freenet: received SIGTERM, shutting down'
+
+# Read BY NAME through the stub's `${!logvar}`, so shellcheck cannot see the use.
+# shellcheck disable=SC2034
+SEEN_TRIGGERED_OLD='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.122" jitter_secs=7
+2026-08-08T02:00:00.300000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.123
+2026-08-08T02:00:00.412000Z  INFO freenet: Startup check: newer version on GitHub, triggering auto-update new_version=0.2.123'
+
+# A CASE THAT ASSERTS A HARD BLOCK MUST SUPPLY MORE SPECS THAN IT EXPECTS TO
+# CONSUME. This is a rule about the fixture, not about style, and getting it
+# wrong silently disarms the case:
+#
+# `CANARY_ATTEMPTS` is set below to the NUMBER OF SPECS. With exactly one spec it
+# is 1, and then rc=1 (a real defect, returns immediately) and rc=2 (an
+# environmental verdict, retried until the budget runs out and the tail `fail`
+# returns 1) produce the SAME exit code after the SAME one attempt. Every
+# discriminator between "block" and "retry" becomes invisible to the outcome, and
+# only the message text is left to notice it.
+#
+# That is not a hypothetical: mutation R-a (`node_exited_on_fatal_abort` stuck
+# TRUE, the escape-hatch direction that launders a real downgrade bug into
+# "environmental") was caught by NO outcome assertion in this file, because every
+# hard-block case here supplied one spec. The REAL gate defaults to
+# `CANARY_ATTEMPTS=2` (auto-update-canary.sh), so with a retry available the same
+# mutation returns 0 and the release publishes. The fixture could not produce the
+# fault because its environment differed from production in exactly the dimension
+# the fault needed -- the same shape as the #5271 fixture that wrapped a real log
+# string in a type the system cannot emit.
+#
+# So: give a hard-block case a spare attempt it must NOT reach, and assert the
+# attempt COUNT. `gate_b_case "a real #5221 failure is never retried"` above is
+# the existing precedent, and it had this right all along.
+#
+# rc=0 cases are exempt: rc=0 leaves the loop immediately, so any mutation that
+# turns one into rc=1 or rc=2 changes the exit code at one attempt.
+gate_a_case() {
+    # gate_a_case <desc> <version-line> <expected-latest> <want-rc> \
+    #             <want-attempts> <want-message-substring> <spec...>
+    # Each <spec> is "<node-exit>:<fixture-variable-name>" for one attempt.
+    local desc="$1" version_line="$2" latest="$3" want_rc="$4" want_attempts="$5" want_msg="$6"
+    shift 6
+    CANARY_STUB_SCRIPT=("$@")
+    CANARY_STUB_ATTEMPT=0
+    local got_rc got_attempts out output outfile bindir
+    outfile="$(mktemp "$TMPROOT/gatea.XXXXXX")"
+    bindir="$(mktemp -d "$TMPROOT/gateabin.XXXXXX")"
+    # BASH, not `/bin/sh`: `%q` renders a string containing a newline as bash's
+    # ANSI-C `$'...'` form, which dash does not understand -- it would emit the
+    # quoting syntax literally and the multi-line case below would fail for a
+    # reason that has nothing to do with the gate.
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" %q\n' "$version_line" > "$bindir/freenet"
+    chmod +x "$bindir/freenet"
+    out="$(
+        CANARY_ATTEMPTS="${#CANARY_STUB_SCRIPT[@]}"
+        CANARY_RETRY_SLEEP=0
+        # Pinned so cmd_preflight does not reach GitHub from a test. It cannot
+        # DISARM anything: an empty value is treated as unset and sends the gate
+        # to `resolve_expected_latest`, so every case here supplies a real one.
+        export CANARY_EXPECTED_LATEST="$latest"
+        run_node_until_check() { run_node_until_check_stub "$@"; }
+        cmd_preflight "$bindir/freenet" >"$outfile" 2>&1
+        printf '%s %s' "$?" "$CANARY_STUB_ATTEMPT"
+    )"
+    got_rc="${out%% *}"
+    got_attempts="${out##* }"
+    output="$(cat "$outfile")"
+    rm -f "$outfile"
+    if [[ "$got_rc" != "$want_rc" || "$got_attempts" != "$want_attempts" ]]; then
+        echo "FAIL - Gate A: $desc" >&2
+        echo "         got exit $got_rc after $got_attempts attempt(s);" >&2
+        echo "         wanted exit $want_rc after $want_attempts" >&2
+        echo "         output: ${output:-<nothing>}" >&2
+        FAILURES=$((FAILURES + 1))
+    elif [[ "$want_msg" == '!'* && "$output" == *"${want_msg#!}"* ]]; then
+        # A `!`-prefixed needle asserts ABSENCE. Needed because `fail` writes to
+        # stderr and does not replace what an earlier `fail` already wrote, so a
+        # branch that should NOT have run is invisible to a presence check --
+        # both messages simply appear. Measured: dropping the `rc -ne 1` guard on
+        # the exit-42 observer lets it overwrite a parse-failure verdict, and the
+        # positive form of this case stayed GREEN because the parse-failure text
+        # was still in the output alongside it.
+        echo "FAIL - Gate A: $desc (exit $got_rc correct, but a message that should NOT appear did)" >&2
+        echo "         must NOT contain: ${want_msg#!}" >&2
+        echo "         got: ${output:-<nothing>}" >&2
+        FAILURES=$((FAILURES + 1))
+    elif [[ "$want_msg" != '!'* && "$output" != *"$want_msg"* ]]; then
+        echo "FAIL - Gate A: $desc (exit $got_rc correct, but the operator sees the wrong text)" >&2
+        echo "         wanted a message containing: $want_msg" >&2
+        echo "         got: ${output:-<nothing>}" >&2
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "ok   - Gate A: $desc"
+    fi
+}
+
+# THE GREEN SIDE, and for a BLOCKING gate it carries as much weight as the red
+# ones: a version of this check that could only fail would stall the first
+# release that ran it, and the first person to hit that learns to override the
+# gate. The message assertion pins that the arm taken is stated in the log --
+# a reader of a green job must be able to tell WHICH assertion ran.
+gate_a_case "healthy release: newer than latest, declines -> pass" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 0 1 \
+    "MUST decline to update" "0:SEEN_OK"
+
+# The version line is found BY ITS MARKER, not by position. `--version` already
+# prints a second line (`Build timestamp: ...`), so anything that printed a line
+# BEFORE the version -- a deprecation banner, a build warning -- would make a
+# positional read return an unparseable field, send the gate down the `unknown`
+# arm, and skip both new assertions while the job stayed green. The format pin
+# further down cannot see that: the format is untouched, only its line moved.
+#
+# The `\n` in the version-line argument is what makes this a real multi-line
+# `--version`; `gate_a_case` writes it through `printf`, so the fake binary emits
+# two lines exactly as the node does.
+gate_a_case "a banner line before the version does not disarm the gate" \
+    "NOTE: this build is unsupported
+Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 0 1 \
+    "MUST decline to update" "0:SEEN_OK"
+
+# The hole this closes. Everything `assert_detection_healthy` reads is exactly
+# what a healthy run produces; the node simply reached the wrong answer.
+#
+# Two specs, one expected attempt, per the rule on `gate_a_case`: the spare
+# attempt is what makes "blocked" distinguishable from "retried into the same
+# exit code".
+gate_a_case "inverted comparator: decides to update with nothing newer -> BLOCK" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 1 1 \
+    "DECIDED TO UPDATE" "0:SEEN_TRIGGERED" "0:SEEN_OK"
+
+# The exit-code observer on its own. The log here is a HEALTHY decline -- no
+# trigger line at all -- so every log-based check passes and only NODE_EXIT
+# speaks. This is the case a log-only assertion cannot reach. No `node.out` at
+# all, so it also covers the fail-closed reading of a missing one.
+gate_a_case "exit 42 with a clean log still blocks (the second observer)" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 1 1 \
+    "exited 42" "42:SEEN_OK" "0:SEEN_OK"
+
+# A real defect is deterministic, so it must not be retried -- which is what the
+# spare attempt asserts, and what a one-spec fixture could not.
+gate_a_case "the #4073 refusal blocks, and names rollback.rs" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 1 1 \
+    "rollback.rs" "0:SEEN_REFUSED_4073" "0:SEEN_OK"
+
+# THE OTHER ARM. `cross-compile.yml` is checked out AT THE TAG, so re-running an
+# older release's workflow after newer releases have published puts a genuinely
+# older binary under Gate A. Deciding to update is then CORRECT, and exiting 42
+# is correct with it -- both of these would be blocked by an unconditional
+# "must have declined" assertion, on a release with nothing wrong.
+gate_a_case "older binary than latest: decides to update -> pass" \
+    "Freenet version: 0.2.122 (deadbeefcafe)" 0.2.123 0 1 \
+    "MUST decide to update" "0:SEEN_TRIGGERED_OLD"
+gate_a_case "older binary than latest: exit 42 is correct there, not a block" \
+    "Freenet version: 0.2.122 (deadbeefcafe)" 0.2.123 0 1 \
+    "MUST decide to update" "42:SEEN_TRIGGERED_OLD"
+
+# An unreadable version skips ONE arm and says so, rather than guessing a
+# direction and blocking a release on the guess. The exit-42 assertion is scoped
+# to the `decline` arm, so it must not fire here either.
+#
+# `::warning::` and not a plain line: this arm disables BOTH new assertions, so
+# reaching it silently returns Gate A to its pre-decision-check strength while the
+# job stays green. A release log runs to thousands of lines; an annotation is seen
+# without reading it. (The `--version` format pin further down is the other half
+# -- it makes a change to that output shape fail LOUDLY here rather than widen
+# this arm quietly.)
+gate_a_case "unreadable shipping version: skips the decision arm LOUDLY" \
+    "Freenet" 0.2.122 0 1 \
+    "::warning::" "42:SEEN_OK"
+gate_a_case "unreadable shipping version: the warning says WHAT was skipped" \
+    "Freenet" 0.2.122 0 1 \
+    "did NOT assert which decision" "42:SEEN_OK"
+# ...and cmd_preflight's OWN annotation, anchored on the PREFIX AND the
+# caller-unique text TOGETHER.
+#
+# Both needles above are produced by `assert_gate_a_decision`, so they were
+# satisfied by the pure function and said nothing about the caller: reverting
+# cmd_preflight's `warn` to a plain `note` left the whole suite GREEN, measured.
+# That is the borrowed anchor this file's own comment (on the unknown-arm
+# decision case) describes, running in the opposite direction -- the pure
+# function was pinned against the caller and the caller against nothing.
+#
+# THE FIRST ATTEMPT AT THIS CASE ALSO FAILED TO CATCH IT, and the reason is worth
+# keeping: it asserted only the caller-unique TEXT, which `note` prints just as
+# `warn` does. Neither half is sufficient alone -- `::warning::` alone is
+# borrowable from the pure function, and the text alone survives the downgrade.
+# The needle must therefore span the boundary between them, which is only
+# possible because the annotation prefix is immediately followed by the message.
+gate_a_case "unreadable shipping version: cmd_preflight raises its OWN annotation" \
+    "Freenet" 0.2.122 0 1 \
+    "::warning::could not compare the shipping version" "42:SEEN_OK"
+
+# --- exit 42 is OVERLOADED, and must not false-block a healthy release -------
+#
+# `FATAL_LISTENER_EXIT_CODE` is also 42 (crates/core/src/node/p2p_impl.rs). Both of
+# its producers run in the real binary, and the distinct code 45 is opted into only
+# via SYSTEMD_FAST_CRASH_ENV_VAR, which the canary does not set -- so a HEALTHY
+# binary that declines the update and then loses its network event listener (a
+# CI-runner transport error) or poisons redb (disk EIO) exits 42 for a reason that
+# has nothing to do with the updater.
+#
+# THE OVERLAP IS EXACTLY COINCIDENT WITH THE CHECK'S VALUE, which is why this is a
+# fix and not a note: when the comparator IS inverted the trigger line is in the
+# log and the decision check already blocks, so exit 42 adds nothing there. Exit 42
+# is load-bearing ONLY when there is no trigger line -- and "42 with no trigger
+# line" is precisely the fatal-abort signature. So the code alone cannot carry it;
+# the node's own CRITICAL line is what separates them.
+#
+# ENVIRONMENTAL means rc=2, which is RETRIED. With one attempt that ends as a
+# blocked release (unverified is not verified) but with the right diagnosis.
+#
+# These two DELIBERATELY supply one spec -- they are asserting the exhaustion
+# path and its tail message, so the budget must run out. They therefore cannot
+# discriminate rc=2 from rc=1 by exit code; the retry case below is what does
+# that, and the hard-block cases after it are what stop rc=2 from being handed
+# to a real defect.
+gate_a_case "exit 42 after a fatal listener abort is environmental, not an updater fault" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 1 1 \
+    "CRITICAL fatal abort" "42:SEEN_OK:FATAL_LISTENER_OUT"
+# ...and the redb path separately, because it was added later (#4604) and reuses
+# the listener path's exit-code decision. A version of this that knew only about
+# the listener would hard-block a healthy release on a disk error.
+gate_a_case "exit 42 after a redb poison is environmental too" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 1 1 \
+    "CRITICAL fatal abort" "42:SEEN_OK:REDB_POISON_OUT"
+# THE ONE THAT MATTERS: retried, and a healthy release is NOT blocked by one bad
+# attempt. This is the whole point of classifying it as 2 rather than 1 -- and it
+# is the case a hard block would have failed.
+gate_a_case "a fatal abort is RETRIED and the healthy retry passes" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 0 2 \
+    "MUST decline to update" "42:SEEN_OK:FATAL_LISTENER_OUT" "0:SEEN_OK:CLEAN_OUT"
+# THE OTHER DIRECTION, AND THE STRONGEST ATTACK ON THIS WHOLE PATH. 42 with node
+# output carrying NO fatal-abort line is a real downgrade bug and must block on
+# attempt 1, with the retry budget untouched.
+#
+# The spare attempt is the entire assertion. The rc=2 path introduced above is an
+# escape hatch by construction: anything that makes the discriminator answer
+# "environmental" for a genuine defect converts a blocked release into a
+# published one. With one spec that conversion is INVISIBLE -- rc=1 and rc=2 both
+# exit 1 after one attempt -- and mutation R-a (the discriminator stuck TRUE) was
+# caught here by message text alone. With the spare attempt R-a yields
+# `exit 0 after 2 attempts`: the release publishes. The real gate runs
+# CANARY_ATTEMPTS=2, so 2 is also the production shape.
+gate_a_case "a real exit-42 downgrade blocks on attempt 1 even when a retry is available" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 1 1 \
+    "downgrade-and-restart loop" "42:SEEN_OK:CLEAN_OUT" "0:SEEN_OK:CLEAN_OUT"
+# ...and it names the alternative cause rather than confidently blaming the
+# comparator. A blocking gate that points at the wrong subsystem is how people
+# learn to override it.
+gate_a_case "the hard block names the fatal-abort alternative it ruled out" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 1 1 \
+    "42 is also FATAL_LISTENER_EXIT_CODE" "42:SEEN_OK:CLEAN_OUT" "0:SEEN_OK:CLEAN_OUT"
+
+# --- the exit-42 observer must survive an INDETERMINATE log verdict ----------
+#
+# Found by an external (Codex) review pass, reproduced twice, and it made the
+# observer unreachable on the one input it exists for.
+#
+# `freenet.rs` `return`s immediately after `update_tx.send`, so the completion
+# line is NEVER emitted on the trigger path. If the trigger's wording drifts out
+# of `MARKER_TRIGGERED_RE`, or the line is dropped, the log then has no matched
+# trigger AND no completion -- `node_check_settled` is false and
+# `assert_detection_healthy` returns 2 (INDETERMINATE). The observer was gated on
+# `rc -eq 0`, so it skipped; Gate A burned both attempts and reported "produced no
+# verdict -- GitHub unreachable, or the check never logged an outcome" for a
+# deterministic self-downgrade. Fail-closed, so no false green -- but the
+# diagnosis named the wrong subsystem, and the file CLAIMED this case was covered.
+#
+# The gate is now `rc -ne 1`, so an INDETERMINATE log verdict no longer disarms
+# it while a definite fault (rc=1, which localises better) still wins.
+# shellcheck disable=SC2034  # read BY NAME through the stub's `${!logvar}`
+SEEN_TRIGGER_REWORDED='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.123" jitter_secs=7
+2026-08-08T02:00:00.300000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.122
+2026-08-08T02:00:00.412000Z  INFO freenet: Startup check: newer release found, starting auto-update new_version=0.2.122'
+# shellcheck disable=SC2034  # read BY NAME through the stub's `${!logvar}`
+SEEN_TRIGGER_DROPPED='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.123" jitter_secs=7
+2026-08-08T02:00:00.300000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.122'
+
+# Both must BLOCK, on attempt 1, with the self-downgrade diagnosis -- not with
+# the "no verdict" message, and not by consuming the retry budget.
+gate_a_case "reworded trigger + exit 42 blocks despite an INDETERMINATE log" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 1 1 \
+    "downgrade-and-restart loop" "42:SEEN_TRIGGER_REWORDED:CLEAN_OUT" "0:SEEN_OK:CLEAN_OUT"
+gate_a_case "dropped trigger line + exit 42 blocks despite an INDETERMINATE log" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 1 1 \
+    "downgrade-and-restart loop" "42:SEEN_TRIGGER_DROPPED:CLEAN_OUT" "0:SEEN_OK:CLEAN_OUT"
+# ...and the operator is told why there is no trigger line to find, so the
+# missing line does not read as evidence against the verdict.
+gate_a_case "the block explains the absent trigger line" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 1 1 \
+    "no matched trigger, and no completion line either" \
+    "42:SEEN_TRIGGER_REWORDED:CLEAN_OUT" "0:SEEN_OK:CLEAN_OUT"
+# THE UPDATE ARM'S BEHAVIOUR ON THE SAME DEFECT, pinned because the comment
+# describing it in auto-update-canary.sh was WRONG twice and a reader has no way
+# to check it without this.
+#
+# The intuitive answer -- "the update arm catches it as 'did NOT decide to
+# update'" -- is false. Every trigger site `return`s straight after
+# `update_tx.send`, so a node that triggered emits no completion line either;
+# `rc` is 2 and `assert_gate_a_decision` is never reached (it is gated on rc=0).
+# The run burns BOTH attempts and blocks as UNVERIFIED, with the same
+# wrong-subsystem "produced no verdict" text this observer removes from the
+# decline arm -- on a node that behaved correctly. Fail-closed, and not fixed
+# here: the exit-42 observer cannot be extended to this arm, because exiting 42
+# is CORRECT when the binary really is older.
+#
+# Two specs and two expected attempts, because burning the retry budget is the
+# behaviour being asserted.
+# shellcheck disable=SC2034  # read BY NAME through the stub's `${!logvar}`
+SEEN_TRIGGER_REWORDED_OLD='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.122" jitter_secs=7
+2026-08-08T02:00:00.300000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.123
+2026-08-08T02:00:00.412000Z  INFO freenet: Startup check: newer release found, starting auto-update new_version=0.2.123'
+gate_a_case "update arm + reworded trigger blocks as UNVERIFIED, not as a decision failure" \
+    "Freenet version: 0.2.122 (deadbeefcafe)" 0.2.123 1 2 \
+    "produced no verdict" "42:SEEN_TRIGGER_REWORDED_OLD:CLEAN_OUT" "42:SEEN_TRIGGER_REWORDED_OLD:CLEAN_OUT"
+gate_a_case "...and NOT with the decision-failure diagnosis" \
+    "Freenet version: 0.2.122 (deadbeefcafe)" 0.2.123 1 2 \
+    '!did NOT decide to update' "42:SEEN_TRIGGER_REWORDED_OLD:CLEAN_OUT" "42:SEEN_TRIGGER_REWORDED_OLD:CLEAN_OUT"
+
+# The corroboration still governs this path: same INDETERMINATE log, but a
+# fatal-abort CRITICAL present means the 42 is explained and must stay
+# environmental rather than becoming a hard block.
+gate_a_case "an INDETERMINATE log + exit 42 + fatal abort stays environmental" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 1 1 \
+    "CRITICAL fatal abort" "42:SEEN_TRIGGER_DROPPED:FATAL_LISTENER_OUT"
+# And rc=1 must still win: a parse failure localises better than "it exited 42",
+# so the observer must not run on top of it. TWO cases, and the second is the
+# load-bearing one -- `fail` appends to stderr rather than replacing, so the
+# positive check below passes even when the observer DID overwrite the verdict
+# (both messages are present). Only the absence assertion can see it; measured,
+# the positive form alone left the guard-removal mutation GREEN.
+gate_a_case "a parse failure still outranks the exit-42 observer" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 1 1 \
+    "could not parse the version GitHub returned" "42:BROKEN:CLEAN_OUT" "0:SEEN_OK:CLEAN_OUT"
+gate_a_case "...and the exit-42 diagnosis is NOT also emitted over it" \
+    "Freenet version: 0.2.123 (deadbeefcafe)" 0.2.122 1 1 \
+    '!downgrade-and-restart loop' "42:BROKEN:CLEAN_OUT" "0:SEEN_OK:CLEAN_OUT"
+
+# The pure predicate underneath all of that.
+fatal_out_case() {
+    # fatal_out_case <desc> <expect yes|no> <node.out content>
+    local desc="$1" expect="$2" content="$3" dir got
+    dir="$(mktemp -d "$TMPROOT/fatal.XXXXXX")"
+    if [[ -n "$content" ]]; then
+        printf '%s\n' "$content" > "$dir/node.out"
+    fi
+    if node_exited_on_fatal_abort "$dir"; then got=yes; else got=no; fi
+    if [[ "$got" == "$expect" ]]; then
+        echo "ok   - fatal-abort detection: $desc"
+    else
+        echo "FAIL - fatal-abort detection: $desc (got '$got', expected '$expect')" >&2
+        if [[ "$expect" == no ]]; then
+            echo "       Reading this as a fatal abort downgrades a REAL downgrade-loop bug to" >&2
+            echo "       'environmental' and retries it -- the direction that ships the bug." >&2
+        else
+            echo "       Not reading this as a fatal abort blocks a healthy release and blames" >&2
+            echo "       compare_versions_for_startup, which is fine." >&2
+        fi
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+fatal_out_case "the network-event-listener CRITICAL"   yes "$FATAL_LISTENER_OUT"
+fatal_out_case "the redb-poison CRITICAL"              yes "$REDB_POISON_OUT"
+fatal_out_case "an ordinary SIGTERM shutdown is NOT one" no "$CLEAN_OUT"
+# A missing node.out must read as "no fatal abort", i.e. the hard block stands.
+# The opposite would hand every exit 42 the environmental path the moment the
+# harness stopped capturing output.
+fatal_out_case "a missing node.out is NOT a fatal abort" no ""
 
 eval "$real_run_node_until_check"
 
@@ -1002,7 +1625,10 @@ else
 fi
 
 # --- TMPDIR must be scoped before either process starts ---------------------
-# `client_api.rs` unconditionally `create_dir_all`s
+# #5291 removed the mkdir below from the tree. This pin stays: the canary gates
+# RELEASED binaries, and every release through v0.2.124 still carries it.
+#
+# `client_api.rs` (through v0.2.124) unconditionally `create_dir_all`s
 # `std::env::temp_dir()/freenet/webs` at router construction. The directory is
 # vestigial (nothing reads it), but the mkdir can FAIL -- `$TMPDIR/freenet`
 # being a file, or another user's directory -- and it panics when it does, exit
@@ -1163,6 +1789,148 @@ else
 fi
 pin_marker "source pin: #4073 refusal phrase"   "$SRC"    "$MARKER_NOT_TRIGGERED"
 pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"
+
+# --- WHY THERE ARE NO SOURCE PINS ON THE TWO FATAL-ABORT MARKERS -------------
+#
+# There were, briefly. `MARKER_FATAL_LISTENER` and `MARKER_REDB_POISONED` decide
+# whether an exit 42 is a genuine self-downgrade bug (block the release) or a
+# fatal-listener / redb abort (environmental, retry), so a reword that the canary
+# does not follow is worth warning about, and two pins were added to do it by
+# scraping `p2p_impl.rs` for text inside `println!`/`eprintln!` bodies.
+#
+# THEY WERE REMOVED, and the reason is not that they were imperfect -- it is that
+# a line-oriented approximation of Rust lexing produced BOTH failure directions.
+# Five review rounds each closed the shape they were shown (whole-line comments,
+# trailing comments, `#[cfg(test)]` modules, blob-vs-line matching, single-line
+# string literals) and each round produced a NEW verified defect rather than a
+# diminishing one:
+#
+#   FALSE PASSES (text the binary never prints satisfying the pin): multi-line
+#   string literals, plain and raw, defeat string masking entirely, since the
+#   masker resets per line; `#[cfg(all(test, ...))]` / `#[cfg(any(test, ...))]`
+#   bypass the test-module cut; the span cap admits an unprinted `const` near a
+#   macro that does not terminate on `);`; `/* */` blocks are not handled at all.
+#
+#   FALSE BLOCKS (a CORRECT tree failing the gate), which is what settled it.
+#   Two independent routes. One: the `#[cfg(test)]` cut matched the TEXT, so a
+#   doc comment merely MENTIONING the attribute truncated the file and produced
+#   two blocking failures on a tree whose binary still printed the markers. Two,
+#   and this is the one no reordering fixes: `sed 's/\\$//'` strips a
+#   continuation backslash WITHOUT JOINING THE LINES, so a marker split across a
+#   `\`-continuation goes red -- while Rust joins the literal, the binary prints
+#   ONE line, and the canary's `grep -aqF` matches it perfectly. Verified by
+#   compiling and running the binary. An earlier version of this file justified
+#   per-line matching as "a single source line is a requirement of the runtime
+#   grep"; for that form the claim is simply false, and it is recorded here so
+#   nobody re-derives the same half-fix.
+#
+# A blocking gate that a doc comment or a line wrap can turn red trains people to
+# override it, and the limits comment warns the next AUTHOR while the cost is
+# paid by the release engineer standing in front of a red gate. So the pins went
+# rather than the release-blocking risk.
+#
+# WHAT THIS COSTS: an early warning if someone rewords either CRITICAL line
+# without updating the marker here. The canary then hard-blocks on the next
+# environmental exit 42 and names the wrong subsystem -- loud and fail-closed,
+# but with no pointer. That is the trade, taken deliberately.
+#
+# THE FIX THAT CLOSES THE CLASS is freenet/freenet-core#5345: lift each marker
+# into a `const` in the Rust source, interpolate it at the emission site, and
+# assert it from a Rust `#[test]`. The compiler, not a tokenizer, becomes the
+# oracle -- no comment, doc comment, string literal, test module or `cfg`
+# spelling can fool it -- and the canary's marker and the node's output get a
+# single source of truth so they cannot drift. #5345 also carries the fallback
+# options if that turns out bigger than expected, and the ranking of the five
+# whole-file `pin_marker` scrapes that remain in this file.
+#
+# DO NOT re-add a scrape-based pin for these two markers without reading #5345.
+
+P2P_SRC="$SCRIPT_DIR/../crates/core/src/node/p2p_impl.rs"
+
+# ...and that 42 really is still the code those paths use. If FATAL_LISTENER_EXIT_CODE
+# ever moves off 42 the corroboration above becomes dead weight that quietly
+# weakens the exit-42 assertion -- an exit 42 could then only mean "update
+# requested", and the environmental branch would be an escape hatch with no
+# legitimate input. Pinned so that change forces a decision here.
+# Whole-line `//` comments dropped first, so a historical `// was: ... = 42;`
+# cannot satisfy it. (A const declaration is not inside a macro, so the
+# emitted-text helper above does not apply here.)
+#
+# Same `/* */` gap as that helper, and stated for the same reason: a
+# `/* const FATAL_LISTENER_EXIT_CODE: i32 = 42; */` left beside a changed const
+# keeps this green. Symmetric with the disclosed limit above rather than a
+# separate defect, and closing it properly means parsing Rust.
+p2p_code_only="$(grep -v '^[[:space:]]*//' "$P2P_SRC" | tr -d '[:space:]')"
+if [[ "$p2p_code_only" == *"constFATAL_LISTENER_EXIT_CODE:i32=42;"* ]]; then
+    echo "ok   - source pin: FATAL_LISTENER_EXIT_CODE is still 42 (so the overload is real)"
+else
+    echo "FAIL - source pin: FATAL_LISTENER_EXIT_CODE is no longer 42 in p2p_impl.rs." >&2
+    echo "       The canary treats an exit 42 with a CRITICAL fatal-abort line as ENVIRONMENTAL" >&2
+    echo "       because that code is shared with the update-requested exit. If they are no" >&2
+    echo "       longer the same number, that branch has no legitimate input and is now an" >&2
+    echo "       escape hatch on a BLOCKING gate -- delete it rather than leaving it." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+# --- the `--version` output format ------------------------------------------
+# cmd_preflight reads the shipping version from field 3 of the `Freenet version:`
+# line and uses it to choose WHICH decision to assert. A change to that output
+# shape does not fail anything on its own: the field split yields something
+# unparseable, the direction becomes `unknown`, and BOTH new assertions silently
+# stop running while the job stays green. So the format is pinned to the
+# `println!` that produces it.
+#
+# SCOPE, stated accurately rather than sold: this pins the FORMAT, and
+# cmd_preflight selects the line by its `Freenet version:` marker rather than by
+# position, so a banner line printed ahead of it no longer shifts the field read.
+# Between them the class is closed; neither alone closes it, and the `::warning::`
+# on the `unknown` arm is the backstop if some third thing gets past both.
+# `cmd_selfupdate` reads the same field of the same output, so this protects both.
+#
+# A WHOLE-FILE scrape, like the five `tracing::` pins above and unlike the
+# emitted-macro extraction that was removed (see the note further up). It is
+# WEAKER -- a comment quoting the old format satisfies it -- and it is kept
+# because its failure direction is safe: adding text to the file can only make a
+# containment check PASS, so no comment, doc comment or line wrap can turn this
+# red on a correct tree. That is the whole reason the extraction went and this
+# stayed. #5345 replaces both.
+#
+# THE WHITESPACE STRIPPING ALSO BLINDS IT TO A MISSING SEPARATOR INSIDE THE
+# LITERAL, which is worth naming because it is the ONE edit that actually
+# defeats what this pin protects. Delete the space after the colon --
+# `"Freenet version:{} ({}{})"` -- and `tr -d '[:space:]'` normalises the change
+# away, so the pin stays green while `awk '{print $3}'` yields `(deadbeefcafe)`,
+# `gate_a_expected_decision` answers `unknown`, and BOTH of Gate A's new
+# assertions are skipped. Found by an external review pass, on code two earlier
+# passes had examined.
+#
+# NOT FIXED HERE, and the rejected fix is recorded so it is not re-proposed.
+# Squeezing instead of deleting (`tr -s '[:space:]' ' '`) does catch it -- and
+# reintroduces a false-BLOCK route, which is the trade this file must never
+# make. Measured: with the needle reduced to the format string alone, a rustfmt
+# reflow and a deeper indent both stay green, but a `\`-continuation splitting
+# the literal mid-word goes RED while the binary prints the text correctly. That
+# is the exact shape that forced the removal of the other three source pins.
+# Preserving "semantic" whitespace is worse still -- it restores the rustfmt
+# fragility the stripping exists to prevent.
+#
+# So this stays a known blind spot, tracked in #5345, which replaces the pin
+# with a marker const plus a Rust test that asserts against real `--version`
+# OUTPUT rather than scraping source. The degradation is LOUD in the meantime:
+# the `unknown` arm it leads to emits a `::warning::` naming both unparseable
+# values, which is exactly the backstop that arm was added for.
+if [[ "$(sed 's/\\$//' "$SRC" | tr -d '[:space:]')" == *'println!("Freenetversion:{}({}{})",'* ]]; then
+    echo "ok   - source pin: --version still prints 'Freenet version: X (sha)' (field 3 is the version)"
+else
+    echo "FAIL - source pin: freenet.rs no longer prints 'Freenet version: {} ({}{})'." >&2
+    echo "       cmd_preflight takes the shipping version from field 3 of that line and uses it" >&2
+    echo "       to pick which decision to assert. A different shape makes the direction" >&2
+    echo "       'unknown', which skips the decision check AND the exit-42 check -- Gate A" >&2
+    echo "       silently returns to its pre-decision-check strength, green. cmd_selfupdate's" >&2
+    echo "       final version comparison reads the same field. Update BOTH awk splits, or the" >&2
+    echo "       gate is weaker than it looks." >&2
+    FAILURES=$((FAILURES + 1))
+fi
 
 # --- the (marker text, first release that shipped it) PAIR ------------------
 # Gate B's version gate is pinned in both directions (the behavioural cases on

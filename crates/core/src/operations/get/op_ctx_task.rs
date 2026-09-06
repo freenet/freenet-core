@@ -316,12 +316,14 @@ async fn emit_get_terminal_event(
 /// network — those paths never call [`start_client_get`], so the driver's
 /// terminal event never fires for them.
 ///
-/// `attempts = 0` is the convention marking a local hit (a networked GET
-/// always sends >= 1 request, so `attempts >= 1`), letting analysts split
-/// "all client GET successes" from "network GET findability" without a new
-/// field. Keeps the client-visible findability metric covering ALL client
-/// GET successes — gateways serve many local hits, which would otherwise
-/// bias the number toward network misses.
+/// `attempts = 0` is the convention marking a local hit: this path sends no
+/// request at all. It is NOT the network-vs-local split — `attempts >= 1`
+/// also covers a loopback `LocalCompletion`, which bumps `requests_sent`
+/// without a network round-trip, so `summarize_client_get_outcomes` splits on
+/// `hop_count` instead (#4852 P2, #5248). Emitting here keeps the
+/// client-visible findability metric covering ALL client GET successes —
+/// gateways serve many local hits, which would otherwise bias the number
+/// toward network misses.
 pub(crate) async fn emit_local_get_terminal_event(
     op_manager: &OpManager,
     instance_id: ContractInstanceId,

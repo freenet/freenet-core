@@ -64,6 +64,7 @@ use tokio::time::Instant;
 
 use crate::ring::futile_repair::{FutileRepairDetector, FutileRepairSnapshot, OutcomeEvidence};
 use crate::transport::TransportPublicKey;
+use crate::util::byte_bounded_lru::ByteBoundedLruCache;
 use crate::util::time_source::TimeSource;
 
 /// Interval between interest heartbeat messages sent to each peer.
@@ -95,7 +96,13 @@ pub const INTEREST_DISCONNECT_GRACE_PERIOD: Duration = Duration::from_secs(90);
 use crate::config::GlobalExecutor;
 use crate::config::GlobalRng;
 
-/// Maximum number of entries in the delta memoization cache.
+/// COUNT target for the delta memoization cache.
+///
+/// This is a coverage target, NOT the RAM bound: the cache's values are
+/// contract-produced `StateDelta`s, so 1024 entries is an unbounded number of
+/// BYTES (a delta may reach `MAX_STATE_SIZE`, 50 MiB, making the count-only
+/// worst case ~51 GiB). [`INTEREST_DELTA_CACHE_MAX_BYTES`] and the
+/// [`ByteBoundedLruCache`] backstop are what bound RAM; see #4805.
 ///
 // TODO(fast-follow): size this by hosted×neighbors rather than a flat 1024, so
 // the interest-heartbeat staleness probes (`peer_summary_has_pending_state`)
@@ -105,6 +112,99 @@ use crate::config::GlobalRng;
 // worst-case load, and summaries are memoized outside WASM so byte keys stay
 // stable while state is unchanged.
 const DELTA_CACHE_SIZE: usize = 1024;
+
+// ============================================================================
+// Delta-cache byte backstop (#4805)
+//
+// `DELTA_CACHE_SIZE` bounds the ENTRY COUNT. It does not bound RAM, because
+// every value is a contract-produced `StateDelta` whose size the contract
+// chooses (up to `wasm_runtime::MAX_STATE_SIZE` = 50 MiB). A contract emitting
+// large deltas could therefore pin ~51 GiB in this one cache — the #4565
+// OOM class, and the code-style rule that per-key collections influenced by
+// external actors MUST be size-bounded. #4804 fixed the identical shape in the
+// executor's summary/delta caches; this applies the same primitive
+// (`util::byte_bounded_lru::ByteBoundedLruCache`) here.
+//
+// Both bounds are kept, and whichever binds first evicts:
+//   - COUNT (coverage): the pre-existing 1024-entry target, unchanged.
+//   - BYTES (safety): a hard ceiling on retained bytes, independent of how
+//     large the contract makes its deltas.
+//
+// Under pressure the cache EVICTS (LRU); it never refuses to serve. A miss is
+// always safe: `compute_delta` and `peer_summary_has_pending_state` fall back
+// to a `GetDeltaQuery` contract round-trip on the live state, and if even that
+// fails `summary_indicates_stale_peer` treats the peer as STALE
+// (`delta_indicates_change.unwrap_or(true)`), which heals with full state.
+// So eviction can cost work — never freshness, and never a silently-missed
+// divergence.
+// ============================================================================
+
+/// Fraction of "the memory the node may use" that sizes the delta cache's byte
+/// budget. Half the share the executor's SUMMARY cache takes (`/64`) because,
+/// unlike the executor's caches, there is exactly ONE `InterestManager` per
+/// node rather than one per pool worker, and this cache is pure memoization
+/// with a safe miss path.
+const INTEREST_DELTA_CACHE_RAM_DIVISOR: usize = 128;
+
+/// Floor for the delta-cache byte budget (4 MiB).
+///
+/// Sized so the byte bound never degrades the small-entry case on a small node:
+/// at the [`crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES`] (512 B)
+/// per-entry floor, 4 MiB holds
+/// ~8192 entries — 8x the [`DELTA_CACHE_SIZE`] count target. That matters
+/// because the entries this cache most needs to keep are the EMPTY deltas that
+/// record "this peer is converged"; losing those is what re-arms the #4857
+/// summarize storm. Below this the count target would stop binding even for
+/// empty deltas, so 4 MiB is the point at which the byte bound is still purely
+/// a backstop.
+const INTEREST_DELTA_CACHE_MIN_BYTES: usize = 4 * 1024 * 1024;
+
+/// Ceiling for the delta-cache byte budget (16 MiB).
+///
+/// Sized against what the cache is FOR rather than picked round:
+/// `DELTA_CACHE_SIZE` (1024) × 16 KiB. 16 KiB is the per-entry size at which
+/// the COUNT target and the BYTE budget bind at the same moment, so for deltas
+/// up to that size behaviour is exactly what it was before this bound existed
+/// — full 1024-entry coverage — and bytes bind only above it. 16 KiB is a
+/// generous allowance for a DELTA specifically: the measured mean FULL-STATE
+/// broadcast payload on this fleet is ~60-95 KiB (see
+/// [`MISSING_SUMMARY_SIZE_BUCKETS`]), and a delta is the diff against that
+/// state, not the state.
+///
+/// This is deliberately NOT sized to the worst case a contract can produce
+/// (50 MiB × 1024): that number is the vector being closed, not a working-set
+/// requirement.
+const INTEREST_DELTA_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Fallback total-RAM estimate (1 GiB) when the OS query fails, mirroring
+/// the executor's `SUMMARY_CACHE_FALLBACK_TOTAL_RAM_BYTES`.
+const INTEREST_DELTA_CACHE_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Byte budget for the interest manager's delta cache, scaled to the memory the
+/// node may use (host RAM, or a smaller cgroup limit when containerized).
+///
+/// Node-wide, not per-executor: there is one `InterestManager` per node, so
+/// unlike the executor's caches this figure is NOT multiplied by the pool size.
+pub(crate) fn interest_delta_cache_budget_bytes() -> usize {
+    interest_delta_budget_for(
+        crate::wasm_runtime::read_total_ram_bytes()
+            .unwrap_or(INTEREST_DELTA_CACHE_FALLBACK_TOTAL_RAM_BYTES),
+    )
+}
+
+/// Pure sizing math behind [`interest_delta_cache_budget_bytes`], split out so
+/// the aggregate-commitment tests can ask what a hypothetical host would get
+/// instead of depending on the test machine's own RAM.
+///
+/// Resolved budgets: 512 MiB host → 4 MiB (floor); 1 GiB → 8 MiB; 2 GiB (the
+/// shipped `MemoryMax=2G`, which most peers report) → 16 MiB; anything larger →
+/// 16 MiB (ceiling).
+pub(crate) fn interest_delta_budget_for(total_ram: usize) -> usize {
+    (total_ram / INTEREST_DELTA_CACHE_RAM_DIVISOR).clamp(
+        INTEREST_DELTA_CACHE_MIN_BYTES,
+        INTEREST_DELTA_CACHE_MAX_BYTES,
+    )
+}
 
 /// Minimum interval between queue-full `ResyncRequest`s to the same peer for
 /// the same contract (issue #4857).
@@ -123,7 +223,7 @@ const DELTA_CACHE_SIZE: usize = 1024;
 ///
 /// `pub(crate)` so the UPDATE queue-full retry (#4857 P2) can size its own
 /// tokio-clock liveness backstop to exactly one reservation window — see
-/// `operations::update::op_ctx_task::resend_queue_full_resync_request`.
+/// `operations::update::op_ctx_task::resend_dropped_broadcast_resync_request`.
 pub(crate) const RESYNC_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Bound on the number of (contract, peer) entries in the queue-full
@@ -134,9 +234,10 @@ pub(crate) const RESYNC_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30)
 /// which is safe.
 const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 
-/// Bound on the number of peers tracked by the full-bytes summary fallback
-/// rotation cursor (#5155). Keyed by remote socket address, so it MUST be
-/// bounded — see the per-key-collection rule in `.claude/rules/code-style.md`.
+/// Bound on the number of peers tracked by the periodic summary rotation
+/// cursor (#5155; every peer since #5238, not just the full-bytes minority).
+/// Keyed by remote peer, so it MUST be bounded — see the per-key-collection
+/// rule in `.claude/rules/code-style.md`.
 ///
 /// Eviction costs a peer its place in the cycle, not coverage: a forgotten
 /// cursor restarts that peer's rotation at a random offset, so the contracts
@@ -144,12 +245,26 @@ const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 ///
 /// The random restart is load-bearing here, not decoration. Under a fixed
 /// restart, a single eviction would be harmless, but SUSTAINED eviction — more
-/// concurrently-syncing fallback peers than cache slots — would return every
-/// peer to the head of its set every round and starve the tail permanently. The
-/// cap is well above `max_connections`, so that is not the expected regime; the
+/// concurrently-syncing peers than cache slots — would return every peer to the
+/// head of its set every round and starve the tail permanently. The cap is well
+/// above `max_connections`, so that is not the expected regime; the
 /// randomisation is what makes it a slow cycle rather than a silent hole if it
-/// ever is. See [`InterestManager::fallback_window_start`].
-const SUMMARY_FALLBACK_CURSOR_CACHE_SIZE: usize = 4096;
+/// ever is. See [`InterestManager::summary_window_start`].
+///
+/// #5238 widened the tracked population from the full-bytes minority to every
+/// connected peer. That does not change the conclusion — 4096 still clears
+/// `max_connections` by an order of magnitude — but it does mean the headroom
+/// is no longer as large as the original margin suggested, so re-check it
+/// against `max_connections` rather than against this paragraph if either
+/// moves.
+///
+/// #5338 re-keyed the cache from [`SocketAddr`] to [`PeerKey`], which makes
+/// this bound the number of tracked PEERS rather than the number of tracked
+/// ADDRESSES. A NATed peer that reconnects on a new source port used to
+/// consume a fresh slot each time (and abandon its old one to age out), so the
+/// occupancy was churn-driven; it is now one slot per peer for as long as that
+/// peer keeps its key.
+const SUMMARY_WINDOW_CURSOR_CACHE_SIZE: usize = 4096;
 
 /// Bounds diagnostic correlation state influenced by remote (contract, peer)
 /// pairs. Eviction only loses classification detail; it never changes routing.
@@ -810,6 +925,15 @@ struct DeltaCacheKey {
     our_summary_hash: u64,
 }
 
+/// Payload size of a cached delta, for the delta cache's byte accounting.
+///
+/// Declared as a free `fn` (not a closure) because
+/// [`ByteBoundedLruCache::new`] takes a `fn(&V) -> usize` and the signature
+/// must match `V = StateDelta<'static>` exactly.
+fn delta_payload_len(delta: &StateDelta<'static>) -> usize {
+    delta.as_ref().len()
+}
+
 /// Hash bytes to u64 for cache key construction.
 /// Uses DefaultHasher for good distribution.
 fn hash_bytes(bytes: &[u8]) -> u64 {
@@ -903,7 +1027,13 @@ pub fn summary_digest(summary_bytes: &[u8]) -> SummaryDigest {
 /// delta marginally exceeds its state keeps sending deltas, while the
 /// poisoned-summary population this gate targets (state-sized deltas at
 /// 550-840 KB) still refuses by a wide margin.
-const MIN_FULL_STATE_SAVING_BYTES: usize = 1024;
+/// How much smaller than the full state a delta must be to be worth sending.
+///
+/// `pub(crate)` so the conformance simulation can gate with the SAME margin the
+/// production path uses. A simulation that mirrors the gate approximately decides a
+/// different thing than the network does, and the consequence there is an accusation
+/// against a contract that converges in production.
+pub(crate) const MIN_FULL_STATE_SAVING_BYTES: usize = 1024;
 
 /// Heuristic: would a delta *probably* be efficient compared to sending full
 /// state, judging only by the peer's summary size?
@@ -1052,7 +1182,12 @@ pub struct InterestManager<T: TimeSource> {
 
     /// Cache for memoizing delta computations.
     /// Avoids recomputing the same delta for multiple peers with identical summaries.
-    delta_cache: Mutex<LruCache<DeltaCacheKey, StateDelta<'static>>>,
+    ///
+    /// Bounded by BOTH a count target ([`DELTA_CACHE_SIZE`]) and a hard byte
+    /// budget ([`interest_delta_cache_budget_bytes`]) — the values are
+    /// contract-produced `StateDelta`s, so the count alone bounds no amount of
+    /// RAM (#4805). See the byte-backstop comment near [`DELTA_CACHE_SIZE`].
+    delta_cache: Mutex<ByteBoundedLruCache<DeltaCacheKey, StateDelta<'static>>>,
 
     /// Fast hash index for connection-time discovery.
     /// Maps u32 hash of contract ID -> list of ContractKeys (handles collisions).
@@ -1096,11 +1231,24 @@ pub struct InterestManager<T: TimeSource> {
     /// issue #4857.
     resync_request_throttle: Mutex<LruCache<(ContractKey, SocketAddr), Instant>>,
 
-    /// Rotation cursor for the bounded full-bytes summary fallback (#5155),
-    /// keyed by the peer's socket address.
+    /// Rotation cursor for the bounded periodic summary reply (#5155, extended
+    /// to the digest form by #5238), keyed by the peer's stable transport
+    /// public key.
+    ///
+    /// KEYED BY [`PeerKey`], NOT BY [`SocketAddr`] (#5338). The address is not
+    /// the peer's identity — a NATed peer that resumes on a new source port is
+    /// the same peer with the same hosted set, and keying by address threw its
+    /// cursor away on every reconnect. That is not a lost optimisation: with no
+    /// cursor, [`Self::summary_window_start`] re-draws a RANDOM offset, so
+    /// coverage degrades from a contiguous `ceil(n / limit)` tiling to
+    /// coupon-collector — about `(n / limit) * H_(n / limit)` rounds, ~90
+    /// minutes rather than ~40 at n = 450 and the 5-minute heartbeat. The
+    /// population it hit hardest was the frequently-reconnecting NATed peer
+    /// #5238 was measured on, i.e. the convergence figure was least accurate
+    /// exactly where it was validated.
     ///
     /// Holds the contract id of the LAST entry included in that peer's previous
-    /// fallback reply — a KEY, not an index. That distinction is what preserves
+    /// reply — a KEY, not an index. That distinction is what preserves
     /// the coverage BOUND when the shared set changes between rounds.
     ///
     /// A stored index names a position, and a removal below it shifts every
@@ -1122,9 +1270,12 @@ pub struct InterestManager<T: TimeSource> {
     /// runs both designs over the same removal schedule and shows the index
     /// one missing contracts the key one covers.
     ///
-    /// Only the full-bytes fallback consults this. Digest-capable peers keep
-    /// receiving the complete set every round and never touch it.
-    summary_fallback_cursor: Mutex<LruCache<SocketAddr, ContractInstanceId>>,
+    /// BOTH wire forms consult this. It served only the full-bytes fallback
+    /// under #5155 — digest-capable peers received the complete set every round
+    /// and never touched it — and #5238 ended that, because the cost the window
+    /// really bounds is the per-entry summarize call, which the digest form
+    /// pays in full.
+    summary_window_cursor: Mutex<LruCache<PeerKey, ContractInstanceId>>,
 
     /// Count of concurrently-outstanding queue-full-resync retry tasks (#4862 P1).
     /// Bounds aggregate retry tasks node-wide, independent of the throttle LRU
@@ -1185,8 +1336,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             interested_peers: DashMap::new(),
             peer_contracts: DashMap::new(),
             local_interests: DashMap::new(),
-            delta_cache: Mutex::new(LruCache::new(
+            delta_cache: Mutex::new(ByteBoundedLruCache::new(
                 NonZeroUsize::new(DELTA_CACHE_SIZE).expect("DELTA_CACHE_SIZE must be > 0"),
+                interest_delta_cache_budget_bytes(),
+                delta_payload_len,
             )),
             contract_hash_index: DashMap::new(),
             time_source,
@@ -1201,9 +1354,9 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 NonZeroUsize::new(RESYNC_THROTTLE_CACHE_SIZE)
                     .expect("RESYNC_THROTTLE_CACHE_SIZE must be > 0"),
             )),
-            summary_fallback_cursor: Mutex::new(LruCache::new(
-                NonZeroUsize::new(SUMMARY_FALLBACK_CURSOR_CACHE_SIZE)
-                    .expect("SUMMARY_FALLBACK_CURSOR_CACHE_SIZE must be > 0"),
+            summary_window_cursor: Mutex::new(LruCache::new(
+                NonZeroUsize::new(SUMMARY_WINDOW_CURSOR_CACHE_SIZE)
+                    .expect("SUMMARY_WINDOW_CURSOR_CACHE_SIZE must be > 0"),
             )),
             missing_summary_history: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MISSING_SUMMARY_HISTORY_SIZE)
@@ -2742,9 +2895,18 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         contracts
     }
 
-    /// Index at which `peer`'s next full-bytes fallback window starts, given
-    /// the shared-contract set in [`Self::get_matching_contracts`] order
+    /// Index at which `peer`'s next periodic summary window starts, given the
+    /// shared-contract set in [`Self::get_matching_contracts`] order
     /// (ascending by contract id).
+    ///
+    /// Serves BOTH wire forms. #5155 introduced it for the full-bytes fallback
+    /// only, hence the `fallback` names it used to carry; #5238 windows the
+    /// hash-first digest path too, because what the window really bounds is the
+    /// number of `summary_if_hosted_or_in_use` calls a reply makes, and that
+    /// cost is identical in either form. One cursor per peer is correct: a
+    /// peer's form is a property of its version and does not alternate, and
+    /// even if it did, the cursor names a position in id space rather than
+    /// anything form-specific.
     ///
     /// Mid-cycle this resumes immediately after the last contract SENT to that
     /// peer, which is what makes successive windows contiguous in id space
@@ -2759,11 +2921,12 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// forever". The two ways to land back at a boundary repeatedly are both
     /// reachable here, and neither needs an attacker:
     ///
-    /// - The cursor is in-memory and keyed by address, so it is lost on our
-    ///   own restart, on LRU eviction, and whenever a peer reconnects from a
-    ///   new source port. A peer that reconnects more often than one cycle
+    /// - The cursor is in-memory, so it is lost on our own restart and on LRU
+    ///   eviction. A peer whose cursor is dropped more often than one cycle
     ///   completes would, with a fixed restart, only ever be told about the
-    ///   head of the set.
+    ///   head of the set. (Reconnection from a new source port used to be a
+    ///   third way in — the cache was keyed by address — and is not one since
+    ///   #5338; see [`Self::summary_window_cursor`].)
     /// - `sorted` is the INTERSECTION with the hash list the peer advertised,
     ///   so the peer influences where the cursor lands. Advertising a single
     ///   high-id contract parks the cursor at the end, and the following full
@@ -2777,11 +2940,11 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// covered first every time.
     ///
     /// `GlobalRng` keeps this deterministic under simulation and test.
-    pub(crate) fn fallback_window_start(&self, peer: SocketAddr, sorted: &[ContractKey]) -> usize {
+    pub(crate) fn summary_window_start(&self, peer: &PeerKey, sorted: &[ContractKey]) -> usize {
         if sorted.is_empty() {
             return 0;
         }
-        let after = { self.summary_fallback_cursor.lock().peek(&peer).copied() };
+        let after = { self.summary_window_cursor.lock().peek(peer).copied() };
         let resumed = after.map(|after| first_index_after(sorted, &after));
         match resumed {
             // Mid-cycle: continue exactly where the last reply stopped.
@@ -2792,26 +2955,28 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     }
 
     /// Record the contract id of the last entry actually included in `peer`'s
-    /// fallback reply, so the next reply resumes after it.
+    /// periodic summary reply, so the next reply resumes after it.
     ///
     /// Takes what was SENT, not what was selected: the byte budget can cut a
     /// window short, and advancing past entries we dropped would skip them
     /// until the rotation wrapped all the way round.
-    pub(crate) fn record_fallback_cursor(&self, peer: SocketAddr, last_sent: ContractInstanceId) {
-        self.summary_fallback_cursor.lock().put(peer, last_sent);
+    pub(crate) fn record_summary_cursor(&self, peer: &PeerKey, last_sent: ContractInstanceId) {
+        self.summary_window_cursor
+            .lock()
+            .put(peer.clone(), last_sent);
     }
 
     /// Test accessor for the stored cursor.
     #[cfg(test)]
-    pub(crate) fn peek_fallback_cursor(&self, peer: SocketAddr) -> Option<ContractInstanceId> {
-        self.summary_fallback_cursor.lock().peek(&peer).copied()
+    pub(crate) fn peek_summary_cursor(&self, peer: &PeerKey) -> Option<ContractInstanceId> {
+        self.summary_window_cursor.lock().peek(peer).copied()
     }
 }
 
 /// First index in `sorted` (ascending by contract id, as
 /// [`InterestManager::get_matching_contracts`] returns it) whose id is strictly
 /// greater than `after`. Returns `sorted.len()` when `after` is at or past the
-/// end, which [`InterestManager::fallback_window_start`] reads as the end of a
+/// end, which [`InterestManager::summary_window_start`] reads as the end of a
 /// cycle and answers with a fresh random offset.
 ///
 /// This is the churn-safe half of the rotation. Because it is a binary search
@@ -2847,7 +3012,13 @@ pub(crate) fn first_index_after(sorted: &[ContractKey], after: &ContractInstance
 /// the real cycle length is set by bytes rather than by entry count whenever
 /// summaries are large. See `MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY` for the
 /// honest bound; do not quote `ceil(len / limit)` as the cycle time without
-/// checking which of the two limits binds.
+/// checking which of the limits binds.
+///
+/// Since #5338 `limit` is the per-message ENTRY CEILING rather than the
+/// summarize budget, and the caller stops early on the budget — so this is now
+/// the widest span a round may walk, not the span it will use. The cycle time
+/// for the contracts that cost a summarize is `ceil(hosted / budget)`; the
+/// cycle time for the whole shared set is what this function's `limit` bounds.
 pub(crate) fn rotation_window_indices(len: usize, start: usize, limit: usize) -> Vec<usize> {
     if len == 0 || limit == 0 {
         return Vec::new();
@@ -4775,6 +4946,203 @@ mod tests {
                 .get_cached_delta(&contract2, &peer_summary, &our_summary)
                 .is_none()
         );
+    }
+
+    /// Tests for the delta cache's BYTE bound (#4805).
+    ///
+    /// The pre-fix cache was a plain `LruCache` capped at
+    /// [`DELTA_CACHE_SIZE`] entries. Since every value is a contract-produced
+    /// `StateDelta` (up to `MAX_STATE_SIZE`, 50 MiB), that count bounded no
+    /// amount of RAM: 1024 entries is ~51 GiB in the worst case.
+    mod delta_cache_byte_bound {
+        use super::*;
+        use crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES;
+
+        /// P1 regression, mirroring #4804's
+        /// `byte_budget_bounds_ram_for_large_values` at the `InterestManager`
+        /// level: a contract emitting LARGE deltas must not be able to pin
+        /// arbitrary RAM here while staying far under the entry-count cap.
+        ///
+        /// The primary assertion is deliberately computed from figures the
+        /// TEST owns (`retained entries × the delta size it inserted`), not
+        /// from the cache's own byte accounting, so it does not check the fix
+        /// against itself. It is red against the pre-fix `LruCache`
+        /// (64 entries × 1 MiB = 64 MiB retained, vs. a 16 MiB ceiling) and
+        /// green with the byte backstop.
+        #[test]
+        fn large_deltas_stay_within_the_byte_budget() {
+            let (manager, _time) = make_manager();
+            let contract = make_contract_key(1);
+            let our_summary = vec![0u8; 8];
+
+            const DELTA_BYTES: usize = 1024 * 1024; // 1 MiB per delta
+            // 64 MiB of deltas — 4x the widest budget any host resolves to —
+            // while the ENTRY COUNT stays far below the count cap, so only a
+            // byte bound can stop this.
+            const INSERTS: usize = 64;
+            const _: () = assert!(INSERTS < DELTA_CACHE_SIZE);
+
+            let budget = interest_delta_cache_budget_bytes();
+            assert!(
+                budget <= INTEREST_DELTA_CACHE_MAX_BYTES,
+                "budget {budget} must never exceed the documented ceiling \
+                 {INTEREST_DELTA_CACHE_MAX_BYTES}"
+            );
+            assert!(
+                INSERTS * DELTA_BYTES > budget,
+                "precondition: the test must insert MORE bytes ({}) than the \
+                 budget ({budget}) or it cannot observe eviction",
+                INSERTS * DELTA_BYTES
+            );
+
+            for i in 0..INSERTS {
+                // A distinct peer-summary per insert, exactly as fan-out
+                // produces (the cache key carries the peer's summary hash).
+                let peer_summary = (i as u64).to_le_bytes().to_vec();
+                manager.cache_delta(
+                    &contract,
+                    &peer_summary,
+                    &our_summary,
+                    StateDelta::from(vec![0u8; DELTA_BYTES]),
+                );
+
+                // Independent bound: entries retained × the size WE inserted.
+                let retained = manager.delta_cache.lock().len();
+                assert!(
+                    retained * DELTA_BYTES <= budget,
+                    "after {} inserts the cache retains {retained} × {DELTA_BYTES} B = {} B, \
+                     which must stay within the {budget} B budget",
+                    i + 1,
+                    retained * DELTA_BYTES
+                );
+            }
+
+            let retained = manager.delta_cache.lock().len();
+            assert!(
+                retained < INSERTS,
+                "eviction must have occurred: {retained} of {INSERTS} inserts retained"
+            );
+            // Secondary: the cache's own accounting agrees.
+            assert!(
+                manager.delta_cache.lock().total_bytes() <= budget,
+                "accounted total {} must stay within the {budget} B budget",
+                manager.delta_cache.lock().total_bytes()
+            );
+        }
+
+        /// The byte bound must not degrade the SMALL-delta case it is a
+        /// backstop for. Empty deltas are the entries that matter most here —
+        /// they are the memoized "this peer is converged" verdicts whose loss
+        /// re-arms the #4857 summarize storm — so the floor budget has to keep
+        /// the COUNT target binding for them on every host.
+        #[test]
+        fn count_target_still_binds_for_small_deltas() {
+            let (manager, _time) = make_manager();
+            let contract = make_contract_key(1);
+            let our_summary = vec![0u8; 8];
+
+            for i in 0..DELTA_CACHE_SIZE {
+                let peer_summary = (i as u64).to_le_bytes().to_vec();
+                manager.cache_delta(
+                    &contract,
+                    &peer_summary,
+                    &our_summary,
+                    StateDelta::from(Vec::<u8>::new()),
+                );
+            }
+
+            assert_eq!(
+                manager.delta_cache.lock().len(),
+                DELTA_CACHE_SIZE,
+                "a full count-cap worth of EMPTY deltas must all be retained; \
+                 the byte budget is a backstop, not a coverage limit"
+            );
+        }
+
+        /// A single delta larger than the whole budget is not cached at all
+        /// (`ByteBoundedLruCache::put`'s skip-oversized guard) — retaining one
+        /// would break the hard cap, and `StateDelta` is contract-controlled.
+        ///
+        /// The behavioural consequence, stated so it is not rediscovered as a
+        /// bug: `compute_delta` caches even an oversized delta on purpose, so
+        /// `cached_staleness_verdict` can answer "peer is stale" without a
+        /// WASM probe. For a delta above the budget that memoization is gone
+        /// and the staleness path falls back to the contract round-trip
+        /// (bounded per message by `MAX_STALENESS_PROBES_PER_SUMMARIES`).
+        /// That costs work in exactly the abusive case this bound exists for,
+        /// and costs no correctness: a miss never reports "converged".
+        #[test]
+        fn a_single_oversized_delta_is_not_cached() {
+            let (manager, _time) = make_manager();
+            let contract = make_contract_key(1);
+            let our_summary = vec![0u8; 8];
+            let peer_summary = vec![1u8; 8];
+
+            let oversized = interest_delta_cache_budget_bytes() + 1;
+            manager.cache_delta(
+                &contract,
+                &peer_summary,
+                &our_summary,
+                StateDelta::from(vec![0u8; oversized]),
+            );
+
+            assert!(
+                manager
+                    .get_cached_delta(&contract, &peer_summary, &our_summary)
+                    .is_none(),
+                "a delta larger than the whole budget must not be retained"
+            );
+            assert_eq!(
+                manager.delta_cache.lock().total_bytes(),
+                0,
+                "refusing the oversized entry must leave the byte total at zero"
+            );
+        }
+
+        /// The resolved budget at the host shapes that actually ship, so a
+        /// future edit to the divisor or the clamps has to state its effect
+        /// here rather than moving them silently.
+        #[test]
+        fn budget_resolves_as_documented_across_host_shapes() {
+            const MIB: usize = 1024 * 1024;
+            for (label, ram, expected) in [
+                (
+                    "128 MiB container",
+                    128 * MIB,
+                    INTEREST_DELTA_CACHE_MIN_BYTES,
+                ),
+                ("512 MiB host", 512 * MIB, 4 * MIB),
+                ("1 GiB host (the OS-query fallback)", 1024 * MIB, 8 * MIB),
+                ("2 GiB peer (shipped MemoryMax=2G)", 2048 * MIB, 16 * MIB),
+                (
+                    "7600 MiB gateway",
+                    7600 * MIB,
+                    INTEREST_DELTA_CACHE_MAX_BYTES,
+                ),
+            ] {
+                assert_eq!(
+                    interest_delta_budget_for(ram),
+                    expected,
+                    "{label}: budget must resolve to {expected} bytes"
+                );
+            }
+        }
+
+        /// The floor is what keeps the byte bound a BACKSTOP rather than a
+        /// coverage limit: at the per-entry overhead floor it must still hold
+        /// more than the count target, so no host ever loses empty-delta
+        /// coverage to bytes. Pins the arithmetic behind
+        /// `count_target_still_binds_for_small_deltas` at the SMALLEST budget,
+        /// which the test machine's own RAM may not produce.
+        #[test]
+        fn floor_budget_holds_more_than_the_count_target() {
+            let entries_at_floor = INTEREST_DELTA_CACHE_MIN_BYTES / CACHE_ENTRY_OVERHEAD_BYTES;
+            assert!(
+                entries_at_floor >= DELTA_CACHE_SIZE,
+                "the floor budget holds {entries_at_floor} minimum-weight entries, which \
+                 must be at least the {DELTA_CACHE_SIZE}-entry count target"
+            );
+        }
     }
 
     #[test]
@@ -7257,7 +7625,7 @@ mod tests {
     /// production uses at a cycle boundary. That is deliberate: these tests
     /// pin the WITHIN-cycle contiguity and coverage properties, which must hold
     /// from any starting offset, so the tests below sweep the starts explicitly
-    /// instead of sampling them. `fallback_window_start_randomises_the_cycle_
+    /// instead of sampling them. `summary_window_start_randomises_the_cycle_
     /// boundary` covers the production entry point.
     fn rotation_round(
         sorted: &[ContractKey],
@@ -7512,29 +7880,29 @@ mod tests {
     /// Mid-cycle the stored cursor round-trips and resumes deterministically,
     /// and cursors do not leak between peers.
     #[test]
-    fn fallback_cursor_round_trips_and_resumes_mid_cycle() {
+    fn summary_cursor_round_trips_and_resumes_mid_cycle() {
         let (mgr, _clock) = make_manager();
-        let peer: SocketAddr = "127.0.0.1:9100".parse().unwrap();
+        let peer = make_peer_key(1);
         let sorted = sorted_keys(0..8);
 
-        assert_eq!(mgr.peek_fallback_cursor(peer), None);
+        assert_eq!(mgr.peek_summary_cursor(&peer), None);
 
-        mgr.record_fallback_cursor(peer, *sorted[2].id());
-        assert_eq!(mgr.peek_fallback_cursor(peer), Some(*sorted[2].id()));
+        mgr.record_summary_cursor(&peer, *sorted[2].id());
+        assert_eq!(mgr.peek_summary_cursor(&peer), Some(*sorted[2].id()));
         assert_eq!(
-            mgr.fallback_window_start(peer, &sorted),
+            mgr.summary_window_start(&peer, &sorted),
             3,
             "mid-cycle the resume point must be exactly after the last id sent"
         );
 
         // Cursors are per peer: one peer's progress must not advance another's.
-        let other: SocketAddr = "127.0.0.1:9101".parse().unwrap();
-        mgr.record_fallback_cursor(other, *sorted[6].id());
-        assert_eq!(mgr.fallback_window_start(peer, &sorted), 3);
-        assert_eq!(mgr.fallback_window_start(other, &sorted), 7);
+        let other = make_peer_key(2);
+        mgr.record_summary_cursor(&other, *sorted[6].id());
+        assert_eq!(mgr.summary_window_start(&peer, &sorted), 3);
+        assert_eq!(mgr.summary_window_start(&other, &sorted), 7);
 
         // An empty shared set has no valid offset; it must not panic or draw.
-        assert_eq!(mgr.fallback_window_start(peer, &[]), 0);
+        assert_eq!(mgr.summary_window_start(&peer, &[]), 0);
     }
 
     /// At a CYCLE BOUNDARY the start is random, not a fixed 0.
@@ -7551,15 +7919,15 @@ mod tests {
     /// at the end. With a fixed restart that alternation pins the window to the
     /// head forever; with a random one it cannot.
     #[test]
-    fn fallback_window_start_randomises_the_cycle_boundary() {
+    fn summary_window_start_randomises_the_cycle_boundary() {
         let (mgr, _clock) = make_manager();
         let sorted = sorted_keys(0..64);
 
         // No cursor: many draws, all in range, and not all the same value.
         let mut seen = HashSet::new();
         for i in 0..40u32 {
-            let peer: SocketAddr = format!("127.0.0.1:{}", 9200 + i).parse().unwrap();
-            let start = mgr.fallback_window_start(peer, &sorted);
+            let peer = make_unique_peer_key(9200 + i);
+            let start = mgr.summary_window_start(&peer, &sorted);
             assert!(start < sorted.len(), "start {start} out of range");
             seen.insert(start);
         }
@@ -7570,11 +7938,11 @@ mod tests {
         );
 
         // Cursor at the highest id: also a boundary, also randomised.
-        let peer: SocketAddr = "127.0.0.1:9300".parse().unwrap();
+        let peer = make_unique_peer_key(9300);
         let mut seen_wrapped = HashSet::new();
         for _ in 0..40 {
-            mgr.record_fallback_cursor(peer, *sorted[sorted.len() - 1].id());
-            seen_wrapped.insert(mgr.fallback_window_start(peer, &sorted));
+            mgr.record_summary_cursor(&peer, *sorted[sorted.len() - 1].id());
+            seen_wrapped.insert(mgr.summary_window_start(&peer, &sorted));
         }
         assert!(
             seen_wrapped.iter().all(|s| *s < sorted.len()),
@@ -7595,11 +7963,11 @@ mod tests {
     /// under the deterministic simulation harness, which would make any
     /// convergence simulation covering this path silently non-deterministic.
     #[test]
-    fn fallback_window_start_draws_its_offset_from_global_rng() {
+    fn summary_window_start_draws_its_offset_from_global_rng() {
         let src = include_str!("interest.rs");
         let at = src
-            .find("pub(crate) fn fallback_window_start(")
-            .expect("fallback_window_start not found");
+            .find("pub(crate) fn summary_window_start(")
+            .expect("summary_window_start not found");
         let body_end = at + src[at..].find("\n    }\n").expect("body end not found");
         let body = &src[at..body_end];
         assert!(

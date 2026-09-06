@@ -34,13 +34,19 @@ SKIP_TESTS=false
 # deprecated and their handler below only prints a note, so the two variables
 # were written once and never read again.
 
-# Release steps for state tracking (in execution order)
+# Release steps for state tracking (in execution order).
+#
+# CRATES_PUBLISHED moved below RELEASE_CREATED: the crates.io upload is the one
+# irreversible step and now runs downstream of the blocking pre-flight canary,
+# in cross-compile.yml's attach-to-release job. This list is only printed
+# (the "Steps to execute" summary), but printing them out of order would
+# describe a pipeline that no longer exists.
 RELEASE_STEPS=(
     "PR_CREATED"
     "PR_MERGED"
     "TAG_CREATED"
-    "CRATES_PUBLISHED"
     "RELEASE_CREATED"
+    "CRATES_PUBLISHED"
     "GATEWAYS_UPDATED"
     "MATRIX_ANNOUNCED"
     "RIVER_ANNOUNCED"
@@ -56,7 +62,9 @@ show_help() {
     echo
     echo "This script automates the complete release process:"
     echo "• Version bumping → Release PR → GitHub CI → Auto-merge"
-    echo "• Publishing to crates.io → GitHub release → Automatic cross-compilation"
+    echo "• Tag + DRAFT GitHub release → cross-compilation (fired by the tag)"
+    echo "• Then, inside cross-compile.yml: attach binaries → blocking auto-update"
+    echo "  pre-flight canary → publish to crates.io → un-draft the release"
     echo
     echo "Options:"
     echo "  --version X.Y.Z           Target version (required)"
@@ -137,7 +145,14 @@ else
 fi
 export FREENET_MIN_COMPATIBLE_VERSION="$MIN_COMPATIBLE"
 
-# Get the most recently published version from crates.io (most authoritative source)
+# Get the most recently published version from crates.io (most authoritative source).
+#
+# `cargo search` is CORRECT here and must not be "fixed" to the registry
+# endpoint: this genuinely wants the NEWEST published version, which is exactly
+# what it reports. The rule is that `cargo search` may only answer questions
+# about the newest version -- fine for this comparison, wrong wherever the
+# question is "is version X published?", which is why
+# crate_version_on_crates_io() below uses the per-version endpoint instead.
 echo -n "Checking latest published version on crates.io... "
 PUBLISHED_VERSION=$(cargo search freenet --limit 1 2>/dev/null | grep "^freenet =" | head -1 | cut -d'"' -f2)
 if [[ -z "$PUBLISHED_VERSION" ]]; then
@@ -396,15 +411,81 @@ detect_tag_state() {
     fi
 }
 
+# Is <crate> <version> already on crates.io?
+#
+# Asks the REGISTRY endpoint for that exact version, NOT `cargo search`.
+# `cargo search` reads the SEARCH index, which lags the registry index, and
+# `--limit 1` only ever reports a crate's newest version. Before the publish
+# moved downstream of Gate A this guard was near-always "no" and the lag did not
+# matter; now the workflow has normally published already, so it is near-always
+# "yes" and the lag decides the answer. A lagging search index would report "no"
+# for a version that IS published, this function's caller would publish, cargo
+# would reject the duplicate, `run_cmd` would exit 1 -- and a fully successful
+# release would show up as a red driver, repeatedly, until the index caught up.
+#
+# Same endpoint and same reasoning as cross-compile.yml's publish step; keep the
+# two in step. `jq` reads a variable via a here-string rather than a pipe:
+# under `set -o pipefail` a short-circuiting reader makes the producer die 141
+# and a PRESENT answer read as ABSENT, which is the very failure being fixed.
+# DEFERRED, deliberately: this is two-state (present / not-present) while
+# `RELEASE_RECOVERY.md`'s `published()` helper is three-state (200 / 404 /
+# UNKNOWN). A 403, 429 or 5xx therefore reads here as "not published".
+#
+# Left as-is for now because the direction is FAIL-CLOSED and the docs' is not.
+# A false "absent" here makes the caller attempt a duplicate upload, which
+# crates.io rejects, which fails the step loudly and leaves the release a draft.
+# The dangerous inverse -- a false "present" causing a publish to be skipped --
+# needs a genuine 200 body and is unreachable. An operator acting on a false
+# "not published" in the docs, by contrast, re-tags a spent version, which is
+# irreversible; that is why the stricter form was applied there first.
+#
+# It is also protected in practice by the User-Agent lint in
+# release_canary_wiring_test.sh: the realistic way to get a non-200/404 here is
+# a missing or empty UA, and that is now pinned across every crates.io call site
+# in the repo.
+#
+# Worth doing properly, and the tri-state helper to copy already exists. Not
+# done in this PR because the matching change in cross-compile.yml's publish
+# step would require rewriting the behavioural fixtures that stub `curl` with
+# response BODIES, and adding an unverified surface late is a worse trade than
+# a documented fail-closed gap.
+crate_version_on_crates_io() {
+    local body
+    body="$(curl -sS -A 'freenet-release-driver' --max-time 30 \
+        --retry 3 --retry-all-errors \
+        "https://crates.io/api/v1/crates/$1/$2" 2>/dev/null)" || return 1
+    jq -e '.version.num? // empty' >/dev/null 2>&1 <<<"$body"
+}
+
 # Detect if crates are published
 detect_crates_state() {
-    # Check if freenet is published at this version.
-    # `|| true` because the old form ran inside an `if` condition, where errexit
-    # is disabled; a bare assignment is not, so a failing `cargo search` would
-    # otherwise abort the release.
-    local search_out
-    search_out="$(cargo search freenet --limit 1 2>/dev/null || true)"
-    if [[ "$search_out" == *"freenet = \"$VERSION\""* ]]; then
+    # BOTH crates, via the REGISTRY endpoint rather than `cargo search` -- see
+    # crate_version_on_crates_io above.
+    #
+    # The `&&` is load-bearing, and the reason is worth reading before anyone
+    # "simplifies" it back to a single check.
+    #
+    # This sets the CRATES_PUBLISHED resume flag, and `publish_crates` RETURNS
+    # EARLY on that flag -- above its own per-crate logic. So a flag set on
+    # freenet alone makes the fdev branch unreachable, and the driver reports a
+    # successful release having never published fdev. The scenario is one this
+    # repo now documents as expected: `attach-to-release` publishes freenet,
+    # `cargo publish -p fdev` fails (the #4240 class, which docs/RELEASING.md
+    # records as having no pre-flight anywhere), the operator resumes
+    # release.sh, and it declares the crates step already complete.
+    #
+    # This checked freenet only for as long as it used `cargo search`, whose
+    # index lag usually answered "not published" -- so the flag went unset,
+    # publish_crates ran, and its per-crate branch published fdev. The
+    # INACCURACY was the only thing holding that gap shut. Making the check
+    # correct without widening it to both crates would have turned an unlikely
+    # path into the reliable one.
+    #
+    # General form, because this is not the only place it can bite: before
+    # making a check more correct, ask what currently depends on it being
+    # wrong.
+    if crate_version_on_crates_io freenet "$VERSION" \
+       && crate_version_on_crates_io fdev "$FDEV_VERSION"; then
         COMPLETED_STEPS["CRATES_PUBLISHED"]=1
     fi
 }
@@ -860,10 +941,13 @@ Generated by: \`scripts/release.sh\`" \
             echo "    The PR may still merge. Check: https://github.com/freenet/freenet-core/pull/$pr_number"
             echo "    If the PR merged, you can continue the release manually with:"
             echo "      git checkout main && git pull origin main"
-            echo "      cargo publish -p freenet"
-            echo "      sleep 30 && cargo publish -p fdev"
             echo "      git tag -a 'v$VERSION' -m 'Release v$VERSION' && git push origin 'v$VERSION'"
-            echo "      gh release create 'v$VERSION' --title 'v$VERSION' --notes 'Release $VERSION'"
+            echo "      gh release create 'v$VERSION' --title 'v$VERSION' --notes 'Release $VERSION' --draft"
+            echo "    Then let cross-compile.yml (fired by the tag) attach the binaries, run"
+            echo "    the blocking pre-flight canary, publish to crates.io and un-draft."
+            echo "    Do NOT 'cargo publish' by hand first: the publish is downstream of the"
+            echo "    canary on purpose, and doing it early is what cost v0.2.124 its version"
+            echo "    number. See scripts/RELEASE_RECOVERY.md."
             # Don't exit with error - the PR might have merged
             return 0
         fi
@@ -1035,8 +1119,58 @@ See commit history for detailed changes.
     echo -e "$notes"
 }
 
+# crates.io publish -- a VERIFY-WITH-BACKSTOP step, and no longer where the
+# release normally publishes from.
+#
+# This used to run before `create_github_release`, i.e. before the tag existed
+# and long before the blocking auto-update pre-flight canary (Gate A, #5222)
+# had a binary to inspect. That ordering is what made a Gate A block cost a
+# version number instead of a re-run: when the gate blocked v0.2.124 its crates
+# were already permanent on crates.io, so the release could only stay a draft
+# and 0.2.125 was cut in its place. The publish now lives in
+# `cross-compile.yml`'s `attach-to-release` job, between Gate A and the
+# un-draft, and the tag push this script performs is what triggers it.
+#
+# So by the time `wait_for_binaries` returns, the workflow has normally already
+# published both crates and the checks below simply confirm it.
+#
+# IT RUNS ONLY ON THE SUCCESS PATH. It is NOT a fallback for a broken workflow
+# and must not be made into one.
+#
+# Two earlier versions of this comment claimed otherwise -- that it "stays a
+# real publish" for a `CARGO_REGISTRY_TOKEN` that never reached CI, and that
+# the call site was `if ! wait_for_binaries; then publish_crates; exit 1; fi`.
+# Both are false, and the second is the shape a maintainer would restore from
+# reading them, so they are corrected rather than merely appended to.
+#
+# WHY IT MUST NOT RUN ON FAILURE. `wait_for_binaries` fails on six modes, only
+# one of which ("assets missing after a successful attach") leaves Gate A known
+# to have passed. The canonical enumeration, with each mode's Gate A
+# implication, lives at the refusal branch in the main flow -- deliberately in
+# ONE place, because the previous two copies of it drifted apart and both
+# undercounted. This function checks the resume flag, DRY_RUN and crates.io
+# presence -- never the gate's verdict -- and on the rejected path the crate is
+# genuinely absent, so the already-published check says "no" and it really does
+# upload.
+#
+# The token justification was also unachievable: cross-compile.yml checks the
+# credential BEFORE running the canary, so a missing token fails the job before
+# the gate; and at the call site a missing token and a canary rejection arrive
+# as the same non-success conclusion, indistinguishable.
+#
+# PINNED BY the refusal case in release_driver_test.sh -- which asserts this
+# function does NOT run when wait_for_binaries fails, the exact opposite of what
+# an earlier reachability case asserted -- NOT by the ordering assertion in
+# release_canary_wiring_test.sh, which compares line numbers and stayed green
+# throughout the period this was dead.
+#
+# MUST be called AFTER wait_for_binaries, and ONLY on its success path. Calling
+# it earlier reinstates the ordering described above; calling it on the FAILURE
+# path publishes a version Gate A never passed, because this function checks
+# only the resume flag, DRY_RUN and crates.io presence -- never the gate's
+# verdict. The main flow refuses instead; see the comment at that call site.
 publish_crates() {
-    echo "Publishing to crates.io:"
+    echo "Confirming crates.io publish (normally already done by cross-compile.yml):"
 
     # Skip if already completed
     if is_step_completed "CRATES_PUBLISHED"; then
@@ -1055,9 +1189,7 @@ publish_crates() {
 
     # Check if freenet is already published
     echo -n "  Checking if freenet $VERSION is already published... "
-    local freenet_search
-    freenet_search="$(cargo search freenet --limit 1 2>/dev/null || true)"
-    if [[ "$freenet_search" == *"freenet = \"$VERSION\""* ]]; then
+    if crate_version_on_crates_io freenet "$VERSION"; then
         echo "yes"
         echo "  ✓ freenet $VERSION already published to crates.io"
         freenet_published=true
@@ -1074,9 +1206,7 @@ publish_crates() {
 
     # Check if fdev is already published
     echo -n "  Checking if fdev $FDEV_VERSION is already published... "
-    local fdev_search
-    fdev_search="$(cargo search fdev --limit 1 2>/dev/null || true)"
-    if [[ "$fdev_search" == *"fdev = \"$FDEV_VERSION\""* ]]; then
+    if crate_version_on_crates_io fdev "$FDEV_VERSION"; then
         echo "yes"
         echo "  ✓ fdev $FDEV_VERSION already published to crates.io"
         fdev_published=true
@@ -1193,9 +1323,15 @@ trigger_gateway_updates() {
     fi
 
     # Known gateways: host, SSH user, SSH options
+    # The AWS gateway was retired 2026-09; its entry is removed so a fallback
+    # release does not SSH to a host that no longer exists and record a failed
+    # update on every run. nova's second gateway (freenet-gateway-2) needs no
+    # entry of its own: it carries WantedBy=freenet-gateway.service, so the same
+    # stop/start cycle brings it up, and gateway-auto-update.sh now verifies
+    # companion units from the .wants symlinks rather than reporting success
+    # while one is down.
     local -a GATEWAYS=(
         "nova.locut.us:ian:"
-        "vega.locut.us:ian:"
     )
 
     local all_ok=true
@@ -1393,7 +1529,27 @@ wait_for_binaries() {
     # Check if all required binaries are already available
     if verify_required_binaries "${REQUIRED_BINARIES[@]}"; then
         echo "  ✓ All required platform binaries already available"
-        publish_draft_release
+        # GUARDED, not bare. `publish_draft_release` returns 1 on two deliberate
+        # refusals -- draft state unknown, and still-a-draft with the Gate A
+        # canary not concluded -- and those must reach the caller.
+        #
+        # Bare, they did not. The call site in the main flow is now
+        # `if ! wait_for_binaries`, and bash suspends errexit for the entire
+        # DYNAMIC EXTENT of a command in an `if`/`!` condition, which includes
+        # the whole body of the called function. So a bare failing call here no
+        # longer aborted: control fell through to the `return 0` below,
+        # `wait_for_binaries` reported SUCCESS, and the driver went on to
+        # publish crates, update gateways and announce -- for a release still
+        # sitting as an unpublished draft, possibly one the blocking canary had
+        # rejected. Verified empirically, both call conventions.
+        #
+        # That is a FAIL-OPEN regression, strictly worse than the fail-closed
+        # bug the guard was added to fix. `return 1` inside the `if` is
+        # unaffected by errexit suspension, so this restores the refusal under
+        # either convention.
+        if ! publish_draft_release; then
+            return 1
+        fi
         return 0
     fi
 
@@ -1476,7 +1632,13 @@ wait_for_binaries() {
                 sleep 5  # Brief delay for asset upload
                 if verify_required_binaries "${REQUIRED_BINARIES[@]}"; then
                     echo "  ✓ All required platform binaries attached"
-                    publish_draft_release
+                    # Guarded for the same reason as the other call site above:
+                    # bare, its refusal is swallowed when `wait_for_binaries` is
+                    # itself called from an `if !` condition, and the adjacent
+                    # `return 0` then reports success for an unpublished draft.
+                    if ! publish_draft_release; then
+                        return 1
+                    fi
                     return 0
                 else
                     echo "  ✗ Attach job succeeded but some required binaries are missing"
@@ -1673,9 +1835,115 @@ echo
 check_prerequisites
 update_versions
 create_release_pr
-publish_crates
 create_github_release
-wait_for_binaries
+# GUARDED, not bare, and that is the whole point of the `if`.
+#
+# This script runs under `set -euo pipefail`, and `wait_for_binaries` fails on
+# six modes (enumerated once, at the refusal branch below). Called bare, every
+# one of those aborted the script HERE -- so `publish_crates`, whose own comment
+# called it the backstop for when "the workflow path is broken", was unreachable
+# in precisely the cases where the workflow path is broken.
+#
+# NOTE the last item, and how it is phrased. An earlier version of this comment
+# enumerated "five paths" and listed only explicit `return 1` statements inside
+# `wait_for_binaries` itself. That enumeration is what hid the bug this guard
+# introduced: it counted RETURN STATEMENTS rather than WAYS THE FUNCTION CAN
+# FAIL, and so did not name failure INHERITED FROM A BARE CALLEE -- which is
+# the one path errexit suspension breaks. It also mis-attributed "draft state
+# unknown", which is `publish_draft_release`'s return, not this function's.
+# Both inner call sites are now guarded so the refusal propagates regardless.
+#
+# The ordering pin in release_canary_wiring_test.sh could not see this: it
+# compares the LINE NUMBERS of the two calls, which were correct while the
+# second call was dead. release_driver_test.sh drives it behaviourally instead
+# -- and asserts that `publish_crates` does NOT run when `wait_for_binaries`
+# fails. An earlier version of that case asserted the opposite, which is the
+# unsafe property; see the refusal branch below and the note on publish_crates.
+#
+# REFUSES TO PUBLISH. This branch does NOT call publish_crates, and that is the
+# whole point of it.
+#
+# An earlier revision called publish_crates here, on the theory that it was a
+# harmless confirmation and a backstop for a CARGO_REGISTRY_TOKEN that never
+# reached CI. Both halves were wrong.
+#
+# WHY IT IS UNSAFE. THIS IS THE CANONICAL ENUMERATION of how
+# `wait_for_binaries` can fail; anywhere else that needs it refers here rather
+# than restating it. Six modes, and publishing is wrong on five:
+#
+#   no workflow run found         -- Gate A never ran       -> publish ungated
+#   attach job never reported     -- Gate A state unknown   -> publish ungated
+#   attach conclusion != success  -- Gate A REJECTED it     -> publish what the
+#                                                              gate blocked
+#   timeout                       -- Gate A undecided       -> pre-empt the gate
+#   refusal from publish_draft_release
+#                                 -- draft state unknown,
+#                                    or canary not concluded
+#                                                           -> publish ungated
+#   assets missing, attach OK     -- Gate A passed          -> the only safe one
+#
+# The sixth is the one two earlier versions of these comments left out, in
+# opposite places, while both claiming "five paths" -- the inherited refusal.
+# It is not an explicit `return 1` in this function's own body, so an
+# enumeration written by reading `return` statements misses it. That is exactly
+# the mistake recorded below as having hidden the round-7 bug, and it recurred
+# HERE, in the comment describing it, twice, with different members each time.
+# Restating a list is how the copies drift; hence one canonical copy.
+#
+# `publish_crates` consults exactly three things: the resume flag, DRY_RUN, and
+# whether the version is already on crates.io. It never looks at the attach
+# job's conclusion, the canary, or the draft state. And on the rejected path the
+# crate is genuinely ABSENT -- cross-compile.yml runs the canary (:772) before
+# its publish step (:803), so a rejected binary means nothing was uploaded --
+# which is precisely when the already-published check says "no" and the fallback
+# really does upload it. Five of the six modes publish a version Gate A never
+# passed, including the one where it actively rejected the binary.
+#
+# WHY THE STATED JUSTIFICATION WAS UNACHIEVABLE. The missing-token case cannot
+# reach here: cross-compile.yml checks the credential at step :705, BEFORE the
+# canary at :772, so a missing token fails the job before the gate ever runs.
+# And at this call site missing-token and canary-rejected are INDISTINGUISHABLE
+# -- both arrive as the same `conclusion != success` on the same job. One would
+# warrant publishing; the other is the unrecoverable spent-version state. A
+# branch that cannot tell them apart must not publish.
+#
+# The deeper lesson, and it is the same one recorded on `detect_crates_state`
+# above: this fallback was previously DEAD, because `wait_for_binaries` was
+# called bare under `set -e`. Making it reachable removed the accident that was
+# preventing an unsafe publish. Before making dead code live, ask what its being
+# dead was protecting.
+#
+# Precedent for refusing rather than guessing: `publish_draft_release` already
+# refuses on anything other than `completed:success`, for the same reason.
+if ! wait_for_binaries; then
+    echo
+    echo "❌ The cross-compile workflow did not complete successfully." >&2
+    echo >&2
+    echo "   NOT publishing to crates.io from here, deliberately. This point is" >&2
+    echo "   reached for any of six reasons -- Gate A never ran, its verdict is" >&2
+    echo "   unknown, it timed out, it REJECTED the binary, the draft-publish step" >&2
+    echo "   refused, or the assets are missing though Gate A passed -- and this" >&2
+    echo "   branch cannot tell them apart. Only the last is safe to publish on." >&2
+    echo "   Publishing on any of them uploads a version the blocking auto-update" >&2
+    echo "   pre-flight canary never passed, which permanently spends the version" >&2
+    echo "   number (the v0.2.124 state)." >&2
+    echo >&2
+    echo "   Find out WHY first:" >&2
+    echo "     gh run list --repo freenet/freenet-core --workflow=cross-compile.yml \\" >&2
+    echo "       --branch \"v$VERSION\" --limit 3" >&2
+    echo >&2
+    echo "   Then follow scripts/RELEASE_RECOVERY.md -- Step 4 if Gate A passed and" >&2
+    echo "   only the crates publish is missing, Step 4b if Gate A blocked it." >&2
+    exit 1
+fi
+
+# AFTER wait_for_binaries, not before create_github_release. The crates.io
+# publish is the one irreversible step in a release, and it now sits downstream
+# of the blocking pre-flight canary (in cross-compile.yml, which the tag push
+# above triggers). By this point the workflow has normally published already and
+# this call just confirms it; see the comment on publish_crates. Moving it back
+# up is what cost v0.2.124 its version number.
+publish_crates
 trigger_gateway_updates
 # Announce AFTER binaries are confirmed available and gateways updated,
 # so users can actually update when they see the announcement.
@@ -1703,7 +1971,7 @@ echo "   Wait 5-10 minutes, then check gateway logs for issues:"
 echo
 echo "   Quick check commands:"
 echo "   ssh ian@nova.locut.us 'sudo /usr/local/bin/freenet --version'"
-echo "   ssh ian@vega.locut.us 'sudo /usr/local/bin/freenet --version'"
+echo "   ssh ian@nova.locut.us 'systemctl is-active freenet-gateway freenet-gateway-2'"
 echo
 echo "   Look for: log spam, rapid log growth, new error patterns"
 echo "   See: ~/.claude/skills/freenet-release/SKILL.md for full checklist"

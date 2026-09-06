@@ -1075,6 +1075,14 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
         let tags = vec![gw_tag.clone(), node1_tag.clone(), node2_tag.clone()];
         let mut all_histories_match = true;
         let mut propagation_matrix = std::collections::HashMap::new();
+        // #5510: the concrete reason each tag failed, recorded by the check that
+        // actually failed. The previous diagnosis printed "timestamp mismatches"
+        // from an `else` on `propagation_rate`, which says nothing about WHICH
+        // check tripped — and the length check `continue`d before the timestamp
+        // comparison ever ran, so that message was reported for failures where
+        // no timestamp was compared at all. Entries were MISSING, not
+        // mismatched, and three investigations were misdirected by it (#5476).
+        let mut failure_reasons: Vec<String> = Vec::new();
 
         // First, analyze what each node received
         println!("=== PROPAGATION MATRIX ===");
@@ -1134,45 +1142,114 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
             println!("  Node1: {} (count: {})", !node1_history.is_empty(), node1_history.len());
             println!("  Node2: {} (count: {})", !node2_history.is_empty(), node2_history.len());
 
-            // Histories should be non-empty if eventual consistency worked
-            if gw_history.is_empty() || node1_history.is_empty() || node2_history.is_empty() {
-                tracing::warn!("Tag '{}' missing from one or more nodes!", tag);
-                if gw_history.is_empty() { tracing::warn!("Gateway missing '{}'", tag); }
-                if node1_history.is_empty() { tracing::warn!("Node1 missing '{}'", tag); }
-                if node2_history.is_empty() { tracing::warn!("Node2 missing '{}'", tag); }
-                all_histories_match = false;
-                continue;
-            }
-
             // Log the number of entries in each history
             println!("  - Gateway: {} entries", gw_history.len());
             println!("  - Node 1:  {} entries", node1_history.len());
             println!("  - Node 2:  {} entries", node2_history.len());
 
-            // Check if the histories have the same length
-            if gw_history.len() != node1_history.len() || gw_history.len() != node2_history.len() {
-                tracing::warn!("Different number of history entries for tag '{}'!", tag);
-                all_histories_match = false;
-                continue;
-            }
+            // MISSING-ENTRY analysis, run for every tag rather than skipped by
+            // an early `continue` (#5510). The union of the three histories is
+            // the set every node should hold; anything a node lacks is an
+            // entry that never reached it — which is a DELIVERY failure, and
+            // is what the old "timestamp mismatch" message was misreporting.
+            let per_node = [
+                ("Gateway", &gw_history),
+                ("Node1", &node1_history),
+                ("Node2", &node2_history),
+            ];
+            let union: std::collections::BTreeSet<_> = per_node
+                .iter()
+                .flat_map(|(_, h)| h.iter().copied())
+                .collect();
 
-            // Compare the actual timestamp vectors element by elemen
-            let mut timestamps_match = true;
-            for i in 0..gw_history.len() {
-                if gw_history[i] != node1_history[i] || gw_history[i] != node2_history[i] {
-                    timestamps_match = false;
-                    tracing::warn!(
-                        "Timestamp mismatch at position {}:\n  - Gateway: {}\n  - Node 1:  {}\n  - Node 2:  {}",
-                        i, gw_history[i], node1_history[i], node2_history[i]
-                    );
+            let mut missing_report: Vec<String> = Vec::new();
+            for (name, history) in &per_node {
+                let held: std::collections::BTreeSet<_> = history.iter().copied().collect();
+                let missing: Vec<_> = union.difference(&held).copied().collect();
+                if !missing.is_empty() {
+                    missing_report.push(format!(
+                        "{name} is missing {} of {} entries: {}",
+                        missing.len(),
+                        union.len(),
+                        missing
+                            .iter()
+                            .map(|t| t.to_rfc3339())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
                 }
             }
 
-            if timestamps_match {
-                println!("History for tag '{tag}' is identical across all nodes!");
-            } else {
-                tracing::warn!("History timestamps for tag '{}' differ between nodes!", tag);
+            if !missing_report.is_empty() {
+                for line in &missing_report {
+                    tracing::warn!("Tag '{}': {}", tag, line);
+                }
+                failure_reasons.push(format!(
+                    "tag '{tag}': MISSING ENTRIES (not a timestamp mismatch) — {}",
+                    missing_report.join("; ")
+                ));
                 all_histories_match = false;
+                // Fall through: a node can be both missing entries AND holding
+                // them in a different order, and reporting only the first is
+                // how the previous diagnostic lost information.
+            }
+
+            // Nobody holds this tag at all. The union is empty, so the
+            // missing-entry analysis above has nothing to report — but this is
+            // still a failure, and the pre-#5510 `is_empty()` guard caught it.
+            if union.is_empty() {
+                failure_reasons.push(format!(
+                    "tag '{tag}': ABSENT FROM EVERY NODE — no node holds a single \
+                     entry for it"
+                ));
+                all_histories_match = false;
+            }
+
+            // Duplicate entries: the sets agree but the vectors are different
+            // lengths, so the positional comparison below would be comparing
+            // shifted sequences (and could index past a shorter history).
+            let lengths_differ = gw_history.len() != node1_history.len()
+                || gw_history.len() != node2_history.len();
+            if missing_report.is_empty() && !union.is_empty() && lengths_differ {
+                failure_reasons.push(format!(
+                    "tag '{tag}': every node holds the same {} distinct entries but \
+                     the histories are different lengths (Gateway={}, Node1={}, \
+                     Node2={}) — duplicate entries, not a delivery failure",
+                    union.len(),
+                    gw_history.len(),
+                    node1_history.len(),
+                    node2_history.len()
+                ));
+                all_histories_match = false;
+            }
+
+            // ORDER/CONTENT analysis. Only meaningful when every node holds the
+            // same set at the same length; otherwise the positional comparison
+            // is just restating what is already reported above.
+            if missing_report.is_empty() && !union.is_empty() && !lengths_differ {
+                let mut mismatches: Vec<String> = Vec::new();
+                for i in 0..gw_history.len() {
+                    if gw_history[i] != node1_history[i] || gw_history[i] != node2_history[i] {
+                        mismatches.push(format!(
+                            "position {i}: Gateway={} Node1={} Node2={}",
+                            gw_history[i], node1_history[i], node2_history[i]
+                        ));
+                    }
+                }
+                if mismatches.is_empty() {
+                    println!("History for tag '{tag}' is identical across all nodes!");
+                } else {
+                    for line in &mismatches {
+                        tracing::warn!("Tag '{}' ordering differs at {}", tag, line);
+                    }
+                    failure_reasons.push(format!(
+                        "tag '{tag}': every node holds the same {} entries but in a \
+                         DIFFERENT ORDER — {}",
+                        union.len(),
+                        mismatches.join("; ")
+                    ));
+                    all_histories_match = false;
+                }
             }
         }
 
@@ -1181,10 +1258,32 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
         // Final diagnosis before assertion
         if !all_histories_match {
             tracing::error!("PROPAGATION FAILURE DIAGNOSIS:");
-            tracing::error!("Overall propagation rate: {:.1}%", propagation_rate * 100.0);
+            // WHAT ACTUALLY FAILED, reported by the check that failed (#5510).
+            // `propagation_rate` counts whether a tag is PRESENT at all, so it
+            // reads 100% while entries inside a present tag are missing —
+            // which is the common shape and the one the old `else` branch
+            // mislabelled "timestamp mismatches". It is printed below as
+            // context, never as the diagnosis.
+            for reason in &failure_reasons {
+                tracing::error!("FAILED: {}", reason);
+            }
+            if failure_reasons.is_empty() {
+                tracing::error!(
+                    "all_histories_match is false but no per-tag reason was \
+                     recorded — this is a bug in the diagnostic itself"
+                );
+            }
+            tracing::error!(
+                "Context — tag-level propagation rate: {:.1}% ({}/{} tags present). \
+                 This counts PRESENCE of a tag, not completeness of its history, so \
+                 a high rate here is consistent with missing entries above.",
+                propagation_rate * 100.0,
+                successful_propagations,
+                total_propagation_attempts
+            );
 
             if propagation_rate < 0.5 {
-                tracing::error!("SEVERE: Less than 50% of updates propagated");
+                tracing::error!("SEVERE: fewer than 50% of tags reached their peers");
                 tracing::error!("This is a BUG - all subscribed nodes MUST receive updates!");
                 tracing::error!("Possible causes:");
                 tracing::error!("1. Bug in subscription notification system");
@@ -1192,12 +1291,9 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
                 tracing::error!("3. Updates sent before subscriptions fully active");
                 tracing::error!("4. Configuration issues (skip_load_from_network, etc.)");
             } else if propagation_rate < 0.8 {
-                tracing::error!("MODERATE: 50-80% of updates propagated");
+                tracing::error!("MODERATE: 50-80% of tags reached their peers");
                 tracing::error!("Still problematic - subscribed nodes should receive ALL updates");
                 tracing::error!("This suggests partial failure in notification system");
-            } else {
-                tracing::error!("PARTIAL: >80% propagated but timestamp mismatches");
-                tracing::error!("Updates reached nodes but content differs - timing or merge issues");
             }
 
             // More detailed failure analysis
@@ -1221,9 +1317,16 @@ async fn test_ping_multi_node() -> anyhow::Result<()> {
         assert!(
             all_histories_match,
             "Eventual consistency test failed: Ping histories are not identical across all nodes\n\
-             Propagation success rate: {:.1}% ({}/{})\n\
-             Check logs above for detailed diagnosis of the failure",
-            propagation_rate * 100.0, successful_propagations, total_propagation_attempts
+             What failed:\n  {}\n\
+             Tag-level propagation rate (presence only, NOT completeness): {:.1}% ({}/{})",
+            if failure_reasons.is_empty() {
+                "(no per-tag reason recorded — diagnostic bug)".to_string()
+            } else {
+                failure_reasons.join("\n  ")
+            },
+            propagation_rate * 100.0,
+            successful_propagations,
+            total_propagation_attempts
         );
 
         println!("Eventual consistency test PASSED - all nodes have identical ping histories!");

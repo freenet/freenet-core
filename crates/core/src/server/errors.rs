@@ -19,6 +19,28 @@ pub(super) enum WebSocketApiError {
     MissingContract {
         instance_id: ContractInstanceId,
     },
+    /// The network GET for this contract exhausted its retries without locating
+    /// it — `ContractResponse::NotFound`.
+    ///
+    /// Its own variant rather than reusing `AxumError(RequestError(Timeout))`,
+    /// for two reasons. It is not a timeout, and saying so in the one type the
+    /// HTTP layer logs and renders from would mislead the next person reading a
+    /// trace. And it must NOT inherit `retry_loading_page`: that page refreshes
+    /// every `RETRY_REFRESH_SECS` forever, which is defensible for a timeout
+    /// (the node has peers and is making progress on THIS get) but not here,
+    /// where the identical reply is produced for a contract that is merely slow
+    /// to propagate AND for a key that will never resolve. A typo'd URL left
+    /// open in a tab would otherwise re-issue a network GET every minute for as
+    /// long as the tab lives — see `.claude/rules/browser-assets.md`, "assume
+    /// every open tab pays the cost".
+    ///
+    /// So: the transient STATUS and headers (503 + `Retry-After`), which is what
+    /// a programmatic client needs in order to come back later instead of
+    /// writing the contract off, with a page that states the situation and lets
+    /// a human retry deliberately.
+    ContractNotFound {
+        instance_id: ContractInstanceId,
+    },
 }
 
 impl WebSocketApiError {
@@ -37,6 +59,12 @@ impl WebSocketApiError {
             WebSocketApiError::AxumError { error } => format!("Server error: {error}"),
             WebSocketApiError::MissingContract { instance_id } => {
                 format!("Missing contract {}", instance_id.encode())
+            }
+            WebSocketApiError::ContractNotFound { instance_id } => {
+                format!(
+                    "Contract not found on the network yet: {}",
+                    instance_id.encode()
+                )
             }
         }
     }
@@ -110,8 +138,15 @@ impl IntoResponse for WebSocketApiError {
         // rather than a message built from request-derived text. Only the
         // latter is escaped — escaping the retry page would render its
         // meta-refresh tag as visible text and break the auto-reload.
+        // Transient for STATUS and headers, but never auto-refreshing — see the
+        // variant's own doc for why this one does not inherit the retry page.
+        let is_not_found_yet = matches!(&self, WebSocketApiError::ContractNotFound { .. });
+
         let mut body_is_trusted_markup = false;
-        let (status, error_message) = if is_transient {
+        let (status, error_message) = if is_not_found_yet {
+            body_is_trusted_markup = true;
+            (StatusCode::SERVICE_UNAVAILABLE, not_found_yet_page())
+        } else if is_transient {
             // Log the cause so operators can distinguish a fast op error
             // from a slow-loading contract without changing the user-facing
             // retry page.
@@ -135,6 +170,12 @@ impl IntoResponse for WebSocketApiError {
                 }
                 err @ WebSocketApiError::MissingContract { .. } => {
                     (StatusCode::NOT_FOUND, err.error_message())
+                }
+                // Handled by the `is_not_found_yet` branch above; this arm only
+                // keeps the match exhaustive. If it ever renders, that branch was
+                // edited out and the explanatory page went with it.
+                err @ WebSocketApiError::ContractNotFound { .. } => {
+                    (StatusCode::SERVICE_UNAVAILABLE, err.error_message())
                 }
                 WebSocketApiError::AxumError { error } => {
                     // Already handled transient cases above; remaining
@@ -161,7 +202,7 @@ impl IntoResponse for WebSocketApiError {
         // Prevent intermediaries/service-workers from pinning a stale retry
         // page, and signal the client when it may retry.
         let mut response = (status, body).into_response();
-        if is_transient {
+        if is_transient || is_not_found_yet {
             response.headers_mut().insert(
                 axum::http::header::CACHE_CONTROL,
                 axum::http::HeaderValue::from_static("no-store"),
@@ -226,6 +267,43 @@ fn retry_loading_page() -> String {
 </html>"##,
         refresh = RETRY_REFRESH_SECS,
     )
+}
+
+/// A 503 page for a contract the network could not locate yet.
+///
+/// Deliberately carries NO `<meta http-equiv="refresh">`. The reply this renders
+/// is produced both for a contract that has not propagated to this node yet and
+/// for one that does not exist at all, and nothing available here tells the two
+/// apart — so an automatic reload would re-issue a network GET every minute, for
+/// the life of the tab, on every mistyped or dead URL. The reload is offered as
+/// a deliberate action instead, and the `Retry-After` header carries the same
+/// advice to programmatic clients, which is where it can be acted on safely.
+fn not_found_yet_page() -> String {
+    r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Contract not found</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               display: flex; justify-content: center; align-items: center; min-height: 100vh;
+               margin: 0; background: #0c0d0f; color: #edeeef; }
+        .container { text-align: center; padding: 2rem; max-width: 32rem; }
+        h1 { font-size: 1.2rem; font-weight: 500; margin-bottom: 0.5rem; }
+        p { color: #94969a; font-size: 0.85rem; margin-bottom: 0.6rem; line-height: 1.5; }
+        a { color: #0abab5; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Couldn't find this contract on the network</h1>
+        <p>It may not have reached this peer yet — a contract published moments ago
+           can take a while to propagate. It may also not exist.</p>
+        <p><a href="">Try again</a> &middot; <a href="/">Dashboard</a></p>
+    </div>
+</body>
+</html>"##
+        .to_string()
 }
 
 /// Minimal HTML entity escaping for error bodies rendered at the node origin.

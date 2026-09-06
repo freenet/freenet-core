@@ -1,6 +1,8 @@
 ---
 paths:
   - "crates/core/src/bin/**"
+  - "crates/core/src/conformance/**"
+  - "crates/core/src/contract/**"
   - "scripts/**"
 ---
 
@@ -157,6 +159,52 @@ arms, the INFO-level checks on `MARKER_CHECK_COMPLETE` and
 canary still runs, and still runs before `--draft=false` — is pinned by
 `scripts/release_canary_wiring_test.sh`.
 
+## A completion predicate that is a proxy for the real termination condition
+
+**A cheap proxy that *usually* agrees with the real condition reads as
+equivalent, gets copied to each new consumer, and diverges in the one
+case nobody tests.** freenet-core has three implementations of "is this
+stream finished" over the same fragment buffer, and two of them shipped
+the same off-by-one.
+
+The proxy here is a FRAGMENT COUNT; the real condition is
+`bytes_delivered >= advertised_bytes`. Two properties make this genre
+expensive out of proportion to the bug:
+
+- **The failure is silent at the site that causes it.** The truncating
+  peer reports success. The victim is the *downstream* peer, which dies
+  on an inactivity timeout naming neither the cause nor the culprit — so
+  the error surfaces in a different process from the defect, and the
+  telemetry that would prompt an audit says everything was fine (#5445).
+- **Each copy looks locally reasonable**, so fixing one consumer leaves
+  the others and nothing flags the asymmetry.
+
+The buffer allocates `base + 1` fragment slots, where
+`base = ceil(total_bytes / FRAGMENT_PAYLOAD_SIZE)`, because embedding
+metadata in fragment #1 (#2757) reduces that fragment's payload and makes
+the sender emit one extra fragment. `is_complete()` is
+`contiguous >= base` — the BASE count — so it goes true **one fragment
+early** on exactly those streams.
+
+| Consumer | State |
+|---|---|
+| `streaming_buffer::assemble()` | Correct: discriminates on assembled length vs `total_size`, keeps waiting when `is_complete()` is true but bytes are short. |
+| `StreamingInboundStream::poll_next` | Was wrong; fixed in #5270. Ended on `is_complete()` alone, so `pipe_stream` forwarded short and the downstream peer sat in `assemble()` until its 5 s inactivity timeout. |
+| `PipedStream` | Still wrong, currently dead code — #5440. Computes `total_fragments` as the base count, so it declares completion early AND then rejects the genuine final fragment as out of range. |
+
+**The rule:** the discriminator is the BYTE total, never the fragment
+count. A fragment count is an estimate derived from an assumption about
+payload sizes; `total_bytes` is what the sender actually advertised.
+
+**And the transferable half:** when a predicate this load-bearing has more
+than one implementation, the bug is the duplication, not any one copy.
+Before adding a fourth, ask whether it can call the existing one. When
+auditing a fix to one, grep for the others — #5440 was found only because
+the #5270 review enumerated every `is_complete()` call site, and it had
+been wrong since it was written. A truncation that reports success is
+also invisible in telemetry (#5445), so nothing prompts the audit on its
+own.
+
 ## Cross-test interference through process-global state: CI cannot see it
 
 A guard whose two inputs rot from one cause. Every CI job runs `cargo
@@ -227,6 +275,49 @@ hand-rolling a `split_once`. It:
 **Prefer a cross-file scrape.** A pin that lives in `auto_update.rs` and
 scrapes `update.rs` cannot be satisfied by its own assertion literal at
 all — a structural guarantee rather than a check someone must remember.
+
+### The variant `fn_body()` does not catch: the anchor survives the deletion
+
+`fn_body()` fixes a *moved* anchor. It does nothing about an anchor that
+is still exactly where the pin expects because the call was **commented
+out**. `// interleave(&mut ops, seed);` contains the string
+`interleave(&mut ops, seed);`, so `split_once` finds it, the region
+splits where it always did, the before/after assertions still hold, and
+the pin stays green over a shuffle that no longer runs. Deleting the line
+outright fails loudly; disabling it does not — and disabling it is what a
+person actually does while debugging, which is precisely when the pin is
+the only thing left watching.
+
+Found in review of #5271, where the PR's own new pin AND the pre-existing
+one it was modelled on both survived commenting out the call they guard.
+Verified by doing it: both stayed green before the fix, both go red after.
+
+**The rule:** a pin that guards a *call* must require the call at
+statement position — the call text preceded on its line by nothing but
+whitespace — not merely present in the region. A few lines:
+
+```rust
+fn split_at_call<'a>(body: &'a str, call: &str) -> (&'a str, &'a str) {
+    let at = body
+        .match_indices(call)
+        .find(|(i, _)| {
+            let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
+            body[line_start..*i].trim().is_empty()
+        })
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| panic!("`{call}` is not called at statement position"));
+    (&body[..at], &body[at + call.len()..])
+}
+```
+
+**The generalisation, which is the part worth carrying:** a source-scrape
+pin asserts that *text exists*, while the property it is standing in for
+is that *code runs*. Every gap between those two is a way for the pin to
+pass vacuously — a moved anchor, a self-matched literal, a commented-out
+call, a call moved inside a branch that is never taken. When writing one,
+ask what the cheapest edit is that keeps the text and removes the
+behaviour, then make that edit fail. **And test the pin by performing that
+edit**, because a pin nobody mutated is a pin nobody has evidence about.
 
 ### The same class without `include_str!`: an expectation stored as a copy
 
@@ -475,3 +566,202 @@ when someone next touches those files, neither investigated here:
 machine) into `grep -q` at five sites. Both would fail in the safe direction —
 reporting a healthy service as unhealthy — which is precisely the direction
 that survives unnoticed.
+
+
+## A count cap enforced by REFUSAL, over entries that ordinary use refreshes
+
+**A bound enforced by refusing newcomers is only safe when incumbents age out on
+their own.** If ordinary traffic restamps an entry's TTL, nothing ever rolls off:
+the cap is held permanently by whoever got in first and stayed active, and every
+newcomer is refused **forever**, with no recovery path. That is the
+permanently-refreshable GC exemption `AGENTS.md` forbids — wearing a memory bound
+as a disguise, which is why it reads as correct in review.
+
+#4981: the UPDATE limiter's 16,384 `(sender, contract)` slots. `*entry.get_mut() =
+now` on every accepted UPDATE meant a busy pair refreshed its own TTL indefinitely,
+so a new pair was refused, **never inserted**, and therefore stayed "new" forever —
+every subsequent UPDATE from it dropped and re-counted. Silent data loss on the
+UPDATE propagation path.
+
+Two things made it survive for months:
+
+- **Saturation was read as an attack signal, so exceeding the cap looked like the
+  bound working.** It is not. Tracked pairs are distinct senders x distinct
+  contracts, so 50 peers x ~330 contracts ~= 16,500 already exceeds the cap with
+  nobody malicious. The module justified its bound purely as an anti-attacker
+  measure and never reckoned with a healthy node simply outgrowing it.
+- **The drop logged at `debug!`**, which `release_max_level_info` compiles out, so
+  a production node discarding legitimate relayed UPDATEs left no greppable
+  evidence and a dashboard tile was the only signal.
+
+### Fix shape (#4997)
+
+**Evict least-recently-used instead of refusing**, and:
+
+- **Evict a BATCH** (`cap / 64`), not one entry. The victim scan is linear in the
+  cap and cannot run while holding a shard guard, so under the saturation this
+  targets — where the map is *persistently* full — one-per-admission means a
+  continuous full scan on the receive path.
+- **Release the shard guard before the walk**, and bound the post-eviction retry:
+  the freed slot is not reserved, so another caller may take it.
+- **Replace any incidental ceiling eviction removes.** Refuse-at-cap was also
+  (accidentally) throttling attacker-chosen keys. Add the replacement explicitly
+  and charge it **before** a slot is reserved, so a throttled peer cannot evict
+  anyone on its way to being refused.
+- **Count what you ACTUALLY removed, not the batch you selected.** A concurrent
+  reaper can take a victim first; over-counting drives the size counter **below**
+  the map's true length, letting the map grow past the cap — the one bound the
+  whole mechanism exists to enforce. Note this is unobservable unless a test
+  interleaves the reaper with an admission: with no such test, `remove()` always
+  returns `Some` and the mutation is behaviourally invisible.
+- **Make saturation visible in RELEASE builds**: `info!` plus a counter, never
+  `debug!` alone.
+
+### Where the wrong instruction came from
+
+`.claude/rules/code-style.md` said, without qualification, *"Reject new entries when
+the limit is reached"*. That is right for age-out-only collections and wrong for
+refresh-on-use ones. It now carries the distinction; keep the two files in step.
+
+Audit question for any bounded per-key map: **does ordinary use restamp this
+entry's TTL?** If yes, reject-at-cap is a starvation bug, not a bound.
+
+```bash
+# Bounded per-key maps whose entries are restamped by ordinary use:
+grep -rnE "get_mut\(\) = now|last_seen = now|last_refill = now" crates/core/src/
+# ...cross-check each against how its cap is enforced:
+grep -rnE "max_tracked|MAX_TRACKED" crates/core/src/
+```
+
+
+## A refusal that is not counted renders as a clean zero
+
+**Any code path that DISCARDS an input must count the discard.** Three bare
+`continue`s, a throwaway local, or an ignored `Admission` all produce the same
+result: an empty output that is indistinguishable from an output that was never
+needed. The reader cannot tell "this contract had no related state" from "this
+contract's related state was thrown away", and the first reading terminates the
+investigation.
+
+This is the sibling of the *"metric describing a filtering decision, re-derived at
+the call site"* pattern, and the relationship is worth stating because the sibling
+is the more dangerous of the two. A **wrong** count invites suspicion — someone
+notices the number is implausible and digs. An **absent** count renders as a clean
+zero, which nobody investigates. Same defect class, opposite symptom, worse outcome.
+
+### Repeat offender history — three instances in one module, one release
+
+All in `crates/core/src/conformance/capture.rs`, all found within a day of each other:
+
+| Instance | What was discarded | How it presented |
+|---|---|---|
+| `admit_related`'s three refusal paths (#5368) | Related-contract state over the byte or slot budget, via bare `continue` | An empty related map. **Measured: 9 of 54 contracts on a live capture peer reached no verdict on ANY case — 2,474 cases — and nothing in the corpus said why.** 17% of hosted contracts were exempt from conformance checking by construction. |
+| `reload`'s related-state refusals (#5368, found in review) | Same, at reload time under a smaller budget than wrote the corpus | Counted into a throwaway local, then overwritten with zero by the next flush — so the evidence was destroyed by the mechanism meant to record it. |
+| `reload`'s **state** refusals (#5374) | States over the per-state ceiling, via a dropped `Admission` | A warning naming the ceiling as the cause while displaying `refused_too_large=0`. The message contradicts its own counter, and neither is obviously the liar. |
+
+The first was a genuine coverage hole: a contract depending on a large related
+contract became permanently unjudgeable, and an unjudgeable contract reads exactly
+like a clean one. **Depending on related state must not be a way to escape
+conformance checking.**
+
+### The rule
+
+When you write a branch that drops an input:
+
+1. **Count it, under its own reason.** Not one counter for "refused" — separate
+   causes need separate counts, because the remedies differ. `too_large` and
+   `over_budget` are fixed by raising a byte budget; `no_slot` is a compile-time
+   constant that no configuration changes, and telling an operator to re-run with a
+   bigger budget sends them somewhere that cannot help.
+2. **Carry the count into the artefact, not just the log.** Logs rotate; a corpus is
+   replayed months later on another machine. If the only record of "this is
+   incomplete" is a log line, the replay reads as a clean bill of health.
+3. **Make it reach the documented consumer.** `fdev verify-merge --bundle` dropped
+   `bundle.note` entirely, so the durable record existed and was invisible to the one
+   workflow meant to read it. Check the whole path, not just the write.
+4. **Test it by deleting the counter and asserting the test fails.** A refusal
+   counter is exactly the kind of code that is never exercised by the happy path.
+
+### Audit
+
+```bash
+# Discards with no adjacent counter increment:
+grep -n "continue;" crates/core/src/conformance/*.rs
+# Results whose Admission/outcome is dropped:
+grep -nE "^\s*(sampler|self)\.(observe_state|observe_transition)\(" crates/core/src/conformance/*.rs
+# Counters that exist but may not reach the artefact:
+grep -n "refused" crates/core/src/conformance/capture.rs
+```
+
+Question to ask of any one of them: *if this branch fires a thousand times, what does
+a reader see?* If the answer is "an empty result", the count is missing.
+
+
+## Manually-inlined originator side effects (a mandatory sequence, hand-inlined per branch)
+
+**When two code paths both owe the same sequence of side effects, extract one
+helper that owns the whole sequence and call it from both. Never re-inline a
+subset at each branch.** The omission is always silent: the operation reports
+success, every existing test stays green, and the missing consumer simply never
+runs.
+
+The tell is a sequence that reads as a list — "record the telemetry, notify the
+local subscribers, notify the delegates, broadcast to the network" — appearing
+twice, in two orders, with two different subsets. Whichever leg is easiest to
+forget (it is usually the one added most recently, or the one behind an `await`
+or a `super::` import) is the one that gets dropped, and the branch that dropped
+it keeps working perfectly for every other consumer.
+
+### Repeat offender history
+
+| Issue | The path that re-inlined a subset | The leg it dropped |
+|---|---|---|
+| [#3851](https://github.com/freenet/freenet-core/issues/3851) | SUBSCRIBE originator, after the task-per-tx migration | The originator's own side-effect call |
+| [#4223](https://github.com/freenet/freenet-core/issues/4223) | SUBSCRIBE originator driver (`operations/subscribe/op_ctx_task.rs`, `ReplyClass::Subscribed`) | `fetch_contract_if_missing` — so a peer registered as a subscriber held no body, and ~37% of failing GETs that reached a subscriber got `NotFound` from it for months |
+| [#5481](https://github.com/freenet/freenet-core/issues/5481) | `bridged_upsert_contract_state_inner`'s initial-state-install branch | `send_delegate_contract_notifications`. The same branch had already dropped `send_update_notification` once before, been fixed, and carried a comment describing that fix — which did not stop the next leg being dropped |
+| #5481, found in review | BOTH branches of `contract_ops::perform_contract_put` | `record_contract_update` AND `send_delegate_contract_notifications` — the identical defect, one file over from where it was being fixed, surfaced by running this row's own audit grep against the fixing PR |
+
+#5481 is the instructive one: a comment explaining the exact failure sat three
+lines above the code that repeated it. Prose does not prevent this; structure
+does.
+
+### The rule
+
+1. **One `finalize_*` helper owns the full sequence.** Both (all) paths call it.
+   Never hand-inline the sequence at a branch, because the next migration will
+   hand-inline a *subset* of it.
+2. **Anchor a source-scrape pin on the API surface**, not on local variable
+   names: assert the helper contains every required call, that each call has
+   exactly ONE site and that site is inside the helper, and that every storing
+   path delegates to it.
+3. **Pin ordering invariants** where one side effect gates another (fetch must
+   precede announce, so the node never advertises hosting without the body).
+4. **Verify the pin by deleting a leg and watching it go red.** Inspection is not
+   verification: a pin needle that no longer matches (rustfmt splitting a long
+   call across lines is the common cause) passes vacuously forever. When you do
+   this, commit BEFORE mutating and mark the broken lines `MUTATION_APPLIED` —
+   `.claude/rules/testing.md` has the convention and why a fixed token matters
+   to whoever cleans up after a dead session.
+5. **Scrape every file the sequence can live in, and run the audit grep against
+   your own branch before claiming the rule holds.** #5481's fixing PR asserted
+   "exactly one call site", scraped one file, and left two counterexamples in a
+   sibling module that the grep three lines below finds in under a second.
+
+### Audit
+
+```bash
+# The post-store fan-out legs. Scoped to the two files that own the real
+# executor's storing paths: each leg must have exactly ONE call site across
+# them, and that site must be inside `finalize_state_commit`.
+grep -rn "\.record_contract_update(\|\.send_update_notification(\|\.send_delegate_contract_notifications(\|\.broadcast_state_change(" \
+  crates/core/src/contract/executor/runtime/executor_impl.rs \
+  crates/core/src/contract/executor/runtime/contract_ops.rs
+# Widening to crates/core/src/contract/ returns about a dozen hits and the
+# "exactly one" claim reads as false. Three are `mock_runtime.rs`, which has
+# its OWN `broadcast_state_change` on a different type and is not part of this
+# invariant; the rest are needle strings inside the pin test that enforces it.
+# Say which you mean before you claim the rule holds.
+# Op-originator side effects: every legacy-path hit needs an equivalent
+# reachable from the driver.
+grep -rn "ring.subscribe(\|complete_subscription_request\|announce_contract_hosted\|fetch_contract_if_missing" crates/core/src/operations/
+```

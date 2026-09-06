@@ -184,6 +184,20 @@ impl ContractInterface for Contract {
         )))
     }
 
+    /// The summary is the whole state, deliberately.
+    ///
+    /// A summary's job is to let the far side work out exactly what we are missing,
+    /// and for this contract the state IS the set of observations — there is no
+    /// smaller thing that still answers "which timestamps do you not have". A
+    /// contract with a compressible state (a version vector, a Merkle root, a set of
+    /// per-peer high-water marks) should summarise instead of copying, and would
+    /// send far less over the wire on every sync.
+    ///
+    /// What matters for the merge laws is that the DELTA is small, and
+    /// `get_state_delta` below makes it so. Sending a large summary costs one
+    /// round-trip's bandwidth; returning a large delta costs the whole state on
+    /// every update, which is what the `whole_state_self_delta` diagnostic exists to
+    /// flag.
     fn summarize_state(
         _parameters: Parameters<'static>,
         state: State<'static>,
@@ -211,6 +225,17 @@ impl ContractInterface for Contract {
         Ok(StateSummary::from(state.to_vec()))
     }
 
+    /// The delta is what we hold and the recipient does not — not the whole state.
+    ///
+    /// This used to merge the summary into our state and return the result, so every
+    /// delta was a full state copy and a delta against our OWN summary was still the
+    /// entire state. The conformance verifier reports that as `self_delta_empty` and
+    /// `whole_state_self_delta` (#5072): both are diagnostics, so neither breaks a
+    /// merge law, but "synchronisation saves nothing" is not what this contract
+    /// should be teaching.
+    ///
+    /// See `Ping::delta_against` for why a difference is sufficient: `merge` is a
+    /// union, so applying `S \ R` to `R` reaches the same state as applying `S`.
     fn get_state_delta(
         parameters: Parameters<'static>,
         state: State<'static>,
@@ -223,13 +248,20 @@ impl ContractInterface for Contract {
             summary.as_ref().len()
         ));
 
+        // Parsed for validation only. The TTL is deliberately NOT applied here:
+        // pruning is the receiving merge's job, and pruning on the sender's side
+        // would be deciding what the recipient may keep on its behalf.
+        // Only the log line below reads this, and that is compiled out without the
+        // `contract` feature — but the parse itself is NOT decoration: a malformed
+        // parameters blob must be rejected here as it is in every other entry point.
+        #[cfg_attr(not(feature = "contract"), allow(unused_variables))]
         let opts = serde_json::from_slice::<PingContractOptions>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
         #[cfg(feature = "contract")]
         freenet_stdlib::log::info(&format!("[GET_STATE_DELTA] Contract options: {opts:?}"));
 
-        let mut ping = if state.is_empty() {
+        let ping = if state.is_empty() {
             #[cfg(feature = "contract")]
             freenet_stdlib::log::info("[GET_STATE_DELTA] Empty state, using default Ping");
 
@@ -258,12 +290,19 @@ impl ContractInterface for Contract {
             ps
         };
 
-        ping.merge(ping_summary, opts.ttl);
+        let Some(delta) = ping.delta_against(&ping_summary) else {
+            #[cfg(feature = "contract")]
+            freenet_stdlib::log::info("[GET_STATE_DELTA] Recipient is up to date, empty delta");
+
+            // Nothing to send. An empty delta is the honest answer and is what makes
+            // the `self_delta_empty` law hold; `update_state` skips empty deltas.
+            return Ok(StateDelta::from(Vec::new()));
+        };
 
         #[cfg(feature = "contract")]
-        freenet_stdlib::log::info(&format!("[GET_STATE_DELTA] Merged result: {ping:?}"));
+        freenet_stdlib::log::info(&format!("[GET_STATE_DELTA] Delta: {delta:?}"));
 
-        let result = serde_json::to_vec(&ping).map_err(|e| ContractError::Other(e.to_string()))?;
+        let result = serde_json::to_vec(&delta).map_err(|e| ContractError::Other(e.to_string()))?;
 
         #[cfg(feature = "contract")]
         freenet_stdlib::log::info(&format!(

@@ -11,14 +11,13 @@ on:
     branches: [main]
     paths:
       - 'crates/core/src/server/**/assets/**'
-      - 'crates/core/src/server/base58_encode.test.mjs'
-      - 'crates/core/src/server/dashboard_refresh.test.mjs'
-      - 'crates/core/src/server/shell_bridge_notifications.test.mjs'
-      - 'crates/core/src/server/shell_bridge_reload.test.mjs'
-      - 'crates/core/src/server/shell_bridge_permission_ws.test.mjs'
-      - 'crates/core/src/server/connecting_recovery.test.mjs'
-      - 'crates/core/src/server/notify_sw.test.mjs'
-      - 'crates/core/src/server/update_check.test.mjs'
+      # A GLOB, not an enumeration. This list previously named every test
+      # file individually, so adding one and forgetting the workflow meant a
+      # PR touching ONLY that test skipped `npm test` entirely and the
+      # regression test could merge without ever running — which had already
+      # happened to table_filter.test.mjs. The bug is the allowlist shape, not
+      # the missing entry, so fix the shape.
+      - 'crates/core/src/server/*.test.mjs'
       - 'crates/core/src/server/package.json'
       - 'crates/core/src/server/package-lock.json'
       - 'crates/core/src/server/.prettierrc.json'
@@ -28,14 +27,13 @@ on:
   pull_request:
     paths:
       - 'crates/core/src/server/**/assets/**'
-      - 'crates/core/src/server/base58_encode.test.mjs'
-      - 'crates/core/src/server/dashboard_refresh.test.mjs'
-      - 'crates/core/src/server/shell_bridge_notifications.test.mjs'
-      - 'crates/core/src/server/shell_bridge_reload.test.mjs'
-      - 'crates/core/src/server/shell_bridge_permission_ws.test.mjs'
-      - 'crates/core/src/server/connecting_recovery.test.mjs'
-      - 'crates/core/src/server/notify_sw.test.mjs'
-      - 'crates/core/src/server/update_check.test.mjs'
+      # A GLOB, not an enumeration. This list previously named every test
+      # file individually, so adding one and forgetting the workflow meant a
+      # PR touching ONLY that test skipped `npm test` entirely and the
+      # regression test could merge without ever running — which had already
+      # happened to table_filter.test.mjs. The bug is the allowlist shape, not
+      # the missing entry, so fix the shape.
+      - 'crates/core/src/server/*.test.mjs'
       - 'crates/core/src/server/package.json'
       - 'crates/core/src/server/package-lock.json'
       - 'crates/core/src/server/.prettierrc.json'
