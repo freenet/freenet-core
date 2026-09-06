@@ -346,17 +346,32 @@ impl P2pConnManager {
                         .ok();
                     return Ok(());
                 }
-                let just_became_ready = self
+                // #4787 instrumentation: count the promotion only if the ring
+                // actually took the connection. `add_connection`'s own `bool`
+                // reports the readiness-threshold crossing, NOT acceptance, so
+                // the outcome struct is what this has to branch on — otherwise
+                // a cap-rejected promotion inflates `promoted_to_ring` in
+                // exactly the saturation direction the counter is meant to
+                // expose.
+                let outcome = self
                     .bridge
                     .op_manager
                     .ring
-                    .add_connection(loc, PeerId::new(peer.pub_key().clone(), peer_addr), true)
+                    .add_connection_reporting(
+                        loc,
+                        PeerId::new(peer.pub_key().clone(), peer_addr),
+                        true,
+                    )
                     .await;
-                crate::node::network_status::record_bootstrap_promoted_to_ring();
+                if outcome.added {
+                    crate::node::network_status::record_bootstrap_promoted_to_ring();
+                }
+                let just_became_ready = outcome.just_became_ready;
                 tracing::info!(
                     tx = %tx,
                     remote = %peer,
                     transient_expired,
+                    added = outcome.added,
                     "connect_peer: promoted to ring"
                 );
 
@@ -1214,12 +1229,28 @@ impl P2pConnManager {
                     return Ok(());
                 }
                 tracing::info!(%peer_addr, %loc, "handle_successful_connection: promoting connection into ring");
-                let just_became_ready = self
+                // #4787 instrumentation: this is the OTHER promotion path, and
+                // on a gateway it is the one inbound connections with a known
+                // peer_id actually take (`promote_to_ring` above is true for
+                // any transient when `is_gateway()`). Leaving it uncounted made
+                // the `transient_expired : promoted_to_ring` ratio the PR's own
+                // doc tells operators to build read far worse than reality.
+                // Gated on `added` for the same reason as the `handle_connect_peer`
+                // site.
+                let outcome = self
                     .bridge
                     .op_manager
                     .ring
-                    .add_connection(loc, PeerId::new(peer.pub_key().clone(), peer_addr), true)
+                    .add_connection_reporting(
+                        loc,
+                        PeerId::new(peer.pub_key().clone(), peer_addr),
+                        true,
+                    )
                     .await;
+                if outcome.added {
+                    crate::node::network_status::record_bootstrap_promoted_to_ring();
+                }
+                let just_became_ready = outcome.just_became_ready;
                 let pkl = crate::ring::PeerKeyLocation::new(peer.pub_key().clone(), peer_addr);
                 crate::node::network_status::record_peer_connected(
                     peer_addr,
@@ -1293,8 +1324,17 @@ impl P2pConnManager {
                     // These connections don't go through should_accept() so there's no pending
                     // reservation. Compute location from address directly.
                     let loc = Location::from_address(&peer_addr);
-                    connection_manager.try_register_transient(peer_addr, Some(loc));
-                    crate::node::network_status::record_bootstrap_transient_registered();
+                    // #4787 instrumentation: `try_register_transient` returns
+                    // `true` both for a fresh insertion and for refreshing an
+                    // address it already tracks, and `false` when the transient
+                    // budget refused it (nothing inserted at all). Only a fresh
+                    // insertion is a "transient registered".
+                    let already_transient = connection_manager.is_transient(peer_addr);
+                    let registered =
+                        connection_manager.try_register_transient(peer_addr, Some(loc));
+                    if registered && !already_transient {
+                        crate::node::network_status::record_bootstrap_transient_registered();
+                    }
                     tracing::info!(
                         peer_id = ?peer_id,
                         %peer_addr,

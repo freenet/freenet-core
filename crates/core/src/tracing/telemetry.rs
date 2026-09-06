@@ -3187,8 +3187,16 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         snapshot.bootstrap_promoted_to_ring,
                     ),
                     (
-                        "bootstrap_startup_connect_retries",
-                        snapshot.bootstrap_startup_connect_retries,
+                        "bootstrap_startup_rounds_connect_issued",
+                        snapshot.bootstrap_startup_rounds_connect_issued,
+                    ),
+                    (
+                        "bootstrap_startup_rounds_backoff_blocked",
+                        snapshot.bootstrap_startup_rounds_backoff_blocked,
+                    ),
+                    (
+                        "bootstrap_startup_rounds_no_target",
+                        snapshot.bootstrap_startup_rounds_no_target,
                     ),
                 ] {
                     obj.insert(key.to_string(), serde_json::json!(value));
@@ -3200,6 +3208,12 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 obj.insert(
                     "bootstrap_time_to_min_connections_secs".to_string(),
                     serde_json::json!(snapshot.bootstrap_time_to_min_connections_secs),
+                );
+                // Disambiguates the `null` above: `false` = this node has never
+                // reached min_connections, absent = the field wasn't reported.
+                obj.insert(
+                    "bootstrap_completed".to_string(),
+                    serde_json::json!(snapshot.bootstrap_completed),
                 );
                 // Computed-upstream vs. stored-flag divergence counters (piece D,
                 // #4642 / #4671) — same hand-mirror footgun: a new
@@ -4134,13 +4148,41 @@ mod tests {
         info.bootstrap_transient_expired = Some(9);
         info.bootstrap_promoted_to_ring = Some(1);
         info.bootstrap_time_to_min_connections_secs = Some(12.5);
-        info.bootstrap_startup_connect_retries = Some(4);
+        info.bootstrap_completed = Some(true);
+        info.bootstrap_startup_rounds_connect_issued = Some(4);
+        info.bootstrap_startup_rounds_backoff_blocked = Some(3);
+        info.bootstrap_startup_rounds_no_target = Some(2);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         assert_eq!(json["bootstrap_transient_registered"], 10);
         assert_eq!(json["bootstrap_transient_expired"], 9);
         assert_eq!(json["bootstrap_promoted_to_ring"], 1);
         assert_eq!(json["bootstrap_time_to_min_connections_secs"], 12.5);
-        assert_eq!(json["bootstrap_startup_connect_retries"], 4);
+        assert_eq!(json["bootstrap_completed"], true);
+        assert_eq!(json["bootstrap_startup_rounds_connect_issued"], 4);
+        assert_eq!(json["bootstrap_startup_rounds_backoff_blocked"], 3);
+        assert_eq!(json["bootstrap_startup_rounds_no_target"], 2);
+    }
+
+    /// Pin the "never bootstrapped" vs "no data" distinction (#4787 finding 3):
+    /// a node that has not reached `min_connections` must emit
+    /// `bootstrap_completed: false` alongside the null latency, so a
+    /// permanently-stuck joiner is visible instead of indistinguishable from a
+    /// build that doesn't report the field.
+    #[test]
+    fn router_snapshot_json_distinguishes_never_bootstrapped_from_no_data() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.bootstrap_time_to_min_connections_secs = None;
+        info.bootstrap_completed = Some(false);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        assert!(json["bootstrap_time_to_min_connections_secs"].is_null());
+        assert_eq!(
+            json["bootstrap_completed"], false,
+            "a stuck joiner must report bootstrap_completed=false, not merely a \
+             null latency that also means 'field not reported'"
+        );
     }
 
     /// Pin: the computed-upstream vs. stored-flag divergence counters (piece D,

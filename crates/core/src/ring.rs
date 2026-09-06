@@ -230,6 +230,22 @@ struct ContractConnectState {
     last_attempt: Instant,
 }
 
+/// Outcome of [`Ring::add_connection_reporting`].
+///
+/// Exists because `add_connection`'s `bool` answers a different question than
+/// callers usually want: it reports the readiness-threshold crossing, and is
+/// `false` both for a rejected connection and for the ordinary successful add
+/// on an already-ready node. Instrumentation that counts promotions needs
+/// `added` (issue #4787).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AddConnectionOutcome {
+    /// The ring accepted the connection into the topology. `false` means it
+    /// was rejected — e.g. the `max_connections` cap.
+    pub added: bool,
+    /// Adding this connection crossed the readiness threshold.
+    pub just_became_ready: bool,
+}
+
 pub(crate) struct Ring {
     pub max_hops_to_live: usize,
     pub connection_manager: ConnectionManager,
@@ -1998,15 +2014,21 @@ impl Ring {
             // joiner-side time-to-min-connections and startup retry count.
             // Instrumentation only, no behavior change — see
             // `network_status::BootstrapChurnStats`.
-            if let Some((registered, expired, promoted, time_to_min_conns, retries)) =
-                crate::node::network_status::bootstrap_churn_counts()
-            {
-                snapshot.bootstrap_transient_registered = Some(registered);
-                snapshot.bootstrap_transient_expired = Some(expired);
-                snapshot.bootstrap_promoted_to_ring = Some(promoted);
+            if let Some(b) = crate::node::network_status::bootstrap_churn_counts() {
+                snapshot.bootstrap_transient_registered = Some(b.transient_registered);
+                snapshot.bootstrap_transient_expired = Some(b.transient_expired);
+                snapshot.bootstrap_promoted_to_ring = Some(b.promoted_to_ring);
                 snapshot.bootstrap_time_to_min_connections_secs =
-                    time_to_min_conns.map(|d| d.as_secs_f64());
-                snapshot.bootstrap_startup_connect_retries = Some(retries);
+                    b.time_to_min_connections.map(|d| d.as_secs_f64());
+                // `Some(false)` (never bootstrapped) is a different fact from
+                // `None` (this build/collector doesn't report it) — see #4787
+                // finding 3.
+                snapshot.bootstrap_completed = Some(b.time_to_min_connections.is_some());
+                snapshot.bootstrap_startup_rounds_connect_issued =
+                    Some(b.startup_rounds_connect_issued);
+                snapshot.bootstrap_startup_rounds_backoff_blocked =
+                    Some(b.startup_rounds_backoff_blocked);
+                snapshot.bootstrap_startup_rounds_no_target = Some(b.startup_rounds_no_target);
             }
 
             // Computed-upstream vs. stored-`is_upstream`-flag divergence counters
@@ -3732,7 +3754,28 @@ impl Ring {
     /// (i.e., we just became ready to accept non-CONNECT operations).
     /// Returns `false` if the connection was rejected (e.g., capacity cap) or we
     /// were already ready.
+    ///
+    /// NOTE the two meanings of `false` collapsed here: callers that need to
+    /// know whether the connection was actually *added* — as opposed to
+    /// whether readiness was just crossed — must use
+    /// [`Ring::add_connection_reporting`]. Reading this `bool` as "added" is
+    /// wrong in both directions: it is `false` for the overwhelmingly common
+    /// successful add (we were already ready), and it is only ever `true` for
+    /// the single add that crosses the threshold.
     pub async fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) -> bool {
+        self.add_connection_reporting(loc, peer, was_reserved)
+            .await
+            .just_became_ready
+    }
+
+    /// [`Ring::add_connection`], reporting whether the ring actually accepted
+    /// the connection as well as whether readiness was crossed.
+    pub async fn add_connection_reporting(
+        &self,
+        loc: Location,
+        peer: PeerId,
+        was_reserved: bool,
+    ) -> AddConnectionOutcome {
         tracing::info!(
             peer = %peer,
             peer_location = %loc,
@@ -3754,7 +3797,10 @@ impl Ring {
                 peer_location = %loc,
                 "Ring rejected connection - not updating caches or logging connection event"
             );
-            return false;
+            return AddConnectionOutcome {
+                added: false,
+                just_became_ready: false,
+            };
         }
         if let Some(own_loc) = self.connection_manager.own_location().location() {
             crate::node::network_status::set_own_location(own_loc.as_f64());
@@ -3764,8 +3810,11 @@ impl Ring {
         self.refresh_density_request_cache();
 
         let is_ready = self.connection_manager.is_self_ready();
-        // Return true only if we just crossed the threshold
-        !was_ready && is_ready
+        AddConnectionOutcome {
+            added: true,
+            // Only report readiness if we just crossed the threshold.
+            just_became_ready: !was_ready && is_ready,
+        }
     }
 
     pub fn update_connection_identity(&self, old_peer: &PeerId, new_peer: PeerId) {
@@ -9112,6 +9161,104 @@ mod cost_pressure_seam_tests {
             freenet_stdlib::prelude::ContractInstanceId::new([seed; 32]),
             freenet_stdlib::prelude::CodeHash::new([seed.wrapping_add(1); 32]),
         )
+    }
+
+    /// `Ring::add_connection`'s `bool` reports the READINESS-threshold
+    /// crossing, not acceptance — it is `false` both when the ring rejects the
+    /// connection and (far more often) when the connection is added while the
+    /// node is already ready. #4787's promotion counter has to know which
+    /// happened, so `add_connection_reporting` splits the two. This pins that
+    /// split, because gating the counter on the plain `bool` — the obvious
+    /// reading of a function returning `false` on rejection — would silently
+    /// count almost no promotions at all.
+    #[tokio::test]
+    async fn add_connection_reporting_separates_added_from_readiness() {
+        let config_args = crate::config::ConfigArgs {
+            id: Some("add-conn-outcome-4787".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14101".parse().unwrap());
+        let ring = &op_manager.ring;
+
+        let max = ring.connection_manager.max_connections;
+        // Beyond max + LATTICE_OVERMAX_SLACK the ceiling is hard, so a margin
+        // past that guarantees we observe a rejection.
+        let attempts = max + super::connection_manager::LATTICE_OVERMAX_SLACK + 16;
+
+        let mut added = 0usize;
+        let mut ready_crossings = 0usize;
+        let mut added_without_readiness = 0usize;
+        let mut first_rejection: Option<usize> = None;
+        for i in 0..attempts {
+            let kp = crate::transport::TransportKeypair::new();
+            let addr: std::net::SocketAddr = format!("127.0.0.2:{}", 20000 + i as u16)
+                .parse()
+                .expect("addr");
+            let loc = super::Location::new((i as f64 + 0.5) / attempts as f64);
+            let outcome = ring
+                .add_connection_reporting(loc, super::PeerId::new(kp.public().clone(), addr), false)
+                .await;
+            if outcome.added {
+                added += 1;
+                if outcome.just_became_ready {
+                    ready_crossings += 1;
+                } else {
+                    added_without_readiness += 1;
+                }
+            } else {
+                first_rejection = Some(i);
+                break;
+            }
+        }
+
+        let rejected_at = first_rejection.expect(
+            "the ring must eventually reject an add at the connection ceiling — \
+             without a rejection this test cannot show `added` is meaningful",
+        );
+        assert!(
+            rejected_at >= max,
+            "rejection came at {rejected_at}, before max_connections={max}"
+        );
+        assert!(
+            added_without_readiness > 0,
+            "the overwhelming majority of accepted adds report \
+             just_became_ready=false; if this is 0 the test proves nothing"
+        );
+        assert!(
+            ready_crossings <= 1,
+            "readiness can be crossed at most once, got {ready_crossings}"
+        );
+        assert!(
+            added >= max,
+            "expected at least {max} accepted adds, got {added}"
+        );
     }
 
     /// Runs under `start_paused` so `tokio::time::Instant` — the clock behind

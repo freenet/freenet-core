@@ -1326,6 +1326,12 @@ fn log_umask_override() {
 fn log_umask_override() {}
 
 fn main() {
+    // Anchor the bootstrap-latency clock at process start, before anything
+    // else, so `freenet.bootstrap.time_to_min_connections_seconds` measures
+    // what its name says — including config load, storage open and the
+    // cached-peer fast-reconnect path (issue #4787).
+    freenet::mark_process_start();
+
     // Defense-in-depth: tighten umask BEFORE the tokio runtime spawns
     // any worker threads. See `set_secure_umask` and issue #4196.
     set_secure_umask();
