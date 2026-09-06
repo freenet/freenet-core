@@ -2950,6 +2950,79 @@ async fn test_v2_delegate_subscribe_known() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// V2 E2E: a real delegate's `subscribe_contract()` reaches the demand
+/// callback, through the real `Runtime` execution path (#4669).
+///
+/// This closes the one seam in the V2 half that nothing else covers.
+/// `Runtime::exec_inbound_with_env` is the SOLE production caller of
+/// `DelegateCallEnv::new`, and it is where `delegate_subscribe_callback` is
+/// threaded into the env. Replace that argument with `None` and every other
+/// guard in the change still passes:
+///
+/// - the constructor pin scrapes `contract/executor/runtime.rs`, which still
+///   installs the callback on the `Runtime`;
+/// - the ordering pin scrapes `native_api.rs`, whose `if let Some(register)` is
+///   still present, now permanently `None`;
+/// - the `delegate_api.rs` callback tests build a `DelegateCallEnv` directly
+///   and never go through this function;
+/// - the two-node E2E drives the V1 path and cannot observe demand anyway.
+///
+/// So the entire V2 half of the feature could go dead with everything green.
+/// That is the "silent omission in a seam between two pinned things" shape the
+/// module doc invokes as its own rationale, and it deserves a test that runs
+/// the real thing rather than another scrape.
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_subscribe_reaches_the_demand_callback_through_the_real_runtime()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::{Arc, Mutex};
+    use v2_contracts_messages::*;
+
+    let (delegate, mut runtime, contract_instance_id, _temp_dir) =
+        setup_v2_runtime_with_contract(54, Some(&[1])).await?;
+    let cid: [u8; 32] = contract_instance_id.as_bytes().try_into().unwrap();
+
+    let seen: Arc<Mutex<Vec<(DelegateKey, ContractKey)>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    runtime.set_delegate_subscribe_callback(Arc::new(
+        move |delegate: &DelegateKey, key: &ContractKey| {
+            recorder.lock().unwrap().push((delegate.clone(), *key));
+        },
+    ));
+
+    let response = send_v2_message(
+        &mut runtime,
+        &delegate,
+        &InboundAppMessage::SubscribeContract { contract_id: cid },
+    )?;
+    match response {
+        OutboundAppMessage::Success { contract_id } => assert_eq!(contract_id, cid),
+        other @ OutboundAppMessage::ContractState { .. }
+        | other @ OutboundAppMessage::ContractNotFound { .. }
+        | other @ OutboundAppMessage::Failed { .. } => {
+            panic!("Expected Success from SUBSCRIBE, got {:?}", other)
+        }
+    }
+
+    let calls = seen.lock().unwrap();
+    assert_eq!(
+        1,
+        calls.len(),
+        "a V2 subscribe driven through the real Runtime must reach the demand \
+         callback exactly once — if this is 0, the callback is not being \
+         threaded into DelegateCallEnv and the V2 half registers no demand"
+    );
+    assert_eq!(delegate.key(), &calls[0].0);
+    assert_eq!(
+        &contract_instance_id,
+        calls[0].1.id(),
+        "the callback must receive the resolved ContractKey for the subscribed \
+         contract — the ring is keyed by ContractKey, so a wrong key registers \
+         demand nothing can match"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_put_contract_request_response() -> Result<(), Box<dyn std::error::Error>> {
     use capabilities_messages::*;

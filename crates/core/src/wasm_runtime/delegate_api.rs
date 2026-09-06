@@ -197,6 +197,7 @@ pub mod delegate_mgmt_error_codes {
 mod tests {
     use super::*;
     use crate::wasm_runtime::native_api::DelegateEnvError;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn test_version_display() {
@@ -402,6 +403,7 @@ mod tests {
                     Some(self.db.clone()),
                     None,
                     None,
+                    None, // delegate_subscribe_callback (#4669)
                     delegate_key,
                     &mut self.delegate_store,
                     depth,
@@ -432,6 +434,41 @@ mod tests {
                     Some(self.db.clone()),
                     Some(cb),
                     None,
+                    None, // delegate_subscribe_callback (#4669)
+                    delegate_key,
+                    &mut self.delegate_store,
+                    0,
+                    vec![],
+                    None,
+                    self.created_delegates_count.clone(),
+                    self.inherited_origins.clone(),
+                )
+            }
+        }
+
+        /// Create a DelegateCallEnv wired to an arbitrary delegate-subscribe
+        /// callback (#4669). The callback is what carries a V2
+        /// `subscribe_contract()` out to the ring's demand machinery; without
+        /// it the subscribe records only a notification hook.
+        ///
+        /// # Safety
+        /// Caller must ensure the returned env does not outlive `self`.
+        unsafe fn make_env_with_subscribe_callback(
+            &mut self,
+            cb: super::super::runtime::DelegateSubscribeCallback,
+            delegate_key: DelegateKey,
+        ) -> DelegateCallEnv {
+            // SAFETY: The caller guarantees the returned env does not outlive `self`,
+            // which keeps the borrowed `secret_store` and `contract_store` alive.
+            unsafe {
+                DelegateCallEnv::new(
+                    vec![],
+                    &mut self.secret_store,
+                    &self.contract_store,
+                    Some(self.db.clone()),
+                    None,
+                    None,
+                    Some(cb),
                     delegate_key,
                     &mut self.delegate_store,
                     0,
@@ -465,6 +502,7 @@ mod tests {
                     Some(self.db.clone()),
                     None,
                     Some(admit),
+                    None, // delegate_subscribe_callback (#4669)
                     delegate_key,
                     &mut self.delegate_store,
                     0,
@@ -495,6 +533,7 @@ mod tests {
                     Some(self.db.clone()),
                     None,
                     None,
+                    None, // delegate_subscribe_callback (#4669)
                     delegate_key,
                     &mut self.delegate_store,
                     0,
@@ -592,6 +631,7 @@ mod tests {
                 None, // No state store
                 None,
                 None,
+                None, // delegate_subscribe_callback (#4669)
                 delegate_key,
                 &mut env_holder.delegate_store,
                 0,
@@ -677,6 +717,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // delegate_subscribe_callback (#4669)
                 delegate_key,
                 &mut env_holder.delegate_store,
                 0,
@@ -708,6 +749,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // delegate_subscribe_callback (#4669)
                 delegate_key,
                 &mut env_holder.delegate_store,
                 0,
@@ -1128,6 +1170,84 @@ mod tests {
         let env = unsafe { env_holder.make_env() };
         let result = env.subscribe_contract_sync(&contract_id);
         assert!(result.is_ok());
+    }
+
+    /// A successful V2 subscribe must invoke the demand callback with the
+    /// subscribing delegate and the RESOLVED contract key (#4669).
+    ///
+    /// Without this the V2 host function records only the
+    /// `DELEGATE_SUBSCRIPTIONS` notification hook, which nothing in `ring/`
+    /// reads — the subscribe succeeds and the pin silently does not take, which
+    /// is the whole defect. The key matters as much as the fact of the call:
+    /// the ring is keyed by `ContractKey`, and passing anything derived from
+    /// the bare instance id would register demand against a key that no
+    /// hosting-cache lookup can match.
+    #[tokio::test]
+    async fn subscribe_invokes_the_demand_callback_with_the_resolved_key() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(91, &[1]).await;
+        let expected_key = ContractKey::from_id_and_code(
+            contract_id,
+            env_holder
+                .contract_store
+                .code_hash_from_id(&contract_id)
+                .expect("contract just stored"),
+        );
+
+        let seen: Arc<Mutex<Vec<(DelegateKey, ContractKey)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let delegate_key = DelegateKey::new([5u8; 32], CodeHash::new([6u8; 32]));
+
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the returned references in `DelegateCallEnv` are valid.
+        let env = unsafe {
+            env_holder.make_env_with_subscribe_callback(
+                Arc::new(move |delegate: &DelegateKey, key: &ContractKey| {
+                    recorder.lock().unwrap().push((delegate.clone(), *key));
+                }),
+                delegate_key.clone(),
+            )
+        };
+
+        env.subscribe_contract_sync(&contract_id)
+            .expect("subscribe to a stored contract must succeed");
+
+        let calls = seen.lock().unwrap();
+        assert_eq!(
+            1,
+            calls.len(),
+            "a successful V2 subscribe must register demand exactly once"
+        );
+        assert_eq!(delegate_key, calls[0].0);
+        assert_eq!(expected_key, calls[0].1);
+    }
+
+    /// A FAILED V2 subscribe must not register demand.
+    ///
+    /// The delegate is told the subscribe failed, so demand registered anyway
+    /// would be a pin nothing can ever release — there is no unsubscribe
+    /// (#2830), and the delegate has no record it holds one.
+    #[tokio::test]
+    async fn failed_subscribe_does_not_register_demand() {
+        let mut env_holder = TestEnv::new().await;
+
+        let seen: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let recorder = Arc::clone(&seen);
+
+        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
+        // the returned references in `DelegateCallEnv` are valid.
+        let env = unsafe {
+            env_holder.make_env_with_subscribe_callback(
+                Arc::new(move |_: &DelegateKey, _: &ContractKey| {
+                    *recorder.lock().unwrap() += 1;
+                }),
+                DelegateKey::new([5u8; 32], CodeHash::new([6u8; 32])),
+            )
+        };
+
+        let missing_id = ContractInstanceId::new([98u8; 32]);
+        assert!(env.subscribe_contract_sync(&missing_id).is_err());
+        assert_eq!(0, *seen.lock().unwrap());
     }
 
     /// V2 delegate subscribe fails for unknown contract.

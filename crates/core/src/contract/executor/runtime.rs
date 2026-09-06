@@ -360,6 +360,38 @@ impl ContractExecutor for Executor<Runtime> {
     }
 }
 
+/// The production demand-registration callback for V2 delegate
+/// `subscribe_contract()` (#4669 part 1 / #5467 Phase 1).
+///
+/// **There is one of these on purpose**, shared by every `Executor<Runtime>`
+/// constructor, rather than an inline closure per constructor. The V2 host
+/// function runs synchronously inside the WASM call and records only a
+/// notification hook in `DELEGATE_SUBSCRIPTIONS`, which nothing in `ring/`
+/// reads — so a constructor that omits this callback produces an executor on
+/// which a V2 delegate subscribe silently registers no demand, while the V1
+/// path (`contract.rs`, the `SubscribeContractRequest` arm) still does. One
+/// shared value means the two constructors cannot drift from each other, and
+/// both converge with V1 on `delegate_demand::register_subscription`.
+///
+/// Returns `None` when there is no `OpManager` (local-only and mock executors),
+/// which have no demand machinery to register with; the notification half still
+/// works there, so the absence degrades to exactly the pre-#4669 behaviour.
+///
+/// Shaped deliberately like `v2_delegate_state_write_callback` (#5479/#5490),
+/// which collapses the same per-constructor duplication for the state-write
+/// callback. Keeping the two in the same shape is what stops this file
+/// re-accumulating one bespoke inline closure per callback.
+pub(super) fn v2_delegate_subscribe_callback(
+    op_manager: Option<Arc<crate::node::OpManager>>,
+) -> Option<crate::wasm_runtime::DelegateSubscribeCallback> {
+    let op_manager = op_manager?;
+    Some(Arc::new(
+        move |delegate: &freenet_stdlib::prelude::DelegateKey, key: &ContractKey| {
+            crate::contract::delegate_demand::register_subscription(&op_manager, delegate, key);
+        },
+    ))
+}
+
 impl Executor<Runtime> {
     /// Create an Executor for local-only mode (no network operations).
     /// Use this from the binary for local mode execution.
@@ -418,6 +450,11 @@ impl Executor<Runtime> {
                     result.map_err(|over| over.to_string())
                 },
             ));
+        }
+        // Demand registration for V2 delegate `subscribe_contract()` (#4669
+        // part 1 / #5467 Phase 1). See `v2_delegate_subscribe_callback`.
+        if let Some(callback) = v2_delegate_subscribe_callback(op_manager.clone()) {
+            rt.set_delegate_subscribe_callback(callback);
         }
         Executor::new(
             state_store,
@@ -566,6 +603,11 @@ impl Executor<Runtime> {
                     result.map_err(|over| over.to_string())
                 },
             ));
+        }
+        // Demand registration for V2 delegate `subscribe_contract()` (#4669
+        // part 1 / #5467 Phase 1). See `v2_delegate_subscribe_callback`.
+        if let Some(callback) = v2_delegate_subscribe_callback(op_manager.clone()) {
+            rt.set_delegate_subscribe_callback(callback);
         }
         Executor::new(
             shared_state_store,

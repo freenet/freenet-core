@@ -3192,6 +3192,32 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "upstream_computed_vs_stored_divergences".to_string(),
                     serde_json::json!(snapshot.upstream_computed_vs_stored_divergences),
                 );
+                // Delegate pin outcome counters by reason (#4669 / #5467 Phase
+                // 0) — same hand-mirror footgun as the counters above: a new
+                // `RouterSnapshotInfo` field is invisible to the collector
+                // unless added here. `delegate_pin_registered` is the
+                // denominator without which a refusal count cannot be read as
+                // a rate. Pinned by
+                // `router_snapshot_json_includes_delegate_pin_refusal_counters`.
+                for (key, value) in [
+                    ("delegate_pin_registered", snapshot.delegate_pin_registered),
+                    ("delegate_pin_not_hosted", snapshot.delegate_pin_not_hosted),
+                    (
+                        "delegate_pin_contract_full",
+                        snapshot.delegate_pin_contract_full,
+                    ),
+                    ("delegate_pin_node_full", snapshot.delegate_pin_node_full),
+                    (
+                        "delegate_pin_delegate_full",
+                        snapshot.delegate_pin_delegate_full,
+                    ),
+                    (
+                        "delegate_pin_evicted_mid_registration",
+                        snapshot.delegate_pin_evicted_mid_registration,
+                    ),
+                ] {
+                    obj.insert(key.to_string(), serde_json::json!(value));
+                }
                 // Reconcile-controller SHADOW comparison counters (keystone
                 // step-2, #4642) — same hand-mirror footgun: a new
                 // `RouterSnapshotInfo` field is invisible to the collector unless
@@ -4115,6 +4141,38 @@ mod tests {
         for (key, want) in [
             ("upstream_computed_vs_stored_comparisons", 337),
             ("upstream_computed_vs_stored_divergences", 347),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the delegate pin refusal counters (#4669 / #5467 Phase 0) must
+    /// also reach the hand-mirrored OTLP body — same footgun as the divergence
+    /// counters above. Every refusal in
+    /// `contract::delegate_demand::register_subscription` still reports
+    /// SUCCESS to the delegate, so this counter (and a rate-limited `warn!`)
+    /// is the only evidence a pin did not take; a silent drop here would
+    /// re-blind central telemetry to that gap.
+    #[test]
+    fn router_snapshot_json_includes_delegate_pin_refusal_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.delegate_pin_registered = Some(601);
+        info.delegate_pin_not_hosted = Some(607);
+        info.delegate_pin_contract_full = Some(613);
+        info.delegate_pin_node_full = Some(617);
+        info.delegate_pin_delegate_full = Some(619);
+        info.delegate_pin_evicted_mid_registration = Some(631);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("delegate_pin_registered", 601),
+            ("delegate_pin_not_hosted", 607),
+            ("delegate_pin_contract_full", 613),
+            ("delegate_pin_node_full", 617),
+            ("delegate_pin_delegate_full", 619),
+            ("delegate_pin_evicted_mid_registration", 631),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

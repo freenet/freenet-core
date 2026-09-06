@@ -93,7 +93,7 @@ pub(crate) use native_api::time::override_contract_clock;
 // naming the type, so gate the re-export to avoid an unused-import warning.
 #[cfg(test)]
 pub(crate) use native_api::InheritedOriginsEntry;
-pub use runtime::{ContractExecError, Runtime};
+pub use runtime::{ContractExecError, DelegateSubscribeCallback, Runtime};
 pub(crate) use runtime::{
     RuntimeConfig, SharedModuleCache, default_wasmtime_cache_size_bytes_for_dir,
 };

@@ -2410,7 +2410,7 @@ where
         // Share one Arc allocation across all subscribers
         let shared_state = Arc::new(new_state.clone());
 
-        for delegate_key in subscribers {
+        for delegate_key in &subscribers {
             match tx.try_send(super::DelegateNotification {
                 delegate_key: delegate_key.clone(),
                 contract_id: instance_id,
@@ -2432,9 +2432,52 @@ where
                         contract = %key,
                         "Delegate notification channel closed — removing stale subscriptions"
                     );
-                    // Receiver is gone; clean up all subscriptions for this contract
-                    // to prevent repeated failed sends on future state updates.
+                    // Scoped to THIS contract, deliberately, and it is worth
+                    // recording why the wider version is wrong.
+                    //
+                    // The tempting argument is: there is one
+                    // delegate-notification channel per `RuntimePool` (created
+                    // in `pool.rs`, cloned into each executor), so `Closed`
+                    // means no delegate on this node can be notified again
+                    // about anything — therefore retire every delegate in the
+                    // snapshot from every contract. That is wrong, because the
+                    // two records this arm keeps in sync have DIFFERENT SCOPES:
+                    // `DELEGATE_SUBSCRIPTIONS` is a process-global `static`
+                    // (`wasm_runtime::native_api`), while demand lives in this
+                    // node's own `Ring`. Several nodes share one process in
+                    // every `#[freenet_test]`, so a node-wide sweep of the
+                    // global map would strip ANOTHER node's hooks while
+                    // dropping only THIS node's demand — manufacturing the
+                    // precise state the paragraph below says must never exist.
+                    //
+                    // So both maps are cleared together, for this contract, on
+                    // this node. Clearing one and not the other is the drift
+                    // this module exists to avoid: demand without a hook is an
+                    // unconsumable pin, a hook without demand is the original
+                    // #4669 defect.
+                    //
+                    // The residual — a delegate whose OTHER contracts are quiet
+                    // keeps their pins until it next subscribes or is
+                    // unregistered — is real and is #5487, along with the two
+                    // other same-shape divergences. It closes when the hook and
+                    // the demand become one record with one owner (#4669 part
+                    // 3), which is also the only fix that could make a
+                    // node-wide sweep coherent.
                     crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&instance_id);
+                    if let Some(op_manager) = &self.op_manager {
+                        // ONE collapse decision for the whole subscriber list,
+                        // not one per delegate. Spawning it per delegate makes N
+                        // tasks race to the same conclusion and lands N shadow
+                        // comparisons in `record_reconcile_shadow_comparison`,
+                        // whose denominator is the #4642 P6 ship-gate
+                        // falsifier — the very double-counting
+                        // `collapse_if_no_interest` refuses to do to itself.
+                        crate::contract::delegate_demand::drop_subscriptions_for_contract(
+                            op_manager,
+                            &subscribers,
+                            key,
+                        );
+                    }
                     return;
                 }
             }
