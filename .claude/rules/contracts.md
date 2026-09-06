@@ -289,10 +289,23 @@ MUST:
 
 - Off-loop deferral (#4391): there are now TWO entry points into the
   bridged upsert.
-  * The NON-deferrable path (`upsert_contract_state`, used by
-    delegate-driven PUTs and direct callers) keeps the INLINE
+  * The NON-deferrable path (`upsert_contract_state`) keeps the INLINE
     `start_sub_op_get` escalation described above — it awaits the
     network GET in place, bounded by RELATED_FETCH_TIMEOUT.
+    Used by direct callers, and as a FALLBACK only: the delegate path
+    reaches it when there is no parking context (direct unit-test calls)
+    or when a park was refused at the node-wide cap. Falling back means
+    accepting the loop stall the deferral exists to remove, which is the
+    deliberate trade at that cap — losing a user's prompt or a delegate's
+    write would be worse.
+  * DELEGATE-DRIVEN PUTs AND UPDATEs USE THE DEFERRABLE PATH (#5544).
+    They used to be listed above as non-deferrable, and were: the delegate
+    arms called `upsert_contract_state` directly, so a related-contract
+    miss awaited a network GET on the serial loop for up to
+    RELATED_FETCH_TIMEOUT. That was one of the two stalls #5544 removes.
+    Past `MAX_DEFERRED_UPSERTS_PER_PARK` the excess REFUSES with
+    `MissingRelated` rather than falling back inline, because nothing caps
+    how many upserts one `process()` may emit.
   * The DEFERRABLE path (`upsert_contract_state_deferrable`, used by the
     serial `contract_handling` loop) resolves related contracts
     LOCAL-ONLY first. On a local miss it does NOT await the network GET

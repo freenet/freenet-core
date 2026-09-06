@@ -526,10 +526,15 @@ async fn fetch_related_off_loop(
 
 /// Whether a delegate run may deliver delegate-to-delegate messages.
 ///
-/// This exists because the two callers of
+/// This exists because the callers of
 /// [`handle_delegate_with_contract_requests`] differ in a security-relevant way:
-/// one descends from a client connection whose scope is known, the other does
-/// not descend from a connection at all (GHSA-824h-7x5x-wfmf).
+/// some descend from a client connection whose scope is known, others do not
+/// descend from a connection at all (GHSA-824h-7x5x-wfmf).
+///
+/// Stated without a count on purpose. This said "the two callers" and there are
+/// now five — the same tally rot retired from `delegate_park`'s module doc, one
+/// file over. What matters is the PROVENANCE split, which survives a new caller;
+/// the number does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InterDelegateDispatch {
     /// Client-driven run. The hop carries the ORIGINATING connection scope, so a
@@ -1656,12 +1661,28 @@ where
                             .iter()
                             .map(|u| (*u.key.id(), u.is_put))
                             .collect();
+                        // SINKS CREATED BEFORE THE GUARD, AND SHARED WITH IT
+                        // (#5544 F2). They used to be created inside the
+                        // spawned future, so `ParkGuard::drop` could not see
+                        // them: on a panic or cancellation it delivered empty
+                        // vectors, `answered` was empty, and EVERY owed prompt
+                        // was rewritten as a denial — including ones a human
+                        // had already answered. The user clicks Allow and the
+                        // delegate is told denied.
+                        let answers_sink: std::sync::Arc<
+                            std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>,
+                        > = Default::default();
+                        let fetch_sink: std::sync::Arc<
+                            std::sync::Mutex<Vec<delegate_park::ResolvedUpsert>>,
+                        > = Default::default();
                         let guard = delegate_park::ParkGuard::new(
                             ctx.park.resume_tx().clone(),
                             delegate_key.clone(),
                             epoch,
                             owed,
                             owed_upserts,
+                            answers_sink.clone(),
+                            fetch_sink.clone(),
                         );
                         let prompter = std::sync::Arc::clone(prompter);
                         let key = delegate_key.clone();
@@ -1684,21 +1705,6 @@ where
                         // this task the handler. See `delegate_park`'s module
                         // docs, "What parking does NOT relax".
                         GlobalExecutor::spawn(async move {
-                            // Results land in these as they complete, so a
-                            // budget expiry keeps what is already done (#5544
-                            // S6). Discarding on timeout would throw away
-                            // prompt answers a HUMAN has already given, and
-                            // prompts run sequentially, so two slow ones can
-                            // exceed the budget with the first already
-                            // answered.
-                            let answers_sink: std::sync::Arc<
-                                std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>,
-                            > = Default::default();
-                            let fetch_sink: std::sync::Arc<
-                                std::sync::Mutex<Vec<delegate_park::ResolvedUpsert>>,
-                            > = Default::default();
-                            let answers_out = answers_sink.clone();
-                            let fetch_out = fetch_sink.clone();
                             // Prompts and fetches run CONCURRENTLY, and the whole
                             // body is capped by PARK_WORK_BUDGET. Sequentially
                             // they could sum past PARK_TTL, at which point the
@@ -1742,32 +1748,18 @@ where
                                     tokio::join!(answers, fetches)
                                 })
                                 .await;
-                            // Either way, resume with whatever completed. On
-                            // expiry that is a PARTIAL result rather than
-                            // nothing, so answers the user already gave are not
-                            // thrown away; the delegate sees responses for the
-                            // requests that finished and none for those that
-                            // did not, which is the same shape as a denied
-                            // prompt.
-                            let responses = std::mem::take(&mut *answers_out.lock().unwrap());
-                            let resolved = std::mem::take(&mut *fetch_out.lock().unwrap());
-
-                            // Denial synthesis lives in `ParkGuard::deliver`
-                            // now, so it also covers the panic and
-                            // cancellation exits — those reach `Drop` and
-                            // never run this block (#5544 P2). Doing it in
-                            // both places would be duplication; doing it
-                            // only here was the bug.
+                            // The guard reads the sinks itself, so this path
+                            // and the panic/cancellation path see the same
+                            // data by construction (#5544 F2). Passing results
+                            // in here is what let `Drop` see none of them.
                             if done.is_err() {
                                 tracing::warn!(
                                     delegate = %key,
-                                    kept_answers = responses.len(),
-                                    kept_fetches = resolved.len(),
                                     "Off-loop delegate work exceeded PARK_WORK_BUDGET; \
-                                     resuming with what completed"
+                                     resuming with whatever completed"
                                 );
                             }
-                            guard.send(responses, resolved);
+                            guard.send();
                         });
                         return DelegateRunOutcome::Parked;
                     }
@@ -3572,6 +3564,9 @@ async fn run_queued_notification<CH, P>(
 
     match outcome {
         DelegateRunOutcome::Parked => {}
+        // Nothing to propagate: a notification has no client waiting. Already
+        // logged inside `handle_delegate_with_contract_requests` (#5263).
+        DelegateRunOutcome::Failed(_) => {}
         DelegateRunOutcome::Completed(outbound) => {
             route_notification_outbound(delegate_key, outbound);
         }
@@ -4420,19 +4415,29 @@ mod tests {
         ContractKey::from_params_and_code(&params, &code)
     }
 
-    /// Pin: the unexpected-response arm must return `Err`, not a fake success.
+    /// Pin: a wrong response variant must NOT be reported to the client as a
+    /// success.
     ///
-    /// The executor answering a delegate request with a variant that is not a
-    /// delegate response is an internal invariant violation. Returning
-    /// `Ok(accumulated_messages)` there is the same lie #5263 removes from the
-    /// execution-failure arm: the client cannot distinguish "the delegate said
-    /// nothing" from "this node is confused".
+    /// PROHIBITION (unchanged from #5263, restated behaviourally): the executor
+    /// answering a delegate request with a variant that is not a delegate
+    /// response is an internal invariant violation, and the client must be able
+    /// to tell it from "the delegate said nothing".
+    ///
+    /// The original asserted `return Err(` and `!contains("return Ok(...)")`.
+    /// #5544 changed the return TYPE, not the prohibition: the function now
+    /// yields `DelegateRunOutcome`, where `Failed` is the only variant that
+    /// reaches the client as `Err` and `Completed` the only one that reaches it
+    /// as `Ok` (see the two `send_delegate_response` call sites). So the same
+    /// two-sided assertion is expressed one type removed — positive AND
+    /// negative, so a silent flip to success is still forbidden rather than
+    /// merely requiring an error somewhere in the arm.
+    ///
+    /// That the prohibition survives without quoting the old code is the signal
+    /// this pin was guarding behaviour rather than shape.
     ///
     /// Pinned from source rather than behaviourally because both mock
-    /// executors (`MockWasmRuntime`, `MockRuntime`) return `Err`
-    /// unconditionally, so no fixture can drive the executor to hand back a
-    /// wrong-variant `Ok`. Truncated at the test module first -- the needles
-    /// occur in this function's own text (see #5450).
+    /// executors return `Err` unconditionally, so no fixture can drive the
+    /// executor to hand back a wrong-variant `Ok`.
     #[test]
     fn unexpected_response_variant_does_not_become_a_fake_success() {
         let full = include_str!("contract.rs");
@@ -4455,40 +4460,46 @@ mod tests {
             .find("phase = \"unexpected_response\"")
             .expect("the unexpected-response arm must exist");
         let after = &body[arm..];
-        // Bound to this arm: stop at the next match arm's opening.
         let arm_end = after.find("Err(err) => {").unwrap_or(after.len());
         let arm = &after[..arm_end];
 
         assert!(
-            arm.contains("return Err("),
-            "the unexpected-response arm must return an error; returning \
-             Ok(accumulated_messages) reports an internal invariant violation \
-             to the client as an empty SUCCESS (#5263). Arm: {arm:?}"
+            arm.contains("DelegateRunOutcome::Failed"),
+            "the unexpected-response arm must yield `Failed`, which is what \
+             reaches the client as Err. Reporting an internal invariant \
+             violation as a success is the lie #5263 removed. Arm: {arm:?}"
         );
         assert!(
-            !arm.contains("return Ok(accumulated_messages)"),
-            "the unexpected-response arm must not fall back to a fake success"
+            !arm.contains("DelegateRunOutcome::Completed"),
+            "the unexpected-response arm must not fall back to a success \
+             outcome. Arm: {arm:?}"
         );
     }
 
-    /// Pin: the delegate->apps TTL sweep must run BEFORE the early return on
-    /// an execution failure.
+    /// Pin: the delegate->apps TTL sweep must not be skippable by ANY exit
+    /// from the notification path.
     ///
-    /// `sweep_expired` is the registry's ONLY production caller, and it is what
-    /// time-bounds the map per the AGENTS.md GC-exemption rule. #5263 added an
-    /// early `return` on a failed execution; putting the sweep after it makes
-    /// the backstop conditional on the delegate SUCCEEDING. The failure that
-    /// motivated #5263 is one a delegate repeats on EVERY invocation (rejecting
-    /// `origin: None`), so on a node whose delegates all fail that way the
-    /// sweep would never run and stale registrations would pin their slots
-    /// against `MAX_APPS_PER_DELEGATE` until restart.
+    /// PROHIBITION (from #5263, restated behaviourally and WIDENED): the sweep
+    /// is the registry's only production caller and is what time-bounds the map
+    /// per the AGENTS.md GC-exemption rule. It must not become conditional on
+    /// the delegate doing anything in particular.
     ///
-    /// The source is truncated at the test module BEFORE scraping: both needles
-    /// below also occur in this function's own text, which `include_str!` pulls
-    /// in, so without the cut a rename would silently widen the region instead
-    /// of panicking (see #5450).
+    /// The original asserted the sweep appears before "the execution-failure
+    /// early return" — anchoring on one named exit, because that was the only
+    /// one its author could see. #5544 added two more (the delegate is already
+    /// parked and this notification is queued; or this run itself parks), and
+    /// the anchor was precisely the part that could not survive a third exit.
+    ///
+    /// So this asserts the STRONGER property the original was reaching for: the
+    /// sweep precedes EVERY exit, by sitting before the first of them. That
+    /// forbids everything the original forbade — its failure return is one of
+    /// the exits — plus the two parking introduced.
+    ///
+    /// The source is truncated at the test module BEFORE scraping: the needles
+    /// also occur in this function's own text, which `include_str!` pulls in
+    /// (see #5450).
     #[test]
-    fn ttl_sweep_precedes_the_execution_failure_return() {
+    fn ttl_sweep_precedes_every_exit_from_the_notification_path() {
         let full = include_str!("contract.rs");
         let cutoff = full
             .find("\nmod tests {")
@@ -4505,18 +4516,42 @@ mod tests {
             .unwrap_or(body.len());
         let body = &body[..end];
 
-        let sweep = body
+        // STRIP LINE COMMENTS FIRST. The needles below occur in this
+        // function's own prose — the sweep's comment explains which exits used
+        // to skip it, and the word "return" appears there. Scanning raw text
+        // found an "exit" inside a comment ABOVE the sweep and failed a
+        // correct implementation. Same hazard as #5450, one needle over.
+        let code: String = body
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(i) => &line[..i],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let sweep = code
             .find("delegate_app_registry::sweep_expired()")
-            .expect("the TTL sweep must live in handle_delegate_notification");
-        let bail = body
-            .find("let Ok(outbound) = outbound else")
-            .expect("the execution-failure early return must exist");
+            .expect("the notification path must sweep the delegate->apps registry");
+
+        // EVERY way out of this function, not one named one. `return` covers
+        // the queued-behind-a-park exit; `match outcome` covers the park and
+        // completion exits, which leave via the tail.
+        let first_exit = code
+            .match_indices("return")
+            .map(|(i, _)| i)
+            .chain(code.match_indices("match outcome").map(|(i, _)| i))
+            .min()
+            .expect("the function must have at least one exit");
 
         assert!(
-            sweep < bail,
-            "the TTL sweep ({sweep}) must run BEFORE the execution-failure \
-             return ({bail}); after it, the registry's only production sweep \
-             becomes conditional on the delegate succeeding"
+            sweep < first_exit,
+            "the TTL sweep must precede EVERY exit from the notification path, \
+             not just the execution-failure one. It is the registry's only GC \
+             and must not be conditional on how this invocation happens to \
+             leave — #5263's case was a delegate failing every time; #5544 \
+             added a delegate PARKING every time. sweep at {sweep}, first exit \
+             at {first_exit}"
         );
     }
 
@@ -6972,9 +7007,12 @@ mod hol_4391_tests {
             .expect("a twice-parked delegate must still resolve")
             .expect("join")
             .expect("the original client must be answered after the second park");
-        let ContractHandlerEvent::DelegateResponse(msgs) = resp else {
+        let ContractHandlerEvent::DelegateResponse(result) = resp else {
             panic!("expected one DelegateResponse covering the whole round-trip, got {resp}");
         };
+        // `DelegateResponse` carries a `Result` since #5263; a successful
+        // round-trip must not arrive as an execution failure.
+        let msgs = result.expect("the round-trip completed, so it must be Ok");
 
         // THE B3 ASSERTION. Both pre-park payloads must survive to the single
         // final response. Before the fix, the resumed run's `accumulated` was
