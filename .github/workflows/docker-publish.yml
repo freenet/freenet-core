@@ -429,14 +429,44 @@ jobs:
       - name: The published package is publicly pullable
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          IMAGE: ghcr.io/${{ github.repository }}
         run: |
           set -euo pipefail
           visibility=$(gh api "orgs/${{ github.repository_owner }}/packages/container/freenet-core" \
             --jq '.visibility' 2>/dev/null || echo unknown)
           echo "package visibility: ${visibility}"
 
-          if [ "$visibility" = public ]; then
+          # The authoritative test is an ANONYMOUS pull, because that is
+          # literally what a user does. It needs no API permission, so unlike
+          # the visibility field it cannot come back "unknown".
+          #
+          # DOCKER_CONFIG is pointed at an empty directory on purpose: the
+          # smoke job logged in to ghcr.io above, and without this the check
+          # would reuse those credentials and pass on a private package.
+          anon_ok=0
+          anon_home=$(mktemp -d)
+          if DOCKER_CONFIG="$anon_home" docker manifest inspect "${IMAGE}:${RELEASE_TAG}" >/dev/null 2>&1; then
+            anon_ok=1
+          fi
+          rm -rf "$anon_home"
+          echo "anonymous manifest fetch: ${anon_ok}"
+
+          if [ "$anon_ok" = 1 ]; then
+            # Public in the only sense that matters. Note a disagreeing
+            # visibility field rather than failing on it.
+            if [ "$visibility" != public ] && [ "$visibility" != unknown ]; then
+              echo "::warning::Anonymous pull works, but the package visibility field reads '${visibility}'. Worth a look, but not a broken release."
+            fi
             exit 0
+          fi
+
+          if [ "$visibility" = unknown ]; then
+            # GITHUB_TOKEN cannot always read org package metadata, so treat a
+            # failed lookup as "could not tell", never as "not public" — a
+            # release job that goes red on every run stops being read at all.
+            echo "::error::Could not pull ${IMAGE}:${RELEASE_TAG} anonymously, and could not read the package visibility either (the API lookup failed — GITHUB_TOKEN may lack read access to org packages). Most likely the GHCR package is still private. Check https://github.com/orgs/${{ github.repository_owner }}/packages/container/package/freenet-core and see docs/RELEASING.md, 'One-time setup: GHCR package visibility'."
+            exit 1
           fi
 
           echo "::error::The image published, but the GHCR package is '${visibility}', so nobody outside the org can pull it. GitHub creates a new package private and offers no API to change it, so this needs one manual change, once, ever: open https://github.com/orgs/${{ github.repository_owner }}/packages/container/package/freenet-core, go to package settings, and set visibility to Public. Then re-run this workflow with: gh workflow run docker-publish.yml --field tag=${{ github.event.release.tag_name || inputs.tag }}"

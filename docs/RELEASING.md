@@ -107,8 +107,12 @@ image published correctly and the `smoke` job failed with
 
 which looks like a broken image and is actually the package being private. The
 smoke job now authenticates its pull, so it tests whether the image runs rather
-than whether the package is public, and checks visibility as a separate step
-whose error message names this section. If you see that error on a future
+than whether the package is public. Public-ness is checked as a separate step,
+and what that step actually tests is an anonymous `docker manifest inspect` —
+the thing a user does — rather than the package's `visibility` field, because
+`GITHUB_TOKEN` cannot always read org package metadata and a lookup that fails
+must read as "could not tell", never as "not public". Its error message names
+this section. If you see that error on a future
 release, the package visibility has been reset rather than the image being bad.
 
 After changing it, re-run the publish for that tag:
