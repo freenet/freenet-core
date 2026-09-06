@@ -354,24 +354,39 @@ decide_linux_service_mode() {
     # Linux install from a system service to a user service — losing start-at-
     # boot and survive-logout for the large majority of users who have no
     # SELinux at all. Gate first, then decide.
-    if [ "$4" = "1" ]; then
-        case "$3" in
-            */.local/*) echo "user"; return ;;
-        esac
-        # The `case` in the && condition is deliberate: "${HOME}/"* requires a
-        # path separator after $HOME. A plain "$HOME"* prefix match would also
-        # match siblings like /home/aliceproject when HOME=/home/alice (see the
-        # prefix-match regression tests in scripts/test-install-sh.sh).
-        if [ -n "${HOME:-}" ] && case "$3" in "${HOME}/"*) true;; *) false;; esac; then
-            echo "user"
-            return
-        fi
+    # `[ "$1" != "1" ]`: never route a ROOT install here. `curl | sudo sh` resets
+    # HOME to /root, so install_dir becomes /root/.local/bin and matches the
+    # `*/.local/*` arm below. Without this guard that lands in `setup_service`'s
+    # user branch, which — unlike the system branch (four root guards) — has
+    # none, and `install_user_service` would either fail obscurely for uid 0 or
+    # install a root-owned user service running the node as root out of /root.
+    # A root install keeps the system service and its guards; SELinux routing is
+    # for a user installing their own binary under their own home.
+    if [ "${4:-0}" = "1" ] && [ "$1" != "1" ] && is_user_local_dir "$3"; then
+        echo "user"
+        return
     fi
     if [ "$1" = "1" ] || [ "$2" = "1" ]; then
         echo "system"
     else
         echo "user"
     fi
+}
+
+# Does this install directory belong to the invoking user rather than the system?
+#   $1 = install_dir
+# Used both by the routing decision and by the existing-system-unit warning, so
+# the two cannot drift apart.
+is_user_local_dir() {
+    case "$1" in
+        */.local/*) return 0 ;;
+    esac
+    # The `case` is deliberate: "${HOME}/"* requires a path separator after
+    # $HOME. A plain "$HOME"* prefix match would also match siblings like
+    # /home/aliceproject when HOME=/home/alice (see the prefix-match regression
+    # tests in scripts/test-install-sh.sh).
+    [ -n "${HOME:-}" ] && case "$1" in "${HOME}/"*) return 0 ;; esac
+    return 1
 }
 
 # Is SELinux actually in force on this machine?
@@ -382,7 +397,16 @@ decide_linux_service_mode() {
 # denials are logged rather than enforced, and an install that only works
 # until someone runs `setenforce 1` is not an install that works.
 selinux_active() {
-    has_cmd selinuxenabled && selinuxenabled 2>/dev/null
+    # `/sys/fs/selinux/enforce` is what `selinuxenabled` checks internally, and
+    # checking it directly removes a PATH dependency that would otherwise make
+    # this whole fix a silent no-op: `selinuxenabled` lives in /usr/sbin, which
+    # a `curl | sh` run from cron or a non-login RHEL shell need not have.
+    [ -e /sys/fs/selinux/enforce ] && return 0
+    # stdout is redirected as well as stderr on purpose. `resolve_service_action`
+    # is consumed via command substitution and matched by a `case` with no
+    # default arm, so one stray line here would install NO service at all and
+    # say nothing — the silent unsupervised node this installer exists to stop.
+    has_cmd selinuxenabled && selinuxenabled >/dev/null 2>&1
 }
 
 # Restore SELinux context on installed binaries (no-op on non-SELinux systems).
@@ -391,7 +415,14 @@ selinux_active() {
 #   $1 = install_dir
 restore_install_context() {
     if has_cmd restorecon; then
-        restorecon -v "$1/freenet" "$1/fdev" 2>/dev/null || true
+        # `|| true` is required (non-SELinux systems, and `set -e`), but a
+        # genuine refusal must not be silent: the user would then hit exactly
+        # the 203/EXEC from #4924 with nothing pointing at the cause.
+        if ! restorecon -v "$1/freenet" "$1/fdev" >/dev/null 2>&1; then
+            warn "Could not restore the SELinux context on the installed binaries."
+            warn "If the service fails to start with status=203/EXEC, run:"
+            warn "    restorecon -v $1/freenet $1/fdev"
+        fi
     fi
 }
 
@@ -406,6 +437,14 @@ resolve_service_action() {
 
     # Existing install wins: refresh the same kind we already have.
     if has_system_unit; then
+        # Deliberate, and it leaves half of #4924 unfixed for exactly the people
+        # who reported it: an affected user already HAS a system unit — that unit
+        # is the bug — so this returns before the SELinux routing below can run.
+        # The relabel half (`restore_install_context`, 203/EXEC) still reaches
+        # them because it runs unconditionally; the init_t AVCs do not. Creating
+        # a second unit here would be worse (duplicate services, orphaned data).
+        # `setup_service` explains it to the user — NOT here: `warn` writes to
+        # stdout, and this function's stdout IS its return value.
         echo "system"
         return
     fi
@@ -473,6 +512,24 @@ setup_service() {
 
     # Linux.
     action=$(resolve_service_action "$interactive" "$(dirname "$bin")")
+
+    # The existing-system-unit early return in resolve_service_action keeps the
+    # system service, which is right (a second unit would orphan the first's
+    # data) but leaves half of #4924 unfixed for precisely the users who
+    # reported it: the relabel below fixes their 203/EXEC, the init_t AVCs need
+    # the user-service routing that early return skips. Say so rather than
+    # leaving them with silence and a service that still gets denied.
+    if [ "$action" = "system" ] && has_system_unit \
+        && selinux_active && is_user_local_dir "$(dirname "$bin")"; then
+        warn "SELinux is enabled and Freenet is installed under your home"
+        warn "directory, but an existing SYSTEM service was found and is kept."
+        warn "A system service running a home-directory binary inherits init_t"
+        warn "and can be denied by SELinux (see issue #4924)."
+        warn "To switch to a user service:"
+        warn "    sudo $bin service uninstall --system"
+        warn "    then re-run this installer"
+    fi
+
     case "$action" in
         system)
             # Refresh guard: an existing system unit is re-templated using the
@@ -602,6 +659,16 @@ setup_service() {
                 warn "User service installation failed."
                 warn_unsupervised "$bin"
             fi
+            ;;
+        *)
+            # Unreachable by construction — but a `case` with no default arm
+            # fails SILENTLY, installing no service and saying nothing, which is
+            # the one outcome this installer must never produce. If a helper
+            # inside resolve_service_action ever leaks a line to stdout, the
+            # captured value stops matching and we land here. Say so and fall
+            # back to the loud unsupervised warning.
+            warn "Could not determine the service type (got: '$action')."
+            warn_unsupervised "$bin"
             ;;
     esac
 }

@@ -88,11 +88,21 @@ check_eq "decide: root, no-elevate + system dir -> system"    "system" "$(decide
 check_eq "decide: non-root + elevate + system dir -> system"  "system" "$(decide 0 1 /usr/local/bin)"
 check_eq "decide: non-root, no-elevate + system dir -> user"  "user"   "$(decide 0 0 /usr/local/bin)"
 
-# ON SELINUX, user-local directories (e.g. ~/.local/bin) use a user service to
-# avoid init_t denials (#4924).
-check_eq "decide: selinux + root + elevate + ~/.local/bin -> user"      "user"   "$(decide 1 1 /home/alice/.local/bin 1)"
+# ON SELINUX, a NON-ROOT install into a user-local directory (e.g. ~/.local/bin)
+# uses a user service to avoid init_t denials (#4924).
 check_eq "decide: selinux + non-root + elevate + ~/.local/bin -> user"  "user"   "$(decide 0 1 /home/alice/.local/bin 1)"
-check_eq "decide: selinux + root + elevate + ~/projects -> user"        "user"   "$(decide_with_home 1 1 /home/alice/projects /home/alice 1)"
+check_eq "decide: selinux + non-root, no-elevate + ~/.local/bin -> user" "user"  "$(decide 0 0 /home/alice/.local/bin 1)"
+check_eq "decide: selinux + non-root + elevate + ~/projects -> user"    "user"   "$(decide_with_home 0 1 /home/alice/projects /home/alice 1)"
+
+# ROOT MUST NEVER ROUTE HERE, even on SELinux with a user-local-looking path.
+# `curl | sudo sh` resets HOME to /root, so install_dir becomes /root/.local/bin
+# and matches the */.local/* arm. setup_service's user branch has none of the
+# four root guards the system branch has, and install_user_service has none
+# either, so this would either fail obscurely for uid 0 or install a root-owned
+# user service running the node as root out of /root.
+check_eq "decide: selinux + ROOT + /root/.local/bin -> system"         "system" "$(decide 1 1 /root/.local/bin 1)"
+check_eq "decide: selinux + ROOT + elevate + ~/.local/bin -> system"   "system" "$(decide 1 1 /home/alice/.local/bin 1)"
+check_eq "decide: selinux + ROOT + ~/projects -> system"               "system" "$(decide_with_home 1 1 /home/alice/projects /home/alice 1)"
 
 # OFF SELinux the routing must be exactly what it was before #4924. These are
 # the regression cases for the scope concern: $install_dir defaults to
@@ -108,28 +118,57 @@ check_eq "decide: no selinux + non-root + no-elevate + ~/.local/bin -> user" "us
 # Path must require a separator after $HOME: /home/aliceproject should NOT
 # match $HOME=/home/alice (prefix-only match bug, fixed with "${HOME}/"*).
 check_eq "decide: selinux + /home/aliceproject/bin with HOME=/home/alice -> system" "system" \
-    "$(decide_with_home 1 1 /home/aliceproject/bin /home/alice 1)"
+    "$(decide_with_home 0 1 /home/aliceproject/bin /home/alice 1)"
 check_eq "decide: selinux + /home/alice/project with HOME=/home/alice -> user"     "user" \
-    "$(decide_with_home 1 1 /home/alice/project /home/alice 1)"
+    "$(decide_with_home 0 1 /home/alice/project /home/alice 1)"
 
 # HOME unset: should NOT match-everything — fall through to elevate logic.
-check_eq "decide: selinux + root + elevate + /usr/local/bin, HOME unset -> system" "system" \
+check_eq "decide: selinux + non-root + elevate + /usr/local/bin, HOME unset -> system" "system" \
     "$(FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
         unset HOME
         . "$INSTALL"
         decide_linux_service_mode "$1" "$2" "$3" "$4"
-    ' _ 1 1 /usr/local/bin 1)"
+    ' _ 0 1 /usr/local/bin 1)"
+
+# $4 omitted entirely must mean "no SELinux", not an unbound-variable abort
+# under `set -u`. install.sh is hand-mirrored into freenet/web and a previous
+# fix was already lost once to a bulk resync, so this defends the default.
+check_eq "decide: selinux arg omitted -> treated as no-selinux" "system" \
+    "$(FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
+        . "$INSTALL"
+        decide_linux_service_mode "$1" "$2" "$3"
+    ' _ 0 1 /home/alice/.local/bin)"
 
 # ── restore_install_context: SELinux restorecon integration ────────────────
 
 # When restorecon is available, it must be called on the installed binaries.
-check_eq "restore: has_cmd restorecon -> calls restorecon" "called" \
-    "$(FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
+# The stub records to a FILE, not to stdout: restore_install_context now
+# redirects restorecon's stdout, precisely so a chatty restorecon cannot leak
+# into a value some caller captures.
+_check_restore_called() {
+    rm -f /tmp/.freenet-restore-called
+    FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
         . "$INSTALL"
         has_cmd() { case "$1" in restorecon) return 0 ;; *) return 1 ;; esac; }
-        restorecon() { printf "called"; }
+        restorecon() { echo called > /tmp/.freenet-restore-called; }
         restore_install_context /tmp/freenet-install
-    ')"
+    ' >/dev/null 2>&1
+    if [ -f /tmp/.freenet-restore-called ]; then printf "called"; else printf "not_called"; fi
+    rm -f /tmp/.freenet-restore-called
+}
+check_eq "restore: has_cmd restorecon -> calls restorecon" "called" "$(_check_restore_called)"
+
+# A relabel refusal must not be silent — it is the one failure this function
+# exists to prevent, and the user would otherwise meet it as a bare 203/EXEC.
+_check_restore_warns() {
+    FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
+        . "$INSTALL"
+        has_cmd() { case "$1" in restorecon) return 0 ;; *) return 1 ;; esac; }
+        restorecon() { return 1; }
+        restore_install_context /tmp/freenet-install
+    ' 2>&1 | grep -c "restorecon -v /tmp/freenet-install/freenet"
+}
+check_eq "restore: restorecon failure is reported, not swallowed" "1" "$(_check_restore_warns)"
 
 # When restorecon is not available, it must NOT be called.
 _check_restore_skip() {
@@ -150,13 +189,19 @@ _check_restore_skip() {
 check_eq "restore: no restorecon cmd -> skip" "not_called" "$(_check_restore_skip)"
 
 # Verify restorecon receives the correct binary paths.
-check_eq "restore: restorecon args match install_dir" "-v /tmp/freenet-install/freenet /tmp/freenet-install/fdev" \
-    "$(FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
+_check_restore_args() {
+    rm -f /tmp/.freenet-restore-args
+    FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
         . "$INSTALL"
         has_cmd() { case "$1" in restorecon) return 0 ;; *) return 1 ;; esac; }
-        restorecon() { printf "%s" "$*"; }
+        restorecon() { printf "%s" "$*" > /tmp/.freenet-restore-args; }
         restore_install_context /tmp/freenet-install
-    ')"
+    ' >/dev/null 2>&1
+    cat /tmp/.freenet-restore-args 2>/dev/null
+    rm -f /tmp/.freenet-restore-args
+}
+check_eq "restore: restorecon args match install_dir" "-v /tmp/freenet-install/freenet /tmp/freenet-install/fdev" \
+    "$(_check_restore_args)"
 
 # ── resolve_service_action: existing-install routing wins ──────────────────
 
@@ -238,7 +283,19 @@ check_eq "resolve: fresh + interactive + sudo present + system dir -> system" "s
 
 # On SELinux, even with elevation available, a user-local install dir uses a
 # user service to avoid init_t denials (#4924).
-check_eq "resolve: selinux + fresh + root + ~/.local/bin -> user" "user" \
+check_eq "resolve: selinux + fresh + non-root + sudo + ~/.local/bin -> user" "user" \
+    "$(resolve_with '
+        is_root() { return 1; }
+        sudo_noninteractive_ok() { return 0; }
+        has_cmd() { return 1; }
+        has_system_unit() { return 1; }
+        has_user_unit() { return 1; }
+        selinux_active() { return 0; }
+    ' 0 /home/alice/.local/bin)"
+
+# End-to-end companion to the decide-level root guard: `curl | sudo sh` on an
+# SELinux box must still take the system branch and its root guards.
+check_eq "resolve: selinux + fresh + ROOT + /root/.local/bin -> system" "system" \
     "$(resolve_with '
         is_root() { return 0; }
         sudo_noninteractive_ok() { return 1; }
@@ -246,7 +303,7 @@ check_eq "resolve: selinux + fresh + root + ~/.local/bin -> user" "user" \
         has_system_unit() { return 1; }
         has_user_unit() { return 1; }
         selinux_active() { return 0; }
-    ' 0 /home/alice/.local/bin)"
+    ' 0 /root/.local/bin)"
 
 # Off SELinux the same install goes to a system service, as it always did.
 # This is the end-to-end companion to the decide-level regression cases above:
