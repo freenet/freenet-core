@@ -1774,6 +1774,64 @@ mod tests {
         assert!(super::should_attempt_update_at(dir.path()));
     }
 
+    /// Pins the deliberate asymmetry between READING and REWRITING a damaged
+    /// counter, end to end, because it reads as a bug and was filed as one:
+    /// the read reports `MAX_UPDATE_FAILURES` (gate shut) while recording the
+    /// next failure rewrites the file as `1` (gate open again).
+    ///
+    /// The property that makes the rewrite safe is not that the gate stays
+    /// shut — it does not — but that reopening it is BOUNDED. So this asserts
+    /// the bound, not the reopening: after the rewrite, `MAX` further failures
+    /// put the lockout back. Without that, "resets to 1" really would be a way
+    /// to get unlimited attempts out of a corrupted file.
+    ///
+    /// `fs::write` is not atomic, so the truncated counter this covers is
+    /// reachable from an ordinary power cut mid-write, not only from tampering
+    /// — which is why persisting `MAX + 1` here would be the worse choice: it
+    /// would turn one ill-timed crash into a permanent lockout.
+    #[test]
+    fn a_corrupt_counter_shuts_the_gate_and_reopens_it_only_boundedly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update_failures");
+
+        // A truncated write is the realistic corruption; an empty file does
+        // not parse as a u32.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(
+            super::get_update_failure_count_at(dir.path()),
+            super::MAX_UPDATE_FAILURES,
+            "a damaged counter must read as fully-failed, never as zero"
+        );
+        assert!(
+            !super::should_attempt_update_at(dir.path()),
+            "so the gate is shut while the file is damaged"
+        );
+
+        super::record_update_failure_at(dir.path());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            "1",
+            "an unparseable counter restarts the count; persisting MAX + 1 would make a \
+             truncated write a permanent lockout that only manual deletion clears"
+        );
+        assert_eq!(super::get_update_failure_count_at(dir.path()), 1);
+        assert!(super::should_attempt_update_at(dir.path()));
+
+        // ...and the reopening is bounded: the lockout re-engages on schedule.
+        for _ in 1..super::MAX_UPDATE_FAILURES {
+            super::record_update_failure_at(dir.path());
+        }
+        assert_eq!(
+            super::get_update_failure_count_at(dir.path()),
+            super::MAX_UPDATE_FAILURES
+        );
+        assert!(
+            !super::should_attempt_update_at(dir.path()),
+            "corruption must not buy unlimited attempts — the gate closes again \
+             after MAX_UPDATE_FAILURES"
+        );
+    }
+
     use super::*;
     use freenet::transport::{
         set_open_connection_count, signal_version_mismatch, version_mismatch_generation,

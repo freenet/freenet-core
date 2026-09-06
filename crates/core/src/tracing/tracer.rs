@@ -1430,19 +1430,55 @@ mod error_filter_tests {
         // two — so each is pinned to its own function body below, and the total
         // is then pinned so a THIRD caller anywhere fails here rather than
         // sliding in unnoticed.
+        // Brace-matched, NOT "until the next `fn`". The file's own `fn_body`
+        // helper refuses indented definitions on purpose, and `build_filter`
+        // is a nested fn inside `init_tracer`, so it cannot be reused here.
+        // An unbounded slice is the failure AGENTS.md calls out: ending at the
+        // next `fn` would swallow the remaining ~250 lines of `init_tracer`,
+        // making the assertion "somewhere in that range there is one call",
+        // which passes vacuously once an unrelated edit lands in the range.
         let body_of = |sig: &str| -> String {
-            let start = source.find(sig).unwrap_or_else(|| {
-                panic!("{sig} not found; if it was renamed, update this pin deliberately")
-            });
-            let rest = &source[start + sig.len()..];
-            // Next top-level or nested `fn ` declaration ends the body well
-            // enough for a call-site count; an over-long slice would only make
-            // this pin STRICTER, never laxer.
-            let end = rest
-                .find("\n    fn ")
-                .or_else(|| rest.find("\npub fn "))
-                .unwrap_or(rest.len());
-            rest[..end].to_string()
+            let at = source
+                .find(sig)
+                .unwrap_or_else(|| panic!("definition not found: {sig}"));
+            assert!(
+                at < cut,
+                "`{sig}` matched inside the test module — this pin would be \
+                 scraping its own source and would pass vacuously"
+            );
+            let after = &source[at + sig.len()..];
+            let open = after
+                .find('{')
+                .unwrap_or_else(|| panic!("no opening brace after: {sig}"));
+            let mut depth = 0usize;
+            let mut end = None;
+            for (i, c) in after[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(open + i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end = end.unwrap_or_else(|| panic!("unbalanced braces in: {sig}"));
+            let body = &after[open..=end];
+            // Over-swallow detectors: a correctly bounded body cannot contain
+            // the test-module attribute or a following top-level definition.
+            assert!(
+                !body.contains("\n#[cfg(test)]\nmod "),
+                "`{sig}` body ran past the function into the test module"
+            );
+            assert!(
+                !body.contains("\npub fn "),
+                "`{sig}` body swallowed a following `pub fn` — the brace match \
+                 is wrong and this pin would measure more than one function"
+            );
+            body.to_string()
         };
 
         assert_eq!(
