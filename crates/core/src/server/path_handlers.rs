@@ -131,9 +131,37 @@ static CONTRACT_REFRESH_LOCKS: LazyLock<
 /// already the thing that serializes refreshers for one contract, and a second
 /// map keyed by a contract id from the URL would be another unbounded per-key
 /// collection to bound (`.claude/rules/code-style.md`).
+/// Which terminal-absence answer a suppressed cold fetch should replay.
+///
+/// `WebSocketApiError` carries no `Clone`/`Copy`, and its two terminal-absence
+/// variants map to genuinely different HTTP responses in `errors.rs`
+/// (`MissingContract` → 404, no `Retry-After`; `ContractNotFound` → 503 +
+/// `Retry-After`). A suppressed request must get the SAME answer the request
+/// that recorded the failure got, not an arbitrary pick between them — so this
+/// records which one it was, not just that failure occurred.
+#[derive(Debug, Clone, Copy)]
+enum TerminalAbsenceKind {
+    ContractNotFound,
+    MissingContract,
+}
+
+impl TerminalAbsenceKind {
+    fn into_error(self, instance_id: ContractInstanceId) -> WebSocketApiError {
+        match self {
+            TerminalAbsenceKind::ContractNotFound => {
+                WebSocketApiError::ContractNotFound { instance_id }
+            }
+            TerminalAbsenceKind::MissingContract => {
+                WebSocketApiError::MissingContract { instance_id }
+            }
+        }
+    }
+}
+
 #[derive(Default, Debug)]
 struct RefreshState {
-    /// When a COLD fetch last failed, and for which contract.
+    /// When a COLD fetch last failed, for which contract, and with which
+    /// terminal-absence answer.
     ///
     /// Without this, every subresource on a page pointing at a contract nobody
     /// can find pays its own full network GET, one after another, because each
@@ -143,15 +171,20 @@ struct RefreshState {
     ///
     /// The id is carried because [`REFRESH_LOCK_OVERFLOW`] stripes are shared
     /// between contracts, so a stripe's state may describe a different one.
-    last_cold_failure: Option<(ContractInstanceId, Instant)>,
+    last_cold_failure: Option<(ContractInstanceId, Instant, TerminalAbsenceKind)>,
 }
 
 impl RefreshState {
-    /// Whether a cold fetch for `instance_id` failed recently enough that
-    /// trying again now would just repeat it.
-    fn cold_fetch_failed_recently(&self, instance_id: &ContractInstanceId) -> bool {
-        self.last_cold_failure
-            .is_some_and(|(id, at)| id == *instance_id && at.elapsed() < CONTRACT_CACHE_REFRESH_TTL)
+    /// The terminal-absence answer to replay for `instance_id`, if a cold
+    /// fetch for it failed recently enough that trying again now would just
+    /// repeat it.
+    fn cold_fetch_failed_recently(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> Option<TerminalAbsenceKind> {
+        self.last_cold_failure.and_then(|(id, at, kind)| {
+            (id == *instance_id && at.elapsed() < CONTRACT_CACHE_REFRESH_TTL).then_some(kind)
+        })
     }
 }
 
@@ -1249,12 +1282,16 @@ async fn refresh_cache_if_due(
     // answer came from the network and nothing has changed since. Without
     // this, the subresources of a page pointing at an unfindable contract
     // each pay their own full GET in turn. Callers inside the window get the
-    // first caller's `ContractNotFound` (503 + `Retry-After`) directly,
-    // rather than falling through to the caller's empty-cache 404/500 — see
-    // the "terminal-absence" comment below for why only that class of
-    // failure suppresses the retry.
-    if cold && refresh.cold_fetch_failed_recently(&instance_id) {
-        return Err(WebSocketApiError::ContractNotFound { instance_id });
+    // first caller's own terminal-absence answer directly — replayed via
+    // `TerminalAbsenceKind::into_error`, not a hardcoded pick between the two,
+    // because `MissingContract` and `ContractNotFound` carry different status
+    // codes and headers in `errors.rs` — rather than falling through to the
+    // caller's empty-cache 404/500. See the "terminal-absence" comment below
+    // for why only that class of failure suppresses the retry.
+    if cold {
+        if let Some(kind) = refresh.cold_fetch_failed_recently(&instance_id) {
+            return Err(kind.into_error(instance_id));
+        }
     }
 
     // `_speculative_slot` must stay a NAMED binding: it holds the permit for
@@ -1288,12 +1325,17 @@ async fn refresh_cache_if_due(
         // recording it here would suppress a locally-stored contract's own
         // retry for the full `CONTRACT_CACHE_REFRESH_TTL` on nothing more
         // than a network hiccup.
-        let is_terminal_absence = matches!(
-            fetched,
-            Err(WebSocketApiError::ContractNotFound { .. }
-                | WebSocketApiError::MissingContract { .. })
-        );
-        refresh.last_cold_failure = is_terminal_absence.then(|| (instance_id, Instant::now()));
+        let terminal_absence_kind = match &fetched {
+            Err(WebSocketApiError::ContractNotFound { .. }) => {
+                Some(TerminalAbsenceKind::ContractNotFound)
+            }
+            Err(WebSocketApiError::MissingContract { .. }) => {
+                Some(TerminalAbsenceKind::MissingContract)
+            }
+            _ => None,
+        };
+        refresh.last_cold_failure =
+            terminal_absence_kind.map(|kind| (instance_id, Instant::now(), kind));
     }
     fetched?;
     CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
@@ -4118,6 +4160,90 @@ mod tests {
         clear_cache(&instance_id).await;
     }
 
+    /// The sibling of the previous test for the OTHER terminal-absence
+    /// variant, `MissingContract` (`GetResponse` with `contract: None`).
+    ///
+    /// This pins two things a single-variant test cannot: that `MissingContract`
+    /// suppresses a follow-up cold fetch exactly like `ContractNotFound` does
+    /// (deleting `| WebSocketApiError::MissingContract { .. }` from the
+    /// `is_terminal_absence`-equivalent match at the write site would not fail
+    /// `a_failed_cold_fetch_is_not_repeated_within_the_window`, since that test
+    /// only ever drives `ContractNotFound`), AND that the suppressed reply
+    /// REPLAYS the SAME variant the first request got. `MissingContract` and
+    /// `ContractNotFound` map to different status codes and headers in
+    /// `errors.rs` (404 with no `Retry-After` vs. 503 + `Retry-After`), so a
+    /// suppressed path that always answered `ContractNotFound` would give a
+    /// caller inside the window a DIFFERENT status than the caller who
+    /// triggered the suppression got.
+    #[tokio::test]
+    async fn a_missing_contract_cold_fetch_is_not_repeated_within_the_window() {
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![0x3b, 0x41])),
+            Parameters::from(vec![0x3b, 0x41]),
+        )));
+        let instance_id = *contract.key().id();
+        clear_cache(&instance_id).await;
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+
+        let (sender, mut rx) = request_channel();
+
+        // First request: fetches, and the node's own GetResponse proves the
+        // contract absent (`contract: None`).
+        let first = {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                refresh_cache_if_due(instance_id, &sender, &test_webapp_cache()).await
+            })
+        };
+        let callbacks = expect_fetch_pair_holding_callbacks(&mut rx, instance_id).await;
+        callbacks
+            .send(HostCallbackResult::Result {
+                id: crate::client_events::ClientId::next(),
+                result: Ok(HostResponse::ContractResponse(
+                    ContractResponse::GetResponse {
+                        key: contract.key(),
+                        contract: None,
+                        state: WrappedState::new(Vec::new()),
+                    },
+                )),
+            })
+            .expect("callback receiver live for the GetResponse");
+        assert!(
+            matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), first)
+                    .await
+                    .expect("the first request must resolve")
+                    .expect("handler must not panic"),
+                Err(WebSocketApiError::MissingContract { .. })
+            ),
+            "premise: a None-contract GetResponse must surface as MissingContract"
+        );
+        while rx.try_recv().is_ok() {} // the fetch's trailing Disconnect
+
+        // Second request, same contract, still cold: no GET may go out, and
+        // the reply must be the SAME variant — `MissingContract` (404, no
+        // `Retry-After`) — not the other terminal-absence variant.
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            refresh_cache_if_due(instance_id, &sender, &test_webapp_cache()),
+        )
+        .await
+        .expect("the second request must resolve, not queue behind a refetch");
+        assert!(
+            matches!(second, Err(WebSocketApiError::MissingContract { .. })),
+            "a request inside the failure window must replay the SAME \
+             terminal-absence variant the first request got, got: {second:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a cold fetch that just failed must not be repeated inside the \
+             window — one dead contract, one GET"
+        );
+
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+        clear_cache(&instance_id).await;
+    }
+
     /// A TRANSIENT cold-fetch failure — the response channel closing, as
     /// happens mid node-restart — must NOT suppress the next request's
     /// retry the way a proven-absent contract does (previous test). Before
@@ -4185,7 +4311,14 @@ mod tests {
                 })),
             })
             .expect("callback receiver live for the NotFound reply");
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), second).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), second)
+                .await
+                .expect("the second request must resolve")
+                .expect("handler must not panic")
+                .is_err(),
+            "an exhausted GET must surface as an error"
+        );
 
         CONTRACT_REFRESH_LOCKS.remove(&instance_id);
         clear_cache(&instance_id).await;
