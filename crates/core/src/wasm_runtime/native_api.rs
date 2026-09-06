@@ -1091,9 +1091,95 @@ pub(super) mod rand {
     }
 }
 
-pub(super) mod time {
+pub(crate) mod time {
     use super::*;
     use chrono::{DateTime, Utc as UtcOriginal};
+    use std::cell::RefCell;
+
+    use crate::util::time_source::DynTimeSource;
+
+    thread_local! {
+        /// Overrides the wall clock handed to a contract by [`utc_now`], for this
+        /// thread only. `None` — the production state — means the real clock.
+        ///
+        /// Contract WASM execution runs on a dedicated blocking thread (see
+        /// `execute_wasm_blocking` in `engine/wasmtime_engine.rs`), never on the
+        /// caller's thread, so this slot is only ever populated by that funnel
+        /// carrying an override captured from the calling thread across the
+        /// `spawn_blocking` boundary — never set directly from contract-call code.
+        static CONTRACT_CLOCK: RefCell<Option<DynTimeSource>> = const { RefCell::new(None) };
+    }
+
+    /// The wall-clock instant a contract sees.
+    ///
+    /// Routed through [`DynTimeSource`] rather than calling `Utc::now()` directly
+    /// so that a test CAN control what a contract believes the time to be.
+    /// `.claude/rules/testing.md` forbids a bare `now()` everywhere else in
+    /// `crates/core`; this was the one remaining exception.
+    ///
+    /// Why it matters beyond the rule: `update_determinism` detects a
+    /// clock-reading contract by calling merge twice and comparing bytes, so it
+    /// only fires when an expiry boundary happens to fall inside the few hundred
+    /// milliseconds between those two calls. Against a contract with hour-scale
+    /// windows nothing crosses a boundary and it reads clean — so a clean verdict
+    /// could not be told apart from "we did not catch it". With an injectable
+    /// clock the two calls can be placed an hour apart deliberately and any
+    /// clock reader is caught by construction. See #5465 and #5462.
+    fn contract_now() -> DateTime<UtcOriginal> {
+        // Read the override out before falling back, so the `RefCell` borrow has
+        // ended by the time anything else runs.
+        let overridden = CONTRACT_CLOCK.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|source| DateTime::<UtcOriginal>::from(source.system_time_now()))
+        });
+        overridden.unwrap_or_else(UtcOriginal::now)
+    }
+
+    /// Restores the previous contract clock when dropped.
+    ///
+    /// Restores the PREVIOUS value rather than clearing, so nesting is safe and an
+    /// inner override cannot silently unset an outer one.
+    #[must_use = "the override is reverted as soon as this guard is dropped"]
+    pub(crate) struct ContractClockGuard {
+        previous: Option<DynTimeSource>,
+    }
+
+    impl Drop for ContractClockGuard {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            CONTRACT_CLOCK.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+
+    /// Make contracts executed ON THIS THREAD read `source` instead of the real
+    /// clock, until the returned guard drops.
+    ///
+    /// This is the low-level primitive `execute_wasm_blocking` uses to carry an
+    /// override across the `spawn_blocking`/dedicated-thread boundary — see
+    /// [`current_contract_clock_override`]. Test code should call this on
+    /// whichever thread actually invokes the contract call (e.g. the test's own
+    /// thread when driving a `RuntimeOracle` synchronously); the funnel then
+    /// propagates it to the worker thread that runs the WASM.
+    pub(crate) fn override_contract_clock(source: DynTimeSource) -> ContractClockGuard {
+        let previous = CONTRACT_CLOCK.with(|slot| slot.borrow_mut().replace(source));
+        ContractClockGuard { previous }
+    }
+
+    /// Read this thread's current override, if any, so it can be carried across
+    /// to the thread that will actually execute the contract.
+    ///
+    /// Contract execution deliberately runs on a different thread from the
+    /// caller (`spawn_blocking` on a multi-thread runtime, a dedicated
+    /// `std::thread` otherwise — `execute_wasm_blocking`, the #4441 whole-node
+    /// hang fix), so a thread-local override installed on the calling thread
+    /// never reaches `utc_now` on its own. `execute_wasm_blocking` calls this on
+    /// the calling thread, then re-installs the result on the worker thread for
+    /// the duration of that one call, so production (which never overrides)
+    /// forwards `None` and pays nothing.
+    pub(crate) fn current_contract_clock_override() -> Option<DynTimeSource> {
+        CONTRACT_CLOCK.with(|slot| slot.borrow().clone())
+    }
 
     pub(crate) fn utc_now(id: i64, ptr: i64) {
         if id == -1 {
@@ -1104,7 +1190,7 @@ pub(super) mod time {
             return;
         }
         let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
-        let now = UtcOriginal::now();
+        let now = contract_now();
         let Some(ptr) = validate_and_compute_ptr::<DateTime<UtcOriginal>>(
             ptr,
             info.start_ptr,

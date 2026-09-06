@@ -7,7 +7,7 @@ pub(crate) mod engine;
 mod error;
 pub(crate) mod mock_state_storage;
 mod module_cache;
-mod native_api;
+pub(crate) mod native_api;
 mod runtime;
 pub mod secret_export;
 pub mod secret_snapshots;

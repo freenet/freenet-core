@@ -2358,12 +2358,21 @@ where
     let started_at_ms = Arc::new(AtomicU64::new(0));
     let started_for_guest = Arc::clone(&started);
     let started_at_for_guest = Arc::clone(&started_at_ms);
+    // Contract WASM runs on a dedicated blocking thread (spawn_blocking, or a
+    // plain std::thread — see the match below), never on the calling thread, so
+    // a contract-clock override set by a test on the CALLER's thread would not
+    // otherwise be visible to `native_api::time::utc_now`. Capture it here, on
+    // the calling thread, and re-install it for the guest's thread only, for
+    // the duration of this one call. Production never overrides the clock, so
+    // this reads and forwards `None` — a no-op.
+    let clock_override = native_api::time::current_contract_clock_override();
     let f = move || {
         // Record started_at BEFORE flipping `started`, so the poll loop that
         // observes started==true (SeqCst) is guaranteed to read a valid
         // started_at.
         started_at_for_guest.store(start.elapsed().as_millis() as u64, Ordering::SeqCst);
         started_for_guest.store(true, Ordering::SeqCst);
+        let _clock_guard = clock_override.map(native_api::time::override_contract_clock);
         f()
     };
 
