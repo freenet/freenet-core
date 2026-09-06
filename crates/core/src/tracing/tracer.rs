@@ -863,6 +863,89 @@ pub fn init_tracer(
     )
 }
 
+/// Install a stderr-only subscriber for a short-lived CLI subcommand.
+///
+/// ## Why this exists (#5244)
+///
+/// `freenet update` ran with **no subscriber at all**: `set_logger` is called
+/// only on the node path (`run_node`), so every `tracing::warn!` / `error!` in
+/// the installer was a no-op. Combined with the supervisor invoking it as
+/// `freenet update --quiet`, sites whose only output was a `warn!` plus a
+/// `!quiet`-gated `eprintln!` were completely silent in production — including
+/// "installed the update but could not arm crash-loop rollback".
+///
+/// ## Why not just call [`set_logger`] here
+///
+/// Two traps, both of which produce a fix that looks done and changes nothing:
+///
+/// 1. Passing a `log_dir` (the natural copy-paste from `run_node`) sets
+///    `use_file_logging`, which routes everything into the rolling log files.
+///    systemd captures stdout/stderr, NOT those files — that asymmetry is the
+///    whole of #5232. Every `warn!` would start "working" and the journal would
+///    stay exactly as blind.
+/// 2. With no log dir, [`init_tracer`] still falls through to stdout unless the
+///    `FREENET_LOG_TO_STDERR` env var happens to be set.
+///
+/// So this is explicit rather than configuration-dependent: **stderr, always**.
+/// Diagnostics belong there, it leaves the command's human-facing `println!`
+/// output on stdout, and systemd records both.
+///
+/// Deliberately minimal: no file appenders, no rate limiters. This is a
+/// process that runs for seconds and exits, and the output it must not lose is
+/// the handful of lines saying a safety mechanism did not engage.
+///
+/// `FREENET_DISABLE_LOGS` is still honoured, and `RUST_LOG` still overrides
+/// `level` via `from_env_lossy`.
+pub fn init_cli_stderr_tracer(level: LevelFilter) -> anyhow::Result<()> {
+    if std::env::var("FREENET_DISABLE_LOGS").is_ok() {
+        return Ok(());
+    }
+    let use_json = std::env::var("FREENET_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    let filter_layer = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(level.into())
+        .from_env_lossy()
+        .add_directive("moka=off".parse().expect("infallible"))
+        .add_directive("sqlx=error".parse().expect("infallible"));
+
+    // ANSI only for a human at a terminal. journald stores what it is given
+    // byte for byte, so colouring unconditionally would write escape sequences
+    // into the journal — which is the destination this whole function exists to
+    // reach. The file layers in `init_tracer` set `.with_ansi(false)` for the
+    // same reason.
+    let ansi = std::io::stderr().is_terminal();
+
+    use tracing_subscriber::layer::SubscriberExt;
+    let registry = Registry::default().with(filter_layer);
+    // `compact` rather than the `pretty` multi-line format `init_stdout_tracer`
+    // uses: one journal entry per event is far easier to read (and to grep)
+    // than an event split across several.
+    let result = if use_json {
+        tracing::subscriber::set_global_default(
+            registry.with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_ansi(false)
+                    .with_writer(std::io::stderr),
+            ),
+        )
+    } else {
+        tracing::subscriber::set_global_default(
+            registry.with(
+                tracing_subscriber::fmt::layer()
+                    .compact()
+                    .with_ansi(ansi)
+                    .with_writer(std::io::stderr),
+            ),
+        )
+    };
+    // Returned, not `expect`ed. `init_stdout_tracer` panics here, which for a
+    // CLI would turn "a subscriber was already installed" into a failed update
+    // — trading a diagnostics problem for an outage.
+    result.map_err(|e| anyhow::anyhow!("could not install the CLI subscriber: {e}"))
+}
+
 fn init_stdout_tracer(
     _default_filter: LevelFilter,
     to_stderr: bool,
@@ -1335,14 +1418,89 @@ mod error_filter_tests {
             "the WARN floor must live in build_error_filter and nowhere else"
         );
 
-        // `build_filter` (main + console) is the only remaining
-        // `from_env_lossy` caller. A second one means an error layer
-        // regressed to the unfloored inline shape this fix removed.
+        // `from_env_lossy` belongs to CONSOLE filters only, because RUST_LOG is
+        // the operator's console knob. An error layer using it would inherit
+        // RUST_LOG's level and lose the WARN floor again (#5015).
+        //
+        // There are exactly two console filters: `build_filter` (the node's
+        // main + console layers) and `init_cli_stderr_tracer` (the CLI's own
+        // stderr layer, added for #5244 so `freenet update` is not mute).
+        //
+        // Counting is not enough on its own — two callers could be the wrong
+        // two — so each is pinned to its own function body below, and the total
+        // is then pinned so a THIRD caller anywhere fails here rather than
+        // sliding in unnoticed.
+        // Brace-matched, NOT "until the next `fn`". The file's own `fn_body`
+        // helper refuses indented definitions on purpose, and `build_filter`
+        // is a nested fn inside `init_tracer`, so it cannot be reused here.
+        // An unbounded slice is the failure AGENTS.md calls out: ending at the
+        // next `fn` would swallow the remaining ~250 lines of `init_tracer`,
+        // making the assertion "somewhere in that range there is one call",
+        // which passes vacuously once an unrelated edit lands in the range.
+        let body_of = |sig: &str| -> String {
+            let at = source
+                .find(sig)
+                .unwrap_or_else(|| panic!("definition not found: {sig}"));
+            assert!(
+                at < cut,
+                "`{sig}` matched inside the test module — this pin would be \
+                 scraping its own source and would pass vacuously"
+            );
+            let after = &source[at + sig.len()..];
+            let open = after
+                .find('{')
+                .unwrap_or_else(|| panic!("no opening brace after: {sig}"));
+            let mut depth = 0usize;
+            let mut end = None;
+            for (i, c) in after[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(open + i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end = end.unwrap_or_else(|| panic!("unbalanced braces in: {sig}"));
+            let body = &after[open..=end];
+            // Over-swallow detectors: a correctly bounded body cannot contain
+            // the test-module attribute or a following top-level definition.
+            assert!(
+                !body.contains("\n#[cfg(test)]\nmod "),
+                "`{sig}` body ran past the function into the test module"
+            );
+            assert!(
+                !body.contains("\npub fn "),
+                "`{sig}` body swallowed a following `pub fn` — the brace match \
+                 is wrong and this pin would measure more than one function"
+            );
+            body.to_string()
+        };
+
+        assert_eq!(
+            body_of("fn build_filter(")
+                .matches(".from_env_lossy()")
+                .count(),
+            1,
+            "build_filter is the node's console filter and must read RUST_LOG"
+        );
+        assert_eq!(
+            body_of("pub fn init_cli_stderr_tracer(")
+                .matches(".from_env_lossy()")
+                .count(),
+            1,
+            "init_cli_stderr_tracer is the CLI's console filter and must read RUST_LOG \
+             (#5244)"
+        );
         assert_eq!(
             count(".from_env_lossy()"),
-            1,
-            "only the main/console filter may use from_env_lossy(); an error layer \
-             using it would inherit RUST_LOG's level again (#5015)"
+            2,
+            "only the two console filters may use from_env_lossy(); a third caller is \
+             an error layer inheriting RUST_LOG's level again (#5015)"
         );
     }
 }
