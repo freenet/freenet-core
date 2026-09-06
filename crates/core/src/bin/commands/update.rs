@@ -15,7 +15,22 @@ use super::service::generate_wrapper_script;
 #[cfg(target_os = "linux")]
 use super::service::{generate_system_service_file, generate_user_service_file};
 
-const GITHUB_API_URL: &str = "https://api.github.com/repos/freenet/freenet-core/releases/latest";
+/// Prefix for the by-exact-tag release endpoint; the caller appends `v{version}`.
+///
+/// This is the ONLY `api.github.com` request left in the update path (#5102), and
+/// it is reached only when an install is actually going ahead — we need the asset
+/// list, which the quota-free redirect cannot provide. The former
+/// `/releases/latest` REST call that ran on every invocation is gone: see
+/// `auto_update::GITHUB_LATEST_REDIRECT_URL`.
+/// Total deadline for the small release assets (`SHA256SUMS.txt`, `.sig`).
+const MANIFEST_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Idle (between-bytes) timeout for the release archive. Bounds a stalled
+/// connection without capping a slow-but-progressing download.
+const STALLED_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+const GITHUB_API_TAG_URL_PREFIX: &str =
+    "https://api.github.com/repos/freenet/freenet-core/releases/tags/";
 
 /// Ed25519 public key (raw 32-byte, little-endian compressed point) used to
 /// authenticate the release `SHA256SUMS.txt` manifest before any binary is
@@ -92,6 +107,19 @@ static FREENET_REVOCATION_PUBKEY: [u8; 32] = [
 ///     established — otherwise nodes on the unsigned lineage brick their own
 ///     auto-update.
 const REQUIRE_RELEASE_SIGNATURE: bool = false;
+
+// Tripwire for the two-release rollout, checked at compile time so flipping
+// the constant fails the build immediately rather than only when the test
+// suite happens to run. Flipping this to `true` makes an ABSENT signature
+// refuse the install, which bricks auto-update for any node still updating
+// from an unsigned older release. Only flip it (and then update this
+// assertion) once every release a live node could be updating from publishes
+// SHA256SUMS.txt.sig. See REQUIRE_RELEASE_SIGNATURE's doc comment above.
+const _: () = assert!(
+    !REQUIRE_RELEASE_SIGNATURE,
+    "do not require signatures until the signed floor is established; \
+     see the two-release transition note on REQUIRE_RELEASE_SIGNATURE"
+);
 
 /// Exit code returned when the binary is already up to date (no update performed).
 /// Used by the service wrapper to avoid unnecessary restarts.
@@ -357,9 +385,21 @@ impl UpdateCommand {
             println!("Checking for updates...");
         }
 
-        let latest = get_latest_release(self.force, self.quiet).await?;
-
-        let latest_version = latest.tag_name.trim_start_matches('v');
+        // #5102: resolve the tag over the quota-free `releases/latest` redirect.
+        // The REST asset list is fetched further down, ONLY once we know an
+        // install is actually going to happen — so the two overwhelmingly common
+        // outcomes of this command now cost zero api.github.com quota:
+        //   * "already up to date", which the systemd `ExecStopPost` hook reaches
+        //     on EVERY non-clean node exit (so a crash-looping node used to burn
+        //     REST quota once per crash), and
+        //   * `--check`, which never installs by definition.
+        let latest_tag = probe_latest_tag(self.force, self.quiet).await?;
+        // `latest_tag` is the tag verbatim (`v0.2.118`); `latest_version` is its
+        // semver part. Both are kept: the version is what we compare and what
+        // the rollback/pin bookkeeping keys on, while the RAW tag is what
+        // addresses the release. Deriving the URL by re-adding a `v` instead
+        // would 404 for any tag the strip/re-add round trip does not reproduce.
+        let latest_version = super::auto_update::version_from_tag(&latest_tag);
         if !self.quiet {
             println!("Latest version: {}", latest_version);
         }
@@ -437,6 +477,12 @@ impl UpdateCommand {
         if !self.quiet {
             println!("Downloading update...");
         }
+        // #5102: only NOW do we spend an api.github.com request, because only now
+        // do we need the asset list (names + download URLs, including the
+        // gnu→musl fallback search and the macOS DMG lookup). Requested by exact
+        // tag rather than `/releases/latest` so we install the release we just
+        // decided about, even if a newer one is published in between.
+        let latest = fetch_release_assets(&latest_tag, self.quiet).await?;
         // #4073 per-target-version install-failure gate. Count a DETERMINISTIC
         // install failure of this version — a checksum mismatch or invalid
         // release signature (`ReleaseVerificationError`) — toward the gate. After
@@ -1176,20 +1222,48 @@ impl Checksums {
     }
 }
 
-async fn get_latest_release(force: bool, quiet: bool) -> Result<Release> {
-    // Persistent rate limit (#4073): this is the supervisor-side choke point —
-    // the on-crash / on-update `freenet update` one-shot reaches GitHub through
-    // here. It uses its OWN on-disk token bucket (the INSTALL bucket), separate
-    // from the node's `get_latest_version` (NODE bucket), so the node — which
-    // always runs first in a restart cycle — can never spend the installer's
-    // tokens and starve a legitimate update. Because each `freenet update` is a
-    // fresh process, an in-memory limiter would reset on every restart and not
-    // bound a loop; the on-disk bucket holds the limit across restarts.
+/// Resolve the latest release tag for the installer, without spending GitHub
+/// REST API quota (#5102).
+///
+/// Replaces the old `/releases/latest` REST call. See
+/// [`auto_update::GITHUB_LATEST_REDIRECT_URL`] for why the redirect endpoint is
+/// used instead of `api.github.com`.
+///
+/// [`auto_update::GITHUB_LATEST_REDIRECT_URL`]: super::auto_update
+async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
+    // Persistent local rate limit (#4073): this is the supervisor-side choke
+    // point — the on-crash / on-update `freenet update` one-shot reaches GitHub
+    // through here. It uses its OWN on-disk token bucket (the INSTALL bucket),
+    // separate from the node's `get_latest_version` (NODE bucket), so the node —
+    // which always runs first in a restart cycle — can never spend the
+    // installer's tokens and starve a legitimate update. Because each `freenet
+    // update` is a fresh process, an in-memory limiter would reset on every
+    // restart and not bound a loop; the on-disk bucket holds the limit across
+    // restarts.
     //
-    // `--force` (an explicit operator action) bypasses the limiter. An automated,
-    // token-denied poll exits EXIT_CODE_ALREADY_UP_TO_DATE so the supervisor
-    // treats it as "nothing to do" and backs off, rather than as a failure that
-    // would count toward any lockout.
+    // The token is spent HERE (on the probe) rather than on the asset fetch
+    // below, because the probe is the call every invocation makes — it is what
+    // bounds a restart loop. The asset fetch happens only on a real install.
+    //
+    // `--force` (an explicit operator action) bypasses OUR local self-restraint —
+    // both this token bucket and the cached rate-limit cooldown below. It does
+    // NOT bypass a live 403/429 from GitHub, which is still honoured.
+    // Cooldown before the token, for the same reason as the node path: a
+    // token spent during a cooldown we will not act on just delays recovery
+    // once the cooldown lifts. `--force` waives both.
+    if !force {
+        if let Some(remaining) = super::auto_update::github_cooldown_remaining_public() {
+            let rate_limited = super::auto_update::GithubRateLimitedError {
+                retry_after: Some(remaining),
+            };
+            if !quiet {
+                eprintln!("{}", rate_limited.user_message());
+            }
+            tracing::warn!("Update check deferred: {}", rate_limited.user_message());
+            std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
+        }
+    }
+
     if !force && !super::auto_update::try_consume_install_poll() {
         if !quiet {
             eprintln!(
@@ -1203,26 +1277,111 @@ async fn get_latest_release(force: bool, quiet: bool) -> Result<Release> {
         std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
     }
 
+    // `force` also waives the CACHED cooldown. Without this, an operator running
+    // `freenet update --force` after a rate-limit episode would be refused by our
+    // own stale marker for up to MAX_GITHUB_COOLDOWN — even once GitHub had
+    // recovered — and told "already up to date". That would break the escape
+    // hatch two separate messages point users at ("Run `freenet update --force`
+    // to override", and the crash-loop rollback's "run it once a fixed release is
+    // available"). A live 403/429 still refuses and still re-arms the cooldown.
+    match super::auto_update::fetch_latest_release_tag(force).await {
+        Ok(tag) => Ok(tag),
+        Err(e) => {
+            // #5102: GitHub rate-limiting is NOT an install failure — it is "we
+            // could not find out". Exit as up-to-date so the supervisor backs off
+            // and restarts the current binary, exactly as for a token-denied
+            // poll, instead of counting a failure toward the #3934 lockout or
+            // restart-looping. This is the path the user hit as a bare
+            // "429 Too Many Requests"; it now explains itself.
+            //
+            // Reached under `--force` too — but only from a LIVE refusal, since
+            // force waives the cached marker above. Retrying immediately against
+            // a server that is actively refusing us is what escalates toward an
+            // IP block, and there is nothing the operator can do here that
+            // waiting would not do better.
+            if let Some(rate_limited) =
+                e.downcast_ref::<super::auto_update::GithubRateLimitedError>()
+            {
+                if !quiet {
+                    eprintln!("{}", rate_limited.user_message());
+                }
+                tracing::warn!("Update check deferred: {}", rate_limited.user_message());
+                std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
+            }
+            Err(e).context("Failed to determine the latest Freenet release")
+        }
+    }
+}
+
+/// Fetch the full release record (asset names + download URLs) for an exact tag.
+///
+/// This is the one remaining `api.github.com` request in the update path, and it
+/// runs only when an install is actually going ahead (#5102). Keyed by exact tag
+/// rather than `latest` so the assets we install match the version we decided to
+/// install, even if a new release lands between the probe and here.
+async fn fetch_release_assets(tag: &str, quiet: bool) -> Result<Release> {
+    // `tag` is verbatim from the redirect, so it is used as-is — no `v` is
+    // re-added. See `version_from_tag` for why the round trip was removed.
+    let url = format!("{GITHUB_API_TAG_URL_PREFIX}{tag}");
+
     let client = reqwest::Client::builder()
-        .user_agent("freenet-updater")
-        // Bound the request (parity with auto_update::get_latest_version). The
-        // broadened post-stop ExecStopPost reaches this on every committed
-        // crash's Proceed path, so a hung GitHub connection during a crash must
-        // not stall the post-stop updater (only loosely bounded by
-        // TimeoutStopSec on systemd, and worse under the mac/in-process wrapper).
+        .user_agent(super::auto_update::GITHUB_USER_AGENT)
+        // Bound the request. The broadened post-stop ExecStopPost reaches the
+        // update path on every committed crash's Proceed path, so a hung GitHub
+        // connection during a crash must not stall the post-stop updater (only
+        // loosely bounded by TimeoutStopSec on systemd, and worse under the
+        // mac/in-process wrapper).
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
     let response = client
-        .get(GITHUB_API_URL)
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
         .send()
         .await
         .context("Failed to fetch release info")?;
 
-    if !response.status().is_success() {
+    let status = response.status();
+    if super::auto_update::is_rate_limited_status(status) {
+        // Record the cooldown so subsequent polls (from any path) stay quiet.
+        let rate_limited = super::auto_update::note_rate_limited_response(|name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        });
+        // Exit as up-to-date rather than returning an error, matching
+        // `probe_latest_tag`. Being rate-limited is "we could not find out", not
+        // "the install failed".
+        //
+        // The mechanism that makes this matter is the macOS launchd wrapper
+        // (`service/macos.rs`): it counts CONSECUTIVE_FAILURES on a non-zero
+        // updater exit and, past MAX_CONSECUTIVE_FAILURES, `give_up_if_failing`
+        // exits 0 — which under `SuccessfulExit=false` STOPS the node
+        // permanently. Exit code 2 (ALREADY_UP_TO_DATE) is explicitly exempt
+        // there. So without this, a rate limit caused by any other client
+        // sharing the IP could take a perfectly healthy node offline for good.
+        //
+        // (An earlier version of this comment blamed the #3934 lockout counter.
+        // That was wrong and a reviewer traced it: `classify_update_subprocess`
+        // maps this to `OtherFailure` -> `NoChange`, deliberately not counting
+        // transient network errors. The macOS path is the real hazard, and a
+        // bigger one.)
+        //
+        // It also previously flattened the typed `GithubRateLimitedError` into a
+        // string, so no caller could tell it from a genuine install failure.
+        if !quiet {
+            eprintln!("{}", rate_limited.user_message());
+        }
+        tracing::warn!("Update deferred: {}", rate_limited.user_message());
+        std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
+    }
+
+    if !status.is_success() {
         anyhow::bail!(
             "GitHub API returned error: {} {}",
-            response.status(),
+            status,
             response.text().await.unwrap_or_default()
         );
     }
@@ -1250,7 +1409,13 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
     use futures::StreamExt;
 
     let client = reqwest::Client::builder()
-        .user_agent("freenet-updater")
+        .user_agent(super::auto_update::GITHUB_USER_AGENT)
+        // A TOTAL deadline is right here: these assets are a manifest of a few
+        // hundred bytes and a 64-byte signature, so there is no legitimate slow
+        // transfer to protect. Unbounded, a half-open connection would hang until
+        // systemd SIGKILLs the post-stop updater — the exact hazard the sibling
+        // timeout on the asset-list fetch was added to prevent.
+        .timeout(MANIFEST_DOWNLOAD_TIMEOUT)
         .build()?;
 
     let response = client
@@ -1495,7 +1660,14 @@ fn get_archive_extension() -> &'static str {
 
 async fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
     let client = reqwest::Client::builder()
-        .user_agent("freenet-updater")
+        .user_agent(super::auto_update::GITHUB_USER_AGENT)
+        // A READ timeout, deliberately NOT a total one: this is the release
+        // archive (tens of MB), so a total deadline would abort a legitimately
+        // slow connection. `read_timeout` bounds time between bytes, which is
+        // what actually distinguishes "slow link" from "stalled connection" —
+        // and it is the stall that would otherwise hang until SIGKILL on the
+        // ExecStopPost path.
+        .read_timeout(STALLED_TRANSFER_TIMEOUT)
         .build()?;
 
     let response = client
@@ -3916,6 +4088,75 @@ done
             .expect("baked-in release public key must be a valid ed25519 point");
     }
 
+    /// The container image verifies the release manifest at BUILD time, before
+    /// the node binary is ever in the image, so it cannot reuse
+    /// [`FREENET_RELEASE_PUBKEY`] and carries its own DER copy of the same key.
+    ///
+    /// Two copies of a key is exactly the shape that rots: rotating the signing
+    /// key and updating only this file would leave every image build failing
+    /// signature verification, with an error that points at the download rather
+    /// than at the stale key. Pin them together so the rotation fails here, in
+    /// CI, instead.
+    #[test]
+    fn release_pubkey_matches_docker_image_key() {
+        let der: &[u8] =
+            include_bytes!("../../../../../docker/freenet-node/release-signing-key.der");
+
+        // SubjectPublicKeyInfo for ed25519: a fixed 12-byte header (the
+        // AlgorithmIdentifier for id-Ed25519) followed by the raw 32-byte key.
+        // Stored as DER rather than PEM so this comparison is a plain byte
+        // check with no base64 dependency, and so `openssl pkeyutl -keyform
+        // DER` in the Dockerfile can read the very same file.
+        const ED25519_SPKI_PREFIX: [u8; 12] = [
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        assert_eq!(
+            der.len(),
+            ED25519_SPKI_PREFIX.len() + FREENET_RELEASE_PUBKEY.len(),
+            "docker release-signing-key.der must be an ed25519 SubjectPublicKeyInfo"
+        );
+        assert_eq!(
+            &der[..ED25519_SPKI_PREFIX.len()],
+            &ED25519_SPKI_PREFIX,
+            "docker release-signing-key.der must carry the ed25519 SPKI header"
+        );
+        assert_eq!(
+            &der[ED25519_SPKI_PREFIX.len()..],
+            FREENET_RELEASE_PUBKEY.as_slice(),
+            "docker/freenet-node/release-signing-key.der does not match the release \
+             key compiled into the node; a key rotation missed one of the two copies"
+        );
+    }
+
+    /// The container image verifies the release manifest at build time and
+    /// mirrors this crate's signing-transition policy: a signature that is
+    /// PRESENT must verify, an ABSENT one warns and proceeds. That mirroring is
+    /// a copy of a decision made here, so it rots the moment the decision
+    /// changes: flipping [`REQUIRE_RELEASE_SIGNATURE`] to `true` would leave the
+    /// Dockerfile silently permissive, building images from unsigned manifests
+    /// long after the node itself refused to.
+    #[test]
+    fn docker_image_signature_policy_matches_require_release_signature() {
+        let dockerfile = include_str!("../../../../../docker/freenet-node/Dockerfile");
+
+        let tolerates_absent_signature = dockerfile.contains("echo absent > /tmp/signature-status");
+        assert_eq!(
+            tolerates_absent_signature, !REQUIRE_RELEASE_SIGNATURE,
+            "docker/freenet-node/Dockerfile tolerates a missing release signature = {}, \
+             but REQUIRE_RELEASE_SIGNATURE = {}. When the signed floor is established \
+             and that constant flips, the Dockerfile's 404 branch must go with it.",
+            tolerates_absent_signature, REQUIRE_RELEASE_SIGNATURE
+        );
+
+        // The whole point of the branch split: only a 404 may skip verification.
+        // Any other status has to abort, or a rate limit or TLS blip produces an
+        // unverified image that exits 0 and looks identical to a verified one.
+        assert!(
+            dockerfile.contains("refusing to build an unverified image"),
+            "the Dockerfile must abort on a signature fetch failure that is not a 404"
+        );
+    }
+
     #[test]
     fn revocation_pubkey_matches_published_hex() {
         // Pins the reserved offline backup/revocation key to its documented
@@ -3934,19 +4175,10 @@ done
             .expect("baked-in revocation public key must be a valid ed25519 point");
     }
 
-    #[test]
-    fn transition_flag_is_false_until_signed_floor_established() {
-        // Tripwire for the two-release rollout. Flipping this to `true` makes
-        // an ABSENT signature refuse the install, which bricks auto-update for
-        // any node still updating from an unsigned older release. Only flip it
-        // (and then update this test) once every release a live node could be
-        // updating from publishes SHA256SUMS.txt.sig. See REQUIRE_RELEASE_SIGNATURE.
-        assert!(
-            !REQUIRE_RELEASE_SIGNATURE,
-            "do not require signatures until the signed floor is established; \
-             see the two-release transition note on REQUIRE_RELEASE_SIGNATURE"
-        );
-    }
+    // transition_flag_is_false_until_signed_floor_established: superseded by
+    // the `const _: () = assert!(...)` compile-time tripwire next to
+    // REQUIRE_RELEASE_SIGNATURE's definition, which catches the flip at
+    // build time instead of only when this test happens to run.
 
     #[test]
     fn valid_signature_accepted() {
@@ -4153,6 +4385,136 @@ done
             verify_manifest_signature_with(&tampered, Some(&sig_bytes), &pubkey, true, true)
                 .is_err(),
             "a tampered manifest must be refused even with a valid openssl signature"
+        );
+    }
+
+    // ── #5102: the update path must not spend REST quota to say "no change" ──
+
+    /// Strip `//` line comments so source-scrape pins assert on real code, not
+    /// on prose that happens to mention the symbol.
+    ///
+    /// URL-safe, unlike the naive version: a `//` preceded by `:` is a URL
+    /// scheme (`https://`), not a comment. This file is full of GitHub URLs, and
+    /// truncating at the scheme silently emptied every line holding one — which
+    /// made the api.github.com pin below report zero matches and "pass" against
+    /// source it had not actually examined.
+    fn strip_line_comments_for_pin(src: &str) -> String {
+        src.lines()
+            .map(|line| {
+                let bytes = line.as_bytes();
+                let mut i = 0;
+                while let Some(off) = line[i..].find("//") {
+                    let at = i + off;
+                    if at > 0 && bytes[at - 1] == b':' {
+                        i = at + 2;
+                        continue;
+                    }
+                    return &line[..at];
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn already_up_to_date_and_check_never_reach_the_rest_api() {
+        // The bug this pins (#5102): `freenet update` used to hit
+        // api.github.com/releases/latest on EVERY invocation, before knowing
+        // whether anything needed installing. systemd's ExecStopPost runs this
+        // command on every non-clean node exit, so a crash-looping node burned
+        // one request from the IP's shared 60/hr budget per crash — and
+        // `--check`, which by definition never installs, paid the same cost.
+        //
+        // The REST call must therefore come strictly AFTER both early exits.
+        let src = strip_line_comments_for_pin(include_str!("update.rs"));
+
+        let probe = src
+            .find("probe_latest_tag(")
+            .expect("run() must resolve the tag via the quota-free probe");
+        let rest_call = src
+            .find("fetch_release_assets(")
+            .expect("the REST asset fetch must still exist for real installs");
+        let up_to_date = src
+            .find("You are already running the latest version.")
+            .expect("already-up-to-date branch not found");
+        let check_branch = src
+            .find("if self.check {")
+            .expect("--check branch not found");
+
+        assert!(
+            probe < up_to_date,
+            "the tag must be probed before the already-up-to-date comparison"
+        );
+        assert!(
+            up_to_date < rest_call,
+            "the already-up-to-date exit must precede the REST asset fetch, or \
+             every ExecStopPost run after a crash spends REST quota (#5102)"
+        );
+        assert!(
+            check_branch < rest_call,
+            "`--check` must return before the REST asset fetch (#5102)"
+        );
+    }
+
+    #[test]
+    fn no_supervisor_path_invokes_update_with_force() {
+        // Load-bearing for the whole rate-limit bound (#5102). `--force` waives
+        // BOTH local limiters — the #4073 install token bucket and the cached
+        // GitHub cooldown — because it is an explicit operator action. That is
+        // only safe while it stays operator-only.
+        //
+        // If a supervisor ever gained `--force` (say, to "make auto-update more
+        // reliable"), every crash in a crash-loop would knock at GitHub with no
+        // local bound at all, which is precisely the runaway this PR exists to
+        // stop. Every automated invocation must use `update --quiet`.
+        let sources: [(&str, &str); 4] = [
+            ("service/wrapper.rs", include_str!("service/wrapper.rs")),
+            ("service/linux.rs", include_str!("service/linux.rs")),
+            ("service/macos.rs", include_str!("service/macos.rs")),
+            ("service.rs", include_str!("service.rs")),
+        ];
+        for (name, src) in sources {
+            for (i, line) in src.lines().enumerate() {
+                let code = match line.find("//") {
+                    Some(at) if at == 0 || !line[..at].ends_with(':') => &line[..at],
+                    _ => line,
+                };
+                assert!(
+                    !code.contains("--force"),
+                    "{name}:{} passes --force to an automated `freenet update`; that waives \
+                     both the token bucket and the GitHub cooldown, removing every local \
+                     bound on GitHub polling (#5102). Automated paths must use \
+                     `update --quiet`.\n  {line}",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_install_asset_fetch_uses_api_github_com() {
+        // Any NEW api.github.com URL in this file is a regression unless it is
+        // similarly gated behind "we are actually installing". Keeping the count
+        // at one makes that a deliberate decision rather than a drift.
+        // Counted as a URL prefix rather than as bare prose, so this test's own
+        // assertion messages cannot inflate the count.
+        let src = strip_line_comments_for_pin(include_str!("update.rs"));
+        // Assembled from fragments so this test's own needle is not present in
+        // the source it scans — otherwise the pin counts itself and the expected
+        // total drifts every time the test is edited.
+        let needle = concat!("https://", "api.github.com");
+        let hits = src.matches(needle).count();
+        assert_eq!(
+            hits, 1,
+            "expected exactly one api.github.com URL (the by-tag asset fetch); found {hits}. \
+             Detection must use the quota-free redirect — see \
+             auto_update::GITHUB_LATEST_REDIRECT_URL (#5102)"
+        );
+        assert!(
+            src.contains("releases/tags/"),
+            "the remaining REST call must request an exact tag, so the assets we \
+             install match the version we decided on"
         );
     }
 }

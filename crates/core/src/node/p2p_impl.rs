@@ -245,7 +245,21 @@ pub fn enable_abort_on_fatal_listener_exit() {
 /// Graceful shutdown (`NodeEvent::Disconnect`, e.g. SIGTERM or auto-update) returns
 /// [`EventLoopExitReason::GracefulShutdown`]; every other listener-exit error
 /// (UDP-listener death, unexpected stream end, a handler/transport error) is fatal.
-fn listener_exit_is_graceful(err: &anyhow::Error) -> bool {
+///
+/// Public because the `freenet` binary must classify the SAME error with the SAME
+/// predicate to choose its PROCESS EXIT CODE (#5227): this predicate already
+/// reported "graceful" for a SIGTERM stop while `main` still fell through to
+/// `eprintln!("Error: …")` + `std::process::exit(1)`, so a clean `systemctl stop`
+/// logged `status=1/FAILURE` and the crash-loop rollback counted it as a crash.
+///
+/// **Necessary but NOT sufficient for a success exit.** `p2p_protoc` also raises
+/// [`EventLoopExitReason::GracefulShutdown`] when a critical internal channel dies
+/// (`ChannelCloseReason::{Bridge, Controller, Notification, OpExecution}`) — a
+/// node-fatal fault nobody requested. This predicate is deliberately permissive
+/// there, because its own job is only to suppress the #4549 force-exit; a caller
+/// choosing an EXIT CODE must additionally confirm the stop was REQUESTED. See
+/// `bin/freenet.rs::finish_run`.
+pub fn listener_exit_is_graceful(err: &anyhow::Error) -> bool {
     err.downcast_ref::<EventLoopExitReason>()
         .is_some_and(|reason| matches!(reason, EventLoopExitReason::GracefulShutdown))
 }
@@ -501,13 +515,22 @@ impl NodeP2P {
         super::network_status::set_ban_list_provider(std::sync::Arc::new(move || {
             ban_list_ring.dashboard_ban_list_snapshot()
         }));
-        // Same pattern for the demand-driven hosting snapshot (piece A,
-        // #4642) — dashboard reads the canonical hosting cache (RAM budget +
-        // Greedy-Dual keep_score), the mechanism that actually governs
-        // retention now, replacing the dormant MAD governance detector.
+        // Same pattern for the demand-driven hosting snapshot (#4642) — the
+        // dashboard reads the canonical hosting cache. Retention is governed
+        // by the subscriber-primary sweep (`cache::victim_order`), NOT by the
+        // demoted telemetry-only Greedy-Dual `keep_score`.
         let hosting_ring = self.op_manager.ring.clone();
         super::network_status::set_hosting_provider(std::sync::Arc::new(move || {
             hosting_ring.dashboard_hosting_snapshot()
+        }));
+
+        // Per-reason hosted-contract breakdown for the OTel exporter only
+        // (count + state bytes per `HostingReason`). Kept off the ring-stats
+        // provider above because that one runs on every dashboard HTTP
+        // request and this is an O(hosted) walk under the cache read lock.
+        let reason_ring = self.op_manager.ring.clone();
+        super::network_status::set_hosting_reason_provider(std::sync::Arc::new(move || {
+            reason_ring.hosted_by_reason()
         }));
 
         // Wire live ring stats for the dashboard: connection count +
@@ -535,6 +558,9 @@ impl NodeP2P {
                 updates_accepted: rate_limiter.accepted_total(),
                 updates_rate_limited: rate_limiter.rejected_total(),
                 updates_capacity_dropped: rate_limiter.capacity_rejected_total(),
+                updates_capacity_evicted: rate_limiter.capacity_evicted_total(),
+                updates_sender_budget_dropped: rate_limiter.new_pair_budget_rejected_total(),
+                updates_sender_budget_unmetered: rate_limiter.new_pair_budget_untracked_total(),
                 lattice_has_successor: succ.is_some(),
                 lattice_has_predecessor: pred.is_some(),
                 lattice_successor_distance: succ,
@@ -849,6 +875,10 @@ impl NodeP2P {
             && !config.config.telemetry.is_test_environment
             && config.config.telemetry.iface_tx_enabled;
         let local_peer_id = config.local_peer_id_string();
+        // Cloned up front: `local_peer_id` is moved into the iface-tx spawn
+        // below, but the payload-mix aggregator is spawned later (it needs
+        // `op_manager`, which does not exist yet).
+        let payload_mix_peer_id = local_peer_id.clone();
         crate::transport::rolling_rtt_stats::spawn_aggregator(
             local_peer_id.clone(),
             &background_task_monitor,
@@ -889,6 +919,32 @@ impl NodeP2P {
             &background_task_monitor,
         )?);
         op_manager.ring.attach_op_manager(&op_manager);
+
+        // Fan-out payload-mix rollup (#3335): which arm of the payload
+        // selection put bytes on the wire (delta vs each of the four
+        // full-state fallbacks), and which contracts those full states belong
+        // to. Always-on and observation-only, same as the shadow aggregators
+        // above. Spawned HERE rather than with them because it reads this
+        // node's own accumulator, which lives on `op_manager` — a process
+        // global would let one node's ticker drain another's records.
+        crate::node::network_bridge::broadcast_payload_mix::spawn_payload_mix_aggregator(
+            op_manager.payload_mix.clone(),
+            payload_mix_peer_id.clone(),
+            &background_task_monitor,
+        );
+
+        // Outbound message-kind census (#4956): the payload mix above covers
+        // only update fan-out, which a paired measurement against
+        // `resource_utilization` found to be roughly a quarter of what a node
+        // actually sends. This one covers every non-stream message, so the
+        // arms SUM to the node's message traffic and the residual against
+        // `cumulative_bytes_sent` names the transport overhead instead of
+        // hiding it. Same per-`op_manager` reasoning as above.
+        crate::node::network_bridge::outbound_message_mix::spawn_outbound_mix_aggregator(
+            op_manager.outbound_mix.clone(),
+            payload_mix_peer_id,
+            &background_task_monitor,
+        );
 
         let contract_handler = CH::build(ch_inbound, op_manager.clone(), ch_builder)
             .await

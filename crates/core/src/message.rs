@@ -174,7 +174,7 @@ impl Transaction {
 impl<'a> arbitrary::Arbitrary<'a> for Transaction {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let ty: TransactionTypeId = u.arbitrary()?;
-        let bytes: u128 = Ulid::new().0;
+        let bytes: u128 = Ulid::generate().0;
         Ok(Self::update(ty.0, Ulid(bytes), None))
     }
 }
@@ -454,6 +454,12 @@ pub enum InterestMessage {
         /// Summary bytes is None if we're interested but don't have state yet.
         /// Use `SummaryEntry::from_summary()` to create entries.
         entries: Vec<SummaryEntry>,
+        /// Which code path built this message. NOT part of the wire format
+        /// (`#[serde(skip)]`), so it neither costs bytes nor changes what an
+        /// older peer decodes — see [`SummariesEmitter`] for why it exists and
+        /// what an inbound message's value means.
+        #[serde(skip)]
+        emitter: SummariesEmitter,
     },
 
     /// Incremental changes to our contract interests.
@@ -488,6 +494,165 @@ pub enum InterestMessage {
         /// Sender's current state summary bytes.
         summary_bytes: Vec<u8>,
     },
+
+    // ---------------------------------------------------------------------
+    // Hash-first summary exchange (#4965).
+    //
+    // APPENDED, and any future variant must be appended too: bincode encodes
+    // the variant as its positional index, so inserting anywhere above would
+    // renumber `Summaries`/`ResyncRequest`/… and silently mis-decode every
+    // message from an older peer. `wire_variant_indices_are_frozen` pins this.
+    // ---------------------------------------------------------------------
+    /// Hash-first replacement for [`InterestMessage::Summaries`]: advertises a
+    /// *digest* of each summary instead of the summary itself.
+    ///
+    /// Sent in place of `Summaries` when — and only when — the recipient's
+    /// reported version is at or above
+    /// `crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION` (an older peer cannot
+    /// deserialize this variant index and would drop the connection).
+    ///
+    /// The receiver compares each digest against a digest of **its own actual
+    /// summary**, and asks for the bytes of only the ones that differ (via
+    /// [`InterestMessage::SummaryRequest`]). Measured on the fleet, 98.1% of
+    /// summary comparisons find both sides already byte-identical (#4965), so
+    /// the overwhelmingly common case stops shipping ~33 KB per contract to
+    /// say "nothing changed".
+    SummaryDigests {
+        /// (contract_hash, summary_digest) pairs for shared contracts.
+        /// The digest is `None` if we're interested but hold no state yet —
+        /// exactly the case `SummaryEntry::summary_bytes == None` covers.
+        entries: Vec<SummaryDigestEntry>,
+        /// Which send path built this — the same non-wire (`#[serde(skip)]`)
+        /// tag [`InterestMessage::Summaries`] carries (#5052).
+        ///
+        /// The digest form REPLACES a `Summaries` at every send site, so it
+        /// must carry the same tag or a path would lose its per-emitter
+        /// attribution the moment its peer upgrades — the rollup would show
+        /// the named arm shrinking and the residual arm growing, which reads
+        /// as "hash-first saved bytes" when it actually means "we stopped
+        /// being able to see them".
+        #[serde(skip)]
+        emitter: SummariesEmitter,
+    },
+
+    /// Ask a peer for the FULL summary bytes of specific contracts.
+    ///
+    /// Sent only in reply to [`InterestMessage::SummaryDigests`], for the
+    /// entries whose advertised digest did not match our own summary's digest.
+    /// The peer answers with a plain [`InterestMessage::Summaries`], so the
+    /// mismatch path funnels back into the unchanged `Summaries` handler —
+    /// including its semantic staleness check and targeted `SyncStateToPeer`
+    /// heal. The exchange terminates there (`Summaries` never replies).
+    SummaryRequest {
+        /// Contract hashes (same `contract_hash` space as
+        /// [`InterestMessage::Interests`]) whose summary bytes we need.
+        hashes: Vec<u32>,
+    },
+}
+
+/// Which code path built an [`InterestMessage::Summaries`] — a NON-WIRE
+/// provenance tag carried alongside the message so the outbound byte census
+/// can attribute it (#5052).
+///
+/// ## Why the tag rides on the message
+///
+/// `interest_sync_summaries` is 49.8% of all outbound bytes on the fleet, and
+/// the arm counts four unrelated emitters together. They have opposite fixes:
+/// if the per-state-change notification dominates, #5003 (skip co-hosts the
+/// broadcast already covered, no wire change) is most of the answer; if the
+/// heartbeat reply dominates, the answer is hash-first (#4965), a wire-format
+/// change. A total that both drive cannot decide between them.
+///
+/// The census is taken at ONE choke point — the single place a `NetMessage` is
+/// handed to a connection ([`OutboundClass::classify`][c]) — where all that
+/// survives of the emitter is the message itself. So the emitter has to travel
+/// with it. Tagging at construction rather than calling a `record_*` at each
+/// site is deliberate: `.claude/rules/bug-prevention-patterns.md` has a whole
+/// row on manually-mirrored telemetry counters silently rotting when an op
+/// path is migrated, and a mandatory field cannot rot — a fifth emitter fails
+/// to COMPILE until it names its own arm, instead of quietly landing in the
+/// residual.
+///
+/// ## What it costs on the wire: nothing
+///
+/// The field is `#[serde(skip)]`, so the encoding of `Summaries` is byte-for-byte
+/// what it was before this tag existed (pinned by
+/// `summaries_emitter_tag_is_not_on_the_wire`). Two consequences worth stating
+/// because the first is easy to forget:
+///
+/// * a peer on any version decodes our messages exactly as before, and
+/// * an INBOUND `Summaries` always arrives as [`SummariesEmitter::Other`],
+///   because that is what `Default` supplies where the wire carries nothing.
+///   That is harmless today (the census only measures what this node SENDS,
+///   and every outbound `Summaries` is built locally), but a future path that
+///   re-sends a decoded message would report it as unattributed rather than
+///   mislabelling it.
+///
+/// [c]: crate::node::network_bridge::outbound_message_mix::OutboundClass::classify
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SummariesEmitter {
+    /// `operations::update::send_proactive_summary_notification` — one entry,
+    /// fanned to every interested peer on every state change.
+    Notification,
+    /// `node::handle_interest_sync_message`, replying to an `Interests`
+    /// advertisement — MULTI-entry, one per shared advertised contract, on
+    /// every ~5-min heartbeat received.
+    InterestsReply,
+    /// `node::handle_interest_sync_message`, replying to a `ChangeInterests`
+    /// delta — driven by interest churn rather than by the heartbeat clock. Kept
+    /// apart from [`Self::InterestsReply`] so the residual arm below stays a pure
+    /// residual; folding the two would repeat, one level down, exactly the
+    /// conflation this tag exists to undo.
+    ///
+    /// **SINGLE-entry, essentially always — but by CALLER convention, not by
+    /// construction.** `broadcast_change_interests` takes `added: Vec<ContractKey>`
+    /// and every caller today passes at most one, yet nothing pins that; and the
+    /// reply loop's hash-collision path can yield 2+ entries on a u32 FNV-1a
+    /// collision. So this is an empirical property of the current call sites, and
+    /// it is deliberately left unpinned: the R4b instrument is robust either way
+    /// (a multi-entry reply simply classifies as `MultiEntry` and leaves the
+    /// single-entry population). Contrast the NOTIFICATION leg, whose identical
+    /// structural property IS pinned, by
+    /// `notification_leg_is_always_full_bytes_and_single_entry` — because `p` is
+    /// read off that leg, so drift there corrupts the measurement rather than
+    /// merely shrinking its denominator.
+    ///
+    /// Corrected 2026-08-12 (#5153 review
+    /// F1); this said "also multi-entry" and that was measurably false.
+    /// `operations::broadcast_change_interests` is called with one contract per
+    /// gossip, so the reply built for it carries one entry: mean **1.000**
+    /// entries/msg with `max_entries` **1** across 418,476 messages on 1,284
+    /// peers in one window. Load-bearing, not trivia — it is why message LENGTH
+    /// is not a clean proxy for "this is a notification", which the R4b
+    /// agreement-rate instrument depends on.
+    ChangeInterestsReply,
+    /// `operations::update::send_summary_back_on_rejection` — one entry, only
+    /// when a rejected broadcast's summary already matched ours.
+    Rejection,
+    /// `node::handle_interest_sync_message`, replying to a `SummaryRequest`
+    /// with the bytes a digest could not settle (#4965).
+    ///
+    /// The one full-bytes send that hash-first ADDS rather than replaces, so
+    /// it gets its own arm: folded into `InterestsReply` it would look like
+    /// the heartbeat failing to shrink, when it is the mismatch tail doing
+    /// exactly what it is supposed to do.
+    SummaryRequestReply,
+    /// The `SummaryRequest` leg itself — a bare list of contract hashes, no
+    /// summaries (#4965).
+    ///
+    /// Carries no payload worth attributing, but is tagged anyway because the
+    /// per-emitter arms must SUM to `interest_sync_summaries`; an untagged
+    /// message would open a gap between the split and the arm it splits.
+    SummaryRequest,
+    /// Residual: no emitter claimed this message. The `Default`, so it is also
+    /// what a decoded inbound message carries.
+    ///
+    /// A non-zero `interest_sync_summaries_other_bytes` in the rollup means a
+    /// send path exists that this enum does not describe. That is the point of
+    /// having it — an unattributed emitter shows up as a number to chase
+    /// instead of silently inflating one of the named arms.
+    #[default]
+    Other,
 }
 
 /// A summary entry for the Summaries message.
@@ -517,6 +682,58 @@ impl SummaryEntry {
         self.summary_bytes
             .as_ref()
             .map(|bytes| freenet_stdlib::prelude::StateSummary::from(bytes.clone()))
+    }
+}
+
+/// The hash-first counterpart of [`SummaryEntry`]: identifies a contract and
+/// describes our summary of it, without carrying the summary.
+///
+/// The two fields are DIFFERENT hashes of different things and must not be
+/// conflated — see [`crate::ring::interest::summary_digest`] for the full
+/// contrast table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryDigestEntry {
+    /// Fast FNV-1a hash of the contract INSTANCE ID — identical in meaning and
+    /// value to [`SummaryEntry::hash`]. Says *which* contract; says nothing
+    /// about its state.
+    pub hash: u32,
+    /// Truncated-BLAKE3 digest of our summary BYTES for that contract, or
+    /// `None` if we're interested but hold no state yet. Says *what state* we
+    /// hold.
+    ///
+    /// Fixed 16 bytes, so for a summary SMALLER than ~8 bytes the digest form
+    /// is LARGER than the summary it replaces. Real summaries are orders of
+    /// magnitude bigger (~33 KB for a River room), so this is a curiosity
+    /// rather than a cost — but it means the saving is not monotonic in
+    /// summary size, and a contract with a trivially small summary should not
+    /// be expected to benefit.
+    pub summary_digest: Option<crate::ring::interest::SummaryDigest>,
+}
+
+impl SummaryDigestEntry {
+    /// Build a digest entry from the full-bytes entry we would otherwise have
+    /// sent.
+    ///
+    /// This is deliberately the only constructor PROVIDED, so every digest is
+    /// a pure function of the exact `SummaryEntry` the fallback `Summaries`
+    /// form would have carried and the two wire forms cannot describe
+    /// different state.
+    ///
+    /// It is a convention, not an invariant: the fields are `pub`, so a caller
+    /// could build the struct literally and pair a digest with an unrelated
+    /// summary. Nothing pins that today. Making the fields private would cost
+    /// the wire-format tests their literal construction, which is why the
+    /// weaker guarantee is stated rather than an enforcement implied. Those summaries in turn always come from
+    /// the node's ACTUAL state (`summary_if_hosted_or_in_use` /
+    /// `get_contract_summary`), never from a cached belief about a peer.
+    pub fn from_entry(entry: &SummaryEntry) -> Self {
+        Self {
+            hash: entry.hash,
+            summary_digest: entry
+                .summary_bytes
+                .as_deref()
+                .map(crate::ring::interest::summary_digest),
+        }
     }
 }
 
@@ -871,8 +1088,8 @@ impl Display for NodeEvent {
                     InterestMessage::Interests { hashes } => {
                         format!("Interests({} hashes)", hashes.len())
                     }
-                    InterestMessage::Summaries { entries } => {
-                        format!("Summaries({} entries)", entries.len())
+                    InterestMessage::Summaries { entries, emitter } => {
+                        format!("Summaries({} entries, {emitter:?})", entries.len())
                     }
                     InterestMessage::ChangeInterests { added, removed } => {
                         format!(
@@ -888,6 +1105,12 @@ impl Display for NodeEvent {
                         key, state_bytes, ..
                     } => {
                         format!("ResyncResponse({key}, {} bytes)", state_bytes.len())
+                    }
+                    InterestMessage::SummaryDigests { entries, emitter } => {
+                        format!("SummaryDigests({} entries, {emitter:?})", entries.len())
+                    }
+                    InterestMessage::SummaryRequest { hashes } => {
+                        format!("SummaryRequest({} hashes)", hashes.len())
                     }
                 };
                 write!(f, "SendInterestMessage (to: {target}, {msg_summary})")
@@ -990,8 +1213,10 @@ impl Display for NetMessage {
 // compile time, preventing a whole class of bugs that previously could
 // only surface at runtime (or worse, as UB via unreachable_unchecked).
 
-/// Transaction layout: Ulid (16 bytes) + Option<Ulid> (24 bytes, with niche) = 40 bytes.
-/// Any change to this layout would break serialization compatibility and network protocol.
+/// Transaction layout: Ulid (16 bytes) + Option<Ulid> (32 bytes) = 48 bytes.
+/// `u128` has no niche, so `Option<Ulid>` cannot pack the discriminant and is
+/// 32 bytes, not 24. Any change to this layout would break serialization
+/// compatibility and network protocol.
 const _: () = {
     // Ulid is a newtype over u128 (16 bytes).
     assert!(std::mem::size_of::<ulid::Ulid>() == 16, "Ulid size changed");
@@ -1017,6 +1242,218 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bincode variant index of every pre-existing `InterestMessage`
+    /// variant, frozen (#4965).
+    ///
+    /// bincode encodes an enum variant as its POSITIONAL index, so inserting a
+    /// variant anywhere but the end renumbers everything after it. That is not
+    /// a compile error and not a deserialization error either — a peer on the
+    /// old build would decode a `Summaries` as a `ChangeInterests` and act on
+    /// garbage. This is the v0.2.11 incident class, and the whole reason the
+    /// hash-first variants are APPENDED.
+    ///
+    /// bincode's default config writes the index as a little-endian u32, so
+    /// the first four bytes of a serialized `InterestMessage` are its index.
+    #[test]
+    fn interest_message_wire_variant_indices_are_frozen() {
+        use freenet_stdlib::prelude::CodeHash;
+
+        fn variant_index(msg: &InterestMessage) -> u32 {
+            let bytes = bincode::serialize(msg).expect("serialize InterestMessage");
+            u32::from_le_bytes(bytes[..4].try_into().expect("variant index prefix"))
+        }
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([1u8; 32]),
+            CodeHash::new([2u8; 32]),
+        );
+
+        // These five indices are on the wire of every released peer. Changing
+        // any of them is a protocol break; a new variant goes at the END.
+        assert_eq!(
+            variant_index(&InterestMessage::Interests { hashes: vec![1] }),
+            0,
+            "Interests must stay variant 0"
+        );
+        assert_eq!(
+            variant_index(&InterestMessage::Summaries {
+                entries: vec![SummaryEntry {
+                    hash: 1,
+                    summary_bytes: Some(vec![9]),
+                }],
+                emitter: SummariesEmitter::Other,
+            }),
+            1,
+            "Summaries must stay variant 1"
+        );
+        assert_eq!(
+            variant_index(&InterestMessage::ChangeInterests {
+                added: vec![1],
+                removed: vec![],
+            }),
+            2,
+            "ChangeInterests must stay variant 2"
+        );
+        assert_eq!(
+            variant_index(&InterestMessage::ResyncRequest { key }),
+            3,
+            "ResyncRequest must stay variant 3"
+        );
+        assert_eq!(
+            variant_index(&InterestMessage::ResyncResponse {
+                key,
+                state_bytes: vec![1],
+                summary_bytes: vec![2],
+            }),
+            4,
+            "ResyncResponse must stay variant 4"
+        );
+
+        // The hash-first additions occupy the next two slots. Pinned so a
+        // future insertion above them is caught here rather than in
+        // production: their indices are what
+        // `HASH_FIRST_SUMMARIES_MIN_VERSION` gates on being decodable.
+        assert_eq!(
+            variant_index(&InterestMessage::SummaryDigests {
+                entries: vec![],
+                emitter: SummariesEmitter::Other,
+            }),
+            5,
+            "SummaryDigests must stay variant 5 (appended, #4965)"
+        );
+        assert_eq!(
+            variant_index(&InterestMessage::SummaryRequest { hashes: vec![] }),
+            6,
+            "SummaryRequest must stay variant 6 (appended, #4965)"
+        );
+    }
+
+    /// The hash-first variants must survive a bincode round trip intact —
+    /// including the fixed-size digest array, which is the one field whose
+    /// encoding differs in kind from anything `SummaryEntry` carries.
+    #[test]
+    fn hash_first_variants_wire_roundtrip() {
+        let digest = crate::ring::interest::summary_digest(b"a summary");
+        let msg = InterestMessage::SummaryDigests {
+            emitter: SummariesEmitter::Other,
+            entries: vec![
+                SummaryDigestEntry {
+                    hash: 0xDEAD_BEEF,
+                    summary_digest: Some(digest),
+                },
+                SummaryDigestEntry {
+                    hash: 7,
+                    summary_digest: None,
+                },
+            ],
+        };
+        let bytes = bincode::serialize(&msg).expect("serialize SummaryDigests");
+        let decoded: InterestMessage =
+            bincode::deserialize(&bytes).expect("deserialize SummaryDigests");
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "a round-trip test asserts ONE variant; any other variant is a loud panic, not a silent fallthrough"
+        )]
+        match decoded {
+            InterestMessage::SummaryDigests { entries, .. } => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].hash, 0xDEAD_BEEF);
+                assert_eq!(entries[0].summary_digest, Some(digest));
+                assert_eq!(entries[1].hash, 7);
+                assert_eq!(
+                    entries[1].summary_digest, None,
+                    "a peer with no state must round-trip as None, not as a \
+                     zero digest — a zero digest would read as a real summary \
+                     and could accidentally 'agree'"
+                );
+            }
+            other => panic!("expected SummaryDigests, got {other:?}"),
+        }
+
+        let req = InterestMessage::SummaryRequest {
+            hashes: vec![1, 2, 3],
+        };
+        let bytes = bincode::serialize(&req).expect("serialize SummaryRequest");
+        let decoded: InterestMessage =
+            bincode::deserialize(&bytes).expect("deserialize SummaryRequest");
+        let InterestMessage::SummaryRequest { hashes } = &decoded else {
+            panic!("expected SummaryRequest, got {decoded:?}");
+        };
+        assert_eq!(hashes, &vec![1, 2, 3]);
+    }
+
+    /// A `SummaryDigests` message must be dramatically smaller than the
+    /// `Summaries` it replaces — that is the entire point (#4965), and a
+    /// refactor that accidentally re-attached the bytes would otherwise pass
+    /// every behavioural test in this PR while saving nothing.
+    ///
+    /// Sized against a River-scale summary (~33 KB measured in production).
+    #[test]
+    fn digest_form_is_orders_of_magnitude_smaller_than_full_bytes() {
+        let summary = vec![0xABu8; 33 * 1024];
+        let entry = SummaryEntry {
+            hash: 42,
+            summary_bytes: Some(summary),
+        };
+        let full = bincode::serialize(&InterestMessage::Summaries {
+            entries: vec![entry.clone()],
+            emitter: SummariesEmitter::Other,
+        })
+        .expect("serialize Summaries");
+        let digests = bincode::serialize(&InterestMessage::SummaryDigests {
+            entries: vec![SummaryDigestEntry::from_entry(&entry)],
+            emitter: SummariesEmitter::Other,
+        })
+        .expect("serialize SummaryDigests");
+
+        assert!(
+            digests.len() < 64,
+            "one digest entry should be a few dozen bytes, got {}",
+            digests.len()
+        );
+        assert!(
+            full.len() > 100 * digests.len(),
+            "the digest form must be >100x smaller than the bytes form \
+             ({} vs {} bytes) — if this fails, the digest is carrying the \
+             summary and the wire change saves nothing",
+            digests.len(),
+            full.len()
+        );
+    }
+
+    /// `SummaryDigestEntry::from_entry` must be a pure function of the entry it
+    /// is derived from: same contract hash, and a digest that is exactly the
+    /// digest of the bytes the fallback `Summaries` would have shipped.
+    ///
+    /// This is what makes the two wire forms interchangeable. If they could
+    /// describe different state, a digest "match" would no longer prove the
+    /// peer holds our summary, and the heal-suppression on agreement would be
+    /// unsound.
+    #[test]
+    fn digest_entry_is_derived_from_the_bytes_it_replaces() {
+        let bytes = vec![1u8, 2, 3, 4, 5];
+        let entry = SummaryEntry {
+            hash: 99,
+            summary_bytes: Some(bytes.clone()),
+        };
+        let digest_entry = SummaryDigestEntry::from_entry(&entry);
+        assert_eq!(digest_entry.hash, entry.hash);
+        assert_eq!(
+            digest_entry.summary_digest,
+            Some(crate::ring::interest::summary_digest(&bytes))
+        );
+
+        let none_entry = SummaryEntry {
+            hash: 99,
+            summary_bytes: None,
+        };
+        assert_eq!(
+            SummaryDigestEntry::from_entry(&none_entry).summary_digest,
+            None,
+            "'we hold no state' must stay distinguishable from any digest value"
+        );
+    }
 
     #[test]
     fn subscribe_hint_wire_roundtrip_and_version() {
@@ -1048,14 +1485,14 @@ mod tests {
 
     #[test]
     fn pack_transaction_type() {
-        let ts_0 = Ulid::new();
+        let ts_0 = Ulid::generate();
         std::thread::sleep(Duration::from_millis(1));
-        let tx = Transaction::update(TransactionType::Connect, Ulid::new(), None);
+        let tx = Transaction::update(TransactionType::Connect, Ulid::generate(), None);
         assert_eq!(tx.transaction_type(), TransactionType::Connect);
-        let tx = Transaction::update(TransactionType::Subscribe, Ulid::new(), None);
+        let tx = Transaction::update(TransactionType::Subscribe, Ulid::generate(), None);
         assert_eq!(tx.transaction_type(), TransactionType::Subscribe);
         std::thread::sleep(Duration::from_millis(1));
-        let ts_1 = Ulid::new();
+        let ts_1 = Ulid::generate();
         assert!(
             tx.id.timestamp_ms() > ts_0.timestamp_ms(),
             "{:?} <= {:?}",
@@ -1235,6 +1672,7 @@ mod tests {
                         summary_bytes: Some(vec![0u8; 10_000]),
                     },
                 ],
+                emitter: SummariesEmitter::InterestsReply,
             },
         };
         let display = format!("{summaries}");
@@ -1244,8 +1682,8 @@ mod tests {
             display.len()
         );
         assert!(
-            display.contains("Summaries(2 entries)"),
-            "Should show entry count: {display}"
+            display.contains("Summaries(2 entries, InterestsReply)"),
+            "Should show entry count and emitter: {display}"
         );
 
         // Interests should show hash count
@@ -1270,6 +1708,78 @@ mod tests {
         assert!(
             display.contains("ChangeInterests(+2 -1 hashes)"),
             "{display}"
+        );
+    }
+
+    /// The #5052 emitter tag must cost NOTHING on the wire and must not change
+    /// what any peer decodes.
+    ///
+    /// This is the property that makes the whole attribution safe to ship into
+    /// a mixed-version fleet, and `#[serde(skip)]` is the only thing enforcing
+    /// it — delete the attribute and everything still compiles, every other
+    /// test still passes, and `Summaries` silently grows a field that older
+    /// peers cannot decode. Freenet has shipped exactly that bug before
+    /// (v0.2.11, a protocol-enum change that broke pinned consumers), so the
+    /// encoding is asserted directly rather than assumed:
+    ///
+    /// 1. two messages with identical entries but DIFFERENT tags encode to
+    ///    identical bytes, and
+    /// 2. those bytes are exactly what a tagless `Summaries` encodes to, so
+    ///    the tag adds no discriminant byte either, and
+    /// 3. decoding yields the `Default` tag, which is the residual arm —
+    ///    an inbound message is unattributed, never mislabelled.
+    #[test]
+    fn summaries_emitter_tag_is_not_on_the_wire() {
+        let entries = || {
+            vec![SummaryEntry {
+                hash: 0xDEAD_BEEF,
+                summary_bytes: Some(vec![1, 2, 3, 4, 5]),
+            }]
+        };
+        let tagged = |emitter| InterestMessage::Summaries {
+            entries: entries(),
+            emitter,
+        };
+
+        let notification =
+            bincode::serialize(&tagged(SummariesEmitter::Notification)).expect("serialize");
+        let interests_reply =
+            bincode::serialize(&tagged(SummariesEmitter::InterestsReply)).expect("serialize");
+        let residual = bincode::serialize(&tagged(SummariesEmitter::Other)).expect("serialize");
+
+        assert_eq!(
+            notification, interests_reply,
+            "the emitter tag must not appear on the wire — two messages that \
+             differ only by emitter must encode identically"
+        );
+        assert_eq!(
+            notification, residual,
+            "not even the Default tag may reach the wire"
+        );
+
+        // A sibling variant with the same payload shape is the control: it
+        // shows the byte total above is a real `Summaries` encoding and not
+        // some degenerate empty one, so assertion (1) has something to prove.
+        let interests = bincode::serialize(&InterestMessage::Interests {
+            hashes: vec![0xDEAD_BEEF],
+        })
+        .expect("serialize");
+        assert_ne!(
+            notification, interests,
+            "sanity: Summaries and Interests must not encode identically"
+        );
+
+        let decoded: InterestMessage = bincode::deserialize(&notification).expect("deserialize");
+        let InterestMessage::Summaries { entries, emitter } = &decoded else {
+            panic!("expected Summaries, got {decoded:?}");
+        };
+        assert_eq!(entries.len(), 1, "payload must survive the round trip");
+        assert_eq!(entries[0].hash, 0xDEAD_BEEF);
+        assert_eq!(
+            *emitter,
+            SummariesEmitter::Other,
+            "a decoded message carries no provenance, so it must land \
+             in the residual arm rather than claim an emitter"
         );
     }
 
@@ -1304,6 +1814,73 @@ mod tests {
         assert!(
             display.contains(&tx.to_string()),
             "should include tx id: {display}"
+        );
+    }
+
+    /// Wire and at-rest format pin for `Transaction` (#4882).
+    ///
+    /// `Transaction.id` is a `ulid::Ulid`, and `ulid`'s `Serialize` emits the
+    /// 26-character Crockford base32 STRING, not the underlying `u128`. That
+    /// encoding is inherited from a third-party crate, so a dependency bump can
+    /// change it with no diff in this repo at all. If it ever flips to a raw
+    /// `u128` — a plausible upstream change — every peer's `NetMessage` decode
+    /// breaks and every existing `NetLogMessage` AOF segment
+    /// (`tracing/aof.rs::encode_log`) becomes undecodable, while CI stays green:
+    /// `Transaction`'s serde is derived structurally, and `NetMessageV1`
+    /// versioning does not cover a nested field's representation.
+    ///
+    /// Verified byte-identical under ulid 1.2.1 and 3.0.0 during the 3.0 bump.
+    ///
+    /// This compares against FIXED bytes on purpose. A round-trip test would
+    /// re-encode with the same version it decodes with, so it is self-consistent
+    /// by construction and cannot detect this class of change.
+    #[test]
+    fn transaction_bincode_encoding_is_pinned() {
+        const RAW: u128 = 0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEF;
+        const ENCODED: &str = "014D2PF2DBSQQG28T5CY4TQKFF";
+
+        // The base32 alphabet and length the pin below is built on.
+        assert_eq!(
+            Ulid(RAW).to_string(),
+            ENCODED,
+            "ULID string encoding changed; the wire format changed with it"
+        );
+
+        fn expect_ulid_bytes(encoded: &str) -> Vec<u8> {
+            let mut v = Vec::new();
+            // bincode writes a str as a little-endian u64 length, then the bytes.
+            v.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+            v.extend_from_slice(encoded.as_bytes());
+            v
+        }
+
+        let mut expected = expect_ulid_bytes(ENCODED);
+        expected.push(0); // Option::None
+
+        let tx = Transaction {
+            id: Ulid(RAW),
+            parent: None,
+        };
+        let actual = bincode::serialize(&tx).expect("serialize Transaction");
+        assert_eq!(
+            actual, expected,
+            "Transaction bincode encoding changed: this is a network protocol \
+             break AND makes existing event-log segments undecodable"
+        );
+        assert_eq!(actual.len(), 35, "Transaction encodes to 8 + 26 + 1 bytes");
+
+        // The parent arm too, since `Option<Ulid>` is the other half of the layout.
+        let mut expected_parent = expect_ulid_bytes(ENCODED);
+        expected_parent.push(1); // Option::Some
+        expected_parent.extend_from_slice(&expect_ulid_bytes("00000000000000000000000001"));
+        let tx = Transaction {
+            id: Ulid(RAW),
+            parent: Some(Ulid(1)),
+        };
+        assert_eq!(
+            bincode::serialize(&tx).expect("serialize Transaction"),
+            expected_parent,
+            "Transaction parent encoding changed"
         );
     }
 }

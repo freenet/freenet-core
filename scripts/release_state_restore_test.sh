@@ -91,4 +91,58 @@ test_restores_persisted_value "matching values" "0.3.205" "0.3.205" "0.3.205"
 # Fresh run: no state file exists, tentative value must be used as-is.
 test_no_persisted_keeps_tentative
 
+# ---------------------------------------------------------------------------
+# detect_crates_state: the CRATES_PUBLISHED resume flag must require BOTH crates
+#
+# Same family as the bug above -- resume state that is wrong in a way the
+# operator cannot see -- and a regression introduced while making a check more
+# accurate, which is why it is worth a permanent test rather than a comment.
+#
+# `publish_crates` returns early on CRATES_PUBLISHED, ABOVE its own per-crate
+# logic. So a flag set on freenet alone makes the fdev branch unreachable
+# exactly when it is needed: attach-to-release publishes freenet, the fdev
+# publish fails (docs/RELEASING.md records that fdev has no packaging
+# pre-flight anywhere, so this is the expected discovery point), the operator
+# resumes release.sh, and it reports the crates step already complete with fdev
+# never published.
+#
+# This checked freenet only for as long as it used `cargo search`, whose index
+# lag usually answered "not published" -- so the flag went unset and
+# publish_crates ran. The inaccuracy was the only thing holding the gap shut.
+# ---------------------------------------------------------------------------
+eval "$(awk '/^detect_crates_state\(\) \{/,/^}/' "$RELEASE_SH")"
+
+test_detect_crates_state() {
+    local name="$1" freenet_up="$2" fdev_up="$3" expected="$4" got
+    # Stub the registry lookup the real function calls.
+    crate_version_on_crates_io() {
+        case "$1" in
+            freenet) [[ "$freenet_up" == yes ]] ;;
+            fdev)    [[ "$fdev_up"    == yes ]] ;;
+            *)       return 1 ;;
+        esac
+    }
+    # Read by the extracted detect_crates_state, not by this function.
+    # shellcheck disable=SC2034  # consumed by the eval'd release.sh function
+    VERSION="9.9.9"
+    FDEV_VERSION="0.9.9"
+    COMPLETED_STEPS=()
+    detect_crates_state > /dev/null
+    got="${COMPLETED_STEPS[CRATES_PUBLISHED]:-unset}"
+    if [[ "$got" != "$expected" ]]; then
+        echo "FAIL [$name]: expected CRATES_PUBLISHED=$expected, got $got" >&2
+        exit 1
+    fi
+    echo "PASS [$name]"
+}
+
+# THE regression: a partial publish must NOT mark the step complete, or fdev is
+# silently stranded and the driver reports a successful release.
+test_detect_crates_state "partial publish leaves crates step incomplete" yes no  unset
+# ...and the normal cases, so the assertion above cannot be satisfied by a
+# function that simply never sets the flag.
+test_detect_crates_state "both crates published marks step complete"     yes yes 1
+test_detect_crates_state "neither published leaves step incomplete"      no  no  unset
+test_detect_crates_state "fdev-only leaves step incomplete"              no  yes unset
+
 echo "All tests passed."

@@ -2,6 +2,70 @@
 
 When the release script fails mid-process, use this guide to complete the release manually.
 
+## Read this before running anything
+
+**Publication is gated, and the gate is not optional.** The order is:
+
+```
+bump PR merges
+  -> tag vX.Y.Z pushed          (this is what triggers cross-compile.yml)
+  -> DRAFT GitHub release created
+  -> cross-compile.yml:  build -> attach binaries
+                         -> Gate A: auto-update pre-flight   BLOCKING
+                         -> cargo publish (crates.io)        IRREVERSIBLE
+                         -> gh release edit --draft=false
+```
+
+Two consequences for anyone recovering by hand. Both are about ORDER, not about
+never touching these commands — **Step 4 is the sanctioned way to do both by
+hand, and it exists because sometimes you have to.** What is never allowed is
+doing either one *ahead of the gate*.
+
+- **Never create the GitHub release without `--draft`, and do not un-draft it
+  yourself until Gate A has passed** (Step 4 shows how to confirm that, and is
+  the one place that un-drafts by hand). Gate A only sees a draft; a release
+  created published skips the gate entirely, which is the failure mode issue
+  #5288 was filed for. The workflow's own comment says the same thing: "Do NOT
+  un-draft it by hand" — meaning to bypass a gate that has not passed. Gate A
+  exists because auto-update was dead fleet-wide for two releases (v0.2.120,
+  v0.2.121) and every other signal stayed green. A broken updater cannot ship
+  its own fix.
+
+- **Never `cargo publish` by hand before Gate A has passed** — after it has, and
+  only when the workflow cannot do it, Step 4 is the procedure. The crates.io
+  upload is the only step in a release that can never be undone. It used to run
+  first, which is why v0.2.124 is permanently a draft with its crates already
+  published: the gate blocked it, and the version number was already spent. It
+  now runs inside `attach-to-release`, after the gate. Leave it there unless
+  the workflow itself is broken.
+
+**Which is why a blocked release is usually cheap now.** If Gate A fails, no
+crates were uploaded — so the tag and draft can be deleted and the same version
+re-cut on a corrected commit.
+
+**Confirm that before deleting anything.** If the crates for that version *are*
+already on crates.io the version is spent, and then the tag and draft must be
+LEFT IN PLACE (see `docs/RELEASING.md`, "If Gate A fails") while you cut the
+next patch instead. The check is cheap and the two cases have opposite answers:
+
+```bash
+# 200 = published (version spent: leave the tag and draft, cut the next patch)
+# 404 = not published (re-cuttable: delete and re-cut the same version)
+# The -A is required -- crates.io answers 403 without a descriptive User-Agent,
+# and a body-parsing form reads that 403 as "not published" for every version.
+curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
+  --max-time 30 --retry 3 --retry-all-errors \
+  https://crates.io/api/v1/crates/freenet/X.Y.Z
+```
+
+Only on a **404**, delete and re-cut:
+
+```bash
+gh release delete vX.Y.Z --repo freenet/freenet-core --yes   # it is still a draft
+git push --delete origin vX.Y.Z
+git tag -d vX.Y.Z
+```
+
 ## Quick Reference
 
 ```bash
@@ -9,7 +73,22 @@ When the release script fails mid-process, use this guide to complete the releas
 gh pr view <PR_NUMBER> --json state,mergedAt
 git tag -l "v*" | tail -5
 gh release list --limit 5
-cargo search freenet --limit 1
+gh release view vX.Y.Z --json isDraft,assets --jq '{isDraft, assets: [.assets[].name]}'
+
+# Is THIS version on crates.io? `cargo search` only ever reports a crate's
+# newest version, and reads the search index, which lags the registry — so it
+# can answer 'no' about a version that is published. Ask for the version.
+# 200 = published, 404 = not published. ANY other code is UNKNOWN, not "no" --
+# notably 403, which is what crates.io returns when the request carries no
+# descriptive User-Agent. Do not drop the -A: without it this returns 403 for
+# every version, and a body-parsing form reads that as "not published" while
+# curl exits 0 and prints nothing.
+curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
+  --max-time 30 --retry 3 --retry-all-errors \
+  https://crates.io/api/v1/crates/freenet/0.1.X
+
+# Did the gate run, and what did it say?
+gh run list --workflow=cross-compile.yml --branch vX.Y.Z --limit 3
 
 # Resume from where you left off
 # See detailed steps below based on where the failure occurred
@@ -39,10 +118,25 @@ cargo search freenet --limit 1
 - No git tag exists for version
 
 **Recovery:**
+
+Tag the **release commit**, not `main`. The release is cut from one pinned
+commit (the version-bump PR's merge commit), and `main` may have moved past it
+while the workflow was waiting on the merge queue. Tagging `main` by hand
+reintroduces #5233 — the bug the pipeline now prevents.
+
 ```bash
 cd ~/code/freenet/freenet-core/main
-git pull origin main
-git tag v0.1.X
+git fetch origin
+
+# The bump PR is the "build: release X.Y.Z" one. The release.yml run log also
+# prints "📌 Release pinned to <sha>".
+RELEASE_SHA=$(gh pr view <BUMP_PR> --repo freenet/freenet-core \
+  --json mergeCommit --jq '.mergeCommit.oid')
+
+# Confirm it really is the bump commit before tagging it.
+git show "$RELEASE_SHA:crates/core/Cargo.toml" | grep '^version'
+
+git tag -a v0.1.X "$RELEASE_SHA" -m "Release v0.1.X"
 git push origin v0.1.X
 ```
 
@@ -53,34 +147,258 @@ git push origin v0.1.X
 - No GitHub release
 
 **Recovery:**
+
+`--draft` is REQUIRED. The pre-flight canary (Gate A) inspects the draft and
+un-drafts it itself, after publishing to crates.io. A release created without
+`--draft` is published the moment it exists: the gate never sees it, the
+crates.io publish that lives behind the gate never runs, and the downstream
+`release.published` cascade fires against a release with no binaries attached.
+
 ```bash
 gh release create v0.1.X \
   --repo freenet/freenet-core \
   --title "v0.1.X" \
+  --draft \
   --notes "$(gh api repos/freenet/freenet-core/releases/generate-notes \
-    -f tag_name=v0.1.X -f target_commitish=main --jq .body)"
+    -f tag_name=v0.1.X -f target_commitish="$RELEASE_SHA" --jq .body)"
 ```
 
-### Step 4: Release Created but Crates Not Published
+Then let the workflow finish the job. If it did not start (a lapsed
+`RELEASE_PAT` suppresses the tag event — see AGENTS.md), start it by hand
+against the tag; `attach-to-release` requires a `refs/tags/v*` ref, so the
+`--ref` must be the tag, not a branch:
+
+**Check nothing is already running for this tag first.** `cross-compile.yml`
+sets `cancel-in-progress` for any ref that is not `main`, so dispatching against
+a tag **cancels the in-flight run for that same tag**. The moment you reach for
+this command — "did it start? is it stuck?" — is exactly when a run may be in
+flight, and a cancellation can now land between the two crate publishes, or
+between the publish and the un-draft. Both states are recoverable (Step 4
+re-runs safely, skipping whatever already published), but do not create them for
+no reason.
+
+```bash
+# Is one already running? If so, watch it instead of dispatching.
+gh run list --repo freenet/freenet-core --workflow=cross-compile.yml \
+  --branch v0.1.X --limit 5 --json databaseId,status,conclusion
+
+gh workflow run cross-compile.yml --repo freenet/freenet-core --ref v0.1.X
+```
+
+**Each dispatch re-signs the Windows binaries.** `build-x86_64-windows`
+Authenticode-signs `freenet.exe` and `fdev.exe` on every tag build and every
+manual dispatch, against an Azure Artifact Signing quota of 5,000 signatures
+per month (Basic tier) — 2 per run. That is a large budget and ordinary
+recovery will not dent it, but a dispatch loop is not free, which is one more
+reason to check for a running job before firing another.
+
+**What a signing failure looks like from the outside: a draft release with NO
+Windows assets at all.** The `Verify signatures` step runs BEFORE the two
+`upload-artifact` steps, so when it throws they are *skipped* — the unsigned
+binaries never become artifacts, and there is nothing for `attach-to-release`
+to attach. Do not go debugging artifact upload; an empty Windows slot is the
+expected shape of a signing failure. Go straight to the `Verify signatures`
+step output. (Verified by deliberately failing the gate: `Verify signatures =>
+failure`, `Upload freenet binary => skipped`, `Upload fdev binary => skipped`.)
+
+**If this job fails at signing, the failure is Azure-side and cannot be fixed
+from the repo.** Unlike every other release secret, Windows signing is
+fail-closed: the `Verify signatures` step throws if either binary is unsigned,
+invalid, missing its RFC3161 timestamp, or signed by a publisher other than
+`CN=Freenet Project Inc`, and `attach-to-release` needs this job, so the
+release stops as a draft rather than shipping unsigned binaries.
+Read the `Verify signatures` step output first — it prints each binary's status
+and signer subject. Expect:
+
+```
+CN=Freenet Project Inc, O=Freenet Project Inc, L=Austin, S=Texas, C=US
+```
+
+**If the failure is `Unexpected signer`** rather than unsigned/untimestamped,
+the binary WAS signed, just not by us. Three possibilities, in the order worth
+checking: the Azure certificate profile was repointed (misconfiguration); the
+certificate was legitimately reissued under a changed name (e.g. the company
+name changed) — in which case update the expected CN deliberately and in a
+reviewed PR, in BOTH the comparison and the thrown message in the `Verify
+signatures` step, and in its pin in
+`crates/core/tests/windows_signing_order.rs`; or, least likely and most
+serious, someone else signed it. Never delete the check to get a release out:
+that is the one action that converts a blocked release into an unsigned one
+shipped to users whose Windows auto-update has no canary (#5341).
+
+Note that a repoint is not guaranteed to surface as `Unexpected signer`. If the
+profile it was repointed to does not chain to a root the runner trusts — an
+Azure Trusted Signing *test* profile, or a private-trust profile — then
+`$sig.Status` is not `Valid` and the step throws `Unsigned or invalid` first, on
+an earlier line. A repoint is therefore worth checking under either message,
+not only this one.
+
+Common causes, in the order worth checking: the `release` environment or the
+`AZURE_*` secrets were changed (the Entra federated credential is pinned to the
+subject `repo:freenet/freenet-core:environment:release`, so removing
+`environment: release` from the job breaks authentication); the certificate
+profile was rotated or disabled in Azure; or a genuine Artifact Signing
+outage. There is no repo-side workaround — do NOT strip the signing steps to
+force a release through, because that ships unsigned binaries to users whose
+Windows auto-update has no canary to catch the regression (#5341).
+
+### Step 4: Binaries Attached but Crates Not Published
 
 **Symptoms:**
-- GitHub release exists
+- Draft GitHub release exists with all assets
 - Crates not on crates.io
 
 **Recovery:**
+
+Normally: re-run the `attach-to-release` job. Its publish step skips any
+version already on crates.io, so a re-run is safe, and it keeps the publish and
+the un-draft in the right order.
+
+```bash
+REPO=freenet/freenet-core
+TAG=v0.1.X
+
+RUN_ID=$(gh run list --repo "$REPO" --workflow=cross-compile.yml \
+  --branch "$TAG" --limit 1 --json databaseId --jq '.[0].databaseId')
+
+# `--job` wants the job's databaseId, which is NOT the number in the browser
+# URL. Look it up rather than copying it from the address bar.
+JOB_ID=$(gh run view "$RUN_ID" --repo "$REPO" --json jobs \
+  --jq '.jobs[] | select(.name | startswith("Attach binaries")) | .databaseId')
+
+gh run rerun --repo "$REPO" --job "$JOB_ID"
+```
+
+Only if that path is unavailable, publish by hand — and **check first that
+Gate A actually passed**, because publishing is what makes the version
+permanent:
+
+```bash
+REPO=freenet/freenet-core
+TAG=v0.1.X
+
+# Find the run for this tag.
+RUN_ID=$(gh run list --repo "$REPO" --workflow=cross-compile.yml \
+  --branch "$TAG" --limit 1 --json databaseId --jq '.[0].databaseId')
+
+# Confirm Gate A actually PASSED, by reading the step's CONCLUSION.
+#
+# Do NOT confirm this by grepping the log for "Gate A". The canary prints
+# "=== Gate A: auto-update pre-flight on the binary about to ship ===" as the
+# FIRST line of cmd_preflight, before it checks anything, so that grep returns
+# the same output whether the gate passed, blocked on a real fault, or gave no
+# verdict at all. It looks like confirmation and confirms nothing — directly
+# above an irreversible publish.
+gh run view "$RUN_ID" --repo "$REPO" --json jobs --jq '
+  .jobs[]
+  | select(.name | startswith("Attach binaries"))
+  | .steps[]
+  | select(.name | startswith("Auto-update pre-flight"))
+  | "\(.name): \(.conclusion)"'
+```
+
+**That must print `success`.** `failure`, `cancelled`, `skipped` — or no line
+at all, which means the step never ran — all mean Gate A did not pass. Stop and
+go to Step 4b. Only continue past this point on `success`:
+
 ```bash
 cd ~/code/freenet/freenet-core/main
-git pull origin main
+git fetch origin
+# Publish from the release commit, not from whatever main is now (see Step 2).
+git checkout "$RELEASE_SHA"
 
-# Publish freenet crate
-cargo publish -p freenet
+# Per crate, because a partial publish is the usual reason to be here:
+# RELEASING.md routes "fdev failed but freenet succeeded" to this step, and an
+# unconditional `cargo publish -p freenet` would just error on the crate that
+# already worked. Mirrors what attach-to-release and release.sh both do.
+# published <crate> <version>
+#   returns 0 = published, 1 = genuinely absent, 2 = UNKNOWN (do not act)
+#
+# The `-A` is load-bearing: crates.io answers 403 to a request with no
+# descriptive User-Agent, and 403 has a JSON body, so a body-parsing form exits
+# 0 and reports "not published" for every version ever released. Distinguishing
+# 404 from every other status is what stops an outage or a rate-limit reading as
+# "not published" too.
+published() {
+  local code
+  code="$(curl -sS -o /dev/null -w '%{http_code}' -A 'freenet-release-driver' \
+      --max-time 30 --retry 3 --retry-all-errors \
+      "https://crates.io/api/v1/crates/$1/$2")" || return 2
+  case "$code" in
+    200) return 0 ;;
+    404) return 1 ;;
+    *) echo "crates.io answered HTTP $code for $1 $2 -- UNKNOWN, not 'absent'" >&2; return 2 ;;
+  esac
+}
 
-# Publish fdev crate
-cargo publish -p fdev
+# Note the explicit `-eq 1`: only a genuine 404 means "go ahead and publish".
+# `|| publish` would treat UNKNOWN (2) as absent and upload on an outage.
+published freenet 0.1.X; case $? in
+  0) echo "freenet 0.1.X already published, skipping" ;;
+  1) cargo publish -p freenet; sleep 30 ;;   # fdev resolves freenet from the registry
+  *) echo "STOP: could not determine whether freenet 0.1.X is published"; exit 1 ;;
+esac
 
-# Verify
-cargo search freenet --limit 1
+published fdev 0.Y.Z; case $? in
+  0) echo "fdev 0.Y.Z already published, skipping" ;;
+  1) cargo publish -p fdev ;;
+  *) echo "STOP: could not determine whether fdev 0.Y.Z is published"; exit 1 ;;
+esac
+
+# Verify both, by exact version. `cargo search` reports only a crate's NEWEST
+# version and reads the search index, which lags the registry — it can say "no"
+# about a version that is published.
+# Explicit, not `&&`: `published` is TRI-state and `&&` treats UNKNOWN (2) the
+# same as absent (1), re-conflating the two states this helper exists to
+# separate -- in the step whose whole job is verifying the publish landed.
+for c in "freenet 0.1.X" "fdev 0.Y.Z"; do
+  # shellcheck disable=SC2086
+  published $c; case $? in
+    0) echo "$c: on crates.io" ;;
+    1) echo "$c: NOT on crates.io -- the publish did not land" ;;
+    *) echo "$c: UNKNOWN -- crates.io did not give a usable answer; re-check before acting" ;;
+  esac
+done
+
+# ONLY now, and only if Gate A reported success above, un-draft:
+gh release edit "$TAG" --repo "$REPO" --draft=false
 ```
+
+### Step 4b: Gate A blocked the release
+
+**Symptoms:**
+- Draft release with all assets attached
+- `attach-to-release` red at the "Auto-update pre-flight canary" step
+- Matrix notification saying the pre-flight did not pass
+
+**This is the gate working.** The binary about to ship cannot read GitHub's
+release tags, or the run could not prove that it can. Do not un-draft.
+
+First establish which side of the irreversible step you are on:
+
+```bash
+# Is THIS version already on crates.io? (not `cargo search` — see Quick Reference)
+# 200 = published, 404 = not published. ANY other code is UNKNOWN, not "no" --
+# notably 403, which is what crates.io returns when the request carries no
+# descriptive User-Agent. Do not drop the -A: without it this returns 403 for
+# every version, and a body-parsing form reads that as "not published" while
+# curl exits 0 and prints nothing.
+curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
+  --max-time 30 --retry 3 --retry-all-errors \
+  https://crates.io/api/v1/crates/freenet/0.1.X
+```
+
+- **Not published** (the normal case, since the publish runs after the canary):
+  nothing irreversible has happened. Read the job log — the canary dumps the
+  node's own output when it blocks — then fix, delete the tag and draft, and
+  re-cut on the corrected commit (commands at the top of this file).
+- **Already published**: the version number is spent. Do not re-tag it. Fix,
+  and cut the next patch version.
+
+If the canary reported UNVERIFIED rather than a fault (GitHub unreachable, or
+no verdict inside its window), that is infrastructure, not a bug in the binary.
+Re-run the job. An unverified gate is still not a passed gate — do not
+un-draft to work around it.
 
 ### Step 5: Crates Published but Local Not Deployed
 
@@ -163,8 +481,17 @@ git push origin release/vX.Y.Z
 
 **Solution:**
 ```bash
-# Check if already published
-cargo search freenet --limit 1
+# Check if THIS version is already published. Not `cargo search` -- it reports
+# only the NEWEST version and reads the lagging search index (see the Quick
+# Reference); here that would answer about some other version entirely.
+# 200 = published, 404 = not published. ANY other code is UNKNOWN, not "no" --
+# notably 403, which is what crates.io returns when the request carries no
+# descriptive User-Agent. Do not drop the -A: without it this returns 403 for
+# every version, and a body-parsing form reads that as "not published" while
+# curl exits 0 and prints nothing.
+curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
+  --max-time 30 --retry 3 --retry-all-errors \
+  https://crates.io/api/v1/crates/freenet/0.1.X
 
 # Verify credentials
 cargo login
@@ -178,6 +505,10 @@ cargo publish --dry-run -p freenet
 
 If you need to do everything manually:
 
+Steps 5 and 6 below are the ones the gate owns. Push the tag, create the
+release as a DRAFT, and let `cross-compile.yml` do the rest — it is the only
+path that runs Gate A before the irreversible publish.
+
 ```bash
 # 1. Create PR and merge
 cd ~/code/freenet/freenet-core/main
@@ -190,24 +521,35 @@ gh pr create --title "chore: release 0.1.X" --body "Release v0.1.X" --base main
 
 # 2. Wait for CI and merge (or use gh pr merge --auto)
 
-# 3. Create tag
-git checkout main
-git pull
-git tag v0.1.X
-git push origin v0.1.X
+# 3. Create tag — on the bump PR's merge commit, NOT on main (see Step 2)
+git fetch origin
+RELEASE_SHA=$(gh pr view <BUMP_PR> --repo freenet/freenet-core \
+  --json mergeCommit --jq '.mergeCommit.oid')
+git tag -a v0.1.X "$RELEASE_SHA" -m "Release v0.1.X"
+git push origin v0.1.X          # this is what triggers cross-compile.yml
 
-# 4. Create GitHub release
-gh release create v0.1.X --repo freenet/freenet-core --generate-notes
+# 4. Create the GitHub release as a DRAFT (see Step 3 for why --draft matters)
+gh release create v0.1.X --repo freenet/freenet-core --draft --generate-notes
 
-# 5. Publish crates
-cargo publish -p freenet
-cargo publish -p fdev
+# 5. Let cross-compile.yml attach the binaries, run Gate A, publish to
+#    crates.io and un-draft. Watch it; do not race it:
+gh run watch "$(gh run list --workflow=cross-compile.yml \
+  --branch v0.1.X --limit 1 --json databaseId --jq '.[0].databaseId')"
 
-# 6. Deploy locally
+# 6. Verify it got there, rather than assuming
+gh release view v0.1.X --json isDraft --jq '.isDraft'   # must be false
+# `cargo search` is CORRECT here and should not be "fixed": after a successful
+# release the newest published version IS the one just cut, which is exactly
+# what it reports. The rule is `cargo search` may only answer questions about
+# the NEWEST version -- fine here, wrong wherever the question is "is version X
+# published?" (see Step 4b and the Quick Reference).
+cargo search freenet --limit 1
+
+# 7. Deploy locally
 cargo build --release --bin freenet
 ./scripts/deploy-local-gateway.sh --all-instances
 
-# 7. Announce to Matrix
+# 8. Announce to Matrix
 matrix-commander -r '#freenet-locutus:matrix.org' -m "..."
 ```
 
@@ -229,7 +571,9 @@ After recovery, verify:
 - [ ] PR merged: `gh pr view <NUMBER> --json state`
 - [ ] Tag exists: `git tag -l "v0.1.X"`
 - [ ] GitHub release: `gh release view v0.1.X`
-- [ ] Crates published: `cargo search freenet --limit 1`
+- [ ] Crates published (by exact version, not `cargo search`):
+      `curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' https://crates.io/api/v1/crates/freenet/0.1.X`
+      (expect `200`; a `403` means the User-Agent was dropped, not that it is unpublished)
 - [ ] Local gateway updated: `/usr/local/bin/freenet --version`
 - [ ] Services running: `systemctl status freenet-gateway freenet-peer-01`
 - [ ] Matrix announced: Check #freenet-locutus channel

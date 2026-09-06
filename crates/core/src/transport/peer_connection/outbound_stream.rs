@@ -1029,6 +1029,7 @@ mod tests {
                         // Expected
                     }
                     SymmetricMessagePayload::AckConnection { .. }
+                    | SymmetricMessagePayload::AckConnectionV2 { .. }
                     | SymmetricMessagePayload::ShortMessage { .. }
                     | SymmetricMessagePayload::NoOp
                     | SymmetricMessagePayload::Ping { .. }

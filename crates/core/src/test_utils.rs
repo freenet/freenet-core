@@ -147,6 +147,21 @@ impl TestLogger {
     /// When enabled, logs will be stored in memory and can be queried
     /// using `contains()`, `logs()`, etc.
     ///
+    /// Known hazard, tracked in #5315: the capture installed by [`Self::init`]
+    /// is thread-local, but `tracing` caches each callsite's `Interest`
+    /// **process-globally** the first time any thread reaches it. A
+    /// concurrently-running test that reaches a callsite first, from a thread
+    /// with no subscriber, can pin it to `never`, and this capture then
+    /// silently records nothing from that one callsite while recording every
+    /// other one (#4927, fixed for the executor tests by #5314).
+    ///
+    /// Unit tests inside the crate should prefer
+    /// `crate::util::test_log_capture::install`, which keeps callsite interest
+    /// resolvable. This builder cannot use it: that helper is `cfg(test)`
+    /// because it registers process-global `tracing` state, while `test_utils`
+    /// is compiled into non-test builds too. See #5315 for the reachability
+    /// assessment and the candidate fixes.
+    ///
     /// # Example
     /// ```ignore
     /// let logger = TestLogger::new().capture_logs().init();
@@ -1519,10 +1534,27 @@ impl TestContext {
             .collect()
     }
 
-    /// Get the path to a node's event log.
+    /// Base path for a node's event log. This is a segment *prefix*, not a file:
+    /// records live in `_EVENT_LOG.NNNNNNNNNN` segments, which is what
+    /// `read_all_events` scans for. Do not `.exists()`-check the returned path.
+    ///
+    /// Nodes run in Network mode, so the base name is `_EVENT_LOG`, not
+    /// `_EVENT_LOG_LOCAL`. Network mode is also the mode where the event log is
+    /// OFF by default (#4968), so the harness must opt in explicitly for these
+    /// segments to exist at all — `#[freenet_test]` does that via
+    /// `enable_event_log: Some(true)`.
+    ///
+    /// If that opt-in is ever dropped, this does NOT start returning a missing
+    /// path: `ConfigPathsArgs::build` writes a zero-length `_EVENT_LOG` stub
+    /// unconditionally, so the path resolves to a file that exists and is
+    /// empty. That is exactly why the breakage is silent — aggregation yields
+    /// zero events and every consumer reads that as "nothing happened" rather
+    /// than "the source is switched off". (With the opt-in present the stub is
+    /// deleted by `LogFile::migrate_legacy`, so the base path is absent while
+    /// the segments beside it hold the records — the inverse of what an
+    /// existence check would suggest.) See #4972.
     pub fn event_log_path(&self, node_label: &str) -> anyhow::Result<PathBuf> {
         let node = self.node(node_label)?;
-        // Nodes run in Network mode, so they create _EVENT_LOG not _EVENT_LOG_LOCAL
         Ok(node.temp_dir_path.join("_EVENT_LOG"))
     }
 
@@ -1569,6 +1601,8 @@ impl TestContext {
                 match aggregator.get_all_events().await {
                     Ok(events) => {
                         writeln!(&mut report, "\nTotal events: {}", events.len()).unwrap();
+
+                        Self::warn_if_no_events(&mut report, events.len());
 
                         // Group by peer_id
                         let mut by_peer: HashMap<String, Vec<_>> = HashMap::new();
@@ -1782,6 +1816,36 @@ impl TestContext {
         Ok(report_dir)
     }
 
+    /// Append a loud warning when event aggregation came back empty.
+    ///
+    /// An empty aggregation is almost never "nothing happened" — it means the
+    /// evidence source is missing, and it reads identically to a genuinely
+    /// quiet run. Say so, or the reader silently draws the wrong conclusion
+    /// (#4972).
+    ///
+    /// Shared by the failure report AND the success summary on purpose: the
+    /// failure this guards is a test that PASSES vacuously, which never reaches
+    /// the failure report.
+    ///
+    /// A warning rather than an error deliberately: `record_logs` sleeps
+    /// briefly before creating segment 0, so a very fast test legitimately has
+    /// no segments and a hard error would be flaky.
+    fn warn_if_no_events(report: &mut String, event_count: usize) {
+        use std::fmt::Write;
+        if event_count == 0 {
+            writeln!(
+                report,
+                "\n  ⚠️  NO EVENTS AGGREGATED across all nodes. This is very likely a \
+                 missing evidence source rather than a quiet run — check that the event \
+                 log is enabled for harness nodes (`enable_event_log: Some(true)`, \
+                 #4972), that the test didn't fail before any events were written, and \
+                 that `record_logs` could open the log. Treat any assert-absence check \
+                 in this test as UNPROVEN."
+            )
+            .unwrap();
+        }
+    }
+
     pub async fn generate_success_summary(&self) -> String {
         use std::fmt::Write;
 
@@ -1796,6 +1860,14 @@ impl TestContext {
                 Ok(mut events) => {
                     writeln!(&mut report, "\n📊 Event Statistics:").unwrap();
                     writeln!(&mut report, "  Total events: {}", events.len()).unwrap();
+
+                    // This is the path that matters most for #4972: the failure
+                    // being guarded is a test that PASSES vacuously, and a
+                    // passing test with `aggregate_events = "always"` comes
+                    // through here, not through the failure report. (The macro
+                    // also does not catch panics, so an `assert!` failure skips
+                    // the failure report entirely.)
+                    Self::warn_if_no_events(&mut report, events.len());
 
                     // Count by event type
                     let mut by_type: HashMap<String, usize> = HashMap::new();

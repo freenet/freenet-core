@@ -45,44 +45,45 @@ pub struct SecretsCliConfig {
 #[derive(clap::Subcommand, Clone, Debug)]
 pub enum SecretsCommand {
     /// Print the active KEK backend and the KEK fingerprint
-    /// (`SHA-256(KEK)[..8]` in hex). Does NOT print the KEK itself.
+    /// (`SHA-256(KEK)[..8]` in hex). The KEK itself is never printed.
     KekStatus(KekStatusArgs),
-    /// Explicitly provision the node KEK into a specific backend
-    /// BEFORE the first node start. Use this to opt in to the OS
-    /// keyring backend (which the auto-resolver intentionally skips
-    /// to avoid an unexpected Keychain / Credential Manager prompt
-    /// at startup).
+    /// Provision the node KEK into a specific backend, before the node is
+    /// started for the first time. Use it to opt in to the OS keyring backend,
+    /// which the automatic resolver skips on purpose so that starting the node
+    /// never springs a Keychain or Credential Manager prompt on you.
     KekInit(KekInitArgs),
-    /// Generate a new KEK, re-encrypt every active secret + snapshot
-    /// under the new derived DEKs, atomically swap the KEK in the
-    /// backend, delete the previous value. The node MUST be stopped.
+    /// Generate a new KEK, re-encrypt every active secret and snapshot under the
+    /// newly derived data encryption keys, swap the KEK in the backend
+    /// atomically, and delete the previous value. The node has to be stopped
+    /// first.
     KekRotate(KekRotateArgs),
     /// Move the KEK from its current backend to a target backend.
     /// Useful when migrating from `file` to `keyring` after installing
     /// a secret-storage daemon, or in reverse during disaster recovery.
     KekMigrate(KekMigrateArgs),
-    /// List the per-secret snapshot history (the on-write backups
-    /// created since #4034). Metadata only — never prints plaintext
-    /// secret values. Read-only.
+    /// List the per-secret snapshot history, meaning the backups taken on each
+    /// write. Read-only, and prints metadata only: plaintext secret values are
+    /// never shown. Secrets last written before snapshotting was added have no
+    /// history to show.
     SnapshotList(SnapshotListArgs),
-    /// Roll a delegate secret back to an earlier snapshot. The current
-    /// value is itself snapshotted first, so the restore is reversible.
-    /// The node MUST be stopped.
+    /// Roll a delegate secret back to an earlier snapshot. The current value is
+    /// snapshotted first, so the restore can itself be undone. The node has to
+    /// be stopped first.
     SnapshotRestore(SnapshotRestoreArgs),
-    /// Export a scope's delegate secrets into a single encrypted, portable
-    /// bundle file (P3 of #4381). Primary use: a hosted user downloading
-    /// their per-user secrets to re-import into their own peer; also backs
-    /// up a normal node's Local secrets. The node MUST be stopped.
+    /// Export a scope's delegate secrets into one encrypted, portable bundle
+    /// file. The main use is a hosted user downloading their own secrets to
+    /// re-import on their own peer; it also backs up a normal node's local
+    /// secrets. The node has to be stopped first.
     ///
-    /// SECURITY: the bundle is ALWAYS encrypted at rest (passphrase- or
-    /// token-derived key). Building it requires the node to decrypt each
-    /// secret in memory, so an operator running this command observes the
-    /// plaintext during the export — inherent to the hosted model.
+    /// Security: the bundle is always encrypted at rest, under a key derived
+    /// from either a passphrase or the user token. Building it means decrypting
+    /// each secret in memory, so whoever runs this command sees the plaintext
+    /// during the export. That is inherent to the hosted model.
     Export(ExportArgs),
-    /// Import a secrets bundle produced by `secrets export` (P3 of #4381),
-    /// re-placing each secret under its original delegate. Default target is
-    /// the single-user (Local) scope — the path a user takes when moving to
-    /// their own peer. The node MUST be stopped.
+    /// Import a secrets bundle produced by `secrets export`, putting each secret
+    /// back under its original delegate. It goes to the single-user (local)
+    /// scope by default, which is what a user wants when moving to their own
+    /// peer. The node has to be stopped first.
     Import(ImportArgs),
 }
 
@@ -102,10 +103,10 @@ pub struct KekInitArgs {
     pub secrets_dir: PathBuf,
     /// Backend to provision the KEK into: `keyring`, `systemd`, or `file`.
     ///
-    /// Choosing `keyring` triggers the OS keyring write here (which is
-    /// what produces the platform's consent dialog on macOS/Linux for
-    /// dev/unsigned builds) — the act of running this command is the
-    /// operator's explicit consent.
+    /// Choosing `keyring` writes to the OS keyring here and now, which is what
+    /// raises the platform's consent dialog on macOS and Linux for development
+    /// and unsigned builds. Running this command is how you give that consent
+    /// deliberately, rather than being asked at startup.
     #[clap(long)]
     pub backend: String,
     /// Acknowledge that this is an interactive provisioning step.
@@ -143,10 +144,10 @@ pub struct SnapshotListArgs {
     /// delegate key (as shown in the unfiltered listing).
     #[clap(long)]
     pub delegate: Option<String>,
-    /// Restrict the listing to a single secret, by its bs58-encoded id
-    /// (as shown in the per-delegate listing). Requires `--delegate`.
-    /// When set, every individual snapshot (timestamp + size) is printed
-    /// instead of just the per-secret count.
+    /// Restrict the listing to a single secret, by its bs58-encoded id as shown
+    /// in the per-delegate listing. Requires `--delegate`. With this set, every
+    /// snapshot is printed with its timestamp and size, rather than just a count
+    /// per secret.
     #[clap(long, requires = "delegate")]
     pub secret: Option<String>,
 }
@@ -165,11 +166,11 @@ pub struct SnapshotRestoreArgs {
     /// `snapshot-list`).
     #[clap(long)]
     pub timestamp_ms: u64,
-    /// Collision suffix (the `suffix` column from `snapshot-list`), for
-    /// the rare case of multiple same-millisecond snapshots at one
-    /// timestamp. Omit to restore the unsuffixed snapshot at the
-    /// timestamp (the `-` row, and the only entry when there is no
-    /// collision); pass the number to target a specific collision row.
+    /// Collision suffix, the `suffix` column from `snapshot-list`, for the rare
+    /// case of several snapshots landing in the same millisecond. Omit it to
+    /// restore the unsuffixed snapshot at that timestamp, shown as the `-` row
+    /// and the only entry when there is no collision, or pass the number to
+    /// target a specific collision row.
     #[clap(long)]
     pub suffix: Option<u32>,
     /// Skip the interactive confirmation prompt (for scripted use).
@@ -182,31 +183,32 @@ pub struct ExportArgs {
     /// Path to the node's secrets directory (the on-disk secret blobs).
     #[clap(long, value_parser)]
     pub secrets_dir: PathBuf,
-    /// Path to the node's data directory (the ReDb `db` file with the
-    /// secrets index). This is the node's `--db-dir` (or the data dir under
-    /// which the runtime created `db`), NOT the secrets dir. Required because
-    /// the export walks the secrets index to enumerate what to gather.
+    /// Path to the node's data directory, holding the ReDb `db` file with the
+    /// secrets index. This is the node's `--db-dir`, or the data dir under which
+    /// the runtime created `db`. It is a different directory from
+    /// `--secrets-dir`. The export needs it to walk the index and work out what
+    /// to gather.
     #[clap(long, value_parser)]
     pub db_dir: PathBuf,
-    /// Export ALL single-user (Local) secrets — the normal-node backup case.
-    /// Mutually exclusive with `--user-token`.
+    /// Export every single-user (local) secret, which is the normal-node backup
+    /// case. Cannot be combined with `--user-token`.
     #[clap(long, conflicts_with = "user_token")]
     pub local: bool,
-    /// Export every per-user secret for the user identified by this opaque
-    /// token (the hosted → self-host migration case). Mutually exclusive with
-    /// `--local`. Pass `--user-token` ALONE to select the user scope and source
-    /// the token safely (from `FREENET_USER_TOKEN`, else an interactive prompt),
-    /// or `--user-token <tok>` to provide it inline. WARNING: an inline value is
-    /// exposed via the process listing and shell history — prefer the env var or
-    /// the prompt.
+    /// Export every per-user secret for the user this opaque token identifies,
+    /// which is the case for migrating from a hosted node to your own. Cannot be
+    /// combined with `--local`. Pass `--user-token` on its own to select the user
+    /// scope and take the token from `FREENET_USER_TOKEN` or an interactive
+    /// prompt, or `--user-token <tok>` to give it inline. Warning: an inline
+    /// value shows up in the process listing and your shell history, so prefer
+    /// the environment variable or the prompt.
     #[clap(long, num_args = 0..=1, default_missing_value = "")]
     pub user_token: Option<String>,
-    /// Encrypt the bundle under a key derived from a passphrase (Argon2id). This
-    /// is the DEFAULT key method. The passphrase is read from
-    /// `FREENET_SECRET_PASSPHRASE`, else this flag's inline value, else an
-    /// interactive hidden prompt (pass `--passphrase` alone to force the
-    /// prompt). WARNING: an inline value is exposed via the process listing and
-    /// shell history — prefer the env var or the prompt.
+    /// Encrypt the bundle under a key derived from a passphrase, using Argon2id.
+    /// This is the default. The passphrase comes from
+    /// `FREENET_SECRET_PASSPHRASE`, failing that this flag's inline value,
+    /// failing that a hidden prompt; pass `--passphrase` on its own to force the
+    /// prompt. Warning: an inline value shows up in the process listing and your
+    /// shell history, so prefer the environment variable or the prompt.
     #[clap(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "use_token_key")]
     pub passphrase: Option<String>,
     /// Encrypt the bundle under a key derived from the `--user-token` (HKDF),
@@ -228,16 +230,16 @@ pub struct ImportArgs {
     /// Path to the target node's secrets directory.
     #[clap(long, value_parser)]
     pub secrets_dir: PathBuf,
-    /// Path to the target node's data directory (the ReDb `db`). See the
+    /// Path to the target node's data directory, holding the ReDb `db`. See the
     /// matching `--db-dir` note on `export`.
     #[clap(long, value_parser)]
     pub db_dir: PathBuf,
-    /// Decrypt the bundle with a passphrase (Argon2id-keyed bundle). This is the
-    /// DEFAULT decrypt method. The passphrase is read from
-    /// `FREENET_SECRET_PASSPHRASE`, else this flag's inline value, else an
-    /// interactive hidden prompt (pass `--passphrase` alone to force the
-    /// prompt). WARNING: an inline value is exposed via the process listing and
-    /// shell history — prefer the env var or the prompt.
+    /// Decrypt a passphrase-keyed (Argon2id) bundle. This is the default. The
+    /// passphrase comes from `FREENET_SECRET_PASSPHRASE`, failing that this
+    /// flag's inline value, failing that a hidden prompt; pass `--passphrase` on
+    /// its own to force the prompt. Warning: an inline value shows up in the
+    /// process listing and your shell history, so prefer the environment
+    /// variable or the prompt.
     #[clap(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "use_token_key")]
     pub passphrase: Option<String>,
     /// Decrypt the bundle with the user token instead of a passphrase (a bundle
@@ -246,23 +248,24 @@ pub struct ImportArgs {
     /// `--passphrase`.
     #[clap(long)]
     pub use_token_key: bool,
-    /// The user token value for token-decrypt (used with `--use-token-key`).
-    /// Resolved from `FREENET_USER_TOKEN`, else this flag's inline value, else an
-    /// interactive prompt. WARNING: an inline value is exposed via the process
-    /// listing and shell history — prefer the env var or the prompt.
+    /// The user token value for token-decrypt, used with `--use-token-key`. It
+    /// comes from `FREENET_USER_TOKEN`, failing that this flag's inline value,
+    /// failing that a prompt. Warning: an inline value shows up in the process
+    /// listing and your shell history, so prefer the environment variable or the
+    /// prompt.
     #[clap(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "passphrase")]
     pub token: Option<String>,
-    /// Place imported secrets at the single-user (Local) scope. This is the
-    /// DEFAULT when neither `--local` nor `--into-user` is given — it is the
-    /// path a user takes when migrating to their own peer. Mutually exclusive
-    /// with `--into-user`.
+    /// Place imported secrets at the single-user (local) scope. This is what
+    /// happens when neither `--local` nor `--into-user` is given, and it is what
+    /// a user wants when migrating to their own peer. Cannot be combined with
+    /// `--into-user`.
     #[clap(long, conflicts_with = "into_user")]
     pub local: bool,
-    /// Place imported secrets under a per-user scope keyed by this token
-    /// (round-trip / re-hosting). Mutually exclusive with `--local`. Pass
-    /// `--into-user` alone to be prompted for the token, or `--into-user <tok>`
-    /// to provide it inline (exposed via the process listing — prefer the
-    /// prompt).
+    /// Place imported secrets under a per-user scope keyed by this token, for a
+    /// round trip or for re-hosting. Cannot be combined with `--local`. Pass
+    /// `--into-user` on its own to be prompted for the token, or
+    /// `--into-user <tok>` to give it inline, which shows up in the process
+    /// listing, so prefer the prompt.
     #[clap(long, num_args = 0..=1, default_missing_value = "")]
     pub into_user: Option<String>,
     /// Overwrite an existing secret at the same delegate+id. Without this an
@@ -751,10 +754,18 @@ async fn snapshot_restore(args: SnapshotRestoreArgs) -> Result<()> {
             // Bound the history (incl. the reversibility snapshot just
             // added), matching the node runtime's default retention.
             // Best-effort: the restore has already succeeded.
+            //
+            // The per-secret BYTE budget is deliberately not applied here,
+            // exactly as in `SecretsStore::restore_snapshot`: an operator
+            // running `snapshot-restore` is mid-recovery and often walking
+            // versions one at a time, so this is the worst moment to delete
+            // history — the budget could evict several older versions,
+            // including the one just restored from, as a side effect of the
+            // reversibility snapshot. Count tiers and `max_age` still apply.
             let snap_dir = snapshot_dir_for_encoded(&delegate_dir, &args.secret);
             thin_snapshots(
                 &snap_dir,
-                &RetentionPolicy::default(),
+                &RetentionPolicy::default().without_byte_budget(),
                 std::time::SystemTime::now(),
             );
             println!(
@@ -1494,6 +1505,66 @@ mod tests {
         let snap_dir = dir.path().join("D").join(".snapshots").join("S");
         let count = std::fs::read_dir(&snap_dir).unwrap().count();
         assert!(count >= 2, "expected reversibility snapshot, got {count}");
+    }
+
+    /// `snapshot-restore` must NOT apply the per-secret byte budget. An
+    /// operator running it is mid-recovery, often walking versions one at a
+    /// time, so this is the worst moment to garbage-collect: with the budget
+    /// applied, the reversibility snapshot the restore itself adds would push
+    /// an already-over-budget history over the limit and evict older
+    /// versions, including the one just restored FROM.
+    #[tokio::test]
+    async fn snapshot_restore_does_not_apply_byte_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64)
+            - 60_000;
+        // Four 1 MiB snapshots: 4 MiB of history against the 3 MiB default
+        // budget, so applying the budget here would visibly evict.
+        const MIB: usize = 1024 * 1024;
+        seed_snapshot(
+            dir.path(),
+            "D",
+            "S",
+            b"current",
+            now_ms - 4000,
+            &vec![1u8; MIB],
+        );
+        let snap_dir = dir.path().join("D").join(".snapshots").join("S");
+        for (i, stamp) in [now_ms - 3000, now_ms - 2000, now_ms - 1000]
+            .into_iter()
+            .enumerate()
+        {
+            std::fs::write(
+                snap_dir.join(format!("{stamp:020}")),
+                vec![2u8 + i as u8; MIB],
+            )
+            .unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&snap_dir).unwrap().count(), 4);
+
+        snapshot_restore(restore_args(dir.path(), "D", "S", now_ms - 4000, true))
+            .await
+            .expect("restore must succeed");
+
+        // 4 seeded + 1 reversibility snapshot, none evicted.
+        assert_eq!(
+            std::fs::read_dir(&snap_dir).unwrap().count(),
+            5,
+            "restore must not evict history for the byte budget"
+        );
+        // The snapshot restored FROM is still there, so the operator can keep
+        // walking versions.
+        assert!(
+            snap_dir.join(format!("{:020}", now_ms - 4000)).exists(),
+            "the snapshot just restored from must survive"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("D").join("S")).unwrap(),
+            vec![1u8; MIB]
+        );
     }
 
     #[tokio::test]

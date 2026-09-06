@@ -91,7 +91,8 @@ fn handle_unsubscribe_inbound_preserves_legacy_branches() {
          to remove the sender from the per-contract downstream list"
     );
     assert!(
-        body.contains("remove_peer_interest(&key, peer)"),
+        body.contains("remove_peer_interest_for(")
+            && body.contains("InterestRemovalCause::Unsubscribe"),
         "handle_unsubscribe_inbound must call `interest_manager.remove_peer_interest` \
          to drop the sender from the per-peer interest registry"
     );
@@ -112,15 +113,25 @@ fn handle_unsubscribe_inbound_preserves_legacy_branches() {
          intermediate peers stay subscribed forever"
     );
 
-    // Counter-symmetry pin: the legacy code only decremented the
-    // global downstream counter when the per-contract removal actually
-    // succeeded (was_downstream || was_interested). Re-introducing an
-    // unconditional decrement would underflow the gauge.
+    // Counter-symmetry pin (#4952 semantics): the increment fires only on a
+    // hosting-map NewAdd in `register_downstream_subscriber`, so the decrement
+    // must key on hosting-map removal ALONE. The legacy `|| was_interested`
+    // leg let interest-only entries (heartbeat registrations, #4952
+    // delivery-seeded co-hosts — which never incremented demand) steal a
+    // decrement from a real subscriber's count via a late/duplicate
+    // Unsubscribe, under-reporting demand to eviction ranking. An
+    // unconditional decrement would be worse still (gauge underflow).
     assert!(
-        body.contains("was_downstream || was_interested"),
+        body.contains("if was_downstream {"),
         "handle_unsubscribe_inbound must gate the global downstream-counter \
-         decrement on `was_downstream || was_interested` to stay in sync \
-         with `register_downstream_subscriber`'s increment"
+         decrement on hosting-map removal (`was_downstream`) ALONE to stay \
+         balanced with the NewAdd-keyed increment (#4952)"
+    );
+    assert!(
+        !body.contains("was_downstream || was_interested"),
+        "the legacy `|| was_interested` decrement leg must not return: \
+         interest entries exist for peers that never incremented demand \
+         (heartbeat registrations, #4952 delivery-seeded co-hosts)"
     );
 }
 
@@ -637,7 +648,7 @@ fn finalize_host_subscribe_fetches_before_register() {
     // from the captured directed holder (`upstream_peer`), NOT the downstream
     // requester, and a newly-viable upstream flushes deferred broadcasts (#4359).
     let upstream_reg = body
-        .find("register_peer_interest(")
+        .find("register_peer_interest_from(")
         .expect("finalize_host_subscribe must register the responder as upstream interest (Fix D)");
     let upstream_call_end = body[upstream_reg..]
         .find(')')

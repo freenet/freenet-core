@@ -9,6 +9,146 @@ use redb::{
 
 use crate::wasm_runtime::StateStorage;
 
+/// Fraction of the memory the node may use that the redb page cache may hold.
+const PAGE_CACHE_RAM_DIVISOR: usize = 32;
+
+/// Floor for the redb page cache (16 MiB) — small enough for a tightly
+/// constrained peer, large enough to keep the hot index pages resident.
+const PAGE_CACHE_MIN_BYTES: usize = 16 * 1024 * 1024;
+
+/// Ceiling for the redb page cache (1 GiB), which is also redb's own default, so
+/// an unconstrained gateway keeps exactly the cache it had.
+const PAGE_CACHE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Page cache size for the contract database.
+///
+/// `Database::create` was called bare, so redb applied its 1 GiB default cache —
+/// an unaccounted third of a peer's whole 2 GiB `MemoryMax`, never composed
+/// against the memory limit alongside the module and summary/delta caches
+/// (#5268 defect 3). Scaling it to `clamp(memory_limit / 32, 16 MiB, 1 GiB)`
+/// makes it part of that composition: 64 MiB on a 2 GiB peer, unchanged at the
+/// 1 GiB default on any host with 32 GiB or more.
+///
+/// The cache is a maximum, not a reservation — redb fills it only as pages are
+/// read — so lowering it costs extra reads on a working set larger than the
+/// cache, never correctness.
+fn page_cache_size_bytes() -> usize {
+    let total_ram =
+        crate::wasm_runtime::read_total_ram_bytes().unwrap_or(PAGE_CACHE_FALLBACK_TOTAL_RAM_BYTES);
+    page_cache_size_for(total_ram)
+}
+
+/// Pure sizing math behind [`page_cache_size_bytes`], split out so aggregate
+/// cache-commitment tests can ask what a hypothetical host would get rather than
+/// depending on the test machine's own RAM.
+pub(crate) fn page_cache_size_for(total_ram: usize) -> usize {
+    (total_ram / PAGE_CACHE_RAM_DIVISOR).clamp(PAGE_CACHE_MIN_BYTES, PAGE_CACHE_MAX_BYTES)
+}
+
+/// Fallback total-RAM estimate (1 GiB) when the OS query fails, mirroring the
+/// module and summary/delta caches' own fallbacks.
+const PAGE_CACHE_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Open (creating if needed) the contract database with a memory-composed page
+/// cache. Every production open MUST go through this rather than
+/// `Database::create`, which silently applies redb's 1 GiB default.
+fn open_database(db_path: &Path) -> Result<Database, DatabaseError> {
+    redb::Builder::new()
+        .set_cache_size(page_cache_size_bytes())
+        .create(db_path)
+}
+
+/// Minimum reclaimable bytes before a startup compaction is worth the whole-file
+/// rewrite it costs. Paired with [`MIN_COMPACTION_RECLAIM_FRACTION`].
+const MIN_COMPACTION_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Minimum reclaimable share of the file before compaction runs, so a large
+/// database with proportionally trivial dead space is left alone.
+const MIN_COMPACTION_RECLAIM_FRACTION: f64 = 0.25;
+
+/// Records the file size the last compaction attempt settled at, so a database
+/// that cannot be compacted further is not rewritten on every start.
+///
+/// redb's compaction leaves a variable amount of unreclaimable free space: a
+/// gateway settled at 1.9% but a laptop peer at 28.4%, which is above the
+/// gate's 25% fraction. Without this marker that peer re-ran a full (and
+/// entirely futile) compaction pass on every single restart.
+const COMPACTION_MARKER_TABLE: TableDefinition<&[u8], u64> =
+    TableDefinition::new("compaction_marker");
+
+/// Key under which the post-compaction file size is stored.
+const COMPACTION_MARKER_KEY: &[u8] = b"settled_at_bytes";
+
+/// How much the file must grow past the last settled size before compaction is
+/// worth attempting again. Compaction cannot help until genuinely new dead
+/// space has accumulated, and the marker records where it bottomed out.
+const COMPACTION_REGROWTH_FACTOR: f64 = 1.25;
+
+/// What the startup reclaim pass decided. Returned so the decision itself is
+/// observable: asserting on the resulting file size cannot distinguish "the gate
+/// declined" from "compaction ran and happened to reclaim little", which made an
+/// earlier round of these tests pass with the gate entirely disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReclaimOutcome {
+    /// File is below the absolute floor; skipped without measuring.
+    BelowFloor,
+    /// Measured, but the dead space did not clear both gates.
+    NotWorthwhile,
+    /// Trailing slack accounted for it; the free trim sufficed, no rewrite.
+    TrimSufficed,
+    /// A full compaction ran.
+    Compacted,
+    /// Already compacted at (about) this size; compaction cannot help until the
+    /// file grows further.
+    AlreadySettled,
+    /// Could not be determined (stat, stats or transaction failure); skipped.
+    Undetermined,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_RECLAIM: std::cell::Cell<Option<ReclaimOutcome>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Record the reclaim decision so tests can assert on it. Compiled out of
+/// non-test builds.
+fn record_reclaim(outcome: ReclaimOutcome) -> ReclaimOutcome {
+    #[cfg(test)]
+    LAST_RECLAIM.with(|c| c.set(Some(outcome)));
+    outcome
+}
+
+#[cfg(test)]
+fn last_reclaim() -> Option<ReclaimOutcome> {
+    LAST_RECLAIM.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn clear_last_reclaim() {
+    LAST_RECLAIM.with(|c| c.set(None));
+}
+
+/// Whether reclaiming `file_bytes - in_use_bytes` justifies rewriting the whole
+/// database file.
+///
+/// BOTH gates must pass. The absolute floor stops a small file being rewritten
+/// for a small win; the fraction stops a multi-GB file being rewritten when its
+/// dead space is proportionally trivial. Without them, a node in a restart loop
+/// would rewrite its entire database on every start.
+///
+/// Pure so the boundary cases are unit-testable without building a real
+/// database, following the same split as `budget_for_ram` /
+/// `disk_budget_for_clamped`.
+fn compaction_is_worthwhile(file_bytes: u64, in_use_bytes: u64) -> bool {
+    let reclaimable = file_bytes.saturating_sub(in_use_bytes);
+    let meets_floor = reclaimable >= MIN_COMPACTION_RECLAIM_BYTES;
+    // Multiply rather than divide so a zero-length file can't produce a NaN.
+    let meets_fraction =
+        (reclaimable as f64) >= (file_bytes as f64) * MIN_COMPACTION_RECLAIM_FRACTION;
+    meets_floor && meets_fraction
+}
+
 const CONTRACT_PARAMS_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("contract_params");
 const STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state");
@@ -59,6 +199,70 @@ pub(crate) const SECRETS_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
 /// Value: Concatenated secret key hashes (N * 32 bytes)
 pub(crate) const USER_SECRETS_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("user_secrets_index");
+
+/// One-shot idempotence / anti-resurrection marker for delegate secret
+/// copy-forward (`SecretsStore::migrate_secrets`, #4117). One row per
+/// `(predecessor, successor)` delegate pair. Presence alone gates the copy:
+/// once a `(predecessor, successor)` migration has run, it is NEVER re-run, so
+/// a secret the user deleted from the successor after migration cannot be
+/// resurrected by a later re-registration. The row value is a small AUDIT FACT
+/// (schema version, the originating contract when known, and the copied/skipped
+/// counts) — see `SecretsStore::migrate_secrets`. Created on first open of
+/// upgraded databases too (redb materializes a missing table inside the same
+/// write txn that opens it), so a pre-#4117 database gains an empty table
+/// without disturbing any existing table.
+///
+/// Key: predecessor DelegateKey (64 bytes) || successor DelegateKey (64 bytes) = 128 bytes
+/// Value: versioned marker blob (see `migration_marker` codec in the secrets store)
+pub(crate) const MIGRATION_MARKER_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_secret_migration_marker");
+
+/// Durable record of the web-app contract origins under which each delegate has
+/// been registered (#4117 H1 same-origin gate). Written on EVERY successful
+/// delegate registration (both `RegisterDelegate` and
+/// `RegisterDelegateWithPredecessors`). Copy-forward consults it: a predecessor's
+/// Local secrets are copied into a successor ONLY when the registering request's
+/// origin is among the predecessor's recorded origins (or both are the Admin/None
+/// class).
+///
+/// **This gate alone is NOT sufficient protection (GHSA-824h-7x5x-wfmf).**
+/// The registering request's `origin_contract` is itself forgeable by any HTTP
+/// client (see GHSA-824h-7x5x-wfmf for the exploit chain), so a malicious web-app CAN obtain
+/// a value that matches an unrelated victim delegate's recorded origin. The
+/// actual protection today is that the copy-forward's sole caller
+/// (`RegisterDelegateWithPredecessors`'s handler) is unconditionally disabled —
+/// this gate is not currently invoked in production at all. Do not treat this
+/// table as a sufficient authorization control if the copy-forward is ever
+/// re-wired; `origin_contract` attestation needs hardening first. See
+/// `SecretsStore::delegate_origins` and `SecretsStore::migrate_secrets`.
+///
+/// Key: DelegateKey (64 bytes)
+/// Value: `[has_admin_none: 1][N × ContractInstanceId(32)]` — `has_admin_none`
+///        records that the delegate was at least once registered with no contract
+///        origin (loopback / CLI / admin).
+pub(crate) const DELEGATE_ORIGINS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_registration_origins");
+
+/// Durable, UNCAPPED set of the secret hashes each delegate holds in the reserved
+/// `\0freenet-migrate/` coordination namespace (#4117 finding 4a). Recorded at
+/// `store_secret` time whenever a Local secret's raw key is under that namespace
+/// (covers both this node's `pred-done:` markers and the app-side `pred-wip:`
+/// markers, since both are written via the registering `set_secret`/`store_secret`
+/// path). Copy-forward excludes these hashes from BOTH the value copy and the
+/// enumeration copy. It exists because the advisory `.keys` enumeration registry
+/// is CAPPED (`MAX_REGISTERED_KEYS_PER_SCOPE`) and may be unreadable — at/above
+/// the cap or with a missing registry, a marker's raw key would be invisible to a
+/// registry-based check and could chain-copy as user data, poisoning `had_data`
+/// and falsely gating a later migration. This table is registry-independent.
+/// INDIVIDUALLY KEYED (#4117 P2a): one row per `(delegate, hash)`, so recording a
+/// marker is a single insert, never a read-modify-write of a growing blob (an
+/// amplification vector). Per-delegate rows are bounded
+/// (`MAX_RESERVED_MARKER_HASHES_PER_DELEGATE`) and read via a prefix range scan.
+///
+/// Key: DelegateKey (64 bytes) || secret hash (32 bytes) = 96 bytes
+/// Value: single presence byte
+pub(crate) const RESERVED_MARKER_HASHES_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_reserved_marker_hashes");
 
 /// Metadata about a hosted contract, persisted to survive restarts.
 #[derive(Debug, Clone, Copy)]
@@ -181,6 +385,20 @@ fn redb_error_is_poison(e: &redb::Error) -> bool {
         e,
         redb::Error::PreviousIo | redb::Error::LockPoisoned(_) | redb::Error::DatabaseClosed
     )
+}
+
+/// True if an error raised on a WRITE path signals a poisoned database.
+///
+/// Unlike [`redb_error_is_poison`], this DOES match `redb::Error::Io`. That
+/// exclusion exists solely because several READ helpers in this file synthesize
+/// `Io(ErrorKind::InvalidData)` for a benign malformed row, and treating those
+/// as poison would crash-loop the node. No write path synthesizes `Io`, so on a
+/// write it can only be a genuine backend failure — at which point redb has
+/// already latched its poison flag and the handle is unusable for any further
+/// write. Classifying it as benign is what would hand a dead handle to
+/// `initialize_database` and stop the node booting.
+fn redb_write_error_is_poison(e: &redb::Error) -> bool {
+    matches!(e, redb::Error::Io(_)) || redb_error_is_poison(e)
 }
 
 /// Test-only observable proof that the storage layer routed a detected poison to
@@ -325,8 +543,11 @@ impl ReDb {
             "Loading contract store"
         );
 
-        match Database::create(&db_path) {
-            Ok(db) => Self::initialize_database(db),
+        match open_database(&db_path) {
+            Ok(db) => {
+                let db = Self::reclaim_free_pages(db, &db_path)?;
+                Self::initialize_database(db)
+            }
             Err(e) if Self::is_version_mismatch(&e) => {
                 tracing::warn!(
                     db_path = ?db_path,
@@ -344,7 +565,8 @@ impl ReDb {
                     phase = "create_new_db",
                     "Creating new database"
                 );
-                let db = Database::create(&db_path)?;
+                let db = open_database(&db_path)?;
+                // No reclaim pass here: the database was just created empty.
                 Self::initialize_database(db)
             }
             Err(e) => {
@@ -355,6 +577,337 @@ impl ReDb {
                     "Failed to load contract store"
                 );
                 Err(e.into())
+            }
+        }
+    }
+
+    /// Return free pages left behind by redb's copy-on-write writes to the OS.
+    ///
+    /// redb reuses freed pages for later writes but keeps the file at its
+    /// all-time high-water mark: an ordinary commit only truncates *trailing*
+    /// free space, so the *interior* dead space a long-running peer accumulates
+    /// is unreclaimable by any normal operation. Measured on production peers
+    /// (2026-07): a gateway holding 1.38 GB of live pages in a 2.59 GB file;
+    /// compacting returned it to 1.41 GB with every row intact.
+    ///
+    /// Runs at startup because that is the one point where no transaction is
+    /// live ([`Database::compact`] refuses otherwise) and the store is not
+    /// serving anything yet. It is also the only point where a `&mut Database`
+    /// exists at all: after `initialize_database` the handle is behind an `Arc`
+    /// shared with every pool executor, so a background or on-eviction variant
+    /// is not merely awkward, it is unrepresentable without reworking that
+    /// sharing.
+    ///
+    /// Three stages, cheapest first, so an already-healthy node pays almost
+    /// nothing:
+    ///
+    /// 1. Skip outright when the file is below the absolute floor; reclaimable
+    ///    can never exceed the file, so no measurement is needed.
+    /// 2. Measure, and skip unless the dead space clears both gates.
+    /// 3. Close and reopen before compacting. Dropping the handle runs redb's
+    ///    maximum-shrink trim, which returns *trailing* slack for free. That
+    ///    slack is not dead space: it re-grows on the next write, and a node
+    ///    that exits uncleanly (this binary calls `std::process::exit`, so the
+    ///    destructor is skipped) can present 40% of it with zero fragmentation.
+    ///    Re-measuring after the trim keeps a crash-restart loop from paying a
+    ///    full rewrite for space a `ftruncate` already recovered.
+    ///
+    /// Returns the handle to use, reopening it if the file was touched. A
+    /// compaction error is not fatal, but the handle is NOT reusable after one:
+    /// redb latches an I/O failure and every later `begin_write` returns
+    /// `PreviousIo`, which would turn a survivable compaction failure into a
+    /// node that cannot start. So the handle is always reopened on that path.
+    fn reclaim_free_pages(db: Database, db_path: &Path) -> Result<Database, redb::Error> {
+        let file_bytes = match std::fs::metadata(db_path) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                tracing::warn!(
+                    db_path = ?db_path,
+                    error = %e,
+                    "Could not stat the contract database; skipping compaction"
+                );
+                record_reclaim(ReclaimOutcome::Undetermined);
+                return Ok(db);
+            }
+        };
+
+        // Reclaimable can never exceed the file, so anything under the floor is
+        // decided without paying for a stats read.
+        if file_bytes < MIN_COMPACTION_RECLAIM_BYTES {
+            tracing::info!(
+                db_path = ?db_path,
+                file_bytes,
+                phase = "compaction_skipped",
+                "Contract database below the compaction floor; skipping"
+            );
+            record_reclaim(ReclaimOutcome::BelowFloor);
+            return Ok(db);
+        }
+
+        // A previous compaction recorded where it bottomed out. Free space below
+        // that point is space compaction provably cannot reclaim, so re-running
+        // it would burn a full-file pass to achieve nothing.
+        if let Some(settled_bytes) = Self::read_compaction_marker(&db) {
+            if (file_bytes as f64) <= (settled_bytes as f64) * COMPACTION_REGROWTH_FACTOR {
+                tracing::info!(
+                    db_path = ?db_path,
+                    file_bytes,
+                    settled_bytes,
+                    phase = "compaction_skipped",
+                    "Contract database already compacted at this size; skipping"
+                );
+                record_reclaim(ReclaimOutcome::AlreadySettled);
+                return Ok(db);
+            }
+        }
+
+        let Some(in_use_bytes) = Self::pages_in_use_bytes(&db, db_path) else {
+            record_reclaim(ReclaimOutcome::Undetermined);
+            return Ok(db);
+        };
+        if !compaction_is_worthwhile(file_bytes, in_use_bytes) {
+            tracing::info!(
+                db_path = ?db_path,
+                file_bytes,
+                in_use_bytes,
+                phase = "compaction_skipped",
+                "Contract database compaction not worthwhile; skipping"
+            );
+            record_reclaim(ReclaimOutcome::NotWorthwhile);
+            return Ok(db);
+        }
+
+        // Trim trailing slack for free, then re-measure. Dropping the handle is
+        // the only public route to redb's maximum-shrink (`set_shrink_policy` is
+        // crate-private). Reaching here already means we were about to rewrite
+        // the whole file, so the close/reopen is cheap by comparison — and a
+        // healthy node never gets here, because the gate above declines first.
+        drop(db);
+        let db = Self::reopen_after_trim(db_path)?;
+        let trimmed_bytes = match std::fs::metadata(db_path) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                // Fall back to skipping rather than to the pre-trim size: an
+                // unknown size must not push us toward the expensive rewrite.
+                tracing::warn!(
+                    db_path = ?db_path,
+                    error = %e,
+                    "Could not stat the contract database after trimming; skipping compaction"
+                );
+                record_reclaim(ReclaimOutcome::Undetermined);
+                return Ok(db);
+            }
+        };
+        let Some(in_use_bytes) = Self::pages_in_use_bytes(&db, db_path) else {
+            record_reclaim(ReclaimOutcome::Undetermined);
+            return Ok(db);
+        };
+        if !compaction_is_worthwhile(trimmed_bytes, in_use_bytes) {
+            tracing::info!(
+                db_path = ?db_path,
+                was_bytes = file_bytes,
+                now_bytes = trimmed_bytes,
+                in_use_bytes,
+                phase = "compaction_trim_sufficed",
+                "Trailing slack trimmed; full compaction not needed"
+            );
+            record_reclaim(ReclaimOutcome::TrimSufficed);
+            return Ok(db);
+        }
+
+        // Logged either side rather than timed: `std::time::Instant` is barred
+        // in this crate (see .claude/rules/code-style.md). The pair also makes
+        // an interrupted compaction diagnosable — redb's `compact` is not
+        // resumable, so a kill in this window forces a repair on next open
+        // (two-phase commit throughout, so no data is lost).
+        tracing::info!(
+            db_path = ?db_path,
+            was_bytes = file_bytes,
+            now_bytes = trimmed_bytes,
+            in_use_bytes,
+            phase = "compaction_start",
+            "Compacting contract database to reclaim free pages"
+        );
+
+        let mut db = db;
+        match db.compact() {
+            Ok(compacted) => {
+                let now_bytes = std::fs::metadata(db_path)
+                    .map(|m| m.len())
+                    .unwrap_or(trimmed_bytes);
+                tracing::info!(
+                    db_path = ?db_path,
+                    was_bytes = file_bytes,
+                    now_bytes,
+                    compacted,
+                    phase = "compaction_done",
+                    "Contract database compaction finished"
+                );
+                // Record where it settled. Whatever free space remains at this
+                // size is unreclaimable, so the next start must not try again
+                // until the file has grown past it.
+                let healthy = Self::write_compaction_marker(&db, db_path, now_bytes);
+                record_reclaim(ReclaimOutcome::Compacted);
+                if healthy {
+                    Ok(db)
+                } else {
+                    drop(db);
+                    Self::reopen_after_trim(db_path)
+                }
+            }
+            Err(e) => {
+                // Deliberately NOT routed through `storage_error_is_poison` /
+                // `abort_process_on_redb_poison` like the store's other I/O
+                // errors: aborting here would loop the supervisor at startup.
+                // Reopening clears redb's per-instance `io_failed` latch, which
+                // would otherwise make every later `begin_write` return
+                // `PreviousIo` and turn a survivable compaction failure into a
+                // node that cannot boot. It does NOT rescue a persistent cause
+                // (a full disk fails the reopen's repair too) — it converts the
+                // transient case from fatal to survivable, nothing more.
+                tracing::warn!(
+                    db_path = ?db_path,
+                    error = %e,
+                    phase = "compaction_failed",
+                    "Contract database compaction failed; reopening and continuing"
+                );
+                drop(db);
+                record_reclaim(ReclaimOutcome::Undetermined);
+                Self::reopen_after_trim(db_path)
+            }
+        }
+    }
+
+    /// Reopen the database after the handle was deliberately dropped.
+    ///
+    /// The drop released the file lock, so a competing opener can briefly win
+    /// it; retry rather than failing startup over a microseconds-wide race.
+    /// A failure here IS fatal (there is no handle left to fall back on), so it
+    /// is logged with a phase before propagating — otherwise it would surface as
+    /// a bare redb error with no hint that compaction was involved.
+    fn reopen_after_trim(db_path: &Path) -> Result<Database, redb::Error> {
+        const ATTEMPTS: usize = 5;
+        let mut last_err = None;
+        for attempt in 1..=ATTEMPTS {
+            match open_database(db_path) {
+                Ok(db) => return Ok(db),
+                Err(e) => {
+                    tracing::warn!(
+                        db_path = ?db_path,
+                        error = %e,
+                        attempt,
+                        phase = "compaction_reopen_retry",
+                        "Could not reopen the contract database after trimming; retrying"
+                    );
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+        let e = last_err.expect("loop runs at least once");
+        tracing::error!(
+            db_path = ?db_path,
+            error = %e,
+            phase = "compaction_reopen_failed",
+            "Could not reopen the contract database after trimming; cannot continue"
+        );
+        Err(e.into())
+    }
+
+    /// The file size the last compaction settled at, if one has been recorded.
+    ///
+    /// A missing table or key simply means no compaction has completed yet, so
+    /// every failure here reads as "no marker" and lets the normal gate decide.
+    fn read_compaction_marker(db: &Database) -> Option<u64> {
+        let txn = db.begin_read().ok()?;
+        let table = txn.open_table(COMPACTION_MARKER_TABLE).ok()?;
+        let value = table.get(COMPACTION_MARKER_KEY).ok()??.value();
+        Some(value)
+    }
+
+    /// Record where compaction bottomed out.
+    ///
+    /// Returns `false` if the write failed in a way that may have poisoned the
+    /// handle, so the caller can reopen rather than hand a latched `Database` to
+    /// `initialize_database` — whose own `begin_write` would then return
+    /// `PreviousIo` and fail startup. That is the same failure mode the
+    /// compaction-error path reopens for, and this write runs immediately after
+    /// a whole-file rewrite, the highest-I/O-risk moment in the function.
+    ///
+    /// A benign failure (and there is no way to persist the marker) only costs
+    /// a re-evaluation on the next start, which is the pre-marker behaviour.
+    fn write_compaction_marker(db: &Database, db_path: &Path, settled_bytes: u64) -> bool {
+        // Each redb call returns a different error type; they converge on the
+        // umbrella `redb::Error` here so a single classifier can judge them.
+        let result: Result<(), redb::Error> = (|| {
+            let txn = db.begin_write()?;
+            {
+                let mut table = txn.open_table(COMPACTION_MARKER_TABLE)?;
+                table.insert(COMPACTION_MARKER_KEY, settled_bytes)?;
+            }
+            txn.commit()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                // redb latches an I/O failure on the instance, so anything in
+                // that class means the handle is no longer usable for writes.
+                let poisoned = redb_write_error_is_poison(&e);
+                tracing::warn!(
+                    db_path = ?db_path,
+                    error = %e,
+                    poisoned,
+                    "Could not record the compaction marker; the next start will re-evaluate"
+                );
+                !poisoned
+            }
+        }
+    }
+
+    /// Bytes held by pages the btrees actually occupy, or `None` if it could not
+    /// be determined (in which case the caller skips compaction).
+    ///
+    /// `stats` lives on the write transaction, so one is opened purely to read
+    /// it and explicitly aborted. `WriteTransaction::new` performs no disk
+    /// writes and `abort` consumes the transaction, so nothing is left behind;
+    /// redb's own `Database::new` uses the same begin/read/abort shape.
+    fn pages_in_use_bytes(db: &Database, db_path: &Path) -> Option<u64> {
+        let txn = match db.begin_write() {
+            Ok(txn) => txn,
+            Err(e) => {
+                tracing::warn!(
+                    db_path = ?db_path,
+                    error = %e,
+                    "Could not open a transaction to size the contract database; skipping compaction"
+                );
+                return None;
+            }
+        };
+        let stats = txn.stats();
+        // Abort regardless of the stats outcome so no transaction is left live
+        // to block the compaction below.
+        if let Err(e) = txn.abort() {
+            tracing::warn!(
+                db_path = ?db_path,
+                error = %e,
+                "Could not abort the sizing transaction; skipping compaction"
+            );
+            return None;
+        }
+        match stats {
+            Ok(stats) => Some(
+                stats
+                    .allocated_pages()
+                    .saturating_mul(stats.page_size() as u64),
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    db_path = ?db_path,
+                    error = %e,
+                    "Could not read contract database stats; skipping compaction"
+                );
+                None
             }
         }
     }
@@ -450,6 +1003,42 @@ impl ReDb {
                     table = "BROKEN_INVARIANTS_TABLE",
                     phase = "table_init_failed",
                     "Failed to open BROKEN_INVARIANTS_TABLE"
+                );
+                e
+            })?;
+
+            // Delegate secret copy-forward marker (#4117). Created on first open
+            // of upgraded databases too (same missing-table-in-write-txn
+            // materialization as the tables above), so a pre-#4117 database
+            // gains an empty table without disturbing any existing one.
+            txn.open_table(MIGRATION_MARKER_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "MIGRATION_MARKER_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open MIGRATION_MARKER_TABLE"
+                );
+                e
+            })?;
+
+            // Delegate registration origins (#4117 H1) + reserved-marker hashes
+            // (#4117 4a). Both created on first open of upgraded databases too.
+            txn.open_table(DELEGATE_ORIGINS_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "DELEGATE_ORIGINS_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open DELEGATE_ORIGINS_TABLE"
+                );
+                e
+            })?;
+
+            txn.open_table(RESERVED_MARKER_HASHES_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "RESERVED_MARKER_HASHES_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open RESERVED_MARKER_HASHES_TABLE"
                 );
                 e
             })?;
@@ -685,7 +1274,7 @@ impl ReDb {
     // These replace the legacy KEY_DATA file in contracts directory
 
     /// Store a contract index entry: ContractInstanceId → CodeHash
-    pub fn store_contract_index(
+    pub(crate) fn store_contract_index(
         &self,
         instance_id: &ContractInstanceId,
         code_hash: &CodeHash,
@@ -769,7 +1358,7 @@ impl ReDb {
 
     /// Store a delegate index entry: DelegateKey → CodeHash
     /// DelegateKey is serialized as 64 bytes (32 byte key + 32 byte code_hash)
-    pub fn store_delegate_index(
+    pub(crate) fn store_delegate_index(
         &self,
         delegate_key: &DelegateKey,
         code_hash: &CodeHash,
@@ -1108,6 +1697,271 @@ impl ReDb {
         })
     }
 
+    // ============ Delegate Secret Copy-Forward Marker (#4117) ============
+    // One-shot idempotence / anti-resurrection marker keyed on the
+    // `(predecessor, successor)` delegate pair. See `MIGRATION_MARKER_TABLE`
+    // and `SecretsStore::migrate_secrets`.
+
+    /// Build the 128-byte composite key `predecessor(64) || successor(64)`,
+    /// where each 64-byte half is `DelegateKey.key(32) || code_hash(32)` — the
+    /// same DelegateKey encoding the secrets-index tables use.
+    fn migration_marker_key(predecessor: &DelegateKey, successor: &DelegateKey) -> [u8; 128] {
+        let mut key_bytes = [0u8; 128];
+        key_bytes[..32].copy_from_slice(predecessor.as_ref());
+        key_bytes[32..64].copy_from_slice(predecessor.code_hash().as_ref());
+        key_bytes[64..96].copy_from_slice(successor.as_ref());
+        key_bytes[96..].copy_from_slice(successor.code_hash().as_ref());
+        key_bytes
+    }
+
+    /// Persist the copy-forward marker for `(predecessor, successor)`. The
+    /// `value` is the opaque, versioned audit blob built by the secrets store.
+    /// Idempotent: re-writing the same pair overwrites in place.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb write transaction, table open, or
+    /// commit fails (e.g. a backend I/O error).
+    pub fn store_migration_marker(
+        &self,
+        predecessor: &DelegateKey,
+        successor: &DelegateKey,
+        value: &[u8],
+    ) -> Result<(), redb::Error> {
+        let key_bytes = Self::migration_marker_key(predecessor, successor);
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(MIGRATION_MARKER_TABLE)?;
+            tbl.insert(key_bytes.as_slice(), value)?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Fetch the copy-forward marker for `(predecessor, successor)`, or `None`
+    /// if this pair has never been migrated. The returned bytes are the opaque
+    /// audit blob the secrets store wrote; only the store interprets them.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb read transaction, table open, or
+    /// lookup fails (e.g. a backend I/O error).
+    pub fn get_migration_marker(
+        &self,
+        predecessor: &DelegateKey,
+        successor: &DelegateKey,
+    ) -> Result<Option<Vec<u8>>, redb::Error> {
+        let key_bytes = Self::migration_marker_key(predecessor, successor);
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(MIGRATION_MARKER_TABLE)?;
+            match tbl.get(key_bytes.as_slice())? {
+                Some(v) => Ok(Some(v.value().to_vec())),
+                None => Ok(None),
+            }
+        })
+    }
+
+    // ========== Delegate registration origins (#4117 H1) ==========
+
+    /// 64-byte delegate key `DelegateKey.key(32) || code_hash(32)` — the same
+    /// encoding the secrets-index tables use.
+    ///
+    /// NOTE (#4117 L3): this redb row key includes the `code_hash`, whereas the
+    /// copy-forward's on-disk namespace and the migration gate are keyed on the
+    /// 32-byte delegate KEY only (`DelegateKey::encode()`). This is harmless:
+    /// `key = BLAKE3(code_hash || params)`, so key and code_hash move together —
+    /// two `DelegateKey`s that share a key but differ in code_hash cannot occur
+    /// for a real delegate. The wider row key just matches the sibling
+    /// secrets-index tables' convention.
+    fn delegate_key64(delegate: &DelegateKey) -> [u8; 64] {
+        let mut b = [0u8; 64];
+        b[..32].copy_from_slice(delegate.as_ref());
+        b[32..].copy_from_slice(delegate.code_hash().as_ref());
+        b
+    }
+
+    /// Record the origin under which `delegate` was FIRST registered —
+    /// FIRST-WRITER-WINS and IMMUTABLE (#4117 H1). The record is written only if
+    /// none exists; a later registration NEVER modifies it. This is the whole
+    /// security property: an attacker who re-registers a victim's
+    /// (public-derivable) WASM later cannot add itself to the origin set, so it
+    /// can never satisfy the copy-forward same-origin gate for that delegate.
+    /// `origin = None` records the Admin/None class (a token-less / loopback
+    /// registration), which the gate treats as NEVER privileged. Returns whether
+    /// a NEW record was written (`false` if one already existed).
+    ///
+    /// Value encoding (unchanged): `[has_admin_none: 1][origin: 32 if Some]` — a
+    /// first-Some writer stores `[0][C]`, a first-None writer stores `[1]`.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb write transaction, table open,
+    /// lookup, or commit fails (e.g. a backend I/O error). The caller MUST fail
+    /// the registration on `Err` (persistence-succeeds-before-usable).
+    pub fn record_delegate_origin_first_writer(
+        &self,
+        delegate: &DelegateKey,
+        origin: Option<[u8; 32]>,
+    ) -> Result<bool, redb::Error> {
+        let key = Self::delegate_key64(delegate);
+        let txn = self.begin_write()?;
+        let wrote = {
+            let mut tbl = txn.open_table(DELEGATE_ORIGINS_TABLE)?;
+            if tbl.get(key.as_slice())?.is_some() {
+                false
+            } else {
+                let mut value = Vec::with_capacity(1 + 32);
+                match origin {
+                    None => value.push(1u8), // Admin/None class, no Some origin
+                    Some(o) => {
+                        value.push(0u8);
+                        value.extend_from_slice(&o);
+                    }
+                }
+                tbl.insert(key.as_slice(), value.as_slice())?;
+                true
+            }
+        };
+        Self::commit_guarded(txn)?;
+        Ok(wrote)
+    }
+
+    /// Fetch `delegate`'s FIRST-registration origin as `(has_admin_none,
+    /// origins)`, or `None` if the delegate has never been registered on this
+    /// node (the NoProvenance case — copy-forward refuses). With first-writer
+    /// -wins, `origins` holds at most one entry.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb read transaction, table open, or
+    /// lookup fails (e.g. a backend I/O error). Copy-forward treats an `Err`
+    /// here as fail-closed (refuse the copy).
+    #[allow(clippy::type_complexity)]
+    pub fn get_delegate_origins(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Result<Option<(bool, Vec<[u8; 32]>)>, redb::Error> {
+        let key = Self::delegate_key64(delegate);
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_ORIGINS_TABLE)?;
+            match tbl.get(key.as_slice())? {
+                Some(v) => Ok(Some(Self::decode_origins(v.value()))),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn decode_origins(bytes: &[u8]) -> (bool, Vec<[u8; 32]>) {
+        if bytes.is_empty() {
+            return (false, Vec::new());
+        }
+        let has_admin_none = bytes[0] != 0;
+        let rest = &bytes[1..];
+        let mut origins = Vec::with_capacity(rest.len() / 32);
+        for chunk in rest.chunks_exact(32) {
+            // `chunks_exact(32)` yields exactly-32 slices, but decode fallibly
+            // (no production `.unwrap()`): a wrong-length chunk is skipped.
+            if let Ok(arr) = <[u8; 32]>::try_from(chunk) {
+                origins.push(arr);
+            }
+        }
+        (has_admin_none, origins)
+    }
+
+    // ========== Reserved-marker hashes (#4117 finding 4a / P2a) ==========
+
+    /// Per-delegate cap on recorded reserved-marker hashes. Bounds the table
+    /// against a delegate that somehow accretes many reserved entries; a real
+    /// delegate's reserved set is at most its predecessor count (itself capped at
+    /// registration). Over the cap, further entries are not recorded (the
+    /// below-cap `.keys` union still covers a freshly-written marker).
+    pub(crate) const MAX_RESERVED_MARKER_HASHES_PER_DELEGATE: usize = 256;
+
+    /// 96-byte row key `delegate_key64(64) || hash(32)` for the individually
+    /// -keyed reserved-marker table (no read-modify-write of a growing blob —
+    /// #4117 P2a).
+    fn reserved_marker_row_key(delegate: &DelegateKey, hash: &[u8; 32]) -> [u8; 96] {
+        let mut k = [0u8; 96];
+        k[..64].copy_from_slice(&Self::delegate_key64(delegate));
+        k[64..].copy_from_slice(hash);
+        k
+    }
+
+    /// Record that `delegate` holds a reserved-namespace coordination secret with
+    /// hash `hash`, as an individually-keyed row (#4117 P2a — no read-modify
+    /// -write amplification). Idempotent; bounded at
+    /// [`Self::MAX_RESERVED_MARKER_HASHES_PER_DELEGATE`] per delegate.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb write transaction, table open, range
+    /// count, or commit fails (e.g. a backend I/O error).
+    pub fn add_reserved_marker_hash(
+        &self,
+        delegate: &DelegateKey,
+        hash: &[u8; 32],
+    ) -> Result<(), redb::Error> {
+        let row_key = Self::reserved_marker_row_key(delegate, hash);
+        let (lo, hi) = Self::reserved_marker_range(delegate);
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(RESERVED_MARKER_HASHES_TABLE)?;
+            // Idempotent + capped. Counting the existing rows is bounded by the
+            // cap; a present row means we're done.
+            if tbl.get(row_key.as_slice())?.is_none() {
+                let count = tbl.range(lo.as_slice()..=hi.as_slice())?.count();
+                if count < Self::MAX_RESERVED_MARKER_HASHES_PER_DELEGATE {
+                    tbl.insert(row_key.as_slice(), [1u8].as_slice())?;
+                } else {
+                    tracing::warn!(
+                        delegate = %delegate.encode(),
+                        cap = Self::MAX_RESERVED_MARKER_HASHES_PER_DELEGATE,
+                        "reserved-marker hash set at cap; not recording (below-cap .keys union still covers fresh markers)"
+                    );
+                }
+            }
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Inclusive `[lo, hi]` 96-byte range bounds covering every reserved-marker
+    /// row for `delegate` (its 64-byte prefix followed by all-zero .. all-ones
+    /// hash).
+    fn reserved_marker_range(delegate: &DelegateKey) -> ([u8; 96], [u8; 96]) {
+        let mut lo = [0u8; 96];
+        lo[..64].copy_from_slice(&Self::delegate_key64(delegate));
+        let mut hi = [0xffu8; 96];
+        hi[..64].copy_from_slice(&Self::delegate_key64(delegate));
+        (lo, hi)
+    }
+
+    /// All reserved-namespace secret hashes recorded for `delegate`. Callers use
+    /// this to EXCLUDE markers from copy-forward, so a read failure MUST NOT be
+    /// silently treated as "no markers" (that would let a marker chain-copy as
+    /// user data): the caller fails closed on `Err`.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb read transaction, table open, or
+    /// range scan fails (e.g. a backend I/O error). Callers MUST fail closed on
+    /// `Err` rather than treating it as "no markers".
+    pub fn get_reserved_marker_hashes(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Result<Vec<[u8; 32]>, redb::Error> {
+        let (lo, hi) = Self::reserved_marker_range(delegate);
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(RESERVED_MARKER_HASHES_TABLE)?;
+            let mut out = Vec::new();
+            for entry in tbl.range(lo.as_slice()..=hi.as_slice())? {
+                let (k, _v) = entry?;
+                let key_bytes = k.value();
+                // Rows are always 96 bytes (delegate64||hash), but decode
+                // fallibly (no production `.unwrap()`): a malformed row is
+                // skipped rather than panicking the read.
+                if let Some(suffix) = key_bytes.get(64..) {
+                    if let Ok(hash) = <[u8; 32]>::try_from(suffix) {
+                        out.push(hash);
+                    }
+                }
+            }
+            Ok(out)
+        })
+    }
+
     // ==================== Broken Invariants Methods ====================
     // Per-contract record of detected CRDT-invariant violations. See
     // `ring::broken_invariants` for the in-memory tracker.
@@ -1276,6 +2130,13 @@ impl StateStorage for ReDb {
     }
 }
 
+// Test-only fault-injection helpers, re-exported so sibling modules' tests
+// (e.g. the secrets-store origin-record failure path, #4117) can build a
+// `ReDb` whose backend I/O can be flipped to fail on demand. Defined inside
+// `mod tests` below; surfaced at module level here for cross-module test use.
+#[cfg(test)]
+pub(crate) use tests::{FailingBackend, open_redb_with_backend};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1288,6 +2149,450 @@ mod tests {
     // 1. The backup tests below (verify backup logic works)
     // 2. Integration tests with actual v2 databases (verify migration works)
     // 3. Manual testing with actual version mismatches
+
+    /// Write `count` entries of `size` bytes, then delete all but every
+    /// `keep_every`-th (always retaining the last, so the tail stays pinned).
+    ///
+    /// The scattering matters. redb truncates *trailing* free space on commit,
+    /// so deleting a contiguous tail would simply shrink the file and prove
+    /// nothing. Real peers accumulate *interior* dead space, which no ordinary
+    /// commit can return to the OS — that is the state compaction exists to
+    /// fix, and the state this fixture reproduces.
+    ///
+    /// Returns the number of rows left alive.
+    fn bloat_database(db_path: &Path, count: usize, size: usize, keep_every: usize) -> usize {
+        let keep = |i: usize| i % keep_every == 0 || i == count - 1;
+        let db = Database::create(db_path).unwrap();
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(STATE_TABLE).unwrap();
+                let value = vec![0xABu8; size];
+                for i in 0..count {
+                    table
+                        .insert(&i.to_be_bytes()[..], value.as_slice())
+                        .unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(STATE_TABLE).unwrap();
+                for i in 0..count {
+                    if !keep(i) {
+                        table.remove(&i.to_be_bytes()[..]).unwrap();
+                    }
+                }
+            }
+            txn.commit().unwrap();
+        }
+        drop(db);
+        (0..count).filter(|i| keep(*i)).count()
+    }
+
+    /// Exact surviving contents: every key plus a digest of its value, so a
+    /// compaction that corrupted, truncated or swapped values is caught. A bare
+    /// row count would pass through all of those.
+    fn state_contents(db_path: &Path) -> Vec<(Vec<u8>, usize, u64)> {
+        let db = Database::open(db_path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let table = txn.open_table(STATE_TABLE).unwrap();
+        let mut out = Vec::new();
+        for entry in table.iter().unwrap() {
+            let (k, v) = entry.unwrap();
+            let bytes = v.value();
+            // Cheap order-sensitive digest; full equality would hold 190 MiB.
+            let digest = bytes
+                .iter()
+                .enumerate()
+                .fold(1469598103934665603u64, |h, (i, b)| {
+                    (h ^ ((*b as u64).wrapping_add(i as u64))).wrapping_mul(1099511628211)
+                });
+            out.push((k.value().to_vec(), bytes.len(), digest));
+        }
+        drop(txn);
+        drop(db);
+        out
+    }
+
+    /// Regression test for the unbounded on-disk growth: redb never returns
+    /// freed pages to the OS, so a long-running peer's file keeps its all-time
+    /// high-water mark. Production peers were sitting at 84% dead space.
+    ///
+    /// Fails without `reclaim_free_pages` (the file stays at its bloated size).
+    #[tokio::test]
+    async fn startup_compaction_reclaims_dead_pages_and_preserves_rows() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+
+        // ~192 MiB written (redb doubles, so the file lands near 386 MiB), every
+        // 16th row kept: clears both gates with the dead space interior.
+        let live_rows = bloat_database(&db_path, 192, 1024 * 1024, 16);
+        let expected = state_contents(&db_path);
+        assert_eq!(expected.len(), live_rows);
+
+        let before = std::fs::metadata(&db_path).unwrap().len();
+
+        // Opening the store is what triggers the reclaim pass.
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+        assert_eq!(
+            last_reclaim(),
+            Some(ReclaimOutcome::Compacted),
+            "the fixture should have been compacted"
+        );
+
+        let after = std::fs::metadata(&db_path).unwrap().len();
+        // The live rows are ~13 MiB, so a correct compaction lands far below
+        // this. A loose `before / 2` would let a compaction that reclaimed only
+        // part of the dead space pass silently.
+        assert!(
+            after < 64 * 1024 * 1024,
+            "compaction should reclaim nearly all dead pages: {before} -> {after}"
+        );
+        assert_eq!(
+            state_contents(&db_path),
+            expected,
+            "compaction must preserve every key and value byte-for-byte"
+        );
+
+        // Restart idempotence: the gate must DECLINE on the compacted file, or
+        // the node would rewrite its whole database on every start forever.
+        // Asserting the decision, not the size: re-compacting an already
+        // compacted file also leaves it the same size, so a size assertion
+        // would pass even if it recompacted every time.
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+        assert_ne!(
+            last_reclaim(),
+            Some(ReclaimOutcome::Compacted),
+            "a second open must NOT recompact; got {:?}",
+            last_reclaim()
+        );
+        assert_eq!(state_contents(&db_path), expected);
+    }
+
+    /// Regression test for repeat compaction on every restart.
+    ///
+    /// redb's compaction leaves a variable amount of unreclaimable free space.
+    /// A production laptop peer settled at 28.4% free — above the 25% fraction
+    /// gate — and so re-ran a full, futile compaction pass on every restart
+    /// (observed live: `compacted=false`, file byte-identical). A gateway
+    /// settled at 1.9% and was unaffected.
+    ///
+    /// That data-dependence is exactly why this does NOT rely on a fixture
+    /// reproducing the 28% residual: a synthetic fixture settles near 7%, where
+    /// the ordinary gate already declines, so it would pass with or without the
+    /// marker and prove nothing. Instead it plants a marker at the current size
+    /// and asserts the decision, which pins the marker path deterministically
+    /// whatever redb's allocator happens to leave behind.
+    #[tokio::test]
+    async fn startup_compaction_skips_when_already_settled_at_this_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+        // A fixture that WOULD otherwise be compacted (verified by the sibling
+        // test), so a skip here can only be the marker's doing.
+        let live_rows = bloat_database(&db_path, 192, 1024 * 1024, 16);
+        let expected = state_contents(&db_path);
+        let file_bytes = std::fs::metadata(&db_path).unwrap().len();
+
+        // Plant the marker: "compaction already bottomed out at this size".
+        {
+            let db = Database::create(&db_path).unwrap();
+            ReDb::write_compaction_marker(&db, &db_path, file_bytes);
+            drop(db);
+        }
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+
+        assert_eq!(
+            last_reclaim(),
+            Some(ReclaimOutcome::AlreadySettled),
+            "a database already settled at this size must not be recompacted; got {:?}",
+            last_reclaim()
+        );
+        assert_eq!(state_contents(&db_path), expected);
+        assert_eq!(expected.len(), live_rows);
+    }
+
+    /// A completed compaction must record where it settled, otherwise the next
+    /// start has nothing to consult and the repeat-compaction loop returns.
+    #[tokio::test]
+    async fn compaction_records_where_it_settled() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+        bloat_database(&db_path, 192, 1024 * 1024, 16);
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+        assert_eq!(last_reclaim(), Some(ReclaimOutcome::Compacted));
+
+        let after = std::fs::metadata(&db_path).unwrap().len();
+        let marker = {
+            let db = Database::create(&db_path).unwrap();
+            let m = ReDb::read_compaction_marker(&db);
+            drop(db);
+            m
+        };
+        let marker = marker.expect("compaction must record a marker");
+        // Written from the post-compaction size, before the marker's own commit
+        // grows the file slightly, so allow a small delta.
+        assert!(
+            marker.abs_diff(after) < 8 * 1024 * 1024,
+            "marker {marker} should record the settled size {after}"
+        );
+    }
+
+    /// A backend I/O failure during the marker write must be classified as
+    /// poison. It is the exact scenario the reopen exists for, and the
+    /// read-path classifier silently gets it wrong: it excludes
+    /// `redb::Error::Io` so that a malformed row cannot crash-loop the node.
+    /// Using it on the write path would report "benign", skip the reopen, and
+    /// hand a latched handle to `initialize_database`, whose own `begin_write`
+    /// then fails and stops the node booting.
+    #[test]
+    fn marker_write_io_failure_classifies_as_poison() {
+        let io = redb::Error::Io(std::io::Error::other("injected backend failure"));
+        assert!(
+            redb_write_error_is_poison(&io),
+            "a backend Io error on the WRITE path must count as poison"
+        );
+        // The read-path classifier must keep excluding it, or a single bad row
+        // would exit-and-restart the node.
+        assert!(
+            !redb_error_is_poison(&io),
+            "the read-path classifier must still treat Io as benign"
+        );
+        // Both agree on the unambiguous signals.
+        for e in [redb::Error::PreviousIo, redb::Error::DatabaseClosed] {
+            assert!(redb_write_error_is_poison(&e));
+            assert!(redb_error_is_poison(&e));
+        }
+    }
+
+    /// End-to-end: with the backend failing, `ReDb::new` must still return a
+    /// usable store rather than propagating the poisoned handle.
+    #[tokio::test]
+    async fn marker_write_failure_does_not_break_store_init() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+        bloat_database(&db_path, 192, 1024 * 1024, 16);
+
+        // A normal open compacts and records the marker; the store must be
+        // usable afterwards. This is the control for the classifier test above,
+        // which covers the failure branch directly (a real backend fault cannot
+        // be injected through `ReDb::new`, which owns its file backend).
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await;
+        assert!(
+            store.is_ok(),
+            "store init must succeed through the marker write"
+        );
+        drop(store);
+        assert_eq!(last_reclaim(), Some(ReclaimOutcome::Compacted));
+    }
+
+    /// Pin the exact `COMPACTION_REGROWTH_FACTOR` boundary. Without this the
+    /// constant survives mutation: the sibling tests sit far either side of it.
+    #[test]
+    fn compaction_marker_regrowth_boundary() {
+        // The decision the marker path makes is
+        //   file_bytes <= settled_bytes * COMPACTION_REGROWTH_FACTOR  -> skip
+        let settled: u64 = 400 * 1024 * 1024;
+        let threshold = (settled as f64) * COMPACTION_REGROWTH_FACTOR;
+        let skips = |file: u64| (file as f64) <= threshold;
+
+        // 1.25 x 400 MiB = exactly 500 MiB.
+        assert!(
+            skips(500 * 1024 * 1024),
+            "exactly at the threshold must skip"
+        );
+        assert!(
+            !skips(500 * 1024 * 1024 + 1),
+            "one byte past the threshold must re-evaluate"
+        );
+        // Well inside: a settled database at its own size.
+        assert!(skips(settled));
+        // Well past: genuine regrowth.
+        assert!(!skips(settled * 2));
+    }
+
+    /// The marker must not wedge compaction shut: once the file grows well past
+    /// where it settled, a fresh compaction is allowed again.
+    #[tokio::test]
+    async fn compaction_resumes_after_the_file_grows_past_the_marker() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+        bloat_database(&db_path, 192, 1024 * 1024, 16);
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+        assert_eq!(last_reclaim(), Some(ReclaimOutcome::Compacted));
+
+        // Grow well past the marker, then create fresh interior dead space.
+        {
+            let db = Database::create(&db_path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(STATE_TABLE).unwrap();
+                let v = vec![0x5Au8; 1024 * 1024];
+                for i in 1000..1400usize {
+                    t.insert(&i.to_be_bytes()[..], v.as_slice()).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(STATE_TABLE).unwrap();
+                for i in 1000..1400usize {
+                    if i % 16 != 0 {
+                        t.remove(&i.to_be_bytes()[..]).unwrap();
+                    }
+                }
+            }
+            txn.commit().unwrap();
+            drop(db);
+        }
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+        assert_eq!(
+            last_reclaim(),
+            Some(ReclaimOutcome::Compacted),
+            "a database that grew past its marker must be compactable again; got {:?}",
+            last_reclaim()
+        );
+    }
+
+    /// The gate must leave a healthy database alone, so a restart loop never
+    /// rewrites a multi-GB file for a trivial gain.
+    #[tokio::test]
+    async fn startup_compaction_skips_database_without_meaningful_dead_space() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+
+        // Aim for the discriminating case: enough dead space that the FRACTION
+        // gate passes, but under the 64 MiB absolute floor. The precondition is
+        // asserted below rather than assumed, because redb's doubling makes the
+        // resulting file size awkward to predict.
+        let live_rows = bloat_database(&db_path, 60, 1024 * 1024, 2);
+        let expected = state_contents(&db_path);
+        assert_eq!(expected.len(), live_rows);
+
+        let before = std::fs::metadata(&db_path).unwrap().len();
+        let in_use = {
+            let db = Database::create(&db_path).unwrap();
+            let n = ReDb::pages_in_use_bytes(&db, &db_path).unwrap();
+            drop(db);
+            n
+        };
+        let reclaimable = before.saturating_sub(in_use);
+
+        // Precondition: only the floor may be what declines here, otherwise the
+        // test would pass for the wrong reason (nothing to reclaim at all).
+        assert!(
+            (reclaimable as f64) >= (before as f64) * MIN_COMPACTION_RECLAIM_FRACTION,
+            "fixture must clear the fraction gate so the FLOOR is what declines; \
+             file={before} in_use={in_use} reclaimable={reclaimable}"
+        );
+        assert!(
+            reclaimable < MIN_COMPACTION_RECLAIM_BYTES,
+            "fixture must sit below the floor; file={before} reclaimable={reclaimable}"
+        );
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+
+        assert_eq!(
+            last_reclaim(),
+            Some(ReclaimOutcome::NotWorthwhile),
+            "the absolute floor should be what declines here"
+        );
+        let after = std::fs::metadata(&db_path).unwrap().len();
+        assert!(
+            after >= before,
+            "a declined compaction must not shrink the file: {before} -> {after}"
+        );
+        assert_eq!(state_contents(&db_path), expected);
+    }
+
+    /// A healthy, never-deleted database must NOT be compacted. redb grows by
+    /// doubling, so a freshly-grown file has ~50% never-allocated slack that
+    /// `allocated_pages` reports as free — if the gate keys on that, every
+    /// healthy node rewrites its whole database on every restart.
+    #[tokio::test]
+    async fn startup_compaction_skips_large_healthy_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+
+        // Nothing deleted: zero dead pages, only growth slack. ~386 MiB file.
+        let live_rows = bloat_database(&db_path, 192, 1024 * 1024, 1);
+        let before = std::fs::metadata(&db_path).unwrap().len();
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+
+        // Assert the DECISION, not the size: compacting a healthy database
+        // barely changes its length, so a size assertion cannot tell "declined"
+        // from "compacted and reclaimed almost nothing".
+        assert_ne!(
+            last_reclaim(),
+            Some(ReclaimOutcome::Compacted),
+            "a healthy database must not be compacted; got {:?}",
+            last_reclaim()
+        );
+        let after = std::fs::metadata(&db_path).unwrap().len();
+        assert!(
+            after <= before,
+            "a healthy database must not grow: {before} -> {after}"
+        );
+        assert_eq!(state_contents(&db_path).len(), live_rows);
+    }
+
+    #[test]
+    fn compaction_gate_requires_both_floor_and_fraction() {
+        const MIB: u64 = 1024 * 1024;
+
+        // Huge absolute reclaim but a trivial share of the file: skip.
+        assert!(!compaction_is_worthwhile(10_000 * MIB, 9_000 * MIB));
+        // Huge share but below the absolute floor: skip.
+        assert!(!compaction_is_worthwhile(60 * MIB, 0));
+        // Both satisfied: compact. This is the production shape (84% dead).
+        assert!(compaction_is_worthwhile(2_680 * MIB, 430 * MIB));
+
+        // Boundaries. The pair below sits where BOTH gates land simultaneously,
+        // so on its own it cannot attribute a decision to either constant.
+        assert!(compaction_is_worthwhile(256 * MIB, 192 * MIB));
+        assert!(!compaction_is_worthwhile(256 * MIB, 193 * MIB));
+
+        // Isolate the FLOOR: fraction comfortably satisfied (~91%), so only the
+        // 64 MiB floor can decide. Pins MIN_COMPACTION_RECLAIM_BYTES.
+        assert!(compaction_is_worthwhile(70 * MIB, 6 * MIB)); // exactly 64 MiB
+        assert!(!compaction_is_worthwhile(70 * MIB, 7 * MIB)); // 63 MiB
+
+        // Isolate the FRACTION: floor comfortably satisfied (250 MiB), so only
+        // the 25% share can decide. Pins MIN_COMPACTION_RECLAIM_FRACTION.
+        assert!(compaction_is_worthwhile(1000 * MIB, 750 * MIB)); // exactly 25%
+        assert!(!compaction_is_worthwhile(1000 * MIB, 751 * MIB));
+
+        // Degenerate inputs must not divide by zero or panic.
+        assert!(!compaction_is_worthwhile(0, 0));
+        assert!(
+            !compaction_is_worthwhile(100, 500),
+            "in_use > file saturates"
+        );
+    }
 
     #[tokio::test]
     async fn test_backup_nonexistent_database() {
@@ -1578,6 +2883,111 @@ mod tests {
         DelegateKey::new([key_seed; 32], CodeHash::from(&[code_seed; 32]))
     }
 
+    /// #4117 H1: the delegate-origin record is FIRST-WRITER-WINS — the first
+    /// write wins and returns `true`, a later write is a no-op returning `false`,
+    /// and the read observes the ORIGINAL (a racing loser sees the winner's
+    /// record). A `None` first-writer records the Admin/None class.
+    #[tokio::test]
+    async fn delegate_origin_first_writer_wins() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        let d = fake_delegate_key(0x33, 0x44);
+        assert!(db.get_delegate_origins(&d).unwrap().is_none());
+
+        let a = [0xA1u8; 32];
+        assert!(db.record_delegate_origin_first_writer(&d, Some(a)).unwrap());
+        // A later, different origin is a no-op (loser).
+        let b = [0xB2u8; 32];
+        assert!(!db.record_delegate_origin_first_writer(&d, Some(b)).unwrap());
+        let (has_none, origins) = db.get_delegate_origins(&d).unwrap().unwrap();
+        assert!(!has_none);
+        assert_eq!(origins, vec![a], "the read observes only the first origin");
+
+        // A None first-writer records the Admin/None class (never privileged).
+        let d2 = fake_delegate_key(0x55, 0x66);
+        assert!(db.record_delegate_origin_first_writer(&d2, None).unwrap());
+        assert!(
+            !db.record_delegate_origin_first_writer(&d2, Some(a))
+                .unwrap()
+        );
+        let (has_none2, origins2) = db.get_delegate_origins(&d2).unwrap().unwrap();
+        assert!(has_none2);
+        assert!(origins2.is_empty());
+    }
+
+    /// #4117 H1 (persistence-succeeds-before-usable): a durable-write failure in
+    /// `record_delegate_origin_first_writer` SURFACES as `Err` — it is never
+    /// swallowed into a silent `Ok`. This is the storage-layer foundation of the
+    /// rule that a failed origin record must ABORT the whole registration (a
+    /// registered-but-recordless delegate has a claimable first-writer slot).
+    /// Uses the fault-injecting backend to produce a REAL redb I/O failure.
+    /// `#[serial(redb_poison_recovery)]`: poisons a backend, which increments
+    /// the process-global `POISON_RECOVERY_TRIGGERED`. Overlapping
+    /// `poisoned_redb_takes_recovery_path_benign_does_not`'s
+    /// store-zero/assert-zero window makes that test fail. See its doc.
+    #[test]
+    #[serial_test::serial(redb_poison_recovery)]
+    fn record_delegate_origin_first_writer_surfaces_backend_failure() {
+        let backend = FailingBackend::new();
+        let db = open_redb_with_backend(backend.clone());
+        let d = fake_delegate_key(0x12, 0x34);
+
+        // Healthy: the first write succeeds and is observable.
+        assert!(
+            db.record_delegate_origin_first_writer(&d, Some([0x11u8; 32]))
+                .unwrap(),
+            "healthy first write must succeed and return `true`"
+        );
+
+        // Disk fails: a subsequent origin write MUST return Err, never a silent Ok.
+        backend.start_failing();
+        let d2 = fake_delegate_key(0x56, 0x78);
+        assert!(
+            db.record_delegate_origin_first_writer(&d2, Some([0x22u8; 32]))
+                .is_err(),
+            "a durable-write failure must surface as Err, never a silent Ok"
+        );
+    }
+
+    /// #4117 P2a: the reserved-marker-hash table is individually keyed,
+    /// idempotent, per-delegate isolated, and per-delegate CAPPED.
+    #[tokio::test]
+    async fn reserved_marker_hashes_capped_and_isolated() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        let d = fake_delegate_key(0x77, 0x88);
+        let other = fake_delegate_key(0x99, 0xAA);
+
+        let h1 = [1u8; 32];
+        let h2 = [2u8; 32];
+        db.add_reserved_marker_hash(&d, &h1).unwrap();
+        db.add_reserved_marker_hash(&d, &h1).unwrap(); // idempotent
+        db.add_reserved_marker_hash(&d, &h2).unwrap();
+        db.add_reserved_marker_hash(&other, &[9u8; 32]).unwrap();
+
+        let mut got = db.get_reserved_marker_hashes(&d).unwrap();
+        got.sort();
+        assert_eq!(got, vec![h1, h2]);
+        assert_eq!(
+            db.get_reserved_marker_hashes(&other).unwrap(),
+            vec![[9u8; 32]],
+            "reserved hashes are per-delegate isolated"
+        );
+
+        // Cap: adding well past the per-delegate cap never exceeds it.
+        let cap = ReDb::MAX_RESERVED_MARKER_HASHES_PER_DELEGATE;
+        for i in 0..(cap as u32 + 10) {
+            let mut h = [0u8; 32];
+            h[..4].copy_from_slice(&i.to_le_bytes());
+            db.add_reserved_marker_hash(&d, &h).unwrap();
+        }
+        assert_eq!(
+            db.get_reserved_marker_hashes(&d).unwrap().len(),
+            cap,
+            "per-delegate reserved-hash count is bounded at the cap"
+        );
+    }
+
     /// Full store → get → remove → load round trip for the per-user secrets
     /// index, exercising `store_user_secrets_index`, `get_user_secrets_index`,
     /// `remove_user_secrets_index` (otherwise uncalled in non-test builds),
@@ -1707,13 +3117,13 @@ mod tests {
     /// `StorageError::PreviousIo`) so the poison-detection and recovery path can be
     /// exercised without relying on the error message string.
     #[derive(Debug, Clone)]
-    struct FailingBackend {
+    pub(crate) struct FailingBackend {
         inner: Arc<redb::backends::InMemoryBackend>,
         fail: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FailingBackend {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 inner: Arc::new(redb::backends::InMemoryBackend::new()),
                 fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1721,7 +3131,7 @@ mod tests {
         }
 
         /// Make every subsequent I/O call fail, simulating a disk EIO / csum failure.
-        fn start_failing(&self) {
+        pub(crate) fn start_failing(&self) {
             self.fail.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -1760,7 +3170,7 @@ mod tests {
     }
 
     /// Open a fully-initialised [`ReDb`] over an arbitrary backend (test-only).
-    fn open_redb_with_backend<B: redb::StorageBackend>(backend: B) -> ReDb {
+    pub(crate) fn open_redb_with_backend<B: redb::StorageBackend>(backend: B) -> ReDb {
         let db = Database::builder()
             .create_with_backend(backend)
             .expect("create_with_backend");
@@ -1771,7 +3181,12 @@ mod tests {
     /// the real underlying-I/O / poison errors and NOT on benign app-level errors.
     /// Uses REAL redb errors produced via the fault-injecting backend, so it is
     /// resilient to redb wording changes (we match variants, not strings).
+    /// `#[serial(redb_poison_recovery)]`: poisons a backend, which increments
+    /// the process-global `POISON_RECOVERY_TRIGGERED`. Overlapping
+    /// `poisoned_redb_takes_recovery_path_benign_does_not`'s
+    /// store-zero/assert-zero window makes that test fail. See its doc.
     #[test]
+    #[serial_test::serial(redb_poison_recovery)]
     fn redb_poison_classifier_is_precise() {
         let backend = FailingBackend::new();
         let db = Database::builder()
@@ -1858,13 +3273,262 @@ mod tests {
         );
     }
 
+    /// Every TEST that drives the redb fault injector must carry the
+    /// `redb_poison_recovery` serial key — enforced across the whole crate, not
+    /// just this module.
+    ///
+    /// The tag on any one test is worth nothing on its own. The counter these
+    /// tests contend over, `POISON_RECOVERY_TRIGGERED`, is process-global, and
+    /// `serial_test` serializes on the KEY rather than the module — so a single
+    /// untagged user anywhere in the crate can still land inside the benign
+    /// test's store-zero/assert-zero window and make it fail. That is exactly
+    /// what happened: three tests in this module were tagged and a fourth,
+    /// `register_aborts_when_origin_record_fails_then_recovers` over in
+    /// `contract::executor::runtime`, was missed, which NARROWED the race
+    /// instead of closing it. A reviewer caught it; nothing in the tree would
+    /// have.
+    ///
+    /// So this pin walks `src/` from disk rather than using `include_str!`. A
+    /// fixed list of files is the same defect one level up: the next user of the
+    /// injector will be in a file nobody thought to add. Any test that so much
+    /// as mentions `FailingBackend` or `start_failing(` must be tagged, and
+    /// over-inclusion is the deliberate bias — a spurious tag costs a little
+    /// serialization, a missing one costs an intermittent failure that CI
+    /// cannot see (`cargo nextest` gives each test its own process; see
+    /// `.claude/rules/testing.md`).
+    #[test]
+    fn every_test_using_the_failure_injector_is_serialized() {
+        const INJECTOR_MARKERS: [&str; 2] = ["FailingBackend", "start_failing("];
+        const SERIAL_KEY: &str = "serial(redb_poison_recovery)";
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src, &mut files);
+        assert!(
+            files.len() > 50,
+            "the walk found only {} files under {}; if the layout moved, FIX THE \
+             WALK rather than letting this pin pass vacuously",
+            files.len(),
+            src.display()
+        );
+
+        let mut untagged = Vec::new();
+        let mut checked = 0usize;
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("read source file");
+            for (attrs, name, body) in functions_with_attributes(&text) {
+                let is_test = attrs.contains("test]") || attrs.contains("test(");
+                if !is_test {
+                    continue;
+                }
+                // This pin names the markers in its own source, so it matches
+                // itself. Excluded by name rather than by weakening the search.
+                if name == "every_test_using_the_failure_injector_is_serialized" {
+                    continue;
+                }
+                if !INJECTOR_MARKERS.iter().any(|m| body.contains(m)) {
+                    continue;
+                }
+                checked += 1;
+                if !attrs.contains(SERIAL_KEY) {
+                    untagged.push(format!("{}::{name}", path.display()));
+                }
+            }
+        }
+
+        // The pin must not pass because it found nothing to look at.
+        assert!(
+            checked >= 4,
+            "expected at least the four known injector tests, found {checked}; a \
+             parser that matches nothing would report success forever"
+        );
+        assert!(
+            untagged.is_empty(),
+            "these tests drive the redb fault injector without \
+             `#[serial_test::serial(redb_poison_recovery)]`, so they can run \
+             concurrently with the poison-recovery tests and corrupt the \
+             process-global POISON_RECOVERY_TRIGGERED counter they share: {untagged:#?}"
+        );
+    }
+
+    /// Blank out string literals and `//` comments so brace counting sees only
+    /// code. Handles escapes and raw strings (`r"..."`, `r#"..."#`).
+    fn strip_strings_and_comments(line: &str) -> String {
+        let bytes: Vec<char> = line.chars().collect();
+        let mut out = String::with_capacity(line.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            // Raw string: r, then any number of #, then a quote.
+            if c == 'r' {
+                let mut j = i + 1;
+                let mut hashes = 0;
+                while j < bytes.len() && bytes[j] == '#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == '"' {
+                    let close: String = std::iter::once('"')
+                        .chain(std::iter::repeat_n('#', hashes))
+                        .collect();
+                    let rest: String = bytes[j + 1..].iter().collect();
+                    match rest.find(&close) {
+                        Some(end) => {
+                            i = j + 1 + end + close.len();
+                            continue;
+                        }
+                        // Unterminated on this line: the rest is string.
+                        None => break,
+                    }
+                }
+            }
+            if c == '"' {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == '"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '\'' {
+                // Char literal or a lifetime. Only skip when it looks like a
+                // literal, so `'static` does not swallow the rest of the line.
+                if i + 2 < bytes.len() && bytes[i + 1] == '\\' {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != '\'' {
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if i + 2 < bytes.len() && bytes[i + 2] == '\'' {
+                    i += 3;
+                    continue;
+                }
+            }
+            if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == '/' {
+                break;
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Split Rust source into `(attributes, name, body)` for every `fn`.
+    ///
+    /// Braces are counted only on text with string literals and line comments
+    /// removed, which is not cosmetic: `export_dispatch_arm_defers_off_loop` in
+    /// `contract::executor::runtime` embeds an unbalanced `{` inside a string
+    /// literal, so a naive counter never closes that function and runs its
+    /// "body" to end of file — reporting it, and everything after it, as an
+    /// injector user. The first version of this pin did exactly that.
+    ///
+    /// Where it is still crude the bias is deliberately toward over-matching: a
+    /// spurious hit costs a serial tag on a test that did not need one, and is
+    /// visible. Under-matching would silently drop a function from the sweep,
+    /// which is the failure this pin exists to prevent.
+    fn functions_with_attributes(text: &str) -> Vec<(String, String, String)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = Vec::new();
+        let mut attrs = String::new();
+        for (i, raw) in lines.iter().enumerate() {
+            let line = raw.trim_start();
+            if line.starts_with("#[") || line.starts_with("///") || line.starts_with("//!") {
+                attrs.push_str(line);
+                attrs.push('\n');
+                continue;
+            }
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            if line.contains("fn ") {
+                let after_fn = line
+                    .strip_prefix("pub ")
+                    .unwrap_or(line)
+                    .strip_prefix("async ")
+                    .map(|rest| rest.strip_prefix("fn ").unwrap_or(rest))
+                    .or_else(|| line.split_once("fn ").map(|(_, rest)| rest));
+                if let Some(rest) = after_fn {
+                    let name = rest
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    if !name.is_empty() {
+                        let mut depth = 0i32;
+                        let mut body = String::new();
+                        let mut started = false;
+                        for l in &lines[i..] {
+                            body.push_str(l);
+                            body.push('\n');
+                            let code = strip_strings_and_comments(l);
+                            depth += code.matches('{').count() as i32;
+                            depth -= code.matches('}').count() as i32;
+                            if code.contains('{') {
+                                started = true;
+                            }
+                            if started && depth <= 0 {
+                                break;
+                            }
+                        }
+                        out.push((std::mem::take(&mut attrs), name, body));
+                        continue;
+                    }
+                }
+            }
+            attrs.clear();
+        }
+        out
+    }
+
     /// End-to-end (issue #4604, requirement 3): a poisoned database routes contract
     /// ops to the recovery path (process-exit-for-restart in production) rather than
     /// failing forever, while a benign not-found does NOT. The recovery handler is
     /// opt-in and OFF in tests, so it returns instead of exiting; the test-only
     /// counter proves the `begin_*` wrapper recognised the poison and would have
     /// exited under the real node binary.
+    /// `#[serial(redb_poison_recovery)]` because this test asserts on
+    /// `POISON_RECOVERY_TRIGGERED`, a PROCESS-GLOBAL counter that the `begin_*`
+    /// choke points increment for ANY poisoned handle in the process. Three
+    /// tests in this module poison a backend
+    /// (`record_delegate_origin_first_writer_surfaces_backend_failure`,
+    /// `redb_poison_classifier_is_precise`, and this one), so under the default
+    /// multi-threaded runner a sibling's increment lands inside another's
+    /// store-zero/assert-zero window and fails it.
+    ///
+    /// Measured, not theorised: 1 failure in 15 full-suite runs of
+    /// `cargo test --lib`, as
+    /// `assertion left == right failed: benign not-found / normal ops must NOT
+    /// take the poison-recovery path, left: 1, right: 0`. It is invisible under
+    /// `cargo nextest` at any repeat count, because nextest gives every test its
+    /// own process and the interference needs two tests in ONE — the exact
+    /// blindness `.claude/rules/testing.md` describes, and the reason CI never
+    /// caught it. Same shape and same fix as the version-discovery statics in
+    /// `transport.rs`.
     #[test]
+    #[serial_test::serial(redb_poison_recovery)]
     fn poisoned_redb_takes_recovery_path_benign_does_not() {
         use std::sync::atomic::Ordering;
 

@@ -1,6 +1,12 @@
 pub(crate) mod backoff;
+pub(crate) mod byte_bounded_lru;
 pub mod deterministic_select;
 pub(crate) mod rate_limit_layer;
+/// Order-independent `tracing` capture for tests that assert on emitted events.
+/// Test-only: it registers process-global `tracing` state and must never be
+/// compiled into a shipped binary.
+#[cfg(all(test, feature = "trace"))]
+pub(crate) mod test_log_capture;
 pub(crate) mod time_source;
 pub(crate) mod workspace;
 

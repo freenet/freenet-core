@@ -45,12 +45,15 @@
 //! would admit writes that actually overflow disk), so a seed that cannot read
 //! the truth must surface the error rather than start from an under-count.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use freenet_stdlib::prelude::ContractKey;
 use parking_lot::Mutex;
+
+use crate::tracing::event_kind::{STATE_SIZE_BUCKET_COUNT, state_size_bucket};
+use crate::wasm_runtime::MAX_STATE_SIZE;
 
 /// A pre-write admission check rejected a state/code write because it would
 /// push aggregate on-disk usage past the disk budget (#4683, admission gate live
@@ -89,12 +92,91 @@ impl std::fmt::Display for DiskBudgetExceeded {
 pub(crate) struct DiskUsageStats {
     /// Persisted contract-state bytes (delta-tracked, seeded from redb rows).
     pub state_bytes: u64,
+    /// Number of persisted contract states in the authoritative size index.
+    pub state_count: u64,
+    /// Exact state counts by fixed state-size bucket.
+    pub state_size_bucket_counts: [u64; STATE_SIZE_BUCKET_COUNT],
+    /// Exact state bytes by the same fixed state-size bucket.
+    pub state_size_bucket_bytes: [u64; STATE_SIZE_BUCKET_COUNT],
+    /// Largest persisted contract state, or zero when none are stored.
+    pub state_max_bytes: u64,
+    /// Persisted states above the runtime's hard state-size limit. This should
+    /// always be zero; a nonzero value exposes an enforcement invariant break.
+    pub state_over_limit_count: u64,
+    /// Bytes held by persisted states above the hard state-size limit.
+    pub state_over_limit_bytes: u64,
+    /// Runtime hard state-size limit used for the invariant above.
+    pub state_limit_bytes: u64,
     /// On-disk WASM code blob bytes (`du` of `contracts_dir/*.wasm`).
     pub wasm_bytes: u64,
     /// Wasmtime compile-cache bytes (`du` of the relocated cache dir).
     pub compile_cache_bytes: u64,
     /// Sum of the three above — the aggregate the disk budget bounds.
     pub total_bytes: u64,
+}
+
+/// Exact state-size index with incrementally maintained fixed-cardinality
+/// aggregates. Snapshotting this structure is O(number of buckets), not
+/// O(number of hosted contracts), so telemetry never pauses state commits for
+/// a full-map clone.
+#[derive(Default)]
+struct StateSizeIndex {
+    by_contract: HashMap<ContractKey, u64>,
+    by_size: BTreeMap<u64, u64>,
+    bucket_counts: [u64; STATE_SIZE_BUCKET_COUNT],
+    bucket_bytes: [u64; STATE_SIZE_BUCKET_COUNT],
+    over_limit_count: u64,
+    over_limit_bytes: u64,
+}
+
+impl StateSizeIndex {
+    fn get(&self, key: &ContractKey) -> Option<u64> {
+        self.by_contract.get(key).copied()
+    }
+
+    fn insert(&mut self, key: ContractKey, size: u64) -> Option<u64> {
+        let old = self.by_contract.insert(key, size);
+        if let Some(old) = old {
+            self.remove_size(old);
+        }
+        self.add_size(size);
+        old
+    }
+
+    fn remove(&mut self, key: &ContractKey) -> Option<u64> {
+        let size = self.by_contract.remove(key)?;
+        self.remove_size(size);
+        Some(size)
+    }
+
+    fn add_size(&mut self, size: u64) {
+        let count = self.by_size.entry(size).or_default();
+        *count = count.saturating_add(1);
+        let bucket = state_size_bucket(size);
+        self.bucket_counts[bucket] = self.bucket_counts[bucket].saturating_add(1);
+        self.bucket_bytes[bucket] = self.bucket_bytes[bucket].saturating_add(size);
+        if size > MAX_STATE_SIZE as u64 {
+            self.over_limit_count = self.over_limit_count.saturating_add(1);
+            self.over_limit_bytes = self.over_limit_bytes.saturating_add(size);
+        }
+    }
+
+    fn remove_size(&mut self, size: u64) {
+        if let std::collections::btree_map::Entry::Occupied(mut entry) = self.by_size.entry(size) {
+            if *entry.get() <= 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() -= 1;
+            }
+        }
+        let bucket = state_size_bucket(size);
+        self.bucket_counts[bucket] = self.bucket_counts[bucket].saturating_sub(1);
+        self.bucket_bytes[bucket] = self.bucket_bytes[bucket].saturating_sub(size);
+        if size > MAX_STATE_SIZE as u64 {
+            self.over_limit_count = self.over_limit_count.saturating_sub(1);
+            self.over_limit_bytes = self.over_limit_bytes.saturating_sub(size);
+        }
+    }
 }
 
 /// Signed-delta + seed-once tracker for aggregate hosting disk usage.
@@ -124,7 +206,7 @@ pub(crate) struct DiskUsageTracker {
     /// [`Self::seed`] and [`Self::record_state_write`]. Per-shard locking would
     /// reopen that race and turn the counter into a load-bearing under-count
     /// now that the admission gate reads it (#4702).
-    state_sizes: Mutex<HashMap<ContractKey, u64>>,
+    state_sizes: Mutex<StateSizeIndex>,
     /// Directory holding `*.wasm` code blobs (mode-resolved `contracts_dir`).
     contracts_dir: PathBuf,
     /// Relocated wasmtime compile-cache directory (on the data-dir mount).
@@ -140,7 +222,7 @@ impl DiskUsageTracker {
             wasm_bytes: AtomicU64::new(0),
             compile_cache_bytes: AtomicU64::new(0),
             seeded: AtomicBool::new(false),
-            state_sizes: Mutex::new(HashMap::new()),
+            state_sizes: Mutex::new(StateSizeIndex::default()),
             contracts_dir,
             compile_cache_dir,
         }
@@ -167,11 +249,33 @@ impl DiskUsageTracker {
 
     /// Snapshot all gauges for telemetry.
     pub(crate) fn stats(&self) -> DiskUsageStats {
-        let state_bytes = self.state_bytes.load(Ordering::Relaxed);
+        // The histogram and ordered size multiset are maintained at each
+        // write/removal, so this lock is held only for a fixed-size copy.
+        let sizes = self.state_sizes.lock();
+        let state_count = sizes.by_contract.len() as u64;
+        let state_size_bucket_counts = sizes.bucket_counts;
+        let state_size_bucket_bytes = sizes.bucket_bytes;
+        let state_bytes = state_size_bucket_bytes
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        let state_max_bytes = sizes.by_size.last_key_value().map_or(0, |(size, _)| *size);
+        let state_over_limit_count = sizes.over_limit_count;
+        let state_over_limit_bytes = sizes.over_limit_bytes;
+        let state_limit_bytes = MAX_STATE_SIZE as u64;
+        drop(sizes);
+
         let wasm_bytes = self.wasm_bytes.load(Ordering::Relaxed);
         let compile_cache_bytes = self.compile_cache_bytes.load(Ordering::Relaxed);
         DiskUsageStats {
             state_bytes,
+            state_count,
+            state_size_bucket_counts,
+            state_size_bucket_bytes,
+            state_max_bytes,
+            state_over_limit_count,
+            state_over_limit_bytes,
+            state_limit_bytes,
             wasm_bytes,
             compile_cache_bytes,
             total_bytes: state_bytes
@@ -234,16 +338,14 @@ impl DiskUsageTracker {
             // true post-write size while we were unseeded. That value is newer
             // and authoritative — do NOT overwrite it with the stale snapshot.
             // Only rows not already buffered by such a write are inserted.
-            match sizes.entry(key) {
-                std::collections::hash_map::Entry::Occupied(_) => {}
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    v.insert(size);
-                }
+            if !sizes.by_contract.contains_key(&key) {
+                sizes.insert(key, size);
             }
         }
         // Recompute the aggregate from the merged map so buffered concurrent
         // writes are reflected exactly.
         let total = sizes
+            .by_contract
             .values()
             .copied()
             .fold(0u64, |acc, v| acc.saturating_add(v));
@@ -432,7 +534,7 @@ impl DiskUsageTracker {
         // `record_state_write` cannot land its delta between our `old` read and
         // our `total` read and make the projection inconsistent.
         let sizes = self.state_sizes.lock();
-        let old = sizes.get(key).copied().unwrap_or(0);
+        let old = sizes.get(key).unwrap_or(0);
         let total = self.total_bytes();
         drop(sizes);
         // projected = total − old + new (saturating so it can never wrap).
@@ -473,7 +575,7 @@ impl DiskUsageTracker {
         // Hold the delta-path lock so the `old` read and the `total` read are a
         // consistent snapshot (same rationale as `admit_state_write`).
         let sizes = self.state_sizes.lock();
-        let old = sizes.get(key).copied().unwrap_or(0);
+        let old = sizes.get(key).unwrap_or(0);
         // Non-positive delta (shrink or hold) never blocks convergence.
         if new_size <= old {
             return Ok(());
@@ -544,7 +646,12 @@ impl DiskUsageTracker {
 /// directory (not yet created) or an unreadable entry contributes 0 rather than
 /// erroring — the refresh path is best-effort telemetry, unlike the fail-loud
 /// state seed.
-fn du_walk(dir: &Path) -> u64 {
+///
+/// `pub(crate)` (re-exported as `ring::disk_directory_size_bytes`, #5014) so
+/// the wasmtime on-disk compile-cache startup sizing
+/// (`wasm_runtime::runtime::default_wasmtime_cache_size_bytes_for_dir`) can
+/// measure a prior run's cache directory without duplicating this walk.
+pub(crate) fn du_walk(dir: &Path) -> u64 {
     let mut total: u64 = 0;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(path) = stack.pop() {
@@ -700,6 +807,68 @@ mod tests {
         // A second seed must be a no-op (no double-count).
         t.seed([(test_key(3), 999)]);
         assert_eq!(t.stats().state_bytes, 150);
+    }
+
+    #[test]
+    fn persisted_state_inventory_is_exact_at_every_bucket_boundary() {
+        let t = tracker();
+        let bounds = crate::tracing::event_kind::STATE_SIZE_BUCKET_UPPER_BOUNDS;
+        let mut rows = Vec::new();
+        let mut expected_counts = [0u64; STATE_SIZE_BUCKET_COUNT];
+        let mut expected_bytes = [0u64; STATE_SIZE_BUCKET_COUNT];
+
+        // Put one state exactly at each inclusive boundary, then one byte above
+        // the hard limit to exercise the final bucket and invariant counter.
+        for (index, size) in bounds.into_iter().enumerate() {
+            rows.push((test_key(index as u8), size));
+            expected_counts[index] += 1;
+            expected_bytes[index] += size;
+        }
+        let over_limit = MAX_STATE_SIZE as u64 + 1;
+        rows.push((test_key(250), over_limit));
+        expected_counts[STATE_SIZE_BUCKET_COUNT - 1] = 1;
+        expected_bytes[STATE_SIZE_BUCKET_COUNT - 1] = over_limit;
+
+        t.seed(rows);
+        let stats = t.stats();
+        assert_eq!(stats.state_count, STATE_SIZE_BUCKET_COUNT as u64);
+        assert_eq!(stats.state_size_bucket_counts, expected_counts);
+        assert_eq!(stats.state_size_bucket_bytes, expected_bytes);
+        assert_eq!(stats.state_max_bytes, over_limit);
+        assert_eq!(stats.state_over_limit_count, 1);
+        assert_eq!(stats.state_over_limit_bytes, over_limit);
+        assert_eq!(stats.state_limit_bytes, MAX_STATE_SIZE as u64);
+        assert_eq!(
+            stats.state_size_bucket_counts.iter().sum::<u64>(),
+            stats.state_count
+        );
+        assert_eq!(
+            stats.state_size_bucket_bytes.iter().sum::<u64>(),
+            stats.state_bytes
+        );
+    }
+
+    #[test]
+    fn persisted_state_inventory_tracks_bucket_crossing_and_removal() {
+        let t = tracker();
+        let key = test_key(1);
+        t.seed([(key, 64 * 1024)]);
+
+        t.record_state_write(&key, 64 * 1024 + 1);
+        let moved = t.stats();
+        assert_eq!(moved.state_size_bucket_counts[0], 0);
+        assert_eq!(moved.state_size_bucket_counts[1], 1);
+        assert_eq!(moved.state_size_bucket_bytes[1], 64 * 1024 + 1);
+        assert_eq!(moved.state_max_bytes, 64 * 1024 + 1);
+
+        t.record_state_removed(&key);
+        let empty = t.stats();
+        assert_eq!(empty.state_count, 0);
+        assert_eq!(empty.state_size_bucket_counts, [0; STATE_SIZE_BUCKET_COUNT]);
+        assert_eq!(empty.state_size_bucket_bytes, [0; STATE_SIZE_BUCKET_COUNT]);
+        assert_eq!(empty.state_max_bytes, 0);
+        assert_eq!(empty.state_over_limit_count, 0);
+        assert_eq!(empty.state_over_limit_bytes, 0);
     }
 
     #[test]

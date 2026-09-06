@@ -316,12 +316,14 @@ async fn emit_get_terminal_event(
 /// network — those paths never call [`start_client_get`], so the driver's
 /// terminal event never fires for them.
 ///
-/// `attempts = 0` is the convention marking a local hit (a networked GET
-/// always sends >= 1 request, so `attempts >= 1`), letting analysts split
-/// "all client GET successes" from "network GET findability" without a new
-/// field. Keeps the client-visible findability metric covering ALL client
-/// GET successes — gateways serve many local hits, which would otherwise
-/// bias the number toward network misses.
+/// `attempts = 0` is the convention marking a local hit: this path sends no
+/// request at all. It is NOT the network-vs-local split — `attempts >= 1`
+/// also covers a loopback `LocalCompletion`, which bumps `requests_sent`
+/// without a network round-trip, so `summarize_client_get_outcomes` splits on
+/// `hop_count` instead (#4852 P2, #5248). Emitting here keeps the
+/// client-visible findability metric covering ALL client GET successes —
+/// gateways serve many local hits, which would otherwise bias the number
+/// toward network misses.
 pub(crate) async fn emit_local_get_terminal_event(
     op_manager: &OpManager,
     instance_id: ContractInstanceId,
@@ -440,6 +442,7 @@ async fn drive_client_get_inner(
         "get",
         &mut driver,
         /* emit_route_failure_on_retry */ true,
+        crate::ring::HostingCause::ClientGet,
     )
     .await;
 
@@ -507,6 +510,7 @@ async fn drive_client_get_inner(
                         state.clone(),
                         contract.clone(),
                         true, // client driver: this node initiated the GET
+                        crate::ring::HostingCause::ClientGet,
                     )
                     .await;
                     *key
@@ -768,6 +772,24 @@ async fn drive_client_get_inner(
                 None,
             )
             .await;
+            // Dashboard op_stats GET counter (issue #4828). Exhaustion
+            // delivered no state to the client, so it is a FAILED GET —
+            // record it explicitly as such. Before #4828 this arm recorded
+            // nothing, so a GET dead-end (the dominant production
+            // `not_found` mode) incremented NEITHER `gets.0` nor `gets.1`
+            // and the ops card showed an idle-looking node while every GET
+            // failed.
+            //
+            // This must stay an explicit `false` rather than moving to a
+            // `deliver_outcome` funnel the way PUT/UPDATE do: the arm
+            // publishes `Ok(HostResponse::…NotFound)` so that clients can
+            // distinguish "contract genuinely absent" from "operation
+            // failed", which means a `matches!(Publish(Ok(_)))` classifier
+            // would score a dead-end as a SUCCESS.
+            crate::node::network_status::record_op_result(
+                crate::node::network_status::OpType::Get,
+                false,
+            );
             Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                 freenet_stdlib::client_api::ContractResponse::NotFound { instance_id },
             ))))
@@ -1101,6 +1123,11 @@ async fn drive_get_with_assembly_retry(
     op_label: &str,
     driver: &mut GetRetryDriver<'_>,
     emit_route_failure_on_retry: bool,
+    // Hosting attribution for the streamed store this wrapper performs. Both the
+    // client driver and the sub-op driver use this wrapper, and the stream store
+    // is unconditionally `is_client_requester = true`, so the flag cannot tell
+    // them apart — the caller names itself instead. Telemetry only.
+    cause: crate::ring::HostingCause,
 ) -> (RetryLoopOutcome<Terminal>, AssemblyOutcome) {
     let mut attempt_tx = first_tx;
     let mut assembly = AssemblyOutcome::default();
@@ -1199,8 +1226,15 @@ async fn drive_get_with_assembly_retry(
         };
 
         let stream_start = tokio::time::Instant::now();
-        match assemble_and_cache_stream(op_manager, peer_addr, stream_id, key, includes_contract)
-            .await
+        match assemble_and_cache_stream(
+            op_manager,
+            peer_addr,
+            stream_id,
+            key,
+            includes_contract,
+            cause,
+        )
+        .await
         {
             Ok(progress) => {
                 assembly.transfer_duration = Some(stream_start.elapsed());
@@ -1453,6 +1487,12 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
 ///    (i.e., `access_result.is_new && put_persisted`). NOT gated on
 ///    `is_client_requester`; legacy announces on any first-time relay
 ///    cache too (`get.rs:2278, 2370`).
+///
+/// `cause` names WHY this store may begin hosting (client GET, relay transit,
+/// or a sub-op fetch). It is TELEMETRY ONLY and is threaded from the call site
+/// because only the call site knows which driver it is: `is_client_requester`
+/// cannot stand in for it, since the streaming originator path passes `true`
+/// for BOTH the client and the sub-op driver.
 // NAMING LANDMINE: "cache"/"store" here means HOSTING, not a lesser cache tier. A
 // peer stores a contract because a GET routed through it, and a routed GET is a
 // demand signal, so the peer HOSTS the contract (WASM+state, kept fresh in the
@@ -1464,6 +1504,7 @@ async fn cache_contract_locally(
     state: WrappedState,
     contract: Option<ContractContainer>,
     is_client_requester: bool,
+    cause: crate::ring::HostingCause,
 ) -> bool {
     // EXPERIMENT-ONLY (findability_probe): suppress RELAY-path GET-return caching
     // so the seeded copy cannot self-scatter along successful GET return paths
@@ -1567,7 +1608,7 @@ async fn cache_contract_locally(
     // or put failed). This mirrors the legacy invariant that a
     // successful wire-level GET must refresh the hosting LRU/TTL
     // regardless of what the local executor did with the state.
-    let access_result = op_manager.ring.record_get_access(key, state_size);
+    let access_result = op_manager.ring.record_get_access(key, state_size, cause);
     // Sticky flag gating subscription renewal; only the client-originating
     // node sets it. Relays that pass through a Found MUST NOT taint their
     // own hosting cache with another node's client access. Legacy mirror:
@@ -1683,6 +1724,8 @@ async fn assemble_and_cache_stream(
     stream_id: StreamId,
     expected_key: ContractKey,
     includes_contract: bool,
+    // Hosting attribution for the store below; see `cache_contract_locally`.
+    cause: crate::ring::HostingCause,
 ) -> Result<StreamProgress, AssemblyFailure> {
     // Test-only deterministic fault injection (#4345). Returning before
     // the claim mirrors the production claim-timeout failure (the inbound
@@ -1812,7 +1855,7 @@ async fn assemble_and_cache_stream(
     // but it uses its own inline assemble+cache with `local_client_access =
     // false`; this path is the originator, which IS the client requester, so
     // the sticky `local_client_access` flag applies here.
-    cache_contract_locally(op_manager, payload.key, state, contract, true).await;
+    cache_contract_locally(op_manager, payload.key, state, contract, true, cause).await;
     Ok(StreamProgress {
         fragments_received,
         total_fragments,
@@ -1993,6 +2036,26 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
                 tx = %client_tx,
                 error = %err,
                 "get: infrastructure error; publishing synthesized client error"
+            );
+            // Dashboard op_stats GET counter (issue #4828). An
+            // infrastructure error (the `Unexpected` / `InfraError`
+            // terminal outcomes, mapped to `InfrastructureError` in
+            // `drive_client_get`) publishes a synthesized client error
+            // below, so it is a terminal client-visible FAILED GET and
+            // must increment `op_stats.gets.1`. Before #4828 this path
+            // recorded nothing — the same silent-counter-rot bug class the
+            // rest of this PR fixes, left open for the one GET failure arm
+            // that does not surface through `Done`/`Exhausted`.
+            //
+            // This is the ONLY site that observes these outcomes: the
+            // `Unexpected`/`InfraError` arms return `Err` from
+            // `drive_client_get_inner`, which `drive_client_get` maps to
+            // `InfrastructureError` and delivers to the client here. The
+            // `Done` and `Exhausted` arms record in the driver and return
+            // `Publish`, so they never reach this arm — no double count.
+            crate::node::network_status::record_op_result(
+                crate::node::network_status::OpType::Get,
+                false,
             );
             let synthesized: HostResult = Err(ErrorKind::OperationError {
                 cause: format!("GET failed: {err}").into(),
@@ -2229,6 +2292,7 @@ async fn drive_sub_op_get(
         // on the sub-op path), so skip the per-retry failure events.
         /* emit_route_failure_on_retry */
         false,
+        crate::ring::HostingCause::SubOpGet,
     )
     .await;
 
@@ -2251,6 +2315,7 @@ async fn drive_sub_op_get(
                         state.clone(),
                         contract.clone(),
                         false, // sub-op: not a client-originating GET
+                        crate::ring::HostingCause::SubOpGet,
                     )
                     .await;
                 }
@@ -3024,6 +3089,31 @@ where
     }
 }
 
+/// Hosting attribution for a local store made by the GET forwarding driver:
+/// did this node's OWN request put the contract here, or did someone else's
+/// merely transit?
+///
+/// `node.rs` maps a locally-originated GET (`source_addr = None`) to
+/// `upstream_addr = own_addr` and drives it through this same forwarding driver,
+/// so "this driver is running" does NOT imply transit. Counting that loopback as
+/// transit defeats the whole point of the enum, which exists to separate our own
+/// demand from someone else's. `start_relay_get` already applies exactly this
+/// gate before `record_relayed_get`; this is the hosting-side twin of it.
+///
+/// Fails safe to [`HostingCause::TransitGet`] when our own address is unknown:
+/// an unattributable store is someone else's until proven otherwise, and the
+/// symmetric mistake (inflating this node's own demand) is the one that would
+/// mislead a hosting-policy decision.
+fn relay_get_hosting_cause(
+    own_addr: Option<SocketAddr>,
+    upstream_addr: SocketAddr,
+) -> crate::ring::HostingCause {
+    match own_addr {
+        Some(own) if own == upstream_addr => crate::ring::HostingCause::ClientGet,
+        _ => crate::ring::HostingCause::TransitGet,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_relay_get_inner<CB>(
     op_manager: &Arc<OpManager>,
@@ -3094,9 +3184,19 @@ where
         return Ok(());
     }
 
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+
+    // Hosting attribution for EVERY local store this driver makes. Computed once
+    // here, at the one place that knows whether this driver invocation is transit
+    // at all, and threaded down — a per-callsite literal is how the loopback case
+    // leaked into the transit row in the first place. See
+    // `relay_get_hosting_cause` for why loopback is not transit; `start_relay_get`
+    // applies the identical gate to `record_relayed_get`.
+    let hosting_cause = relay_get_hosting_cause(own_addr, upstream_addr);
+
     // ── Update visited set: mark this peer and the upstream ─────────────
     let mut new_visited = visited.with_transaction(&incoming_tx);
-    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
+    if let Some(own_addr) = own_addr {
         new_visited.mark_visited(own_addr);
     }
     new_visited.mark_visited(upstream_addr);
@@ -3155,9 +3255,37 @@ where
             .get_peer_by_addr(upstream_addr)
         {
             let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
-            let is_new = op_manager
+            // Refresh-if-present, register-if-absent (#4672). A bare
+            // `register_peer_interest` inserts a fresh `PeerInterest` over an
+            // existing entry, wiping its cached delta-sync summary and forcing
+            // the next broadcast to this peer back to full state.
+            //
+            // Plain `refresh_peer_interest` here, NOT the `_with_upstream`
+            // variant the subscribe finalizers use: this call passes
+            // `is_upstream = false`, and asserting that on an existing entry
+            // would DOWNGRADE a peer that is legitimately our upstream, which is
+            // the `Unsubscribe` routing target. A GET requester's interest must
+            // not clear an upstream edge established by SUBSCRIBE.
+            //
+            // One acquisition, via the refresh's own bool — NOT
+            // `get_peer_interest(..).is_some()`, which clones the cached
+            // summary (state-sized on the contracts that matter) purely to test
+            // presence, and can lose the registration if the entry is removed
+            // between the two lookups.
+            let is_new = if op_manager
                 .interest_manager
-                .register_peer_interest(&key, peer_key, None, false);
+                .refresh_peer_interest(&key, &peer_key)
+            {
+                false
+            } else {
+                op_manager.interest_manager.register_peer_interest_from(
+                    &key,
+                    peer_key,
+                    None,
+                    false,
+                    crate::ring::interest::InterestRegistrationSource::Get,
+                )
+            };
             if is_new {
                 // #4359 (MUST-FIX 1): a remote GET with subscribe=false still
                 // registers the requester's interest, making them a viable
@@ -3213,7 +3341,7 @@ where
             hop_count,
         )
         .await;
-        cache_contract_locally(op_manager, key, state, contract, false).await;
+        cache_contract_locally(op_manager, key, state, contract, false, hosting_cause).await;
         send_result?;
         return Ok(());
     }
@@ -3303,7 +3431,8 @@ where
                         hop_count,
                     )
                     .await;
-                    cache_contract_locally(op_manager, key, state, contract, false).await;
+                    cache_contract_locally(op_manager, key, state, contract, false, hosting_cause)
+                        .await;
                     send_result?;
                     return Ok(());
                 }
@@ -3693,7 +3822,8 @@ where
                 // `get.rs:2370` which announces on any first-time relay
                 // cache).
                 let state_present =
-                    cache_contract_locally(op_manager, key, state, contract, false).await;
+                    cache_contract_locally(op_manager, key, state, contract, false, hosting_cause)
+                        .await;
                 send_result?;
 
                 // Register the requester as a downstream subscriber (subscribe
@@ -3834,6 +3964,7 @@ where
                                         state,
                                         contract,
                                         false,
+                                        hosting_cause,
                                     )
                                     .await;
                                     // Loopback delivery succeeded (state cached
@@ -3969,6 +4100,7 @@ where
                                     state,
                                     contract,
                                     false,
+                                    hosting_cause,
                                 )
                                 .await
                             } else {
@@ -4963,6 +5095,145 @@ mod tests {
              `true`. The success flag must track `host_result.is_ok()` so \
              telemetry does not diverge from the client-visible outcome. \
              Call window: {call_window}"
+        );
+    }
+
+    /// Issue #4828: the `Exhausted` arm publishes `NotFound` to the
+    /// client — the contract was never delivered — but before #4828 it
+    /// called `record_op_result` nowhere at all, so a GET dead-end
+    /// incremented NEITHER `op_stats.gets.0` nor `.1`. GET dead-ends are
+    /// the dominant production `not_found` mode, so the ops card showed
+    /// an idle-looking node while every GET failed.
+    ///
+    /// Note GET cannot use PUT/UPDATE's `deliver_outcome` funnel shape:
+    /// exhaustion publishes `Ok(HostResponse::…NotFound)`, so a
+    /// `matches!(Publish(Ok(_)))` classifier would score a dead-end as a
+    /// SUCCESS. The arm must therefore record `false` explicitly, which
+    /// is what this pin enforces.
+    #[test]
+    fn exhausted_arm_records_get_failure() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source();
+        // Isolate the Exhausted arm: from its match pattern to the start
+        // of the following `Unexpected` arm.
+        let arm_start = prod
+            .find("RetryLoopOutcome::Exhausted(cause) => {")
+            .expect("Exhausted arm must exist");
+        let arm_end = prod[arm_start..]
+            .find("RetryLoopOutcome::Unexpected")
+            .expect("Unexpected arm must follow Exhausted");
+        let arm = &prod[arm_start..arm_start + arm_end];
+
+        assert!(
+            arm.contains("record_op_result"),
+            "the GET Exhausted arm must call record_op_result — it \
+             publishes NotFound to the client, so the op_stats.gets \
+             counter must see it. Without this a GET dead-end increments \
+             neither ok nor fail and the node looks idle. Issue #4828."
+        );
+        assert!(
+            arm.contains("OpType::Get"),
+            "record_op_result in the Exhausted arm must be passed OpType::Get."
+        );
+        // Exhaustion delivered no state, so it must be recorded as a
+        // FAILURE. `true` here would be the mirror-image of the #4828 PUT
+        // bug (successes counted, failures invisible).
+        let call_pos = arm
+            .find("record_op_result")
+            .expect("record_op_result must be called in the Exhausted arm");
+        let tail = &arm[call_pos..];
+        let call_window = &tail[..tail.len().min(200)];
+        assert!(
+            call_window.contains("false,"),
+            "the GET Exhausted arm must record a FAILURE (`false`) — it \
+             publishes NotFound, having delivered no state to the client. \
+             Issue #4828. Call window: {call_window}"
+        );
+        // Guard the pin itself: `production_source` must actually be
+        // trimming the test module, or this test could match its own text.
+        assert!(
+            prod.len() < SOURCE.len(),
+            "production_source must trim the test module"
+        );
+    }
+
+    /// Issue #4828: the `Unexpected` / `InfraError` terminal outcomes
+    /// return `Err` from `drive_client_get_inner`, are mapped to
+    /// `DriverOutcome::InfrastructureError` in `drive_client_get`, and
+    /// publish a synthesized client error in `deliver_outcome`'s
+    /// `InfrastructureError` arm — a terminal client-visible FAILED GET.
+    /// Before #4828 that arm recorded no `op_stats.gets` counter, so this
+    /// GET failure path silently rotted the counter, the same bug class
+    /// this PR fixes (Codex + Claude Rule Review both flagged it). Unlike
+    /// the `Exhausted` arm (which publishes `Ok(NotFound)`), the failure
+    /// classification here is unambiguous: an `InfrastructureError` always
+    /// publishes a client `Err`, so this arm records `false`.
+    ///
+    /// No double count: the `Done` and `Exhausted` arms record in the
+    /// driver and return `DriverOutcome::Publish`, so they reach
+    /// `deliver_outcome`'s `Publish` arm, never this one.
+    #[test]
+    fn infra_error_arm_records_get_failure() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source();
+        let body = extract_fn_body(prod, "fn deliver_outcome(");
+        // Isolate the InfrastructureError arm within deliver_outcome.
+        let arm_start = body
+            .find("DriverOutcome::InfrastructureError(err) => {")
+            .expect("deliver_outcome must have an InfrastructureError arm");
+        let arm = &body[arm_start..];
+
+        assert!(
+            arm.contains("record_op_result"),
+            "deliver_outcome's InfrastructureError arm must call \
+             record_op_result — it publishes a synthesized client error, so \
+             this terminal GET failure must increment op_stats.gets. Without \
+             it the Unexpected/InfraError GET failure path silently rots the \
+             counter. Issue #4828."
+        );
+        assert!(
+            arm.contains("OpType::Get"),
+            "record_op_result in the InfrastructureError arm must be passed \
+             OpType::Get."
+        );
+        // Infrastructure errors publish a client `Err`, so they are an
+        // unambiguous FAILURE and must record `false`.
+        let call_pos = arm
+            .find("record_op_result")
+            .expect("record_op_result must be called in the InfraError arm");
+        let tail = &arm[call_pos..];
+        let call_window = &tail[..tail.len().min(200)];
+        assert!(
+            call_window.contains("false,"),
+            "deliver_outcome's InfrastructureError arm must record a FAILURE \
+             (`false`) — it publishes a synthesized client error, delivering \
+             no state. Issue #4828. Call window: {call_window}"
+        );
+        // Exact-once: a second record_op_result in this arm would
+        // double-count every infrastructure-error GET. Pin the count so a
+        // future edit that adds a stray call fails CI.
+        assert_eq!(
+            arm.matches("record_op_result(").count(),
+            1,
+            "deliver_outcome's InfrastructureError arm must record exactly \
+             once — a duplicate would double-count op_stats.gets. Issue #4828."
+        );
+        // And the Publish arm (which the Done/Exhausted driver arms reach,
+        // since they return DriverOutcome::Publish) must record NOTHING here
+        // — those arms already record in the driver, so recording again in
+        // deliver_outcome's Publish arm would double-count them.
+        let publish_region = &body[..arm_start];
+        assert!(
+            !publish_region.contains("record_op_result"),
+            "deliver_outcome's Publish arm must NOT call record_op_result — \
+             the Done/Exhausted arms already record in the driver and return \
+             Publish, so recording here too would double-count. Issue #4828."
+        );
+        // Guard the pin itself: `production_source` must actually be
+        // trimming the test module, or this test could match its own text.
+        assert!(
+            prod.len() < SOURCE.len(),
+            "production_source must trim the test module"
         );
     }
 
@@ -6516,17 +6787,116 @@ mod tests {
                 panic!("unterminated cache_contract_locally call at relay callsite #{idx}")
             });
             let call = &tail[..=end];
-            // The last argument must be `false`. Normalize whitespace.
-            let normalized: String = call.chars().filter(|c| !c.is_whitespace()).collect();
-            assert!(
-                normalized.ends_with("false,).await")
-                    || normalized.ends_with("false)")
-                    || normalized.ends_with("false,)"),
+            // Split the argument list at depth 1 and check arguments BY
+            // POSITION. The older form of this check asserted the call "ends
+            // with `false`", which silently stopped testing `is_client_requester`
+            // the moment a sixth argument was appended — position is what the
+            // invariant is actually about.
+            let args_start = call.find('(').expect("call must have an arg list");
+            let inner = &call[args_start + 1..call.len() - 1];
+            let mut args: Vec<String> = Vec::new();
+            let mut arg_depth: i32 = 0;
+            let mut current = String::new();
+            for c in inner.chars() {
+                match c {
+                    '(' | '[' | '<' => {
+                        arg_depth += 1;
+                        current.push(c);
+                    }
+                    ')' | ']' | '>' => {
+                        arg_depth -= 1;
+                        current.push(c);
+                    }
+                    ',' if arg_depth == 0 => {
+                        args.push(current.trim().to_string());
+                        current.clear();
+                    }
+                    _ => current.push(c),
+                }
+            }
+            if !current.trim().is_empty() {
+                args.push(current.trim().to_string());
+            }
+            assert_eq!(
+                args.len(),
+                6,
+                "relay callsite #{idx} should pass six arguments (op_manager, \
+                 key, state, contract, is_client_requester, cause). \
+                 Call text: {call}"
+            );
+            assert_eq!(
+                args[4], "false",
                 "Relay callsite #{idx} of cache_contract_locally must pass \
                  `false` for is_client_requester (relay is not the client). \
                  Call text: {call}"
             );
+            // The hosting attribution must be the DRIVER-COMPUTED `hosting_cause`,
+            // never a per-callsite literal. `is_client_requester` is `false` at
+            // every one of these sites because a forwarder is never the client;
+            // the CAUSE is not that simple, because dispatch drives a
+            // locally-originated GET through this same driver with
+            // `upstream_addr = own_addr`. A hardcoded `TransitGet` here therefore
+            // reports this node's OWN request as someone else's transit, which is
+            // precisely the distinction the enum exists to make. Threading one
+            // value computed by `relay_get_hosting_cause` is what keeps that
+            // impossible; a literal at any site re-opens it.
+            assert_eq!(
+                args[5], "hosting_cause",
+                "Relay callsite #{idx} of cache_contract_locally must pass the \
+                 driver-computed `hosting_cause`, not a hardcoded variant — \
+                 dispatch routes an originator-loopback GET through this same \
+                 driver, so a literal `HostingCause::TransitGet` would file this \
+                 node's own request under transit. Call text: {call}"
+            );
         }
+        // ...and `hosting_cause` must be the loopback-aware value, not a
+        // constant bound to make the assertion above pass. Matched with
+        // whitespace stripped so a future rustfmt line-split cannot disarm it.
+        let packed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            packed.contains("lethosting_cause=relay_get_hosting_cause(own_addr,upstream_addr);"),
+            "drive_relay_get_inner must bind `hosting_cause` from \
+             `relay_get_hosting_cause(own_addr, upstream_addr)`; binding it to a \
+             constant would satisfy the per-callsite check while re-introducing \
+             the mislabelling."
+        );
+    }
+
+    /// The loopback gate itself: `relay_get_hosting_cause` must map an
+    /// originator-loopback GET to `ClientGet` and a genuine forward to
+    /// `TransitGet`.
+    ///
+    /// Dispatch (`node.rs`) maps a locally-originated GET (`source_addr = None`)
+    /// to `upstream_addr = own_addr` and runs it through the forwarding driver,
+    /// so the driver cannot infer transit from its own existence. Recording that
+    /// case as transit is not a cosmetic mislabel: the ONLY thing this enum adds
+    /// over `AccessType` is the own-demand-vs-transit split, so leaking one into
+    /// the other empties the counter of meaning while it keeps reporting
+    /// plausible numbers.
+    #[test]
+    fn relay_get_hosting_cause_attributes_originator_loopback_to_client_get() {
+        let own: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+
+        assert_eq!(
+            super::relay_get_hosting_cause(Some(own), own),
+            crate::ring::HostingCause::ClientGet,
+            "an originator-loopback GET (upstream == own_addr) is this node's \
+             OWN demand, not transit"
+        );
+        assert_eq!(
+            super::relay_get_hosting_cause(Some(own), peer),
+            crate::ring::HostingCause::TransitGet,
+            "a GET forwarded from a genuine upstream peer is transit"
+        );
+        // Fail safe: an unknown own address must not be read as loopback, or a
+        // node that has not yet learned its address would file every forwarded
+        // GET as its own client demand.
+        assert_eq!(
+            super::relay_get_hosting_cause(None, peer),
+            crate::ring::HostingCause::TransitGet,
+            "unknown own address must fall back to transit"
+        );
     }
 
     /// The `client_driver`-side callsite (drive_client_get_inner's
@@ -6591,9 +6961,25 @@ mod tests {
         let fn_pos = src
             .find("async fn cache_contract_locally(")
             .expect("cache_contract_locally must exist");
-        // Look in the 1500 chars before the fn for the docstring.
-        let window_start = fn_pos.saturating_sub(1500);
-        let window = &src[window_start..fn_pos];
+        // Take the WHOLE contiguous comment block above the fn, walking back
+        // until a non-comment line. A fixed-size character window (what this
+        // used to be) silently drops the TOP of the docstring the moment the
+        // docstring grows, which turns a rot guard into a length guard.
+        let head = &src[..fn_pos];
+        let doc_len: usize = head
+            .lines()
+            .rev()
+            .take_while(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("//") || trimmed.starts_with("#[")
+            })
+            .map(|line| line.len() + 1)
+            .sum();
+        let window = &head[head.len().saturating_sub(doc_len)..];
+        assert!(
+            !window.trim().is_empty(),
+            "cache_contract_locally must keep a docstring above it"
+        );
         assert!(
             window.contains("is_client_requester"),
             "cache_contract_locally docstring must describe the \

@@ -11,15 +11,21 @@ pub(crate) mod delegate_app_registry;
 mod executor;
 mod fair_queue;
 pub(crate) use fair_queue::Priority;
+/// Fair-queue occupancy for the status snapshot (#4917). Re-exported rather
+/// than widening `fair_queue` itself, which is otherwise private to this
+/// module.
+pub(crate) use fair_queue::{FairQueueStats, global_stats as fair_queue_stats};
 pub(crate) mod governance;
 mod handler;
+mod state_size_metrics;
 pub mod storages;
 pub(crate) mod user_input;
 
 pub(crate) use executor::{
     ContractExecutor, ExecutorTransactionStream, ExportBusy, MAX_CREATED_DELEGATES_PER_NODE,
     MAX_DELEGATE_CREATION_DEPTH, MAX_DELEGATE_CREATIONS_PER_CALL,
-    SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE, UpsertOutcome, UpsertResult, mock_runtime::MockRuntime,
+    SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE, UpsertOutcome, UpsertResult, declared_cache_ceiling,
+    mock_runtime::MockRuntime,
 };
 
 // Re-export CRDT emulation functions for testing
@@ -38,6 +44,9 @@ pub(crate) use handler::{
 
 pub use executor::{ContractQueueFull, Executor, ExecutorError, OperationMode};
 pub use handler::reset_event_id_counter;
+pub(crate) use state_size_metrics::{
+    StateSizeRejectionStage, record_state_size_rejection, state_size_rejection_snapshot,
+};
 
 use freenet_stdlib::client_api::DelegateRequest;
 use tracing::Instrument;
@@ -496,6 +505,22 @@ async fn fetch_related_off_loop(
     }
 }
 
+/// Whether a delegate run may deliver delegate-to-delegate messages.
+///
+/// This exists because the two callers of
+/// [`handle_delegate_with_contract_requests`] differ in a security-relevant way:
+/// one descends from a client connection whose scope is known, the other does
+/// not descend from a connection at all (GHSA-824h-7x5x-wfmf).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterDelegateDispatch {
+    /// Client-driven run. The hop carries the ORIGINATING connection scope, so a
+    /// non-local caller cannot obtain an attested `MessageOrigin::Delegate`.
+    Allowed,
+    /// Contract-notification-driven run. Suppressed — see the rationale at the
+    /// dispatch site.
+    Suppressed,
+}
+
 /// Handle a delegate request, including any contract request messages in the response.
 ///
 /// When a delegate emits contract request messages, this function:
@@ -508,24 +533,53 @@ async fn fetch_related_off_loop(
 /// 5. Repeats until no more contract request messages
 ///
 /// Returns the final response with contract request messages filtered out.
+#[allow(clippy::too_many_arguments)]
 async fn handle_delegate_with_contract_requests<CH, P>(
     contract_handler: &mut CH,
     initial_req: DelegateRequest<'static>,
     origin_contract: Option<&ContractInstanceId>,
+    connection_scope: crate::client_events::ConnectionScope,
+    inter_delegate: InterDelegateDispatch,
     user_context: Option<&UserSecretContext>,
     delegate_key: &DelegateKey,
     prompter: &P,
-) -> Vec<OutboundDelegateMsg>
+) -> Result<Vec<OutboundDelegateMsg>, ExecutorError>
 where
     CH: ContractHandler + Send + 'static,
     P: UserInputPrompter,
 {
-    // Extract initial params from the request (only ApplicationMessages has params we need)
+    // Extract initial params from the request (only ApplicationMessages has params we need).
+    // The registration variants (including RegisterDelegateWithPredecessors,
+    // #4117) carry no params relevant here — registration's empty response exits
+    // the loop before params are read — but the new variant is listed EXPLICITLY
+    // for local consistency with this match's style; the wildcard remains only to
+    // satisfy `#[non_exhaustive]`.
+    // GATE THE ORIGIN BEFORE ANY CONSUMER IN THIS FUNCTION
+    // (GHSA-824h-7x5x-wfmf).
+    //
+    // Two consumers below read `origin_contract`: the executor call (which
+    // gates again internally, so it is safe either way) and
+    // `caller_identity_from_origin`, which names the calling app to the HUMAN in
+    // the consent prompt. The prompt was the one that mattered: a remote caller
+    // could mint a token for a well-known contract id, drive a delegate that
+    // emits `RequestUserInput` with attacker-chosen text, and have the prompt
+    // render that contract's identity as the requester to a local user who then
+    // approves it.
+    //
+    // Gating here rather than at the prompt call site keeps the two consumers on
+    // one value, so a future third consumer cannot be added ungated by accident.
+    let origin_contract = if connection_scope.is_local() {
+        origin_contract
+    } else {
+        None
+    };
+
     let initial_params = match &initial_req {
         DelegateRequest::ApplicationMessages { params, .. } => params.clone(),
-        DelegateRequest::RegisterDelegate { .. } | DelegateRequest::UnregisterDelegate(_) | _ => {
-            Parameters::from(Vec::new())
-        }
+        DelegateRequest::RegisterDelegate { .. }
+        | DelegateRequest::RegisterDelegateWithPredecessors { .. }
+        | DelegateRequest::UnregisterDelegate(_)
+        | _ => Parameters::from(Vec::new()),
     };
 
     let mut current_req = initial_req;
@@ -542,14 +596,26 @@ where
                 iterations = iterations,
                 "Exceeded maximum contract request iterations, possible infinite loop"
             );
-            // Return whatever we accumulated so far
-            return accumulated_messages;
+            // Stays `Ok` DELIBERATELY, and this is an OPEN QUESTION, not a
+            // settled decision. Exhausting the iteration budget may be a
+            // legitimate outcome for a delegate that simply has more work than
+            // the cap allows, in which case converting it to `Err` would turn
+            // working delegates into client-visible failures. Nobody has
+            // established which it is, so #5263 deliberately did not touch it.
+            // Confirm the intent before changing this -- tracked as #5454.
+            return Ok(accumulated_messages);
         }
 
         // Execute the delegate request
         let values = match contract_handler
             .executor()
-            .execute_delegate_request(current_req, origin_contract, None, user_context)
+            .execute_delegate_request(
+                current_req,
+                origin_contract,
+                None,
+                connection_scope,
+                user_context,
+            )
             .await
         {
             Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key: _, values }) => {
@@ -562,27 +628,39 @@ where
                     phase = "unexpected_response",
                     "Unexpected response type from delegate request"
                 );
-                // Return whatever we accumulated so far
-                return accumulated_messages;
+                // An internal invariant violation, not a delegate outcome: the
+                // executor answered a delegate request with a variant that is
+                // not a delegate response at all. Reporting it as an empty
+                // success is the same lie #5263 removes from the failure arm
+                // below -- the client cannot tell "the delegate said nothing"
+                // from "this node is confused". Nothing legitimate reaches
+                // here, so there is no working behaviour to regress.
+                return Err(ExecutorError::other(anyhow::anyhow!(
+                    "unexpected response variant for a delegate request on {delegate_key}"
+                )));
             }
             Err(err) => {
                 // Downgrade "not found" to warn — expected during legacy
-                // migration probes when old delegate WASM isn't on this node
+                // migration probes when old delegate WASM isn't on this node.
+                // A missing-delegate probe stays a benign empty response
+                // rather than a client-visible error; only genuine execution
+                // failures propagate as Err below (#5263 — previously EVERY
+                // failure here, including real ones, silently became an
+                // empty successful DelegateResponse to the client).
                 if err.is_missing_delegate() {
                     tracing::warn!(
                         delegate_key = %delegate_key,
                         "Delegate not found in store (expected for migration probes)"
                     );
-                } else {
-                    tracing::error!(
-                        delegate_key = %delegate_key,
-                        error = %err,
-                        phase = "execution_failed",
-                        "Failed executing delegate request"
-                    );
+                    return Ok(accumulated_messages);
                 }
-                // Return whatever we accumulated so far
-                return accumulated_messages;
+                tracing::error!(
+                    delegate_key = %delegate_key,
+                    error = %err,
+                    phase = "execution_failed",
+                    "Failed executing delegate request"
+                );
+                return Err(err);
             }
         };
 
@@ -631,7 +709,7 @@ where
             && delegate_messages.is_empty()
             && user_input_requests.is_empty()
         {
-            return accumulated_messages;
+            return Ok(accumulated_messages);
         }
 
         let mut inbound_responses: Vec<InboundDelegateMsg<'static>> = Vec::new();
@@ -910,10 +988,14 @@ where
         //   sees `MessageOrigin::Delegate(caller_key)` and can authorize on it
         //   (issue #3860). The runtime attests this identity — the calling delegate
         //   cannot forge it.
-        // - Inter-delegate messaging only works via ApplicationMessages path; messages
-        //   from handle_delegate_notification (contract state change callbacks) do not
-        //   trigger delegate-to-delegate delivery.
-        if !delegate_messages.is_empty() {
+        // - Inter-delegate delivery runs ONLY for a client-driven run
+        //   (`InterDelegateDispatch::Allowed`). It is SUPPRESSED for a
+        //   contract-notification-driven run — see the guard below. An earlier
+        //   version of this comment asserted that notification-driven runs did
+        //   not reach this code; that was false, because
+        //   `handle_delegate_notification` calls THIS function, and the guard is
+        //   what finally makes the statement true.
+        if !delegate_messages.is_empty() && inter_delegate == InterDelegateDispatch::Allowed {
             tracing::debug!(
                 delegate_key = %delegate_key,
                 count = delegate_messages.len(),
@@ -938,7 +1020,29 @@ where
                     // keeps the per-user namespace bound to the connection
                     // boundary, not propagated transitively through delegate
                     // messages (part of the #4381 unforgeability invariant).
-                    .execute_delegate_request(target_req, None, Some(delegate_key), None)
+                    // The ORIGINATING connection's scope rides along, never a
+                    // literal `Local`: a hop driven by an off-host caller must
+                    // not manufacture an attested `MessageOrigin::Delegate` that
+                    // the caller could not have obtained directly
+                    // (GHSA-824h-7x5x-wfmf). This forwarding is the control that
+                    // REPLACED the deleted registration-record refusal, so it is
+                    // source-pinned by
+                    // `inter_delegate_hop_forwards_the_originating_scope`.
+                    //
+                    // Scope nulls the `origin` ARGUMENT only. `msg.sender` still
+                    // rides through unchanged on every path, so the target can
+                    // always see which delegate sent it — that field is
+                    // runtime-attested (`execution.rs` overwrites it with the key
+                    // of the delegate that actually ran) and is a hash of that
+                    // delegate's own code, so it is self-authenticating rather
+                    // than borrowed authority.
+                    .execute_delegate_request(
+                        target_req,
+                        None,
+                        Some(delegate_key),
+                        connection_scope,
+                        None,
+                    )
                     .await
                 {
                     Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
@@ -963,6 +1067,64 @@ where
                     }
                 }
             }
+        } else if !delegate_messages.is_empty() {
+            // SCOPE-LAUNDERING GUARD (GHSA-824h-7x5x-wfmf).
+            //
+            // `handle_delegate_notification` invokes this function for a run that
+            // descends from a contract state change rather than from any client
+            // connection, so it has no connection scope to pass and hardcodes
+            // `Local`. That made the notification path a laundry: a non-local
+            // caller drives its own delegate (correctly resolving to NO attested
+            // origin), the delegate emits `SubscribeContractRequest`, and on the
+            // next state change of that contract the SAME delegate re-executes
+            // under `Local` — at which point its `SendDelegateMessage` would
+            // reach a victim carrying a fully attested
+            // `MessageOrigin::Delegate(caller)`. The scope the caller was
+            // refused would have been handed back to it one hop later.
+            //
+            // Suppressing the hop on this path removes the laundering route
+            // outright, which is stronger than propagating a scope and is what
+            // the function's own design notes always claimed happened.
+            //
+            // TEST COVERAGE, precisely: this suppression has NO behavioural
+            // test. It is covered only by the source scrape
+            // `inter_delegate_hop_forwards_the_originating_scope`, which asserts
+            // that this call site passes `InterDelegateDispatch::Suppressed` and
+            // that the hop forwards a scope variable rather than a literal.
+            // Both halves were checked non-vacuous by mutation. What that does
+            // NOT cover is the runtime behaviour — that a delegate emitting
+            // `SendDelegateMessage` from a notification run really is not
+            // delivered to. Exercising that needs a delegate that subscribes,
+            // then messages, under a notification-driven run; if you add one,
+            // this comment should shrink.
+            //
+            // Safe to suppress because nothing first-party emits here, verified
+            // by reading the delegates rather than by observing tests: River's
+            // chat delegate returns only empty or `UpdateContractRequest` from
+            // `ContractNotification` and never constructs a `DelegateMessage`,
+            // ghostkeys rejects notifications in its catch-all, and the only
+            // in-tree emitter of `SendDelegateMessage` sits in the
+            // `ApplicationMessage` arm and errors on notifications. "No test
+            // relied on it" is deliberately NOT the grounds here — that is the
+            // same reasoning that let the tokenless-CLI break through.
+            //
+            // If
+            // notification-driven inter-delegate messaging is ever wanted, it
+            // must come back with the originating scope RECORDED ON THE
+            // SUBSCRIPTION (both `DELEGATE_SUBSCRIPTIONS` registration paths) and
+            // propagated here — never with a hardcoded `Local`.
+            //
+            // `info!`, not `debug!`: the crate sets `release_max_level_info`, so
+            // a `debug!` would compile out of shipped binaries and a delegate
+            // author would have no way to see why their message vanished.
+            tracing::info!(
+                delegate_key = %delegate_key,
+                count = delegate_messages.len(),
+                "Suppressed delegate-to-delegate messages from a \
+                 notification-driven run (GHSA-824h-7x5x-wfmf): this path carries \
+                 no client connection scope, so it must not confer an attested \
+                 caller identity"
+            );
         }
 
         // Process UserInput requests: prompt the user and send responses back
@@ -975,9 +1137,21 @@ where
 
             // The caller identity passed to the prompter is built from the
             // executor's runtime context, NOT from anything the delegate could
-            // influence — so a malicious delegate cannot spoof another app's
-            // or delegate's identity in the structured fields the prompt UI
-            // renders. Today the only attested non-None caller is a web app
+            // influence — so a malicious DELEGATE cannot spoof another app's
+            // identity in the structured fields the prompt UI renders.
+            //
+            // That was never the whole story, and the missing half was a real
+            // hole (GHSA-824h-7x5x-wfmf): the identity came from
+            // `origin_contract`, which the CLIENT chooses by presenting a token
+            // the node mints on request for any contract id. A caller the node
+            // cannot prove is local now resolves to `None` (gated at the top of
+            // this function), so it is rendered as an unattested caller rather
+            // than as the app whose id it named. This bounds the spoof to
+            // callers that are already on this host — see the PR's limitations:
+            // "local" means this HOST, not this USER, and it is not a defence
+            // behind a colocated reverse proxy.
+            //
+            // Today the only attested non-None caller is a web app
             // (via `MessageOrigin::WebApp`); delegate-to-delegate attestation
             // is tracked by #3860 and will appear here as a new variant.
             //
@@ -1791,6 +1965,8 @@ async fn push_with_background_eviction<CH>(
         match fair_queue.try_push(rejected.id, rejected.event, rejected.priority) {
             Ok(()) => return,
             Err(still_rejected) => {
+                // Terminal: eviction did not free enough room (#4917).
+                fair_queue.record_terminal_rejection(still_rejected.reason);
                 track_pending_reclamation_if_evict(contract_handler, &still_rejected);
                 send_queue_full_response(contract_handler.channel(), still_rejected).await;
                 return;
@@ -1798,6 +1974,9 @@ async fn push_with_background_eviction<CH>(
         }
     }
 
+    // Terminal: eviction could not help (wrong priority, wrong reason, or no
+    // Background queued), so this event is refused (#4917).
+    fair_queue.record_terminal_rejection(rejected.reason);
     track_pending_reclamation_if_evict(contract_handler, &rejected);
     send_queue_full_response(contract_handler.channel(), rejected).await;
 }
@@ -1954,6 +2133,18 @@ async fn handle_delegate_notification<CH, P>(
         contract_handler,
         req,
         None,
+        // Node-internal invocation: this descends from a contract state change,
+        // not from any client connection, so there is NO scope to classify and
+        // this hardcodes `Local` to keep the delegate's own inherited
+        // attestation intact exactly as before.
+        //
+        // That hardcoded `Local` is precisely why the inter-delegate hop must be
+        // SUPPRESSED below: a non-local caller can steer WHICH delegate runs here
+        // (drive it once, have it subscribe, then trigger a state change), so a
+        // hop under this scope would hand back the attestation the caller was
+        // refused. See the guard in `handle_delegate_with_contract_requests`.
+        crate::client_events::ConnectionScope::Local,
+        InterDelegateDispatch::Suppressed,
         // Contract-state-change notification: not driven by a client
         // connection, so there is no user token and no per-user secret
         // namespace. Secrets stay `SecretScope::Local`.
@@ -1962,6 +2153,26 @@ async fn handle_delegate_notification<CH, P>(
         prompter,
     )
     .await;
+
+    // Notification-driven: there is no client waiting to answer, so an
+    // execution failure has nothing to propagate to. Already logged inside
+    // `handle_delegate_with_contract_requests`; there is nothing to route.
+    //
+    // The TTL sweep runs BEFORE this return, not after. It is the registry's
+    // only production caller, and it is what time-bounds the delegate->apps
+    // map per the AGENTS.md GC-exemption rule. Returning above it would make
+    // the sweep conditional on the delegate SUCCEEDING -- and the failure that
+    // motivated #5263 is one a delegate repeats on every single invocation
+    // (rejecting `origin: None`), so on a node whose delegates are all failing
+    // that way the backstop would never run at all. Registrations for apps
+    // that vanished without a clean disconnect would then pin their slots
+    // against MAX_APPS_PER_DELEGATE until the process restarted. Sweeping is
+    // independent of whether this particular execution produced anything.
+    delegate_app_registry::sweep_expired();
+
+    let Ok(outbound) = outbound else {
+        return;
+    };
 
     // Route outbound ApplicationMessages to the apps registered with this
     // delegate (#3275). handle_delegate_with_contract_requests already
@@ -1992,12 +2203,6 @@ async fn handle_delegate_notification<CH, P>(
         })
         .collect();
 
-    // Opportunistic TTL sweep of the delegate->apps registry, mirroring how
-    // prune_expired_contexts sweeps on delegate activity rather than via a
-    // background task. Bounds stale registrations for apps that vanished
-    // without a clean disconnect (AGENTS.md GC-exemption rule).
-    delegate_app_registry::sweep_expired();
-
     if app_messages.is_empty() {
         return;
     }
@@ -2013,10 +2218,21 @@ async fn handle_delegate_notification<CH, P>(
             });
         let delivered = delegate_app_registry::route_to_apps(&delegate_key, response);
         if delivered == 0 {
+            // `debug!` on purpose. This fires once per notification, so at
+            // `release_max_level_info` it would ship one line per contract-state
+            // change on any node where nobody happens to be registered — a
+            // headless node, or simply a closed browser tab. That is the same
+            // per-room-update amplification removed from the executor's audit
+            // line, and "nobody is listening" is a normal state rather than a
+            // security event.
+            //
+            // The case that IS a security event — a registration that exists but
+            // is withheld from delivery — is reported at INFO by
+            // `route_to_apps`, once per registration.
             tracing::debug!(
                 delegate = %delegate_key,
-                "Delegate notification produced an ApplicationMessage but no apps \
-                 are registered with this delegate — nothing to route to"
+                "Delegate notification produced an ApplicationMessage but no \
+                 local app is registered with this delegate — nothing to route to"
             );
         }
     }
@@ -2352,6 +2568,7 @@ where
         ContractHandlerEvent::DelegateRequest {
             req,
             origin_contract,
+            connection_scope,
             user_context,
         } => {
             let delegate_key = req.key().clone();
@@ -2370,6 +2587,11 @@ where
                 contract_handler,
                 req,
                 origin_contract.as_ref(),
+                connection_scope,
+                // Client-driven: the hop forwards THIS connection's scope, so a
+                // non-local caller cannot obtain an attested caller identity
+                // through it.
+                InterDelegateDispatch::Allowed,
                 user_context.as_ref(),
                 &delegate_key,
                 prompter,
@@ -2870,6 +3092,213 @@ mod tests {
         let code = ContractCode::from(vec![42u8; 32]);
         let params = Parameters::from(vec![7u8; 8]);
         ContractKey::from_params_and_code(&params, &code)
+    }
+
+    /// Pin: the unexpected-response arm must return `Err`, not a fake success.
+    ///
+    /// The executor answering a delegate request with a variant that is not a
+    /// delegate response is an internal invariant violation. Returning
+    /// `Ok(accumulated_messages)` there is the same lie #5263 removes from the
+    /// execution-failure arm: the client cannot distinguish "the delegate said
+    /// nothing" from "this node is confused".
+    ///
+    /// Pinned from source rather than behaviourally because both mock
+    /// executors (`MockWasmRuntime`, `MockRuntime`) return `Err`
+    /// unconditionally, so no fixture can drive the executor to hand back a
+    /// wrong-variant `Ok`. Truncated at the test module first -- the needles
+    /// occur in this function's own text (see #5450).
+    #[test]
+    fn unexpected_response_variant_does_not_become_a_fake_success() {
+        let full = include_str!("contract.rs");
+        let cutoff = full
+            .find("\nmod tests {")
+            .expect("contract.rs must have a top-level `mod tests`");
+        let src = &full[..cutoff];
+
+        let start = src
+            .find("async fn handle_delegate_with_contract_requests")
+            .expect("handle_delegate_with_contract_requests must exist");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\nasync fn ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let arm = body
+            .find("phase = \"unexpected_response\"")
+            .expect("the unexpected-response arm must exist");
+        let after = &body[arm..];
+        // Bound to this arm: stop at the next match arm's opening.
+        let arm_end = after.find("Err(err) => {").unwrap_or(after.len());
+        let arm = &after[..arm_end];
+
+        assert!(
+            arm.contains("return Err("),
+            "the unexpected-response arm must return an error; returning \
+             Ok(accumulated_messages) reports an internal invariant violation \
+             to the client as an empty SUCCESS (#5263). Arm: {arm:?}"
+        );
+        assert!(
+            !arm.contains("return Ok(accumulated_messages)"),
+            "the unexpected-response arm must not fall back to a fake success"
+        );
+    }
+
+    /// Pin: the delegate->apps TTL sweep must run BEFORE the early return on
+    /// an execution failure.
+    ///
+    /// `sweep_expired` is the registry's ONLY production caller, and it is what
+    /// time-bounds the map per the AGENTS.md GC-exemption rule. #5263 added an
+    /// early `return` on a failed execution; putting the sweep after it makes
+    /// the backstop conditional on the delegate SUCCEEDING. The failure that
+    /// motivated #5263 is one a delegate repeats on EVERY invocation (rejecting
+    /// `origin: None`), so on a node whose delegates all fail that way the
+    /// sweep would never run and stale registrations would pin their slots
+    /// against `MAX_APPS_PER_DELEGATE` until restart.
+    ///
+    /// The source is truncated at the test module BEFORE scraping: both needles
+    /// below also occur in this function's own text, which `include_str!` pulls
+    /// in, so without the cut a rename would silently widen the region instead
+    /// of panicking (see #5450).
+    #[test]
+    fn ttl_sweep_precedes_the_execution_failure_return() {
+        let full = include_str!("contract.rs");
+        let cutoff = full
+            .find("\nmod tests {")
+            .expect("contract.rs must have a top-level `mod tests`");
+        let src = &full[..cutoff];
+
+        let start = src
+            .find("async fn handle_delegate_notification")
+            .expect("handle_delegate_notification must exist");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\nasync fn ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let sweep = body
+            .find("delegate_app_registry::sweep_expired()")
+            .expect("the TTL sweep must live in handle_delegate_notification");
+        let bail = body
+            .find("let Ok(outbound) = outbound else")
+            .expect("the execution-failure early return must exist");
+
+        assert!(
+            sweep < bail,
+            "the TTL sweep ({sweep}) must run BEFORE the execution-failure \
+             return ({bail}); after it, the registry's only production sweep \
+             becomes conditional on the delegate succeeding"
+        );
+    }
+
+    /// H2 — the control that REPLACED the deleted registration-record gate.
+    ///
+    /// Removing a control is only safe if the thing standing in for it is
+    /// itself pinned. The inter-delegate hop is safe because it forwards the
+    /// ORIGINATING connection scope, so a non-local caller cannot launder its
+    /// lack of attestation through a delegate. Nothing enforced that: passing a
+    /// literal `ConnectionScope::Local` at the hop compiled and broke nothing.
+    ///
+    /// Two properties, because the hop has two callers with different scope
+    /// provenance:
+    ///  1. the hop forwards the `connection_scope` VARIABLE, never a literal; and
+    ///  2. the notification path — which has no connection and therefore
+    ///     hardcodes `Local` — is `InterDelegateDispatch::Suppressed`, so that
+    ///     hardcoded value can never reach the hop.
+    #[test]
+    fn inter_delegate_hop_forwards_the_originating_scope() {
+        let src = include_str!("contract.rs");
+        let body = src
+            .split("async fn handle_delegate_with_contract_requests")
+            .nth(1)
+            .expect("handle_delegate_with_contract_requests must exist");
+        let body = body
+            .split("\nasync fn ")
+            .next()
+            .expect("bounded by the next free function");
+
+        // Isolate the hop's own executor call.
+        let hop = body
+            .split(".execute_delegate_request(")
+            .nth(2)
+            .expect("the inter-delegate hop is the SECOND execute_delegate_request call");
+        // Bound on `.await`, not on the first `)` — the argument list itself
+        // contains parentheses (`Some(delegate_key)`).
+        let hop_args = hop
+            .split(".await")
+            .next()
+            .expect("the call is bounded by its .await");
+        assert!(
+            hop_args.contains("connection_scope"),
+            "the hop must forward the originating connection scope; got args: {hop_args}"
+        );
+        assert!(
+            !hop_args.contains("ConnectionScope::Local"),
+            "the hop must NOT hardcode a scope — that is the laundering bug this \
+             replaced the removed registration-record gate to avoid; got args: {hop_args}"
+        );
+
+        // And the scopeless caller must not be able to reach it at all.
+        let notification = src
+            .split("async fn handle_delegate_notification")
+            .nth(1)
+            .expect("handle_delegate_notification must exist");
+        let notification = notification
+            .split("\nasync fn ")
+            .next()
+            .expect("bounded by the next free function");
+        assert!(
+            notification.contains("InterDelegateDispatch::Suppressed"),
+            "the notification path hardcodes ConnectionScope::Local, so it MUST \
+             suppress inter-delegate dispatch or that literal reaches the hop"
+        );
+    }
+
+    /// GHSA-824h-7x5x-wfmf: the identity rendered to the HUMAN in a consent
+    /// prompt must come from the GATED origin.
+    ///
+    /// `caller_identity_from_origin` feeds `CallerIdentity` to
+    /// `DashboardPrompter`, which names the requesting app to the user deciding
+    /// whether to approve. Fed the raw `origin_contract`, a caller the node
+    /// cannot prove is local could mint a token for a well-known contract id,
+    /// drive a delegate that emits `RequestUserInput` with attacker-chosen text,
+    /// and have the prompt attribute the request to that app.
+    ///
+    /// This is a source pin rather than a behavioural test because reaching the
+    /// prompt needs a full delegate + prompter harness; what it must catch is
+    /// the gate being deleted or moved below its consumer, which it does. The
+    /// region is bounded to the function so the pin cannot match its own
+    /// assertion strings further down the file.
+    #[test]
+    fn consent_prompt_identity_comes_from_the_gated_origin() {
+        let src = include_str!("contract.rs");
+        let body = src
+            .split("async fn handle_delegate_with_contract_requests")
+            .nth(1)
+            .expect("handle_delegate_with_contract_requests must exist");
+        let body = body
+            .split("\nasync fn ")
+            .next()
+            .expect("bounded by the next free function");
+
+        let gate = body
+            .find("let origin_contract = if connection_scope.is_local()")
+            .expect(
+                "handle_delegate_with_contract_requests must gate `origin_contract` on \
+                 the connection scope before using it",
+            );
+        let prompt_use = body
+            .find("caller_identity_from_origin(origin_contract)")
+            .expect("the prompter's caller identity must be built from origin_contract");
+        assert!(
+            gate < prompt_use,
+            "the connection-scope gate must run BEFORE the origin reaches the \
+             consent prompt, or a non-local caller's forged app identity is \
+             rendered to the user"
+        );
     }
 
     // Regression test for issue #3857: the executor's origin context must be
@@ -3593,6 +4022,56 @@ mod tests {
                 other => panic!("expected UpdateResponse for {label}, got {other}"),
             }
         }
+    }
+
+    /// Anti-rot pin for #4917: every TERMINAL admission rejection in
+    /// `push_with_background_eviction` must record itself.
+    ///
+    /// The counter deliberately does not live in `try_push`, because a
+    /// capacity failure there is often recovered by shedding Background and
+    /// retrying — counting it would report a client-visible reject for an
+    /// operation that succeeded. That correctness depends on the terminal arms
+    /// remembering to call `record_terminal_rejection`, so pin it: a new
+    /// terminal path that forgets would silently under-report queue-full
+    /// failures on the dashboard.
+    #[test]
+    fn terminal_rejection_paths_record_the_rejection() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/contract.rs");
+        let source = std::fs::read_to_string(&path).expect("read own source");
+        let start = source
+            .find("async fn push_with_background_eviction")
+            .expect("push_with_background_eviction must exist");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n/// ")
+            .map(|o| start + o)
+            .unwrap_or(source.len());
+        let body = &source[start..end];
+
+        let records = body.matches("record_terminal_rejection(").count();
+        assert_eq!(
+            records, 2,
+            "expected exactly two terminal rejection sites (eviction retry \
+             exhausted, and eviction-cannot-help), found {records}. If you \
+             added a terminal path, record the rejection there too; if you \
+             removed one, update this pin deliberately. See #4917."
+        );
+
+        // The shed loop also calls send_queue_full_response, for Background
+        // work that is re-emitted on its next cycle. That is a shed, not an
+        // admission rejection, and must NOT be counted as one.
+        let shed_loop = body
+            .find("for shed in evicted {")
+            .expect("the Background shed loop must exist");
+        let shed_end = body[shed_loop..]
+            .find('}')
+            .map(|o| shed_loop + o)
+            .expect("shed loop must close");
+        assert!(
+            !body[shed_loop..shed_end].contains("record_terminal_rejection"),
+            "a shed Background event is not an admission rejection; counting \
+             it would inflate the client-visible failure count (#4917)"
+        );
     }
 }
 
@@ -4821,6 +5300,64 @@ mod hol_4391_tests {
                 );
             }
             other => panic!("expected RegisterSubscriberListenerResponse, got {other}"),
+        }
+    }
+
+    /// Regression for #5263: when a delegate's execution fails, the client
+    /// driving `ContractHandlerEvent::DelegateRequest` through
+    /// `handle_contract_event` MUST see the failure ride back as
+    /// `DelegateResponse(Err(_))`, not a fake empty successful response.
+    ///
+    /// `MockWasmRuntime::execute_delegate_request` unconditionally returns a
+    /// generic `ExecutorError::other(...)` for any delegate request — not the
+    /// `is_missing_delegate()` case, which stays a benign empty response for
+    /// legacy migration probes (see `handle_delegate_with_contract_requests`)
+    /// — so no delegate needs to be registered to exercise the genuine
+    /// execution-failure branch this test targets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_request_surfaces_execution_failure_5263() {
+        let (send_halve, rcv_halve, _) = handler::contract_handler_channel();
+        let mut handler = MockWasmContractHandler::new_test(rcv_halve, None, "del_fail_5263").await;
+
+        let delegate_key = DelegateKey::new([7u8; 32], CodeHash::new([0u8; 32]));
+        let req = DelegateRequest::ApplicationMessages {
+            key: delegate_key,
+            params: Parameters::from(vec![]),
+            inbound: vec![],
+        };
+        let event = ContractHandlerEvent::DelegateRequest {
+            req,
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+        };
+        let send_fut = send_halve.send_to_handler(event);
+        let recv_fut = async {
+            let (id, received, _priority) = handler
+                .channel()
+                .recv_from_sender()
+                .await
+                .expect("handler channel should be open");
+            handle_contract_event(
+                &mut handler,
+                id,
+                received,
+                &user_input::AutoApprovePrompter,
+                None,
+            )
+            .await
+            .expect("dispatch must not error");
+        };
+        let (send_res, ()) = tokio::join!(send_fut, recv_fut);
+        match send_res.expect("must receive a response") {
+            ContractHandlerEvent::DelegateResponse(result) => {
+                assert!(
+                    result.is_err(),
+                    "a delegate execution failure must surface an error to the \
+                     client, not a fake empty success (#5263)"
+                );
+            }
+            other => panic!("expected DelegateResponse, got {other}"),
         }
     }
 }

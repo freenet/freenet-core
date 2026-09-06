@@ -18,7 +18,11 @@ name: Shell Playwright E2E
 # required without first restructuring it into an always-green gate + a
 # conditional real job (see the note in macos-dmg-swap-e2e.yml). Until then it
 # runs as an informational gate on PRs that touch the relevant surface and on
-# main.
+# main. If it IS ever promoted, add its context to REQUIRED_CONTEXTS in
+# .github/scripts/check_required_check_path_filters.py in the same change —
+# that linter is what would otherwise catch this filter, and it only looks at
+# workflows providing a context it knows to be required. #5451 is what happens
+# when a required context comes from a path-filtered workflow.
 
 on:
   push:
@@ -81,8 +85,15 @@ jobs:
         with:
           node-version: 20
 
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
       - name: Install nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: taiki-e/install-action@v2
+        id: install-nextest
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
 
       # fdev is the publish path the harness shells out to. Build it (and the
       # test's own crate deps) before the test step so the binary is on disk.
@@ -110,9 +121,16 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
 
+      # All three engines, because this suite's subject is per-engine
+      # behaviour. #5087 (a blank new tab) reproduces only in WebKit, #5106 (a
+      # dead click) only in Firefox, and the #3818 escape guard passes
+      # VACUOUSLY in Chromium — there the escape dies a step earlier, so the
+      # assertion runs against an empty set and the header it exists to protect
+      # could be deleted with the suite still green. A chromium-only matrix is
+      # how #5087 shipped green in the first place.
       - name: Install Playwright browsers
         working-directory: crates/core/tests/playwright
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps chromium firefox webkit
 
       - name: Clean test directories
         run: rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true

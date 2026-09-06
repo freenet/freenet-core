@@ -11,12 +11,14 @@
 //! - `log_utils` – log file rotation helpers
 //! - `single_instance` – macOS wrapper single-instance lock (flock-based)
 //! - `launch_at_login` – macOS Launch at Login, plist helpers, legacy migration
+//! - `cli_symlinks` – macOS first-launch `freenet`/`fdev` PATH symlink setup
 //! - `wrapper` – process wrapper loop, state machine, log events
 //! - `purge` – data purge, doctor, process-reaping
 //! - `linux` – Linux/systemd service management
 //! - `macos` – macOS/launchd service management
 //! - `windows` – Windows registry/task service management
 
+mod cli_symlinks;
 mod launch_at_login;
 mod linux;
 mod log_utils;
@@ -26,7 +28,7 @@ mod single_instance;
 mod windows;
 pub mod wrapper;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Subcommand;
 use freenet::config::ConfigPaths;
 use std::path::{Path, PathBuf};
@@ -43,15 +45,15 @@ pub enum ServiceCommand {
         /// servers, or environments without a user session bus.
         #[arg(long)]
         system: bool,
-        /// Do NOT enable systemd lingering for a user service.
+        /// Leave systemd lingering off for a user service.
         ///
         /// By default a user service enables lingering
-        /// (`loginctl enable-linger <user>`) so it keeps running without an
-        /// active login session — required for the auto-update self-heal to
-        /// work on a headless server (without it, a `--user` service is
+        /// (`loginctl enable-linger <user>`) so that it keeps running without
+        /// an active login session. That is what the auto-update self-heal
+        /// needs on a headless server: without it, a `--user` service is
         /// stopped at logout and never catches the node's exit-42 "update
-        /// needed" signal). Pass this to keep the service login-scoped
-        /// instead. Has no effect on a `--system` service.
+        /// needed" signal. Pass this to keep the service login-scoped instead.
+        /// Has no effect on a `--system` service.
         #[arg(long)]
         no_linger: bool,
     },
@@ -91,12 +93,38 @@ pub enum ServiceCommand {
         #[arg(long)]
         system: bool,
     },
-    /// Recover a wedged service install: re-template the wrapper/unit to the
-    /// current binary, reap stale orphaned `freenet network` processes (PPID=1,
-    /// holding the port on an old binary), and restart cleanly. Use when the
-    /// node appears frozen on an old version (see issue #3967). Unlike
-    /// `restart`, this kills detached orphans and refreshes the wrapper, so it
-    /// closes the bootstrap gap that `restart` alone cannot.
+    /// Disable the background daemon so it stays stopped across restarts.
+    ///
+    /// This writes a marker, kept across reboots, in the config directory that
+    /// the node checks at startup. While it is there, `freenet network` stays
+    /// idle rather than running, so systemd, launchd, or the tray wrapper
+    /// cannot bring the node back on reboot or re-login. The running service is restarted so the
+    /// change takes effect straight away: the supervisor stays alive and only
+    /// the node stops doing work. Re-enable with `freenet service enable`.
+    Disable {
+        /// Target the system-wide service instead of the user service
+        #[arg(long)]
+        system: bool,
+    },
+    /// Re-enable the background daemon previously disabled with
+    /// `freenet service disable`.
+    ///
+    /// Removes the disable marker and restarts the service so the node comes
+    /// back immediately.
+    Enable {
+        /// Target the system-wide service instead of the user service
+        #[arg(long)]
+        system: bool,
+    },
+    /// Repair a stuck service install: point the wrapper and unit file at the
+    /// current binary, kill orphaned `freenet network` processes still holding
+    /// the port on an old binary, and restart cleanly. An orphan shows up as a
+    /// `freenet network` process whose parent is init, so
+    /// `ps -o ppid= -p <pid>` reports 1.
+    /// Use this when the node looks frozen on an old version. `restart` on its
+    /// own neither kills detached orphans nor refreshes the wrapper, which is
+    /// why it cannot recover this state.
+    // Internal: #3967.
     Doctor {
         /// Repair the system-wide service instead of the user service
         #[arg(long)]
@@ -133,10 +161,12 @@ impl ServiceCommand {
                 purge,
                 keep_data,
             } => uninstall_service(*system, *purge, *keep_data),
-            ServiceCommand::Status { system } => service_status(*system),
+            ServiceCommand::Status { system } => service_status_reporting(*system, &config_dirs),
             ServiceCommand::Start { system } => start_service(*system),
             ServiceCommand::Stop { system } => stop_service(*system),
             ServiceCommand::Restart { system } => restart_service(*system),
+            ServiceCommand::Disable { system } => disable_daemon(*system, &config_dirs),
+            ServiceCommand::Enable { system } => enable_daemon(*system, &config_dirs),
             ServiceCommand::Doctor { system } => service_doctor(*system),
             ServiceCommand::Logs { err } => service_logs(*err),
             ServiceCommand::Report(cmd) => {
@@ -224,6 +254,19 @@ pub(super) fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
 #[allow(dead_code)]
 pub(super) fn legacy_migration_marker_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("freenet").join(".legacy-migration-complete"))
+}
+
+/// Path of the CLI-symlink setup marker (`freenet`/`fdev` on `PATH` via
+/// `/usr/local/bin`). Same reasoning as `legacy_migration_marker_path`: a
+/// user who already onboarded via an older DMG has the first-run marker set
+/// but never got a CLI symlink, so this cannot be gated on onboarding state
+/// either. Its own one-shot marker, so the (possibly password-prompting)
+/// symlink setup runs exactly once per install, whether the user is on their
+/// very first launch or upgrading from a build that predates this feature.
+/// See `service::cli_symlinks`.
+#[allow(dead_code)]
+pub(super) fn cli_symlinks_marker_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("freenet").join(".cli-symlinks-setup-attempted"))
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -323,6 +366,25 @@ fn restart_service(system: bool) -> Result<()> {
     windows::restart_service(system)
 }
 
+/// Restart the service without announcing that the node came up.
+///
+/// `disable_daemon` restarts the service purely so the supervisor re-reads the
+/// disable marker and the node parks in its idle state. The normal
+/// `restart_service` ends by printing "started" plus the dashboard URL, which
+/// is false there: nothing is listening on 7509 once the marker is honored.
+#[cfg(target_os = "linux")]
+fn restart_service_quiet(system: bool) -> Result<()> {
+    linux::restart_service_quiet(system)
+}
+#[cfg(target_os = "macos")]
+fn restart_service_quiet(system: bool) -> Result<()> {
+    macos::restart_service_quiet(system)
+}
+#[cfg(target_os = "windows")]
+fn restart_service_quiet(system: bool) -> Result<()> {
+    windows::restart_service_quiet(system)
+}
+
 #[cfg(target_os = "linux")]
 fn service_logs(error_only: bool) -> Result<()> {
     linux::service_logs(error_only)
@@ -338,6 +400,111 @@ fn service_logs(error_only: bool) -> Result<()> {
 
 fn service_doctor(system: bool) -> Result<()> {
     purge::service_doctor(system)
+}
+
+// ── Persistent daemon enable/disable ──────────────────────────────────────────
+//
+// These are platform-independent: the disable state is a marker file in the
+// config dir (see `super::daemon_control`), honored by `freenet network` itself
+// at startup, so it works the same whether the node is supervised by systemd, a
+// launchd agent, or the tray wrapper. The `system` flag only selects which
+// service to restart so the change takes effect without waiting for a reboot.
+
+/// `freenet service disable`: write the persistent disable marker, then restart
+/// the running service so the node drops into its idle state immediately.
+fn disable_daemon(system: bool, config_dirs: &ConfigPaths) -> Result<()> {
+    let config_dir = config_dirs.config_dir();
+    let already = super::daemon_control::write_disabled_marker(&config_dir).with_context(|| {
+        format!(
+            "failed to write daemon-disabled marker in {}",
+            config_dir.display()
+        )
+    })?;
+
+    if already {
+        println!("Freenet background daemon was already disabled.");
+    } else {
+        println!(
+            "Freenet background daemon disabled. It will stay stopped across restarts and \
+             reboots until you run `freenet service enable`."
+        );
+    }
+    println!(
+        "Marker: {}",
+        super::daemon_control::disabled_marker_path(&config_dir).display()
+    );
+
+    // Best-effort: restart the (still-supervised) service so the node re-reads
+    // the marker and stops serving now instead of at the next reboot/relaunch.
+    // The supervisor stays alive; only the node child goes idle. If no service
+    // is installed/running, say so rather than failing the command — the marker
+    // is written and will take effect the next time the node starts.
+    //
+    // Deliberately the *quiet* restart: the normal one signs off with "started"
+    // and a dashboard URL, which is exactly wrong here — the node comes back up
+    // only to read the marker and park idle, with nothing listening on 7509.
+    match restart_service_quiet(system) {
+        Ok(()) => {
+            println!("Service restarted; the node is now idle and off the network.");
+        }
+        Err(e) => {
+            println!(
+                "Note: could not restart the running service ({e}). The daemon will enter its \
+                 disabled state the next time it starts."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `freenet service enable`: remove the disable marker, then restart the service
+/// so the node comes back immediately.
+fn enable_daemon(system: bool, config_dirs: &ConfigPaths) -> Result<()> {
+    let config_dir = config_dirs.config_dir();
+    let was_disabled =
+        super::daemon_control::remove_disabled_marker(&config_dir).with_context(|| {
+            format!(
+                "failed to remove daemon-disabled marker in {}",
+                config_dir.display()
+            )
+        })?;
+
+    if !was_disabled {
+        println!("Freenet background daemon was not disabled; nothing to do.");
+        return Ok(());
+    }
+
+    println!("Freenet background daemon re-enabled.");
+    // Best-effort: restart so the node picks up the change now. If no service is
+    // installed, tell the user how to start it manually.
+    match restart_service(system) {
+        Ok(()) => {}
+        Err(e) => {
+            println!(
+                "Note: could not restart the service ({e}). Start it with \
+                 `freenet service start` (or launch `freenet network` manually)."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `freenet service status`, augmented with the persistent-disable state. When
+/// the daemon is disabled the underlying service may still report "active"
+/// (a supervised-but-idle node), so surface the disable explicitly first.
+fn service_status_reporting(system: bool, config_dirs: &ConfigPaths) -> Result<()> {
+    let config_dir = config_dirs.config_dir();
+    if super::daemon_control::is_daemon_disabled(&config_dir) {
+        println!("Freenet background daemon: DISABLED (via `freenet service disable`).");
+        println!("The node stays idle and will not join the network until you re-enable it:");
+        println!("    freenet service enable");
+        println!(
+            "Marker: {}",
+            super::daemon_control::disabled_marker_path(&config_dir).display()
+        );
+        println!();
+    }
+    service_status(system)
 }
 fn run_wrapper(version: &str) -> Result<()> {
     wrapper::run_wrapper(version)
@@ -418,6 +585,11 @@ fn restart_service(_system: bool) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn restart_service_quiet(_system: bool) -> Result<()> {
+    anyhow::bail!("Service management is not supported on this platform")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn service_logs(_error_only: bool) -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
 }
@@ -449,6 +621,34 @@ mod tests {
         assert!(
             windows.contains("use super::log_utils::find_latest_log_file;"),
             "windows.rs must import find_latest_log_file from log_utils."
+        );
+    }
+
+    /// Regression guard for the ordering invariant the single-instance
+    /// guard depends on: `acquire_wrapper_single_instance_lock` MUST run
+    /// before `kill_stale_freenet_processes` in `run_wrapper` (#5132) — a
+    /// second wrapper has to detect the first one is still alive BEFORE
+    /// force-killing what it (wrongly) assumes are only stale orphans. This
+    /// is a call-order invariant inside one function, not something a
+    /// behavioral unit test can exercise, so pin it textually — mirrors the
+    /// `windows_first_run_wiring_is_present` source-scrape pattern above and
+    /// runs on every platform even though the guarded code is
+    /// macOS/Windows-only.
+    #[test]
+    fn wrapper_lock_is_acquired_before_killing_stale_processes() {
+        let wrapper = include_str!("service/wrapper.rs");
+        let acquire_pos = wrapper
+            .find("acquire_wrapper_single_instance_lock()")
+            .expect("run_wrapper must call acquire_wrapper_single_instance_lock");
+        let kill_pos = wrapper
+            .find("kill_stale_freenet_processes(&log_dir)")
+            .expect("run_wrapper must call kill_stale_freenet_processes");
+        assert!(
+            acquire_pos < kill_pos,
+            "acquire_wrapper_single_instance_lock must run BEFORE \
+             kill_stale_freenet_processes in run_wrapper, or a second wrapper \
+             can kill the first wrapper's live backend before the guard has a \
+             chance to detect it and exit"
         );
     }
 
@@ -695,6 +895,47 @@ mod tests {
         assert!(
             try_acquire_flock_at(&lock_path).is_some(),
             "acquire must succeed once the previous holder has exited"
+        );
+    }
+
+    /// Windows analogue of `wrapper_lock_is_exclusive` (#5132). Unlike the
+    /// flock primitive above, `CreateMutexW`'s "already exists" signal
+    /// fires even for a second handle opened by the SAME process, so the
+    /// real production function can be exercised directly in-process
+    /// rather than needing a simplified stand-in.
+    ///
+    /// This only compiles and runs on Windows, where the mutex API
+    /// exists. `windows_check` in CI only `cargo check`s the crate, which
+    /// does not execute tests — see `.claude/rules/deployment.md`
+    /// ("compilation is not verification"). CI also runs a dedicated
+    /// `windows_unit` job on `windows-latest` (mirroring `macos_unit`)
+    /// that runs this test for real.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn wrapper_single_instance_lock_is_exclusive() {
+        let first = match acquire_wrapper_single_instance_lock() {
+            AcquireWrapperLockOutcome::Acquired(guard) => guard,
+            other => panic!("first acquire must succeed on an unheld mutex, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                acquire_wrapper_single_instance_lock(),
+                AcquireWrapperLockOutcome::AnotherWrapperRunning
+            ),
+            "second acquire must report AnotherWrapperRunning while the first holder is alive"
+        );
+
+        // Dropping the holder closes its handle, releasing the mutex; a
+        // new acquirer should now succeed. Exercises the kernel-released-
+        // on-close semantics relied on for crash recovery (a crashed
+        // wrapper's handle is closed by the OS on process exit).
+        drop(first);
+        assert!(
+            matches!(
+                acquire_wrapper_single_instance_lock(),
+                AcquireWrapperLockOutcome::Acquired(_)
+            ),
+            "acquire must succeed once the previous holder has dropped its handle"
         );
     }
 
@@ -1141,6 +1382,23 @@ mod tests {
         // of a first-run flow that somehow re-ran shouldn't blow up).
         mark_first_run_complete_at(&marker).unwrap();
         assert!(!is_first_run_at(&marker));
+    }
+
+    #[test]
+    fn onboarding_markers_are_distinct_files() {
+        // The whole point of splitting cli_symlinks_marker_path (and
+        // legacy_migration_marker_path) out from first_run_marker_path is
+        // that an already-onboarded user — who has the first-run marker set
+        // — still needs the CLI-symlink one-shot (and the legacy migration)
+        // to run once on their next launch. If a future edit accidentally
+        // collapsed these onto the same path, that guarantee would silently
+        // break and this is the only thing that would catch it.
+        let first_run = first_run_marker_path().unwrap();
+        let legacy_migration = legacy_migration_marker_path().unwrap();
+        let cli_symlinks = cli_symlinks_marker_path().unwrap();
+        assert_ne!(first_run, legacy_migration);
+        assert_ne!(first_run, cli_symlinks);
+        assert_ne!(legacy_migration, cli_symlinks);
     }
 
     #[test]

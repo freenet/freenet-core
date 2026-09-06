@@ -7,9 +7,10 @@
 //! Features:
 //! - Exponential backoff on connection failures (1s → 2s → 4s → ... → 5min max)
 //! - Event batching (send every 10 seconds or when buffer reaches 100 events)
-//! - Rate limiting (max 10 events/second aggregate), with a separate shadow
-//!   sub-budget (max 6/second) so always-on low-priority shadow telemetry
-//!   cannot starve operational telemetry (#4380)
+//! - Rate limiting (max 10 ordinary events/second aggregate), with a separate
+//!   shadow sub-budget (max 6/second) so always-on low-priority shadow
+//!   telemetry cannot starve operational telemetry (#4380), plus one bounded
+//!   reserved path for the fixed 30-minute #5090 diagnostic
 //! - Priority-based dropping when buffer is full
 //!
 //! ## Design Notes
@@ -22,7 +23,8 @@
 //! TODO(#2456): Enable HTTPS once TLS is configured on the collector server.
 //! Currently the server only accepts HTTP connections.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -47,7 +49,254 @@ use super::{EventKind, NetEventLog, NetEventRegister, NetLogMessage};
 /// Initialized when `TelemetryReporter::new()` creates the reporter.
 /// If telemetry is disabled, this remains unset and `send_standalone_event`
 /// silently drops events.
-static TELEMETRY_SENDER: OnceLock<mpsc::Sender<TelemetryCommand>> = OnceLock::new();
+static TELEMETRY_SENDER: OnceLock<TelemetryChannel> = OnceLock::new();
+
+/// The fixed set of background rollups admitted at [`EventPriority::Shadow`].
+///
+/// This is deliberately an enum rather than an event-name map: #5090 needs to
+/// identify which aligned rollup was lost without creating attacker-controlled
+/// telemetry cardinality. Keep [`Self::ALL`] exhaustive when adding a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KnownShadowRollup {
+    ShadowRttAggregate,
+    ShadowRateDemand,
+    ShadowOutboundClass,
+    ShadowReferencePing,
+    ShadowIfaceTx,
+    OutboundMessageMix,
+    BroadcastPayloadMix,
+}
+
+impl KnownShadowRollup {
+    pub(crate) const ALL: [Self; 7] = [
+        Self::ShadowRttAggregate,
+        Self::ShadowRateDemand,
+        Self::ShadowOutboundClass,
+        Self::ShadowReferencePing,
+        Self::ShadowIfaceTx,
+        Self::OutboundMessageMix,
+        Self::BroadcastPayloadMix,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::ShadowRttAggregate => 0,
+            Self::ShadowRateDemand => 1,
+            Self::ShadowOutboundClass => 2,
+            Self::ShadowReferencePing => 3,
+            Self::ShadowIfaceTx => 4,
+            Self::OutboundMessageMix => 5,
+            Self::BroadcastPayloadMix => 6,
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ShadowRttAggregate => "shadow_rtt_aggregate",
+            Self::ShadowRateDemand => "shadow_rate_demand",
+            Self::ShadowOutboundClass => "shadow_outbound_class",
+            Self::ShadowReferencePing => "shadow_reference_ping",
+            Self::ShadowIfaceTx => "shadow_iface_tx",
+            Self::OutboundMessageMix => "outbound_message_mix",
+            Self::BroadcastPayloadMix => "broadcast_payload_mix",
+        }
+    }
+
+    fn from_event_type(event_type: &str) -> Option<Self> {
+        match event_type {
+            "shadow_rtt_aggregate" => Some(Self::ShadowRttAggregate),
+            "shadow_rate_demand" => Some(Self::ShadowRateDemand),
+            "shadow_outbound_class" => Some(Self::ShadowOutboundClass),
+            "shadow_reference_ping" => Some(Self::ShadowReferencePing),
+            "shadow_iface_tx" => Some(Self::ShadowIfaceTx),
+            "outbound_message_mix" => Some(Self::OutboundMessageMix),
+            "broadcast_payload_mix" => Some(Self::BroadcastPayloadMix),
+            _ => None,
+        }
+    }
+}
+
+/// Loss counters for one fixed shadow-rollup stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct KnownShadowRollupMetricsSnapshot {
+    pub event_type: &'static str,
+    pub enqueue_attempts_total: u64,
+    pub enqueue_dropped_full_total: u64,
+    pub enqueue_dropped_closed_total: u64,
+    pub rate_limit_admitted_total: u64,
+    pub dropped_aggregate_limit_total: u64,
+    pub dropped_shadow_limit_total: u64,
+    pub dropped_backoff_buffer_full_total: u64,
+    pub retry_truncated_total: u64,
+    pub sent_total: u64,
+}
+
+/// Process-local telemetry delivery counters for the five-minute node snapshot.
+///
+/// Every field is a monotonic lifetime total. A later successful snapshot can
+/// therefore report a snapshot that was itself dropped; that loss appears one
+/// snapshot late rather than disappearing with the failed event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct TelemetryLocalMetricsSnapshot {
+    pub enqueue_attempts_total: u64,
+    pub enqueue_succeeded_total: u64,
+    pub enqueue_dropped_full_total: u64,
+    pub enqueue_dropped_closed_total: u64,
+    pub rate_limit_admitted_operational_total: u64,
+    pub rate_limit_admitted_shadow_total: u64,
+    pub dropped_aggregate_limit_operational_total: u64,
+    pub dropped_aggregate_limit_shadow_total: u64,
+    pub dropped_shadow_limit_total: u64,
+    pub dropped_backoff_buffer_full_total: u64,
+    pub batch_send_attempts_total: u64,
+    pub batch_send_successes_total: u64,
+    pub batch_send_failures_total: u64,
+    pub batch_events_sent_total: u64,
+    pub batch_retry_truncated_events_total: u64,
+    pub known_shadow_rollups: [KnownShadowRollupMetricsSnapshot; KnownShadowRollup::ALL.len()],
+    /// Delivery path for router snapshots carrying `network_efficiency_v1`:
+    /// attempts, enqueue full/closed, admitted, rate-limit drop, coalesced
+    /// pending sample, retry truncation, final sent.
+    pub network_efficiency_delivery: [u64; 8],
+}
+
+#[derive(Default)]
+struct NetworkEfficiencyDeliveryMetrics {
+    attempts: AtomicU64,
+    enqueue_full: AtomicU64,
+    enqueue_closed: AtomicU64,
+    admitted: AtomicU64,
+    rate_limit_drop: AtomicU64,
+    coalesced: AtomicU64,
+    retry_truncated: AtomicU64,
+    sent: AtomicU64,
+}
+
+impl NetworkEfficiencyDeliveryMetrics {
+    fn snapshot(&self) -> [u64; 8] {
+        [
+            self.attempts.load(Ordering::Relaxed),
+            self.enqueue_full.load(Ordering::Relaxed),
+            self.enqueue_closed.load(Ordering::Relaxed),
+            self.admitted.load(Ordering::Relaxed),
+            self.rate_limit_drop.load(Ordering::Relaxed),
+            self.coalesced.load(Ordering::Relaxed),
+            self.retry_truncated.load(Ordering::Relaxed),
+            self.sent.load(Ordering::Relaxed),
+        ]
+    }
+}
+
+#[derive(Default)]
+struct KnownShadowRollupMetrics {
+    enqueue_attempts_total: AtomicU64,
+    enqueue_dropped_full_total: AtomicU64,
+    enqueue_dropped_closed_total: AtomicU64,
+    rate_limit_admitted_total: AtomicU64,
+    dropped_aggregate_limit_total: AtomicU64,
+    dropped_shadow_limit_total: AtomicU64,
+    dropped_backoff_buffer_full_total: AtomicU64,
+    retry_truncated_total: AtomicU64,
+    sent_total: AtomicU64,
+}
+
+impl KnownShadowRollupMetrics {
+    fn snapshot(&self, stream: KnownShadowRollup) -> KnownShadowRollupMetricsSnapshot {
+        KnownShadowRollupMetricsSnapshot {
+            event_type: stream.as_str(),
+            enqueue_attempts_total: self.enqueue_attempts_total.load(Ordering::Relaxed),
+            enqueue_dropped_full_total: self.enqueue_dropped_full_total.load(Ordering::Relaxed),
+            enqueue_dropped_closed_total: self.enqueue_dropped_closed_total.load(Ordering::Relaxed),
+            rate_limit_admitted_total: self.rate_limit_admitted_total.load(Ordering::Relaxed),
+            dropped_aggregate_limit_total: self
+                .dropped_aggregate_limit_total
+                .load(Ordering::Relaxed),
+            dropped_shadow_limit_total: self.dropped_shadow_limit_total.load(Ordering::Relaxed),
+            dropped_backoff_buffer_full_total: self
+                .dropped_backoff_buffer_full_total
+                .load(Ordering::Relaxed),
+            retry_truncated_total: self.retry_truncated_total.load(Ordering::Relaxed),
+            sent_total: self.sent_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TelemetryLocalMetrics {
+    enqueue_attempts_total: AtomicU64,
+    enqueue_succeeded_total: AtomicU64,
+    enqueue_dropped_full_total: AtomicU64,
+    enqueue_dropped_closed_total: AtomicU64,
+    rate_limit_admitted_operational_total: AtomicU64,
+    rate_limit_admitted_shadow_total: AtomicU64,
+    dropped_aggregate_limit_operational_total: AtomicU64,
+    dropped_aggregate_limit_shadow_total: AtomicU64,
+    dropped_shadow_limit_total: AtomicU64,
+    dropped_backoff_buffer_full_total: AtomicU64,
+    batch_send_attempts_total: AtomicU64,
+    batch_send_successes_total: AtomicU64,
+    batch_send_failures_total: AtomicU64,
+    batch_events_sent_total: AtomicU64,
+    batch_retry_truncated_events_total: AtomicU64,
+    known_shadow_rollups: [KnownShadowRollupMetrics; KnownShadowRollup::ALL.len()],
+    network_efficiency_delivery: NetworkEfficiencyDeliveryMetrics,
+}
+
+impl TelemetryLocalMetrics {
+    fn shadow(&self, event_type: &str) -> Option<&KnownShadowRollupMetrics> {
+        KnownShadowRollup::from_event_type(event_type)
+            .map(|stream| &self.known_shadow_rollups[stream.index()])
+    }
+
+    fn snapshot(&self) -> TelemetryLocalMetricsSnapshot {
+        TelemetryLocalMetricsSnapshot {
+            enqueue_attempts_total: self.enqueue_attempts_total.load(Ordering::Relaxed),
+            enqueue_succeeded_total: self.enqueue_succeeded_total.load(Ordering::Relaxed),
+            enqueue_dropped_full_total: self.enqueue_dropped_full_total.load(Ordering::Relaxed),
+            enqueue_dropped_closed_total: self.enqueue_dropped_closed_total.load(Ordering::Relaxed),
+            rate_limit_admitted_operational_total: self
+                .rate_limit_admitted_operational_total
+                .load(Ordering::Relaxed),
+            rate_limit_admitted_shadow_total: self
+                .rate_limit_admitted_shadow_total
+                .load(Ordering::Relaxed),
+            dropped_aggregate_limit_operational_total: self
+                .dropped_aggregate_limit_operational_total
+                .load(Ordering::Relaxed),
+            dropped_aggregate_limit_shadow_total: self
+                .dropped_aggregate_limit_shadow_total
+                .load(Ordering::Relaxed),
+            dropped_shadow_limit_total: self.dropped_shadow_limit_total.load(Ordering::Relaxed),
+            dropped_backoff_buffer_full_total: self
+                .dropped_backoff_buffer_full_total
+                .load(Ordering::Relaxed),
+            batch_send_attempts_total: self.batch_send_attempts_total.load(Ordering::Relaxed),
+            batch_send_successes_total: self.batch_send_successes_total.load(Ordering::Relaxed),
+            batch_send_failures_total: self.batch_send_failures_total.load(Ordering::Relaxed),
+            batch_events_sent_total: self.batch_events_sent_total.load(Ordering::Relaxed),
+            batch_retry_truncated_events_total: self
+                .batch_retry_truncated_events_total
+                .load(Ordering::Relaxed),
+            known_shadow_rollups: std::array::from_fn(|index| {
+                self.known_shadow_rollups[index].snapshot(KnownShadowRollup::ALL[index])
+            }),
+            network_efficiency_delivery: self.network_efficiency_delivery.snapshot(),
+        }
+    }
+}
+
+struct TelemetryChannel {
+    sender: mpsc::Sender<TelemetryCommand>,
+    metrics: Arc<TelemetryLocalMetrics>,
+}
+
+/// Read this process's telemetry admission/drop totals for periodic export.
+#[allow(dead_code)] // Read by the router-snapshot integration added alongside #5090.
+pub(crate) fn telemetry_local_metrics_snapshot() -> Option<TelemetryLocalMetricsSnapshot> {
+    TELEMETRY_SENDER
+        .get()
+        .map(|channel| channel.metrics.snapshot())
+}
 
 /// Admission priority for a telemetry event.
 ///
@@ -65,6 +314,12 @@ static TELEMETRY_SENDER: OnceLock<mpsc::Sender<TelemetryCommand>> = OnceLock::ne
 /// can never starve `Operational` telemetry. The sub-budget is best-effort:
 /// excess shadow events are dropped silently, same as any other rate-limited
 /// event.
+///
+/// `NetworkEfficiency` is the one fixed, 30-minute diagnostic used to decide
+/// #5090. It has a dedicated one-slot producer channel and one reserved buffer
+/// slot, and is exempt from the per-second cap. Those structural bounds make
+/// eventual observation independent of ordinary telemetry saturation without
+/// creating an unbounded or attacker-controlled priority path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EventPriority {
     /// Operational net-events and node telemetry. Admitted up to the full
@@ -76,6 +331,10 @@ pub enum EventPriority {
     /// analysis). Admitted only under the shadow sub-budget so it yields to
     /// `Operational` events under load.
     Shadow,
+    /// The fixed `router_snapshot.network_efficiency_v1` diagnostic. Routed
+    /// only by [`TelemetryReporter::send_event`], never exposed to standalone
+    /// event producers.
+    NetworkEfficiency,
 }
 
 /// Send a standalone telemetry event from any context.
@@ -133,7 +392,7 @@ fn send_standalone_event_inner(
     event_data: serde_json::Value,
     priority: EventPriority,
 ) {
-    if let Some(sender) = TELEMETRY_SENDER.get() {
+    if let Some(channel) = TELEMETRY_SENDER.get() {
         let event = TelemetryEvent {
             timestamp: current_timestamp_ms(),
             peer_id: peer_id.to_string(),
@@ -142,14 +401,16 @@ fn send_standalone_event_inner(
             event_data,
             priority,
         };
-        // Fire-and-forget: channel full means telemetry event is dropped
-        #[allow(clippy::let_underscore_must_use)]
-        let _ = sender.try_send(TelemetryCommand::Event(event));
+        try_enqueue_event(&channel.sender, &channel.metrics, event);
     }
 }
 
 /// Maximum number of events to buffer before sending
 const MAX_BUFFER_SIZE: usize = 100;
+
+/// One structurally reserved buffer slot for the 30-minute #5090 diagnostic.
+/// Ordinary telemetry remains capped at [`MAX_BUFFER_SIZE`].
+const NETWORK_EFFICIENCY_BUFFER_RESERVE: usize = 1;
 
 /// How often to send batched events (in seconds)
 const BATCH_INTERVAL_SECS: u64 = 10;
@@ -225,6 +486,10 @@ pub fn current_timestamp_ms() -> u64 {
 #[derive(Clone)]
 pub struct TelemetryReporter {
     sender: mpsc::Sender<TelemetryCommand>,
+    /// Dedicated one-slot path for the fixed 30-minute diagnostic. Ordinary
+    /// event bursts cannot consume this channel's capacity.
+    network_efficiency_sender: mpsc::Sender<TelemetryCommand>,
+    metrics: Arc<TelemetryLocalMetrics>,
     /// This node's own peer id, stamped on events that are emitted
     /// without a `NetLogMessage` carrying one (timeouts, transfer
     /// events, transport snapshots). Without it those events carry an
@@ -257,6 +522,78 @@ struct TelemetryEvent {
     priority: EventPriority,
 }
 
+fn is_network_efficiency_event(event: &TelemetryEvent) -> bool {
+    event.event_type == "router_snapshot"
+        && event
+            .event_data
+            .get("network_efficiency_v1")
+            .is_some_and(|value| !value.is_null())
+}
+
+/// Enqueue without blocking, preserving the reporter's original best-effort
+/// behavior while making both local loss outcomes observable.
+fn try_enqueue_event(
+    sender: &mpsc::Sender<TelemetryCommand>,
+    metrics: &TelemetryLocalMetrics,
+    event: TelemetryEvent,
+) {
+    metrics
+        .enqueue_attempts_total
+        .fetch_add(1, Ordering::Relaxed);
+    let is_efficiency = is_network_efficiency_event(&event);
+    if is_efficiency {
+        metrics
+            .network_efficiency_delivery
+            .attempts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    let event_type = event.event_type.clone();
+    if let Some(shadow) = metrics.shadow(&event_type) {
+        shadow
+            .enqueue_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    match sender.try_send(TelemetryCommand::Event(event)) {
+        Ok(()) => {
+            metrics
+                .enqueue_succeeded_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            metrics
+                .enqueue_dropped_full_total
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(shadow) = metrics.shadow(&event_type) {
+                shadow
+                    .enqueue_dropped_full_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if is_efficiency {
+                metrics
+                    .network_efficiency_delivery
+                    .enqueue_full
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            metrics
+                .enqueue_dropped_closed_total
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(shadow) = metrics.shadow(&event_type) {
+                shadow
+                    .enqueue_dropped_closed_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if is_efficiency {
+                metrics
+                    .network_efficiency_delivery
+                    .enqueue_closed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Best-effort runtime detection of a cargo test/bench harness.
 ///
 /// Cargo builds every unit-test, integration-test and bench binary into a
@@ -275,7 +612,7 @@ struct TelemetryEvent {
 ///
 /// Best-effort: if `current_exe()` fails we return `false` and fall back to the
 /// compile-time guards, which already cover unit tests and CI.
-fn running_under_cargo_test() -> bool {
+pub(crate) fn running_under_cargo_test() -> bool {
     std::env::current_exe()
         .ok()
         .and_then(|exe| {
@@ -404,35 +741,50 @@ impl TelemetryReporter {
         // Channel capacity: 1000 events provides ~100 seconds of buffer at max rate (10 events/sec)
         // plus headroom for bursts. Events are dropped via try_send if channel is full.
         let (sender, receiver) = mpsc::channel(1000);
+        let (network_efficiency_sender, network_efficiency_receiver) = mpsc::channel(1);
 
-        // Store a clone in the global sender for standalone event emission
-        // OnceLock::set returns Err if already initialized; expected on repeated calls
-        #[allow(clippy::let_underscore_must_use)]
-        let _ = TELEMETRY_SENDER.set(sender.clone());
+        // Standalone emitters, the reporter, and the worker must update the same
+        // counters. Repeated initialization keeps the first global sender (the
+        // pre-existing OnceLock behavior) and also reuses its metrics so the
+        // crate-visible snapshot never silently switches accumulator instances.
+        let proposed_metrics = Arc::new(TelemetryLocalMetrics::default());
+        let global = TELEMETRY_SENDER.get_or_init(|| TelemetryChannel {
+            sender: sender.clone(),
+            metrics: proposed_metrics.clone(),
+        });
+        let metrics = global.metrics.clone();
 
         // Initialize the transfer event channel for per-transfer telemetry
         let transfer_event_receiver = crate::transport::metrics::init_transfer_event_channel();
 
         // Spawn the background worker
-        let worker = TelemetryWorker::new(
+        let worker = TelemetryWorker::new_with_network_efficiency_receiver(
             endpoint,
             receiver,
+            network_efficiency_receiver,
             transport_snapshot_interval_secs,
             transfer_event_receiver,
             local_peer_id.clone(),
+            metrics.clone(),
         );
         GlobalExecutor::spawn(worker.run());
 
         Some(Self {
             sender,
+            network_efficiency_sender,
+            metrics,
             local_peer_id,
         })
     }
 
-    async fn send_event(&self, event: TelemetryEvent) {
-        // Fire-and-forget: non-blocking send, drop if channel is full
-        #[allow(clippy::let_underscore_must_use)]
-        let _ = self.sender.try_send(TelemetryCommand::Event(event));
+    async fn send_event(&self, mut event: TelemetryEvent) {
+        let sender = if is_network_efficiency_event(&event) {
+            event.priority = EventPriority::NetworkEfficiency;
+            &self.network_efficiency_sender
+        } else {
+            &self.sender
+        };
+        try_enqueue_event(sender, &self.metrics, event);
     }
 }
 
@@ -456,6 +808,15 @@ impl NetEventRegister for TelemetryReporter {
                 // consumes the per-event stream (topology / rejection panels).
                 // Retiring here (skip the two variants) would make net telemetry
                 // volume NEGATIVE.
+                //
+                // BEFORE retiring connect_rejected, read #5335. The terminus-
+                // rejection log lines in operations/connect.rs are `debug!`,
+                // which `release_max_level_info` compiles out of release
+                // builds, so this per-event stream's `reason` field is now the
+                // ONLY thing that distinguishes those causes in production.
+                // The snapshot counters have no reason dimension, so retiring
+                // the per-event stream without adding one would silently
+                // delete that signal entirely rather than relocate it.
                 match event_type.as_str() {
                     "connect_connected" => {
                         crate::node::network_status::record_connect_accept_emitted()
@@ -490,6 +851,7 @@ impl NetEventRegister for TelemetryReporter {
         target_peer: Option<String>,
     ) -> BoxFuture<'_, ()> {
         let sender = self.sender.clone();
+        let metrics = self.metrics.clone();
         let op_type = op_type.to_string();
         let local_peer_id = self.local_peer_id.clone();
         async move {
@@ -505,9 +867,7 @@ impl NetEventRegister for TelemetryReporter {
                 }),
                 priority: EventPriority::Operational,
             };
-            // Fire-and-forget: channel full means telemetry event is dropped
-            #[allow(clippy::let_underscore_must_use)]
-            let _ = sender.try_send(TelemetryCommand::Event(event));
+            try_enqueue_event(&sender, &metrics, event);
         }
         .boxed()
     }
@@ -517,6 +877,8 @@ impl NetEventRegister for TelemetryReporter {
 struct TelemetryWorker {
     endpoint: String,
     receiver: mpsc::Receiver<TelemetryCommand>,
+    network_efficiency_receiver: mpsc::Receiver<TelemetryCommand>,
+    network_efficiency_channel_open: bool,
     buffer: Vec<TelemetryEvent>,
     http_client: reqwest::Client,
     backoff_ms: u64,
@@ -539,20 +901,72 @@ struct TelemetryWorker {
     /// [`RESOURCE_TELEMETRY_BATCH_INTERVAL`] ticks (~60s). Advanced by
     /// [`Self::should_emit_resource_utilization`] on every batch tick.
     resource_emit_batch_counter: u64,
+    /// Shared with every producer feeding this worker so enqueue and worker-side
+    /// losses reconcile into one process-local snapshot.
+    metrics: Arc<TelemetryLocalMetrics>,
 }
 
 impl TelemetryWorker {
+    #[cfg(test)]
     fn new(
         endpoint: String,
         receiver: mpsc::Receiver<TelemetryCommand>,
         transport_snapshot_interval_secs: u64,
         transfer_event_receiver: mpsc::Receiver<super::TransferEvent>,
         local_peer_id: String,
+        metrics: Arc<TelemetryLocalMetrics>,
+    ) -> Self {
+        let (_network_efficiency_sender, network_efficiency_receiver) = mpsc::channel(1);
+        Self::new_inner(
+            endpoint,
+            receiver,
+            network_efficiency_receiver,
+            false,
+            transport_snapshot_interval_secs,
+            transfer_event_receiver,
+            local_peer_id,
+            metrics,
+        )
+    }
+
+    fn new_with_network_efficiency_receiver(
+        endpoint: String,
+        receiver: mpsc::Receiver<TelemetryCommand>,
+        network_efficiency_receiver: mpsc::Receiver<TelemetryCommand>,
+        transport_snapshot_interval_secs: u64,
+        transfer_event_receiver: mpsc::Receiver<super::TransferEvent>,
+        local_peer_id: String,
+        metrics: Arc<TelemetryLocalMetrics>,
+    ) -> Self {
+        Self::new_inner(
+            endpoint,
+            receiver,
+            network_efficiency_receiver,
+            true,
+            transport_snapshot_interval_secs,
+            transfer_event_receiver,
+            local_peer_id,
+            metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        endpoint: String,
+        receiver: mpsc::Receiver<TelemetryCommand>,
+        network_efficiency_receiver: mpsc::Receiver<TelemetryCommand>,
+        network_efficiency_channel_open: bool,
+        transport_snapshot_interval_secs: u64,
+        transfer_event_receiver: mpsc::Receiver<super::TransferEvent>,
+        local_peer_id: String,
+        metrics: Arc<TelemetryLocalMetrics>,
     ) -> Self {
         Self {
             endpoint,
             receiver,
-            buffer: Vec::with_capacity(MAX_BUFFER_SIZE),
+            network_efficiency_receiver,
+            network_efficiency_channel_open,
+            buffer: Vec::with_capacity(MAX_BUFFER_SIZE + NETWORK_EFFICIENCY_BUFFER_RESERVE),
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -566,6 +980,7 @@ impl TelemetryWorker {
             transfer_event_receiver,
             local_peer_id,
             resource_emit_batch_counter: 0,
+            metrics,
         }
     }
 
@@ -669,6 +1084,30 @@ impl TelemetryWorker {
 
         loop {
             crate::deterministic_select! {
+                cmd = async {
+                    if self.network_efficiency_channel_open {
+                        self.network_efficiency_receiver.recv().await
+                    } else {
+                        std::future::pending::<Option<TelemetryCommand>>().await
+                    }
+                } => {
+                    match cmd {
+                        Some(TelemetryCommand::Event(event)) => {
+                            self.handle_event(event).await;
+                        }
+                        Some(TelemetryCommand::Shutdown) => {
+                            self.flush().await;
+                            break;
+                        }
+                        None => {
+                            // Reporter clones own both senders, but the global
+                            // standalone channel can keep the ordinary sender
+                            // alive after reporter shutdown. Disable only this
+                            // branch so a closed reserved channel cannot spin.
+                            self.network_efficiency_channel_open = false;
+                        }
+                    }
+                },
                 cmd = self.receiver.recv() => {
                     match cmd {
                         Some(TelemetryCommand::Event(event)) => {
@@ -739,15 +1178,41 @@ impl TelemetryWorker {
     ///   the slots, always leaving
     ///   `MAX_EVENTS_PER_SECOND - MAX_SHADOW_EVENTS_PER_SECOND` for
     ///   operational telemetry.
-    fn admit_event(&mut self, priority: EventPriority, now: Instant) -> bool {
+    /// - `NetworkEfficiency` bypasses both counters. Its dedicated one-slot
+    ///   channel, reserved buffer slot, and fixed 30-minute producer cadence
+    ///   provide the bound that the ordinary per-second limiter otherwise
+    ///   supplies.
+    fn admit_event(&mut self, priority: EventPriority, event_type: &str, now: Instant) -> bool {
         if now.duration_since(self.rate_limit_window_start) >= Duration::from_secs(1) {
             self.rate_limit_window_start = now;
             self.events_this_second = 0;
             self.shadow_events_this_second = 0;
         }
 
+        if priority == EventPriority::NetworkEfficiency {
+            return true;
+        }
+
         // Aggregate cap applies to every event regardless of priority.
         if self.events_this_second >= MAX_EVENTS_PER_SECOND {
+            match priority {
+                EventPriority::Operational => self
+                    .metrics
+                    .dropped_aggregate_limit_operational_total
+                    .fetch_add(1, Ordering::Relaxed),
+                EventPriority::Shadow => self
+                    .metrics
+                    .dropped_aggregate_limit_shadow_total
+                    .fetch_add(1, Ordering::Relaxed),
+                EventPriority::NetworkEfficiency => {
+                    unreachable!("network-efficiency telemetry bypasses the aggregate rate limit")
+                }
+            };
+            if let Some(shadow) = self.metrics.shadow(event_type) {
+                shadow
+                    .dropped_aggregate_limit_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return false;
         }
 
@@ -755,32 +1220,103 @@ impl TelemetryWorker {
         // crowd out operational telemetry (#4380).
         if priority == EventPriority::Shadow {
             if self.shadow_events_this_second >= MAX_SHADOW_EVENTS_PER_SECOND {
+                self.metrics
+                    .dropped_shadow_limit_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(shadow) = self.metrics.shadow(event_type) {
+                    shadow
+                        .dropped_shadow_limit_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 return false;
             }
             self.shadow_events_this_second += 1;
         }
 
         self.events_this_second += 1;
+        match priority {
+            EventPriority::Operational => self
+                .metrics
+                .rate_limit_admitted_operational_total
+                .fetch_add(1, Ordering::Relaxed),
+            EventPriority::Shadow => self
+                .metrics
+                .rate_limit_admitted_shadow_total
+                .fetch_add(1, Ordering::Relaxed),
+            EventPriority::NetworkEfficiency => unreachable!(
+                "network-efficiency telemetry returns before ordinary admission accounting"
+            ),
+        };
+        if let Some(shadow) = self.metrics.shadow(event_type) {
+            shadow
+                .rate_limit_admitted_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         true
     }
 
     async fn handle_event(&mut self, event: TelemetryEvent) {
+        let is_efficiency = is_network_efficiency_event(&event);
         // Rate limiting (#4380: shadow events admitted under a sub-budget)
-        if !self.admit_event(event.priority, Instant::now()) {
+        if !self.admit_event(event.priority, &event.event_type, Instant::now()) {
+            if is_efficiency {
+                self.metrics
+                    .network_efficiency_delivery
+                    .rate_limit_drop
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             // Drop event due to rate limiting
             return;
         }
+        if is_efficiency {
+            self.metrics
+                .network_efficiency_delivery
+                .admitted
+                .fetch_add(1, Ordering::Relaxed);
+
+            // A collector outage can span multiple 30-minute ticks. Keep the
+            // newest diagnostic rather than consuming more reserved memory.
+            // Its lifetime counters subsume the older counters and its gauges
+            // are the freshest point sample, but this intentionally discards
+            // one historical gauge sample, so record that terminal outcome.
+            if let Some(existing) = self.buffer.iter_mut().find(|queued| {
+                queued.priority == EventPriority::NetworkEfficiency
+                    || is_network_efficiency_event(queued)
+            }) {
+                self.metrics
+                    .network_efficiency_delivery
+                    .coalesced
+                    .fetch_add(1, Ordering::Relaxed);
+                *existing = event;
+                return;
+            }
+        }
 
         // Drop events if buffer is full and we're in backoff (prevents unbounded memory growth)
-        if self.buffer.len() >= MAX_BUFFER_SIZE && self.backoff_ms > 0 {
+        let buffer_capacity = MAX_BUFFER_SIZE
+            + usize::from(self.buffer.iter().any(is_network_efficiency_event))
+                * NETWORK_EFFICIENCY_BUFFER_RESERVE;
+        if !is_efficiency && self.buffer.len() >= buffer_capacity && self.backoff_ms > 0 {
             let elapsed = self.last_send.elapsed();
             if elapsed < Duration::from_millis(self.backoff_ms) {
                 // Still in backoff and buffer full - drop event
+                self.metrics
+                    .dropped_backoff_buffer_full_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(shadow) = self.metrics.shadow(&event.event_type) {
+                    shadow
+                        .dropped_backoff_buffer_full_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 return;
             }
         }
 
         self.buffer.push(event);
+        debug_assert!(
+            self.buffer.len() <= MAX_BUFFER_SIZE + NETWORK_EFFICIENCY_BUFFER_RESERVE,
+            "only the fixed network-efficiency event may occupy the reserved slot"
+        );
 
         // Send if buffer is full
         if self.buffer.len() >= MAX_BUFFER_SIZE {
@@ -803,10 +1339,31 @@ impl TelemetryWorker {
         }
 
         let events = std::mem::take(&mut self.buffer);
-        self.buffer = Vec::with_capacity(MAX_BUFFER_SIZE);
+        self.buffer = Vec::with_capacity(MAX_BUFFER_SIZE + NETWORK_EFFICIENCY_BUFFER_RESERVE);
+
+        self.metrics
+            .batch_send_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
 
         match self.send_batch(&events).await {
             Ok(()) => {
+                self.metrics
+                    .batch_send_successes_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .batch_events_sent_total
+                    .fetch_add(events.len() as u64, Ordering::Relaxed);
+                for event in &events {
+                    if let Some(shadow) = self.metrics.shadow(&event.event_type) {
+                        shadow.sent_total.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if is_network_efficiency_event(event) {
+                        self.metrics
+                            .network_efficiency_delivery
+                            .sent
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 // Reset backoff on success
                 self.backoff_ms = 0;
                 self.last_send = Instant::now();
@@ -824,12 +1381,44 @@ impl TelemetryWorker {
                 self.backoff_ms = base_backoff + jitter;
                 self.last_send = Instant::now();
 
-                // Put events back in buffer (up to limit)
-                let remaining_capacity = MAX_BUFFER_SIZE.saturating_sub(self.buffer.len());
-                self.buffer
-                    .extend(events.into_iter().take(remaining_capacity));
+                self.requeue_failed_batch(events);
             }
         }
+    }
+
+    /// Restore a failed HTTP batch without changing the existing retry policy,
+    /// accounting for the otherwise-silent tail if capacity ever becomes
+    /// smaller than the failed batch. Under today's serial worker this tail is
+    /// normally zero; keeping the counter at the actual truncation point makes
+    /// that invariant observable and regression-testable.
+    fn requeue_failed_batch(&mut self, events: Vec<TelemetryEvent>) {
+        self.metrics
+            .batch_send_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        let has_network_efficiency = self.buffer.iter().any(is_network_efficiency_event)
+            || events.iter().any(is_network_efficiency_event);
+        let capacity = MAX_BUFFER_SIZE
+            + usize::from(has_network_efficiency) * NETWORK_EFFICIENCY_BUFFER_RESERVE;
+        let remaining_capacity = capacity.saturating_sub(self.buffer.len());
+        let retained = events.len().min(remaining_capacity);
+        let truncated = events.len().saturating_sub(retained);
+        if truncated > 0 {
+            self.metrics
+                .batch_retry_truncated_events_total
+                .fetch_add(truncated as u64, Ordering::Relaxed);
+            for event in &events[retained..] {
+                if let Some(shadow) = self.metrics.shadow(&event.event_type) {
+                    shadow.retry_truncated_total.fetch_add(1, Ordering::Relaxed);
+                }
+                if is_network_efficiency_event(event) {
+                    self.metrics
+                        .network_efficiency_delivery
+                        .retry_truncated
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        self.buffer.extend(events.into_iter().take(retained));
     }
 
     async fn send_batch(&self, events: &[TelemetryEvent]) -> Result<(), reqwest::Error> {
@@ -2129,6 +2718,88 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             // the collector unless added here. Pinned by
             // `router_snapshot_json_includes_placement_gauges`.
             if let Some(obj) = body.as_object_mut() {
+                // #5090: one compact, versioned, fixed-cardinality diagnostic
+                // object. Kept nested so its marginal serialized size and
+                // schema can be pinned independently of the legacy snapshot.
+                obj.insert(
+                    "network_efficiency_v1".to_string(),
+                    serde_json::json!(snapshot.network_efficiency_v1),
+                );
+                // Contract-exec WASM counters: the cache-hit / WASM-miss split
+                // that makes a summarize or delta rate interpretable at all.
+                // Same hand-mirroring footgun as everything else in this block —
+                // a new `RouterSnapshotInfo` field is invisible to the collector
+                // unless added here. Pinned by
+                // `router_snapshot_json_includes_contract_exec_counters`, which
+                // asserts the FULL set so a partially-mirrored addition fails.
+                for (name, value) in [
+                    (
+                        "contract_exec_summarize_fast_hits_total",
+                        snapshot.contract_exec_summarize_fast_hits_total,
+                    ),
+                    (
+                        "contract_exec_summarize_reload_hits_total",
+                        snapshot.contract_exec_summarize_reload_hits_total,
+                    ),
+                    (
+                        "contract_exec_summarize_wasm_calls_total",
+                        snapshot.contract_exec_summarize_wasm_calls_total,
+                    ),
+                    (
+                        "contract_exec_summarize_wasm_uncached_total",
+                        snapshot.contract_exec_summarize_wasm_uncached_total,
+                    ),
+                    (
+                        "contract_exec_delta_fast_hits_total",
+                        snapshot.contract_exec_delta_fast_hits_total,
+                    ),
+                    (
+                        "contract_exec_delta_reload_hits_total",
+                        snapshot.contract_exec_delta_reload_hits_total,
+                    ),
+                    (
+                        "contract_exec_delta_wasm_calls_total",
+                        snapshot.contract_exec_delta_wasm_calls_total,
+                    ),
+                    (
+                        "contract_exec_delta_wasm_uncached_total",
+                        snapshot.contract_exec_delta_wasm_uncached_total,
+                    ),
+                    (
+                        "contract_exec_summarize_fast_hits_last_snapshot",
+                        snapshot.contract_exec_summarize_fast_hits_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_summarize_reload_hits_last_snapshot",
+                        snapshot.contract_exec_summarize_reload_hits_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_summarize_wasm_calls_last_snapshot",
+                        snapshot.contract_exec_summarize_wasm_calls_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_summarize_wasm_uncached_last_snapshot",
+                        snapshot.contract_exec_summarize_wasm_uncached_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_delta_fast_hits_last_snapshot",
+                        snapshot.contract_exec_delta_fast_hits_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_delta_reload_hits_last_snapshot",
+                        snapshot.contract_exec_delta_reload_hits_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_delta_wasm_calls_last_snapshot",
+                        snapshot.contract_exec_delta_wasm_calls_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_delta_wasm_uncached_last_snapshot",
+                        snapshot.contract_exec_delta_wasm_uncached_last_snapshot,
+                    ),
+                ] {
+                    obj.insert(name.to_string(), serde_json::json!(value));
+                }
                 obj.insert(
                     "hosted_contracts_count".to_string(),
                     serde_json::json!(snapshot.hosted_contracts_count),
@@ -2220,6 +2891,30 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 obj.insert(
                     "lattice_probe_improvements".to_string(),
                     serde_json::json!(snapshot.lattice_probe_improvements),
+                );
+                // Version-gate refusal counters (#5156): same hand-mirror
+                // footgun as the gauges above — a new `RouterSnapshotInfo`
+                // field is invisible to the collector unless added here.
+                // These split the hash-first-summaries / summary-first-PUT
+                // fail-closed fallback into its two causes (unknown remote
+                // version vs known-but-pre-floor), which have opposite
+                // self-healing implications. Pinned by
+                // `router_snapshot_json_includes_version_gate_refusal_counters`.
+                obj.insert(
+                    "hash_first_summaries_declined_unknown_version".to_string(),
+                    serde_json::json!(snapshot.hash_first_summaries_declined_unknown_version),
+                );
+                obj.insert(
+                    "hash_first_summaries_declined_pre_floor".to_string(),
+                    serde_json::json!(snapshot.hash_first_summaries_declined_pre_floor),
+                );
+                obj.insert(
+                    "summary_first_put_declined_unknown_version".to_string(),
+                    serde_json::json!(snapshot.summary_first_put_declined_unknown_version),
+                );
+                obj.insert(
+                    "summary_first_put_declined_pre_floor".to_string(),
+                    serde_json::json!(snapshot.summary_first_put_declined_pre_floor),
                 );
                 // Interest-weighted (two-tier) module-cache SHADOW gauges
                 // (#4441/#4534). Inserted here (not as inline `json!` keys) to
@@ -2344,6 +3039,35 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_subscribed_evictions_total".to_string(),
                     serde_json::json!(snapshot.hosting_subscribed_evictions_total),
                 );
+                // Cost-pressure eviction falsifier (cost-aware eviction,
+                // #4861): zero-demand contracts shed for dominating the
+                // node's attributed update-work. Same hand-mirrored footgun —
+                // invisible to the collector unless added here. Pinned by
+                // `router_snapshot_json_includes_cost_evictions_gauge`.
+                obj.insert(
+                    "hosting_cost_evictions_total".to_string(),
+                    serde_json::json!(snapshot.hosting_cost_evictions_total),
+                );
+                // Local notification-delivery outcomes (#4681). These replace a
+                // diagnostic that #5040 had to remove: the no-local-subscriber
+                // case cannot be logged per occurrence (22k lines/day) and its
+                // `debug!` is compiled out of release entirely, so a counter is
+                // the only thing an operator can actually see in production.
+                // Same hand-mirrored footgun — invisible to the collector
+                // unless added here. Pinned by
+                // `router_snapshot_json_includes_notification_delivery_gauges`.
+                obj.insert(
+                    "notifications_dropped_channel_full".to_string(),
+                    serde_json::json!(snapshot.notifications_dropped_channel_full),
+                );
+                obj.insert(
+                    "notifications_dropped_channel_closed".to_string(),
+                    serde_json::json!(snapshot.notifications_dropped_channel_closed),
+                );
+                obj.insert(
+                    "notifications_no_local_subscriber".to_string(),
+                    serde_json::json!(snapshot.notifications_no_local_subscriber),
+                );
                 // Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d):
                 // current count of contracts in-use via a downstream subscriber
                 // with NO state on disk. Should read 0 after register-after-state.
@@ -2377,6 +3101,18 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 obj.insert(
                     "terminal_consult_still_not_found".to_string(),
                     serde_json::json!(snapshot.terminal_consult_still_not_found),
+                );
+                // Eviction-retraction emission counters (#5059): whether the
+                // retraction that stops co-host fan-out at an evicted contract
+                // actually reached the wire. Pinned by
+                // `router_snapshot_json_includes_hosting_retraction_counters`.
+                obj.insert(
+                    "hosting_retractions_emitted".to_string(),
+                    serde_json::json!(snapshot.hosting_retractions_emitted),
+                );
+                obj.insert(
+                    "hosting_retractions_dropped".to_string(),
+                    serde_json::json!(snapshot.hosting_retractions_dropped),
                 );
                 // Streamed-transfer abort counters (Group B), routing/hosting
                 // attribution (Group C), and connect-emit counters — same
@@ -2704,6 +3440,260 @@ mod tests {
         );
     }
 
+    #[test]
+    fn router_snapshot_network_efficiency_v1_has_explicit_realistic_and_worst_case_budgets() {
+        use arbitrary::Arbitrary;
+
+        const BUSY_FLEET_COUNTER: u64 = 999_999;
+        const MAX_EMPTY_JSON_BYTES: usize = 2_048;
+        // Raised from 5_120 to admit TWO independently-developed blocks that
+        // landed together on this soak branch:
+        //
+        //  * the hosting-observability counters (#4642): `host_begin`
+        //    (7 causes) + `host_reads` (6 buckets) + `host_recency`
+        //    (5 buckets) = 18 counters, +173 JSON bytes at busy-fleet values
+        //    (5095 -> 5268, measured on that branch alone);
+        //  * the shadow-mode futile-repair block
+        //    (`crate::ring::futile_repair`): `futile` (14 scalars) +
+        //    `futile_ladder` (an 8-rung survival ladder) = 22 counters,
+        //    +183 JSON bytes at busy-fleet values (5095 -> 5278, measured on
+        //    that branch alone).
+        //
+        // The two costs are ADDITIVE and each branch had independently raised
+        // this budget to 5_376, which merges without a conflict marker because
+        // both sides are the same text. The merged busy-fleet block is
+        // MEASURED at 5451 bytes (5095 base + 173 + 183), which OVERFLOWS
+        // 5_376 by 75, so the budget is raised one further 256-byte step.
+        //
+        //   40 new counters
+        //   +356 JSON bytes at busy-fleet values
+        //   emitted once per ~30 min per peer, ~2000 reporting peers
+        //   => 48 * 2000 * ~356 B ~= 34 MB/day
+        //
+        // against a collector ingesting ~88.8 GB/day: about 0.04%. Both blocks
+        // are already the minimum that answers their question — the hosting
+        // rows are the ONLY record of why a peer hosts anything plus the only
+        // fleet-wide view of `read_count` / `last_genuine_access` (the demand
+        // signals the eviction ranking is built on, previously reaching the
+        // node's own HTML dashboard and nothing else), and the futile ladder is
+        // 8 rungs rather than a per-value histogram. Neither carries a
+        // per-contract or per-peer label: contract keys are attacker-chosen, so
+        // labelling would hand an attacker control of collector cardinality.
+        // Do NOT raise this again without redoing the arithmetic.
+        const MAX_BUSY_JSON_BYTES: usize = 5_632;
+        // Raised from 14_336 alongside the busy budget, same 40 counters. This
+        // is the MATHEMATICAL ceiling (every counter at u64::MAX, 20 digits),
+        // measured 15195; no fleet value approaches it, so it constrains
+        // schema shape rather than real bytes.
+        const MAX_WORST_CASE_JSON_BYTES: usize = 15_360;
+        const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_048;
+        // Raised from 5_120 (2026-08-07) to admit `ms_size` + `ms_unt_age`,
+        // the two counters added for #5153. The budget exists to force this
+        // arithmetic, not to forbid growth, so here it is:
+        //
+        //   30 new counters (4 size rows x 6 buckets, + 6 age buckets)
+        //   ~210 JSON bytes at busy-fleet values, 5157 OTLP marginal measured
+        //   emitted once per ~30 min per peer, ~2000 reporting peers
+        //   => 48 * 2000 * ~210 B ~= 20 MB/day
+        //
+        // against a collector ingesting ~88.8 GB/day: about 0.02%. The block
+        // is also already trimmed twice to get here — the histogram covers 4
+        // of 10 classes (the other 6 are a measured zero) and 6 size buckets
+        // rather than 8. Do NOT raise this again without redoing the
+        // arithmetic; the JSON-bytes budgets above are deliberately unchanged.
+        // Raised again from 5_376 for the 40 counters of the two blocks merged
+        // onto this soak branch (hosting observability + futile repair); see
+        // the arithmetic on MAX_BUSY_JSON_BYTES above. Measured 5523. Note
+        // the OTLP marginal is NOT the JSON figure plus a constant — it is a
+        // different axis (the JSON block re-encoded as an escaped OTLP string
+        // body), so it is measured separately rather than inferred.
+        const MAX_BUSY_OTLP_MARGINAL_BYTES: usize = 5_632;
+        // Raised from 14_336 alongside the busy budget above, same 30 new
+        // counters, same #5153 rationale, then again for the 40 counters of the
+        // two blocks merged onto this soak branch — measured 15267. This
+        // bound is the MATHEMATICAL ceiling (every counter at u64::MAX, 20
+        // digits); no fleet value approaches it, so it constrains schema shape
+        // rather than real bytes.
+        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 15_360;
+        const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
+
+        let diagnostic = |value| crate::router::NetworkEfficiencyV1 {
+            v: 1,
+            ms_s: [value; 10],
+            ms_b: [value; 10],
+            ms_age: [value; 5],
+            ms_size: [[value; 6]; 4],
+            ms_unt_age: [value; 6],
+            reg_ow_k: [value; 7],
+            reg_ow_m: [value; 7],
+            reg_new_k: [value; 7],
+            reg_new_m: [value; 7],
+            reg_cap: [value; 7],
+            removed: [value; 7],
+            current: [value; 5],
+            recreated: [value; 7],
+            populated: [[value; 4]; 6],
+            corr_ovf: [value; 2],
+            queue: [value; 15],
+            recv_n: [[value; 9]; 4],
+            recv_tn: [[value; 9]; 10],
+            recv_tb: [[value; 9]; 10],
+            state_n: [value; 9],
+            state_b: [value; 9],
+            state: [value; 9],
+            evict_n: [[value; 9]; 3],
+            evict_b: [[value; 9]; 3],
+            vict_n: [[value; 9]; 3],
+            vict_b: [[value; 9]; 3],
+            cost: [[value; 5]; 3],
+            cost_ba: [[value; 9]; 3],
+            cost_be: [[value; 9]; 3],
+            tel: [value; 15],
+            shadow: [[value; 9]; 7],
+            eff: [value; 8],
+            host_begin: [value; 7],
+            host_reads: [value; 6],
+            host_recency: [value; 5],
+            futile: [value; crate::ring::futile_repair::SNAPSHOT_SCALARS],
+            futile_ladder: [value; crate::ring::futile_repair::LADDER_LEN],
+        };
+
+        let mut u = arbitrary::Unstructured::new(&[0_u8; 32_768]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        let base_info = info.clone();
+        info.network_efficiency_v1 = Some(diagnostic(BUSY_FLEET_COUNTER));
+
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info.clone())));
+        let block = &json["network_efficiency_v1"];
+        let object = block
+            .as_object()
+            .expect("network_efficiency_v1 must remain a JSON object");
+        assert_eq!(object.len(), 38, "schema must remain fixed-cardinality");
+        let encoded = serde_json::to_vec(block).expect("serialize diagnostic block");
+        assert!(
+            encoded.len() <= MAX_BUSY_JSON_BYTES,
+            "busy-fleet diagnostic grew to {} bytes (limit {MAX_BUSY_JSON_BYTES})",
+            encoded.len()
+        );
+
+        let empty = serde_json::to_vec(&diagnostic(0)).expect("serialize empty diagnostic block");
+        assert!(
+            empty.len() <= MAX_EMPTY_JSON_BYTES,
+            "empty diagnostic grew to {} bytes (limit {MAX_EMPTY_JSON_BYTES})",
+            empty.len()
+        );
+
+        let worst_case = serde_json::to_vec(&diagnostic(u64::MAX))
+            .expect("serialize worst-case diagnostic block");
+        assert!(
+            worst_case.len() <= MAX_WORST_CASE_JSON_BYTES,
+            "mathematical worst-case diagnostic grew to {} bytes (limit \
+             {MAX_WORST_CASE_JSON_BYTES})",
+            worst_case.len()
+        );
+
+        let otlp_data_len = |event_data| {
+            let event = TelemetryEvent {
+                timestamp: 1,
+                peer_id: "peer".to_string(),
+                transaction_id: String::new(),
+                event_type: "router_snapshot".to_string(),
+                event_data,
+                priority: EventPriority::Operational,
+            };
+            serde_json::to_vec(&to_otlp_logs(&[event])).unwrap().len()
+        };
+        let base_data = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(base_info.clone())));
+        let base_otlp = otlp_data_len(base_data.clone());
+        let mut without_field = base_data;
+        without_field
+            .as_object_mut()
+            .unwrap()
+            .remove("network_efficiency_v1");
+        let null_otlp = base_otlp.saturating_sub(otlp_data_len(without_field));
+        let busy_otlp = otlp_data_len(event_kind_to_json(&EventKind::RouterSnapshot(Box::new(
+            info,
+        ))))
+        .saturating_sub(base_otlp);
+        let mut empty_info = base_info.clone();
+        empty_info.network_efficiency_v1 = Some(diagnostic(0));
+        let empty_otlp = otlp_data_len(event_kind_to_json(&EventKind::RouterSnapshot(Box::new(
+            empty_info,
+        ))))
+        .saturating_sub(base_otlp);
+        let mut worst_info = base_info;
+        worst_info.network_efficiency_v1 = Some(diagnostic(u64::MAX));
+        let worst_otlp = otlp_data_len(event_kind_to_json(&EventKind::RouterSnapshot(Box::new(
+            worst_info,
+        ))))
+        .saturating_sub(base_otlp);
+        assert_eq!(null_otlp, 31, "null snapshots are part of the fleet budget");
+        // Report the measured value, not just the verdict: when this trips, the
+        // useful question is "by how much", and a bare assert makes every
+        // adjustment a guess-and-recompile loop.
+        assert!(
+            null_otlp <= MAX_NULL_OTLP_MARGINAL_BYTES,
+            "null OTLP marginal {null_otlp} > {MAX_NULL_OTLP_MARGINAL_BYTES}"
+        );
+        assert!(
+            empty_otlp <= MAX_EMPTY_OTLP_MARGINAL_BYTES,
+            "empty OTLP marginal {empty_otlp} > {MAX_EMPTY_OTLP_MARGINAL_BYTES}"
+        );
+        assert!(
+            busy_otlp <= MAX_BUSY_OTLP_MARGINAL_BYTES,
+            "busy OTLP marginal {busy_otlp} > {MAX_BUSY_OTLP_MARGINAL_BYTES}"
+        );
+        assert!(
+            worst_otlp <= MAX_WORST_OTLP_MARGINAL_BYTES,
+            "worst-case OTLP marginal {worst_otlp} > {MAX_WORST_OTLP_MARGINAL_BYTES}"
+        );
+    }
+
+    /// The hosting-observability rows must survive SERIALIZATION into the
+    /// `router_snapshot` body, not merely exist as struct fields.
+    ///
+    /// `network_efficiency_v1` is the only telemetry family that bypasses both
+    /// the node-side rate limiter (which drops ~69-77% of operational events,
+    /// load-proportionally) and the collector's 5% sampler, so a field that
+    /// silently fails to serialize is not "degraded" — it is absent, with no
+    /// second path to notice by. Each row is given a DISTINCT value so a
+    /// transposed assignment (`host_reads` fed from `host_recency`, say) fails
+    /// here instead of quietly publishing the wrong series.
+    #[test]
+    fn router_snapshot_json_carries_hosting_observability_rows() {
+        use arbitrary::Arbitrary;
+
+        let mut u = arbitrary::Unstructured::new(&[0_u8; 32_768]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        let mut block_bytes = arbitrary::Unstructured::new(&[0_u8; 32_768]);
+        let mut block = crate::router::NetworkEfficiencyV1::arbitrary(&mut block_bytes)
+            .expect("construct NetworkEfficiencyV1 for test");
+        block.host_begin = [11, 12, 13, 14, 15, 16, 17];
+        block.host_reads = [21, 22, 23, 24, 25, 26];
+        block.host_recency = [31, 32, 33, 34, 35];
+        info.network_efficiency_v1 = Some(block);
+
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        let efficiency = &json["network_efficiency_v1"];
+        assert_eq!(
+            efficiency["host_begin"],
+            serde_json::json!([11, 12, 13, 14, 15, 16, 17]),
+            "hosting-begin causes must reach the OTLP body"
+        );
+        assert_eq!(
+            efficiency["host_reads"],
+            serde_json::json!([21, 22, 23, 24, 25, 26]),
+            "the read_count gauge must reach the OTLP body"
+        );
+        assert_eq!(
+            efficiency["host_recency"],
+            serde_json::json!([31, 32, 33, 34, 35]),
+            "the genuine-access recency gauge must reach the OTLP body"
+        );
+    }
+
     /// Pin: the module-cache gauges (#4440) must also reach the hand-mirrored
     /// OTLP body — same footgun as the fd gauges above.
     #[test]
@@ -2873,6 +3863,59 @@ mod tests {
         );
     }
 
+    /// Pin: the cost-pressure eviction falsifier gauge (cost-aware eviction,
+    /// #4861) must reach the hand-mirrored OTLP body. It counts zero-demand
+    /// contracts shed for dominating the node's attributed update-work (CPU /
+    /// broadcast fan-out); a silent drop would blind central telemetry to
+    /// whether the cost trigger fires in the field — the validation signal the
+    /// whole cost-aware-eviction change rests on.
+    #[test]
+    fn router_snapshot_json_includes_cost_evictions_gauge() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hosting_cost_evictions_total = Some(58);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        assert_eq!(
+            json["hosting_cost_evictions_total"], 58,
+            "hosting_cost_evictions_total must reach the OTLP body"
+        );
+    }
+
+    /// Pin: the notification-delivery gauges (#4681) must reach the
+    /// hand-mirrored OTLP body.
+    ///
+    /// These carry more weight than a usual gauge. #5040 had to stop logging
+    /// the no-local-subscriber case per occurrence (22,413 lines in one day on
+    /// a single node), and its replacement `debug!` is compiled out of release
+    /// builds by `release_max_level_info`. So in production these counters are
+    /// the ONLY visibility into local notification delivery — a silent drop
+    /// here restores exactly the blind spot #4773 was merged to close.
+    #[test]
+    fn router_snapshot_json_includes_notification_delivery_gauges() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.notifications_dropped_channel_full = Some(7);
+        info.notifications_dropped_channel_closed = Some(11);
+        info.notifications_no_local_subscriber = Some(22413);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        assert_eq!(
+            json["notifications_dropped_channel_full"], 7,
+            "notifications_dropped_channel_full must reach the OTLP body"
+        );
+        assert_eq!(
+            json["notifications_dropped_channel_closed"], 11,
+            "notifications_dropped_channel_closed must reach the OTLP body"
+        );
+        assert_eq!(
+            json["notifications_no_local_subscriber"], 22413,
+            "notifications_no_local_subscriber must reach the OTLP body"
+        );
+    }
+
     /// Pin: the phantom-hosting falsifier gauge (SUBSCRIBE-retirement step 10
     /// §1d) must reach the hand-mirrored OTLP body. It counts contracts in-use
     /// via a downstream subscriber with NO state on disk
@@ -2891,6 +3934,34 @@ mod tests {
             json["phantom_in_use_contracts"], 7,
             "phantom_in_use_contracts must reach the OTLP body"
         );
+    }
+
+    /// Pin: the version-gate refusal counters (#5156) must reach the
+    /// hand-mirrored OTLP body — same footgun as the gauges above. These
+    /// split why `supports_hash_first_summaries` / `supports_summary_first_put`
+    /// fell back to the full-bytes path into its two causes (unknown remote
+    /// version, which never self-heals, vs known-but-pre-floor, which
+    /// self-heals as the fleet upgrades). A silent drop would re-blind
+    /// central telemetry to which cause actually dominates the fallback.
+    #[test]
+    fn router_snapshot_json_includes_version_gate_refusal_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hash_first_summaries_declined_unknown_version = Some(41);
+        info.hash_first_summaries_declined_pre_floor = Some(43);
+        info.summary_first_put_declined_unknown_version = Some(47);
+        info.summary_first_put_declined_pre_floor = Some(53);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("hash_first_summaries_declined_unknown_version", 41),
+            ("hash_first_summaries_declined_pre_floor", 43),
+            ("summary_first_put_declined_unknown_version", 47),
+            ("summary_first_put_declined_pre_floor", 53),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
     }
 
     /// Pin: the terminal advertisement-consult counters (hosting redesign piece
@@ -2917,6 +3988,29 @@ mod tests {
             ("terminal_consult_hits", 313),
             ("terminal_consult_resolved_found", 317),
             ("terminal_consult_still_not_found", 331),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the eviction-retraction counters (#5059) must reach the
+    /// hand-mirrored OTLP body — same footgun as the counters above. The
+    /// retraction is emitted best-effort on the cap-2048 node-event channel and
+    /// its drop is logged at `debug`, which compiles out in release, so these
+    /// counters are the ONLY production signal distinguishing "retraction
+    /// dropped, healing on the ~5-min heartbeat" from "the fix is not working".
+    #[test]
+    fn router_snapshot_json_includes_hosting_retraction_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hosting_retractions_emitted = Some(509);
+        info.hosting_retractions_dropped = Some(521);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("hosting_retractions_emitted", 509),
+            ("hosting_retractions_dropped", 521),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
@@ -3158,6 +4252,64 @@ mod tests {
             ("broadcast_stream_attempts_total", 37),
             ("broadcast_stream_failures_total", 41),
             ("broadcast_stream_failures_last_snapshot", 43),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// The contract-exec WASM counters must reach the hand-mirrored OTLP body.
+    ///
+    /// These are the fields that make a summarize/delta rate interpretable —
+    /// without them, the only production signal is a handler-entry span that
+    /// counts cache hits and WASM invocations identically, which is how five
+    /// consecutive storm fixes were sized against an undifferentiated number.
+    /// Losing one to the hand-mirroring footgun would re-blind us in exactly the
+    /// way this change exists to fix, so the assertion covers the FULL set: a
+    /// partially-mirrored addition fails here rather than shipping half-visible.
+    ///
+    /// Every value below is DISTINCT, so a copy-paste slip that mirrors one
+    /// field's value under another field's key fails too — an all-`Some(1)`
+    /// fixture would pass under that mutation.
+    #[test]
+    fn router_snapshot_json_includes_contract_exec_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.contract_exec_summarize_fast_hits_total = Some(101);
+        info.contract_exec_summarize_reload_hits_total = Some(102);
+        info.contract_exec_summarize_wasm_calls_total = Some(103);
+        info.contract_exec_summarize_wasm_uncached_total = Some(104);
+        info.contract_exec_delta_fast_hits_total = Some(105);
+        info.contract_exec_delta_reload_hits_total = Some(106);
+        info.contract_exec_delta_wasm_calls_total = Some(107);
+        info.contract_exec_delta_wasm_uncached_total = Some(108);
+        info.contract_exec_summarize_fast_hits_last_snapshot = Some(109);
+        info.contract_exec_summarize_reload_hits_last_snapshot = Some(110);
+        info.contract_exec_summarize_wasm_calls_last_snapshot = Some(111);
+        info.contract_exec_summarize_wasm_uncached_last_snapshot = Some(112);
+        info.contract_exec_delta_fast_hits_last_snapshot = Some(113);
+        info.contract_exec_delta_reload_hits_last_snapshot = Some(114);
+        info.contract_exec_delta_wasm_calls_last_snapshot = Some(115);
+        info.contract_exec_delta_wasm_uncached_last_snapshot = Some(116);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("contract_exec_summarize_fast_hits_total", 101),
+            ("contract_exec_summarize_reload_hits_total", 102),
+            ("contract_exec_summarize_wasm_calls_total", 103),
+            ("contract_exec_summarize_wasm_uncached_total", 104),
+            ("contract_exec_delta_fast_hits_total", 105),
+            ("contract_exec_delta_reload_hits_total", 106),
+            ("contract_exec_delta_wasm_calls_total", 107),
+            ("contract_exec_delta_wasm_uncached_total", 108),
+            ("contract_exec_summarize_fast_hits_last_snapshot", 109),
+            ("contract_exec_summarize_reload_hits_last_snapshot", 110),
+            ("contract_exec_summarize_wasm_calls_last_snapshot", 111),
+            ("contract_exec_summarize_wasm_uncached_last_snapshot", 112),
+            ("contract_exec_delta_fast_hits_last_snapshot", 113),
+            ("contract_exec_delta_reload_hits_last_snapshot", 114),
+            ("contract_exec_delta_wasm_calls_last_snapshot", 115),
+            ("contract_exec_delta_wasm_uncached_last_snapshot", 116),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
@@ -3444,6 +4596,7 @@ mod tests {
             0,
             transfer_rx,
             "snapshot-peer-id".to_string(),
+            Arc::new(TelemetryLocalMetrics::default()),
         );
         let snapshot = crate::transport::metrics::TransportSnapshot::default();
         let event = worker.snapshot_to_telemetry(&snapshot);
@@ -3471,6 +4624,7 @@ mod tests {
             0,
             transfer_rx,
             "resource-peer-id".to_string(),
+            Arc::new(TelemetryLocalMetrics::default()),
         );
         let event = worker.resource_utilization_telemetry();
         assert_eq!(event.event_type, "resource_utilization");
@@ -3516,6 +4670,7 @@ mod tests {
             0,
             transfer_rx,
             "cadence-peer-id".to_string(),
+            Arc::new(TelemetryLocalMetrics::default()),
         );
 
         // The constant yields the intended ~60s cadence.
@@ -3556,8 +4711,12 @@ mod tests {
         use crate::operations::get::GetMsg;
 
         let (sender, mut receiver) = mpsc::channel(1);
+        let (network_efficiency_sender, _network_efficiency_receiver) = mpsc::channel(1);
+        let metrics = Arc::new(TelemetryLocalMetrics::default());
         let mut reporter = TelemetryReporter {
             sender,
+            network_efficiency_sender,
+            metrics,
             local_peer_id: "timeout-peer-id".to_string(),
         };
         let tx = Transaction::new::<GetMsg>();
@@ -3620,6 +4779,7 @@ mod tests {
             0,
             transfer_rx,
             "test-local-peer-id".to_string(),
+            Arc::new(TelemetryLocalMetrics::default()),
         );
         let event = worker.transfer_event_to_telemetry(crate::tracing::TransferEvent::Failed {
             stream_id: 42,
@@ -3924,7 +5084,32 @@ mod tests {
             0,
             transfer_rx,
             "rate-limit-test-peer".to_string(),
+            Arc::new(TelemetryLocalMetrics::default()),
         )
+    }
+
+    fn test_telemetry_event(event_type: &str, priority: EventPriority) -> TelemetryEvent {
+        TelemetryEvent {
+            timestamp: 1,
+            peer_id: "test-peer".to_string(),
+            transaction_id: String::new(),
+            event_type: event_type.to_string(),
+            event_data: serde_json::json!({}),
+            priority,
+        }
+    }
+
+    fn test_network_efficiency_event(sequence: u64) -> TelemetryEvent {
+        TelemetryEvent {
+            timestamp: sequence,
+            peer_id: "test-peer".to_string(),
+            transaction_id: String::new(),
+            event_type: "router_snapshot".to_string(),
+            event_data: serde_json::json!({
+                "network_efficiency_v1": {"v": 1, "sequence": sequence}
+            }),
+            priority: EventPriority::NetworkEfficiency,
+        }
     }
 
     /// Admit `count` events of `priority` at instant `now`, returning how many
@@ -3932,11 +5117,12 @@ mod tests {
     fn admit_n(
         worker: &mut TelemetryWorker,
         priority: EventPriority,
+        event_type: &str,
         count: usize,
         now: Instant,
     ) -> usize {
         (0..count)
-            .filter(|_| worker.admit_event(priority, now))
+            .filter(|_| worker.admit_event(priority, event_type, now))
             .count()
     }
 
@@ -3957,11 +5143,29 @@ mod tests {
 
         // A flood of shadow-only events is capped at the sub-budget, never the
         // full aggregate cap.
-        let admitted = admit_n(&mut worker, EventPriority::Shadow, 100, now);
+        let admitted = admit_n(
+            &mut worker,
+            EventPriority::Shadow,
+            "broadcast_payload_mix",
+            100,
+            now,
+        );
         assert_eq!(
             admitted, MAX_SHADOW_EVENTS_PER_SECOND,
             "shadow events must be capped at the sub-budget within a window"
         );
+        let snapshot = worker.metrics.snapshot();
+        assert_eq!(
+            snapshot.rate_limit_admitted_shadow_total,
+            MAX_SHADOW_EVENTS_PER_SECOND as u64
+        );
+        assert_eq!(
+            snapshot.dropped_shadow_limit_total,
+            (100 - MAX_SHADOW_EVENTS_PER_SECOND) as u64
+        );
+        let stream = snapshot.known_shadow_rollups[KnownShadowRollup::BroadcastPayloadMix.index()];
+        assert_eq!(stream.rate_limit_admitted_total, admitted as u64);
+        assert_eq!(stream.dropped_shadow_limit_total, (100 - admitted) as u64);
     }
 
     #[test]
@@ -3987,7 +5191,13 @@ mod tests {
 
         // All five rollups arrive in the same aligned second (no operational
         // load competing for the aggregate cap).
-        let admitted = admit_n(&mut worker, EventPriority::Shadow, SHADOW_STREAMS, now);
+        let admitted = admit_n(
+            &mut worker,
+            EventPriority::Shadow,
+            "test_shadow",
+            SHADOW_STREAMS,
+            now,
+        );
         assert_eq!(
             admitted, SHADOW_STREAMS,
             "all five aligned shadow rollups must be admitted; none dropped"
@@ -4004,13 +5214,19 @@ mod tests {
         let now = Instant::now();
 
         // Shadow events arrive first and try to grab everything.
-        let shadow_admitted = admit_n(&mut worker, EventPriority::Shadow, 50, now);
+        let shadow_admitted = admit_n(&mut worker, EventPriority::Shadow, "test_shadow", 50, now);
         assert_eq!(shadow_admitted, MAX_SHADOW_EVENTS_PER_SECOND);
 
         // Operational events arriving afterwards still get the slots the
         // shadow sub-budget reserved for them.
         let expected_operational = MAX_EVENTS_PER_SECOND - MAX_SHADOW_EVENTS_PER_SECOND;
-        let op_admitted = admit_n(&mut worker, EventPriority::Operational, 50, now);
+        let op_admitted = admit_n(
+            &mut worker,
+            EventPriority::Operational,
+            "test_operational",
+            50,
+            now,
+        );
         assert_eq!(
             op_admitted, expected_operational,
             "operational events must keep (aggregate cap - shadow sub-budget) \
@@ -4025,11 +5241,168 @@ mod tests {
         let mut worker = rate_limit_test_worker();
         let now = Instant::now();
 
-        let admitted = admit_n(&mut worker, EventPriority::Operational, 100, now);
+        let admitted = admit_n(
+            &mut worker,
+            EventPriority::Operational,
+            "test_operational",
+            100,
+            now,
+        );
         assert_eq!(
             admitted, MAX_EVENTS_PER_SECOND,
             "operational events alone must be able to fill the aggregate cap"
         );
+    }
+
+    #[test]
+    fn test_network_efficiency_has_one_structurally_bounded_reserved_rate_slot() {
+        let mut worker = rate_limit_test_worker();
+        let now = Instant::now();
+
+        assert_eq!(
+            admit_n(
+                &mut worker,
+                EventPriority::Operational,
+                "test_operational",
+                MAX_EVENTS_PER_SECOND,
+                now,
+            ),
+            MAX_EVENTS_PER_SECOND
+        );
+        assert!(
+            worker.admit_event(EventPriority::NetworkEfficiency, "router_snapshot", now,),
+            "ordinary saturation must not starve the fixed 30-minute diagnostic"
+        );
+        assert_eq!(
+            worker.events_this_second, MAX_EVENTS_PER_SECOND,
+            "the reserved diagnostic must not expand the ordinary event budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_network_efficiency_uses_dedicated_channel_when_ordinary_channel_is_full() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .try_send(TelemetryCommand::Event(test_telemetry_event(
+                "ordinary-filler",
+                EventPriority::Operational,
+            )))
+            .expect("fill ordinary channel");
+        let (network_efficiency_sender, mut network_efficiency_receiver) = mpsc::channel(1);
+        let metrics = Arc::new(TelemetryLocalMetrics::default());
+        let reporter = TelemetryReporter {
+            sender,
+            network_efficiency_sender,
+            metrics: metrics.clone(),
+            local_peer_id: "test-peer".to_string(),
+        };
+
+        let mut event = test_network_efficiency_event(1);
+        // Production callers initially create every NetEvent as Operational;
+        // send_event owns both classification and reserved routing.
+        event.priority = EventPriority::Operational;
+        reporter.send_event(event).await;
+
+        assert!(
+            receiver.try_recv().is_ok(),
+            "ordinary filler remains queued"
+        );
+        let TelemetryCommand::Event(reserved) = network_efficiency_receiver
+            .try_recv()
+            .expect("diagnostic must enter its dedicated channel")
+        else {
+            panic!("expected reserved Event command");
+        };
+        assert_eq!(reserved.priority, EventPriority::NetworkEfficiency);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.network_efficiency_delivery[0], 1);
+        assert_eq!(snapshot.network_efficiency_delivery[1], 0);
+        assert_eq!(snapshot.enqueue_succeeded_total, 1);
+    }
+
+    #[tokio::test]
+    async fn test_network_efficiency_keeps_reserved_buffer_slot_during_backoff() {
+        let mut worker = rate_limit_test_worker();
+        worker.buffer = (0..MAX_BUFFER_SIZE)
+            .map(|_| test_telemetry_event("filler", EventPriority::Operational))
+            .collect();
+        worker.backoff_ms = MAX_BACKOFF_MS;
+        worker.last_send = Instant::now();
+
+        worker.handle_event(test_network_efficiency_event(1)).await;
+        assert_eq!(
+            worker.buffer.len(),
+            MAX_BUFFER_SIZE + NETWORK_EFFICIENCY_BUFFER_RESERVE
+        );
+        assert!(worker.buffer.iter().any(is_network_efficiency_event));
+        let snapshot = worker.metrics.snapshot();
+        assert_eq!(snapshot.network_efficiency_delivery[3], 1);
+        assert_eq!(snapshot.network_efficiency_delivery[4], 0);
+        assert_eq!(snapshot.network_efficiency_delivery[5], 0);
+
+        // A later cumulative sample supersedes the old one rather than using
+        // a second reserved slot during a prolonged collector outage.
+        worker.handle_event(test_network_efficiency_event(2)).await;
+        assert_eq!(
+            worker.buffer.len(),
+            MAX_BUFFER_SIZE + NETWORK_EFFICIENCY_BUFFER_RESERVE
+        );
+        let retained: Vec<_> = worker
+            .buffer
+            .iter()
+            .filter(|event| is_network_efficiency_event(event))
+            .collect();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].timestamp, 2);
+        assert_eq!(
+            worker.metrics.snapshot().network_efficiency_delivery[5],
+            1,
+            "the replaced historical point sample must be a visible terminal outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reserved_slot_does_not_reduce_ordinary_buffer_capacity() {
+        let mut worker = rate_limit_test_worker();
+        worker.buffer = (0..MAX_BUFFER_SIZE - 1)
+            .map(|_| test_telemetry_event("filler", EventPriority::Operational))
+            .collect();
+        worker.buffer.push(test_network_efficiency_event(1));
+        worker.backoff_ms = MAX_BACKOFF_MS;
+        worker.last_send = Instant::now();
+
+        worker
+            .handle_event(test_telemetry_event(
+                "last-ordinary-slot",
+                EventPriority::Operational,
+            ))
+            .await;
+
+        assert_eq!(
+            worker.buffer.len(),
+            MAX_BUFFER_SIZE + NETWORK_EFFICIENCY_BUFFER_RESERVE,
+            "the diagnostic reserve must not take one of the 100 ordinary slots"
+        );
+    }
+
+    #[test]
+    fn test_failed_full_batch_retains_network_efficiency_reserved_slot() {
+        let mut worker = rate_limit_test_worker();
+        let mut failed = (0..MAX_BUFFER_SIZE)
+            .map(|_| test_telemetry_event("ordinary", EventPriority::Operational))
+            .collect::<Vec<_>>();
+        failed.push(test_network_efficiency_event(1));
+
+        worker.requeue_failed_batch(failed);
+
+        assert_eq!(
+            worker.buffer.len(),
+            MAX_BUFFER_SIZE + NETWORK_EFFICIENCY_BUFFER_RESERVE
+        );
+        assert!(worker.buffer.iter().any(is_network_efficiency_event));
+        let snapshot = worker.metrics.snapshot();
+        assert_eq!(snapshot.batch_retry_truncated_events_total, 0);
+        assert_eq!(snapshot.network_efficiency_delivery[6], 0);
     }
 
     #[test]
@@ -4043,17 +5416,129 @@ mod tests {
         let op_admitted = admit_n(
             &mut worker,
             EventPriority::Operational,
+            "test_operational",
             MAX_EVENTS_PER_SECOND,
             now,
         );
         assert_eq!(op_admitted, MAX_EVENTS_PER_SECOND);
 
         // Sub-budget untouched, but the aggregate cap is exhausted.
-        let shadow_admitted = admit_n(&mut worker, EventPriority::Shadow, 10, now);
+        let shadow_admitted = admit_n(
+            &mut worker,
+            EventPriority::Shadow,
+            "outbound_message_mix",
+            10,
+            now,
+        );
         assert_eq!(
             shadow_admitted, 0,
             "shadow events must still respect the aggregate cap, not just the \
              sub-budget"
+        );
+        let snapshot = worker.metrics.snapshot();
+        assert_eq!(snapshot.dropped_aggregate_limit_shadow_total, 10);
+        assert_eq!(
+            snapshot.known_shadow_rollups[KnownShadowRollup::OutboundMessageMix.index()]
+                .dropped_aggregate_limit_total,
+            10
+        );
+    }
+
+    #[test]
+    fn test_enqueue_full_and_closed_are_accounted_by_fixed_stream() {
+        let metrics = TelemetryLocalMetrics::default();
+
+        let (full_sender, _full_receiver) = mpsc::channel(1);
+        full_sender
+            .try_send(TelemetryCommand::Event(test_telemetry_event(
+                "filler",
+                EventPriority::Operational,
+            )))
+            .expect("fill the one-slot channel");
+        try_enqueue_event(
+            &full_sender,
+            &metrics,
+            test_telemetry_event("broadcast_payload_mix", EventPriority::Shadow),
+        );
+
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        try_enqueue_event(
+            &closed_sender,
+            &metrics,
+            test_telemetry_event("outbound_message_mix", EventPriority::Shadow),
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.enqueue_attempts_total, 2);
+        assert_eq!(snapshot.enqueue_succeeded_total, 0);
+        assert_eq!(snapshot.enqueue_dropped_full_total, 1);
+        assert_eq!(snapshot.enqueue_dropped_closed_total, 1);
+        assert_eq!(
+            snapshot.known_shadow_rollups[KnownShadowRollup::BroadcastPayloadMix.index()]
+                .enqueue_dropped_full_total,
+            1
+        );
+        assert_eq!(
+            snapshot.known_shadow_rollups[KnownShadowRollup::OutboundMessageMix.index()]
+                .enqueue_dropped_closed_total,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backoff_full_buffer_drop_is_accounted_by_fixed_stream() {
+        let mut worker = rate_limit_test_worker();
+        worker.buffer = (0..MAX_BUFFER_SIZE)
+            .map(|_| test_telemetry_event("filler", EventPriority::Operational))
+            .collect();
+        worker.backoff_ms = INITIAL_BACKOFF_MS;
+        worker.last_send = Instant::now();
+
+        worker
+            .handle_event(test_telemetry_event(
+                "broadcast_payload_mix",
+                EventPriority::Shadow,
+            ))
+            .await;
+
+        assert_eq!(worker.buffer.len(), MAX_BUFFER_SIZE);
+        let snapshot = worker.metrics.snapshot();
+        assert_eq!(snapshot.rate_limit_admitted_shadow_total, 1);
+        assert_eq!(snapshot.dropped_backoff_buffer_full_total, 1);
+        assert_eq!(
+            snapshot.known_shadow_rollups[KnownShadowRollup::BroadcastPayloadMix.index()]
+                .dropped_backoff_buffer_full_total,
+            1
+        );
+    }
+
+    #[test]
+    fn test_failed_batch_retry_truncation_is_accounted_by_fixed_stream() {
+        let mut worker = rate_limit_test_worker();
+        worker.buffer = (0..MAX_BUFFER_SIZE - 1)
+            .map(|_| test_telemetry_event("buffered", EventPriority::Operational))
+            .collect();
+
+        worker.requeue_failed_batch(vec![
+            test_telemetry_event("retained", EventPriority::Operational),
+            test_telemetry_event("broadcast_payload_mix", EventPriority::Shadow),
+            test_telemetry_event("outbound_message_mix", EventPriority::Shadow),
+        ]);
+
+        assert_eq!(worker.buffer.len(), MAX_BUFFER_SIZE);
+        let snapshot = worker.metrics.snapshot();
+        assert_eq!(snapshot.batch_send_failures_total, 1);
+        assert_eq!(snapshot.batch_retry_truncated_events_total, 2);
+        assert_eq!(
+            snapshot.known_shadow_rollups[KnownShadowRollup::BroadcastPayloadMix.index()]
+                .retry_truncated_total,
+            1
+        );
+        assert_eq!(
+            snapshot.known_shadow_rollups[KnownShadowRollup::OutboundMessageMix.index()]
+                .retry_truncated_total,
+            1
         );
     }
 
@@ -4066,25 +5551,37 @@ mod tests {
 
         // Fill the aggregate cap (some shadow, some operational) in window 0.
         assert_eq!(
-            admit_n(&mut worker, EventPriority::Shadow, 10, t0),
+            admit_n(&mut worker, EventPriority::Shadow, "test_shadow", 10, t0),
             MAX_SHADOW_EVENTS_PER_SECOND
         );
         assert_eq!(
-            admit_n(&mut worker, EventPriority::Operational, 10, t0),
+            admit_n(
+                &mut worker,
+                EventPriority::Operational,
+                "test_operational",
+                10,
+                t0,
+            ),
             MAX_EVENTS_PER_SECOND - MAX_SHADOW_EVENTS_PER_SECOND
         );
         // Window 0 is now full.
-        assert!(!worker.admit_event(EventPriority::Operational, t0));
+        assert!(!worker.admit_event(EventPriority::Operational, "test_operational", t0));
 
         // Roll the window over (exactly 1s is the boundary: >= 1s resets).
         let t1 = t0 + Duration::from_secs(1);
         assert_eq!(
-            admit_n(&mut worker, EventPriority::Shadow, 10, t1),
+            admit_n(&mut worker, EventPriority::Shadow, "test_shadow", 10, t1),
             MAX_SHADOW_EVENTS_PER_SECOND,
             "shadow sub-budget must refresh on window rollover"
         );
         assert_eq!(
-            admit_n(&mut worker, EventPriority::Operational, 10, t1),
+            admit_n(
+                &mut worker,
+                EventPriority::Operational,
+                "test_operational",
+                10,
+                t1,
+            ),
             MAX_EVENTS_PER_SECOND - MAX_SHADOW_EVENTS_PER_SECOND,
             "aggregate cap must refresh on window rollover"
         );
@@ -4100,6 +5597,7 @@ mod tests {
             admit_n(
                 &mut worker,
                 EventPriority::Operational,
+                "test_operational",
                 MAX_EVENTS_PER_SECOND,
                 t0
             ),
@@ -4108,7 +5606,7 @@ mod tests {
 
         let almost = t0 + Duration::from_millis(999);
         assert!(
-            !worker.admit_event(EventPriority::Operational, almost),
+            !worker.admit_event(EventPriority::Operational, "test_operational", almost),
             "window must not reset before a full second elapses"
         );
     }

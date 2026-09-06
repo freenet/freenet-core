@@ -38,6 +38,11 @@ pub(crate) mod reconcile;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc, TimeSource};
+/// Hosting-BEGIN attribution (#5090-family observability): WHY a peer started
+/// hosting a contract. Re-exported so the operation drivers — the only code that
+/// knows whether a store is client-originated, transit, or a sub-op fetch — can
+/// name their cause at the `Ring::host_contract` boundary.
+pub(crate) use cache::HostingCause;
 pub(crate) use cache::HostingContractScore;
 /// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
 /// `config::ConfigArgs::build` (see the constant's docs).
@@ -52,27 +57,67 @@ pub(crate) use cache::MAX_DEFAULT_HOSTING_BUDGET_BYTES;
 /// clamp lower bound; the config round-trip test asserts the RAM default lands
 /// within [MIN, MAX]). `pub(crate)` so `ring` can re-export it for that test.
 pub(crate) use cache::MIN_DEFAULT_HOSTING_BUDGET_BYTES;
+/// The hosting budget's pure RAM clamp, re-exported (test-only) so the wasmtime
+/// on-disk compile-cache sizing can assert it never exceeds the contract-state
+/// budget it accelerates at ANY host size.
+#[cfg(test)]
+pub(crate) use cache::budget_for_ram as hosting_budget_for_ram;
 /// Re-exported as the single source of truth for the default hosting storage
 /// budget. `config::default_max_hosting_storage()` resolves to this function so
 /// the operator-facing default and the in-code fallback can never drift. The
 /// default is RAM-scaled (capability-relative, A2) rather than a flat constant.
 pub(crate) use cache::default_hosting_budget_bytes;
 pub use cache::{AccessType, EvictedInUseTeardown, RecordAccessResult};
+/// Cost-pressure eviction inputs + day-one calibration constants (cost-aware
+/// eviction, #4861). Re-exported so `Ring` (which reads the topology meter)
+/// can build the per-axis snapshots the sweep consumes; the policy constants
+/// and the shared axis assembly live beside the decision in `cache.rs`.
+pub(crate) use cache::{COST_RATE_MIN_WINDOW, CostAxisPressure, build_cost_axes};
 /// Aggregate disk-budget sizing defaults + pure clamp math (#4683). Re-exported
 /// so `config` can resolve the persisted `hosting-disk-pct` / `max-hosting-disk`
 /// defaults and `ring`/`HostingManager` can size the eviction floor.
-pub(crate) use cache::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES};
-use cache::{HostingCache, HostingCacheStats, disk_budget_for_clamped};
+pub(crate) use cache::{
+    DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE,
+};
+/// Widths of the two hosted-set demand-signal histograms exported on the router
+/// snapshot. Re-exported so `router` can size the wire arrays from the single
+/// definition next to the bucketing code.
+pub(crate) use cache::{GENUINE_ACCESS_RECENCY_BUCKETS, READ_COUNT_HIST_BUCKETS};
+use cache::{HostingCache, HostingCacheStats, ReasonRow};
+// Re-exported (not just used internally) so the wasmtime disk-cache sizing
+// tests (#5328 review) can verify headroom against the SAME aggregate
+// hosting-disk budget function this module uses, rather than duplicating its
+// math.
+pub(crate) use cache::disk_budget_for_clamped;
 use dashmap::{DashMap, DashSet};
 use demand::ProximityPrior;
 use disk_usage::DiskUsageTracker;
 pub(crate) use disk_usage::{DiskBudgetExceeded, DiskUsageStats};
+// #5014: the wasmtime on-disk compile-cache startup sizing needs the same
+// mount-availability probe and directory walk this module already uses for
+// the aggregate disk budget, re-exported one level further in `ring.rs`.
+pub(crate) use disk_usage::{
+    available_bytes as disk_available_bytes, du_walk as disk_directory_size_bytes,
+};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
+
+use crate::tracing::event_kind::{STATE_SIZE_BUCKET_COUNT, state_size_bucket};
+
+/// Current cost-eviction eligibility by state-size bucket. Class order is
+/// `[eligible_zero_demand, subscribed, recent_unsubscribed]`.
+pub(crate) struct CostEligibilityStats {
+    pub counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    pub bytes: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    /// Per cost axis × state-size bucket maxima for every attributed contract.
+    pub max_attributed_rate: [[f64; STATE_SIZE_BUCKET_COUNT]; 3],
+    /// Same maxima restricted to cost-eviction-eligible zero-demand contracts.
+    pub max_eligible_rate: [[f64; STATE_SIZE_BUCKET_COUNT]; 3],
+}
 use tracing::{debug, info};
 
 use super::Location;
@@ -177,6 +222,189 @@ pub(crate) enum PhantomRepair {
     /// Repair attempts exhausted AND the phantom is older than
     /// `PHANTOM_ABSOLUTE_MAX_AGE` — drop the stale downstream registration.
     Drop(ContractKey),
+}
+
+/// Why this node is holding a contract it hosts, RIGHT NOW.
+///
+/// Not to be confused with `HostingCause` (`hosting/cache.rs`), which is the
+/// other half of the same question and answers a different tense: `HostingCause`
+/// is provenance AT ADMISSION, counted once at the branch that begins hosting
+/// and never revised (`host_begin` in `router.rs`), while `HostingReason` is
+/// current DEMAND, re-derived from live subscription state on every collection.
+/// A contract admitted as `TransitGet` becomes `LocalClient` the moment a local
+/// client subscribes; its `HostingCause` stays `TransitGet` forever. The two
+/// deliberately overlap in one place only — [`HostingReason::Restored`] reads
+/// the same "reloaded at startup" provenance `HostingCause::StartupRestore`
+/// counts, because a restored contract genuinely has no current demand signal
+/// to classify by.
+///
+/// This is a PARTITION, not a set of flags: the classifier in
+/// [`HostingManager::hosted_by_reason`] evaluates the variants in declaration
+/// order and assigns each hosted contract to the FIRST one that matches, so
+/// the per-reason counts sum to the hosting-cache size and the per-reason
+/// bytes sum to its used bytes. That is the whole point — the underlying
+/// signals overlap (a contract can be locally accessed AND have downstream
+/// subscribers), and an overlapping breakdown makes `sum by (reason)` lie.
+///
+/// Ordering is strongest-claim-first: a reason further down the list only
+/// applies when every reason above it is absent. `LocalClient` outranks
+/// `Downstream` for the same reason eviction does (`local_and_downstream_counts`
+/// — this node's own user beats forwarded demand), and everything outranks
+/// `Routed`, which is the residual "no demand signal at all" bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostingReason {
+    /// A local client (WebSocket/HTTP) holds a subscription. This node's own
+    /// user wants the contract.
+    LocalClient,
+    /// A downstream peer subscribes to us for this contract — we are a relay
+    /// in someone else's update mesh.
+    Downstream,
+    /// We hold an unexpired network subscription but nothing local or
+    /// downstream reads it: hosted on the network's behalf.
+    Subscribed,
+    /// No subscription of any kind, but a local client GET/PUT touched it
+    /// RECENTLY (within `SUBSCRIPTION_LEASE_DURATION`). The read-only /
+    /// PUT-only local-demand class (River UI containers and friends).
+    ///
+    /// Gated on recency, not on the sticky `local_client_access` flag, which is
+    /// set once and never cleared: classifying on the flag would make this
+    /// bucket monotonically absorb every contract a client ever touched over a
+    /// node's uptime, and would disagree with the hosting policy — which
+    /// consults `has_recent_local_client_access` (see `cache.rs`'s
+    /// `local_client_access_age_gate_expires` for a test of the divergence).
+    ///
+    /// Reading this post-restart: `load_persisted_entry_with_demand` stamps
+    /// `local_client_last_access = Some(now)` for every entry persisted with
+    /// `local_client_access`, so for one `SUBSCRIPTION_LEASE_DURATION` after
+    /// boot this bucket holds that whole cohort without any access having
+    /// happened this run, and `restored` correspondingly under-reports. The
+    /// partition stays sound and this agrees with the policy signal, but a
+    /// spike here just after a restart is reloaded state rather than live
+    /// client demand.
+    LocalAccess,
+    /// Was in use and no longer is (`abandoned_at`) — the eviction candidate
+    /// pool. Distinguished from `Routed` because a rising `abandoned` count is
+    /// churn, while a rising `routed` count is ordinary transit caching.
+    Abandoned,
+    /// Reloaded from persisted hosting metadata at startup and not read since
+    /// (`!seeded_this_run && read_count == 0`), the
+    /// `HostingCause::StartupRestore` cohort viewed from the demand side.
+    ///
+    /// Both halves are load-bearing. `seeded_this_run` is written at exactly
+    /// two sites — the not-cached insert branch of `record_access` (true) and
+    /// `load_persisted_entry_with_demand` (false) — and never by the
+    /// existing-entry refresh branch. Classifying on it alone would make this
+    /// bucket permanent for the process lifetime: since every node restarts,
+    /// `restored` would absorb the whole persisted hosted set while `routed`
+    /// only ever counted contracts admitted since boot, so live transit demand
+    /// would read fleet-wide as bulk reload. `read_count` IS reset by the
+    /// reload, so it supplies the "since" the name claims.
+    ///
+    /// Residual, deliberately left: `read_count` counts GET/SUBSCRIBE only, so
+    /// a reloaded contract that is exclusively written to — a routed PUT with
+    /// no subscriber and no local client — stays here. That is a far narrower
+    /// case than the one above (which caught every restored contract serving
+    /// any traffic at all), and the obvious write-side twin is not usable:
+    /// `write_generation` is assigned from a caller-supplied snapshot on every
+    /// refresh rather than counted, so `== 0` does not mean "unwritten".
+    ///
+    /// Separate from `Routed` because the restore path resets `abandoned_at`
+    /// to `None` (`cache.rs::load_persisted_entry_with_demand`): without this
+    /// bucket a restart silently empties `abandoned` into `routed`, and every
+    /// restored contract would be reported as having "arrived through a routed
+    /// GET/PUT", which is false. A bulk reload must not read as live demand.
+    Restored,
+    /// Residual: arrived through a routed GET/PUT and never acquired any
+    /// demand signal.
+    Routed,
+}
+
+impl HostingReason {
+    /// Every variant, in classifier (and export) order.
+    pub const ALL: [HostingReason; 7] = [
+        HostingReason::LocalClient,
+        HostingReason::Downstream,
+        HostingReason::Subscribed,
+        HostingReason::LocalAccess,
+        HostingReason::Abandoned,
+        HostingReason::Restored,
+        HostingReason::Routed,
+    ];
+
+    /// Index into [`HostingReasonStats`]'s per-reason arrays.
+    ///
+    /// An exhaustive match rather than `self as usize`, because those arrays
+    /// are sized by [`Self::ALL`] and `ALL` is hand-maintained. A new variant
+    /// that nobody adds to `ALL` would leave the arrays one short while
+    /// `self as usize` cheerfully produced the out-of-range index — and that
+    /// index is read inside an OTel observable callback, where a panic kills
+    /// the `PeriodicReader` thread and silently stops EVERY metric for the
+    /// process lifetime. The compiler stops you here instead.
+    ///
+    /// **If you are adding a variant: add it to [`Self::ALL`] as well.** The
+    /// const assertion below catches an `ALL` that is out of order or has a
+    /// duplicate, but it cannot see a variant that was never listed.
+    const fn index(self) -> usize {
+        match self {
+            HostingReason::LocalClient => 0,
+            HostingReason::Downstream => 1,
+            HostingReason::Subscribed => 2,
+            HostingReason::LocalAccess => 3,
+            HostingReason::Abandoned => 4,
+            HostingReason::Restored => 5,
+            HostingReason::Routed => 6,
+        }
+    }
+
+    /// Stable attribute value. These strings are a metrics contract — a
+    /// collector-side dashboard filters on them, so renaming one silently
+    /// empties a panel. Add variants rather than repurposing these.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HostingReason::LocalClient => "local_client",
+            HostingReason::Downstream => "downstream",
+            HostingReason::Subscribed => "subscribed",
+            HostingReason::LocalAccess => "local_access",
+            HostingReason::Abandoned => "abandoned",
+            HostingReason::Restored => "restored",
+            HostingReason::Routed => "routed",
+        }
+    }
+}
+
+/// `ALL` must be in index order, complete, and free of duplicates — every
+/// element of the per-reason arrays is addressed through it.
+const _: () = {
+    let mut i = 0;
+    while i < HostingReason::ALL.len() {
+        assert!(
+            HostingReason::ALL[i].index() == i,
+            "HostingReason::ALL must list every variant exactly once, in index order"
+        );
+        i += 1;
+    }
+};
+
+/// Hosted-contract count and state bytes per [`HostingReason`], indexed by
+/// [`HostingReason::index`]. Both arrays partition the hosting cache (see
+/// [`HostingReason`]), so `counts.iter().sum()` is the hosted-contract count
+/// and `bytes.iter().sum()` is the cache's used bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostingReasonStats {
+    counts: [u64; HostingReason::ALL.len()],
+    bytes: [u64; HostingReason::ALL.len()],
+}
+
+impl HostingReasonStats {
+    /// Contracts held for `reason`.
+    pub fn count(&self, reason: HostingReason) -> u64 {
+        self.counts[reason.index()]
+    }
+
+    /// Contract state bytes held for `reason`.
+    pub fn bytes(&self, reason: HostingReason) -> u64 {
+        self.bytes[reason.index()]
+    }
 }
 
 /// Result of adding a client subscription.
@@ -347,6 +575,15 @@ pub(crate) struct HostingManager {
     /// `serves / (serves + forwards)`. Monotonic per-node scalars.
     local_get_serves: AtomicU64,
     local_get_forwards: AtomicU64,
+    /// Local `UpdateNotification` delivery outcomes (#4681). PER-NODE, not
+    /// process-global: the simulation harness runs many nodes as tasks inside
+    /// ONE process, so a `static` counter here would report the aggregate
+    /// across every simulated node and silently defeat the per-node rate signal
+    /// these exist to give — in exactly the environment this class of bug is
+    /// diagnosed in.
+    notifications_dropped_channel_full: AtomicU64,
+    notifications_dropped_channel_closed: AtomicU64,
+    notifications_no_local_subscriber: AtomicU64,
 
     /// Downstream peers subscribed to contracts we host, with lease timestamps.
     /// Drives `should_unsubscribe_upstream()` decisions.
@@ -473,6 +710,15 @@ pub(crate) struct HostingManager {
     /// installs a real value (the tracker is also unseeded before then, so the
     /// gate is a no-op regardless).
     disk_budget_bytes: AtomicU64,
+
+    /// Default share of genuine LIVE host-wide surplus memory the
+    /// resident-overhead budget is willing to claim by default (#5333) —
+    /// the RAM-axis analogue of `disk_pct_bits` above. Defaults to
+    /// [`cache::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE`]; overridden from config
+    /// at startup via [`Self::configure_resident_overhead_mem_share`]. Stored
+    /// as bits so it lives in an `AtomicU64` (the recompute reads it off the
+    /// sweep task without a lock).
+    resident_overhead_mem_share_bits: AtomicU64,
 }
 
 impl HostingManager {
@@ -501,6 +747,9 @@ impl HostingManager {
             own_location: RwLock::new(None),
             local_get_serves: AtomicU64::new(0),
             local_get_forwards: AtomicU64::new(0),
+            notifications_dropped_channel_full: AtomicU64::new(0),
+            notifications_dropped_channel_closed: AtomicU64::new(0),
+            notifications_no_local_subscriber: AtomicU64::new(0),
             downstream_subscribers: DashMap::new(),
             time_source,
             pending_subscription_requests: DashSet::new(),
@@ -517,6 +766,9 @@ impl HostingManager {
             disk_pct_bits: AtomicU64::new(DEFAULT_HOSTING_DISK_PCT.to_bits()),
             max_hosting_disk_bytes: AtomicU64::new(DEFAULT_MAX_HOSTING_DISK_BYTES),
             disk_budget_bytes: AtomicU64::new(u64::MAX),
+            resident_overhead_mem_share_bits: AtomicU64::new(
+                DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE.to_bits(),
+            ),
         }
     }
 
@@ -648,6 +900,75 @@ impl HostingManager {
         // OUTSIDE any lock before this call.
         self.hosting_cache.write().set_budget_bytes(effective);
         Some(effective)
+    }
+
+    /// Install the operator-configured resident-overhead sizing knob (#5333):
+    /// the default share of genuine live host-wide surplus memory the
+    /// resident-overhead budget is willing to claim, mirroring
+    /// [`Self::configure_disk_budget`] for the disk axis. Called once at
+    /// startup (the config is only reachable there). If never called, the
+    /// default set in the ctor applies.
+    pub(crate) fn configure_resident_overhead_mem_share(&self, mem_share: f64) {
+        self.resident_overhead_mem_share_bits
+            .store(mem_share.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Recompute the resident-overhead hosting budget from LIVE memory
+    /// signals and install it via
+    /// [`HostingCache::set_resident_overhead_budget_bytes`] (#5333). Run on
+    /// the SAME 60s sweep as [`Self::recompute_effective_budget`], mirroring
+    /// its shape: the (cheap — a couple of `/proc` reads, no directory walk)
+    /// signal sampling happens here, and only the O(1)
+    /// `set_resident_overhead_budget_bytes` touches the cache lock.
+    ///
+    /// `total_ram`/`pool_size`/`live_signals` are injected as parameters —
+    /// same determinism seam [`Self::recompute_effective_budget`] uses for
+    /// `available` — so tests can drive this without depending on the test
+    /// host's real RAM, core count, or `/proc` contents.
+    ///
+    /// Returns the budget it installed (for telemetry/tests).
+    pub(crate) fn recompute_resident_overhead_budget(
+        &self,
+        total_ram: u64,
+        pool_size: usize,
+        live_signals: Option<(u64, u64)>,
+    ) -> u64 {
+        let mem_share = f64::from_bits(
+            self.resident_overhead_mem_share_bits
+                .load(Ordering::Relaxed),
+        );
+        // #5333 review (skeptical lens, Blocker 2): `own_rss` as read by
+        // `read_own_rss_bytes()` is the WHOLE process's resident memory,
+        // which already includes the very hosting overhead this budget is
+        // meant to bound (`estimated_resident_overhead_bytes()`, the `C` the
+        // eviction predicate compares against). Passing it through
+        // unadjusted made the live-surplus term self-referential: as C grows
+        // by hosting one more contract, `own_rss` grows by (approximately,
+        // per the same 1 MiB/contract calibration) the SAME amount, so the
+        // budget `own_rss + mem_share*available` grows in lockstep with the
+        // cost it is supposed to cap — the axis could never actually bind on
+        // an unconstrained host. Strip `C` out here, before the live signal
+        // reaches the pure formula, so `own_rss` reflects only the process's
+        // NON-hosting-attributable resident memory (base runtime, transport
+        // buffers, other caches) — the genuine "never shrink below this"
+        // floor the mechanism intends, without cancelling out the growth
+        // it's meant to detect.
+        let current_estimated_overhead = self
+            .hosting_cache
+            .read()
+            .estimated_resident_overhead_bytes();
+        let live_signals = live_signals.map(|(own_rss, available)| {
+            (
+                own_rss.saturating_sub(current_estimated_overhead),
+                available,
+            )
+        });
+        let budget =
+            cache::resident_overhead_budget_for(total_ram, pool_size, live_signals, mem_share);
+        self.hosting_cache
+            .write()
+            .set_resident_overhead_budget_bytes(budget);
+        budget
     }
 
     /// Pre-write admission gate for a state write (#4683, live since #4702): reject the write
@@ -860,6 +1181,92 @@ impl HostingManager {
             return None;
         }
         Some(tracker.stats())
+    }
+
+    /// Count and state bytes of hosted contracts, partitioned by WHY each one
+    /// is held (see [`HostingReason`]). Fixed cardinality — seven buckets, no
+    /// contract identity survives the walk — so it is safe to export as
+    /// metric attributes.
+    ///
+    /// One O(hosted) pass under the hosting-cache read lock. The subscription
+    /// lookups inside the closure read only the `client_subscriptions` /
+    /// `downstream_subscribers` / `active_subscriptions` DashMaps, never the
+    /// hosting cache, so there is no re-lock — the same discipline
+    /// [`Self::cost_eligibility_stats`] relies on.
+    pub(crate) fn hosted_by_reason(&self) -> HostingReasonStats {
+        let mut stats = HostingReasonStats::default();
+        self.hosting_cache.read().for_each_reason_row(|row| {
+            let ReasonRow {
+                key,
+                size_bytes,
+                recent_local_client_access,
+                abandoned,
+                seeded_this_run,
+                read_count,
+            } = row;
+            let (local, downstream) = self.local_and_downstream_counts(key);
+            let reason = if local > 0 {
+                HostingReason::LocalClient
+            } else if downstream > 0 {
+                HostingReason::Downstream
+            } else if self.is_subscribed(key) {
+                HostingReason::Subscribed
+            } else if recent_local_client_access {
+                HostingReason::LocalAccess
+            } else if abandoned {
+                HostingReason::Abandoned
+            } else if !seeded_this_run && read_count == 0 {
+                HostingReason::Restored
+            } else {
+                HostingReason::Routed
+            };
+            let bucket = reason.index();
+            stats.counts[bucket] = stats.counts[bucket].saturating_add(1);
+            stats.bytes[bucket] = stats.bytes[bucket].saturating_add(size_bytes);
+        });
+        stats
+    }
+
+    pub(crate) fn cost_eligibility_stats(
+        &self,
+        cost_axes: &[CostAxisPressure],
+    ) -> CostEligibilityStats {
+        let mut counts = [[0u64; STATE_SIZE_BUCKET_COUNT]; 3];
+        let mut bytes = [[0u64; STATE_SIZE_BUCKET_COUNT]; 3];
+        let mut max_attributed_rate = [[0.0f64; STATE_SIZE_BUCKET_COUNT]; 3];
+        let mut max_eligible_rate = [[0.0f64; STATE_SIZE_BUCKET_COUNT]; 3];
+        self.hosting_cache
+            .read()
+            .for_each_cost_eligibility_row(|key, size, recently_accessed| {
+                let (local, downstream) = self.local_and_downstream_counts(key);
+                let class = if local + downstream > 0 {
+                    1
+                } else if recently_accessed {
+                    2
+                } else {
+                    0
+                };
+                let bucket = state_size_bucket(size);
+                counts[class][bucket] = counts[class][bucket].saturating_add(1);
+                bytes[class][bucket] = bytes[class][bucket].saturating_add(size);
+                for (axis_index, axis) in cost_axes.iter().take(3).enumerate() {
+                    let rate = axis.rates.get(key.id()).copied().unwrap_or(0.0);
+                    if rate.is_finite() && rate > 0.0 {
+                        max_attributed_rate[axis_index][bucket] =
+                            max_attributed_rate[axis_index][bucket].max(rate);
+                        if class == 0 {
+                            max_eligible_rate[axis_index][bucket] =
+                                max_eligible_rate[axis_index][bucket].max(rate);
+                        }
+                    }
+                }
+            });
+        CostEligibilityStats {
+            counts,
+            bytes,
+            max_attributed_rate,
+            max_eligible_rate,
+        }
     }
 
     /// Test-only: install a disk tracker on nonexistent paths (so the du-walks
@@ -1546,6 +1953,32 @@ impl HostingManager {
         self.has_client_subscriptions(contract.id()) || self.has_downstream_subscribers(contract)
     }
 
+    /// The instance ids of every contract [`contract_in_use`](Self::contract_in_use)
+    /// currently holds true for, i.e. the exact same two demand sources that
+    /// method counts.
+    ///
+    /// Exists because the compiled-module cache is keyed by CODE hash rather
+    /// than by contract instance (#5268), so its interest predicate has to ask
+    /// "is ANY in-use contract running this code?" — a question no per-key
+    /// lookup can answer. Enumerating the (small) in-use set and mapping it
+    /// through the contract store's instance index is far cheaper than scanning
+    /// the whole index. See `RuntimePool`'s `InUseCodeHashes`.
+    pub(crate) fn in_use_contract_ids(&self) -> Vec<ContractInstanceId> {
+        let mut ids: Vec<ContractInstanceId> = self
+            .client_subscriptions
+            .iter()
+            .filter(|entry| !entry.value().is_empty())
+            .map(|entry| *entry.key())
+            .collect();
+        ids.extend(
+            self.downstream_subscribers
+                .iter()
+                .filter(|entry| !entry.value().is_empty())
+                .map(|entry| *entry.key().id()),
+        );
+        ids
+    }
+
     /// The SPLIT genuine-demand counts pinning `contract`:
     /// `(local_client_subscriptions, downstream_subscribers)`. This is the
     /// subscriber-primary eviction key (#4642, Ian's confirmed ordering): the
@@ -1931,6 +2364,44 @@ impl HostingManager {
         self.local_get_serves.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a local `UpdateNotification` dropped by a FULL subscriber channel
+    /// (#4681). The subscriber's cached summary is invalidated at the same
+    /// time, so the next update resyncs it with full state; a sustained nonzero
+    /// rate means a client is not draining fast enough.
+    pub(crate) fn record_notification_dropped_channel_full(&self) {
+        self.notifications_dropped_channel_full
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a local `UpdateNotification` dropped by a CLOSED subscriber
+    /// channel (#4681). The subscriber is unregistered at that point.
+    pub(crate) fn record_notification_dropped_channel_closed(&self) {
+        self.notifications_dropped_channel_closed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a committed update that found NO local subscriber (#4681/#5040).
+    /// Normal for contracts hosted on the network's behalf; counted because
+    /// logging it per occurrence produced 22k lines/day and its `debug!` is
+    /// compiled out of release builds.
+    pub(crate) fn record_notification_no_local_subscriber(&self) {
+        self.notifications_no_local_subscriber
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(dropped_channel_full, dropped_channel_closed, no_local_subscriber)`
+    /// for this node.
+    pub(crate) fn notification_delivery_counts(&self) -> (u64, u64, u64) {
+        (
+            self.notifications_dropped_channel_full
+                .load(Ordering::Relaxed),
+            self.notifications_dropped_channel_closed
+                .load(Ordering::Relaxed),
+            self.notifications_no_local_subscriber
+                .load(Ordering::Relaxed),
+        )
+    }
+
     /// Record that a local-client GET was routed to the network (a miss/forward).
     /// Counterpart to [`record_local_get_serve`](Self::record_local_get_serve).
     pub(crate) fn record_local_get_forward(&self) {
@@ -1977,11 +2448,16 @@ impl HostingManager {
     ///
     /// Automatically persists hosting metadata for the accessed contract and
     /// removes persisted metadata for evicted contracts.
+    ///
+    /// `cause` is the hosting ATTRIBUTION (see [`HostingCause`]); it is passed
+    /// straight through to the cache, which counts it only if this access
+    /// actually begins hosting. It influences nothing else.
     pub fn record_contract_access(
         &self,
         key: ContractKey,
         size_bytes: u64,
         access_type: AccessType,
+        cause: HostingCause,
     ) -> RecordAccessResult {
         // `contract_in_use` reads only the client_subscriptions /
         // downstream_subscribers / active_subscriptions DashMaps — never
@@ -2009,6 +2485,7 @@ impl HostingManager {
             access_type,
             current_generation,
             predicted_demand,
+            cause,
             |k: &ContractKey| self.local_and_downstream_counts(k),
         );
 
@@ -2178,6 +2655,49 @@ impl HostingManager {
         true
     }
 
+    /// Async existence probe for the ResyncResponse responder (#4864 round-5 P1).
+    /// The sync [`Self::contract_state_present`] only has a redb fast-path, so on
+    /// a SQLite build (`--no-default-features --features sqlite`) it returns
+    /// `true` for every key — reopening the responder limiter-map key-flood hole
+    /// there. This async variant keeps the redb SYNC fast-path (a cheap point
+    /// lookup, no `.await`) and adds a REAL SQLite existence probe via the async
+    /// `get_state_size` (`SELECT LENGTH(state) … WHERE contract = ?`), so a bogus
+    /// key is rejected before it can consume a limiter slot on EITHER backend.
+    /// Conservative on error / no-storage: returns `true` (assume present) so a
+    /// genuinely-hosted contract is never wrongly refused a resync response.
+    pub(crate) async fn contract_state_present_async(&self, key: &ContractKey) -> bool {
+        #[cfg(feature = "redb")]
+        {
+            // redb: the synchronous point lookup is already cheap — no await.
+            self.contract_state_present(key)
+        }
+        #[cfg(all(feature = "sqlite", not(feature = "redb")))]
+        {
+            // Clone the pool handle out of the (sync parking_lot) guard so the
+            // `.await` below never holds a lock across an await point.
+            let storage = self.storage.read().as_ref().cloned();
+            match storage {
+                Some(storage) => match storage.get_state_size(key).await {
+                    Ok(size) => size.is_some(),
+                    Err(e) => {
+                        tracing::debug!(
+                            contract = %key,
+                            error = %e,
+                            "sqlite state-presence check failed; assuming present"
+                        );
+                        true
+                    }
+                },
+                None => true,
+            }
+        }
+        #[cfg(not(any(feature = "redb", feature = "sqlite")))]
+        {
+            let _ = key;
+            true
+        }
+    }
+
     /// The composed #4610 gate: summarize / broadcast a contract's state ONLY
     /// when we host or actively serve it AND we actually hold its state:
     /// `(is_hosting_contract || contract_in_use) && contract_state_present`.
@@ -2228,6 +2748,12 @@ impl HostingManager {
         self.hosting_cache.read().budget_bytes()
     }
 
+    /// Get the installed resident-overhead (count-derived) budget (#5333).
+    #[cfg(test)]
+    pub(crate) fn resident_overhead_budget_bytes(&self) -> u64 {
+        self.hosting_cache.read().resident_overhead_budget_bytes()
+    }
+
     /// Snapshot the hosting cache's aggregate resource gauges (budget, current
     /// bytes, contract count, budget-triggered eviction count) under a single
     /// read lock, for the per-node `RouterSnapshot` telemetry (A2).
@@ -2235,11 +2761,14 @@ impl HostingManager {
         self.hosting_cache.read().stats()
     }
 
-    /// Per-contract Greedy-Dual eviction rows for the local-peer dashboard,
-    /// in eviction order (next victim first). Reads the canonical hosting
-    /// cache under a single lock — this is piece A's live demand-driven
-    /// retention state (#4642), the mechanism that replaced the dormant MAD
-    /// governance detector. See [`HostingContractScore`].
+    /// Per-contract eviction rows for the local-peer dashboard, in the
+    /// cache-side eviction order (ascending `recency_seq`, then key). Reads
+    /// the canonical hosting cache under a single lock.
+    ///
+    /// That order is only the ordering WITHIN the zero-subscriber tier:
+    /// `cache::victim_order` ranks local-subscription and downstream-subscriber
+    /// counts above recency, and those are computed during the sweep rather
+    /// than carried on the row. See [`HostingContractScore`].
     pub(crate) fn dashboard_hosting_scores(&self) -> Vec<HostingContractScore> {
         self.hosting_cache.read().eviction_ordered_scores()
     }
@@ -2417,14 +2946,51 @@ impl HostingManager {
     /// guard can detect a re-host race — plus, for any still-in-use victim shed
     /// as a last resort, the subscription state torn down so the caller can sync
     /// the `InterestManager` (PR #4734 Fix 1).
+    // No-axes convenience wrapper (the pure byte sweep). Production always
+    // goes through `Ring::sweep_expired_hosting`, which supplies the cost
+    // axes to `sweep_expired_hosting_with_cost`; this wrapper is retained for
+    // tests exercising the no-cost degradation path.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn sweep_expired_hosting(&self) -> HostingSweepResult {
+        self.sweep_expired_hosting_with_cost(&[])
+    }
+
+    /// [`Self::sweep_expired_hosting`] plus the cost-pressure decision
+    /// (cost-aware eviction, #4861): after the byte-budget sweep, shed
+    /// zero-demand contracts whose attributed update-work cost dominates the
+    /// node's total on a cost axis — even while UNDER the byte budget. The
+    /// caller (`Ring::sweep_expired_hosting`) builds `cost_axes` from the
+    /// topology meter; an empty slice degrades to the pure byte sweep. Both
+    /// phases run under ONE hosting-cache write guard so the combined
+    /// decision is atomic against concurrent accesses; cost victims flow
+    /// through the same teardown / metadata-cleanup / reclaim funnel as byte
+    /// victims (their `was_in_use` is `false` by construction, so the in-use
+    /// teardown is a no-op for them).
+    pub fn sweep_expired_hosting_with_cost(
+        &self,
+        cost_axes: &[cache::CostAxisPressure],
+    ) -> HostingSweepResult {
         // AtCapacity: the Overflow op-backstop-pierce trigger is intentionally
         // unwired in production (see cache::MemoryPressure). AtCapacity itself
         // CAN now shed a subscribed contract as a last resort — see below.
-        let evicted = self.hosting_cache.write().sweep_expired(
-            |key| self.local_and_downstream_counts(key),
-            cache::MemoryPressure::AtCapacity,
-        );
+        //
+        // `local_and_downstream_counts` reads only the subscription DashMaps —
+        // never `hosting_cache` — so calling it from inside the write guard
+        // does not re-enter the lock (same pattern as `record_contract_access`).
+        let evicted = {
+            let mut cache_guard = self.hosting_cache.write();
+            let mut evicted = cache_guard.sweep_expired(
+                |key| self.local_and_downstream_counts(key),
+                cache::MemoryPressure::AtCapacity,
+            );
+            if !cost_axes.is_empty() {
+                evicted.extend(cache_guard.evict_cost_pressure(
+                    &|key: &ContractKey| self.local_and_downstream_counts(key),
+                    cost_axes,
+                ));
+            }
+            evicted
+        };
 
         // Tear down subscription state for any still-in-use victim BEFORE the
         // caller reclaims it, so `contract_in_use` is false when the reclaim gate
@@ -2792,7 +3358,20 @@ impl HostingManager {
                 instance_id_bytes.copy_from_slice(&key_bytes);
                 loaded_instance_ids.insert(instance_id_bytes);
                 let instance_id = ContractInstanceId::new(instance_id_bytes);
-                let code_hash = CodeHash::new(metadata.code_hash);
+                // #4978: prefer the contract store's instance->code row over the
+                // hash persisted in this row. The persisted hash is whatever key
+                // reached `StateStorage::store`, and a pre-fix binary could put a
+                // WRONG one there: local-mode UPDATE wrote the client's key
+                // verbatim, so `fdev update`'s all-zero placeholder landed here.
+                // Restoring that gives a hosting-cache key whose code half is
+                // zeros, and `ContractStore::remove_contract` derives the blob
+                // path from `key.code_hash()` — so eviction never reclaims the
+                // real `.wasm` and the row stays wrong across every subsequent
+                // restart. Resolving here repairs that corpus in place; the
+                // persisted hash remains the fallback for an instance the
+                // contract store has no row for.
+                let code_hash = code_hash_lookup(&instance_id)
+                    .unwrap_or_else(|| CodeHash::new(metadata.code_hash));
                 let key = ContractKey::from_id_and_code(instance_id, code_hash);
 
                 let access_type = match metadata.access_type {
@@ -2954,7 +3533,20 @@ impl HostingManager {
                 instance_id_bytes.copy_from_slice(&key_bytes);
                 loaded_instance_ids.insert(instance_id_bytes);
                 let instance_id = ContractInstanceId::new(instance_id_bytes);
-                let code_hash = CodeHash::new(metadata.code_hash);
+                // #4978: prefer the contract store's instance->code row over the
+                // hash persisted in this row. The persisted hash is whatever key
+                // reached `StateStorage::store`, and a pre-fix binary could put a
+                // WRONG one there: local-mode UPDATE wrote the client's key
+                // verbatim, so `fdev update`'s all-zero placeholder landed here.
+                // Restoring that gives a hosting-cache key whose code half is
+                // zeros, and `ContractStore::remove_contract` derives the blob
+                // path from `key.code_hash()` — so eviction never reclaims the
+                // real `.wasm` and the row stays wrong across every subsequent
+                // restart. Resolving here repairs that corpus in place; the
+                // persisted hash remains the fallback for an instance the
+                // contract store has no row for.
+                let code_hash = code_hash_lookup(&instance_id)
+                    .unwrap_or_else(|| CodeHash::new(metadata.code_hash));
                 let key = ContractKey::from_id_and_code(instance_id, code_hash);
 
                 let access_type = match metadata.access_type {
@@ -3109,6 +3701,59 @@ mod tests {
         )
     }
 
+    /// End-to-end through the PRODUCTION entry point (`record_contract_access`,
+    /// which `Ring::host_contract` delegates to): the caller's cause reaches the
+    /// exported stats, and only a real hosting BEGIN moves it.
+    ///
+    /// The manager layer is where the attribution could most plausibly be lost —
+    /// it re-shapes the result (teardown lists, demand training, metadata
+    /// persistence) between the caller and the cache. This asserts the pass-
+    /// through survives all of that.
+    ///
+    /// Mutation verified to FAIL: replacing the forwarded `cause` with a
+    /// constant, and deleting the increment in the cache's insert branch.
+    #[tokio::test]
+    async fn record_contract_access_reports_hosting_begins_by_cause() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let relayed = make_contract_key(1);
+        let fetched = make_contract_key(2);
+
+        manager.record_contract_access(relayed, 100, AccessType::Put, HostingCause::TransitPut);
+        // A repeat PUT of the same contract: recency refresh, NOT a new hosting
+        // decision — the counter must not move.
+        manager.record_contract_access(relayed, 100, AccessType::Put, HostingCause::TransitPut);
+        manager.record_contract_access(fetched, 100, AccessType::Get, HostingCause::SubOpGet);
+
+        let stats = manager.hosting_cache_stats();
+        assert_eq!(
+            stats.hosting_begins[HostingCause::TransitPut.index()],
+            1,
+            "two PUTs of one contract are ONE hosting begin; a 2 here means the \
+             counter fires on refresh and is really counting writes"
+        );
+        assert_eq!(
+            stats.hosting_begins[HostingCause::SubOpGet.index()],
+            1,
+            "a subscribe-fetch / auto-fetch travels the ordinary GET driver — \
+             this row is the only thing that separates it from a client GET"
+        );
+        assert_eq!(
+            stats.hosting_begins[HostingCause::ClientGet.index()],
+            0,
+            "no caller named ClientGet"
+        );
+        assert_eq!(
+            stats.hosting_begins[HostingCause::Other.index()],
+            0,
+            "a production path must never lose its attribution"
+        );
+        assert_eq!(
+            stats.hosting_begins.iter().sum::<u64>(),
+            stats.contract_count,
+            "with no evictions, begins and the hosted set agree"
+        );
+    }
+
     #[tokio::test]
     async fn test_subscribe_creates_new_subscription() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
@@ -3118,6 +3763,357 @@ mod tests {
 
         assert!(result.is_new);
         assert!(manager.is_subscribed(&contract));
+    }
+
+    /// THE cost-aware-eviction discriminator (#4861), at the manager level:
+    /// under cost pressure — with the byte budget nowhere near exceeded (the
+    /// exact shape of the production storm: a 121-byte zero-subscriber
+    /// contract holding ~58% of the gateway's broadcast capacity, never
+    /// evicted because the sweep was byte-gated) — the sweep sheds the
+    /// zero-subscriber cost offender, while a SUBSCRIBED contract holding an
+    /// equally dominant cost share is untouched. The victim flows through the
+    /// standard [`HostingSweepResult::expired`] funnel (the same list the
+    /// ring maintenance task feeds to `unregister_local_hosting` →
+    /// advertisement retraction and `reclaim_evicted_contract` → disk
+    /// reclamation), with no in-use teardown (cost victims are zero-demand by
+    /// construction). Removing the subscriber then flips the protection: the
+    /// same contract becomes evictable on the next cost sweep — proving the
+    /// gate is the subscriber, not the key.
+    #[tokio::test]
+    async fn cost_pressure_sweep_evicts_zero_subscriber_offender_not_subscribed() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let junk = make_contract_key(1);
+        let hot_subscribed = make_contract_key(2);
+        manager.record_contract_access(junk, 121, AccessType::Put, HostingCause::Other);
+        manager.record_contract_access(hot_subscribed, 121, AccessType::Put, HostingCause::Other);
+        manager.add_downstream_subscriber(&hot_subscribed, make_peer_key(10));
+        // Age the PUT-seed genuine-access stamps past the cost window: the
+        // storm has been running long past it with no genuine GET/PUT.
+        clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+
+        let axes = vec![CostAxisPressure {
+            axis: "exec_cpu_micros_per_sec",
+            total_rate: 100_000.0,
+            floor: cache::EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC,
+            rates: [(*junk.id(), 58_000.0), (*hot_subscribed.id(), 41_000.0)]
+                .into_iter()
+                .collect(),
+        }];
+
+        let result = manager.sweep_expired_hosting_with_cost(&axes);
+        let expired_keys: Vec<ContractKey> = result.expired.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            expired_keys,
+            vec![junk],
+            "the zero-subscriber cost offender is shed; the subscribed \
+             contract is protected by candidacy, not ranking"
+        );
+        assert!(
+            result.evicted_in_use_teardown.is_empty(),
+            "cost victims are zero-demand — nothing to tear down"
+        );
+        assert!(!manager.is_hosting_contract(&junk));
+        assert!(manager.is_hosting_contract(&hot_subscribed));
+
+        // Idempotent under unchanged pressure: the offender is gone, the
+        // subscribed contract stays protected.
+        let again = manager.sweep_expired_hosting_with_cost(&axes);
+        assert!(again.expired.is_empty());
+        assert!(manager.is_hosting_contract(&hot_subscribed));
+
+        // Protection follows the SUBSCRIBER: once the downstream subscriber
+        // leaves — and the termination grace window (the recency reset at
+        // subscription termination, invariant 3) has elapsed — the same
+        // high-cost contract becomes a candidate.
+        manager.remove_downstream_subscriber(&hot_subscribed, &make_peer_key(10));
+        clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let after_unsub = manager.sweep_expired_hosting_with_cost(&axes);
+        let after_keys: Vec<ContractKey> = after_unsub.expired.iter().map(|(k, _)| *k).collect();
+        assert_eq!(after_keys, vec![hot_subscribed]);
+        assert!(!manager.is_hosting_contract(&hot_subscribed));
+    }
+
+    /// STORM-FREQUENCY integration test (#4861): drive the REAL production
+    /// storm profile — 121-byte payload, ~58 co-host targets, sustained
+    /// ~0.62 dispatches/s (~36 per-peer sends/s) for 10 minutes — through the
+    /// ACTUAL `Meter` (production 100-sample window, real count-truncation),
+    /// the real `contract_cost_rates` read, the shared `build_cost_axes`
+    /// assembly, and the real sweep. This is the test the synthetic-axes
+    /// tests above cannot substitute for: it proves the metering itself
+    /// registers the storm (the reviewers' finding was that byte-denominated
+    /// fanout reads ~4 KB/s vs a 131 KB/s floor — 30x under — and the
+    /// 100-sample window truncated the rate further, so the trigger would
+    /// NEVER fire for the real profile).
+    ///
+    /// Asserts, in order:
+    /// 1. the byte axis alone indeed CANNOT see the storm (the bug);
+    /// 2. the message-count axis reads the storm's TRUE ~36/s despite the
+    ///    saturated 100-sample buffer (the window fix — the old
+    ///    min-window-clamped math reads ~19/s and this assertion fails);
+    /// 3. the storm contract IS shed through the real sweep;
+    /// 4. an equally-storming but recently-GET-read contract is NOT shed
+    ///    (recency-aware candidacy);
+    /// 5. a single large-state fan-out burst (5 MB × 30 targets, first report
+    ///    seconds before the sweep) is NOT shed (sustained-pressure gate), so
+    ///    one burst can never mass-evict a large-state contract;
+    /// 6. an OLD-first-sample contract whose only recent activity is a
+    ///    ~60-second flurry is NOT shed (#4903 review Fix 2 / BLOCKER: the
+    ///    continuity gap-reset restarts the activity run at the flurry, so its
+    ///    `activity_span` is only ~60s — a long-known contract's later burst
+    ///    can never masquerade as sustained).
+    #[tokio::test]
+    async fn storm_frequency_profile_crosses_cost_trigger_through_real_meter() {
+        use crate::topology::meter::{AttributionSource, Meter, ResourceType};
+
+        // --- the real meter, production window size (TopologyManager::new). ---
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let junk = make_contract_key(1);
+        let read_hot = make_contract_key(2);
+        let burst = make_contract_key(3);
+        let old_then_burst = make_contract_key(4);
+
+        // 10 minutes of storm: one fan-out dispatch every 1.6s to 58 targets
+        // of a 121-byte payload (the FX2j profile), for junk AND read_hot
+        // (read_hot proves protection comes from recency, not a smaller cost).
+        for i in 0..375u64 {
+            let at = t0 + Duration::from_millis(1600 * i);
+            for id in [junk.id(), read_hot.id()] {
+                meter.report(
+                    &AttributionSource::Contract(*id),
+                    ResourceType::BroadcastMessagesSent,
+                    58.0,
+                    at,
+                );
+                meter.report(
+                    &AttributionSource::Contract(*id),
+                    ResourceType::BroadcastFanoutCost,
+                    121.0 * 58.0,
+                    at,
+                );
+            }
+        }
+        let now = t0 + Duration::from_secs(600);
+        // ONE large-state fan-out burst just before the sweep: 5 MB × 30.
+        let burst_bytes = 5.0 * 1024.0 * 1024.0 * 30.0;
+        meter.report(
+            &AttributionSource::Contract(*burst.id()),
+            ResourceType::BroadcastMessagesSent,
+            30.0,
+            now - Duration::from_secs(1),
+        );
+        meter.report(
+            &AttributionSource::Contract(*burst.id()),
+            ResourceType::BroadcastFanoutCost,
+            burst_bytes,
+            now - Duration::from_secs(1),
+        );
+        // OLD-first-sample contract (#4903 review Fix 2 / BLOCKER): one sample
+        // 10 minutes before the sweep, then a ~60s flurry just before it (120
+        // samples at 0.5s cadence). The >max-gap silence between them restarts
+        // the activity run at the flurry, so its activity_span is ~60s — under
+        // the sustained bar.
+        meter.report(
+            &AttributionSource::Contract(*old_then_burst.id()),
+            ResourceType::BroadcastMessagesSent,
+            58.0,
+            t0,
+        );
+        for i in 0..120u64 {
+            meter.report(
+                &AttributionSource::Contract(*old_then_burst.id()),
+                ResourceType::BroadcastMessagesSent,
+                5.0,
+                t0 + Duration::from_secs(540) + Duration::from_millis(500 * i),
+            );
+        }
+
+        // --- the real reads + the shared axis assembly. ---
+        let cpu = meter.contract_cost_rates(
+            &ResourceType::ExecCpuMicros,
+            now,
+            cache::COST_RATE_MIN_WINDOW,
+        );
+        let fanout = meter.contract_cost_rates(
+            &ResourceType::BroadcastFanoutCost,
+            now,
+            cache::COST_RATE_MIN_WINDOW,
+        );
+        let msgs = meter.contract_cost_rates(
+            &ResourceType::BroadcastMessagesSent,
+            now,
+            cache::COST_RATE_MIN_WINDOW,
+        );
+
+        // (1) The byte axis alone cannot see the storm: the junk contract's
+        // byte rate is far below the byte floor (this is the production bug —
+        // ~4 KB/s vs 131 KB/s).
+        let junk_byte_rate = fanout.1.get(junk.id()).copied().unwrap_or(0.0);
+        assert!(
+            junk_byte_rate < cache::BROADCAST_FANOUT_PRESSURE_FLOOR_BYTES_PER_SEC / 20.0,
+            "precondition: the tiny-payload storm must be invisible to the \
+             byte axis (got {junk_byte_rate} B/s) — otherwise this test no \
+             longer reproduces the #4861 blind spot"
+        );
+        // (2) The message-count axis reads the TRUE sustained rate despite
+        // count-truncation: ~36/s. Under the pre-fix min-window-clamped math
+        // the saturated 100-sample buffer reads 100×58/300s ≈ 19/s and this
+        // fails.
+        let junk_msg_rate = msgs.1.get(junk.id()).copied().unwrap_or(0.0);
+        assert!(
+            junk_msg_rate > 30.0,
+            "saturated-buffer rate must reflect the true storm frequency \
+             (~36 msgs/s), got {junk_msg_rate}/s — the count-truncation \
+             under-read is back"
+        );
+        // The burst contract is in the TOTAL but excluded from candidacy
+        // (sustained gate: its recent samples span ~0s).
+        assert!(!msgs.1.contains_key(burst.id()));
+        assert!(!fanout.1.contains_key(burst.id()));
+        // (6) The old-first-sample flurry is ALSO excluded from candidacy: the
+        // gap-reset restarts its activity run at the flurry, so activity_span
+        // is ~60s. Under the pre-fix lifetime-first-sample-age gate (first
+        // report 10 min old — trivially "sustained") it would be a candidate
+        // here and this assertion fails.
+        assert!(
+            !msgs.1.contains_key(old_then_burst.id()),
+            "an old-first-sample contract's short flurry must not be a candidate \
+             (#4903 review Fix 2 / BLOCKER)"
+        );
+
+        let axes = cache::build_cost_axes(cpu, fanout, msgs);
+
+        // --- the real sweep over real hosted entries. ---
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        manager.record_contract_access(junk, 121, AccessType::Put, HostingCause::Other);
+        manager.record_contract_access(read_hot, 121, AccessType::Put, HostingCause::Other);
+        manager.record_contract_access(
+            burst,
+            5 * 1024 * 1024,
+            AccessType::Put,
+            HostingCause::Other,
+        );
+        manager.record_contract_access(old_then_burst, 121, AccessType::Put, HostingCause::Other);
+        // The storm has run long past the cost window with no genuine access…
+        clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        // …but read_hot was genuinely GET-read just now.
+        manager.record_contract_access(read_hot, 121, AccessType::Get, HostingCause::Other);
+
+        let result = manager.sweep_expired_hosting_with_cost(&axes);
+        let expired_keys: Vec<ContractKey> = result.expired.iter().map(|(k, _)| *k).collect();
+        // (3) the storm contract is shed; (4) the recently-read one is not;
+        // (5) the single-burst large-state contract is not.
+        assert_eq!(
+            expired_keys,
+            vec![junk],
+            "the sustained zero-demand storm contract must be the ONLY victim"
+        );
+        assert!(result.evicted_in_use_teardown.is_empty());
+        assert!(!manager.is_hosting_contract(&junk));
+        assert!(
+            manager.is_hosting_contract(&read_hot),
+            "an equally-storming but recently-read contract must survive"
+        );
+        assert!(
+            manager.is_hosting_contract(&burst),
+            "a single large fan-out burst must not mass-evict (sustained gate)"
+        );
+        assert!(
+            manager.is_hosting_contract(&old_then_burst),
+            "an old-first-sample contract's ~60s flurry must not evict it \
+             (#4903 review Fix 2: sustained = recent-sample SPAN, not lifetime \
+             first-sample age)"
+        );
+    }
+
+    /// #4903 review BLOCKER, end-to-end: a FAST-cadence (0.5s) zero-demand
+    /// storm — whose count-bounded sample buffer spans only ~50s, far under the
+    /// 150s sustained bar — is shed by the real sweep. Under the old
+    /// buffer-span sustained gate this exact storm (the fastest, worst profile)
+    /// was PERMANENTLY exempt from candidacy while still inflating the share
+    /// denominator; the continuity-tracked `activity_span` makes it a
+    /// candidate, so the sweep sheds it.
+    #[tokio::test]
+    async fn fast_cadence_storm_is_shed_through_real_sweep() {
+        use crate::topology::meter::{AttributionSource, Meter, ResourceType};
+
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let fast_junk = make_contract_key(1);
+
+        // 400s of storm at 0.5s cadence (800 dispatches): the 100-sample buffer
+        // retains only the last ~50s of it — the old gate's fatal blind spot.
+        for i in 0..800u64 {
+            meter.report(
+                &AttributionSource::Contract(*fast_junk.id()),
+                ResourceType::BroadcastMessagesSent,
+                58.0,
+                t0 + Duration::from_millis(500 * i),
+            );
+        }
+        let now = t0 + Duration::from_millis(500 * 799) + Duration::from_secs(1);
+
+        let msgs = meter.contract_cost_rates(
+            &ResourceType::BroadcastMessagesSent,
+            now,
+            cache::COST_RATE_MIN_WINDOW,
+        );
+        assert!(
+            msgs.1.contains_key(fast_junk.id()),
+            "the 0.5s-cadence storm must be a candidate (activity_span, not the \
+             ~50s buffer span, decides sustained-ness)"
+        );
+        let cpu = meter.contract_cost_rates(
+            &ResourceType::ExecCpuMicros,
+            now,
+            cache::COST_RATE_MIN_WINDOW,
+        );
+        let fanout = meter.contract_cost_rates(
+            &ResourceType::BroadcastFanoutCost,
+            now,
+            cache::COST_RATE_MIN_WINDOW,
+        );
+        let axes = cache::build_cost_axes(cpu, fanout, msgs);
+
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        manager.record_contract_access(fast_junk, 121, AccessType::Put, HostingCause::Other);
+        // Long past the cost window with no genuine access.
+        clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+
+        let result = manager.sweep_expired_hosting_with_cost(&axes);
+        let expired_keys: Vec<ContractKey> = result.expired.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            expired_keys,
+            vec![fast_junk],
+            "the fast-cadence zero-demand storm must be shed end-to-end"
+        );
+        assert!(!manager.is_hosting_contract(&fast_junk));
+    }
+
+    /// The no-cost degradation path: `sweep_expired_hosting()` (no axes) is
+    /// the pure byte sweep and never cost-evicts, so every pre-existing
+    /// caller is behaviorally unchanged.
+    #[tokio::test]
+    async fn sweep_without_cost_axes_never_cost_evicts() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let junk = make_contract_key(1);
+        manager.record_contract_access(junk, 121, AccessType::Put, HostingCause::Other);
+        let result = manager.sweep_expired_hosting();
+        assert!(result.expired.is_empty());
+        assert!(manager.is_hosting_contract(&junk));
+        assert_eq!(manager.hosting_cache_stats().cost_evictions_total, 0);
     }
 
     /// `subscribed_keys_in` (the bounded connection-drop-shadow lookup, #4642)
@@ -3255,8 +4251,8 @@ mod tests {
         // Learn our location, then read the contract twice. The second read has
         // non-zero residency (floored at 1s), so it yields a training sample.
         manager.set_own_location(Location::new(0.5));
-        manager.record_contract_access(key, 1_000, AccessType::Get);
-        manager.record_contract_access(key, 1_000, AccessType::Get);
+        manager.record_contract_access(key, 1_000, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(key, 1_000, AccessType::Get, HostingCause::Other);
 
         assert_eq!(
             manager.demand_estimator.read().len(),
@@ -3281,8 +4277,8 @@ mod tests {
         let key = make_contract_key(1);
         manager.set_own_location(Location::new(0.5));
 
-        manager.record_contract_access(key, 1_000, AccessType::Put);
-        manager.record_contract_access(key, 1_000, AccessType::Put);
+        manager.record_contract_access(key, 1_000, AccessType::Put, HostingCause::Other);
+        manager.record_contract_access(key, 1_000, AccessType::Put, HostingCause::Other);
 
         assert_eq!(
             manager.demand_estimator.read().len(),
@@ -3320,7 +4316,7 @@ mod tests {
 
         // Host the contract (a new-entry insert yields no rate sample), then
         // serve it locally: the touch has non-zero residency so it trains.
-        manager.record_contract_access(key, 1_000, AccessType::Get);
+        manager.record_contract_access(key, 1_000, AccessType::Get, HostingCause::Other);
         let before = manager.demand_estimator.read().len();
         manager.touch_hosting(&key);
         assert!(
@@ -3577,7 +4573,7 @@ mod tests {
         assert!(!manager.is_hosting_contract(&key));
         assert_eq!(manager.hosting_contracts_count(), 0);
 
-        manager.record_contract_access(key, 1000, AccessType::Put);
+        manager.record_contract_access(key, 1000, AccessType::Put, HostingCause::Other);
 
         assert!(manager.is_hosting_contract(&key));
         assert_eq!(manager.hosting_contracts_count(), 1);
@@ -3613,7 +4609,7 @@ mod tests {
         assert!(!manager.should_host(&contract));
 
         // Add to hosting cache
-        manager.record_contract_access(contract, 1000, AccessType::Put);
+        manager.record_contract_access(contract, 1000, AccessType::Put, HostingCause::Other);
         assert!(manager.should_host(&contract));
     }
 
@@ -3623,7 +4619,7 @@ mod tests {
     fn test_hosted_contract_not_in_renewal_after_restart() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(42);
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         assert!(manager.is_hosting_contract(&contract));
         assert!(
             manager.contracts_needing_renewal().is_empty(),
@@ -3642,7 +4638,7 @@ mod tests {
         assert!(!manager.is_receiving_updates(&contract));
 
         // Add to hosting cache only — should_host true, is_receiving_updates false
-        manager.record_contract_access(contract, 1000, AccessType::Put);
+        manager.record_contract_access(contract, 1000, AccessType::Put, HostingCause::Other);
         assert!(manager.should_host(&contract));
         assert!(
             !manager.is_receiving_updates(&contract),
@@ -3711,6 +4707,187 @@ mod tests {
         assert!(used.in_use, "a client subscription is real demand → in_use");
     }
 
+    /// `hosted_by_reason` must PARTITION the hosting cache: one bucket per
+    /// contract, counts summing to the cache size and bytes to its used bytes.
+    /// The classification is priority-ordered, so each case below is set up
+    /// with every HIGHER-priority signal deliberately absent — a contract with
+    /// both a local client subscription and downstream subscribers must land in
+    /// `local_client` only, never be counted twice.
+    #[test]
+    fn hosted_by_reason_partitions_the_hosting_cache() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+
+        // Empty cache: every bucket zero (a real datapoint, not absence).
+        let empty = manager.hosted_by_reason();
+        for reason in HostingReason::ALL {
+            assert_eq!(empty.count(reason), 0, "{reason:?} on an empty cache");
+            assert_eq!(empty.bytes(reason), 0, "{reason:?} on an empty cache");
+        }
+
+        // One contract per reason, distinct sizes so a mis-bucketed contract
+        // shows up in the bytes assertions too.
+        let local_client = make_contract_key(1);
+        let downstream = make_contract_key(2);
+        let subscribed = make_contract_key(3);
+        let local_access = make_contract_key(4);
+        let abandoned = make_contract_key(5);
+        let routed = make_contract_key(6);
+        for (key, size) in [
+            (local_client, 100),
+            (downstream, 200),
+            (subscribed, 400),
+            (local_access, 800),
+            (abandoned, 1_600),
+            (routed, 3_200),
+        ] {
+            manager.record_contract_access(key, size, AccessType::Get, HostingCause::Other);
+        }
+
+        // `local_client` ALSO gets a downstream subscriber and a network
+        // subscription: priority must keep it in exactly one bucket.
+        manager.add_client_subscription(local_client.id(), crate::client_events::ClientId::next());
+        manager.add_downstream_subscriber(&local_client, make_peer_key(10));
+        manager.subscribe(local_client);
+
+        // `downstream` also holds a network subscription — downstream wins.
+        manager.add_downstream_subscriber(&downstream, make_peer_key(11));
+        manager.subscribe(downstream);
+
+        manager.subscribe(subscribed);
+        manager.mark_local_client_access(&local_access);
+
+        // Abandonment is a transition, not a flag: subscribe a downstream peer
+        // and take it away again.
+        manager.add_downstream_subscriber(&abandoned, make_peer_key(12));
+        manager.remove_downstream_subscriber(&abandoned, &make_peer_key(12));
+
+        // `routed` gets nothing beyond the GET that seeded it.
+
+        // `restored` arrives the way a restart delivers it: reloaded from
+        // persisted metadata, so `abandoned_at` is reset to None and
+        // `seeded_this_run` is false. Without its own bucket this lands in
+        // `routed` and claims to have "arrived through a routed GET/PUT".
+        let restored = make_contract_key(7);
+        {
+            let mut cache = manager.hosting_cache.write();
+            cache.load_persisted_entry(
+                restored,
+                6_400,
+                AccessType::Get,
+                std::time::Duration::from_secs(10),
+                false,
+            );
+            cache.finalize_loading();
+        }
+
+        let stats = manager.hosted_by_reason();
+        for (reason, size) in [
+            (HostingReason::LocalClient, 100),
+            (HostingReason::Downstream, 200),
+            (HostingReason::Subscribed, 400),
+            (HostingReason::LocalAccess, 800),
+            (HostingReason::Abandoned, 1_600),
+            (HostingReason::Restored, 6_400),
+            (HostingReason::Routed, 3_200),
+        ] {
+            assert_eq!(stats.count(reason), 1, "{reason:?} count");
+            assert_eq!(stats.bytes(reason), size, "{reason:?} bytes");
+        }
+
+        // The partition property itself — what makes `sum by (reason)` valid.
+        let total_count: u64 = HostingReason::ALL.iter().map(|r| stats.count(*r)).sum();
+        let total_bytes: u64 = HostingReason::ALL.iter().map(|r| stats.bytes(*r)).sum();
+        let cache = manager.hosting_cache_stats();
+        assert_eq!(total_count, cache.contract_count, "counts must partition");
+        assert_eq!(total_bytes, cache.current_bytes, "bytes must partition");
+
+        // The `local_access` bucket is age-gated on the same window the
+        // hosting policy uses. Classifying on the sticky `local_client_access`
+        // flag instead would hold this contract here for the node's whole
+        // uptime while the policy had long since stopped counting it.
+        clock.advance_time(SUBSCRIPTION_LEASE_DURATION + std::time::Duration::from_secs(1));
+        assert!(
+            !manager.has_recent_local_client_access(&local_access),
+            "the policy signal must have expired, or this assertion proves nothing"
+        );
+        let aged = manager.hosted_by_reason();
+        assert_eq!(
+            aged.count(HostingReason::LocalAccess),
+            0,
+            "a stale local access must leave the local_access bucket"
+        );
+        assert!(
+            aged.count(HostingReason::Routed) > stats.count(HostingReason::Routed),
+            "and fall through to the residual bucket"
+        );
+        // The network subscription's lease expires on the same clock, so the
+        // exact residual count is not pinned here — only that nothing was lost.
+        let aged_total: u64 = HostingReason::ALL.iter().map(|r| aged.count(*r)).sum();
+        assert_eq!(aged_total, cache.contract_count, "still a partition");
+    }
+
+    /// `Restored` means "reloaded and not read since", so a restored contract
+    /// that goes on to serve routed traffic must leave the bucket.
+    ///
+    /// Classifying on `!seeded_this_run` alone made it sticky for the process
+    /// lifetime: nothing ever sets that flag back once an entry exists, so
+    /// after any restart `restored` kept the entire persisted hosted set and
+    /// `freenet.node.contracts.hosted{reason="routed"}` read near zero
+    /// fleet-wide. The partition test does not catch it because it asserts
+    /// immediately after loading and never drives an access through.
+    #[test]
+    fn a_restored_contract_that_serves_traffic_moves_to_routed() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+
+        let key = make_contract_key(1);
+        {
+            let mut cache = manager.hosting_cache.write();
+            cache.load_persisted_entry(
+                key,
+                6_400,
+                AccessType::Get,
+                std::time::Duration::from_secs(10),
+                false,
+            );
+            cache.finalize_loading();
+        }
+        let restored = manager.hosted_by_reason();
+        assert_eq!(
+            restored.count(HostingReason::Restored),
+            1,
+            "a freshly reloaded, unread contract is restored"
+        );
+
+        // One routed GET, carrying no demand signal of its own — the only
+        // thing that changes is that this run has now read it.
+        manager.record_contract_access(key, 6_400, AccessType::Get, HostingCause::Other);
+
+        let after = manager.hosted_by_reason();
+        assert_eq!(
+            after.count(HostingReason::Restored),
+            0,
+            "a restored contract that has served a read is no longer untouched"
+        );
+        assert_eq!(
+            after.count(HostingReason::Routed),
+            1,
+            "it is ordinary transit hosting now, which is what routed counts"
+        );
+        assert_eq!(
+            after.bytes(HostingReason::Routed),
+            6_400,
+            "bytes must move with the count, not be double-counted or dropped"
+        );
+    }
+
     /// `is_eviction_eligible` gates the dashboard's "next to evict" badge on the
     /// sweep skip filter, which since 2026-07-08 is `!contract_in_use` ONLY (the
     /// `min_ttl` age gate was dropped — invariant 3). A freshly-accessed, not-in-
@@ -3725,8 +4902,8 @@ mod tests {
         // is no longer a `min_ttl` cold-start floor to protect it.
         let evictable = make_contract_key(2);
         let pinned = make_contract_key(3);
-        manager.record_contract_access(evictable, 100, AccessType::Get);
-        manager.record_contract_access(pinned, 100, AccessType::Get);
+        manager.record_contract_access(evictable, 100, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(pinned, 100, AccessType::Get, HostingCause::Other);
         // Pin `pinned` with a local client subscription → contract_in_use true.
         let client = crate::client_events::ClientId::next();
         manager.add_client_subscription(pinned.id(), client);
@@ -3758,7 +4935,7 @@ mod tests {
         let contract = make_contract_key(1);
 
         // Add to hosting cache (simulating GET operation)
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
 
         // Hosted-only contracts should NOT be renewed -- subscribing to all
         // hosted contracts causes subscription storms (#3546). The local
@@ -3849,7 +5026,7 @@ mod tests {
     fn test_hosted_contract_renewed_despite_no_interest() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(42);
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         assert!(manager.is_hosting_contract(&contract));
         // Before #3546: contracts_needing_renewal() included this during startup window
         // After #3546: hosted-only contracts are never included
@@ -3867,7 +5044,7 @@ mod tests {
     fn test_startup_revalidation_includes_hosted_contracts() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         // Before #3546: during startup window, this would be in renewal list
         // After #3546: hosted-only contracts are never renewed
         let needs_renewal = manager.contracts_needing_renewal();
@@ -3883,7 +5060,7 @@ mod tests {
     fn test_startup_revalidation_skips_already_subscribed() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         manager.subscribe(contract);
         let needs_renewal = manager.contracts_needing_renewal();
         assert!(
@@ -3898,7 +5075,7 @@ mod tests {
     fn test_startup_revalidation_window_expires() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         let needs_renewal = manager.contracts_needing_renewal();
         assert!(
             !needs_renewal.contains(&contract),
@@ -3914,9 +5091,9 @@ mod tests {
         let contract_a = make_contract_key(1);
         let contract_b = make_contract_key(2);
         let contract_c = make_contract_key(3);
-        manager.record_contract_access(contract_a, 1000, AccessType::Get);
-        manager.record_contract_access(contract_b, 1000, AccessType::Get);
-        manager.record_contract_access(contract_c, 1000, AccessType::Get);
+        manager.record_contract_access(contract_a, 1000, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(contract_b, 1000, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(contract_c, 1000, AccessType::Get, HostingCause::Other);
         manager.subscribe(contract_b);
         let client_id = crate::client_events::ClientId::next();
         manager.add_client_subscription(contract_c.id(), client_id);
@@ -3948,7 +5125,7 @@ mod tests {
         // Simulate 200 relay-cached contracts loaded from disk
         for i in 0..200u8 {
             let contract = make_contract_key(i);
-            manager.record_contract_access(contract, 1000, AccessType::Get);
+            manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         }
         assert_eq!(manager.hosting_contracts_count(), 200);
 
@@ -5265,7 +6442,7 @@ mod tests {
         assert_eq!(manager.state_generation(&key), 3);
 
         // Recording the access captures the current generation (3).
-        manager.record_contract_access(key, 100, AccessType::Get);
+        manager.record_contract_access(key, 100, AccessType::Get, HostingCause::Other);
 
         // Simulate a state write that races ahead of `EvictContract`.
         let new_generation = manager.bump_state_generation(&key);
@@ -5277,7 +6454,8 @@ mod tests {
         // `RuntimePool::remove_contract` will compare this captured
         // value (3) against the current `state_generation` (4) and
         // SKIP the on-disk reclamation, closing the re-host race.
-        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        let result =
+            manager.record_contract_access(trigger, 100, AccessType::Get, HostingCause::Other);
         assert_eq!(
             result.evicted,
             vec![(key, 3)],
@@ -5333,7 +6511,7 @@ mod tests {
         let new_gen = manager.bump_state_generation(&key);
         assert_eq!(new_gen, 1);
         manager.refresh_cache_generation(&key, new_gen);
-        manager.record_contract_access(key, 100, AccessType::Get);
+        manager.record_contract_access(key, 100, AccessType::Get, HostingCause::Other);
 
         // Simulate an UPDATE that bumps the counter to 2 AND refreshes
         // the cached snapshot — this is the bump+refresh pair installed
@@ -5347,7 +6525,8 @@ mod tests {
         // would carry the stale snapshot (1), and `RuntimePool::remove_contract`
         // would see a mismatch against the current generation (2) and
         // SKIP reclamation — leaking the on-disk state forever.
-        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        let result =
+            manager.record_contract_access(trigger, 100, AccessType::Get, HostingCause::Other);
         assert_eq!(
             result.evicted,
             vec![(key, 2)],
@@ -5451,13 +6630,14 @@ mod tests {
         manager.add_client_subscription(in_use.id(), client);
         assert!(manager.contract_in_use(&in_use));
 
-        manager.record_contract_access(in_use, 100, AccessType::Get);
-        manager.record_contract_access(filler, 100, AccessType::Get);
+        manager.record_contract_access(in_use, 100, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(filler, 100, AccessType::Get, HostingCause::Other);
 
         // Inserting `trigger` puts the cache over budget. A naive LRU would evict
         // `in_use` (oldest) — but it is locally subscribed so it is ordered LAST,
         // and one eviction of the zero-subscriber `filler` is enough.
-        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        let result =
+            manager.record_contract_access(trigger, 100, AccessType::Get, HostingCause::Other);
         assert_eq!(
             result.evicted,
             vec![(filler, 0)],
@@ -5478,7 +6658,8 @@ mod tests {
         manager.remove_client_subscription(in_use.id(), client);
         assert!(!manager.contract_in_use(&in_use));
 
-        let result = manager.record_contract_access(filler, 100, AccessType::Get);
+        let result =
+            manager.record_contract_access(filler, 100, AccessType::Get, HostingCause::Other);
         assert!(
             result.evicted.iter().any(|(k, _)| *k == in_use),
             "once the subscription is removed the contract is evicted normally \
@@ -5524,15 +6705,16 @@ mod tests {
             manager.add_downstream_subscriber(&trigger, p.clone());
         }
 
-        manager.record_contract_access(few, 100, AccessType::Get);
-        manager.record_contract_access(many, 100, AccessType::Get);
+        manager.record_contract_access(few, 100, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(many, 100, AccessType::Get, HostingCause::Other);
         assert!(manager.contract_in_use(&few));
         assert!(manager.contract_in_use(&many));
 
         // Insert `trigger` over budget. Nothing is zero-subscriber, so the fewest-
         // downstream contract `few` (1 sub) is shed as the last resort ahead of
         // `many` (3 subs).
-        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        let result =
+            manager.record_contract_access(trigger, 100, AccessType::Get, HostingCause::Other);
         assert_eq!(
             result.evicted,
             vec![(few, 0)],
@@ -5597,14 +6779,15 @@ mod tests {
             manager.subscribe(*k);
         }
 
-        manager.record_contract_access(victim, 100, AccessType::Get);
-        manager.record_contract_access(keep, 100, AccessType::Get);
+        manager.record_contract_access(victim, 100, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(keep, 100, AccessType::Get, HostingCause::Other);
         assert!(manager.contract_in_use(&victim));
 
         // Insert `trigger` over budget. Every contract is locally subscribed
         // (local = 1), so ties break by least-recent GET → `victim` (accessed
         // first) is shed as the last resort and torn down.
-        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        let result =
+            manager.record_contract_access(trigger, 100, AccessType::Get, HostingCause::Other);
         assert_eq!(
             result.evicted_in_use,
             vec![victim],
@@ -5938,8 +7121,8 @@ mod tests {
         let relay_contract = make_contract_key(2);
 
         // Both contracts get hosted via GET
-        manager.record_contract_access(local_contract, 1000, AccessType::Get);
-        manager.record_contract_access(relay_contract, 1000, AccessType::Get);
+        manager.record_contract_access(local_contract, 1000, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(relay_contract, 1000, AccessType::Get, HostingCause::Other);
 
         // Only the local one gets marked as locally accessed
         manager.mark_local_client_access(&local_contract);
@@ -5956,6 +7139,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cost_eligibility_stats_separate_zero_demand_subscribed_and_recent_by_size() {
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let clock = SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let eligible = make_contract_key(11);
+        let subscribed = make_contract_key(12);
+        let recent = make_contract_key(13);
+        let eligible_size = 100;
+        let subscribed_size = 3 * 1024 * 1024;
+        let recent_size = 4 * 1024 * 1024;
+
+        manager.record_contract_access(
+            eligible,
+            eligible_size,
+            AccessType::Get,
+            HostingCause::Other,
+        );
+        manager.record_contract_access(
+            subscribed,
+            subscribed_size,
+            AccessType::Get,
+            HostingCause::Other,
+        );
+        manager.record_contract_access(recent, recent_size, AccessType::Get, HostingCause::Other);
+        manager.add_downstream_subscriber(&subscribed, make_peer_key(12));
+
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        manager.mark_local_client_access(&recent);
+
+        let axes = [CostAxisPressure {
+            axis: "test",
+            total_rate: 60.0,
+            floor: 1.0,
+            rates: [(*eligible.id(), 10.0), (*subscribed.id(), 50.0)]
+                .into_iter()
+                .collect(),
+        }];
+        let stats = manager.cost_eligibility_stats(&axes);
+        assert_eq!(stats.counts[0][state_size_bucket(eligible_size)], 1);
+        assert_eq!(
+            stats.bytes[0][state_size_bucket(eligible_size)],
+            eligible_size
+        );
+        assert_eq!(stats.counts[1][state_size_bucket(subscribed_size)], 1);
+        assert_eq!(
+            stats.bytes[1][state_size_bucket(subscribed_size)],
+            subscribed_size
+        );
+        assert_eq!(stats.counts[2][state_size_bucket(recent_size)], 1);
+        assert_eq!(stats.bytes[2][state_size_bucket(recent_size)], recent_size);
+        assert_eq!(
+            stats.max_eligible_rate[0][state_size_bucket(eligible_size)],
+            10.0
+        );
+        assert_eq!(
+            stats.max_eligible_rate[0][state_size_bucket(subscribed_size)],
+            0.0
+        );
+        assert_eq!(
+            stats.max_attributed_rate[0][state_size_bucket(subscribed_size)],
+            50.0
+        );
+    }
+
     /// Relay-only contracts at scale should not cause subscription storms.
     /// Regression test for #3763/#3765 (the subscription storm incident).
     #[test]
@@ -5965,7 +7217,7 @@ mod tests {
         // Simulate 200 relay-cached contracts (no local_client_access)
         for i in 0..200u8 {
             let contract = make_contract_key(i);
-            manager.record_contract_access(contract, 1000, AccessType::Get);
+            manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         }
 
         // Mark only 2 as locally accessed (simulating River user)
@@ -5992,7 +7244,7 @@ mod tests {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         manager.mark_local_client_access(&contract);
         manager.subscribe(contract);
 
@@ -6023,12 +7275,12 @@ mod tests {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         manager.mark_local_client_access(&contract);
         assert!(manager.has_local_client_access(&contract));
 
         // Refresh via a relay PUT -- should NOT clear the local flag
-        manager.record_contract_access(contract, 1000, AccessType::Put);
+        manager.record_contract_access(contract, 1000, AccessType::Put, HostingCause::Other);
         assert!(
             manager.has_local_client_access(&contract),
             "local_client_access should persist across access type changes"
@@ -6092,21 +7344,21 @@ mod tests {
         let contract_c = make_contract_key(3);
 
         // Add A (locally accessed) and B
-        manager.record_contract_access(contract_a, 100, AccessType::Get);
+        manager.record_contract_access(contract_a, 100, AccessType::Get, HostingCause::Other);
         manager.mark_local_client_access(&contract_a);
-        manager.record_contract_access(contract_b, 100, AccessType::Get);
+        manager.record_contract_access(contract_b, 100, AccessType::Get, HostingCause::Other);
 
         assert!(manager.has_local_client_access(&contract_a));
 
         // Add C -- should evict A (oldest in LRU)
-        manager.record_contract_access(contract_c, 100, AccessType::Get);
+        manager.record_contract_access(contract_c, 100, AccessType::Get, HostingCause::Other);
         assert!(
             !manager.is_hosting_contract(&contract_a),
             "contract_a should have been evicted"
         );
 
         // Re-add A via relay (no mark_local_client_access)
-        manager.record_contract_access(contract_a, 100, AccessType::Get);
+        manager.record_contract_access(contract_a, 100, AccessType::Get, HostingCause::Other);
         assert!(
             !manager.has_local_client_access(&contract_a),
             "Re-added via relay should NOT have local_client_access"
@@ -6313,7 +7565,7 @@ mod tests {
         // the hosting cache (record_contract_access ≈ what
         // `host_contract` does in production).
         manager.bump_state_generation(&contract);
-        manager.record_contract_access(contract, 128, AccessType::Put);
+        manager.record_contract_access(contract, 128, AccessType::Put, HostingCause::Other);
         assert!(manager.is_hosting_contract(&contract));
 
         // The `RuntimePool::remove_contract` generation-mismatch +
@@ -6362,7 +7614,7 @@ mod tests {
         // should_unsubscribe_upstream() reads only has_client_subscriptions()
         // + has_downstream_subscribers(), never the hosting cache or the lease
         // map. The decision keys solely off the downstream-subscriber map here.
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         manager.subscribe(contract);
         assert!(
             manager
@@ -6416,7 +7668,7 @@ mod tests {
         let contract = make_contract_key(0x33);
 
         // Contract is in the hosting cache (durable fallback) ...
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         assert!(manager.is_hosting_contract(&contract));
 
         // ... and an active, non-expired subscription reads as receiving.
@@ -6468,7 +7720,12 @@ mod tests {
         // 50 purely-cached contracts (e.g. relay-cached from GETs) — no
         // subscription, no client, no local-client access.
         for i in 0..50u8 {
-            manager.record_contract_access(make_contract_key(i), 1000, AccessType::Get);
+            manager.record_contract_access(
+                make_contract_key(i),
+                1000,
+                AccessType::Get,
+                HostingCause::Other,
+            );
         }
         assert_eq!(manager.hosting_contracts_count(), 50);
         assert!(
@@ -6512,7 +7769,7 @@ mod tests {
             lease.expires_at = Instant::now() + Duration::from_secs(30);
         }
         let expired = make_contract_key(0xE0);
-        manager.record_contract_access(expired, 1000, AccessType::Get);
+        manager.record_contract_access(expired, 1000, AccessType::Get, HostingCause::Other);
         manager.subscribe(expired);
         if let Some(mut lease) = manager.active_subscriptions.get_mut(&expired) {
             lease.expires_at = Instant::now() - Duration::from_secs(1);
@@ -6724,6 +7981,152 @@ mod tests {
         assert_eq!(manager.hosting_budget_bytes(), GIB);
     }
 
+    /// #5333: end-to-end wiring test for the resident-overhead budget's live
+    /// recompute path — mirrors `recompute_installs_min_of_ram_and_disk`
+    /// above for the disk axis. Verifies (a) the ctor installs the
+    /// CONSTRUCTION-TIME default via `default_resident_overhead_budget_bytes`
+    /// before any config/recompute runs, (b) `configure_resident_overhead_mem_share`
+    /// survives the `f64` <-> `AtomicU64`-bits round trip, and (c)
+    /// `recompute_resident_overhead_budget` installs exactly what the pure
+    /// `cache::resident_overhead_budget_for` formula would compute for the
+    /// same inputs — true here because the cache is EMPTY (no hosted
+    /// contracts, so the manager's `own_rss` pre-adjustment, see the pure
+    /// formula's own doc, is a no-op). With a non-empty cache the two
+    /// intentionally diverge — see
+    /// `resident_overhead_budget_can_actually_fire_on_an_unconstrained_host`
+    /// for that case.
+    #[test]
+    fn configure_and_recompute_resident_overhead_installs_the_pure_formula_result() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let manager = HostingManager::new(4 * GIB);
+
+        // Ctor default: whatever the live host's own real signals produce —
+        // just assert it's floored sanely, not a specific value (this test
+        // host's real RAM is unknown/irrelevant here).
+        assert!(
+            manager.resident_overhead_budget_bytes() >= cache::MIN_RESIDENT_OVERHEAD_BUDGET_BYTES
+        );
+
+        // A non-default share, to prove the configured value (not the
+        // DEFAULT) is what the recompute actually uses.
+        let mem_share = 0.3;
+        manager.configure_resident_overhead_mem_share(mem_share);
+
+        let total_ram = 64 * GIB;
+        let pool_size = 8;
+        let live_signals = Some((2 * GIB, 40 * GIB));
+        let installed =
+            manager.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
+
+        let expected =
+            cache::resident_overhead_budget_for(total_ram, pool_size, live_signals, mem_share);
+        assert_eq!(
+            installed, expected,
+            "the manager's recompute must install exactly what the pure formula \
+             computes for the same (total_ram, pool_size, live_signals, mem_share)"
+        );
+        assert_eq!(
+            manager.resident_overhead_budget_bytes(),
+            expected,
+            "the installed value must actually be readable back off the cache"
+        );
+
+        // A DIFFERENT share on the same inputs must (for this shape, where
+        // the live-surplus term binds) install a DIFFERENT budget — proves
+        // configure_resident_overhead_mem_share actually reaches the
+        // recompute rather than being silently ignored.
+        manager.configure_resident_overhead_mem_share(0.05);
+        let installed_lower_share =
+            manager.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
+        assert_ne!(
+            installed, installed_lower_share,
+            "changing the configured share must change the installed budget \
+             on a shape where the live-surplus term binds"
+        );
+    }
+
+    /// A key-maker with a wider seed space than `make_contract_key` (`u8`,
+    /// 256 max): the resident-overhead test below needs well over 256
+    /// distinct contracts. Mirrors `cache::tests::make_key_u32`.
+    fn make_key_u32(seed: u32) -> ContractKey {
+        let mut id_bytes = [0u8; 32];
+        id_bytes[..4].copy_from_slice(&seed.to_le_bytes());
+        let mut code_bytes = [0u8; 32];
+        code_bytes[..4].copy_from_slice(&seed.wrapping_add(1).to_le_bytes());
+        ContractKey::from_id_and_code(ContractInstanceId::new(id_bytes), CodeHash::new(code_bytes))
+    }
+
+    /// #5333 review (skeptical lens, Blocker 2): the live-surplus term is
+    /// SELF-REFERENTIAL if `own_rss` is passed through unadjusted, because
+    /// `own_rss` already includes the very hosting cost
+    /// (`estimated_resident_overhead_bytes()`, `C`) this budget is compared
+    /// against. Algebraically (`live_term = own_rss + mem_share*available`,
+    /// `own_rss = base_other_rss + C` under the calibration
+    /// `ESTIMATED_RESIDENT_BYTES_PER_CONTRACT` assumes): the eviction
+    /// predicate `C > budget` reduces to `0 > base_other_rss +
+    /// mem_share*available`, which — since every term on the right is
+    /// non-negative — is NEVER true, however large `C` grows or however far
+    /// `available` shrinks. The live-surplus branch could therefore NEVER
+    /// actually bind on an unconstrained host, silently defeating the whole
+    /// OOM-protection purpose of this axis on exactly the case it targets.
+    /// The fix (`recompute_resident_overhead_budget` subtracting the
+    /// cache's current `C` from `own_rss` before calling the pure formula)
+    /// restores a genuine, reachable fixed point.
+    ///
+    /// This test hosts enough contracts to exhaust a small, fixed `available`
+    /// budget, then asserts the axis CAN fire (`cost > installed_budget`) —
+    /// the direct, end-to-end version of "is OOM protection reachable at
+    /// all", not an indirect proxy for it. Reverting the fix makes this test
+    /// fail (mutation-tested): without it, `cost` never exceeds the budget.
+    #[test]
+    fn resident_overhead_budget_can_actually_fire_on_an_unconstrained_host() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+        let total_ram = 64 * GIB; // generous enough the structural term never binds
+        let pool_size = 8;
+        let base_other_rss = 50 * MIB; // non-hosting resident memory, held constant
+        let available0 = 200 * MIB; // small on purpose: cheap to exhaust by hosting
+
+        let manager = HostingManager::new(total_ram);
+        manager.configure_resident_overhead_mem_share(0.125);
+
+        // Host enough contracts that cost alone exceeds `available0` — i.e.
+        // this process has consumed all the memory that was "available",
+        // the scenario genuine OOM protection must catch.
+        for i in 0..300u32 {
+            manager.record_contract_access(
+                make_key_u32(i),
+                1,
+                AccessType::Get,
+                HostingCause::Other,
+            );
+        }
+        let cost =
+            manager.hosting_contracts_count() as u64 * cache::ESTIMATED_RESIDENT_BYTES_PER_CONTRACT;
+        assert!(
+            cost > available0,
+            "test setup: hosted cost ({cost}) must exceed available0 ({available0}) \
+             to exercise the exhausted-available regime"
+        );
+        let own_rss = base_other_rss + cost;
+        let available = available0.saturating_sub(cost); // saturates to 0
+
+        let installed_budget = manager.recompute_resident_overhead_budget(
+            total_ram,
+            pool_size,
+            Some((own_rss, available)),
+        );
+
+        assert!(
+            cost > installed_budget,
+            "cost ({cost}) must exceed the installed budget ({installed_budget}) once \
+             available memory is exhausted by hosting — if it doesn't, the \
+             live-surplus term is self-referential (own_rss not adjusted for the \
+             current hosting cost) and this axis can NEVER actually protect \
+             against OOM on an unconstrained host — the #5333 Blocker 2 regression."
+        );
+    }
+
     /// The recompute takes only the O(1) `set_budget_bytes` cache write lock, so
     /// it cannot deadlock against a concurrent `record_access_with_demand` (which
     /// also takes the cache write lock). Interleave many recomputes with many
@@ -6745,6 +8148,7 @@ mod tests {
                     make_contract_key((i % 250) as u8),
                     i % 4096,
                     AccessType::Get,
+                    HostingCause::Other,
                 );
             }
         });
@@ -6998,6 +8402,101 @@ mod tests {
                 .admit_state_update(&make_contract_key(1), 300 * MIB)
                 .is_err(),
             "growth over budget must still reject"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "redb"))]
+mod restore_code_hash_repair_tests {
+    //! freenet/freenet-core#4978, the durable half.
+    //!
+    //! `StateStorage::store` persists whatever `key.code_hash()` it is handed
+    //! into the hosting-metadata row (`storages/redb.rs`, `storages/sqlite.rs`),
+    //! and `load_from_storage` rebuilds the `ContractKey` from it on restart.
+    //! A pre-fix binary could put a WRONG hash there — local-mode UPDATE wrote
+    //! the client's key verbatim, so `fdev update`'s all-zero placeholder
+    //! landed in the row. Restoring that verbatim gives a hosting-cache key
+    //! whose code half is zeros, and `ContractStore::remove_contract` derives
+    //! the blob path from `key.code_hash()`, so eviction never reclaims the
+    //! real `.wasm` and the bad row survives every subsequent restart.
+    //!
+    //! So the load path must prefer the contract store's instance->code row.
+    //! These tests are the guard for that, and they need no WASM engine: the
+    //! resolver is just the closure `load_from_storage` already takes.
+
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey, WrappedState};
+
+    use super::HostingManager;
+    use crate::contract::storages::Storage;
+    use crate::wasm_runtime::StateStorage;
+
+    const REAL_CODE_HASH: [u8; 32] = [0xAB; 32];
+
+    async fn storage_with_row(dir: &tempfile::TempDir, key: ContractKey) -> Storage {
+        let storage = Storage::new(dir.path()).await.expect("create storage");
+        // Goes through the production write, so the test cannot drift from how
+        // the row is actually produced.
+        storage
+            .store(key, WrappedState::new(vec![1u8; 8]))
+            .await
+            .expect("store state + hosting metadata");
+        storage
+    }
+
+    fn instance() -> ContractInstanceId {
+        ContractInstanceId::new([0x11; 32])
+    }
+
+    /// A row written by a pre-fix binary carries an all-zero code hash. The
+    /// contract store knows the real one, so the load must use it.
+    #[tokio::test]
+    async fn load_prefers_the_contract_index_over_a_placeholder_row() {
+        let dir = crate::util::tests::get_temp_dir();
+        let placeholder = ContractKey::from_id_and_code(instance(), CodeHash::new([0u8; 32]));
+        let storage = storage_with_row(&dir, placeholder).await;
+
+        let manager = HostingManager::new(10_000_000);
+        manager
+            .load_from_storage(&storage, |id| {
+                (*id == instance()).then(|| CodeHash::new(REAL_CODE_HASH))
+            })
+            .expect("load must succeed");
+
+        let restored = manager
+            .hosting_contract_keys()
+            .into_iter()
+            .find(|k| *k.id() == instance())
+            .expect("the row must be restored");
+        assert_eq!(
+            restored.code_hash(),
+            &CodeHash::new(REAL_CODE_HASH),
+            "the persisted placeholder must be repaired from the contract index, \
+             or eviction computes the blob path from zeros and leaks the .wasm"
+        );
+    }
+
+    /// The fallback must survive: an instance the contract store has no row for
+    /// keeps the persisted hash rather than being dropped or zeroed.
+    #[tokio::test]
+    async fn load_falls_back_to_the_persisted_hash_when_unresolvable() {
+        let dir = crate::util::tests::get_temp_dir();
+        let persisted = ContractKey::from_id_and_code(instance(), CodeHash::new(REAL_CODE_HASH));
+        let storage = storage_with_row(&dir, persisted).await;
+
+        let manager = HostingManager::new(10_000_000);
+        manager
+            .load_from_storage(&storage, |_| None)
+            .expect("load must succeed");
+
+        let restored = manager
+            .hosting_contract_keys()
+            .into_iter()
+            .find(|k| *k.id() == instance())
+            .expect("the row must still be restored when nothing resolves it");
+        assert_eq!(
+            restored.code_hash(),
+            &CodeHash::new(REAL_CODE_HASH),
+            "an unresolvable instance must keep its persisted hash"
         );
     }
 }

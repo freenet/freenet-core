@@ -466,12 +466,29 @@ pub(crate) struct ConnectionManager {
     /// Populated at connection establishment
     /// (`p2p_protoc::connection_lifecycle`, the same call site that populates
     /// `P2pConnManager.connections[addr].remote_version`) via
-    /// `record_remote_version`. Never proactively removed: a stale entry can
-    /// only matter if a different peer later reconnects at the exact same
-    /// socket address with an older version, and any real reconnection at
-    /// that address overwrites the entry before it is ever consulted (lookups
-    /// only target addresses with a live connection). Unknown addresses
-    /// (`None`) fail closed in `version_supports_summary_first_put`.
+    /// `record_remote_version`, which writes the `Option` THROUGH — a `None`
+    /// clears any prior entry.
+    ///
+    /// That unconditional write is load-bearing, and the reasoning this
+    /// rustdoc used to carry was wrong. It claimed a stale entry could not
+    /// matter because "any real reconnection at that address overwrites the
+    /// entry before it is ever consulted". That holds only when the
+    /// reconnection yields `Some`. It does NOT on the joiner->gateway path,
+    /// where the gateway's `AckConnection` carries no version and the
+    /// handshake yields `None`: under the old `if let Some(version)` guard
+    /// nothing was written, so a peer that reconnected on an OLDER build kept
+    /// its stale entry, we kept believing it was current, and it received a
+    /// wire variant it could not decode — which closes the connection
+    /// (`p2p_protoc.rs`, `ConnectionError::Serialization`) and reads as a
+    /// transport fault.
+    ///
+    /// Pre-existing (`SUMMARY_FIRST_PUT_MIN_VERSION` had the same exposure),
+    /// but hash-first (#4965) changes the frequency from rare to persistent:
+    /// summary-first PUT consults the mirror only when PUTting to that peer,
+    /// while hash-first consults it on EVERY interest-sync exchange with it.
+    ///
+    /// Unknown addresses (`None`) fail closed in every
+    /// `version_supports_*` predicate.
     #[allow(clippy::type_complexity)]
     remote_version: Arc<RwLock<BTreeMap<SocketAddr, (u8, u8, u16)>>>,
     /// Test-only override for the summary-first PUT probe version floor,
@@ -480,6 +497,37 @@ pub(crate) struct ConnectionManager {
     /// `Some(floor)` only in a sim test that opted in via
     /// `SimNetwork::enable_summary_first_put`. See `NodeConfig`.
     summary_first_put_floor_override: Option<(u8, u8, u16)>,
+    /// Test-only override for the hash-first summary version floor (#4965),
+    /// threaded exactly like `summary_first_put_floor_override`. `None` in
+    /// production (the real `HASH_FIRST_SUMMARIES_MIN_VERSION` applies).
+    /// Simulations default it to an always-passing floor so the suite
+    /// exercises the hash-first path before the crate version reaches the
+    /// production floor. See `NodeConfig`.
+    hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
+    /// Version-gate refusal counters (#5156). Both `supports_hash_first_summaries`
+    /// and `supports_summary_first_put` fail closed to the full-bytes fallback
+    /// for two causes with opposite implications — a pre-floor peer self-heals
+    /// as the fleet upgrades, an unknown remote version never does (it is
+    /// documented on joiner->gateway `AckConnection` links, `peer_connection.rs`)
+    /// — and until now nothing told the two apart. Each gate increments its own
+    /// pair directly, at the point it decides, so the count can never drift from
+    /// the decision it describes (see the "Metric describing a filtering
+    /// decision" row in `.claude/rules/bug-prevention-patterns.md`: a count
+    /// re-derived at the call site, e.g. by subtracting set sizes, silently
+    /// keeps reporting a plausible number after the filter it claims to measure
+    /// is deleted). Cheap `Relaxed` atomics, read once per `router_snapshot`
+    /// cadence via `version_gate_refusal_stats`; never blocks.
+    hash_first_declined_unknown_version: Arc<AtomicU64>,
+    hash_first_declined_pre_floor: Arc<AtomicU64>,
+    summary_first_put_declined_unknown_version: Arc<AtomicU64>,
+    summary_first_put_declined_pre_floor: Arc<AtomicU64>,
+    /// Test-only override for the originator-target-list version floor
+    /// (#5147), threaded exactly like `summary_first_put_floor_override`.
+    /// `None` in production (the real `BROADCAST_TARGET_LIST_MIN_VERSION`
+    /// applies). Simulations default it OFF — this gate changes fan-out
+    /// BEHAVIOUR, not just an encoding — so a sim opts in explicitly via
+    /// `SimNetwork::enable_broadcast_target_list`. See `NodeConfig`.
+    broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
     /// Rotating start offset for the per-new-peer migration scan. The scan
     /// examines at most `MIGRATION_SCAN_CAP_PER_NEW_PEER` hosted contracts per
     /// event; advancing this cursor each event makes successive events cover
@@ -538,6 +586,16 @@ pub(crate) struct ConnectionManager {
     /// surfaced via the dashboard ring-stats provider.
     lattice_probes_issued: Arc<AtomicU64>,
     lattice_probe_improvements: Arc<AtomicU64>,
+}
+
+/// A point-in-time read of the version-gate refusal counters (#5156). See
+/// [`ConnectionManager::version_gate_refusal_stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct VersionGateRefusalStats {
+    pub hash_first_declined_unknown_version: u64,
+    pub hash_first_declined_pre_floor: u64,
+    pub summary_first_put_declined_unknown_version: u64,
+    pub summary_first_put_declined_pre_floor: u64,
 }
 
 impl ConnectionManager {
@@ -610,6 +668,8 @@ impl ConnectionManager {
         // sim opted into the migration cascade.
         cm.subscribe_hint_floor_override = config.subscribe_hint_floor_override;
         cm.summary_first_put_floor_override = config.summary_first_put_floor_override;
+        cm.hash_first_summaries_floor_override = config.hash_first_summaries_floor_override;
+        cm.broadcast_target_list_floor_override = config.broadcast_target_list_floor_override;
         cm
     }
 
@@ -646,6 +706,12 @@ impl ConnectionManager {
             remote_version: Arc::new(RwLock::new(BTreeMap::new())),
             // Default off; `new(config)` overrides from config after init.
             summary_first_put_floor_override: None,
+            hash_first_summaries_floor_override: None,
+            hash_first_declined_unknown_version: Arc::new(AtomicU64::new(0)),
+            hash_first_declined_pre_floor: Arc::new(AtomicU64::new(0)),
+            summary_first_put_declined_unknown_version: Arc::new(AtomicU64::new(0)),
+            summary_first_put_declined_pre_floor: Arc::new(AtomicU64::new(0)),
+            broadcast_target_list_floor_override: None,
             migration_scan_cursor: Arc::new(AtomicUsize::new(0)),
             transient_connections: Arc::new(DashMap::new()),
             transient_in_use: Arc::new(AtomicUsize::new(0)),
@@ -1340,16 +1406,48 @@ impl ConnectionManager {
         self.subscribe_hint_floor_override
     }
 
-    /// Record the negotiated protocol version for a peer at `addr`, mirroring
-    /// `P2pConnManager.connections[addr].remote_version` so op drivers can
-    /// read it via `op_manager.ring.connection_manager`. Overwrites any prior
-    /// entry for `addr` (a fresh connection at a reused address always wins).
+    /// Record (or CLEAR) the negotiated protocol version for a peer at `addr`,
+    /// mirroring `P2pConnManager.connections[addr].remote_version` so op
+    /// drivers can read it via `op_manager.ring.connection_manager`.
+    ///
+    /// Takes the `Option` rather than a bare version, and writes it through:
+    /// `Some` overwrites, **`None` REMOVES**. A fresh connection at a reused
+    /// address always wins, including when that connection's version is
+    /// unknown — which is the whole point. Accepting only `Some` let a stale
+    /// entry outlive the connection that created it and made us send an
+    /// undecodable wire variant to a downgraded peer; see the
+    /// `remote_version` field rustdoc for the full failure.
+    ///
+    /// # Why #5161 did NOT relax this to "keep the old value on `None`"
+    ///
+    /// The issue read the clearing as information loss — a reconnect deleting a
+    /// version we already knew. That was the SYMPTOM of the handshake gap, not
+    /// a second bug, and relaxing it would have re-opened the downgrade failure
+    /// above.
+    ///
+    /// What #5161 changed is what `None` MEANS. Enumerate where a `None` can
+    /// now reach this function: the joiner->gateway ack path and the
+    /// peer-to-peer ack race both yield `Some` for any remote at or above
+    /// `GATEWAY_ACK_VERSION_MIN_VERSION`, and the intro-parsing path always
+    /// did. So a remaining `None` is not "we failed to learn it" — it is the
+    /// positive fact that the remote is BELOW the floor. Clearing a stale
+    /// newer entry is then the accurate write, not a lossy one, and every
+    /// `version_supports_*` predicate fails closed on the absence exactly as it
+    /// would on a below-floor value. Pinned by
+    /// `record_remote_version_none_clears_a_stale_entry`.
     ///
     /// Called from `p2p_protoc::connection_lifecycle` at the same point
     /// `P2pConnManager` records `remote_version` on its own `connections`
     /// entry — keep the two writes together if that call site changes.
-    pub(crate) fn record_remote_version(&self, addr: SocketAddr, version: (u8, u8, u16)) {
-        self.remote_version.write().insert(addr, version);
+    pub(crate) fn record_remote_version(&self, addr: SocketAddr, version: Option<(u8, u8, u16)>) {
+        match version {
+            Some(v) => {
+                self.remote_version.write().insert(addr, v);
+            }
+            None => {
+                self.remote_version.write().remove(&addr);
+            }
+        }
     }
 
     /// Look up the negotiated protocol version recorded for `addr` via
@@ -1377,12 +1475,125 @@ impl ConnectionManager {
     /// treated as unsupported (fail-closed): an older peer that cannot
     /// deserialize the appended `ProbeRequest` wire tag would drop the
     /// connection, so when in doubt the caller must not emit it.
+    ///
+    /// Refusals are attributed (#5156): a `None` remote version increments
+    /// `summary_first_put_declined_unknown_version` (never self-heals — see
+    /// [`Self::version_gate_refusal_stats`]), a known-but-below-floor version
+    /// increments `summary_first_put_declined_pre_floor` (self-heals as the
+    /// fleet upgrades). Recorded HERE, at the point the gate decides, not
+    /// re-derived by a caller from set sizes.
     pub(crate) fn supports_summary_first_put(&self, addr: SocketAddr) -> bool {
         let remote = self.remote_version(addr);
         let floor = self
             .summary_first_put_floor_override()
             .unwrap_or(crate::node::SUMMARY_FIRST_PUT_MIN_VERSION);
-        crate::node::version_supports_summary_first_put(remote, floor)
+        let supported = crate::node::version_supports_summary_first_put(remote, floor);
+        if !supported {
+            match remote {
+                None => self
+                    .summary_first_put_declined_unknown_version
+                    .fetch_add(1, Ordering::Relaxed),
+                Some(_) => self
+                    .summary_first_put_declined_pre_floor
+                    .fetch_add(1, Ordering::Relaxed),
+            };
+        }
+        supported
+    }
+
+    /// Whether the peer at `addr` reports a version new enough to understand
+    /// the hash-first `InterestSync` variants (`InterestMessage::SummaryDigests`
+    /// / `SummaryRequest`, #4965).
+    ///
+    /// Same shape and same fail-closed rule as
+    /// [`Self::supports_summary_first_put`]: an unknown version is treated as
+    /// unsupported, because a peer that lacks the variant index drops the
+    /// connection on the decode failure. Every caller's fallback is the
+    /// existing full-bytes `InterestMessage::Summaries`, so failing closed
+    /// costs bandwidth, never convergence.
+    ///
+    /// Honours `NodeConfig::hash_first_summaries_floor_override` exactly like
+    /// [`Self::supports_summary_first_put`] does. Simulations run the real
+    /// transport handshake, so `remote_version` IS populated there (with the
+    /// crate version) — which is what makes the override load-bearing rather
+    /// than decorative: it is the only way the simulation suite can exercise
+    /// this path before the release that lifts the crate version over the
+    /// production floor.
+    ///
+    /// Note the asymmetry a sim test must respect: a connection carries the
+    /// version of the peer that introduced itself over it, so only one
+    /// DIRECTION of a sim peer pair may have a known version. A test that
+    /// picks the wrong direction gets `None`, fails closed, and silently
+    /// exercises the fallback instead of the feature.
+    ///
+    /// Refusals are attributed (#5156) the same way as
+    /// [`Self::supports_summary_first_put`]: a `None` remote version
+    /// increments `hash_first_declined_unknown_version`, a known-but-below-
+    /// floor version increments `hash_first_declined_pre_floor`. See
+    /// [`Self::version_gate_refusal_stats`].
+    pub(crate) fn supports_hash_first_summaries(&self, addr: SocketAddr) -> bool {
+        let floor = self
+            .hash_first_summaries_floor_override
+            .unwrap_or(crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION);
+        let remote = self.remote_version(addr);
+        let supported = crate::node::version_supports_hash_first_summaries(remote, floor);
+        if !supported {
+            match remote {
+                None => self
+                    .hash_first_declined_unknown_version
+                    .fetch_add(1, Ordering::Relaxed),
+                Some(_) => self
+                    .hash_first_declined_pre_floor
+                    .fetch_add(1, Ordering::Relaxed),
+            };
+        }
+        supported
+    }
+
+    /// Read the version-gate refusal counters (#5156): why
+    /// [`Self::supports_hash_first_summaries`] and
+    /// [`Self::supports_summary_first_put`] fell back to the full-bytes /
+    /// full-state path, split by cause. `*_declined_unknown_version` never
+    /// self-heals (documented on joiner->gateway `AckConnection` links, which
+    /// carry no negotiated version); `*_declined_pre_floor` self-heals as the
+    /// fleet upgrades past the floor. Monotonic lifetime totals; the collector
+    /// differences them across the `router_snapshot` cadence.
+    pub(crate) fn version_gate_refusal_stats(&self) -> VersionGateRefusalStats {
+        VersionGateRefusalStats {
+            hash_first_declined_unknown_version: self
+                .hash_first_declined_unknown_version
+                .load(Ordering::Relaxed),
+            hash_first_declined_pre_floor: self
+                .hash_first_declined_pre_floor
+                .load(Ordering::Relaxed),
+            summary_first_put_declined_unknown_version: self
+                .summary_first_put_declined_unknown_version
+                .load(Ordering::Relaxed),
+            summary_first_put_declined_pre_floor: self
+                .summary_first_put_declined_pre_floor
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    /// Whether the peer at `addr` reports a version new enough to understand
+    /// the originator target list (`UpdateMsg::BroadcastToV2` /
+    /// `BroadcastToStreamingV2`, #5147).
+    ///
+    /// Same shape and same fail-closed rule as
+    /// [`Self::supports_hash_first_summaries`]. The fallback is the legacy
+    /// `BroadcastTo` / `BroadcastToStreaming`, byte-identical to what every
+    /// peer receives today, so failing closed costs the duplicate bandwidth we
+    /// already spend and never costs convergence.
+    ///
+    /// Honours `NodeConfig::broadcast_target_list_floor_override`, which
+    /// simulations must set explicitly — unlike the hash-first override it
+    /// defaults OFF, because opening this gate changes which peers receive a
+    /// broadcast at all.
+    pub(crate) fn supports_broadcast_target_list(&self, addr: SocketAddr) -> bool {
+        let floor = self
+            .broadcast_target_list_floor_override
+            .unwrap_or(crate::node::BROADCAST_TARGET_LIST_MIN_VERSION);
+        crate::node::version_supports_broadcast_target_list(self.remote_version(addr), floor)
     }
 
     /// Reserve the next `window`-sized slice of the hosting set for a migration
@@ -1647,6 +1858,27 @@ impl ConnectionManager {
             new_addr = %addr,
             "set_own_addr called"
         );
+    }
+
+    /// Set only the local `own_addr`, WITHOUT mirroring to the process-global
+    /// `network_status::external_address`.
+    ///
+    /// For tests that need routing to know this node's address but do not
+    /// exercise the external-address mirror. The full [`Self::set_own_addr`]
+    /// writes a `OnceLock`-backed process global shared by every test in the
+    /// binary; a test that calls it must hold
+    /// [`crate::node::network_status::TEST_GLOBAL_STATE_LOCK`], or it races the
+    /// `set_own_addr` atomicity regression test
+    /// (`test_set_own_addr_atomic_with_network_status`) under `cargo test`'s
+    /// shared-process model. Using this local-only setter sidesteps that
+    /// coupling entirely — the write never touches the global, so there is
+    /// nothing to serialize. See issue #4918.
+    ///
+    /// `test_no_test_calls_global_set_own_addr` pins that the test files which
+    /// previously raced use this helper and not the mirroring setter.
+    #[cfg(test)]
+    pub(crate) fn set_own_addr_local_for_test(&self, addr: SocketAddr) {
+        *self.own_addr.lock() = Some(addr);
     }
 
     pub fn prune_alive_connection(&self, addr: SocketAddr) -> Option<Location> {
@@ -2634,8 +2866,62 @@ mod tests {
         let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
         let addr = make_addr(9001);
         assert_eq!(cm.remote_version(addr), None);
-        cm.record_remote_version(addr, (0, 2, 94));
+        cm.record_remote_version(addr, Some((0, 2, 94)));
         assert_eq!(cm.remote_version(addr), Some((0, 2, 94)));
+    }
+
+    /// **The address-reuse-with-downgrade case (#5161).** A `None` MUST clear a
+    /// previously recorded version rather than preserve it.
+    ///
+    /// A recorded version is keyed by socket address, and addresses are reused:
+    /// a peer restarts on an older binary, or a NAT reassigns the port. If the
+    /// new connection reports no version and we kept the old one, we would keep
+    /// believing a downgraded peer is current and send it a wire variant it
+    /// cannot deserialize — which closes the connection
+    /// (`ConnectionError::Serialization`) and reads as a transport fault. That
+    /// is the failure the write-through exists to prevent, and #5161 removed
+    /// its most common trigger (the version-less gateway ack) rather than the
+    /// protection itself.
+    ///
+    /// The trailing assertions are the point: a cleared entry must fail closed
+    /// at the gates, so clearing is conservative in the same direction as a
+    /// genuinely below-floor version would be.
+    #[test]
+    fn record_remote_version_none_clears_a_stale_entry() {
+        let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
+        let addr = make_addr(9002);
+
+        cm.record_remote_version(addr, Some((0, 2, 118)));
+        assert_eq!(cm.remote_version(addr), Some((0, 2, 118)));
+
+        // Reconnect at the same address whose handshake yielded no version.
+        cm.record_remote_version(addr, None);
+        assert_eq!(
+            cm.remote_version(addr),
+            None,
+            "a reconnect that reports no version must not leave the previous \
+             version in place — the peer may have restarted on an older build \
+             at this address, and we would then send it an undecodable variant"
+        );
+        assert!(!cm.supports_summary_first_put(addr));
+        assert!(!cm.supports_hash_first_summaries(addr));
+    }
+
+    /// The other half of the same rule: a `Some` at a reused address overwrites
+    /// unconditionally, INCLUDING downwards. A "keep the highest version seen"
+    /// policy would be the same downgrade bug in a different shape.
+    #[test]
+    fn record_remote_version_overwrites_downwards_at_a_reused_address() {
+        let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
+        let addr = make_addr(9003);
+
+        cm.record_remote_version(addr, Some((0, 2, 120)));
+        cm.record_remote_version(addr, Some((0, 2, 100)));
+        assert_eq!(
+            cm.remote_version(addr),
+            Some((0, 2, 100)),
+            "the most recent connection's version wins, even when it is lower"
+        );
     }
 
     /// Emission gate, fail-closed case: a peer with no recorded version
@@ -2663,7 +2949,7 @@ mod tests {
         let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
 
         let pre_floor_addr = make_addr(9003);
-        cm.record_remote_version(pre_floor_addr, (0, 2, 80));
+        cm.record_remote_version(pre_floor_addr, Some((0, 2, 80)));
         assert!(!cm.supports_summary_first_put(pre_floor_addr));
 
         // The exact staggered-rollout boundary (#4642 step 3-bis): the probe
@@ -2674,7 +2960,7 @@ mod tests {
         // must therefore fall back to a full-state PUT and NEVER send it a
         // probe. The floor being strictly greater than 0.2.94 enforces this.
         let pre_variant_peer = make_addr(9005);
-        cm.record_remote_version(pre_variant_peer, (0, 2, 94));
+        cm.record_remote_version(pre_variant_peer, Some((0, 2, 94)));
         assert!(
             !cm.supports_summary_first_put(pre_variant_peer),
             "a 0.2.94 peer has no probe variants; a probe would fail to decode \
@@ -2685,8 +2971,484 @@ mod tests {
         // A peer at the floor (0.2.95, the first release carrying the probe
         // variants + handler) is accepted.
         let at_floor_addr = make_addr(9004);
-        cm.record_remote_version(at_floor_addr, crate::node::SUMMARY_FIRST_PUT_MIN_VERSION);
+        cm.record_remote_version(
+            at_floor_addr,
+            Some(crate::node::SUMMARY_FIRST_PUT_MIN_VERSION),
+        );
         assert!(cm.supports_summary_first_put(at_floor_addr));
+    }
+
+    // ============ hash-first summary version-gate tests (#4965) ============
+
+    /// The send gate for `InterestMessage::SummaryDigests` / `SummaryRequest`.
+    ///
+    /// Mirrors the summary-first PUT gate above and matters for the same
+    /// reason: a peer that predates the variants cannot bincode-deserialize
+    /// them and DROPS THE CONNECTION on the decode failure. During the 0-4h
+    /// staggered rollout most peers are pre-floor, so getting this wrong
+    /// churns live connections network-wide.
+    ///
+    /// Asserts the gate DISCRIMINATES rather than merely always-rejecting: an
+    /// unknown peer and the last pre-floor release are refused, the floor
+    /// release and anything newer are accepted.
+    #[test]
+    fn supports_hash_first_summaries_gate_discriminates_by_version() {
+        let cm = make_connection_manager(Some(make_addr(9100)), 1, 10, false);
+
+        let unknown = make_addr(9101);
+        assert!(
+            !cm.supports_hash_first_summaries(unknown),
+            "an unrecorded peer version must fail CLOSED — sending an \
+             undecodable variant to a pre-floor peer drops the connection, \
+             while the fallback merely costs the bytes we send today"
+        );
+
+        // 0.2.115 is the highest already-released version at the time this
+        // shipped and carries neither variant.
+        let pre_floor = make_addr(9102);
+        cm.record_remote_version(pre_floor, Some((0, 2, 115)));
+        assert!(
+            !cm.supports_hash_first_summaries(pre_floor),
+            "a peer one release below the floor has no SummaryDigests variant \
+             index; it must keep receiving full-bytes Summaries"
+        );
+
+        let at_floor = make_addr(9103);
+        cm.record_remote_version(
+            at_floor,
+            Some(crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION),
+        );
+        assert!(
+            cm.supports_hash_first_summaries(at_floor),
+            "the floor release itself carries the variants and their handlers, \
+             so it must be accepted — otherwise the feature never activates"
+        );
+
+        let newer = make_addr(9104);
+        cm.record_remote_version(newer, Some((0, 3, 0)));
+        assert!(
+            cm.supports_hash_first_summaries(newer),
+            "a peer above the floor must stay supported (the floor is a \
+             minimum, never an equality test)"
+        );
+    }
+
+    // ============ version-gate refusal counters (#5156) ============
+
+    /// Each refusal counter increments ONLY for its own cause: an unknown
+    /// remote version bumps `*_declined_unknown_version`, a known-but-
+    /// below-floor version bumps `*_declined_pre_floor` — never both at once,
+    /// and a call to one gate never touches the other gate's counters.
+    /// Exercises both `supports_hash_first_summaries` and
+    /// `supports_summary_first_put` since they share the same shape.
+    #[test]
+    fn version_gate_refusal_counters_increment_for_their_own_cause_only() {
+        let cm = make_connection_manager(Some(make_addr(9200)), 1, 10, false);
+        assert_eq!(
+            cm.version_gate_refusal_stats(),
+            VersionGateRefusalStats::default(),
+            "counters must start at zero"
+        );
+
+        // Hash-first: unknown version.
+        let unknown_hf = make_addr(9201);
+        assert!(!cm.supports_hash_first_summaries(unknown_hf));
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(
+            s.hash_first_declined_unknown_version, 1,
+            "unknown-version cause"
+        );
+        assert_eq!(
+            s.hash_first_declined_pre_floor, 0,
+            "must not also count as pre-floor"
+        );
+        assert_eq!(
+            s.summary_first_put_declined_unknown_version, 0,
+            "must not leak into the PUT gate's counters"
+        );
+        assert_eq!(s.summary_first_put_declined_pre_floor, 0);
+
+        // Hash-first: known but below the floor.
+        let pre_floor_hf = make_addr(9202);
+        cm.record_remote_version(pre_floor_hf, Some((0, 2, 115)));
+        assert!(!cm.supports_hash_first_summaries(pre_floor_hf));
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(
+            s.hash_first_declined_unknown_version, 1,
+            "must not also double-count as unknown-version"
+        );
+        assert_eq!(s.hash_first_declined_pre_floor, 1, "pre-floor cause");
+
+        // Hash-first: at/above the floor never refuses; counters unchanged.
+        let at_floor_hf = make_addr(9203);
+        cm.record_remote_version(
+            at_floor_hf,
+            Some(crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION),
+        );
+        assert!(cm.supports_hash_first_summaries(at_floor_hf));
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(s.hash_first_declined_unknown_version, 1);
+        assert_eq!(s.hash_first_declined_pre_floor, 1);
+
+        // Summary-first PUT: unknown version.
+        let unknown_sf = make_addr(9204);
+        assert!(!cm.supports_summary_first_put(unknown_sf));
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(
+            s.summary_first_put_declined_unknown_version, 1,
+            "unknown-version cause"
+        );
+        assert_eq!(
+            s.summary_first_put_declined_pre_floor, 0,
+            "must not also count as pre-floor"
+        );
+        // The hash-first counters from above must be untouched by the PUT gate.
+        assert_eq!(s.hash_first_declined_unknown_version, 1);
+        assert_eq!(s.hash_first_declined_pre_floor, 1);
+
+        // Summary-first PUT: known but below the floor.
+        let pre_floor_sf = make_addr(9205);
+        cm.record_remote_version(pre_floor_sf, Some((0, 2, 80)));
+        assert!(!cm.supports_summary_first_put(pre_floor_sf));
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(s.summary_first_put_declined_unknown_version, 1);
+        assert_eq!(s.summary_first_put_declined_pre_floor, 1, "pre-floor cause");
+    }
+
+    /// Mutation check prescribed by `.claude/rules/bug-prevention-patterns.md`
+    /// ("Metric describing a filtering decision, re-derived at the call
+    /// site"): a refusal counter must be driven by the ACTUAL gate decision,
+    /// not by a fact independent of it. This simulates deleting the floor
+    /// filter by overriding it to the lowest possible version `(0, 0, 0)` —
+    /// every known remote version then satisfies it, so the pre-floor cause
+    /// can never fire — using the EXACT same remote versions that
+    /// `supports_hash_first_summaries_gate_discriminates_by_version` and
+    /// `supports_summary_first_put_respects_recorded_version_against_production_floor`
+    /// prove get refused under the real production floor. If the counter were
+    /// re-derived (e.g. from total refusals minus some other tally) rather
+    /// than incremented by the gate's own floor comparison, it could stay
+    /// non-zero here even though this specific cause can no longer occur.
+    #[test]
+    fn pre_floor_counters_go_to_zero_when_the_floor_filter_is_disabled() {
+        let mut cm = make_connection_manager(Some(make_addr(9300)), 1, 10, false);
+        cm.hash_first_summaries_floor_override = Some((0, 0, 0));
+        cm.summary_first_put_floor_override = Some((0, 0, 0));
+
+        let hf_addr = make_addr(9301);
+        cm.record_remote_version(hf_addr, Some((0, 2, 115)));
+        assert!(
+            cm.supports_hash_first_summaries(hf_addr),
+            "with the floor overridden to (0,0,0) every known version must pass"
+        );
+
+        let sf_addr = make_addr(9302);
+        cm.record_remote_version(sf_addr, Some((0, 2, 80)));
+        assert!(
+            cm.supports_summary_first_put(sf_addr),
+            "with the floor overridden to (0,0,0) every known version must pass"
+        );
+
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(
+            s.hash_first_declined_pre_floor, 0,
+            "the pre-floor cause can never fire once the floor filter is disabled"
+        );
+        assert_eq!(
+            s.summary_first_put_declined_pre_floor, 0,
+            "the pre-floor cause can never fire once the floor filter is disabled"
+        );
+
+        // The unknown-version cause is a SEPARATE filter (`remote.is_some_and`)
+        // that the floor override does not touch, so it must still fire
+        // normally — proving the zero above reflects "this cause is
+        // unreachable", not "the counters are wired to do nothing".
+        let unknown_hf = make_addr(9303);
+        assert!(!cm.supports_hash_first_summaries(unknown_hf));
+        let unknown_sf = make_addr(9304);
+        assert!(!cm.supports_summary_first_put(unknown_sf));
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(s.hash_first_declined_unknown_version, 1);
+        assert_eq!(s.summary_first_put_declined_unknown_version, 1);
+        assert_eq!(s.hash_first_declined_pre_floor, 0);
+        assert_eq!(s.summary_first_put_declined_pre_floor, 0);
+    }
+
+    /// A reconnection whose version is UNKNOWN must CLEAR the mirror, not
+    /// leave the previous connection's version standing.
+    ///
+    /// The failure this guards is not hypothetical arithmetic. A peer
+    /// reconnects on an older build; the joiner->gateway handshake yields
+    /// `None` (the gateway's `AckConnection` carries no version); under the
+    /// old `if let Some(version)` write the stale entry survived; we kept
+    /// believing the peer was current and sent it `SummaryDigests`; it could
+    /// not decode the variant and the connection was CLOSED. The visible
+    /// symptom is connection flap that looks like a transport fault.
+    ///
+    /// Pre-existing exposure (summary-first PUT had it too), but hash-first
+    /// consults this mirror on every interest-sync exchange rather than only
+    /// when PUTting to that peer, which turns rare into persistent.
+    #[test]
+    fn unknown_version_on_reconnect_clears_the_mirror() {
+        let cm = make_connection_manager(Some(make_addr(9200)), 1, 10, false);
+        let addr = make_addr(9201);
+
+        // First connection: a current peer.
+        cm.record_remote_version(addr, Some(crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION));
+        assert_eq!(
+            cm.remote_version(addr),
+            Some(crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION)
+        );
+        assert!(
+            cm.supports_hash_first_summaries(addr),
+            "precondition: the peer is believed capable"
+        );
+
+        // Reconnection at the same address with an UNKNOWN version.
+        cm.record_remote_version(addr, None);
+
+        assert_eq!(
+            cm.remote_version(addr),
+            None,
+            "an unknown-version reconnection must REMOVE the stale entry - leaving it makes us send a wire variant the peer may not be able to decode, which closes the connection"
+        );
+        assert!(
+            !cm.supports_hash_first_summaries(addr),
+            "with the version cleared the gate must fail closed again, so the peer goes back to receiving full-bytes Summaries"
+        );
+    }
+
+    /// The hash-first floor must track the release that actually ships it.
+    ///
+    /// Two failure directions, both fleet-wide and both silent under the
+    /// previous frozen-literal guard:
+    ///
+    /// - **Floor too LOW** (a release ships at or above the floor WITHOUT the
+    ///   feature): peers on that real release read as at-floor, receive a
+    ///   `SummaryDigests` they have no variant index for, fail to
+    ///   bincode-decode, and the connection is CLOSED.
+    /// - **Floor too HIGH** (the feature ships below its own floor): the gate
+    ///   never opens and the feature is inert against fully-capable peers.
+    ///
+    /// The previous guard compared the floor against a frozen
+    /// `LAST_RELEASE_WITHOUT_VARIANTS = (0,2,115)` literal, which can only
+    /// catch the floor moving DOWN. It cannot notice the RELEASE moving up
+    /// past a floor that stayed put — the actual risk at this project's
+    /// cadence (five releases in the four days before this was written).
+    ///
+    /// This version couples the floor to `CARGO_PKG_VERSION` through
+    /// [`crate::node::HASH_FIRST_SHIPPED_IN`], so a release bump forces a
+    /// conscious decision instead of a silent drift.
+    #[test]
+    fn hash_first_floor_tracks_the_shipping_release() {
+        /// `CARGO_PKG_VERSION` of the `freenet` crate as a comparable triple.
+        /// Pre-release suffixes (`-rc1`) are dropped: they order below the
+        /// release proper, so ignoring them is the conservative direction.
+        fn crate_version() -> (u8, u8, u16) {
+            let v = env!("CARGO_PKG_VERSION");
+            let mut it = v.split('.');
+            let major = it.next().unwrap().parse().expect("major");
+            let minor = it.next().unwrap().parse().expect("minor");
+            let patch = it
+                .next()
+                .unwrap()
+                .split(['-', '+'])
+                .next()
+                .unwrap()
+                .parse()
+                .expect("patch");
+            (major, minor, patch)
+        }
+
+        let floor = crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION;
+        let current = crate_version();
+
+        match crate::node::HASH_FIRST_SHIPPED_IN {
+            None => {
+                // Not shipped yet: the floor is a PREDICTION about a future
+                // release, so it must still be ahead of the crate version.
+                // This is the assertion that fires on the release bump PR.
+                assert!(
+                    floor > current,
+                    "HASH_FIRST_SUMMARIES_MIN_VERSION is {floor:?} but the crate \
+                     is already at {current:?}, and HASH_FIRST_SHIPPED_IN is \
+                     None.\n\n\
+                     The release has caught up with the floor. Decide which is \
+                     true and encode it:\n\
+                     - This release DOES carry hash-first -> set \
+                     HASH_FIRST_SHIPPED_IN = Some({floor:?}) and freeze both.\n\
+                     - It does NOT -> raise HASH_FIRST_SUMMARIES_MIN_VERSION to \
+                     the release that will.\n\n\
+                     Leaving it as-is ships a floor that peers on the real \
+                     {current:?} satisfy without carrying the SummaryDigests \
+                     variant: they cannot decode it, and the connection is \
+                     closed. See HASH_FIRST_SHIPPED_IN."
+                );
+            }
+            Some(shipped) => {
+                assert_eq!(
+                    shipped, floor,
+                    "HASH_FIRST_SHIPPED_IN ({shipped:?}) must EQUAL \
+                     HASH_FIRST_SUMMARIES_MIN_VERSION ({floor:?}). The gate opens \
+                     at the floor, so a mismatch means peers on the shipping \
+                     release either receive a variant they lack, or never \
+                     receive one they have."
+                );
+                assert!(
+                    floor <= current,
+                    "HASH_FIRST_SHIPPED_IN says the feature shipped in \
+                     {shipped:?}, but the crate is only at {current:?} — a \
+                     release cannot have shipped in the future. One of the two \
+                     is wrong."
+                );
+            }
+        }
+    }
+
+    /// The send gate for `UpdateMsg::BroadcastToV2` / `BroadcastToStreamingV2`
+    /// (#5147).
+    ///
+    /// Same stakes as the hash-first gate above: a pre-floor peer has no
+    /// variant index for these, cannot bincode-deserialize them, and DROPS THE
+    /// CONNECTION. During a staggered rollout most peers are pre-floor.
+    ///
+    /// Asserts the gate DISCRIMINATES rather than always-rejecting — an
+    /// always-false gate would pass a test that only checked the unknown case,
+    /// and the feature would be silently inert.
+    #[test]
+    fn supports_broadcast_target_list_gate_discriminates_by_version() {
+        let cm = make_connection_manager(Some(make_addr(9200)), 1, 10, false);
+
+        let unknown = make_addr(9201);
+        assert!(
+            !cm.supports_broadcast_target_list(unknown),
+            "an unrecorded peer version must fail CLOSED. Note this is not \
+             hypothetical during rollout: until #5161/#5167 deploys, a node \
+             never learns its GATEWAY's version at all, so every gateway link \
+             takes this branch"
+        );
+
+        // 0.2.119 is the highest already-released version at the time this
+        // shipped and carries neither V2 variant.
+        let pre_floor = make_addr(9202);
+        cm.record_remote_version(pre_floor, Some((0, 2, 119)));
+        assert!(
+            !cm.supports_broadcast_target_list(pre_floor),
+            "a peer one release below the floor must keep receiving the legacy \
+             BroadcastTo, byte-identical to today"
+        );
+
+        let at_floor = make_addr(9203);
+        cm.record_remote_version(
+            at_floor,
+            Some(crate::node::BROADCAST_TARGET_LIST_MIN_VERSION),
+        );
+        assert!(
+            cm.supports_broadcast_target_list(at_floor),
+            "the floor release carries the variants, so it must be accepted — \
+             otherwise the feature never activates at all"
+        );
+
+        let newer = make_addr(9204);
+        cm.record_remote_version(newer, Some((0, 3, 0)));
+        assert!(
+            cm.supports_broadcast_target_list(newer),
+            "the floor is a minimum, never an equality test"
+        );
+    }
+
+    /// #5147's copy of the release-timing guard. See
+    /// `hash_first_floor_tracks_the_shipping_release` for the full rationale;
+    /// the failure it prevents is identical — a floor left behind by a release
+    /// bump means peers on the real 0.2.120 read as at-floor, receive a
+    /// `BroadcastToV2` they have no variant index for, fail to decode, and the
+    /// connection is closed.
+    #[test]
+    fn broadcast_target_list_floor_tracks_the_shipping_release() {
+        fn crate_version() -> (u8, u8, u16) {
+            let v = env!("CARGO_PKG_VERSION");
+            let mut it = v.split('.');
+            let major = it.next().unwrap().parse().expect("major");
+            let minor = it.next().unwrap().parse().expect("minor");
+            let patch = it
+                .next()
+                .unwrap()
+                .split(['-', '+'])
+                .next()
+                .unwrap()
+                .parse()
+                .expect("patch");
+            (major, minor, patch)
+        }
+
+        let floor = crate::node::BROADCAST_TARGET_LIST_MIN_VERSION;
+        let current = crate_version();
+
+        match crate::node::BROADCAST_TARGET_LIST_SHIPPED_IN {
+            None => assert!(
+                floor > current,
+                "BROADCAST_TARGET_LIST_MIN_VERSION is {floor:?} but the crate \
+                 is already at {current:?}, and BROADCAST_TARGET_LIST_SHIPPED_IN \
+                 is None.\n\n\
+                 The release has caught up with the floor. Decide which is true \
+                 and encode it:\n\
+                 - This release DOES carry the target list -> set \
+                 BROADCAST_TARGET_LIST_SHIPPED_IN = Some({floor:?}) and freeze \
+                 both.\n\
+                 - It does NOT -> raise BROADCAST_TARGET_LIST_MIN_VERSION to the \
+                 release that will.\n\n\
+                 Leaving it ships a floor that peers on the real {current:?} \
+                 satisfy without carrying the BroadcastToV2 variant: they cannot \
+                 decode it, and the connection is closed."
+            ),
+            Some(shipped) => {
+                assert_eq!(
+                    shipped, floor,
+                    "BROADCAST_TARGET_LIST_SHIPPED_IN ({shipped:?}) must EQUAL \
+                     BROADCAST_TARGET_LIST_MIN_VERSION ({floor:?})"
+                );
+                assert!(
+                    floor <= current,
+                    "shipped in {shipped:?} but the crate is only at {current:?} \
+                     — a release cannot have shipped in the future"
+                );
+            }
+        }
+    }
+
+    /// Catches the floor being LOWERED, which the marker test above cannot see.
+    #[test]
+    fn broadcast_target_list_floor_stays_above_every_release_without_the_variants() {
+        /// Last release that does NOT carry the V2 broadcast variants.
+        const LAST_RELEASE_WITHOUT_VARIANTS: (u8, u8, u16) = (0, 2, 119);
+        assert!(
+            crate::node::BROADCAST_TARGET_LIST_MIN_VERSION > LAST_RELEASE_WITHOUT_VARIANTS,
+            "BROADCAST_TARGET_LIST_MIN_VERSION ({:?}) dropped to or below \
+             {LAST_RELEASE_WITHOUT_VARIANTS:?}, a release with no BroadcastToV2 \
+             variant index. Emitting to those peers fails to decode and drops \
+             the connection.",
+            crate::node::BROADCAST_TARGET_LIST_MIN_VERSION,
+        );
+    }
+
+    /// Companion to the marker guard: the floor must never drop to or below a
+    /// release known NOT to carry the variants.
+    ///
+    /// Kept alongside the marker test rather than replaced by it, because the
+    /// two catch different mistakes: this one catches the floor being LOWERED
+    /// (e.g. someone "fixing" a gate that seems not to fire), the marker one
+    /// catches the RELEASE advancing past a stationary floor.
+    #[test]
+    fn hash_first_floor_stays_above_every_release_without_the_variants() {
+        /// Last release that does NOT carry the hash-first wire variants.
+        const LAST_RELEASE_WITHOUT_VARIANTS: (u8, u8, u16) = (0, 2, 115);
+        assert!(
+            crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION > LAST_RELEASE_WITHOUT_VARIANTS,
+            "HASH_FIRST_SUMMARIES_MIN_VERSION ({:?}) dropped to or below \
+             {LAST_RELEASE_WITHOUT_VARIANTS:?}, a release with no \
+             SummaryDigests variant index. Emitting to those peers fails to \
+             decode and drops the connection.",
+            crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION,
+        );
     }
 
     // ============ cleanup_expired_transients tests ============
@@ -3643,10 +4405,16 @@ mod tests {
         // global races this one's `assert_eq!`. (CI's `cargo nextest` masks
         // the race with per-process isolation; `cargo test` does not.)
         //
-        // `connection_manager`'s `test_try_set_own_addr_*` tests and every
-        // test in `node::network_status` also touch this global. They are all
-        // serialized by the crate-wide `TEST_GLOBAL_STATE_LOCK`, which this
-        // test acquires below for its entire body.
+        // Other writers of this global — `connection_manager`'s
+        // `test_try_set_own_addr_*` tests and every `node::network_status`
+        // test — take the crate-wide `TEST_GLOBAL_STATE_LOCK`, which this test
+        // holds for its entire body. Tests that only need routing to know
+        // their address (resync/eviction tests in `node.rs`, `ring.rs`,
+        // `node/op_state_manager.rs`) do NOT write the global at all: they use
+        // `ConnectionManager::set_own_addr_local_for_test`, so they cannot race
+        // this assertion. `test_no_test_calls_global_set_own_addr` pins that.
+        // (Before #4918 those tests used the mirroring `set_own_addr` without
+        // the lock and flaked this test ~1 run in 3 under `cargo test`.)
         //
         // `network_status::set_external_address` is a no-op until `init()` has
         // run. `init()` is idempotent-overwrite (installs the tracker on the
@@ -3684,6 +4452,9 @@ mod tests {
                 handles.push(std::thread::spawn(move || {
                     // Align starts so the threads' critical sections overlap.
                     barrier.wait();
+                    // GLOBAL-ADDR-WRITE-OK: this test IS the mirror's
+                    // atomicity regression test, and its body holds
+                    // TEST_GLOBAL_STATE_LOCK throughout (#4918).
                     cm.set_own_addr(addr);
                 }));
             }
@@ -3716,6 +4487,108 @@ mod tests {
         drop(_global);
         if let Some(msg) = divergence {
             panic!("{msg}");
+        }
+    }
+
+    /// Guard for #4918: tests that only need routing to know their address
+    /// must NOT call the mirroring [`ConnectionManager::set_own_addr`], which
+    /// writes the process-global `network_status::external_address` and races
+    /// `test_set_own_addr_atomic_with_network_status` unless serialized by
+    /// `TEST_GLOBAL_STATE_LOCK`.
+    ///
+    /// This is a SOURCE-SCRAPE guard on purpose. The race only manifests under
+    /// `cargo test`'s shared-process model; CI's `cargo nextest` gives every
+    /// test its own process and masks it. A behavioural test therefore could
+    /// not catch a regression in CI — but this scrape runs deterministically
+    /// under both runners, so it does.
+    ///
+    /// It walks the WHOLE crate source and checks each call site individually.
+    /// Neither a fixed file list nor a per-file allowlist is enough: both are
+    /// the same "remember to update it" fragility this fix exists to remove.
+    /// The caller inventory for this bug was wrong three times running (5 sites,
+    /// then 7, then 9 — the last two found by review), and the two files that
+    /// legitimately write the global both contain test modules, so exempting
+    /// them wholesale would let the identical race back in. Every call site
+    /// must therefore carry an explicit [`MARKER`] annotation justifying it.
+    #[test]
+    fn test_no_test_calls_global_set_own_addr() {
+        use std::path::Path;
+
+        // Built at runtime so this file's own source does not contain the
+        // literal being searched for (which would match the guard itself).
+        let bare = format!(".set_own_addr{}", "(");
+        // An annotation on the call line, or anywhere in the comment block
+        // immediately above it, marks a write to the process-global mirror as
+        // deliberate and justified. The whole block is searched so a
+        // multi-line justification can lead with the marker and still read
+        // naturally.
+        const MARKER: &str = "GLOBAL-ADDR-WRITE-OK";
+
+        fn visit(dir: &Path, out: &mut Vec<(String, usize, String)>, bare: &str) {
+            let entries = std::fs::read_dir(dir).expect("read crate source dir");
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(&path, out, bare);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let src = std::fs::read_to_string(&path).expect("read source file");
+                    let lines: Vec<&str> = src.lines().collect();
+                    for (i, line) in lines.iter().enumerate() {
+                        if !line.contains(bare) {
+                            continue;
+                        }
+                        // Walk back over the contiguous comment block directly
+                        // above the call, stopping at the first non-comment
+                        // line so a marker on an unrelated earlier statement
+                        // cannot vouch for this one.
+                        let annotated = line.contains(MARKER)
+                            || lines[..i]
+                                .iter()
+                                .rev()
+                                .take_while(|l| l.trim_start().starts_with("//"))
+                                .any(|l| l.contains(MARKER));
+                        if !annotated {
+                            out.push((
+                                path.to_string_lossy().replace('\\', "/"),
+                                i + 1,
+                                line.trim().to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut unannotated = Vec::new();
+        visit(&src_root, &mut unannotated, &bare);
+
+        assert!(
+            unannotated.is_empty(),
+            "unannotated calls to the mirroring `set_own_addr`, which writes \
+             the process-global external_address and races \
+             test_set_own_addr_atomic_with_network_status under `cargo test`: \
+             {unannotated:#?}\nFor a test that only needs routing to know the \
+             address, use `set_own_addr_local_for_test`. If the global mirror \
+             is genuinely required, hold TEST_GLOBAL_STATE_LOCK (or be \
+             production code) and annotate the line with `{MARKER}` plus a \
+             reason. See #4918."
+        );
+
+        // The migrated files must still SET an address, so a future edit
+        // cannot quietly drop address-setting and pass vacuously.
+        for name in [
+            "node.rs",
+            "ring.rs",
+            "node/op_state_manager.rs",
+            "operations/update/op_ctx_task.rs",
+        ] {
+            let src = std::fs::read_to_string(src_root.join(name)).expect("read migrated file");
+            assert!(
+                src.contains(".set_own_addr_local_for_test("),
+                "{name} should set own address via set_own_addr_local_for_test \
+                 (see #4918)"
+            );
         }
     }
 

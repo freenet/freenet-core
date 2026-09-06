@@ -296,7 +296,11 @@ impl SecretArgs {
 pub struct Secrets {
     #[serde(skip)]
     pub transport_keypair: TransportKeypair,
-    #[serde(rename = "transport_keypair", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "transport_keypair",
+        alias = "transport-keypair",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub transport_keypair_path: Option<PathBuf>,
     #[serde(skip)]
     pub nonce: [u8; 24],
@@ -341,8 +345,9 @@ impl Drop for Secrets {
 // (e.g. encrypting under one and decrypting under another without a
 // `register_delegate` round-trip) will fail. All current test sites
 // construct exactly one `SecretsStore::new(_, Default::default(), _)`
-// per test and route their crypto through the registered-cipher path,
-// so the non-reproducibility is invisible to them.
+// per test, and since #4146 their delegate crypto runs on the node-KEK-derived
+// DEK rather than on this cipher at all, so the non-reproducibility is
+// invisible to them.
 #[cfg(test)]
 impl Default for Secrets {
     fn default() -> Self {

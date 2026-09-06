@@ -2,6 +2,25 @@ import { test, expect } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+// SUPERSEDED by PR #5100 — retained, skipped, as historical documentation of
+// the pre-#5100 contract (project rule: a test superseded by a semantic change
+// is skipped with an explanation, not deleted).
+//
+// The `window.open` override these tests pin is gone. It existed because a
+// popup opened from the sandboxed iframe INHERITED the sandbox (opaque origin,
+// no localStorage), so the interceptor forwarded programmatic opens to the
+// shell via `open_url`. That forwarding is exactly what broke Firefox: the
+// shell's `window.open` then ran inside a `message` handler, which Firefox's
+// popup blocker refuses. The iframe now carries
+// `allow-popups-to-escape-sandbox`, so a native `window.open` from contract JS
+// produces a real top-level tab on its own and needs no shell round-trip.
+//
+// Current coverage for programmatic opens under the new design lives in
+// shell.spec.ts ("contract JS calling window.open() gets a real top-level
+// tab"). Unskipping this file would fail by design — it asserts the forwarding
+// that #5100 deliberately removed.
+test.skip(true, "superseded by PR #5100: window.open override removed");
+
 // Behavioral regression tests for the programmatic `window.open` override in
 // the injected navigation interceptor
 // (crates/core/src/server/path_handlers/assets/navigation_interceptor.js).
@@ -54,7 +73,10 @@ type Collected = {
 // window.open (so fallbacks are observable without spawning real popups), then
 // the real interceptor (which binds the spy as its native fallback), then an
 // exercise script that calls the overridden window.open and reports back.
-function buildSrcdoc(baseHref: string, calls: Array<{ label: string; expr: string }>): string {
+function buildSrcdoc(
+  baseHref: string,
+  calls: Array<{ label: string; expr: string }>,
+): string {
   const exercise = calls
     .map(
       (c) =>
@@ -119,7 +141,9 @@ async function runHarness(
 
   await page
     .waitForFunction(
-      () => (window as unknown as { __collected: Collected }).__collected.report !== null,
+      () =>
+        (window as unknown as { __collected: Collected }).__collected.report !==
+        null,
       { timeout: 5000 },
     )
     .catch(() => {});
@@ -150,7 +174,9 @@ test("forwards http(s) new-window opens to the shell as an absolute URL, returni
 
   const fwd = collected.forwarded.map((f) => f.url);
   // Relative resolves against the iframe base to an absolute URL.
-  expect(fwd).toContain("https://node.example/v1/contract/web/KEY/page2/sub#frag");
+  expect(fwd).toContain(
+    "https://node.example/v1/contract/web/KEY/page2/sub#frag",
+  );
   expect(fwd).toContain("https://example.com/x?q=1");
   expect(fwd).toContain("http://example.org/y");
   // URL objects are coerced and forwarded, not dead-ended.
@@ -202,7 +228,9 @@ test("strips __sandbox from an absolute same-origin open (window.open(location.h
     "https://node.example/v1/contract/web/KEY/sub/page?__sandbox=1&invite=a%20b~";
   const collected = await runHarness(
     page,
-    buildSrcdoc(BASE, [{ label: "same-origin-abs", expr: JSON.stringify(sameOriginAbs) }]),
+    buildSrcdoc(BASE, [
+      { label: "same-origin-abs", expr: JSON.stringify(sameOriginAbs) },
+    ]),
   );
   const report = collected.report!;
   expect(report.error).toBeUndefined();
@@ -220,7 +248,10 @@ test("forwards window.open(null) as the coerced relative 'null' target (native p
 }) => {
   // Native Web IDL coerces null to the string "null" (a relative URL), unlike an
   // omitted arg (about:blank). So it must be forwarded, not sent to native.
-  const collected = await runHarness(page, buildSrcdoc(BASE, [{ label: "null-arg", expr: "null" }]));
+  const collected = await runHarness(
+    page,
+    buildSrcdoc(BASE, [{ label: "null-arg", expr: "null" }]),
+  );
   const report = collected.report!;
   expect(report.error).toBeUndefined();
   expect(report.nativeCalls.length).toBe(0);
@@ -238,7 +269,9 @@ test("forwards absolute external URLs without reserializing the query string", a
   const signed = "https://example.com/o?X-Amz-Signature=abc&a=%2F%2f%20~";
   const collected = await runHarness(
     page,
-    buildSrcdoc(BASE, [{ label: "signed-external", expr: JSON.stringify(signed) }]),
+    buildSrcdoc(BASE, [
+      { label: "signed-external", expr: JSON.stringify(signed) },
+    ]),
   );
   const report = collected.report!;
   expect(report.error).toBeUndefined();
@@ -317,7 +350,10 @@ test("does not intercept in a nested descendant frame (parent !== top)", async (
   // Outer app frame simply embeds the inner frame (both sandboxed). Escape the
   // inner document's </script> tags so they don't prematurely close the outer
   // frame's own inline <script> when this HTML is parsed.
-  const innerEmbedded = JSON.stringify(inner).replace(/<\/script>/g, "<\\/script>");
+  const innerEmbedded = JSON.stringify(inner).replace(
+    /<\/script>/g,
+    "<\\/script>",
+  );
   const outer = `<!doctype html><html><body>
 <script>
   var b = document.createElement('iframe');
@@ -333,7 +369,11 @@ test("does not intercept in a nested descendant frame (parent !== top)", async (
       new Promise<{ ret: string; parentIsTop: boolean }>((resolve) => {
         window.addEventListener("message", (e: MessageEvent) => {
           const m = e.data as Record<string, unknown>;
-          if (m && m.__nested__) resolve({ ret: m.ret as string, parentIsTop: m.parentIsTop as boolean });
+          if (m && m.__nested__)
+            resolve({
+              ret: m.ret as string,
+              parentIsTop: m.parentIsTop as boolean,
+            });
         });
         const a = document.createElement("iframe");
         a.setAttribute("sandbox", "allow-scripts allow-popups");
@@ -348,14 +388,18 @@ test("does not intercept in a nested descendant frame (parent !== top)", async (
   expect(result.ret).toBe("NATIVE_SPY");
 });
 
-test("does not override window.open at top level (parent guard)", async ({ page }) => {
+test("does not override window.open at top level (parent guard)", async ({
+  page,
+}) => {
   // Loaded top-level, window.parent === window, so the override must NOT engage
   // (otherwise it would break the shell page's own window.open). Evaluate the
   // interceptor at top level with a postMessage spy and confirm no forward.
   await page.goto("about:blank");
   const forwarded = await page.evaluate((src: string) => {
     const posts: unknown[] = [];
-    (window as unknown as { postMessage: unknown }).postMessage = (m: unknown) => posts.push(m);
+    (window as unknown as { postMessage: unknown }).postMessage = (
+      m: unknown,
+    ) => posts.push(m);
     let nativeCalled = false;
     (window as unknown as { open: unknown }).open = () => {
       nativeCalled = true;
@@ -363,7 +407,9 @@ test("does not override window.open at top level (parent guard)", async ({ page 
     };
     // Indirect eval runs the IIFE in global scope (window.parent === window).
     (0, eval)(src);
-    (window as unknown as { open: (u: string) => unknown }).open("https://example.com/x");
+    (window as unknown as { open: (u: string) => unknown }).open(
+      "https://example.com/x",
+    );
     return { posts, nativeCalled };
   }, INTERCEPTOR);
   expect(forwarded.nativeCalled).toBe(true);

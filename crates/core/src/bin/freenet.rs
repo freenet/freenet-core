@@ -34,17 +34,17 @@ struct Cli {
 enum Command {
     /// Run the node in network mode (default if no subcommand specified)
     ///
-    /// NOTE ON AUTO-UPDATE: a node detects new releases and exits with code 42
-    /// to request an update, but it does NOT update itself. Applying the update
-    /// requires a supervisor that catches exit code 42 and runs `freenet update`
-    /// before restarting — this is set up by `freenet service install` (systemd
-    /// on Linux, a launchd wrapper on macOS, the tray wrapper on Windows).
+    /// About auto-update: the node spots new releases and exits with code 42 to
+    /// ask for an update, and something else has to apply it. That something is
+    /// a supervisor which catches exit code 42, runs `freenet update`, and
+    /// restarts the node. `freenet service install` sets one up: a systemd unit
+    /// on Linux, a launchd wrapper on macOS, the tray wrapper on Windows.
     ///
-    /// A bare `freenet network` run has no such supervisor: it will detect an
-    /// update, exit, and NOT be restarted, so it stays on its current version.
-    /// To keep a hand-run node current, either run `freenet update` yourself when
-    /// prompted in the logs, or install Freenet as a service. Dirty/dev builds
-    /// disable auto-update entirely (it would clobber local changes).
+    /// A bare `freenet network` run has no supervisor, so it spots an update,
+    /// exits, and is never restarted, leaving it on its current version. To keep
+    /// a hand-run node current, run `freenet update` yourself when the logs
+    /// prompt you, or install Freenet as a service. Builds from a dirty working
+    /// tree skip auto-update entirely, since it would discard local changes.
     Network {
         #[command(flatten)]
         config: ConfigArgs,
@@ -61,11 +61,12 @@ enum Command {
     Update(UpdateCommand),
     /// Completely uninstall Freenet (service, binaries, and optionally data)
     Uninstall(UninstallCommand),
-    /// Manage the node KEK (Key Encryption Key) backend.
+    /// Manage the node KEK (key encryption key) backend.
     ///
-    /// The KEK is the master key from which every per-delegate DEK is
-    /// derived via HKDF. Subcommands report status, rotate, or migrate
-    /// the KEK between backends (OS keyring / systemd credential / file).
+    /// The KEK is the master key that every per-delegate data encryption key
+    /// (DEK) is derived from, via HKDF. The subcommands report its status,
+    /// rotate it, or move it between backends: OS keyring, systemd credential,
+    /// or a file.
     Secrets(SecretsCliConfig),
 }
 
@@ -209,6 +210,24 @@ fn auto_update_is_disabled(git_dirty: &str, disable_flag: bool) -> bool {
 async fn run_network(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in network mode");
 
+    // Initialise conformance capture (RFC #5320) here rather than leaving it to the
+    // first merge. It is a no-op unless FREENET_CONFORMANCE_CAPTURE_DIR is set, but
+    // an operator who set it needs to see confirmation at startup: initialising
+    // lazily means the "capture enabled" line only appears once traffic happens to
+    // arrive, so a freshly-joined peer looks identical whether capture is working or
+    // silently misconfigured.
+    let _ = freenet::conformance::capture::global();
+
+    // Honor a persistent operator disable (`freenet service disable`, #4690
+    // sibling): while the marker is present the node must not run, and must stay
+    // down across restarts/reboots. Idle instead of serving so the supervisor
+    // keeps us as a healthy (but inert) unit rather than restart-looping.
+    // `freenet service enable` removes the marker and restarts the service.
+    let config_dir = config.paths().config_dir();
+    if commands::daemon_control::is_daemon_disabled(&config_dir) {
+        return run_disabled_idle(&config_dir).await;
+    }
+
     // Check if another freenet process is already using the WS API port.
     // If so, bail out immediately instead of proceeding to bind and fail.
     // This prevents systemd restart loops when another instance is running.
@@ -237,6 +256,47 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
 
     // Run node with signal handling for graceful shutdown
     run_network_node_with_signals(node, shutdown_handle, disable_auto_update).await
+}
+
+/// Park the process in an inert "disabled" state until it receives a shutdown
+/// signal. Entered when `freenet service disable` has written the daemon-
+/// disabled marker (checked in `run_network`).
+///
+/// The node deliberately does NOT bind the WS API or join the network: it stays
+/// a live-but-idle process so the service supervisor (systemd unit, launchd
+/// agent, or tray wrapper) keeps it as a healthy unit instead of restart-looping
+/// on a fast exit. It does no work until re-enabled. `freenet service enable`
+/// removes the marker and restarts the service to bring the node back.
+///
+/// Returning `Ok(())` on SIGTERM/SIGINT means a `systemctl stop` (or the wrapper
+/// killing the child) exits cleanly; with no signal the process simply parks
+/// indefinitely, which is the whole point of "disabled until turned on again".
+async fn run_disabled_idle(config_dir: &std::path::Path) -> anyhow::Result<()> {
+    use tokio::signal;
+
+    tracing::warn!(
+        marker = %commands::daemon_control::disabled_marker_path(config_dir).display(),
+        "Freenet background daemon is DISABLED (`freenet service disable`). The node will NOT \
+         start or join the network and will remain idle until you run `freenet service enable`. \
+         This persists across restarts and reboots."
+    );
+
+    #[cfg(unix)]
+    {
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .context("failed to install SIGTERM handler")?;
+        tokio::select! {
+            _ = signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
+    }
+
+    tracing::info!("Disabled daemon received shutdown signal; exiting cleanly.");
+    Ok(())
 }
 
 /// Run the network node with signal handling for graceful shutdown.
@@ -315,9 +375,18 @@ async fn run_network_node_with_signals(
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .context("failed to install SIGTERM handler")?;
 
+    // Set when THIS process asks the node to stop because an operator signalled
+    // it (SIGTERM from `systemctl stop`, SIGINT from Ctrl+C). Load-bearing for
+    // the exit code: see `finish_run` — an "operator asked us to stop" exit is a
+    // SUCCESS, but the same `EventLoopExitReason::GracefulShutdown` value is
+    // ALSO produced by a fault (a critical internal channel dying, see
+    // `p2p_protoc::ChannelCloseReason`), which must keep failing loudly.
+    let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Spawn a task to listen for shutdown signals and trigger graceful shutdown
     let signal_task = {
         let shutdown_handle = shutdown_handle.clone();
+        let shutdown_requested = Arc::clone(&shutdown_requested);
         GlobalExecutor::spawn(async move {
             #[cfg(unix)]
             let shutdown_reason = tokio::select! {
@@ -332,6 +401,9 @@ async fn run_network_node_with_signals(
             };
 
             tracing::info!(reason = shutdown_reason, "Initiating graceful shutdown");
+            // Record the request BEFORE making it, so the flag is always visible
+            // by the time the event loop can observe the shutdown and return.
+            shutdown_requested.store(true, std::sync::atomic::Ordering::SeqCst);
             shutdown_handle.shutdown().await;
         })
     };
@@ -477,7 +549,27 @@ async fn run_network_node_with_signals(
                 return;
             }
         }
-        tracing::debug!("Startup update check: no newer version found");
+        // INFO, not `debug!`: release builds set `release_max_level_info`
+        // (crates/core/Cargo.toml), so a `debug!` here is compiled OUT of every
+        // shipped binary. That left the startup check with no observable ENDING
+        // on the outcome it takes most often. "The check finished and decided to
+        // stay put" looked exactly like "the check was killed mid-request", and
+        // the release canary (#5222) cannot pass a binary safely without telling
+        // those apart: absence of a parse error is evidence that parsing worked
+        // only if the check is known to have finished. Without this line Gate A
+        // would wave through a binary carrying the #5221 bug whenever GitHub
+        // answered slowly enough that the canary stopped the node first.
+        //
+        // Reached on EVERY non-triggering outcome -- already up to date, GitHub
+        // unreachable, unparseable tag, #4073 locally-blocked version -- so it
+        // claims only that the check ended. The WARN above it, if any, says why.
+        // Do not reword it into a claim about the version, and do not change the
+        // leading phrase: scripts/auto-update-canary.sh greps for it, and
+        // scripts/auto-update-canary_test.sh pins it against this file.
+        tracing::info!(
+            current = build_info::VERSION,
+            "Startup update check complete: staying on the current version"
+        );
 
         /// Parse our version string into a (major, minor, patch) tuple for comparison.
         fn parse_our_version() -> Option<(u8, u8, u16)> {
@@ -848,11 +940,62 @@ async fn run_network_node_with_signals(
     // and complete their cleanup without being forcefully killed by SIGKILL.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
+    let result = finish_run(
+        result,
+        shutdown_requested.load(std::sync::atomic::Ordering::SeqCst),
+    );
+
     if result.is_ok() {
         tracing::info!("Graceful shutdown complete");
     }
 
     result
+}
+
+/// Decide what a finished node run means for the PROCESS EXIT CODE (#5227).
+///
+/// `run_network_node` reports a clean SIGTERM/SIGINT stop as
+/// `Err(EventLoopExitReason::GracefulShutdown)` — a typed sentinel, not a real
+/// error. `main` used to hand that straight to its `eprintln!("Error: …")` +
+/// `std::process::exit(1)` fallback, so a deliberate `systemctl stop` was logged
+/// as `status=1/FAILURE`; and because `rollback::classify_stop` treats any
+/// status outside {0, 2, 42, 43, 44} as a crash, three clean stops of a freshly
+/// updated node inside its post-update probation window were enough to trigger
+/// an auto-rollback of a perfectly healthy release (#4073).
+///
+/// Two conditions are required to map that to a success exit, and the second is
+/// the load-bearing one:
+///
+/// 1. `listener_exit_is_graceful(&err)` — the SAME predicate the #4549
+///    fatal-listener force-exit path uses, so the two cannot disagree about
+///    which errors are candidates.
+/// 2. `shutdown_requested` — THIS process asked the node to stop, because an
+///    operator signalled it.
+///
+/// (1) alone is NOT sufficient, and this is the whole reason the flag exists.
+/// `p2p_protoc` raises the very same `GracefulShutdown` when a critical internal
+/// channel dies (`ChannelCloseReason::{Bridge, Controller, Notification,
+/// OpExecution}`) — a node-fatal fault that logs `CRITICAL: Channel closed …`.
+/// `client_events.rs` likewise sends the identical `NodeEvent::Disconnect` when
+/// every client transport has died, a degraded state its own comments call
+/// "restart recommended". Neither is distinguishable from an operator stop at the
+/// p2p layer, so this flag is the sole discriminator. Both must keep a non-zero
+/// exit: on Linux that is what still fires the unit's `ExecStopPost` self-heal
+/// and counts the crash toward probation, and on the macOS/Windows wrappers an
+/// exit 0 is read as "normal shutdown" and would leave the node DOWN rather than
+/// relaunching it.
+///
+/// The auto-update exit is untouched: it surfaces as `UpdateNeededError`, not an
+/// `EventLoopExitReason`, so it still exits 42 and still fires the supervisor's
+/// `freenet update` hook. In the rare race where an update is detected in the
+/// same instant as a SIGTERM, the unbiased `select!` above may resolve the node
+/// arm and the exit is a clean 0 — the operator asked us to stop, so stopping
+/// wins, and the update is picked up by `startup_update_check` on the next boot.
+fn finish_run(result: anyhow::Result<()>, shutdown_requested: bool) -> anyhow::Result<()> {
+    match result {
+        Err(e) if shutdown_requested && freenet::listener_exit_is_graceful(&e) => Ok(()),
+        other => other,
+    }
 }
 
 /// Exit code when another freenet instance is already running.
@@ -1007,6 +1150,12 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
     rt.block_on(async move {
         let config = config_args.build().await?;
         freenet::config::set_logger(None, None, config.paths().log_dir());
+        // Same reason as the info! below: `ConfigArgs::build()` resolves the
+        // client API's bind address, but it runs with no subscriber installed,
+        // so it records the decision instead of logging it. Replay it here —
+        // this is the only place an operator learns that their node stopped
+        // answering clients on other machines, and why.
+        config.log_client_api_exposure();
         // The logger is needed before this info which is why it's here instead of above
         tracing::info!(
             max_blocking_threads,
@@ -1019,6 +1168,34 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
     })?;
 
     Ok(())
+}
+
+/// Carry the client-API exposure flags across the subcommand boundary.
+///
+/// `--ws-api-address` / `--allowed-host` / `--allowed-source-cidrs` placed
+/// BEFORE the subcommand (`freenet --ws-api-address :: network`) land in the
+/// top-level `ConfigArgs`, which the `Network`/`Local` arms otherwise discard —
+/// the same trap `--disable-auto-update` hit in #4690.
+///
+/// This matters more since the client API started defaulting to loopback
+/// (GHSA-824h-7x5x-wfmf): these three flags are exactly how an operator asks
+/// for a wider bind, so silently dropping one leaves the node loopback-only
+/// while the operator believes they opted out. Previously the same typo was
+/// harmless, because network mode bound `::` either way.
+///
+/// The subcommand's own value wins; the top-level one only fills a gap.
+fn merge_pre_subcommand_ws_api_args(config: &mut ConfigArgs, top_level: &ConfigArgs) {
+    config.ws_api.address = config.ws_api.address.or(top_level.ws_api.address);
+    config.ws_api.allowed_host = config
+        .ws_api
+        .allowed_host
+        .take()
+        .or_else(|| top_level.ws_api.allowed_host.clone());
+    config.ws_api.allowed_source_cidrs = config
+        .ws_api
+        .allowed_source_cidrs
+        .take()
+        .or_else(|| top_level.ws_api.allowed_source_cidrs.clone());
 }
 
 fn freenet_main() -> anyhow::Result<()> {
@@ -1060,11 +1237,13 @@ fn freenet_main() -> anyhow::Result<()> {
             // opt-out leaves the from-source node auto-updating (the exact loop
             // we are preventing).
             config.disable_auto_update |= cli.config.disable_auto_update;
+            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
             run_node(config)
         }
         Some(Command::Local { mut config }) => {
             config.mode = Some(OperationMode::Local);
             config.disable_auto_update |= cli.config.disable_auto_update;
+            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
             run_node(config)
         }
         None => {
@@ -1245,6 +1424,336 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::parse_listening_inode;
 
+    /// #5227 truth table for the process exit code. The end-to-end proof is
+    /// `tests/graceful_shutdown_exit_code.rs` (it asserts the real process's
+    /// status); this pins the decision itself, including the case that test
+    /// cannot drive a live node into — an UNREQUESTED `GracefulShutdown`, raised
+    /// when a critical internal channel dies (`p2p_protoc::ChannelCloseReason`)
+    /// or every client transport is lost (`client_events.rs`).
+    ///
+    /// Restoring the bug (`finish_run` returning `result`), broadening the guard
+    /// to `Err(_) => Ok(())`, or dropping either conjunct fails this test.
+    #[test]
+    fn finish_run_maps_only_a_requested_graceful_stop_to_success() {
+        use super::commands::auto_update::UpdateNeededError;
+        use super::finish_run;
+        use freenet::EventLoopExitReason;
+
+        // The bug: an operator-requested stop is a SUCCESS.
+        assert!(
+            finish_run(Err(EventLoopExitReason::GracefulShutdown.into()), true).is_ok(),
+            "a SIGTERM/SIGINT stop must exit 0, or systemd logs status=1/FAILURE for a \
+             clean `systemctl stop` and the post-update probation counts it as a crash"
+        );
+
+        // The trap: the SAME sentinel is raised by a critical-channel death that
+        // nobody asked for. It must keep failing, or the macOS/Windows wrappers
+        // read "normal shutdown" and leave the node DOWN, and systemd skips the
+        // ExecStopPost self-heal and the probation crash count.
+        assert!(
+            finish_run(Err(EventLoopExitReason::GracefulShutdown.into()), false).is_err(),
+            "an UNREQUESTED graceful-shutdown exit is a fault and must stay non-zero"
+        );
+
+        // Ordinary fatal listener exits are untouched, requested or not.
+        assert!(finish_run(Err(EventLoopExitReason::UnexpectedStreamEnd.into()), true).is_err());
+        assert!(finish_run(Err(anyhow::anyhow!("boom")), true).is_err());
+
+        // Auto-update must still exit 42, or `ExecStopPost` (which skips `0|43`)
+        // never runs `freenet update`.
+        let update = finish_run(
+            Err(UpdateNeededError {
+                new_version: "9.9.9".to_string(),
+            }
+            .into()),
+            true,
+        )
+        .expect_err("update exit must not become a success");
+        assert_eq!(
+            update
+                .downcast_ref::<UpdateNeededError>()
+                .map(|u| u.new_version.as_str()),
+            Some("9.9.9"),
+            "the UpdateNeededError must survive so `main` exits 42"
+        );
+
+        // A run that somehow returned Ok stays Ok.
+        assert!(finish_run(Ok(()), false).is_ok());
+    }
+
+    /// Whitespace-stripped view of source text, so a source-scrape pin survives
+    /// `rustfmt` re-wrapping a call across lines (`shutdown_requested\n
+    /// .store(..)` would otherwise stop matching a contiguous needle).
+    fn squeeze(src: &str) -> String {
+        src.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The part of this file BEFORE its `#[cfg(test)] mod tests`, i.e. production
+    /// code only.
+    ///
+    /// A pin that counts occurrences across the whole file counts its own
+    /// assertion literals too (`include_str!` pulls in the test module), so it
+    /// can never assert "exactly once". Cutting the region here is a structural
+    /// fix rather than the `concat!("a", "b")` needle-splitting used elsewhere in
+    /// this module, which only holds until someone writes the contiguous string.
+    ///
+    /// `.expect`, not a silent fallback: if the attribute stops matching, the
+    /// region would widen to the whole file and the pin would pass vacuously.
+    /// Refuse instead. (Same fail-closed reasoning as `commands::auto_update`'s
+    /// `fn_body`; see `.claude/rules/bug-prevention-patterns.md`.)
+    ///
+    /// Uniqueness is asserted rather than taking the first match: a second
+    /// `#[cfg(test)] mod` added ABOVE this one would truncate the region early
+    /// and hide any production code below it — fail-OPEN in exactly the
+    /// direction a bounded region exists to protect.
+    fn production_region(src: &str) -> &str {
+        let anchor = "\n#[cfg(test)]\nmod ";
+        assert_eq!(
+            src.matches(anchor).count(),
+            1,
+            "expected exactly one `#[cfg(test)] mod` in this file — the region this \
+             pin counts over is bounded by it, and an earlier one would truncate \
+             the region and hide production code"
+        );
+        let tests_at = src
+            .find(anchor)
+            .expect("test module not located — this pin cannot bound anything");
+        &src[..tests_at]
+    }
+
+    /// Slice `src` from `opener` (which must end at the block's `{`) to its
+    /// brace-matched close.
+    ///
+    /// Panics when the anchor is missing or the braces never balance, so a moved
+    /// anchor fails LOUDLY rather than silently widening the scoped region —
+    /// the #5102 failure mode that shipped twice.
+    fn braced_block<'a>(src: &'a str, opener: &str) -> &'a str {
+        delimited_block(src, opener, '{', '}')
+    }
+
+    /// As `braced_block`, for an arbitrary delimiter pair — used to slice a call's
+    /// argument list, where asserting on a substring would let a widened
+    /// expression through (`shutdown_requested.load(..) || whatever`).
+    fn delimited_block<'a>(src: &'a str, opener: &str, open: char, close: char) -> &'a str {
+        assert!(
+            opener.ends_with(open),
+            "opener must end at the opening delimiter: {opener}"
+        );
+        // Uniqueness, for the same reason `production_region` asserts it: this
+        // returns the FIRST match, so a second anchor would be sliced past in
+        // silence and every assertion below would describe the wrong block —
+        // fail-OPEN, the direction a bounded region exists to prevent.
+        assert_eq!(
+            src.matches(opener).count(),
+            1,
+            "expected exactly one `{opener}` in the scanned region; this slice \
+             takes the first, so any other is invisible to the pin that consumes it"
+        );
+        let at = src
+            .find(opener)
+            .unwrap_or_else(|| panic!("block anchor not found: {opener}"));
+        let body_start = at + opener.len();
+        let mut depth = 1usize;
+        for (i, c) in src[body_start..].char_indices() {
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[body_start..body_start + i];
+                }
+            }
+        }
+        panic!("delimiters never balanced after: {opener}");
+    }
+
+    /// #5230 rests entirely on `shutdown_requested` meaning EXACTLY "an operator
+    /// asked THIS process to stop". `finish_run` maps
+    /// `EventLoopExitReason::GracefulShutdown` to a success exit only when that
+    /// flag is set, because the identical sentinel is ALSO raised by faults — a
+    /// dead critical `p2p_protoc` channel, or `client_events` losing every client
+    /// transport. Those must keep exiting non-zero, or systemd skips the unit's
+    /// `ExecStopPost` self-heal and the macOS/Windows wrappers read "normal
+    /// shutdown" and leave the node DOWN.
+    ///
+    /// The whole discrimination therefore depends on there being exactly ONE
+    /// place that sets the flag. `finish_run_maps_only_a_requested_graceful_stop_to_success`
+    /// above takes it as a parameter, so it cannot see WHERE it is set: a second
+    /// store elsewhere would launder a fault into a success exit — the node exits
+    /// 0, looks healthy, and stays dead — with the entire suite green. The
+    /// tempting site is the auto-update arm of the `select!` in
+    /// `run_network_node_with_signals`, which also calls `shutdown_handle
+    /// .shutdown()` but is NOT an operator stop (it must keep exiting 42).
+    ///
+    /// So: the flag is mentioned in production only in the four ways below, its
+    /// one store is in the signal-handler task, and it happens only after a
+    /// signal has actually arrived.
+    ///
+    /// The check is CLOSED-WORLD — an enumeration of every permitted mention —
+    /// rather than a blocklist of forbidden spellings. A blocklist was the first
+    /// attempt and it leaked badly: `(*shutdown_requested).store(..)`,
+    /// `shutdown_requested.as_ref().store(..)`, and passing `&shutdown_requested`
+    /// to a helper that stores through it all raise the flag while matching no
+    /// banned string. Enumerating what is ALLOWED needs no foresight about how
+    /// the next author might spell it.
+    #[test]
+    fn shutdown_requested_is_stored_only_by_the_signal_handler() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let prod = production_region(&src);
+        let signal_task = squeeze(braced_block(prod, "let signal_task = {"));
+
+        // Anti-vacuity: if brace matching ran past the block, these markers from
+        // later in `run_network_node_with_signals` would be inside it, and the
+        // containment assertion below would prove nothing. `update_tx` and
+        // `startup_update_check` bound the NEAR side of an over-run (the update
+        // loop, immediately after this block); the rest bound the far side.
+        for escaped in [
+            "update_tx",
+            "startup_update_check",
+            "run_network_node(",
+            "UpdateNeededError",
+            "finish_run(",
+        ] {
+            assert!(
+                !signal_task.contains(&squeeze(escaped)),
+                "the scoped signal-task block escaped its braces (found `{escaped}`) — \
+                 this pin would pass vacuously"
+            );
+        }
+        // Anti-vacuity, other direction: confirm we scoped the right block. The
+        // marker must be one the TEMPTING block does not share — awaiting a
+        // signal is unique to this task, whereas `shutdown_handle.shutdown()`
+        // appears in the auto-update arm too and so would not discriminate. A set
+        // rather than one literal, so extracting the cfg-gated wait into a helper
+        // (a legitimate refactor) does not panic with a misleading message.
+        let awaits_a_signal = ["ctrl_c()", "sigterm.recv()", "shutdown_signal("]
+            .iter()
+            .filter_map(|m| signal_task.rfind(&squeeze(m)))
+            .max()
+            .expect("scoped block is not the signal-handler task: it awaits no signal");
+
+        // Every mention of the flag in production, in source order, identified by
+        // what FOLLOWS it. Anything else — any spelling, any new call site, any
+        // borrow handed to a helper — changes this list and fails.
+        let flat = squeeze(prod);
+        let follows: Vec<String> = flat
+            .split("shutdown_requested")
+            .skip(1)
+            .map(|after| after.chars().take(13).collect())
+            .collect();
+        let expected = [
+            // The `Arc<AtomicBool>` in `run_network_node_with_signals`:
+            "=Arc::new(std", // the declaration
+            "=Arc::clone(&", // the signal task's own handle
+            ");GlobalExecu", // ... the argument to that clone
+            ".store(true,s", // THE one write, in the signal task
+            ".load(std::sy", // the read that feeds `finish_run`
+            // `finish_run`'s parameter of the same name is a DISTINCT binding, a
+            // plain `bool`, so it cannot raise the flag:
+            ":bool)->anyho", // the parameter
+            "&&freenet::li", // the guard that consumes it
+        ];
+        assert_eq!(
+            follows, expected,
+            "production mentions `shutdown_requested` in a way this pin does not \
+             recognise. Every mention is enumerated on purpose: a new one is a new \
+             way to raise the flag (`(*flag).store(..)`, `flag.as_ref().store(..)`, \
+             `helper(&flag)`, `swap`/`fetch_or`/`compare_exchange`, a second \
+             `Arc::clone`), and raising it outside an operator stop makes \
+             `finish_run` report a FAULT as a clean exit 0 — the service manager \
+             skips its self-heal and the node stays dead (#5230). If the change is \
+             legitimate, extend the list deliberately"
+        );
+
+        // The enumeration above identifies each mention by only the first 13
+        // characters that follow it, which stops well short of the initialiser:
+        // `AtomicBool::new(true)` leaves all seven windows byte-identical, keeps
+        // the single store where it belongs, and still raises the flag before any
+        // signal arrives — so EVERY fault exits 0. That is the #5230 hole itself,
+        // reached without tripping anything else in this file or in
+        // `tests/graceful_shutdown_exit_code.rs`, which asserts SIGTERM => 0 and
+        // is equally satisfied by a flag that is never false.
+        //
+        // Pinned separately rather than by widening the windows: reaching `false`
+        // needs ~50 characters, which would drag that much incidental following
+        // text into all seven entries and make every adjacent edit churn the list.
+        assert_eq!(
+            flat.matches(&squeeze(
+                "shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false))"
+            ))
+            .count(),
+            1,
+            "the flag must be DECLARED false, exactly once. It means `an operator \
+             asked THIS process to stop`, so any initialiser that can be true \
+             before the signal task observes a signal makes `finish_run` report a \
+             FAULT as a clean exit 0 — the service manager skips its self-heal and \
+             the node stays dead (#5230)"
+        );
+
+        let store_at = signal_task
+            .find(&squeeze("shutdown_requested.store("))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the one store must live in the signal-handler task, which is \
+                     the only place that knows an operator (SIGTERM/SIGINT) asked \
+                     us to stop (#5230)"
+                )
+            });
+        // Location alone is not the invariant: a store hoisted ABOVE the signal
+        // await would still sit inside this block, yet would raise the flag
+        // unconditionally at startup and launder EVERY fault into a clean exit 0.
+        assert!(
+            store_at > awaits_a_signal,
+            "the store must come AFTER the signal await, not before it — a hoisted \
+             store raises the flag at startup, so every fault exits 0 (#5230)"
+        );
+    }
+
+    /// The write site is only half of #5230: `finish_run` must be FED the flag.
+    ///
+    /// `finish_run(result, true)` reopens the identical hole without touching the
+    /// store, and so does widening the argument
+    /// (`shutdown_requested.load(..) || transports_lost`) — which is not
+    /// hypothetical, since lost client transports are one of the two faults that
+    /// must keep exiting non-zero. No other test covers this: the truth-table test
+    /// takes the bool as a parameter and `tests/graceful_shutdown_exit_code.rs`
+    /// drives it with a real signal.
+    ///
+    /// So the whole argument list is matched, not a prefix of it.
+    #[test]
+    fn finish_run_is_fed_the_live_shutdown_flag() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let prod = production_region(&src);
+        // `= finish_run(` is the CALL; `fn finish_run(` is the definition. Keying
+        // on the `=` identifies the call wherever it sits in the file.
+        //
+        // `delimited_block` asserts `= finish_run(` is unique, but a second call
+        // written `return finish_run(result, true);` carries no `=`, so it would
+        // slip past that check while re-opening the hole this pin is named for.
+        // Exactly two mentions: the one call, and the definition.
+        assert_eq!(
+            prod.matches("finish_run(").count(),
+            2,
+            "expected exactly one `finish_run` CALL and one definition in \
+             production. A second call site is not inspected by this pin, so it \
+             could be fed a constant and make every fault exit 0 (#5230)"
+        );
+        let args = squeeze(delimited_block(prod, "= finish_run(", '(', ')'));
+        assert!(
+            args.contains(&squeeze("shutdown_requested.load(")),
+            "`finish_run` must receive the live `shutdown_requested` flag — a \
+             constant would make every fault exit 0 (#5230); got `{args}`"
+        );
+        for widened in ["||", "&&", "true", "false"] {
+            assert!(
+                !args.contains(widened),
+                "`finish_run`'s argument must be the flag ALONE: `{widened}` widens \
+                 the operator-stop test to cover something else, which is the #5230 \
+                 fault-laundering hole in a new spelling; got `{args}`"
+            );
+        }
+    }
+
     #[test]
     fn auto_update_default_stays_enabled_flag_and_dirty_disable() {
         use super::auto_update_is_disabled;
@@ -1289,6 +1798,82 @@ mod tests {
                 "flag must be honored in either position: {argv:?}"
             );
         }
+    }
+
+    /// Same trap, for the flags that now decide the client API's bind: placed
+    /// before the subcommand they land in the top-level `ConfigArgs`, which the
+    /// `Network`/`Local` arms discard. Dropping one leaves the node
+    /// loopback-only while the operator believes they widened it.
+    #[test]
+    fn ws_api_exposure_flags_are_honored_before_the_subcommand() {
+        use super::{Cli, Command, merge_pre_subcommand_ws_api_args};
+        use clap::Parser;
+        for argv in [
+            vec![
+                "freenet",
+                "--ws-api-address",
+                "::",
+                "--allowed-host",
+                "node.example",
+                "--allowed-source-cidrs",
+                "100.64.0.0/10",
+                "network",
+            ],
+            vec![
+                "freenet",
+                "network",
+                "--ws-api-address",
+                "::",
+                "--allowed-host",
+                "node.example",
+                "--allowed-source-cidrs",
+                "100.64.0.0/10",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("parse");
+            let mut config = match cli.command {
+                Some(Command::Network { config }) => config,
+                _ => panic!("expected network subcommand"),
+            };
+            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
+            assert_eq!(
+                config.ws_api.address,
+                Some("::".parse().unwrap()),
+                "--ws-api-address must survive in either position: {argv:?}"
+            );
+            assert_eq!(
+                config.ws_api.allowed_host.as_deref(),
+                Some(&["node.example".to_string()][..]),
+                "--allowed-host must survive in either position: {argv:?}"
+            );
+            assert_eq!(
+                config.ws_api.allowed_source_cidrs.as_deref(),
+                Some(&["100.64.0.0/10".to_string()][..]),
+                "--allowed-source-cidrs must survive in either position: {argv:?}"
+            );
+        }
+    }
+
+    /// The subcommand's own value wins; the top-level one only fills a gap.
+    #[test]
+    fn subcommand_ws_api_address_beats_the_pre_subcommand_one() {
+        use super::{Cli, Command, merge_pre_subcommand_ws_api_args};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "freenet",
+            "--ws-api-address",
+            "::",
+            "network",
+            "--ws-api-address",
+            "127.0.0.1",
+        ])
+        .expect("parse");
+        let mut config = match cli.command {
+            Some(Command::Network { config }) => config,
+            _ => panic!("expected network subcommand"),
+        };
+        merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
+        assert_eq!(config.ws_api.address, Some("127.0.0.1".parse().unwrap()));
     }
 
     #[test]

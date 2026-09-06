@@ -745,6 +745,7 @@ where
         _req: DelegateRequest<'_>,
         _origin_contract: Option<&ContractInstanceId>,
         _caller_delegate: Option<&DelegateKey>,
+        _connection_scope: crate::client_events::ConnectionScope,
         _user_context: Option<&UserSecretContext>,
     ) -> Response {
         Err(ExecutorError::other(anyhow::anyhow!(
@@ -784,8 +785,12 @@ where
             );
         }
 
-        // Default mode: hash-based summary (32 bytes) to enable delta efficiency.
-        // With hash summaries, is_delta_efficient(32, state_size) = true when state > 64 bytes.
+        // Default mode: hash-based summary (32 bytes) — small, cheap to ship in
+        // interest syncs. (Historical note: while compute_delta still had its
+        // pre-compute is_delta_efficient gate, the 32-byte summary also kept
+        // that gate open for any state > 64 bytes; since #4923 the gate runs
+        // post-compute on the actual delta size, so summary size no longer
+        // decides delta viability.)
         let hash = blake3::hash(state.as_ref());
         Ok(StateSummary::from(hash.as_bytes().to_vec()))
     }

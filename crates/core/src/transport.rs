@@ -645,10 +645,19 @@ pub(crate) trait PeerConnectionApi: Send {
     /// Sends a network message to the remote peer.
     ///
     /// The message is serialized and sent over the transport connection.
+    ///
+    /// Returns the SERIALIZED length of the message. Callers use it to
+    /// attribute outbound bytes by message kind
+    /// ([`outbound_message_mix`][omm]) without serializing a second time just
+    /// to measure. It is the payload the transport was asked to move, not the
+    /// on-wire total (no framing, ACKs or retransmits) — see that module for
+    /// what the difference means.
+    ///
+    /// [omm]: crate::node::network_bridge::outbound_message_mix
     fn send_message(
         &mut self,
         msg: NetMessage,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<usize, TransportError>> + Send + '_>>;
 
     /// Receives raw bytes from the remote peer.
     ///
@@ -761,11 +770,18 @@ mod tests {
 #[cfg(test)]
 mod version_discovery_tests {
     use super::*;
+    use serial_test::serial;
 
-    // These tests mutate global statics and must run sequentially.
-    // Use `cargo test -- --test-threads=1 version_discovery` if running standalone.
+    // These tests mutate the process-global version-discovery statics
+    // (`HIGHEST_SEEN_VERSION` et al.), so they MUST NOT run concurrently with
+    // each other — an interleaved `report_peer_version` from a sibling test
+    // corrupts another's `get_highest_seen_version` read. `#[serial(...)]`
+    // enforces that (the module comment previously only *asked* for
+    // `--test-threads=1`, which the default multi-threaded runner ignores,
+    // making these tests flaky in the full suite).
 
     #[test]
+    #[serial(version_discovery)]
     fn single_reporter_not_trusted() {
         reset_version_discovery();
         report_peer_version((0, 1, 153));
@@ -774,6 +790,7 @@ mod version_discovery_tests {
     }
 
     #[test]
+    #[serial(version_discovery)]
     fn two_reporters_trusted() {
         reset_version_discovery();
         report_peer_version((0, 1, 153));
@@ -782,6 +799,7 @@ mod version_discovery_tests {
     }
 
     #[test]
+    #[serial(version_discovery)]
     fn higher_version_resets_count() {
         reset_version_discovery();
         report_peer_version((0, 1, 153));
@@ -798,6 +816,7 @@ mod version_discovery_tests {
     }
 
     #[test]
+    #[serial(version_discovery)]
     fn major_minor_bumps_accepted() {
         reset_version_discovery();
         report_peer_version((1, 0, 0));

@@ -548,8 +548,10 @@ mod messages {
             ///
             /// `Some(D_rev)` only when `holder_found == true`, the holder is
             /// genuinely ahead, AND the reverse delta passes the SAME
-            /// efficiency gate the forward delta uses (`compute_delta` /
-            /// `is_delta_efficient`). `None` when no holder was found, when
+            /// post-compute efficiency gate the forward delta uses
+            /// (`compute_delta`, #4923: refused only when the computed delta
+            /// is not smaller than the holder's state). `None` when no
+            /// holder was found, when
             /// the originator is already current (empty delta), or when the
             /// reverse delta would be inefficient / uncomputable — in the
             /// last two the originator falls back to healing via a normal
@@ -1018,7 +1020,8 @@ mod tests {
     fn put_msg_probe_response_serde_roundtrip() {
         let key = make_contract_key(4);
         // (holder_found, hop_count, holder_summary bytes, reverse_delta bytes)
-        let cases: [(bool, usize, Option<Vec<u8>>, Option<Vec<u8>>); 3] = [
+        type ProbeResponseCase = (bool, usize, Option<Vec<u8>>, Option<Vec<u8>>);
+        let cases: [ProbeResponseCase; 3] = [
             // No holder: both trailing fields absent.
             (false, 0usize, None, None),
             // Holder found, originator current-or-ahead: summary present, no

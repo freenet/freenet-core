@@ -148,6 +148,55 @@ async fn run_client_put(
     deliver_outcome(&op_manager, client_tx, outcome);
 }
 
+/// Decide whether an `Exhausted` retry-loop outcome should be reported to
+/// the client as success rather than a failure (#5458).
+///
+/// A streaming PUT gets exactly one attempt
+/// (`MAX_PEER_ADVANCEMENTS_STREAMING == 0`): its watchdog abandoning the
+/// wait for a downstream reply is the ONLY way it reaches `Exhausted`, and
+/// by construction (`drive_relay_put`'s Step 1) the contract is already
+/// durably stored on this node before any downstream dispatch is even
+/// attempted. So "exhausted" there means "we gave up waiting to hear back",
+/// not "the PUT failed" — PROVIDED the local store had actually finished
+/// before the watchdog fired, which `local_store_committed` is the one
+/// honest signal for (the watchdog's own clock starts before the store
+/// even begins, so a very early false stall is a real possibility this
+/// function must not paper over).
+///
+/// # What "success" means here — and what it does NOT confirm
+///
+/// This cannot distinguish "the downstream peer received and stored the
+/// contract, only the reply was lost" (the scenario #5458's own evidence
+/// documents — the peer's telemetry showed the store succeeded) from "the
+/// downstream peer never received anything at all" (dead target, dropped
+/// mid-transfer, one-way partition) — both dispatch without a synchronous
+/// error, so both reach this same `Exhausted` path. Reporting success here
+/// means "your data is durably stored in the network" (this node is a
+/// legitimate host per `.claude/rules/hosting-invariants.md` invariant 2),
+/// NOT "confirmed replicated to or discoverable from the target peer".
+/// That is a real, deliberate widening of the existing `ReplyClass::
+/// LocalCompletion` / #3465 precedent this mirrors: those cover a KNOWN
+/// non-delivery (no next hop, or the forward's own dispatch call returned
+/// an error), where "local success" is the only honest answer. Here the
+/// forward's outcome is genuinely UNKNOWN. The tradeoff is accepted
+/// because the alternative — reporting failure — was already just as
+/// unreliable a signal (fdev's own error text says "may have succeeded,
+/// verify out-of-band"), and #5458's evidence is that the unknown case
+/// resolves to "succeeded" far more often than not. It does mean a client
+/// that hits this path after a genuinely dead target gets no signal to
+/// retry elsewhere, and the contract may end up discoverable only from
+/// this node. See freenet/freenet-core#5458's own "suggested starting
+/// points" for the still-open work on making the real downstream reply
+/// arrive reliably, which would close this gap properly.
+///
+/// Non-streaming PUTs retry across multiple peers before exhausting, so a
+/// local copy existing does not mean the network-wide propagation that
+/// class of caller is more plausibly relying on has happened — they are
+/// deliberately excluded here and keep reporting the real failure.
+fn exhausted_attempt_is_local_success(is_streaming: bool, local_store_committed: bool) -> bool {
+    is_streaming && local_store_committed
+}
+
 /// PUT driver has exactly two outcomes — no `SkipAlreadyDelivered` because
 /// PUT doesn't use `NodeEvent::LocalPutComplete` (the driver owns local
 /// completion delivery directly).
@@ -282,10 +331,6 @@ async fn drive_client_put_inner(
                 // (reverse-leg convergence) is a deliberate follow-up, not
                 // required for this PUT to report success correctly.
                 op_manager.completed(client_tx);
-                crate::node::network_status::record_op_result(
-                    crate::node::network_status::OpType::Put,
-                    true,
-                );
                 super::finalize_put_at_originator(
                     op_manager,
                     client_tx,
@@ -508,10 +553,6 @@ async fn drive_client_put_inner(
                     .await;
             }
             op_manager.ring.routing_finished(route_event);
-            crate::node::network_status::record_op_result(
-                crate::node::network_status::OpType::Put,
-                true,
-            );
 
             // Telemetry only — subscribe=false to avoid double-subscribe.
             //
@@ -563,6 +604,53 @@ async fn drive_client_put_inner(
             .into())))
         }
         RetryLoopOutcome::Exhausted(cause) => {
+            // #5458: see `exhausted_attempt_is_local_success` for why a
+            // streaming PUT's watchdog giving up is not the same as the PUT
+            // having failed.
+            let locally_stored = exhausted_attempt_is_local_success(
+                is_streaming,
+                driver
+                    .stream_progress
+                    .as_ref()
+                    .is_some_and(|p| p.handle().local_store_committed()),
+            );
+            if locally_stored {
+                tracing::info!(
+                    tx = %client_tx,
+                    contract = %key,
+                    %cause,
+                    phase = "put_exhausted_but_locally_stored",
+                    "PUT: streaming attempt gave up waiting for the downstream \
+                     reply, but the contract is already durably stored on this \
+                     node; reporting success instead of the timeout (#5458)"
+                );
+                op_manager.completed(client_tx);
+                super::finalize_put_at_originator(
+                    op_manager,
+                    client_tx,
+                    key,
+                    PutFinalizationData {
+                        sender: driver.current_target.clone(),
+                        // Unlike `LocalCompletion` (definitively zero remote
+                        // hops), the payload WAS forwarded here — we just
+                        // never learned how far. `None` avoids reporting a
+                        // knowingly wrong hop count.
+                        hop_count: None,
+                        state_hash: None,
+                        state_size: None,
+                    },
+                    false,
+                    false,
+                )
+                .await;
+
+                maybe_subscribe_child(op_manager, client_tx, key, subscribe, blocking_subscribe)
+                    .await;
+
+                return Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
+                    ContractResponse::PutResponse { key },
+                ))));
+            }
             Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                 cause: cause.into(),
             }
@@ -639,6 +727,8 @@ async fn try_summary_first_put(
         related.clone(),
         htl,
         crate::contract::Priority::ClientLocal,
+        // Summary-first PUT runs on the ORIGINATOR: a real client-initiated PUT.
+        crate::ring::HostingCause::ClientPut,
     )
     .await
     {
@@ -788,6 +878,18 @@ async fn try_summary_first_put(
             UpdateData::Delta(reverse_delta),
             RelatedContracts::default(),
             crate::contract::Priority::ClientLocal,
+            // Provenance, deliberately NOT derived from the `Priority` above:
+            // this delta is what the REMOTE HOLDER sent back, so for #5062 it
+            // is relayed content this node re-broadcasts. The `ClientLocal`
+            // tag is a scheduling-lane choice (see the comment above), and
+            // the two are free to disagree.
+            crate::node::ApplyOrigin::NetworkRelay,
+            // #5147: a PUT-path apply names no broadcast delivery targets, so
+            // it attests to no coverage. Registering an EMPTY set rather than
+            // skipping registration is deliberate: it collapses any concurrent
+            // relayed coverage for this contract, so a PUT's fan-out is never
+            // suppressed against a list belonging to someone else's broadcast.
+            crate::ring::broadcast_coverage::BroadcastOrigin::local(),
         )
         .await
         {
@@ -811,6 +913,23 @@ async fn try_summary_first_put(
                 );
             }
         }
+    }
+
+    // Delta-incompat gate (HQk7 resync loop): if the contract is armed as
+    // delta-incapable, the ProbeReconcile delta below is doomed at the
+    // holder ("Invalid update"). Fall through to the full-state driver
+    // instead — the same recovery the delta-computation-failure arm uses.
+    // See `crate::ring::delta_incompat`.
+    if op_manager.ring.delta_incompat.suppress_deltas(key.id()) {
+        tracing::debug!(
+            tx = %client_tx,
+            contract = %key,
+            event = "delta_suppressed_incompat",
+            phase = "summary_first_delta_suppressed",
+            "PUT summary-first: contract is in delta-incompat backoff; \
+             falling through to full-state driver"
+        );
+        return SummaryFirstOutcome::FallThrough;
     }
 
     let our_state_size = merged_value.size();
@@ -1137,7 +1256,46 @@ async fn maybe_subscribe_child(
 
 // --- Outcome delivery ---
 
+/// Dashboard op_stats success classifier (issue #4828). Extracted so the
+/// success/failure mapping per `DriverOutcome` variant has direct unit
+/// coverage; `deliver_outcome` itself takes an `OpManager` which is
+/// expensive to construct in tests. Mirrors UPDATE's
+/// `classify_update_outcome_for_op_stats` (#4010).
+fn classify_put_outcome_for_op_stats(outcome: &DriverOutcome) -> bool {
+    matches!(outcome, DriverOutcome::Publish(Ok(_)))
+}
+
 fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: DriverOutcome) {
+    // Dashboard op_stats PUT counter (issue #4828). The legacy
+    // `report_result` recording path is bypassed for driver terminal
+    // replies (see `node::record_op_result` rustdoc), so every terminal
+    // outcome must be recorded here.
+    //
+    // Recording here rather than in the driver's arms is load-bearing:
+    // `run_client_put` -> `drive_client_put` -> `drive_client_put_inner`
+    // is the only call chain, so this single funnel sees EVERY terminal
+    // outcome. The pre-#4828 code recorded a hardcoded `true` in the two
+    // success arms instead, which left the `Done((Err(..), _))` #4111
+    // bypass, `Exhausted`, and `InfrastructureError` paths recording
+    // nothing at all — so `op_stats.puts.1` (the red "fail" number on the
+    // ops card) was structurally unreachable. Do NOT re-inline this into
+    // a driver arm; that is exactly how #4009/#4010 regrew here.
+    //
+    // Sub-operation gate: defensive. Today PUT has no sub-operation entry
+    // points (`Transaction::new_child_of` is only ever used to spawn
+    // SUBSCRIBE children), so `client_tx.is_sub_operation()` is always
+    // false on this path. The explicit gate matches UPDATE's and
+    // SUBSCRIBE's pattern so a future change that routes a sub-op tx
+    // through `run_client_put` doesn't silently start inflating the
+    // user-facing dashboard counter.
+    if !client_tx.is_sub_operation() {
+        let success = classify_put_outcome_for_op_stats(&outcome);
+        crate::node::network_status::record_op_result(
+            crate::node::network_status::OpType::Put,
+            success,
+        );
+    }
+
     match outcome {
         DriverOutcome::Publish(result) => {
             op_manager.send_client_result(client_tx, result);
@@ -1625,7 +1783,11 @@ where
     // Originator-loopback (a local client's own PUT, mapped to
     // upstream_addr=own_addr in dispatch) is ClientLocal so it lands in the
     // reserved fair-queue lane; a genuine relay store stays NetworkRelay (#4534).
-    let store_priority = put_store_priority(op_manager, upstream_addr);
+    let originator_loopback = put_is_originator_loopback(
+        op_manager.ring.connection_manager.get_own_addr(),
+        upstream_addr,
+    );
+    let store_priority = put_store_priority(originator_loopback);
     let merged_value = relay_put_store_locally(
         op_manager,
         incoming_tx,
@@ -1635,8 +1797,23 @@ where
         related_contracts.clone(),
         htl,
         store_priority,
+        put_store_cause(originator_loopback),
     )
     .await?;
+
+    // #5458: the contract is now durably stored on this node, independent of
+    // whatever happens to the downstream forward below. On the
+    // originator-loopback path, `incoming_tx` is the same `attempt_tx` the
+    // client's own retry loop (Task A) registered a `StreamProgress` handle
+    // under before sending — latch the fact so Task A can tell "this PUT
+    // never applied" apart from "it applied, we just never got the
+    // downstream reply" if its watchdog gives up waiting. A genuine relay
+    // hop's lookup is a harmless no-op: this node's own registry never had
+    // `incoming_tx` inserted (that only happens in the client's own
+    // `drive_retry_loop`, on the client's own node).
+    if let Some(progress) = op_manager.stream_progress_registry().get(&incoming_tx) {
+        progress.mark_local_store_committed();
+    }
 
     // ── Step 2: Build skip list + select next hop ──────────────────────────
     let mut new_skip_list = skip_list;
@@ -2333,9 +2510,11 @@ where
     }
 }
 
-/// Store a relayed PUT's contract locally: `put_contract` + (if not
-/// already hosting) `host_contract` + `announce_contract_hosted` +
-/// interest register/unregister + broadcast interest changes.
+/// Store a relayed PUT's contract locally: `put_contract` + `host_contract`
+/// (unconditional, so EVERY genuine PUT refreshes hosting recency —
+/// invariant 3 / #4903 review Fix 1) + (on first host, gated on the atomic
+/// `host_contract` `is_new` result) `announce_contract_hosted` + interest
+/// register/unregister + broadcast interest changes.
 ///
 /// Shared between the non-streaming relay driver (`drive_relay_put`)
 /// and the streaming relay driver (`drive_relay_put_streaming`) so both
@@ -2347,18 +2526,44 @@ where
 /// `put_failure` telemetry event and propagate.
 /// Fair-queue priority for a relay PUT's local store (#4534).
 ///
-/// A local client's own PUT enters the relay driver via originator-loopback,
-/// which dispatch maps to `upstream_addr = own_addr` (see operations.md). That
-/// case is `ClientLocal` so the store uses the reserved admission lane; any
-/// genuine upstream peer is `NetworkRelay`. If our own address is unknown we
-/// fail safe to `NetworkRelay` (never over-prioritize an ambiguous store).
-fn put_store_priority(
-    op_manager: &Arc<OpManager>,
-    upstream_addr: SocketAddr,
-) -> crate::contract::Priority {
-    match op_manager.ring.connection_manager.get_own_addr() {
-        Some(own) if own == upstream_addr => crate::contract::Priority::ClientLocal,
-        _ => crate::contract::Priority::NetworkRelay,
+/// A local client's own PUT enters the forwarding driver via originator-loopback,
+/// which dispatch maps to `upstream_addr = own_addr` (see operations.md) — see
+/// [`put_is_originator_loopback`], which is where that fact is read. That case is
+/// `ClientLocal` so the store uses the reserved admission lane; any genuine
+/// upstream peer is `NetworkRelay`.
+fn put_store_priority(originator_loopback: bool) -> crate::contract::Priority {
+    if originator_loopback {
+        crate::contract::Priority::ClientLocal
+    } else {
+        crate::contract::Priority::NetworkRelay
+    }
+}
+
+/// Did this PUT reach the forwarding driver via originator-loopback — i.e. is it
+/// our OWN client's PUT rather than someone else's in transit?
+///
+/// The single authoritative read of that fact. Both the scheduling lane
+/// ([`put_store_priority`]) and the hosting attribution ([`put_store_cause`])
+/// derive from it, so they cannot disagree, and the `get_own_addr()` lock is
+/// taken once per store rather than once per consumer.
+///
+/// Fails safe to `false` when our own address is unknown: never over-prioritize
+/// an ambiguous store, and never credit an unattributable one to a local client.
+fn put_is_originator_loopback(own_addr: Option<SocketAddr>, upstream_addr: SocketAddr) -> bool {
+    matches!(own_addr, Some(own) if own == upstream_addr)
+}
+
+/// Hosting attribution for a forwarding-driver local store.
+///
+/// Derived from the same [`put_is_originator_loopback`] fact as
+/// [`put_store_priority`], NOT from the priority that function returns:
+/// priority is a scheduling lane that may be re-tuned, and a counter that reads
+/// a proxy silently re-labels itself when the proxy moves.
+fn put_store_cause(originator_loopback: bool) -> crate::ring::HostingCause {
+    if originator_loopback {
+        crate::ring::HostingCause::ClientPut
+    } else {
+        crate::ring::HostingCause::TransitPut
     }
 }
 
@@ -2378,6 +2583,13 @@ async fn relay_put_store_locally(
     related_contracts: RelatedContracts<'static>,
     htl: usize,
     priority: crate::contract::Priority,
+    // Hosting attribution: this one chokepoint serves BOTH the client-loopback
+    // PUT and the relay-hop PUT (see the comment on the `host_contract` call
+    // below), so the caller names which it is. `priority` correlates today
+    // (`ClientLocal` vs `NetworkRelay`) but is a scheduling knob, not an
+    // attribution: deriving the cause from it would silently re-label the
+    // counter the first time a lane is re-tuned. Telemetry only.
+    cause: crate::ring::HostingCause,
 ) -> Result<WrappedState, OpError> {
     // EXPERIMENT-ONLY (findability_probe): suppress the every-hop PUT store so
     // the copy lands ONLY at the routing terminus (stored there explicitly by
@@ -2388,7 +2600,6 @@ async fn relay_put_store_locally(
     if crate::operations::findability_probe::scatter_disabled() {
         return Ok(value);
     }
-    let was_hosting = op_manager.ring.is_hosting_contract(&key);
     let (merged_value, _state_changed) = match super::put_contract(
         op_manager,
         key,
@@ -2439,11 +2650,34 @@ async fn relay_put_store_locally(
         }
     };
 
-    if !was_hosting {
-        let access_result =
-            op_manager
-                .ring
-                .host_contract(key, value.size() as u64, crate::ring::AccessType::Put);
+    // EVERY genuine PUT stamps hosting recency — including a repeat PUT to a
+    // contract this peer already hosts (invariant 3: "a real GET or PUT resets
+    // recency", and this applies to BOTH the client-loopback and the relay-hop
+    // PUT, which share this store chokepoint). This call is unconditional so a
+    // write-only publisher re-PUTting an already-hosted contract keeps its
+    // recency fresh instead of being stamped once at first host and becoming a
+    // cost-eviction candidate `COST_RATE_MIN_WINDOW` later — an evict →
+    // re-host churn loop (#4903 review Fix 1). Record the POST-merge size
+    // (`merged_value`), not the pre-merge `value`, so hosting-byte accounting
+    // reflects what is actually stored (#4903 review round-3 Fix 3).
+    let access_result = op_manager.ring.host_contract(
+        key,
+        merged_value.size() as u64,
+        crate::ring::AccessType::Put,
+        cause,
+    );
+
+    // Gate the first-time-hosting side effects on the ATOMIC `host_contract`
+    // result (`is_new`), NOT a pre-await `is_hosting_contract` snapshot
+    // (#4903 review round-3 Fix 1): a sweep can evict this contract during the
+    // `put_contract().await` above, in which case `host_contract` re-adds it
+    // (`is_new = true`) and we MUST run announce / interest-register /
+    // evicted-teardown here. A stale pre-await "was already hosting" snapshot
+    // would skip them AND drop `access_result.evicted` (leaking the contracts
+    // this re-add shed to make room). On the already-hosted refresh path
+    // `is_new` is false and `evicted` is empty (`record_access_with_demand`
+    // refreshes recency/size/generation only, evicts nothing).
+    if access_result.is_new {
         let evicted = access_result.evicted;
 
         // Sync the InterestManager for any subscribed contract the
@@ -2643,6 +2877,7 @@ async fn relay_put_finalize_scatter_disabled_store(
                     key,
                     merged.size() as u64,
                     crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::TransitPut,
                 );
             }
         }
@@ -3379,8 +3614,13 @@ where
     // forward (#4509) before the store consumes `related_contracts`.
     let replicate_payload =
         terminus_replicate_to.map(|addr| (addr, contract.clone(), related_contracts.clone()));
-    // Originator-loopback client PUT → ClientLocal reserved lane (#4534).
-    let store_priority = put_store_priority(op_manager, upstream_addr);
+    // Originator-loopback client PUT → ClientLocal reserved lane (#4534), and the
+    // same fact names the hosting cause.
+    let originator_loopback = put_is_originator_loopback(
+        op_manager.ring.connection_manager.get_own_addr(),
+        upstream_addr,
+    );
+    let store_priority = put_store_priority(originator_loopback);
     let merged_value = relay_put_store_locally(
         op_manager,
         incoming_tx,
@@ -3390,6 +3630,7 @@ where
         related_contracts,
         htl,
         store_priority,
+        put_store_cause(originator_loopback),
     )
     .await?;
 
@@ -3701,9 +3942,9 @@ async fn relay_probe_send_response(
 /// mirror of the originator's forward delta — the holder already has both
 /// inputs (the originator's summary arrived on the `ProbeRequest`, and it has
 /// its own state) — so it reuses `InterestManager::compute_delta`, and
-/// therefore the SAME `is_delta_efficient` gate the forward leg uses (a
-/// summary-size proxy for delta size: the delta is skipped when the
-/// originator's summary is ≥ ~50% of the holder's state size).
+/// therefore the SAME post-compute efficiency gate the forward leg uses
+/// (#4923: the delta is always computed, and refused only when the ACTUAL
+/// delta is not smaller than the holder's state size).
 ///
 /// Returns `None` (skip the reverse leg — the originator heals via a normal
 /// GET / anti-entropy rather than receiving a bloated or absent delta) when:
@@ -3771,7 +4012,7 @@ async fn compute_probe_reverse_delta(
 /// heal via a normal GET / anti-entropy. Kept as a pure function so the three
 /// arms are unit-testable without a live contract handler.
 fn reverse_delta_from_compute_result(
-    computed: Result<Option<StateDelta<'static>>, String>,
+    computed: Result<Option<StateDelta<'static>>, crate::ring::interest::DeltaUnavailable>,
 ) -> Option<StateDelta<'static>> {
     computed.unwrap_or(None)
 }
@@ -4129,6 +4370,13 @@ async fn drive_relay_probe_reconcile(
             UpdateData::Delta(delta),
             RelatedContracts::default(),
             crate::contract::Priority::NetworkRelay,
+            crate::node::ApplyOrigin::NetworkRelay,
+            // #5147: a PUT-path apply names no broadcast delivery targets, so
+            // it attests to no coverage. Registering an EMPTY set rather than
+            // skipping registration is deliberate: it collapses any concurrent
+            // relayed coverage for this contract, so a PUT's fan-out is never
+            // suppressed against a list belonging to someone else's broadcast.
+            crate::ring::broadcast_coverage::BroadcastOrigin::local(),
         )
         .await
         {
@@ -4236,6 +4484,41 @@ mod tests {
         ContractKey::from_id_and_code(ContractInstanceId::new([1u8; 32]), CodeHash::new([2u8; 32]))
     }
 
+    /// Source-scrape pin (HQk7 resync loop): the summary-first PUT path must
+    /// consult the delta-incompat memo BEFORE computing the ProbeReconcile
+    /// delta and fall through to the full-state driver for an armed
+    /// contract. Without the gate this path keeps sending doomed deltas to a
+    /// delta-incapable holder (bounded per-PUT, no loop — but every one is a
+    /// wasted WASM delta computation plus a guaranteed "Invalid update" at
+    /// the holder). See `crate::ring::delta_incompat`.
+    #[test]
+    fn summary_first_put_gates_delta_on_incompat_memo() {
+        let src = include_str!("op_ctx_task.rs");
+        let fn_start = src
+            .find("async fn try_summary_first_put(")
+            .expect("try_summary_first_put not found");
+        let after = &src[fn_start..];
+        let fn_end = after.find("\nasync fn ").unwrap_or(after.len());
+        let body = &after[..fn_end];
+
+        let gate_pos = body
+            .find(".suppress_deltas(")
+            .expect("try_summary_first_put must consult the delta-incompat memo");
+        let delta_pos = body
+            .find(".compute_delta(")
+            .expect("ProbeReconcile compute_delta call not found");
+        assert!(
+            gate_pos < delta_pos,
+            "the delta-incompat gate must run BEFORE compute_delta \
+             (gate {gate_pos} < compute_delta {delta_pos})"
+        );
+        let fallthrough = &body[gate_pos..delta_pos];
+        assert!(
+            fallthrough.contains("SummaryFirstOutcome::FallThrough"),
+            "an armed contract must fall through to the full-state driver"
+        );
+    }
+
     fn dummy_tx() -> Transaction {
         Transaction::new::<PutMsg>()
     }
@@ -4247,8 +4530,8 @@ mod tests {
     /// - `Ok(Some)` → ship the delta (holder ahead),
     /// - `Ok(None)` (originator already current — contract returned an empty
     ///   delta) → ship NOTHING,
-    /// - `Err` (delta inefficient / uncomputable — SAME gate as the forward
-    ///   leg) → ship NOTHING.
+    /// - `Err` (computed delta not smaller than full state / uncomputable —
+    ///   SAME post-compute gate as the forward leg, #4923) → ship NOTHING.
     ///
     /// The two `None` arms are the "originator already current / heal via a
     /// normal GET or anti-entropy" fallback: the reconcile must not emit a
@@ -4277,11 +4560,26 @@ mod tests {
         // Delta inefficient or uncomputable: send nothing — the originator
         // heals via a normal GET / anti-entropy instead of receiving a
         // bloated or absent delta.
-        let inefficient =
-            reverse_delta_from_compute_result(Err("Delta not efficient for this contract".into()));
+        // Both Err variants must behave identically here: the reverse leg
+        // ships nothing whether the post-compute gate refused an oversized
+        // delta (#4923) or the contract's delta computation failed.
+        let inefficient = reverse_delta_from_compute_result(Err(
+            crate::ring::interest::DeltaUnavailable::NotEfficient {
+                summary_size: 600,
+                state_size: 1000,
+            },
+        ));
         assert!(
             inefficient.is_none(),
-            "Err (inefficient/uncomputable) must send NO reverse delta"
+            "Err (computed delta not smaller than full state) must send NO \
+             reverse delta"
+        );
+        let uncomputable = reverse_delta_from_compute_result(Err(
+            crate::ring::interest::DeltaUnavailable::ComputeFailed("wasm exploded".into()),
+        ));
+        assert!(
+            uncomputable.is_none(),
+            "Err (delta computation failed) must send NO reverse delta"
         );
     }
 
@@ -4654,6 +4952,55 @@ mod tests {
         );
     }
 
+    /// The scheduling lane and the hosting attribution must BOTH follow the
+    /// originator-loopback fact, and must agree — they are two readings of one
+    /// question ("is this our own client's PUT?"), and a node whose store runs
+    /// in the client-reserved lane while its telemetry files the contract under
+    /// transit is reporting something no operator could reconcile.
+    ///
+    /// Both derive from `put_is_originator_loopback` for that reason, so this
+    /// pins the mapping rather than the (now impossible) disagreement.
+    #[test]
+    fn put_store_lane_and_cause_follow_originator_loopback() {
+        let own: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+
+        assert!(
+            super::put_is_originator_loopback(Some(own), own),
+            "upstream == own_addr is the originator-loopback PUT"
+        );
+        assert!(
+            !super::put_is_originator_loopback(Some(own), peer),
+            "a genuine upstream peer is not loopback"
+        );
+        // Fail safe: unknown own address must not be read as loopback, or a node
+        // that has not yet learned its address would both over-prioritize every
+        // forwarded store and credit it to a local client.
+        assert!(
+            !super::put_is_originator_loopback(None, peer),
+            "unknown own address must not be treated as loopback"
+        );
+
+        assert_eq!(
+            super::put_store_priority(true),
+            crate::contract::Priority::ClientLocal
+        );
+        assert_eq!(
+            super::put_store_priority(false),
+            crate::contract::Priority::NetworkRelay
+        );
+        assert_eq!(
+            super::put_store_cause(true),
+            crate::ring::HostingCause::ClientPut,
+            "our own client's PUT is ClientPut, never transit"
+        );
+        assert_eq!(
+            super::put_store_cause(false),
+            crate::ring::HostingCause::TransitPut,
+            "someone else's PUT storing at this hop is transit"
+        );
+    }
+
     /// Truncate this file's source at the `#[cfg(test)]` marker so the
     /// source-pin tests never match code or comments inside the test
     /// module itself (mirrors the GET / UPDATE helpers).
@@ -4697,6 +5044,115 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Issue #4828 (same class as #4009 / #4010): `deliver_outcome` is the
+    /// single funnel every client PUT terminal outcome passes through
+    /// (`run_client_put` -> `drive_client_put` -> `drive_client_put_inner`
+    /// is the only call chain), so it MUST record the dashboard
+    /// `op_stats.puts` counter there. Recording in the driver's success
+    /// arms instead — which is what this file did before #4828 — left
+    /// every failure arm (`Done((Err(..), _))` #4111 bypass,
+    /// `Exhausted`, and the `InfrastructureError` synthesis) recording
+    /// nothing, so `op_stats.puts.1` (the red "fail" number on the ops
+    /// card) was structurally stuck at 0.
+    ///
+    /// Mirrors UPDATE's `deliver_outcome_records_update_op_result`, the
+    /// #4010 fix shape that did NOT rot.
+    #[test]
+    fn deliver_outcome_records_put_op_result() {
+        let prod = production_source();
+        let body = extract_fn_body(prod, "fn deliver_outcome(");
+
+        assert!(
+            body.contains("record_op_result"),
+            "deliver_outcome must call record_op_result so the dashboard \
+             PUT counter advances on EVERY driver terminal outcome — \
+             including the failure arms. Issue #4828."
+        );
+        assert!(
+            body.contains("OpType::Put"),
+            "record_op_result inside deliver_outcome must be passed \
+             OpType::Put (not Get/Update/Subscribe)."
+        );
+        // The success flag must be DERIVED from the outcome. An
+        // unconditional `true` is the #4828 bug — it is what made
+        // `op_stats.puts.1` unreachable. Mirrors the assertion text of
+        // GET's `record_op_result_reflects_host_result_outcome`.
+        let call_pos = body
+            .find("record_op_result")
+            .expect("record_op_result must be called in deliver_outcome");
+        let tail = &body[call_pos..];
+        let call_window = &tail[..tail.len().min(200)];
+        assert!(
+            !call_window.contains("true,"),
+            "record_op_result in deliver_outcome is passed an unconditional \
+             `true`. The success flag must be derived from the outcome via \
+             `classify_put_outcome_for_op_stats` so a failing PUT increments \
+             op_stats.puts.1. Issue #4828. Call window: {call_window}"
+        );
+        assert!(
+            body.contains("!client_tx.is_sub_operation()"),
+            "deliver_outcome must gate record_op_result on \
+             `!client_tx.is_sub_operation()` (note the leading `!`) for \
+             parity with SUBSCRIBE / UPDATE; defensive against a future \
+             change that routes a sub-op tx through run_client_put and \
+             silently inflates the user-facing dashboard counter."
+        );
+    }
+
+    /// Issue #4828: the PUT driver must NOT record `op_stats` itself.
+    /// `deliver_outcome` owns the counter for every terminal outcome; a
+    /// `record_op_result` re-inlined into a driver arm double-counts that
+    /// arm (and is how the pre-#4828 code came to record only successes).
+    /// This is the counterpart pin to `deliver_outcome_records_put_op_result`.
+    #[test]
+    fn put_driver_must_not_record_op_result_directly() {
+        let prod = production_source();
+        let body = extract_fn_body(prod, "async fn drive_client_put_inner(");
+
+        assert!(
+            !body.contains("record_op_result"),
+            "drive_client_put_inner must NOT call record_op_result — \
+             `deliver_outcome` is the single recording funnel for the PUT \
+             op_stats counter. Re-inlining the call into a driver arm \
+             double-counts that arm and re-opens #4828 (only the arms that \
+             remember to call it get counted)."
+        );
+    }
+
+    /// Issue #4828: pure-function coverage of every `DriverOutcome`
+    /// variant, pinning the success/failure mapping against an
+    /// accidental `success: !success` flip. Mirrors UPDATE's
+    /// `classify_update_outcome_covers_all_variants` (#4010).
+    #[test]
+    fn classify_put_outcome_covers_all_variants() {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([8u8; 32]),
+        );
+        let publish_ok = DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
+            ContractResponse::PutResponse { key },
+        )));
+        let publish_err = DriverOutcome::Publish(Err(ErrorKind::OperationError {
+            cause: "synthetic".into(),
+        }
+        .into()));
+        let infra = DriverOutcome::InfrastructureError(OpError::UnexpectedOpState);
+
+        assert!(classify_put_outcome_for_op_stats(&publish_ok));
+        assert!(
+            !classify_put_outcome_for_op_stats(&publish_err),
+            "a published client error is a FAILED PUT — it must increment \
+             op_stats.puts.1. Issue #4828."
+        );
+        assert!(
+            !classify_put_outcome_for_op_stats(&infra),
+            "an infrastructure error publishes a synthesized client error, \
+             so it is a FAILED PUT. Issue #4828."
+        );
     }
 
     /// Pin (telemetry accuracy): BOTH relay PUT entry points must record
@@ -5453,7 +5909,10 @@ mod tests {
     #[test]
     fn driver_outcome_exhausted_produces_client_error() {
         // Verify that RetryLoopOutcome::Exhausted maps to a client-visible
-        // OperationError, not a silent drop or infrastructure error.
+        // OperationError, not a silent drop or infrastructure error. This is
+        // the baseline (non-locally-stored) case; see
+        // `exhausted_attempt_is_local_success_*` below for the #5458 case
+        // where an exhausted streaming attempt is reported as success instead.
         let cause = "PUT to contract failed after 3 attempts".to_string();
         let outcome: DriverOutcome =
             match RetryLoopOutcome::<(ContractKey, Option<usize>)>::Exhausted(cause) {
@@ -5470,6 +5929,114 @@ mod tests {
         assert!(
             matches!(outcome, DriverOutcome::Publish(Err(_))),
             "Exhaustion must produce a client error, not be swallowed"
+        );
+    }
+
+    /// #5458: the decision table for `exhausted_attempt_is_local_success`.
+    /// Only the streaming-AND-committed cell may report success; the other
+    /// three must keep reporting the real failure.
+    #[test]
+    fn exhausted_attempt_is_local_success_decision_table() {
+        assert!(
+            exhausted_attempt_is_local_success(true, true),
+            "streaming + locally committed → success"
+        );
+        assert!(
+            !exhausted_attempt_is_local_success(true, false),
+            "streaming but NOT yet committed (watchdog fired before the local \
+             store finished) must NOT report success — that would be a false \
+             positive for a PUT that never actually applied"
+        );
+        assert!(
+            !exhausted_attempt_is_local_success(false, true),
+            "non-streaming PUTs retry across peers before exhausting; a local \
+             copy existing must not paper over exhausting every peer"
+        );
+        assert!(
+            !exhausted_attempt_is_local_success(false, false),
+            "neither streaming nor committed → definitely not a success"
+        );
+    }
+
+    /// #5458 regression: `drive_relay_put` must latch `mark_local_store_committed`
+    /// on the tx's `StreamProgress` handle (if one is registered) AFTER the
+    /// local store succeeds and BEFORE attempting the downstream forward —
+    /// mirroring `drive_relay_put_stores_locally_before_forwarding`'s ordering
+    /// check for the store itself. Without this, `drive_client_put_inner`'s
+    /// `Exhausted` arm has no way to distinguish a genuinely-applied streaming
+    /// PUT from one whose local store never even ran.
+    #[test]
+    fn drive_relay_put_marks_local_store_committed_after_storing_locally() {
+        let prod = production_source();
+        let body = extract_fn_body(prod, "async fn drive_relay_put<CB>(");
+
+        let store_pos = body
+            .find("relay_put_store_locally(")
+            .expect("relay_put_store_locally call missing in drive_relay_put");
+        let mark_pos = body.find("mark_local_store_committed()").expect(
+            "drive_relay_put MUST call mark_local_store_committed() after the \
+             local store succeeds (#5458)",
+        );
+        assert!(
+            mark_pos > store_pos,
+            "mark_local_store_committed must run AFTER relay_put_store_locally \
+             — it exists to prove the store actually happened, not to predict it"
+        );
+
+        for forward_marker in ["ctx.send_to_and_await(", "send_to_and_register_waiter("] {
+            let forward_pos = body
+                .find(forward_marker)
+                .unwrap_or_else(|| panic!("{forward_marker} call missing in drive_relay_put"));
+            assert!(
+                mark_pos < forward_pos,
+                "mark_local_store_committed must run BEFORE the downstream \
+                 forward ({forward_marker}) — the whole point is to record the \
+                 fact before anything about the forward can go wrong"
+            );
+        }
+    }
+
+    /// #5458 regression: `drive_client_put_inner`'s `Exhausted` arm must
+    /// actually consult `exhausted_attempt_is_local_success` and, when it
+    /// returns true, publish a success `PutResponse` instead of the generic
+    /// `OperationError` — not merely compute the boolean and ignore it.
+    ///
+    /// Mutation-verified: deleting the `if locally_stored { ... }` early
+    /// return (leaving only the unconditional `Err` at the bottom) makes this
+    /// FAIL, because `PutResponse` no longer appears before the `Err(...)`
+    /// this test anchors on.
+    #[test]
+    fn drive_client_put_inner_reports_success_when_locally_stored_and_exhausted() {
+        let prod = production_source();
+        let body = extract_fn_body(prod, "async fn drive_client_put_inner(");
+
+        // Brace-matched to the arm's OWN body (not sliced to end-of-function):
+        // `extract_fn_body` finds the first `{` after the given prefix, and
+        // the prefix here already ends in `{` — the arm's own opening brace —
+        // so this returns exactly the arm's contents, immune to a later match
+        // arm coincidentally containing either marker string.
+        let arm = extract_fn_body(body, "RetryLoopOutcome::Exhausted(cause) => {");
+
+        let decision_pos = arm
+            .find("exhausted_attempt_is_local_success(")
+            .expect("Exhausted arm must consult exhausted_attempt_is_local_success");
+        let success_pos = arm
+            .find("ContractResponse::PutResponse { key }")
+            .expect("Exhausted arm must be able to publish a PutResponse success");
+        let error_pos = arm
+            .find("ErrorKind::OperationError")
+            .expect("Exhausted arm must still be able to publish the real failure");
+
+        assert!(
+            decision_pos < success_pos,
+            "the local-success decision must be computed before the success \
+             path that acts on it"
+        );
+        assert!(
+            success_pos < error_pos,
+            "the success return must be reachable BEFORE the unconditional \
+             error at the bottom of the arm, i.e. behind an early return — \
+             otherwise the success branch is dead code"
         );
     }
 
@@ -5912,6 +6479,91 @@ mod tests {
             helper_src.contains("remove_evicted_in_use"),
             "helper MUST call interest_manager.remove_evicted_in_use to sync the \
              InterestManager after a subscribed eviction"
+        );
+    }
+
+    /// Pin (#4903 review Fix 1 / invariant 3): `relay_put_store_locally` MUST
+    /// call `ring.host_contract(.., AccessType::Put)` UNCONDITIONALLY — i.e.
+    /// BEFORE (outside) the first-time-hosting gate — so a repeat PUT to an
+    /// already-hosted contract refreshes hosting recency (`recency_seq` /
+    /// `last_genuine_access`). This applies to BOTH the client-loopback and the
+    /// relay-hop PUT, which share this store chokepoint. When the stamp was
+    /// gated on the first-time gate, a write-only publisher re-PUTting every few
+    /// seconds was stamped once at first host and became a cost-eviction
+    /// candidate `COST_RATE_MIN_WINDOW` later — an evict → re-host churn loop.
+    #[test]
+    fn relay_put_store_locally_stamps_recency_on_repeat_put() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn relay_put_store_locally(")
+            .expect("relay_put_store_locally not found");
+        let end = src[start..]
+            .find("\nasync fn relay_put_replicate_forward(")
+            .expect("relay_put_store_locally body end not found")
+            + start;
+        let body = &src[start..end];
+        let host_pos = body
+            .find(".host_contract(")
+            .expect("relay_put_store_locally must call ring.host_contract");
+        let gate_pos = body
+            .find("if access_result.is_new")
+            .expect("first-time-hosting gate not found");
+        assert!(
+            host_pos < gate_pos,
+            "host_contract MUST run before (outside) the first-time-hosting gate \
+             so a repeat PUT refreshes hosting recency (invariant 3: a real PUT \
+             resets recency; #4903 review Fix 1)"
+        );
+    }
+
+    /// Pin (#4903 review round-3 Fix 1 + Fix 3): `relay_put_store_locally` MUST
+    /// (1) gate the first-time-hosting side effects on the ATOMIC
+    ///     `access_result.is_new`, NOT a pre-await `is_hosting_contract` /
+    ///     `was_hosting` snapshot. A sweep can evict the contract during the
+    ///     `put_contract().await`; only the atomic `host_contract` result knows
+    ///     the re-add is new, so a stale pre-await snapshot would skip
+    ///     announce / interest-register and DROP `access_result.evicted`
+    ///     (leaking the contracts the re-add shed); and
+    /// (2) charge hosting bytes as the POST-merge `merged_value.size()`, not the
+    ///     pre-merge input `value.size()`.
+    #[test]
+    fn relay_put_store_locally_first_host_gate_uses_atomic_result_and_merged_size() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn relay_put_store_locally(")
+            .expect("relay_put_store_locally not found");
+        let end = src[start..]
+            .find("\nasync fn relay_put_replicate_forward(")
+            .expect("relay_put_store_locally body end not found")
+            + start;
+        let body = &src[start..end];
+
+        // (1) The gate is the atomic result, and NO pre-await snapshot survives.
+        assert!(
+            body.contains("if access_result.is_new"),
+            "first-time-hosting side effects MUST be gated on the atomic \
+             host_contract `is_new`, not a pre-await snapshot"
+        );
+        assert!(
+            !body.contains("was_hosting"),
+            "no pre-await `was_hosting` / `is_hosting_contract` snapshot may gate \
+             the first-time-hosting side effects — a sweep can evict during \
+             put_contract().await, and a stale snapshot would skip \
+             announce/register and drop access_result.evicted (round-3 Fix 1)"
+        );
+
+        // (2) host_contract charges the POST-merge size.
+        let host_pos = body
+            .find(".host_contract(")
+            .expect("relay_put_store_locally must call ring.host_contract");
+        let rel_end = body[host_pos..]
+            .find(");")
+            .expect("host_contract call end not found");
+        let host_args = &body[host_pos..host_pos + rel_end];
+        assert!(
+            host_args.contains("merged_value.size()"),
+            "host_contract MUST charge the POST-merge merged_value.size(), not \
+             the pre-merge value.size() (round-3 Fix 3)"
         );
     }
 

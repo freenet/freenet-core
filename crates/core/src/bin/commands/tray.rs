@@ -262,18 +262,28 @@ mod tests {
         // bare name, because the test body itself mentions
         // `open_log_file` in its assertions and `include_str!` would
         // otherwise pick up the first textual match inside this test.
+        // Bounded to the real function body (#5102 follow-up). Two independent
+        // defects made this pin latently vacuous:
+        //   1. the anchor self-matched THIS test's own string literal, which
+        //      appears above the real definition; and
+        //   2. the end anchor `"\n#[cfg(test)]"` never matched at all — tray.rs's
+        //      only `#[cfg(test)]` is ABOVE `open_log_file` — so `unwrap_or`
+        //      silently widened the region to the entire rest of the file.
+        // It bit only by luck: `open_log_file` is currently the file's sole
+        // null-stdio site. The project's own bug-prevention rule REQUIRES every
+        // new `Command::spawn` here to null all three handles, so complying with
+        // that rule would have supplied a decoy and killed the pin guarding
+        // #3933. Slice from the LAST occurrence of the signature (the definition,
+        // not this literal) to the function's closing brace.
         let src = include_str!("tray.rs");
-        let (_, after_fn_start) = src
-            .split_once("pub fn open_log_file() {")
+        let at = src
+            .rfind("pub fn open_log_file() {")
             .expect("open_log_file definition not found");
-        // Body ends at the next blank line followed by a `#[cfg(test)]`
-        // attribute — the module-level tests block. Restricting the
-        // search window avoids double-counting nulls from unrelated
-        // helpers elsewhere in the file.
+        let after_fn_start = &src[at..];
         let body = after_fn_start
-            .split_once("\n#[cfg(test)]")
+            .split_once("\n}\n")
             .map(|(b, _)| b)
-            .unwrap_or(after_fn_start);
+            .expect("could not locate end of open_log_file");
         for handle in ["stdin", "stdout", "stderr"] {
             let pattern = format!(".{handle}(std::process::Stdio::null())");
             assert!(

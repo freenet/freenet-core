@@ -31,6 +31,16 @@ compile_error!("The wasmtime-backend feature must be enabled.");
 #[cfg(feature = "wasmtime-backend")]
 mod wasmtime_engine;
 
+/// Retired-instance bytes ONE wasmtime Store may hold before it is refreshed, for
+/// a host with `total_ram` bytes and `pool_size` executors. Re-exported because
+/// there is one Store per executor, so it is a per-worker term in the node's
+/// aggregate memory commitment — consulted by both
+/// `contract::executor::declared_cache_ceiling` (production) and
+/// `contract::executor::tests::cache_byte_budgets_are_aggregate_safe` (the
+/// test that verifies it stays safe).
+#[cfg(feature = "wasmtime-backend")]
+pub(crate) use wasmtime_engine::store_arena_budget_for;
+
 use super::ContractError;
 use super::runtime::RuntimeConfig;
 
@@ -83,6 +93,14 @@ pub(crate) enum WasmError {
     /// WASM execution exceeded the configured time limit.
     #[error("execution timeout")]
     Timeout,
+
+    /// The execution never ran because it sat queued on a saturated blocking
+    /// pool past the wall-clock deadline (#4864 round-6). Distinct from
+    /// [`WasmError::Timeout`]: the guest never started, so this is a transient
+    /// load condition, NOT a contract-intrinsic timeout, and callers treat it
+    /// like queue-full backpressure (no per-contract quarantine).
+    #[error("scheduler overloaded")]
+    SchedulerOverloaded,
 
     /// Catch-all for backend-specific errors.
     #[error(transparent)]
@@ -140,10 +158,20 @@ pub(crate) trait WasmEngine: Send {
     ///
     /// Sets up imports, calls `__frnt_set_id`, records memory address,
     /// and ensures sufficient memory for `req_bytes`.
+    ///
+    /// The instance id is NOT a parameter: it is issued by
+    /// `native_api::next_instance_id` and returned in the [`InstanceHandle`].
+    /// Instance ids key the process-global `MEM_ADDR` / `DELEGATE_ENV` /
+    /// `CONTRACT_IO` maps, so a caller-chosen id could collide with a LIVE
+    /// instance belonging to another engine in the same process and make
+    /// [`Self::drop_instance`] evict that instance's entry (#4213 / #5023).
+    ///
+    /// Any future backend implementing this trait MUST allocate the same way;
+    /// `create_instance_allocates_its_own_instance_id` in the wasmtime backend
+    /// pins that for the one implementation that exists today.
     fn create_instance(
         &mut self,
         module: &Self::Module,
-        id: i64,
         req_bytes: usize,
     ) -> Result<InstanceHandle, WasmError>;
 

@@ -515,6 +515,16 @@ pub struct ControlledSimulationResult {
     /// to/from the crashed node was subsequently blocked. `0` when no crash was
     /// scheduled. See #4642 piece F.
     pub crash_packets_dropped: u64,
+    /// Per-peer count of WASM `summarize_state` invocations (summary-cache
+    /// SLOW-path misses) captured at the end of the run, keyed by socket
+    /// address. Captured here (before the `SimNetwork` is dropped, which clears
+    /// the registry) so the every-hop-placement summarize-storm falsifier can
+    /// assert this stays flat as the hosted set / neighbor overlap grows. A
+    /// cache hit does NOT increment, so a working cache keeps this proportional
+    /// to the state-change rate, not to hosted-set size. See
+    /// `crate::ring::topology_registry::record_summarize_wasm_call` (#4440, spec
+    /// step 8).
+    pub summarize_wasm_calls: HashMap<std::net::SocketAddr, u64>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -531,6 +541,35 @@ impl ControlledSimulationResult {
         self.node_rings
             .get(label)
             .is_some_and(|ring| ring.is_hosting_contract(key))
+    }
+
+    /// The protocol version `label`'s node had recorded for the peer at `addr`
+    /// at the end of the run, or `None` if it never learned one (#5161).
+    ///
+    /// Reads the same `ConnectionManager` mirror the production emission gates
+    /// read, so it answers the question those gates ask rather than a proxy for
+    /// it. `None` when the node never published its Ring.
+    pub fn node_recorded_remote_version(
+        &self,
+        label: &NodeLabel,
+        addr: SocketAddr,
+    ) -> Option<(u8, u8, u16)> {
+        self.node_rings
+            .get(label)
+            .and_then(|ring| ring.connection_manager.remote_version(addr))
+    }
+
+    /// Whether `label`'s node would emit the hash-first summary encoding to the
+    /// peer at `addr` — i.e. whether that link passes the version gate (#4965).
+    ///
+    /// The end-to-end consequence of #5161 on a node->gateway link: before the
+    /// version-carrying ack this could never be true from the node's side, so
+    /// the node answered every anti-entropy exchange with full summary bytes.
+    /// `false` when the node never published its Ring.
+    pub fn node_supports_hash_first_summaries(&self, label: &NodeLabel, addr: SocketAddr) -> bool {
+        self.node_rings
+            .get(label)
+            .is_some_and(|ring| ring.connection_manager.supports_hash_first_summaries(addr))
     }
 
     /// Number of contracts `label`'s node held in its hosting cache at the end
@@ -686,6 +725,33 @@ impl ControlledSimulationResult {
     /// tests); `0` when no crash was scheduled. See #4642 piece F.
     pub fn crash_packets_dropped(&self) -> u64 {
         self.crash_packets_dropped
+    }
+
+    /// WASM `summarize_state` invocations (summary-cache misses) recorded for
+    /// the peer at `addr`. `0` if the peer ran none. See #4440 / spec step 8.
+    pub fn summarize_wasm_calls_for(&self, addr: &std::net::SocketAddr) -> u64 {
+        self.summarize_wasm_calls.get(addr).copied().unwrap_or(0)
+    }
+
+    /// Total WASM `summarize_state` invocations across every peer in the run.
+    ///
+    /// This is the every-hop summarize-storm falsifier's primary signal: it must
+    /// stay proportional to the contract STATE-CHANGE count, NOT to hosted-set
+    /// size or neighbor overlap. If it grows with the number of shared hosted
+    /// contracts × neighbors, the state-hash summary cache is not covering
+    /// every-hop load and the #4440 storm has re-armed.
+    pub fn total_summarize_wasm_calls(&self) -> u64 {
+        self.summarize_wasm_calls.values().copied().sum()
+    }
+
+    /// The single peer's peak WASM-summarize count — the worst per-node
+    /// summarize load any peer bore during the run.
+    pub fn max_summarize_wasm_calls(&self) -> u64 {
+        self.summarize_wasm_calls
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -1296,6 +1362,38 @@ pub struct SimNetwork {
     pub skip_convergence_wait: bool,
     /// Optional churn (crash/restart) configuration for the chaos driver.
     churn_config: Option<ChurnConfig>,
+    /// Optional pre-operation join-convergence barrier for
+    /// [`run_controlled_simulation`](Self::run_controlled_simulation). When
+    /// `Some((min_fraction, max_wait))`, the controlled-event client waits —
+    /// before firing any scheduled operation — until at least `min_fraction`
+    /// of the network's peers have completed their network join, or `max_wait`
+    /// virtual time elapses, whichever comes first. Join is detected via the
+    /// topology-snapshot registry: a peer only registers a snapshot once its
+    /// own address/location is established (`peer_ready`), so the count of
+    /// distinct snapshot peers is a direct join tally (see
+    /// `ring::register_topology_snapshots_periodically`, which `continue`s
+    /// while `get_own_addr()` is `None`).
+    ///
+    /// `None` (default) preserves the historical behavior of firing operations
+    /// after a fixed 3s warmup, racing topology formation. This barrier exists
+    /// because a cold-start GET-reliability measurement must run against a
+    /// FORMED network: with only the fixed warmup, higher-index nodes' one-shot,
+    /// no-retry GETs fire before those nodes finish joining and are rejected
+    /// with `PeerNotJoined`, so the metric conflates join speed with GET
+    /// reliability. See `test_get_reliability_diagnostic`. Opt in via
+    /// [`wait_for_join_convergence_before_ops`](Self::wait_for_join_convergence_before_ops).
+    wait_for_join_before_ops: Option<(f64, Duration)>,
+    /// Optional override for the delay the controlled-event client waits after
+    /// triggering each scheduled operation before triggering the next one.
+    /// `None` (default) uses the historical fixed 3s settle. A test whose
+    /// operations complete quickly against an already-formed network (e.g. a
+    /// read-only GET sweep behind `wait_for_join_convergence_before_ops`) can
+    /// shrink this to avoid spending ~3s of virtual time — and the wall-clock
+    /// to simulate it — per operation for work that finishes in milliseconds.
+    /// Only affects regular client-request operations; special in-client ops
+    /// (clock advance, crash/recover) keep their own fixed settle. See
+    /// [`with_controlled_op_interval`](Self::with_controlled_op_interval).
+    controlled_op_interval: Option<Duration>,
     /// Optional governance-manager config override applied to every node
     /// this network builds. Lets governance sim tests compress the
     /// production minute-to-hour timescales and lower `min_samples` so the
@@ -1323,6 +1421,49 @@ pub struct SimNetwork {
     /// untouched: `NodeConfig::new` sets this to `None`, which resolves to
     /// the real `SUMMARY_FIRST_PUT_MIN_VERSION`.
     summary_first_put_floor_override: Option<(u8, u8, u16)>,
+    /// Per-node hash-first summary version-floor override (#4965, see
+    /// [`SimNetwork::enable_hash_first_summaries`]).
+    ///
+    /// **Defaults to `Some(SIM_MIGRATION_ENABLED_FLOOR)` — ON — which is the
+    /// OPPOSITE of the two overrides above.** They gate behavioural cascades
+    /// that pile load onto unrelated sims, so they fail closed. Hash-first
+    /// only changes the ENCODING of the `Summaries` exchange that already
+    /// runs in every sim, with identical convergence semantics, so ON by
+    /// default costs unrelated sims nothing — and it is the only way the
+    /// suite exercises the new wire path before the release that lifts the
+    /// crate version over the production floor. Without it the first
+    /// integration-level run of a Full-tier protocol change would be the
+    /// release PR, where a red sim could not be attributed between the
+    /// feature and the version bump.
+    hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
+    /// Per-node version-carrying-ack version-floor override (#5161, see
+    /// [`SimNetwork::enable_gateway_ack_version`]).
+    ///
+    /// **Defaults to `Some(SIM_MIGRATION_DISABLED_FLOOR)` — OFF**, like the two
+    /// cascade gates and unlike `hash_first_summaries_floor_override`. The gate
+    /// is encoding-only where it fires, but the version it teaches is the INPUT
+    /// to every other `version_supports_*` gate, so enabling it network-wide
+    /// makes node->gateway links newly eligible for those features. Measured,
+    /// not assumed: defaulting it ON changed the outcome of unrelated sims.
+    ///
+    /// The cost of OFF, stated plainly: sims keep the pre-0.2.120 topology
+    /// asymmetry (a regular node never learns its gateway's version) even after
+    /// production stops having it. `enable_gateway_ack_version` is how a test
+    /// that cares opts in.
+    ack_version_floor_override: Option<(u8, u8, u16)>,
+    /// Per-node override for the originator-target-list version floor (#5147).
+    ///
+    /// Defaults to `SIM_MIGRATION_DISABLED_FLOOR` — OFF — grouping with
+    /// `subscribe_hint_floor_override` and `summary_first_put_floor_override`
+    /// rather than with `hash_first_summaries_floor_override`. Hash-first is ON
+    /// by default because it changes only the ENCODING of an exchange with
+    /// identical semantics. This one changes fan-out BEHAVIOUR: it removes
+    /// peers from a broadcast. Defaulting it ON would silently alter the
+    /// delivery graph under every sim that asserts on convergence or delivery
+    /// counts, and a failure could not be attributed between that sim's own
+    /// subject and this suppression. Tests that want it call
+    /// [`enable_broadcast_target_list`](Self::enable_broadcast_target_list).
+    broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
     /// Optional controllable hosting clock injected into every node's
     /// `HostingManager` (via `NodeConfig::hosting_time_source_override`). When
     /// set, hosting-cache TTL and subscription-lease eviction advance ONLY when
@@ -1499,6 +1640,8 @@ impl SimNetwork {
             use_mock_wasm: false,
             skip_convergence_wait: false,
             churn_config: None,
+            wait_for_join_before_ops: None,
+            controlled_op_interval: None,
             governance_config_override: None,
             // Fail-closed by default: pin the placement-migration (`SubscribeHint`)
             // cascade OFF for every simulation unless a test explicitly opts in
@@ -1514,6 +1657,21 @@ impl SimNetwork {
             // `subscribe_hint_floor_override` above: summary-first PUT is
             // genuinely opt-in per sim via `enable_summary_first_put`.
             summary_first_put_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
+            // Fail-OPEN by default, deliberately unlike the two above (#4965).
+            // See the field's rustdoc: hash-first is an encoding change, not a
+            // load-bearing cascade, and defaulting it ON is what gives a
+            // version-gated wire change simulation coverage BEFORE the release
+            // that lifts the crate version past its floor.
+            hash_first_summaries_floor_override: Some(Self::SIM_MIGRATION_ENABLED_FLOOR),
+            // Fail-CLOSED by default, like the two cascade gates and unlike
+            // hash-first. This gate is encoding-only where it fires, but what
+            // it teaches — the remote's version — is the INPUT to every other
+            // `version_supports_*` gate, so switching it on network-wide is a
+            // cascade in effect. Opt in per sim via `enable_gateway_ack_version`.
+            ack_version_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
+            // Fail-CLOSED by default, like the two behavioural gates above and
+            // unlike hash-first (#5147). See the field's rustdoc.
+            broadcast_target_list_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
             hosting_clock: None,
             hosting_budget_override: None,
             shared_rings: HashMap::new(),
@@ -1720,6 +1878,45 @@ impl SimNetwork {
     /// other sim is left untouched and cannot be perturbed by migration load.
     /// Like `with_governance_config`, this patches the already-built node/gateway
     /// configs (config_* ran during construction with the disabled default).
+    /// Make [`run_controlled_simulation`](Self::run_controlled_simulation) wait
+    /// for the ring to form before firing any scheduled operation: the
+    /// controlled-event client blocks until at least `min_fraction` of this
+    /// network's peers (gateways + nodes) have joined — registered a topology
+    /// snapshot, which a peer only does once its own address is established
+    /// (`peer_ready`) — or `max_wait` virtual time elapses, whichever comes
+    /// first.
+    ///
+    /// Without this, operations fire after a fixed 3s warmup and race topology
+    /// formation; a node whose one-shot, no-retry GET fires before it finishes
+    /// joining is rejected with `PeerNotJoined` and never dispatches, so a
+    /// cold-start reliability metric ends up measuring join speed rather than
+    /// GET reliability. Opt-in; the default is the historical fixed-warmup
+    /// behavior. See the `wait_for_join_before_ops` field.
+    #[allow(dead_code)]
+    pub fn wait_for_join_convergence_before_ops(
+        &mut self,
+        min_fraction: f64,
+        max_wait: Duration,
+    ) -> &mut Self {
+        // Clamp to [0, 1]: a fraction > 1.0 would make the target unreachable
+        // and always burn the full `max_wait` before proceeding.
+        self.wait_for_join_before_ops = Some((min_fraction.clamp(0.0, 1.0), max_wait));
+        self
+    }
+
+    /// Override the delay the controlled-event client waits after triggering
+    /// each scheduled *regular* operation (GET/PUT/etc.) before triggering the
+    /// next. Default is a fixed 3s settle. Lower it for a test whose operations
+    /// finish quickly against a formed network to avoid burning ~3s of virtual
+    /// time — and the wall-clock to simulate it — per operation. Does not affect
+    /// special in-client ops (clock advance, crash/recover). See the
+    /// `controlled_op_interval` field.
+    #[allow(dead_code)]
+    pub fn with_controlled_op_interval(&mut self, interval: Duration) -> &mut Self {
+        self.controlled_op_interval = Some(interval);
+        self
+    }
+
     #[allow(dead_code)]
     pub fn enable_placement_migration(&mut self) -> &mut Self {
         let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
@@ -1804,6 +2001,137 @@ impl SimNetwork {
         }
         for (builder, _) in self.nodes.iter_mut() {
             builder.config.summary_first_put_floor_override = floor;
+        }
+        self
+    }
+
+    /// State explicitly that this simulation exercises the hash-first summary
+    /// exchange (#4965) by pinning the per-node floor to the always-passing
+    /// [`Self::SIM_MIGRATION_ENABLED_FLOOR`].
+    ///
+    /// This is ALREADY the default for every `SimNetwork` (see `new_inner`),
+    /// so calling it changes nothing — it exists so a test whose premise
+    /// depends on hash-first being on says so at the call site instead of
+    /// relying on a default that a future edit could flip out from under it.
+    /// Mirrors [`disable_summary_first_put`](Self::disable_summary_first_put)'s
+    /// belt-and-suspenders rationale, in the opposite direction.
+    #[allow(dead_code)]
+    pub fn enable_hash_first_summaries(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
+        self.hash_first_summaries_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
+        }
+        self
+    }
+
+    /// Opt this simulation into the version-carrying connection ack (#5161) by
+    /// pinning the per-node floor to the always-passing
+    /// [`Self::SIM_MIGRATION_ENABLED_FLOOR`], so a joiner learns the version of
+    /// the gateway (or ack-racing peer) it connects to.
+    ///
+    /// Genuinely opt-in, unlike
+    /// [`enable_hash_first_summaries`](Self::enable_hash_first_summaries) which
+    /// only restates a default. The reasoning is the fail-closed criterion this
+    /// codebase already applies: hash-first is opt-OUT because it changes only
+    /// the ENCODING of an exchange every sim already runs. This gate looks like
+    /// that from the inside — it changes only how one ack is encoded — but its
+    /// EFFECT is a cascade, because the version it teaches is the input to
+    /// every other `version_supports_*` gate. Turning it on network-wide makes
+    /// node->gateway links newly eligible for summary-first PUT probes and
+    /// hash-first digests in whatever sims have those enabled, which is exactly
+    /// the "piles load onto unrelated simulations" shape that
+    /// `subscribe_hint_floor_override` and `summary_first_put_floor_override`
+    /// default OFF to avoid. Measured, not assumed: defaulting it ON changed
+    /// the outcome of several unrelated sims.
+    ///
+    /// Note this leaves the sim suite pinned OFF even after the production
+    /// floor is reached, so sims and production diverge on this from 0.2.120
+    /// onwards. That is the deliberate trade — the alternative is every sim
+    /// silently changing behaviour at a release — and the coverage it costs is
+    /// bought back by `test_joiner_records_gateway_version_through_sim_handshake`
+    /// plus the transport-level tests in `connection_handler`.
+    #[allow(dead_code)]
+    pub fn enable_gateway_ack_version(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
+        self.ack_version_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.ack_version_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.ack_version_floor_override = floor;
+        }
+        self
+    }
+
+    /// Turn the originator target list (#5147) ON for this simulation by
+    /// pinning the per-node version floor to the always-passing
+    /// [`Self::SIM_MIGRATION_ENABLED_FLOOR`].
+    ///
+    /// Unlike [`enable_hash_first_summaries`](Self::enable_hash_first_summaries),
+    /// this is NOT the default and the call is load-bearing: without it every
+    /// peer falls back to the legacy `BroadcastTo` and the sim measures
+    /// today's unsuppressed fan-out. That is exactly what the control arm of a
+    /// suppression measurement wants, so the two arms differ by this one call.
+    #[allow(dead_code)]
+    pub fn enable_broadcast_target_list(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
+        self.broadcast_target_list_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        self
+    }
+
+    /// Force the originator target list OFF for this simulation.
+    ///
+    /// Already the default (see `new_inner`); exists so the CONTROL arm of a
+    /// suppression measurement states its premise at the call site rather than
+    /// depending on a default a future edit could flip.
+    #[allow(dead_code)]
+    pub fn disable_broadcast_target_list(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_DISABLED_FLOOR);
+        self.broadcast_target_list_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        self
+    }
+
+    /// Force the hash-first summary exchange OFF for this simulation by
+    /// pinning the per-node floor to the unreachable
+    /// [`Self::SIM_MIGRATION_DISABLED_FLOOR`], so every peer falls back to the
+    /// full-bytes `InterestMessage::Summaries`.
+    ///
+    /// This is the PRE-0.2.116 fleet: it reproduces what an un-upgraded peer
+    /// does.
+    ///
+    /// Note the override is per-node (`builder.config`), so a genuinely MIXED
+    /// simulation — one peer at the floor, one below — is constructible by
+    /// setting the two builders differently rather than using this helper,
+    /// which sets every node uniformly. No such test exists yet; the mixed
+    /// case that IS covered today is incidental rather than constructed: unless
+    /// a sim calls [`enable_gateway_ack_version`](Self::enable_gateway_ack_version),
+    /// a regular node never learns its gateway's version, so every gateway link
+    /// already runs digests one way and full bytes the other.
+    #[allow(dead_code)]
+    pub fn disable_hash_first_summaries(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_DISABLED_FLOOR);
+        self.hash_first_summaries_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
         }
         self
     }
@@ -2460,6 +2788,9 @@ impl SimNetwork {
             config.governance_config_override = self.governance_config_override.clone();
             config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
             config.summary_first_put_floor_override = self.summary_first_put_floor_override;
+            config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
+            config.ack_version_floor_override = self.ack_version_floor_override;
+            config.broadcast_target_list_floor_override = self.broadcast_target_list_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()
@@ -2560,6 +2891,9 @@ impl SimNetwork {
             config.governance_config_override = self.governance_config_override.clone();
             config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
             config.summary_first_put_floor_override = self.summary_first_put_floor_override;
+            config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
+            config.ack_version_floor_override = self.ack_version_floor_override;
+            config.broadcast_target_list_floor_override = self.broadcast_target_list_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()
@@ -4838,10 +5172,81 @@ impl SimNetwork {
         // `network_name` is still needed after `sim.run()` for topology capture).
         let network_name_for_client = network_name.clone();
 
+        // Optional pre-operation join-convergence barrier (see
+        // `wait_for_join_convergence_before_ops`). Captured by value into the
+        // client closure.
+        let wait_for_join_before_ops = self.wait_for_join_before_ops;
+        let total_peers_expected = self.number_of_nodes + self.number_of_gateways;
+        // Delay between triggering successive regular operations (default 3s).
+        let controlled_op_interval = self
+            .controlled_op_interval
+            .unwrap_or_else(|| Duration::from_secs(3));
+        // A peer counts as "joined" for the barrier once it has >= 1 established
+        // ring connection. This is a slightly STRONGER condition than the
+        // `peer_ready` bar `ensure_peer_ready` checks before letting a peer
+        // originate an operation (`peer_ready` is set at handshake completion,
+        // just before the connection is added to the ring), so any peer the
+        // barrier counts as joined is definitely `peer_ready` — the barrier can
+        // only over-wait, never under-wait, and every scheduled GET dispatches
+        // rather than being rejected with `PeerNotJoined`. We deliberately do
+        // NOT wait for the stronger min_connections/full-ring criterion: a
+        // single connection is all a node needs to originate a GET (routing
+        // stays correct from a lightly-connected node via the gateway-fallback
+        // path), and waiting for a fully-formed ring roughly doubles the
+        // barrier's wall-clock for no change in what the metric measures.
+        const PEER_READY_MIN_CONNECTIONS: usize = 1;
+        let join_conn_threshold = PEER_READY_MIN_CONNECTIONS;
+
         // Register the test client that triggers controlled events
         sim.client("test", async move {
             // Give nodes time to start and establish connections
             tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Optional join-convergence barrier: wait until enough peers have
+            // finished joining before firing any scheduled operation, so the
+            // operations run against a FORMED network instead of racing topology
+            // formation. A peer registers a topology snapshot only after its own
+            // address is established (`peer_ready`), so the distinct snapshot
+            // count is a live join tally. Poll it, advancing virtual time via
+            // short sleeps, until the target fraction joins or the cap elapses.
+            // Default (`None`) skips this entirely, preserving historical timing.
+            if let Some((min_fraction, max_wait)) = wait_for_join_before_ops {
+                let target = ((total_peers_expected as f64) * min_fraction).ceil() as usize;
+                let poll_interval = Duration::from_secs(5);
+                let mut waited = Duration::ZERO;
+                loop {
+                    // Count peers that have reached the join threshold. Snapshot
+                    // *presence* is gated only on the (early) bind address, so it
+                    // is NOT a join signal; the stamped `connection_count` is.
+                    let joined = get_all_topology_snapshots(&network_name_for_client)
+                        .iter()
+                        .filter(|s| s.connection_count >= join_conn_threshold)
+                        .count();
+                    if joined >= target {
+                        tracing::info!(
+                            joined,
+                            target,
+                            total = total_peers_expected,
+                            waited_secs = waited.as_secs(),
+                            "controlled sim: ring join-convergence reached — firing operations"
+                        );
+                        break;
+                    }
+                    if waited >= max_wait {
+                        tracing::warn!(
+                            joined,
+                            target,
+                            total = total_peers_expected,
+                            waited_secs = waited.as_secs(),
+                            "controlled sim: join-convergence cap reached before target — \
+                             firing operations against a partially-formed network"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                    waited += poll_interval;
+                }
+            }
 
             // Trigger events in the specified order
             for (event_id, node_label) in operation_sequence {
@@ -4930,7 +5335,8 @@ impl SimNetwork {
                     }
 
                     // Wait for operation to complete before triggering next
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    // (overridable via `with_controlled_op_interval`; default 3s).
+                    tokio::time::sleep(controlled_op_interval).await;
                 } else {
                     tracing::warn!(
                         event_id,
@@ -4962,6 +5368,12 @@ impl SimNetwork {
         let renewal_metrics =
             crate::ring::topology_registry::get_all_renewal_metrics(&network_name);
 
+        // Capture WASM-summarize counts BEFORE self drops (Drop clears the
+        // registry), same lifetime constraint as the renewal metrics above. The
+        // every-hop summarize-storm falsifier reads these after the run returns.
+        let summarize_wasm_calls =
+            crate::ring::topology_registry::get_all_summarize_wasm_calls(&network_name);
+
         // Capture the crash-drop count BEFORE self drops (Drop clears the fault
         // injector via `set_fault_injector(None)`). `> 0` proves a scripted
         // `CrashNode` actually blocked traffic — the discriminating signal for
@@ -4984,6 +5396,7 @@ impl SimNetwork {
             node_rings,
             renewal_metrics,
             crash_packets_dropped,
+            summarize_wasm_calls,
         }
     }
 
@@ -6064,7 +6477,8 @@ impl Drop for SimNetwork {
     fn drop(&mut self) {
         use crate::node::network_bridge::set_fault_injector;
         use crate::ring::topology_registry::{
-            clear_current_network_name, clear_renewal_metrics, clear_topology_snapshots,
+            clear_current_network_name, clear_renewal_metrics, clear_summarize_metrics,
+            clear_topology_snapshots,
         };
         use crate::transport::in_memory_socket::{
             clear_network_address_mappings, remove_network_socket_registry,
@@ -6076,6 +6490,7 @@ impl Drop for SimNetwork {
         unregister_network_time_source(&self.name);
         clear_topology_snapshots(&self.name);
         clear_renewal_metrics(&self.name);
+        clear_summarize_metrics(&self.name);
         remove_network_socket_registry(&self.name);
         clear_network_address_mappings(&self.name);
 

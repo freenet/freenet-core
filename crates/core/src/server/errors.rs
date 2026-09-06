@@ -19,17 +19,36 @@ pub(super) enum WebSocketApiError {
     MissingContract {
         instance_id: ContractInstanceId,
     },
+    /// The network GET for this contract exhausted its retries without locating
+    /// it — `ContractResponse::NotFound`.
+    ///
+    /// Its own variant rather than reusing `AxumError(RequestError(Timeout))`,
+    /// for two reasons. It is not a timeout, and saying so in the one type the
+    /// HTTP layer logs and renders from would mislead the next person reading a
+    /// trace. And it must NOT inherit `retry_loading_page`: that page refreshes
+    /// every `RETRY_REFRESH_SECS` forever, which is defensible for a timeout
+    /// (the node has peers and is making progress on THIS get) but not here,
+    /// where the identical reply is produced for a contract that is merely slow
+    /// to propagate AND for a key that will never resolve. A typo'd URL left
+    /// open in a tab would otherwise re-issue a network GET every minute for as
+    /// long as the tab lives — see `.claude/rules/browser-assets.md`, "assume
+    /// every open tab pays the cost".
+    ///
+    /// So: the transient STATUS and headers (503 + `Retry-After`), which is what
+    /// a programmatic client needs in order to come back later instead of
+    /// writing the contract off, with a page that states the situation and lets
+    /// a human retry deliberately.
+    ContractNotFound {
+        instance_id: ContractInstanceId,
+    },
 }
 
 impl WebSocketApiError {
-    pub fn status_code(&self) -> StatusCode {
-        match self {
-            WebSocketApiError::InvalidParam { .. } => StatusCode::BAD_REQUEST,
-            WebSocketApiError::NodeError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            WebSocketApiError::AxumError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            WebSocketApiError::MissingContract { .. } => StatusCode::NOT_FOUND,
-        }
-    }
+    // `status_code()` lived here and was used only by `From<_> for Response`,
+    // which now delegates to `IntoResponse`. It had also drifted: it answered
+    // 500 for a `NodeError` that `into_response` renders as 404 ("Contract not
+    // found"), and knew nothing of the 503 retry/connecting pages. Deleted
+    // rather than kept in sync — one status decision, in `into_response`.
 
     pub fn error_message(&self) -> String {
         match self {
@@ -40,6 +59,12 @@ impl WebSocketApiError {
             WebSocketApiError::AxumError { error } => format!("Server error: {error}"),
             WebSocketApiError::MissingContract { instance_id } => {
                 format!("Missing contract {}", instance_id.encode())
+            }
+            WebSocketApiError::ContractNotFound { instance_id } => {
+                format!(
+                    "Contract not found on the network yet: {}",
+                    instance_id.encode()
+                )
             }
         }
     }
@@ -52,9 +77,17 @@ impl Display for WebSocketApiError {
 }
 
 impl From<WebSocketApiError> for Response {
+    /// Delegates to `IntoResponse` rather than rendering its own body.
+    ///
+    /// It used to build `Html(error.error_message())` directly, which is a
+    /// SECOND rendering path for the same type that skipped the escaping in
+    /// `into_response` — so a future handler returning `Result<_, Response>`
+    /// and reaching this `impl` via `?` would have silently reintroduced the
+    /// injection that escaping closes. It also skipped the retry/connecting
+    /// pages and the no-store headers. No caller uses it today; keeping the two
+    /// paths in sync by construction is cheaper than remembering to.
     fn from(error: WebSocketApiError) -> Self {
-        let body = Html(error.error_message());
-        (error.status_code(), body).into_response()
+        error.into_response()
     }
 }
 
@@ -101,13 +134,26 @@ impl IntoResponse for WebSocketApiError {
             }
         );
 
-        let (status, error_message) = if is_transient {
+        // `true` when the body below is node-authored MARKUP (the retry page)
+        // rather than a message built from request-derived text. Only the
+        // latter is escaped — escaping the retry page would render its
+        // meta-refresh tag as visible text and break the auto-reload.
+        // Transient for STATUS and headers, but never auto-refreshing — see the
+        // variant's own doc for why this one does not inherit the retry page.
+        let is_not_found_yet = matches!(&self, WebSocketApiError::ContractNotFound { .. });
+
+        let mut body_is_trusted_markup = false;
+        let (status, error_message) = if is_not_found_yet {
+            body_is_trusted_markup = true;
+            (StatusCode::SERVICE_UNAVAILABLE, not_found_yet_page())
+        } else if is_transient {
             // Log the cause so operators can distinguish a fast op error
             // from a slow-loading contract without changing the user-facing
             // retry page.
             if let WebSocketApiError::AxumError { error } = &self {
                 tracing::info!(%error, "serving retry page for transient contract-fetch error");
             }
+            body_is_trusted_markup = true;
             (StatusCode::SERVICE_UNAVAILABLE, retry_loading_page())
         } else {
             match self {
@@ -125,6 +171,12 @@ impl IntoResponse for WebSocketApiError {
                 err @ WebSocketApiError::MissingContract { .. } => {
                     (StatusCode::NOT_FOUND, err.error_message())
                 }
+                // Handled by the `is_not_found_yet` branch above; this arm only
+                // keeps the match exhaustive. If it ever renders, that branch was
+                // edited out and the explanatory page went with it.
+                err @ WebSocketApiError::ContractNotFound { .. } => {
+                    (StatusCode::SERVICE_UNAVAILABLE, err.error_message())
+                }
                 WebSocketApiError::AxumError { error } => {
                     // Already handled transient cases above; remaining
                     // AxumErrors are infrastructure failures.
@@ -133,12 +185,24 @@ impl IntoResponse for WebSocketApiError {
             }
         };
 
-        let body = Html(error_message);
+        // These bodies are served as text/html at the NODE's own origin, and
+        // several carry request-derived text: `web_subpages`' "Page not found:
+        // {page}" reflects the requested sub-path verbatim, and an
+        // `AxumError`'s `Display` can surface a rejected byte. Escape before
+        // wrapping in `Html`, so a crafted URL cannot become markup on a
+        // node-origin page — this is the one response class on the contract-web
+        // routes that carries no CSP, no `nosniff` and no `X-Frame-Options`,
+        // i.e. exactly where an injection would be worth the most.
+        let body = if body_is_trusted_markup {
+            Html(error_message)
+        } else {
+            Html(html_escape(&error_message))
+        };
 
         // Prevent intermediaries/service-workers from pinning a stale retry
         // page, and signal the client when it may retry.
         let mut response = (status, body).into_response();
-        if is_transient {
+        if is_transient || is_not_found_yet {
             response.headers_mut().insert(
                 axum::http::header::CACHE_CONTROL,
                 axum::http::HeaderValue::from_static("no-store"),
@@ -205,8 +269,109 @@ fn retry_loading_page() -> String {
     )
 }
 
+/// A 503 page for a contract the network could not locate yet.
+///
+/// Deliberately carries NO `<meta http-equiv="refresh">`. The reply this renders
+/// is produced both for a contract that has not propagated to this node yet and
+/// for one that does not exist at all, and nothing available here tells the two
+/// apart — so an automatic reload would re-issue a network GET every minute, for
+/// the life of the tab, on every mistyped or dead URL. The reload is offered as
+/// a deliberate action instead, and the `Retry-After` header carries the same
+/// advice to programmatic clients, which is where it can be acted on safely.
+fn not_found_yet_page() -> String {
+    r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Contract not found</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               display: flex; justify-content: center; align-items: center; min-height: 100vh;
+               margin: 0; background: #0c0d0f; color: #edeeef; }
+        .container { text-align: center; padding: 2rem; max-width: 32rem; }
+        h1 { font-size: 1.2rem; font-weight: 500; margin-bottom: 0.5rem; }
+        p { color: #94969a; font-size: 0.85rem; margin-bottom: 0.6rem; line-height: 1.5; }
+        a { color: #0abab5; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Couldn't find this contract on the network</h1>
+        <p>It may not have reached this peer yet — a contract published moments ago
+           can take a while to propagate. It may also not exist.</p>
+        <p><a href="">Try again</a> &middot; <a href="/">Dashboard</a></p>
+    </div>
+</body>
+</html>"##
+        .to_string()
+}
+
+/// Minimal HTML entity escaping for error bodies rendered at the node origin.
+///
+/// Deliberately duplicated from `permission_prompts::html_escape` rather than
+/// shared: this module is on the error path of every route and must not depend
+/// on a sibling that may itself fail to build.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Regression test for the reflected-HTML gap the escaped-popup review
+    /// found: these bodies are served as `text/html` at the NODE's own origin,
+    /// and several carry request-derived text — `web_subpages` renders
+    /// "Page not found: {page}" with the requested sub-path verbatim.
+    #[tokio::test]
+    async fn error_bodies_escape_request_derived_text() {
+        for error in [
+            WebSocketApiError::InvalidParam {
+                error_cause: "Page not found: <script>alert(1)</script>".to_string(),
+            },
+            WebSocketApiError::NodeError {
+                error_cause: "<img src=x onerror=alert(1)>".to_string(),
+            },
+        ] {
+            let raw = axum::body::to_bytes(error.into_response().into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&raw).to_string();
+            assert!(
+                !body.contains("<script>") && !body.contains("<img "),
+                "error bodies must not render request-derived text as markup; got: {body}"
+            );
+            assert!(
+                body.contains("&lt;") && body.contains("&gt;"),
+                "the payload must survive, escaped, so the message is still \
+                 readable; got: {body}"
+            );
+        }
+    }
+
+    /// `From<WebSocketApiError> for Response` must go through the same
+    /// rendering as `IntoResponse`, or it is a second path that skips the
+    /// escaping above.
+    #[tokio::test]
+    async fn from_impl_renders_identically_to_into_response() {
+        let payload = "<script>alert(1)</script>";
+        let via_from: axum::response::Response = WebSocketApiError::InvalidParam {
+            error_cause: payload.to_string(),
+        }
+        .into();
+        let raw = axum::body::to_bytes(via_from.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&raw).to_string();
+        assert!(
+            !body.contains("<script>"),
+            "the `From` conversion must escape too; got: {body}"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -216,6 +381,66 @@ mod tests {
         };
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn connecting_page_redirects_to_root_only_at_top_level() {
+        // Regression (peer-restart breaks a framed webapp): the connecting page
+        // is served (503, EmptyRing/PeerNotJoined) while the peer rejoins the
+        // ring, and it can render INSIDE a webapp's sandboxed shell iframe as
+        // well as top-level. It must NOT unconditionally navigate to the node
+        // root `/`: doing so inside the iframe yanks the running webapp to a
+        // page that denies framing on hardened deployments ("Refused to
+        // display ... X-Frame-Options: deny" -> broken tab, exactly the River
+        // peer-restart symptom). The redirect to `/` must be conditioned on
+        // being the top document; a framed instance reloads its OWN url in
+        // place. See the head comment in connecting.html.
+        let page = connecting_page();
+        assert!(
+            page.contains("window.top === window.self"),
+            "connecting page must condition the /-redirect on being the top document"
+        );
+        assert!(
+            page.contains("window.location.reload()"),
+            "a framed connecting page must reload its own url instead of navigating to /"
+        );
+        // The only meta-refresh to `/` must be the <noscript> no-JS fallback,
+        // never an unconditional redirect that also fires in a sandboxed frame.
+        let noscript_fallback =
+            r#"<noscript><meta http-equiv="refresh" content="3;url=/" /></noscript>"#;
+        assert!(
+            page.contains(noscript_fallback),
+            "url=/ meta-refresh must be wrapped in <noscript> as the no-JS fallback"
+        );
+        assert!(
+            !page.replace(noscript_fallback, "").contains("url=/"),
+            "connecting page must not contain an unconditional top-level url=/ redirect"
+        );
+        // MAJOR #1 (PR #4781 review): a TOP-LEVEL connecting page that carries
+        // the shell's `_freload` recovery marker is a recovery reload that
+        // momentarily landed here during ring rejoin. It must NOT go to `/`
+        // (that abandons the app for the dashboard — the app-loss this recovery
+        // exists to prevent); it must retry the contract URL in place. The
+        // decision is centralised in the pure `connectingRecoveryDecision`.
+        assert!(
+            page.contains("_freload"),
+            "connecting page must recognize the shell's _freload recovery reload"
+        );
+        assert!(
+            page.contains("function connectingRecoveryDecision("),
+            "the redirect decision must be a pure, testable function of (_freload, atTop, now)"
+        );
+        // MAJOR #3 (PR #4781 review): the retry-in-place must be BOUNDED, not a
+        // 3s-forever loop. `_freload` carries a start timestamp; after the window
+        // the page stops looping (top-level -> `/`, framed -> a stop message).
+        assert!(
+            page.contains("RECOVERY_MAX_MS"),
+            "the recovery retry must be time-bounded, not an unconditional forever loop"
+        );
+        assert!(
+            page.contains("window.location.replace('/')"),
+            "top-level recovery must fall back to the dashboard once the window elapses"
+        );
     }
 
     #[test]

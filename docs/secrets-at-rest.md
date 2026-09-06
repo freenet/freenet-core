@@ -174,6 +174,88 @@ consequence: if you restore from a snapshot older than the 2-year
 already the active secret by then) and stays reversible — the prior
 active value is captured as a fresh snapshot before the overwrite.
 
+#### What gets snapshotted, and how much history is kept
+
+A snapshot is taken only when a write actually **changes** the secret's
+plaintext. Re-writing a byte-identical value is a no-op for history: the
+snapshot would be a second copy of a value already on disk, and since
+every write draws a fresh AEAD nonce, that copy is a distinct ciphertext
+no deduplication can reclaim later. Any uncertainty about the current
+on-disk value (unreadable file, unexpected size, a blob that does not
+decrypt) falls back to taking the snapshot.
+
+Retained history per secret is bounded on three axes:
+
+| Axis | Default | Effect |
+|------|---------|--------|
+| Count tiers | last 5, then 1/min x10, 1/hour x24, 1/day x7, 1/week x4, 1/month x12 | ~62 versions in steady state |
+| `max_age` | 2 years | drops anything older, overriding the tiers |
+| `max_total_bytes` | 3 MiB | drops the OLDEST survivors until the rest fit |
+
+The byte budget is what keeps a large secret from turning a generous
+version count into tens of megabytes of disk — a ~1 MiB value keeps a
+handful of versions instead of ~30, while small secrets stay well under
+the budget and keep their full tiered history.
+
+It never empties a history. At least **three** snapshots are always kept,
+even when that exceeds the budget, so an operator always has a few
+versions to walk back through. For a secret under ~1 MiB this floor never
+comes into play — three of those versions already fit in 3 MiB (each
+snapshot costs its plaintext plus 41 bytes of header and AEAD tag, so
+three fit for plaintexts up to 1,048,535 bytes; at exactly 1 MiB the
+floor already binds). It only matters for the genuinely large values,
+where the practical bound becomes `max(3 MiB, 3 x the largest version)`.
+
+##### The byte budget is applied retroactively — read this before upgrading
+
+Unlike the count tiers, which a node upgrading into them satisfies
+gradually, the byte budget takes effect **all at once**: on a node that
+accumulated a large history before the budget existed, the first
+`store_secret` for a given secret after the upgrade thins that secret's
+history down to the budget in a single pass, and **those deletions are
+permanent**. On a peer where snapshots had grown to 130 MB, that is the
+intended reclaim — but it is a one-way door.
+
+If you want to keep an existing history, either copy
+`<secrets_dir>/<delegate>/.snapshots/` aside before starting the upgraded
+node, or raise/disable the budget (below) before the first write.
+
+##### Tuning or disabling the byte budget
+
+`FREENET_SECRET_SNAPSHOT_BYTES_PER_SECRET` overrides the per-secret budget,
+in bytes:
+
+| Value | Effect |
+|-------|--------|
+| unset, empty, or unparseable | 3 MiB default (an unparseable value logs a warning and keeps the default) |
+| `0` | budget **disabled** — only the count tiers and `max_age` bound the history, i.e. the pre-budget behaviour |
+| any other number | that many bytes |
+
+This is the knob for "I want more history". The separate
+`FREENET_DISABLE_SECRET_SNAPSHOTS` variable turns snapshotting off
+entirely, which is the opposite.
+
+##### Recovery is exempt
+
+`snapshot-restore` — both the CLI and the node runtime's restore path —
+thins **without** the byte budget. Applying it there could evict several
+older versions (including the one just restored from) as a side effect of
+the reversibility snapshot the restore itself adds. The count tiers and
+`max_age` still apply.
+
+How long that exemption lasts depends on which path you are on, and the
+difference matters:
+
+- **`freenet secrets snapshot-restore` (what you should be using):** it
+  lasts as long as you need. The command requires the node to be stopped,
+  so no delegate write can intervene — you can list, restore, inspect and
+  restore again across the whole retained history.
+- **The in-process `SecretsStore::restore_snapshot` API:** it lasts only
+  until the next write to that secret. An ordinary write thins with the
+  full policy, so on a *running* node a delegate touching that secret
+  collapses the restored history to the three-snapshot floor. This is one
+  more reason the supported recovery procedure stops the node first.
+
 ### Export / import a portable secrets bundle (#4035, P3 of #4381)
 
 Unlike snapshot-restore, `export`/`import` move secrets BETWEEN nodes.
@@ -236,8 +318,10 @@ bundle FILE, by contrast, is never written in plaintext.
 **Collision handling.** On import, a secret that already exists at the
 same delegate+id is left untouched and reported as skipped, unless
 `--overwrite` is passed (in which case the prior value is snapshotted
-first, like a normal write). `--out` on export refuses to overwrite an
-existing file.
+first). That snapshot is unconditional — unlike an ordinary delegate
+write, an import does not skip it when the content happens to match,
+because an import is where foreign data lands on top of local data.
+`--out` on export refuses to overwrite an existing file.
 
 ## File permissions (PR #4195 / issue #4141)
 

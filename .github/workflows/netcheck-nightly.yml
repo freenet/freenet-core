@@ -1,0 +1,119 @@
+name: Netcheck (Nightly)
+
+# Runs netcheck against the LIVE network from the gateway host (#4665).
+#
+# Self-hosted on purpose: the check needs the gateway's loopback WebSocket API
+# and the UDP port opened there for its ephemeral peer, neither of which is
+# reachable from a cloud runner.
+#
+# The job body is deliberately thin. All the logic is in
+# scripts/netcheck-nightly.sh, which can be run by hand over ssh on the same
+# host; a workflow file cannot be tested before it reaches the default branch.
+
+on:
+  schedule:
+    # 04:00 UTC, an hour after the simulation nightly so a human reading the
+    # morning results sees them in a predictable order.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+# Never run two at once: they would contend for the ephemeral peer's UDP port
+# and both write the same manifest.
+concurrency:
+  group: netcheck-nightly
+  cancel-in-progress: false
+
+jobs:
+  netcheck:
+    name: Live network check
+    runs-on: self-hosted
+    # A normal run is minutes. The cap is generous because the first PUT after
+    # a release pays for WASM validation, and joining the ring is not instant.
+    # If it ever trips, something is genuinely stuck: investigate rather than
+    # raise it.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Ensure the wasm target is present
+        # netcheck compiles the probe contract at startup. Idempotent.
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Run netcheck against the live network
+        env:
+          NETCHECK_OTLP_ENDPOINT: http://127.0.0.1:4318
+          NETCHECK_VANTAGE: nova
+        run: bash scripts/netcheck-nightly.sh
+
+      - name: Upload the run report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: netcheck-report
+          path: ~/netcheck/last-run.jsonl
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Same transport as the simulation nightly: riverctl against the Freenet
+  # gateway with the shared RIVER_SIGNING_KEY, so there is one set of
+  # credentials to maintain rather than a second standalone token.
+  #
+  # Today any failure notifies. Distinguishing a real regression from a
+  # degraded retention window or an infrastructure error is the threshold
+  # work tracked in #4665, and belongs with the dashboard that can show it.
+  notify-failure:
+    name: Notify River on Failure
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: netcheck
+    if: failure() && needs.netcheck.result == 'failure'
+    continue-on-error: true
+    steps:
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Install riverctl
+        run: cargo install riverctl
+
+      - name: Send failure message to River (with exponential backoff)
+        env:
+          RIVER_SIGNING_KEY: ${{ secrets.RIVER_SIGNING_KEY }}
+        run: |
+          MESSAGE="🚨 Nightly netcheck failed against the live network - ${{ github.repository }} - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          NODE_URL="${{ secrets.RIVER_GATEWAY_URL }}"
+          ROOM_ID="${{ secrets.RIVER_ROOM_ID }}"
+
+          max_attempts=7
+          delay=10
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Attempt $attempt/$max_attempts (delay: ${delay}s)..."
+            if riverctl --node-url "$NODE_URL" message send "$ROOM_ID" "$MESSAGE" 2>&1; then
+              echo "Message sent successfully on attempt $attempt"
+              exit 0
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              echo "Failed, retrying in ${delay}s..."
+              sleep "$delay"
+              delay=$((delay * 2))
+            fi
+          done
+          echo "::warning::Failed to send River notification after $max_attempts attempts (gateway may be restarting)"
+          exit 0
+
+  notify-dev-room-failure:
+    name: Notify dev room on Failure
+    runs-on: ubuntu-latest
+    needs: netcheck
+    if: failure() && needs.netcheck.result == 'failure'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/river-dev-notify
+        with:
+          message: "🚨 Nightly netcheck failed against the live network, ${{ github.repository }}, ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

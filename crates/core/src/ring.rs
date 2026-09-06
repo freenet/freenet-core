@@ -25,8 +25,8 @@ use parking_lot::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 pub use hosting::{
-    AddClientSubscriptionResult, ClientDisconnectResult, SubscribeResult,
-    SubscribedContractSnapshot,
+    AddClientSubscriptionResult, AddSubscriberOutcome, ClientDisconnectResult, HostingReason,
+    HostingReasonStats, SubscribeResult, SubscribedContractSnapshot,
 };
 
 use crate::message::TransactionType;
@@ -80,10 +80,15 @@ const _: () = {
     );
 };
 
+pub(crate) mod broadcast_coverage;
 mod broken_invariants;
 mod connection_backoff;
 mod connection_manager;
 pub(crate) mod contract_ban_list;
+pub(crate) mod contract_exec_metrics;
+pub(crate) mod delta_incompat;
+/// Shadow-mode detector for repairs that never converge (see the module docs).
+pub(crate) mod futile_repair;
 pub(crate) use connection_manager::ConnectionManager;
 // Nearest-neighbor ring lattice (successor+predecessor base edges).
 // `nn_lattice_active_for` is the full activation gate — the flag AND the
@@ -103,15 +108,39 @@ pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
 /// executor chokepoints so a write that would overflow the aggregate disk
 /// budget is refused before any bytes land.
 pub(crate) use hosting::DiskBudgetExceeded;
+/// Hosting-BEGIN attribution: WHY this peer started hosting a contract. Every
+/// production caller of [`Ring::host_contract`] names one.
+pub(crate) use hosting::HostingCause;
 /// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
 /// `config::ConfigArgs::build` so an upgraded node re-derives its hosting budget
 /// instead of keeping the historically-pinned default (#4565).
 pub(crate) use hosting::LEGACY_FLAT_HOSTING_BUDGET_BYTES;
+/// Clamp bound re-exported only for the config-default round-trip test.
+#[cfg(test)]
+pub(crate) use hosting::MAX_DEFAULT_HOSTING_BUDGET_BYTES;
+/// The aggregate hosting-disk budget's own floor — also the wasmtime
+/// compile-cache's configured-budget bound's floor (#5328 review), so this is
+/// a genuine production dependency now, not test-only.
+pub(crate) use hosting::MIN_DEFAULT_HOSTING_BUDGET_BYTES;
 /// Single source of truth for the default hosted-contract-state budget.
 /// `config::default_max_hosting_storage()` resolves to this so the
 /// operator-facing default and the in-code fallback can never drift. The
 /// default is RAM-scaled (capability-relative, A2) rather than a flat constant.
 pub(crate) use hosting::default_hosting_budget_bytes;
+/// The aggregate hosting-disk budget's own pure clamp math. A genuine
+/// production dependency (#5328 review): the wasmtime compile-cache's
+/// configured-budget bound (`wasm_runtime::runtime::bound_by_configured_disk_budget`)
+/// projects what the live aggregate budget will resolve to via this SAME
+/// function, so the compile cache respects an operator-shrunk
+/// `--max-hosting-disk` rather than only physical disk availability. Also
+/// used by the wasmtime disk-cache sizing tests to verify headroom against
+/// the real function rather than a duplicate.
+pub(crate) use hosting::disk_budget_for_clamped;
+/// The hosting budget's pure RAM clamp, re-exported (test-only) so the wasmtime
+/// on-disk compile-cache sizing test can pin that the compile cache never
+/// exceeds the contract-state budget it accelerates.
+#[cfg(test)]
+pub(crate) use hosting::hosting_budget_for_ram;
 /// Re-export the reconcile controller (pure decision core, its input/action
 /// types, and the shadow-mode set-membership comparator) so the node layer can
 /// build inputs and run the shadow compare (keystone step-2, #4642).
@@ -120,17 +149,28 @@ pub use hosting::{AccessType, RecordAccessResult};
 /// Aggregate disk-budget defaults (#4683). `config` resolves the persisted
 /// `hosting-disk-pct` / `max-hosting-disk` defaults from these so the operator-
 /// facing defaults and the in-code sizing math share one source of truth.
-pub(crate) use hosting::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES};
-/// Clamp bounds re-exported only for the config-default round-trip test.
-#[cfg(test)]
-pub(crate) use hosting::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
+pub(crate) use hosting::{
+    DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE,
+};
+/// Widths of the two hosted-set demand-signal histograms carried on the router
+/// snapshot, re-exported so `router` sizes its wire arrays from the same
+/// definition the bucketing code uses.
+pub(crate) use hosting::{GENUINE_ACCESS_RECENCY_BUCKETS, READ_COUNT_HIST_BUCKETS};
+/// The aggregate disk-usage tracker's mount-availability probe and directory
+/// walk, re-exported so the wasmtime on-disk compile-cache startup sizing
+/// (`wasm_runtime::runtime::default_wasmtime_cache_size_bytes_for_dir`, #5014)
+/// can bound itself by real disk headroom, not just RAM, without duplicating
+/// the `statvfs` FFI call or the walk.
+pub(crate) use hosting::{disk_available_bytes, disk_directory_size_bytes};
 pub mod interest;
 mod live_tx;
 mod location;
+pub(crate) mod merge_backoff;
 pub(crate) mod peer_cache;
 mod peer_connection_backoff;
 mod peer_key_location;
 mod placement_migration_metrics;
+pub(crate) mod resync_rate_limit;
 pub mod topology_registry;
 pub(crate) mod update_rate_limit;
 
@@ -212,6 +252,43 @@ pub(crate) struct Ring {
     /// `crate::ring::update_rate_limit` and `docs/design/contract-hardening.md`
     /// Phase 2.
     pub(crate) update_rate_limiter: Arc<update_rate_limit::UpdateRateLimiter>,
+    /// Per-contract merge-failure backoff (#4861). Quarantines "poison"
+    /// contracts whose WASM merges reliably fail/time out: while a contract is
+    /// in its exponential cooldown the UPDATE broadcast drivers skip the merge
+    /// (and its `ResyncRequest` amplification) entirely, so it costs O(1) per
+    /// inbound broadcast instead of O(WASM merge). Cleared the instant a merge
+    /// succeeds. See `crate::ring::merge_backoff`.
+    pub(crate) merge_backoff: Arc<merge_backoff::MergeBackoff>,
+    /// SENDER-side memo of contracts whose deltas are known-doomed (the HQk7
+    /// resync loop). Armed by repeated resync-after-our-delta signals or local
+    /// `Invalid`-class delta-apply failures; while armed, the broadcast path
+    /// skips delta computation and sends full state. TTL-bounded, LRU-capped,
+    /// cleared by a successful delta apply. See `crate::ring::delta_incompat`.
+    pub(crate) delta_incompat: Arc<delta_incompat::DeltaIncompat>,
+    /// Per-contract cap on how often THIS node emits a `ResyncRequest` (#4861).
+    /// Bounds the full-state resync amplification independently of the merge
+    /// outcome. See `crate::ring::resync_rate_limit`.
+    pub(crate) resync_emit_limiter: Arc<resync_rate_limit::ResyncEmitLimiter>,
+    /// Per-`(peer, contract)` cap on how often this node answers a given peer's
+    /// `ResyncRequest` with a full-state `ResyncResponse` (#4861). The
+    /// mixed-version-rollout guard: a not-yet-upgraded peer that still emits
+    /// unlimited `ResyncRequest`s cannot make an upgraded peer full-state-reply
+    /// in a loop. See `crate::ring::resync_rate_limit`.
+    pub(crate) resync_response_limiter: Arc<resync_rate_limit::ResyncResponseLimiter>,
+    /// GLOBAL per-contract cap on `ResyncResponse` emission, aggregated across
+    /// ALL requesters (#4861). Per-(peer, contract) limiting alone is
+    /// insufficient — production saw ~45 distinct requester IPs drive ~9,733
+    /// full-state responses/day for one forked contract. Checked AFTER the
+    /// per-peer limit. See `crate::ring::resync_rate_limit`.
+    pub(crate) resync_response_global_limiter: Arc<resync_rate_limit::ResyncResponseGlobalLimiter>,
+    /// Correlation map for outstanding `ResyncRequest`s WE emitted (#4864
+    /// round-8, Codex P1). The `ResyncResponse` apply path runs a full-state WASM
+    /// merge that is deliberately NOT backoff-gated, so without correlation it is
+    /// an unmetered DoS surface — a peer could stream/replay unsolicited responses
+    /// bypassing every emitter-side gate. The receive arm require-and-consumes a
+    /// matching `(contract, source)` entry BEFORE applying; consume-on-first-match
+    /// kills replay. See `crate::ring::resync_rate_limit::OutstandingResyncRequests`.
+    pub(crate) outstanding_resync_requests: Arc<resync_rate_limit::OutstandingResyncRequests>,
     /// Per-contract ban list. Populated by the governance reaper on
     /// `BanTriggered` / `BanLifted` transitions; consulted at the
     /// inbound dispatch site to drop wire requests for banned
@@ -242,6 +319,15 @@ pub(crate) struct Ring {
     /// task *reads* it. Threading the `Arc` (rather than a process-global)
     /// keeps the gauges per-node so unit tests stay isolated (#4488).
     module_cache_metrics: Arc<crate::wasm_runtime::ModuleCacheMetrics>,
+    /// Per-node contract-exec WASM counters: how many `summarize_state` /
+    /// `get_state_delta` invocations this node actually ran, split from the
+    /// cache hits that elided them. Constructed once here and shared via `Arc`:
+    /// the executor increments it through `op_manager.ring`, while
+    /// `emit_router_snapshot_telemetry` reads it. Threading the `Arc` (rather
+    /// than a process-global) keeps the counters per-node so unit tests stay
+    /// isolated (#4488). See [`contract_exec_metrics`] for why an
+    /// undifferentiated span count could not answer the storm question.
+    contract_exec_metrics: Arc<contract_exec_metrics::ContractExecMetrics>,
     /// Per-node placement-migration activity counters (#4404 follow-up).
     /// Constructed once here and shared via `Arc`: the migration SEND site
     /// (`p2p_protoc::migration`) and the two RECEIVE sites (`node::process_message`)
@@ -580,6 +666,11 @@ impl Ring {
             governance_config,
             time_source.clone(),
         ));
+        // Read before `connection_manager` is moved into the literal.
+        // The UPDATE limiter's per-sender budget is keyed by the
+        // immediate upstream hop, so its map is sized from this node's
+        // OWN connection cap rather than a hardcoded default.
+        let max_connections = connection_manager.max_connections;
         let ring = Ring {
             max_hops_to_live,
             router,
@@ -599,8 +690,28 @@ impl Ring {
             broken_invariants: BrokenInvariantsTracker::new(time_source.clone()),
             governance,
             update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
+                // Production passes `None` and gets `time_source` (the real
+                // clock). The override exists so a test can decide the
+                // limiter's verdict instead of racing MIN_UPDATE_INTERVAL —
+                // see `NodeConfig::update_rate_limit_time_source_override`.
+                config
+                    .update_rate_limit_time_source_override
+                    .clone()
+                    .unwrap_or_else(|| time_source.clone()),
+                max_connections,
+            )),
+            merge_backoff: Arc::new(merge_backoff::MergeBackoff::new(time_source.clone())),
+            delta_incompat: Arc::new(delta_incompat::DeltaIncompat::new(time_source.clone())),
+            resync_emit_limiter: Arc::new(resync_rate_limit::new_emit_limiter(time_source.clone())),
+            resync_response_limiter: Arc::new(resync_rate_limit::new_response_limiter(
                 time_source.clone(),
             )),
+            resync_response_global_limiter: Arc::new(
+                resync_rate_limit::new_response_global_limiter(time_source.clone()),
+            ),
+            outstanding_resync_requests: Arc::new(
+                resync_rate_limit::new_outstanding_resync_requests(time_source.clone()),
+            ),
             contract_ban_list: Arc::new(contract_ban_list::ContractBanList::new(
                 time_source.clone(),
             )),
@@ -616,6 +727,7 @@ impl Ring {
             // (the `RuntimePool` reaches it through `op_manager.ring`). See
             // the field docs and #4488.
             module_cache_metrics: Arc::new(crate::wasm_runtime::ModuleCacheMetrics::new()),
+            contract_exec_metrics: Arc::new(contract_exec_metrics::ContractExecMetrics::default()),
             // One placement-migration counter sink per node, shared with the
             // migration send/receive sites via the `Arc` (reached through
             // `op_manager.ring`). See the field docs.
@@ -633,6 +745,29 @@ impl Ring {
         }
 
         let ring = Arc::new(ring);
+
+        // Conformance focus selects over the contracts this peer HOSTS (RFC #5320),
+        // so the ring - which owns the hosting cache - is what can answer that. A
+        // `Weak` deliberately: this closure is stored in a process-global that
+        // outlives the node, and holding a strong `Arc` there would keep an entire
+        // ring, its background tasks' handles and its caches alive past teardown. A
+        // dead ring reads as "no candidates", which surfaces as `focused=0` rather
+        // than as a stale set. Registration is a no-op unless capture is enabled.
+        {
+            let weak = Arc::downgrade(&ring);
+            crate::conformance::capture::set_hosted_contracts_source(Box::new(move || {
+                weak.upgrade()
+                    .map(|ring| {
+                        ring.hosting_manager
+                            .hosting_contract_keys()
+                            .into_iter()
+                            .map(|key| *key.id())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }));
+        }
+
         let current_span = tracing::Span::current();
         let span = if current_span.is_none() {
             tracing::info_span!("connection_maintenance")
@@ -762,6 +897,16 @@ impl Ring {
     /// this `Arc` is what replaced the old `MODULE_CACHE_METRICS` process-global.
     pub(crate) fn module_cache_metrics(&self) -> Arc<crate::wasm_runtime::ModuleCacheMetrics> {
         self.module_cache_metrics.clone()
+    }
+
+    /// Shared per-node contract-exec WASM counters. Returns a BORROW, not an
+    /// `Arc` clone: the increment sites sit on the contract-handling loop's hot
+    /// path (tens of calls/sec per node), where an `Arc` refcount bump would be
+    /// a needless atomic RMW on top of the counter's own. The snapshot reader
+    /// borrows the same way on its 5-minute cadence.
+    #[inline]
+    pub(crate) fn contract_exec_metrics(&self) -> &contract_exec_metrics::ContractExecMetrics {
+        &self.contract_exec_metrics
     }
 
     /// Shared per-node placement-migration counter sink (#4404 follow-up). The
@@ -1270,6 +1415,29 @@ impl Ring {
             // for pairs that haven't tried an UPDATE since then.
             ring.update_rate_limiter.cleanup();
 
+            // Sweep idle merge-failure backoff entries (#4861) on the same
+            // cadence. Drops entries for contracts past their cooldown that
+            // haven't failed a merge recently; a poison contract still in
+            // cooldown is preserved.
+            ring.merge_backoff.cleanup_expired();
+
+            // Sweep stale delta-send attributions and idle unarmed entries in
+            // the delta-incompatibility memo (HQk7 resync loop); an armed
+            // (unexpired) memo is preserved.
+            ring.delta_incompat.cleanup();
+
+            // Sweep recovered/idle resync rate-limiter buckets (#4861) so the
+            // per-contract emit and per-(peer, contract) responder maps stay
+            // bounded.
+            ring.resync_emit_limiter.cleanup();
+            ring.resync_response_limiter.cleanup();
+            ring.resync_response_global_limiter.cleanup();
+
+            // Reap outstanding-ResyncRequest correlation entries past their TTL
+            // (#4864 round-8) so a burst of requests whose responses never arrive
+            // cannot pin the map past OUTSTANDING_RESYNC_TTL.
+            ring.outstanding_resync_requests.cleanup();
+
             // Phase 7 ban-list maintenance. Defense-in-depth — the
             // BanLifted decisions below explicitly unban, but if any
             // entry slipped through the reaper (e.g. mode flipped off
@@ -1514,8 +1682,18 @@ impl Ring {
                 }
             }
 
-            crate::tracing::telemetry::send_standalone_event(
+            // #4956: tag with the local peer so this can be JOINED per-peer
+            // against `resource_utilization` / `outbound_message_mix`. Without
+            // it the event reports fleet-wide distributions only, which is why
+            // the InterestSync cost hypothesis could not be confirmed by
+            // correlation and had to stay an estimate.
+            crate::tracing::telemetry::send_standalone_event_with_peer_id(
                 "interest_heartbeat_cycle",
+                &op_manager
+                    .ring
+                    .connection_manager
+                    .own_location()
+                    .to_string(),
                 serde_json::json!({
                     "peers_sent": peers_sent,
                     "interest_hashes": hashes.len(),
@@ -1553,6 +1731,19 @@ impl Ring {
         let mut prev_broadcast_stream_failures_total: u64 = crate::node::BROADCAST_STREAM_METRICS
             .snapshot()
             .streaming_failures_total;
+        // Same shape for the contract-exec WASM counters: the monotonic totals
+        // are emitted for collector-side differencing, and these loop-local
+        // previous values turn the four headline arms into per-window deltas so
+        // a SINGLE snapshot says whether this node's summarize/delta load was
+        // cache hits or real WASM work. Seeded from the current values so the
+        // first emitted window covers only elapsed-since-start work.
+        let mut prev_exec = ring.contract_exec_metrics.snapshot();
+        // The diagnostic block is substantially wider than the ordinary
+        // snapshot gauges. Its counters are lifetime-monotonic, so collecting
+        // locally on every event but exporting one in six snapshots preserves
+        // counter evidence while bounding collector/storage load. Start at five
+        // so a newly started node reports after its first five-minute snapshot.
+        let mut network_efficiency_tick = 5u8;
 
         loop {
             if sleep_or_shutdown(&shutdown, async {
@@ -1604,6 +1795,23 @@ impl Ring {
             snapshot.lattice_predecessor_distance = lattice_predecessor;
             snapshot.lattice_probes_issued = Some(lattice_probes_issued);
             snapshot.lattice_probe_improvements = Some(lattice_probe_improvements);
+
+            // Version-gate refusal counters (#5156): why
+            // `supports_hash_first_summaries` / `supports_summary_first_put`
+            // fell back to the full-bytes path, split into the two causes
+            // with opposite implications (unknown remote version, which never
+            // self-heals, vs a known pre-floor version, which self-heals as
+            // the fleet upgrades). Read directly from the gate's own counters
+            // — see `ConnectionManager::version_gate_refusal_stats`.
+            let version_gate_refusals = cm.version_gate_refusal_stats();
+            snapshot.hash_first_summaries_declined_unknown_version =
+                Some(version_gate_refusals.hash_first_declined_unknown_version);
+            snapshot.hash_first_summaries_declined_pre_floor =
+                Some(version_gate_refusals.hash_first_declined_pre_floor);
+            snapshot.summary_first_put_declined_unknown_version =
+                Some(version_gate_refusals.summary_first_put_declined_unknown_version);
+            snapshot.summary_first_put_declined_pre_floor =
+                Some(version_gate_refusals.summary_first_put_declined_pre_floor);
 
             // Compiled-WASM module-cache occupancy + eviction gauges (#4440),
             // read from the per-node `Arc` the caches publish into (they live
@@ -1664,6 +1872,20 @@ impl Ring {
             // as the rework ships (AtCapacity now sheds subscribed as a last
             // resort). Same periodic cadence.
             snapshot.hosting_subscribed_evictions_total = Some(hosting.subscribed_evictions_total);
+            // Cost-pressure eviction falsifier (cost-aware eviction, #4861):
+            // zero-demand contracts shed because their attributed update-work
+            // (CPU / broadcast fan-out) dominated the node's total. Nonzero =
+            // the trigger is firing; runaway = floors/share miscalibrated.
+            snapshot.hosting_cost_evictions_total = Some(hosting.cost_evictions_total);
+            // Local notification-delivery outcomes (#4681). PER-NODE counters
+            // (see HostingManager), read once per snapshot — no per-event
+            // stream. Read from the manager, not the stats snapshot, for the
+            // same reason `hosting_local_hits_total` does below.
+            let (notif_full, notif_closed, notif_none) =
+                ring.hosting_manager.notification_delivery_counts();
+            snapshot.notifications_dropped_channel_full = Some(notif_full);
+            snapshot.notifications_dropped_channel_closed = Some(notif_closed);
+            snapshot.notifications_no_local_subscriber = Some(notif_none);
             // Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d):
             // current count of contracts in-use via a downstream subscriber with
             // NO state on disk (contract_in_use && !contract_state_present). After
@@ -1685,7 +1907,8 @@ impl Ring {
             // WASM blobs + wasmtime compile cache (both du-measured) + their sum.
             // `None` until the tracker is configured and seeded (early startup),
             // in which case the fields stay unset. Observational only in this PR.
-            if let Some(disk) = ring.hosting_manager.disk_usage_stats() {
+            let disk_usage = ring.hosting_manager.disk_usage_stats();
+            if let Some(disk) = disk_usage {
                 snapshot.hosting_disk_state_bytes = Some(disk.state_bytes);
                 snapshot.hosting_disk_wasm_bytes = Some(disk.wasm_bytes);
                 snapshot.hosting_disk_compile_cache_bytes = Some(disk.compile_cache_bytes);
@@ -1709,6 +1932,18 @@ impl Ring {
                 snapshot.terminal_consult_hits = Some(hits);
                 snapshot.terminal_consult_resolved_found = Some(resolved_found);
                 snapshot.terminal_consult_still_not_found = Some(still_not_found);
+            }
+
+            // Eviction-retraction emission counters (#5059). Same hand-mirror
+            // footgun as every counter here: a new `RouterSnapshotInfo` field is
+            // invisible to the collector unless added BOTH here AND in
+            // `event_kind_to_json` (pinned by
+            // `router_snapshot_json_includes_hosting_retraction_counters`).
+            if let Some((emitted, dropped)) =
+                crate::node::network_status::hosting_retraction_counts()
+            {
+                snapshot.hosting_retractions_emitted = Some(emitted);
+                snapshot.hosting_retractions_dropped = Some(dropped);
             }
 
             // Streamed-transfer abort counters (Group B): isolate the
@@ -1878,6 +2113,70 @@ impl Ring {
             snapshot.broadcast_stream_failures_last_snapshot =
                 Some(broadcast_stream_failures_delta);
 
+            // Contract-exec WASM counters: the split that makes a summarize rate
+            // interpretable. A high `fast_hits` rate with a low `wasm_calls` rate
+            // is a warm cache doing cheap work; the two converging means the
+            // change-detector has stopped covering the load and the storm class
+            // (#4473 / #4610 / #5040 / #5238) has re-armed.
+            //
+            // EVERY arm is windowed, not a chosen headline subset. Emitting some
+            // arms as a 5-minute delta and others as a lifetime total, under
+            // parallel names on one log line, invites reading them as comparable
+            // magnitudes — and the arm that would be understated that way is
+            // `delta_wasm_uncached`, the per-local-subscriber fan-out delta that
+            // has no cache in front of it at all and can dominate on a
+            // client-facing node. An overstated saving is worse than a missing
+            // one, because it terminates the investigation.
+            let ce = ring.contract_exec_metrics.snapshot();
+            let ce_d = ce.window_deltas(&mut prev_exec);
+            // Exhaustive destructure with no `..` rest pattern, on BOTH the
+            // lifetime snapshot and the window deltas. A 9th counter arm then
+            // fails to COMPILE here until it is exported, which is strictly
+            // stronger than the source-scrape pin below: a scrape that hardcodes
+            // today's eight names passes unchanged when a ninth is added, which
+            // is exactly how a counter ends up recorded but never exported.
+            let contract_exec_metrics::ContractExecSnapshot {
+                summarize_fast_hits: _,
+                summarize_reload_hits: _,
+                summarize_wasm_calls: _,
+                summarize_wasm_uncached: _,
+                delta_fast_hits: _,
+                delta_reload_hits: _,
+                delta_wasm_calls: _,
+                delta_wasm_uncached: _,
+            } = ce;
+            let contract_exec_metrics::ContractExecSnapshot {
+                summarize_fast_hits: _,
+                summarize_reload_hits: _,
+                summarize_wasm_calls: _,
+                summarize_wasm_uncached: _,
+                delta_fast_hits: _,
+                delta_reload_hits: _,
+                delta_wasm_calls: _,
+                delta_wasm_uncached: _,
+            } = ce_d;
+            snapshot.contract_exec_summarize_fast_hits_total = Some(ce.summarize_fast_hits);
+            snapshot.contract_exec_summarize_reload_hits_total = Some(ce.summarize_reload_hits);
+            snapshot.contract_exec_summarize_wasm_calls_total = Some(ce.summarize_wasm_calls);
+            snapshot.contract_exec_summarize_wasm_uncached_total = Some(ce.summarize_wasm_uncached);
+            snapshot.contract_exec_delta_fast_hits_total = Some(ce.delta_fast_hits);
+            snapshot.contract_exec_delta_reload_hits_total = Some(ce.delta_reload_hits);
+            snapshot.contract_exec_delta_wasm_calls_total = Some(ce.delta_wasm_calls);
+            snapshot.contract_exec_delta_wasm_uncached_total = Some(ce.delta_wasm_uncached);
+            snapshot.contract_exec_summarize_fast_hits_last_snapshot =
+                Some(ce_d.summarize_fast_hits);
+            snapshot.contract_exec_summarize_reload_hits_last_snapshot =
+                Some(ce_d.summarize_reload_hits);
+            snapshot.contract_exec_summarize_wasm_calls_last_snapshot =
+                Some(ce_d.summarize_wasm_calls);
+            snapshot.contract_exec_summarize_wasm_uncached_last_snapshot =
+                Some(ce_d.summarize_wasm_uncached);
+            snapshot.contract_exec_delta_fast_hits_last_snapshot = Some(ce_d.delta_fast_hits);
+            snapshot.contract_exec_delta_reload_hits_last_snapshot = Some(ce_d.delta_reload_hits);
+            snapshot.contract_exec_delta_wasm_calls_last_snapshot = Some(ce_d.delta_wasm_calls);
+            snapshot.contract_exec_delta_wasm_uncached_last_snapshot =
+                Some(ce_d.delta_wasm_uncached);
+
             // Placement-quality gauge (#4404 follow-up): host-to-hosted-key
             // ring-distance distribution. If the SubscribeHint placement
             // migration is working, hosting drifts toward each contract's key,
@@ -1934,6 +2233,172 @@ impl Ring {
             snapshot.subscribe_hint_acted_succeeded = Some(pm.acted_succeeded);
             snapshot.subscribe_hint_acted_failed = Some(pm.acted_failed);
 
+            // Large-state decision evidence (#5090). The fixed-cardinality
+            // block rides the existing snapshot event once every six ticks
+            // (30 minutes), with no new event stream, peer identifiers, or
+            // contract-key map. Lifetime-monotonic counters recover both local
+            // snapshot drops and the deliberately skipped five-minute ticks.
+            network_efficiency_tick = (network_efficiency_tick + 1) % 6;
+            if network_efficiency_tick == 0
+                && let (Some(op_manager), Some(disk), Some(telemetry)) = (
+                    ring.upgrade_op_manager(),
+                    disk_usage,
+                    crate::tracing::telemetry::telemetry_local_metrics_snapshot(),
+                )
+            {
+                let lifecycle = op_manager.interest_manager.interest_lifecycle_snapshot();
+                // SHADOW MODE: futile-repair evidence (#nc-merge). Rides the
+                // same fixed-cardinality block for the same reason the rest of
+                // it does — `network_efficiency_v1` is the only family that
+                // bypasses both the node rate limiter and the collector's 5%
+                // sampler, so a rare-but-decisive counter is not sampled away.
+                let futile_repair = op_manager.interest_manager.futile_repair_snapshot();
+                let receiver = op_manager.payload_mix.receiver_apply_stats();
+                let queue = crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS.snapshot();
+                let state_rejections = crate::contract::state_size_rejection_snapshot();
+                let rate_to_u64 = |rate: f64| {
+                    if !rate.is_finite() || rate <= 0.0 {
+                        0
+                    } else if rate >= u64::MAX as f64 {
+                        u64::MAX
+                    } else {
+                        rate.round() as u64
+                    }
+                };
+                let cost_axes = ring.hosting_cost_pressure_axes();
+                let eligibility = ring.hosting_manager.cost_eligibility_stats(&cost_axes);
+                let cost = std::array::from_fn(|index| {
+                    cost_axes.get(index).map_or([0; 5], |axis| {
+                        let max_any = axis.rates.values().copied().fold(0.0, f64::max);
+                        let max_eligible = eligibility.max_eligible_rate[index]
+                            .iter()
+                            .copied()
+                            .fold(0.0, f64::max);
+                        [
+                            rate_to_u64(axis.total_rate),
+                            rate_to_u64(axis.floor),
+                            rate_to_u64(max_any),
+                            rate_to_u64(max_eligible),
+                            axis.rates.len() as u64,
+                        ]
+                    })
+                });
+                let cost_bucket_any = std::array::from_fn(|axis| {
+                    std::array::from_fn(|bucket| {
+                        rate_to_u64(eligibility.max_attributed_rate[axis][bucket])
+                    })
+                });
+                let cost_bucket_eligible = std::array::from_fn(|axis| {
+                    std::array::from_fn(|bucket| {
+                        rate_to_u64(eligibility.max_eligible_rate[axis][bucket])
+                    })
+                });
+
+                let tel = [
+                    telemetry.enqueue_attempts_total,
+                    telemetry.enqueue_succeeded_total,
+                    telemetry.enqueue_dropped_full_total,
+                    telemetry.enqueue_dropped_closed_total,
+                    telemetry.rate_limit_admitted_operational_total,
+                    telemetry.rate_limit_admitted_shadow_total,
+                    telemetry.dropped_aggregate_limit_operational_total,
+                    telemetry.dropped_aggregate_limit_shadow_total,
+                    telemetry.dropped_shadow_limit_total,
+                    telemetry.dropped_backoff_buffer_full_total,
+                    telemetry.batch_send_attempts_total,
+                    telemetry.batch_send_successes_total,
+                    telemetry.batch_send_failures_total,
+                    telemetry.batch_events_sent_total,
+                    telemetry.batch_retry_truncated_events_total,
+                ];
+                let shadow = std::array::from_fn(|index| {
+                    let stream = telemetry.known_shadow_rollups[index];
+                    [
+                        stream.enqueue_attempts_total,
+                        stream.enqueue_dropped_full_total,
+                        stream.enqueue_dropped_closed_total,
+                        stream.rate_limit_admitted_total,
+                        stream.dropped_aggregate_limit_total,
+                        stream.dropped_shadow_limit_total,
+                        stream.dropped_backoff_buffer_full_total,
+                        stream.retry_truncated_total,
+                        stream.sent_total,
+                    ]
+                });
+
+                snapshot.network_efficiency_v1 = Some(crate::router::NetworkEfficiencyV1 {
+                    v: 1,
+                    ms_s: lifecycle.delivered_sends,
+                    ms_b: lifecycle.delivered_bytes,
+                    ms_age: lifecycle.first_send_age,
+                    ms_size: lifecycle.delivered_size_hist,
+                    ms_unt_age: lifecycle.untracked_prior_removal_age,
+                    reg_ow_k: lifecycle.registration_overwrite_known,
+                    reg_ow_m: lifecycle.registration_overwrite_missing,
+                    reg_new_k: lifecycle.registration_new_known,
+                    reg_new_m: lifecycle.registration_new_missing,
+                    reg_cap: lifecycle.registration_cap_rejected,
+                    removed: lifecycle.removals,
+                    current: lifecycle.current_summary_state,
+                    recreated: lifecycle.recreated_after_removal,
+                    populated: lifecycle.population,
+                    corr_ovf: [lifecycle.history_overflow, lifecycle.active_overflow],
+                    queue: [
+                        queue.capacity_evictions,
+                        queue.dedup_replacements,
+                        queue.enqueues_while_pair_active,
+                        queue.large_head_blocking_incidents,
+                        queue.large_head_blocked_millis,
+                        queue.small_entry_millis_blocked,
+                        queue.queued_large_actual_small,
+                        queue.queued_small_actual_large,
+                        queue.queued_large_actual_small_bytes,
+                        queue.queued_small_actual_large_bytes,
+                        queue.scheduled_small,
+                        queue.scheduled_large,
+                        queue.scheduled_small_state_bytes,
+                        queue.scheduled_large_state_bytes,
+                        queue.active_tracking_overflow,
+                    ],
+                    recv_n: receiver.counts,
+                    recv_tn: receiver.terminal_counts,
+                    recv_tb: receiver.terminal_bytes,
+                    state_n: disk.state_size_bucket_counts,
+                    state_b: disk.state_size_bucket_bytes,
+                    state: [
+                        disk.state_count,
+                        disk.state_max_bytes,
+                        disk.state_over_limit_count,
+                        disk.state_over_limit_bytes,
+                        disk.state_limit_bytes,
+                        state_rejections.pre_wasm_count,
+                        state_rejections.pre_wasm_max_bytes,
+                        state_rejections.post_merge_count,
+                        state_rejections.post_merge_max_bytes,
+                    ],
+                    evict_n: eligibility.counts,
+                    evict_b: eligibility.bytes,
+                    vict_n: hosting.eviction_victim_counts,
+                    vict_b: hosting.eviction_victim_bytes,
+                    cost,
+                    cost_ba: cost_bucket_any,
+                    cost_be: cost_bucket_eligible,
+                    tel,
+                    shadow,
+                    eff: telemetry.network_efficiency_delivery,
+                    // Hosting observability (#4642): WHY this peer began hosting
+                    // each contract, and the two demand-signal gauges the
+                    // eviction ranking is built on. `hosting` is the same
+                    // `hosting_cache_stats()` read that feeds `vict_n`/`vict_b`
+                    // above, so all four describe one consistent hosted set.
+                    host_begin: hosting.hosting_begins,
+                    host_reads: hosting.read_count_hist,
+                    host_recency: hosting.genuine_access_recency,
+                    futile: futile_repair.to_row(),
+                    futile_ladder: futile_repair.ladder,
+                });
+            }
+
             tracing::info!(
                 failure_events = snapshot.failure_events,
                 success_events = snapshot.success_events,
@@ -1947,6 +2412,20 @@ impl Ring {
                 broadcast_stream_attempts_total = bs.streaming_attempts_total,
                 broadcast_stream_failures_total = bs.streaming_failures_total,
                 broadcast_stream_failures_last_snapshot = broadcast_stream_failures_delta,
+                // The per-window arms are logged (not the lifetime totals) so a
+                // local operator reading `journalctl` gets the answer from ONE
+                // line, and ALL EIGHT are logged in the same unit — mixing
+                // 5-minute deltas with lifetime totals under parallel names
+                // would invite reading them as comparable magnitudes. `info!`
+                // survives `release_max_level_info`; `debug!` would not.
+                contract_exec_summarize_fast_hits_last_snapshot = ce_d.summarize_fast_hits,
+                contract_exec_summarize_reload_hits_last_snapshot = ce_d.summarize_reload_hits,
+                contract_exec_summarize_wasm_calls_last_snapshot = ce_d.summarize_wasm_calls,
+                contract_exec_summarize_wasm_uncached_last_snapshot = ce_d.summarize_wasm_uncached,
+                contract_exec_delta_fast_hits_last_snapshot = ce_d.delta_fast_hits,
+                contract_exec_delta_reload_hits_last_snapshot = ce_d.delta_reload_hits,
+                contract_exec_delta_wasm_calls_last_snapshot = ce_d.delta_wasm_calls,
+                contract_exec_delta_wasm_uncached_last_snapshot = ce_d.delta_wasm_uncached,
                 hosted_contracts_count = ?snapshot.hosted_contracts_count,
                 hosted_key_distance_median = ?snapshot.hosted_key_distance_median,
                 hosted_key_distance_p90 = ?snapshot.hosted_key_distance_p90,
@@ -2929,6 +3408,33 @@ impl Ring {
                 .disk_available_bytes()
                 .unwrap_or(u64::MAX);
             ring.hosting_manager.recompute_effective_budget(available);
+
+            // Resident-overhead (count-derived) budget (#5325, live-basis #5333):
+            // recomputed every tick so it tracks LIVE memory pressure rather than
+            // being fixed at startup — a peer that grows busy (or a `MemoryMax`
+            // cgroup that gets tightened externally) re-derives a smaller budget
+            // on the next tick, and one that goes idle re-derives a larger one.
+            // All three reads are cheap (a `/proc` parse or a single syscall on
+            // every platform), so unlike the disk-usage walk above these run
+            // inline rather than on a blocking thread.
+            // 1 GiB fallback mirrors `cache::FALLBACK_TOTAL_RAM_BYTES` (private to
+            // that module) for the rare case the RAM read itself fails.
+            let total_ram = crate::wasm_runtime::read_total_ram_bytes()
+                .map(|v| v as u64)
+                .unwrap_or(1024 * 1024 * 1024);
+            let pool_size = crate::config::runtime_pool_size().get();
+            let live_signals = match (
+                crate::wasm_runtime::read_own_rss_bytes(),
+                crate::wasm_runtime::read_available_memory_bytes(),
+            ) {
+                (Some(rss), Some(avail)) => Some((rss as u64, avail as u64)),
+                _ => None,
+            };
+            ring.hosting_manager.recompute_resident_overhead_budget(
+                total_ram,
+                pool_size,
+                live_signals,
+            );
         }
     }
 
@@ -2980,9 +3486,13 @@ impl Ring {
                 .map(|l| l.as_f64())
                 .unwrap_or(0.0);
 
-            let snapshot = ring
+            let mut snapshot = ring
                 .hosting_manager
                 .generate_topology_snapshot(peer_addr, location);
+            // Stamp the live connection count so consumers can use it as a
+            // join/peer_ready progress signal (snapshot presence alone only
+            // means the bind address is set — see `TopologySnapshot::connection_count`).
+            snapshot.connection_count = ring.connection_manager.connection_count();
             let contract_count = snapshot.contracts.len();
             register_topology_snapshot(&network_name, snapshot);
 
@@ -3004,22 +3514,33 @@ impl Ring {
     /// Returns a `RecordAccessResult` containing:
     /// - `is_new`: Whether this contract was newly added (vs. refreshed existing)
     /// - `evicted`: Contracts that were evicted to make room
+    ///
+    /// `cause` attributes WHY this peer is (possibly) starting to host: the
+    /// caller is the only code that knows whether this is its own client's
+    /// request, someone else's request in transit, or a sub-op fetch. It feeds
+    /// telemetry only — it changes nothing about what is hosted or evicted.
     pub fn host_contract(
         &self,
         key: ContractKey,
         size_bytes: u64,
         access_type: AccessType,
+        cause: HostingCause,
     ) -> RecordAccessResult {
         self.hosting_manager
-            .record_contract_access(key, size_bytes, access_type)
+            .record_contract_access(key, size_bytes, access_type, cause)
     }
 
     /// Record a GET access to a contract in the hosting cache.
     ///
     /// Returns a `RecordAccessResult` indicating whether this was a new addition
     /// and which contracts were evicted (if any).
-    pub fn record_get_access(&self, key: ContractKey, size_bytes: u64) -> RecordAccessResult {
-        self.host_contract(key, size_bytes, AccessType::Get)
+    pub fn record_get_access(
+        &self,
+        key: ContractKey,
+        size_bytes: u64,
+        cause: HostingCause,
+    ) -> RecordAccessResult {
+        self.host_contract(key, size_bytes, AccessType::Get, cause)
     }
 
     /// Record that a local-client GET was answered from local hosted state
@@ -3032,6 +3553,26 @@ impl Ring {
     /// — see [`HostingManager::record_local_get_forward`]. (#4642 A3)
     pub fn record_get_forwarded(&self) {
         self.hosting_manager.record_local_get_forward();
+    }
+
+    /// Record a local `UpdateNotification` dropped by a FULL subscriber channel
+    /// (#4681) — see [`HostingManager::record_notification_dropped_channel_full`].
+    pub(crate) fn record_notification_dropped_channel_full(&self) {
+        self.hosting_manager
+            .record_notification_dropped_channel_full();
+    }
+
+    /// Record a local `UpdateNotification` dropped by a CLOSED subscriber
+    /// channel (#4681).
+    pub(crate) fn record_notification_dropped_channel_closed(&self) {
+        self.hosting_manager
+            .record_notification_dropped_channel_closed();
+    }
+
+    /// Record a committed update that found NO local subscriber (#4681/#5040).
+    pub(crate) fn record_notification_no_local_subscriber(&self) {
+        self.hosting_manager
+            .record_notification_no_local_subscriber();
     }
 
     /// Number of client GETs this node answered from local hosted state (A3
@@ -3093,6 +3634,14 @@ impl Ring {
         // config is only reachable here). The 60s sweep's recompute reads them.
         self.hosting_manager
             .configure_disk_budget(hosting_disk_pct, max_hosting_disk);
+    }
+
+    /// Install the operator-configurable share of live host-wide surplus
+    /// memory the resident-overhead (count-derived) eviction budget may claim
+    /// (#5333). Called once at startup; the 60s sweep's recompute reads it.
+    pub fn configure_resident_overhead_mem_share(&self, mem_share: f64) {
+        self.hosting_manager
+            .configure_resident_overhead_mem_share(mem_share);
     }
 
     /// Drop the ring's clones of the redb `Storage` handle (hosting metadata +
@@ -3480,6 +4029,16 @@ impl Ring {
         self.hosting_manager.contract_state_present(contract)
     }
 
+    /// Async existence probe (redb sync fast-path + real SQLite EXISTS probe) —
+    /// see [`hosting::HostingManager::contract_state_present_async`]. Used by the
+    /// ResyncResponse responder so the pre-limiter existence gate is backend-
+    /// agnostic (#4864 round-5 P1).
+    pub(crate) async fn contract_state_present_async(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager
+            .contract_state_present_async(contract)
+            .await
+    }
+
     /// Whether at least one LOCAL WebSocket client is currently subscribed to
     /// `contract` (real local demand, distinct from downstream peer
     /// subscribers). Used by the reconcile input-builder (keystone step-2,
@@ -3531,10 +4090,11 @@ impl Ring {
 
     // ==================== Downstream Subscriber Tracking ====================
 
-    pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) -> bool {
-        let outcome = self
-            .hosting_manager
-            .add_downstream_subscriber(contract, peer);
+    pub fn add_downstream_subscriber(
+        &self,
+        contract: &ContractKey,
+        peer: PeerKey,
+    ) -> crate::ring::hosting::AddSubscriberOutcome {
         // No governance demand is ingested here anymore. Benefit is a
         // LIVE SNAPSHOT read fresh each reaper tick from the hosting
         // manager's standing subscriber count (see
@@ -3551,12 +4111,15 @@ impl Ring {
         // are attacker-rotatable: without an identity layer a single
         // attacker can spin up many peers that each "subscribe", so each
         // forwarded subscriber is worth one tenth of a real local client.
-        // Caller-facing bool preserved for backward compat: Rejected
-        // → false; NewAdd or Renewal → true (the peer is tracked).
-        !matches!(
-            outcome,
-            crate::ring::hosting::AddSubscriberOutcome::Rejected
-        )
+        // The NewAdd/Renewal distinction is load-bearing for the caller
+        // (#4952 follow-through): the demand-counter increment in
+        // `register_downstream_subscriber` must key on HOSTING-map newness,
+        // not on `interested_peers` newness — summary-upserted entries make
+        // the latter unreliable (a delivery-seeded co-host that later
+        // genuinely subscribes is not "new" in the interest map but IS new
+        // demand).
+        self.hosting_manager
+            .add_downstream_subscriber(contract, peer)
     }
 
     #[allow(dead_code)] // Only used in tests
@@ -3584,6 +4147,12 @@ impl Ring {
     /// machinery would refresh the lease unboundedly).
     pub(crate) fn contract_in_use(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.contract_in_use(contract)
+    }
+
+    /// Instance ids of every contract [`Self::contract_in_use`] holds for. See
+    /// `HostingManager::in_use_contract_ids`.
+    pub(crate) fn in_use_contract_ids(&self) -> Vec<ContractInstanceId> {
+        self.hosting_manager.in_use_contract_ids()
     }
 
     /// Single helper for every state-write chokepoint. Does the three
@@ -3860,6 +4429,14 @@ impl Ring {
         self.hosting_manager.hosting_contracts_count()
     }
 
+    /// The same hosted set as [`Self::hosting_contracts_count`], partitioned by
+    /// WHY each contract is held, with state bytes per bucket. Backs the
+    /// `freenet.node.contracts.hosted{,.bytes}` OTel gauges. See
+    /// [`HostingReason`].
+    pub fn hosted_by_reason(&self) -> HostingReasonStats {
+        self.hosting_manager.hosted_by_reason()
+    }
+
     /// Number of active network subscription leases this node currently holds.
     ///
     /// Together with [`hosting_contracts_count`](Self::hosting_contracts_count)
@@ -4059,12 +4636,18 @@ impl Ring {
     }
 
     /// Snapshot of the demand-driven hosting state for the local-peer
-    /// dashboard (piece A, #4642). Reads the canonical hosting cache — the
-    /// capability-relative RAM budget + per-contract Greedy-Dual keep_score
-    /// that actually governs retention today, replacing the dormant MAD
-    /// governance detector (#4296). No mirror, no cache: the aggregate gauges
-    /// and per-contract rows come straight from the `HostingManager`, so the
-    /// panel can't drift the way a mirrored counter would.
+    /// dashboard (#4642). Reads the canonical hosting cache — the
+    /// capability-relative budget plus the per-contract rows. No mirror, no
+    /// cache: the aggregate gauges and per-contract rows come straight from
+    /// the `HostingManager`, so the panel can't drift the way a mirrored
+    /// counter would.
+    ///
+    /// The demoted telemetry-only estimator (`keep_score` /
+    /// `predicted_demand`) is deliberately NOT carried on these rows: eviction
+    /// does not read it, and rendering it implied a ranking it never governed.
+    /// Real eviction ordering is subscriber-primary (`victim_order`);
+    /// `recency_seq` is the one ranking input available here, and is what the
+    /// cache actually sorts these rows by.
     ///
     /// Per-contract rows are returned in EVICTION order (next victim first).
     /// The renderer bounds how many it displays; the full count is
@@ -4093,10 +4676,9 @@ impl Ring {
                 ns::HostedContractEntry {
                     key_full,
                     key_short,
-                    keep_score: row.keep_score,
-                    predicted_demand: row.predicted_demand,
                     size_bytes: row.size_bytes,
                     read_count: row.read_count,
+                    recency_seq: row.recency_seq,
                     eviction_eligible,
                 }
             })
@@ -4132,6 +4714,10 @@ impl Ring {
             disk_compile_cache_bytes,
             disk_total_bytes,
             disk_budget_bytes,
+            resident_overhead_budget_bytes: stats.resident_overhead_budget_bytes,
+            estimated_resident_overhead_bytes: stats.estimated_resident_overhead_bytes,
+            contract_slot_budget: stats.contract_slot_budget,
+            resident_overhead_evictions_total: stats.resident_overhead_evictions_total,
         }
     }
 
@@ -4204,6 +4790,14 @@ impl Ring {
         self.broken_invariants.record(*contract.id(), kind);
     }
 
+    /// Claim a slot for the deterministic identical-input idempotency probe
+    /// (`Executor::probe_identical_input_idempotency`). Bounded to one
+    /// probe per contract per `IDENTITY_PROBE_COOLDOWN`.
+    pub(crate) fn try_claim_identity_probe(&self, contract: &ContractKey) -> bool {
+        self.broken_invariants
+            .try_claim_identity_probe(contract.id())
+    }
+
     /// Wire persistent storage for the broken-invariants tracker. Called
     /// once at executor wiring time.
     pub(crate) fn set_broken_invariants_storage(
@@ -4233,37 +4827,60 @@ impl Ring {
         resource: crate::topology::meter::ResourceType,
         amount: f64,
     ) {
-        // Use the injectable `TimeSource` (rather than `Instant::now()`
-        // directly) so deterministic simulation tests can drive this
-        // path. Per `.claude/rules/code-style.md` "Need current time?
-        // → USE: TimeSource trait" — the executor commit path will reach
-        // here from inside simulated nodes once the governance scoring
-        // integration tests land, and reading wall-clock there would
-        // break determinism.
-        let now = self.time_source.now();
-        let mut topo = self.connection_manager.topology_manager.write();
-        topo.report_resource_usage(
-            &crate::topology::meter::AttributionSource::Contract(contract_id),
-            resource,
-            amount,
-            now,
-        );
-        drop(topo);
-        // Also feed the governance manager — the meter stores rates
-        // for telemetry/the dashboard's bandwidth view, while the
-        // governance manager aggregates these samples into the
-        // cost/benefit ratio that drives state. Both ingest in
-        // parallel from this one entry point so there's no risk of
-        // them diverging (governance reading from a stale meter
-        // snapshot, etc).
+        self.report_contract_resource_usage_batch(contract_id, &[(resource, amount)]);
+    }
+
+    /// Report several cost axes for ONE contract under a SINGLE topology
+    /// write-lock acquisition.
+    ///
+    /// The broadcast send path (#4903 review MEDIUM) reports the send-time
+    /// WASM CPU AND the actual fan-out payload bytes for each per-peer send;
+    /// batching them into one lock (instead of two separate
+    /// `report_contract_resource_usage` calls) halves the per-send topology
+    /// write-lock traffic on a busy gateway's fan-out.
+    ///
+    /// Uses the injectable `TimeSource` (rather than `Instant::now()`
+    /// directly) so deterministic simulation tests can drive this path
+    /// (`.claude/rules/code-style.md`: "Need current time? → USE: TimeSource").
+    /// `now` is read INSIDE the write lock (#4903 review L2) so concurrent
+    /// reporters insert in lock-acquisition order and cannot trip the
+    /// `RunningAverage::insert_with_time` monotonicity `debug_assert!`.
+    pub(crate) fn report_contract_resource_usage_batch(
+        &self,
+        contract_id: freenet_stdlib::prelude::ContractInstanceId,
+        samples: &[(crate::topology::meter::ResourceType, f64)],
+    ) {
+        if samples.is_empty() {
+            return;
+        }
+        let source = crate::topology::meter::AttributionSource::Contract(contract_id);
+        {
+            let mut topo = self.connection_manager.topology_manager.write();
+            // Read `now` under the lock (see rustdoc — L2 monotonicity).
+            let now = self.time_source.now();
+            for (resource, amount) in samples {
+                topo.report_resource_usage(&source, *resource, *amount, now);
+            }
+        }
+        // Also feed the governance manager — the meter stores rates for
+        // telemetry/the dashboard's bandwidth view, while the governance
+        // manager aggregates cost into the cost/benefit ratio that drives its
+        // ban state. But governance ingests ONLY the axes in
+        // `governance_ingests_axis` (currently just `StateBytesWritten`) — the
+        // three #4861 cost-eviction axes are deliberately NOT fed to it (see
+        // that fn's rustdoc for the #4296 rationale). The meter above still
+        // gets EVERY axis, so cost-eviction is unaffected.
         //
-        // Per-resource weight: identity (1.0) for now. Future tuning
-        // could weight CPU-µs and fanout-cost higher than
-        // state-bytes, but until we have live data to calibrate
-        // against, unit weights match what the design doc proposed
-        // as a starting point.
-        let weight = resource_weight(resource);
-        self.governance.ingest_cost(contract_id, amount * weight);
+        // Per-resource weight: identity (1.0) for now. Future tuning could
+        // weight axes differently, but until we have live data to calibrate
+        // against, unit weights match what the design doc proposed.
+        for (resource, amount) in samples {
+            if !governance_ingests_axis(*resource) {
+                continue;
+            }
+            let weight = resource_weight(*resource);
+            self.governance.ingest_cost(contract_id, *amount * weight);
+        }
     }
 
     // Note: there is intentionally no `ingest_contract_demand` method
@@ -4345,7 +4962,48 @@ fn resource_weight(resource: crate::topology::meter::ResourceType) -> f64 {
     match resource {
         InboundBandwidthBytes | OutboundBandwidthBytes => 1.0,
         ExecCpuMicros | ExecFuelUnits => 1.0,
-        StateBytesWritten | BroadcastFanoutCost => 1.0,
+        StateBytesWritten | BroadcastFanoutCost | BroadcastMessagesSent => 1.0,
+    }
+}
+
+/// Whether a cost axis feeds the GOVERNANCE cost/benefit ban decision.
+///
+/// This is deliberately an inclusion allowlist (only `StateBytesWritten`
+/// today), NOT "every axis" or "everything except X" — and it is exhaustive so
+/// a new [`ResourceType`](crate::topology::meter::ResourceType) variant must be
+/// consciously classified here.
+///
+/// WHY governance must NOT ingest the #4861 cost-eviction axes
+/// (`ExecCpuMicros`, `BroadcastFanoutCost`, `BroadcastMessagesSent`): those are
+/// per-send / per-update signals that scale with a contract's POPULARITY (a
+/// heavily-subscribed contract fans out more, so it accrues more send CPU and
+/// fan-out cost). Governance is a benefit-thresholded BAN system that — unlike
+/// the cost-eviction sweep — has NO zero-demand candidacy protection (invariant
+/// 3), so feeding it a popularity-scaled cost reproduces the #4296 "popular
+/// contract banned for being popular" false positive BY CONSTRUCTION: the
+/// contract crosses the ban threshold before its live-beneficiary count (the
+/// denominator that would spare it) can register, and a banned contract then
+/// drops inbound Subscribe, so its benefit can never catch up. The
+/// `popular_contract_with_subscribers_not_evicted` sim test is exactly this
+/// scenario. Storms are the cost-eviction sweep's job (it HAS the zero-demand
+/// protection); governance is Off in production, so excluding these axes is a
+/// pure de-risking that restores the cost basis governance was calibrated
+/// against on `main` (`StateBytesWritten`, the sole production feed via
+/// `commit_state_write`).
+///
+/// A future governance-On effort that wants to weigh CPU/fan-out MUST first add
+/// a benefit-aware normalization (e.g. cost-PER-beneficiary), NOT re-add these
+/// raw axes here — doing so silently re-opens #4296. See #4296 / #4861.
+fn governance_ingests_axis(resource: crate::topology::meter::ResourceType) -> bool {
+    use crate::topology::meter::ResourceType::*;
+    match resource {
+        // The axis governance was calibrated against on `main`.
+        StateBytesWritten => true,
+        // #4861 cost-eviction axes: popularity-scaled → meter/sweep only.
+        ExecCpuMicros | BroadcastFanoutCost | BroadcastMessagesSent => false,
+        // Peer-attributed bandwidth / fuel: never fed governance (it keys on
+        // per-contract cost), keep them out.
+        InboundBandwidthBytes | OutboundBandwidthBytes | ExecFuelUnits => false,
     }
 }
 
@@ -4535,7 +5193,49 @@ impl Ring {
     /// subscribers is eligible). The generation snapshot is carried through
     /// `EvictContract` so the deletion-time guard can detect a re-host race.
     pub fn sweep_expired_hosting(&self) -> crate::ring::hosting::HostingSweepResult {
-        self.hosting_manager.sweep_expired_hosting()
+        // Cost-aware eviction (#4861): feed the sweep the node's attributed
+        // update-work cost so a zero-subscriber contract dominating CPU /
+        // broadcast capacity is shed even while UNDER the byte budget (the
+        // byte-gated sweep alone never fires for a tiny-state storm contract).
+        let cost_axes = self.hosting_cost_pressure_axes();
+        self.hosting_manager
+            .sweep_expired_hosting_with_cost(&cost_axes)
+    }
+
+    /// Build the per-axis attributed-cost snapshots for the hosting sweep's
+    /// cost-pressure trigger (cost-aware eviction, #4861): per-contract
+    /// `ExecCpuMicros`, `BroadcastFanoutCost` (bytes), and
+    /// `BroadcastMessagesSent` (per-send count — the load-bearing storm
+    /// signal) rates plus their node totals, read from the topology meter.
+    /// Sparse samples are amortized over at least
+    /// [`hosting::COST_RATE_MIN_WINDOW`] (a lone burst can't masquerade as a
+    /// sustained storm), a saturated sample buffer reads its true rate, and
+    /// candidacy is pre-filtered to sustained sources — see
+    /// `Meter::contract_cost_rates`. The floors, share threshold, and axis
+    /// assembly live beside the decision in `ring/hosting/cache.rs`
+    /// (`build_cost_axes`, shared with the storm-frequency integration test).
+    ///
+    /// Lock discipline: takes the topology read lock briefly and drops it
+    /// before the caller takes the hosting-cache write lock — the two are
+    /// never held together.
+    fn hosting_cost_pressure_axes(&self) -> Vec<hosting::CostAxisPressure> {
+        use crate::topology::meter::ResourceType;
+        let now = self.time_source.now();
+        // Read all three cost axes in ONE pass over the attribution meters
+        // (#4903 review perf) rather than three separate scans under the read
+        // lock. Order here must match the `build_cost_axes` argument order.
+        let axes = [
+            ResourceType::ExecCpuMicros,
+            ResourceType::BroadcastFanoutCost,
+            ResourceType::BroadcastMessagesSent,
+        ];
+        let topo = self.connection_manager.topology_manager.read();
+        let mut rates = topo.contract_cost_rates_multi(&axes, now, hosting::COST_RATE_MIN_WINDOW);
+        drop(topo);
+        let messages = rates.pop().expect("three axis results");
+        let fanout_bytes = rates.pop().expect("three axis results");
+        let cpu = rates.pop().expect("three axis results");
+        hosting::build_cost_axes(cpu, fanout_bytes, messages)
     }
 
     // ==================== Legacy GET Auto-Subscription (delegating to hosting cache) ====================
@@ -5772,9 +6472,10 @@ impl Ring {
             .map(|l| l.as_f64())
             .unwrap_or(0.0);
 
-        let snapshot = self
+        let mut snapshot = self
             .hosting_manager
             .generate_topology_snapshot(peer_addr, location);
+        snapshot.connection_count = self.connection_manager.connection_count();
         topology_registry::register_topology_snapshot(network_name, snapshot);
     }
 
@@ -6949,6 +7650,68 @@ mod k_closest_source_tests {
         }
         assert_eq!(checked, 24, "expected exactly 24 export assignments");
     }
+
+    /// Same mirror seam, for the contract-exec WASM counters. The export block
+    /// hand-copies each `ContractExecSnapshot` field into its `RouterSnapshotInfo`
+    /// twin, so a swap — feeding `..._wasm_calls_total` from `fast_hits`, say —
+    /// compiles cleanly and emits a plausible number that is measuring the
+    /// opposite thing.
+    ///
+    /// That failure mode is not hypothetical here: mistaking cache hits for WASM
+    /// work is the exact blindness these counters exist to remove, and an
+    /// overstated saving is worse than a missing one because it terminates the
+    /// investigation. Assert every assignment reads its own field.
+    /// Whitespace-normalized so rustfmt line-wrapping is irrelevant.
+    #[test]
+    fn contract_exec_export_maps_each_field_to_its_own_counter() {
+        let src = production_source();
+        let block = extract_fn_body(src, "async fn emit_router_snapshot_telemetry(");
+        let norm = block.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let fields = [
+            "summarize_fast_hits",
+            "summarize_reload_hits",
+            "summarize_wasm_calls",
+            "summarize_wasm_uncached",
+            "delta_fast_hits",
+            "delta_reload_hits",
+            "delta_wasm_calls",
+            "delta_wasm_uncached",
+        ];
+        for field in fields {
+            // Every arm is exported in BOTH units. A lifetime total sitting on
+            // a line of otherwise-parallel `_last_snapshot` names reads as a
+            // comparable magnitude and understates nothing visibly — which is
+            // why the pin demands both rather than either.
+            for expected in [
+                format!("snapshot.contract_exec_{field}_total = Some(ce.{field});"),
+                format!("snapshot.contract_exec_{field}_last_snapshot = Some(ce_d.{field});"),
+            ] {
+                assert!(
+                    norm.contains(&expected),
+                    "mirror-seam: export must contain `{expected}` — a field swap here \
+                     silently reports one arm's count under another arm's name"
+                );
+            }
+        }
+
+        // The delta computation itself is NOT scraped: it is
+        // `ContractExecSnapshot::window_deltas`, one function whose field
+        // correspondence is structural and unit-tested by
+        // `each_field_differences_its_own_twin`. What must be pinned here is
+        // that the emitter uses it rather than re-deriving eight deltas by hand
+        // at the call site, which is where a cross-wiring hides.
+        assert!(
+            norm.contains("let ce_d = ce.window_deltas(&mut prev_exec);"),
+            "the emitter must delegate to ContractExecSnapshot::window_deltas, not \
+             hand-difference each arm at the call site"
+        );
+        assert!(
+            !norm.contains("window_delta(ce."),
+            "no hand-written per-arm window_delta call may remain — that is the \
+             shape in which one arm gets differenced against another's previous value"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7857,6 +8620,57 @@ mod instant_now_pin_test {
     }
 }
 
+/// Wiring pin for the shadow-mode futile-repair rows on
+/// `network_efficiency_v1` (`crate::ring::futile_repair`).
+///
+/// The detector's state machine is unit-tested in its own module and its
+/// handler wiring in `node.rs`. What NEITHER can see is the assignment in
+/// `router_snapshot_telemetry` that connects the two: drop it, or feed a row
+/// from the wrong source, and every one of those tests stays green while the
+/// fleet publishes zeros — for a release whose entire purpose is to establish
+/// the detector's real frequency in production. That is the #4009/#4010
+/// manually-mirrored-telemetry footgun, and the snapshot loop is a 30-minute
+/// background cadence inside a fully-built `Ring`, which is why it is pinned by
+/// source scrape rather than executed.
+#[cfg(test)]
+mod futile_repair_wiring_pin {
+    /// Production source only: the needles below appear in this module too, and
+    /// a pin that matches its own source is a pin that can never fail.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    #[test]
+    fn network_efficiency_block_is_fed_from_the_futile_repair_snapshot() {
+        let src = production_source();
+        assert!(
+            src.contains(
+                "let futile_repair = op_manager.interest_manager.futile_repair_snapshot();"
+            ),
+            "the futile-repair snapshot is no longer taken in the \
+             router_snapshot block — the detector then collects its counters \
+             and exports nothing, while every test for it still passes"
+        );
+        for (field, source_expr) in [
+            ("futile", "futile_repair.to_row()"),
+            ("futile_ladder", "futile_repair.ladder"),
+        ] {
+            let needle = format!("{field}: {source_expr},");
+            assert!(
+                src.contains(&needle),
+                "`NetworkEfficiencyV1.{field}` must be populated as `{needle}` \
+                 in the router_snapshot block. Dropping it, or feeding it from \
+                 anything else, publishes an empty or wrong series with no \
+                 failing test — #4009/#4010."
+            );
+        }
+    }
+}
+
 /// Pin tests for the periodic hosting-advertisement re-request (#4642 spec step
 /// 1, "Fix 1"): the reliability backstop that heals a dropped on-connect
 /// advertisement exchange or a dropped per-eviction retraction. It is PIGGYBACKED
@@ -8219,6 +9033,627 @@ mod sleep_or_shutdown_tests {
         assert!(
             cancelled,
             "an already-cancelled token must short-circuit immediately"
+        );
+    }
+}
+
+/// Wiring pin for the hosting-observability rows on `network_efficiency_v1`.
+///
+/// The counters themselves are unit-tested in `ring::hosting` (attribution) and
+/// `tracing::telemetry` (serialization). What NEITHER can see is the assignment
+/// in `router_snapshot_telemetry` that connects them: drop it, or feed a row
+/// from the wrong source, and every one of those tests stays green while the
+/// fleet publishes zeros or the wrong series. That is the #4009/#4010
+/// manually-mirrored-telemetry footgun, and the snapshot loop is a 30-minute
+/// background cadence inside a fully-built `Ring`, which is why it is pinned by
+/// source scrape rather than executed.
+#[cfg(test)]
+mod hosting_observability_wiring_pin {
+    /// Production source only: the needles below appear in this module too, and
+    /// a pin that matches its own source is a pin that can never fail.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    #[test]
+    fn network_efficiency_block_is_fed_from_the_hosting_cache_stats() {
+        let src = production_source();
+        for (field, source_expr) in [
+            ("host_begin", "hosting.hosting_begins"),
+            ("host_reads", "hosting.read_count_hist"),
+            ("host_recency", "hosting.genuine_access_recency"),
+        ] {
+            let needle = format!("{field}: {source_expr},");
+            assert!(
+                src.contains(&needle),
+                "`NetworkEfficiencyV1.{field}` must be populated as `{needle}` in \
+                 the router_snapshot block. Without this assignment the hosting \
+                 counters are collected and never exported, and every unit test \
+                 for them still passes — the exact failure mode of #4009/#4010."
+            );
+        }
+    }
+}
+
+/// End-to-end seam test for cost-aware eviction (#4861 / #4903 review):
+/// drives the message axis through the REAL production reporter
+/// (`Ring::report_contract_resource_usage` → topology meter) and the REAL
+/// `Ring::sweep_expired_hosting()` (→ `hosting_cost_pressure_axes` →
+/// `HostingManager::sweep_expired_hosting_with_cost`) — the exact
+/// reporter → meter → axes → sweep chain the manager-level storm test
+/// (`storm_frequency_profile_crosses_cost_trigger_through_real_meter`)
+/// bypasses by assembling its axes by hand from a standalone `Meter`.
+#[cfg(test)]
+mod cost_pressure_seam_tests {
+    use std::time::Duration;
+
+    fn seam_key(seed: u8) -> freenet_stdlib::prelude::ContractKey {
+        freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([seed; 32]),
+            freenet_stdlib::prelude::CodeHash::new([seed.wrapping_add(1); 32]),
+        )
+    }
+
+    /// Runs under `start_paused` so `tokio::time::Instant` — the clock behind
+    /// BOTH the Ring's production `InstantTimeSrc` (meter timestamps, sweep
+    /// reads, hosting recency) and every background interval — is virtual and
+    /// advanced deterministically with `tokio::time::advance`. The Ring's
+    /// periodic background tasks (including the 60s hosting sweep, which runs
+    /// this same seam) fire during the advances; the assertions are therefore
+    /// on the FINAL hosting state, which is identical whether a background
+    /// sweep or the explicit call below sheds the storm contract.
+    #[tokio::test(start_paused = true)]
+    async fn zero_demand_storm_is_shed_through_real_reporter_and_sweep() {
+        use crate::topology::meter::ResourceType;
+
+        // --- a real OpManager (and thus a real Ring with its production
+        // InstantTimeSrc), mirroring the fixture in node.rs
+        // (`resync_request_for_bogus_keys_does_not_consume_limiter_slots`). ---
+        let config_args = crate::config::ConfigArgs {
+            id: Some("cost-seam-4903".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14100".parse().unwrap());
+        let ring = &op_manager.ring;
+
+        let junk = seam_key(1);
+        let subscribed = seam_key(2);
+        let read_hot = seam_key(3);
+
+        // Host all three through the production entry point (PUT seeds).
+        let _ = ring.host_contract(
+            junk,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        let _ = ring.host_contract(
+            subscribed,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        let _ = ring.host_contract(
+            read_hot,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        assert!(ring.is_hosting_contract(&junk), "precondition: hosted");
+
+        // Age the PUT-seed recency stamps past the cost window, so only the
+        // demand signals added BELOW protect anything.
+        tokio::time::advance(super::hosting::COST_RATE_MIN_WINDOW + Duration::from_secs(1)).await;
+
+        // Demand: `subscribed` gains a downstream subscriber (lease outlives
+        // this test's remaining ~3 virtual minutes); `read_hot` is genuinely
+        // GET-read now (within the cost window of the final sweep).
+        assert!(!matches!(
+            ring.add_downstream_subscriber(
+                &subscribed,
+                crate::ring::interest::PeerKey(crate::transport::TransportPublicKey::from_bytes(
+                    [9u8; 32]
+                )),
+            ),
+            crate::ring::hosting::AddSubscriberOutcome::Rejected
+        ));
+        let _ = ring.record_get_access(read_hot, 121, crate::ring::HostingCause::Other);
+
+        // The FX2j storm profile, reported for ALL THREE contracts through
+        // the production reporter: one 58-target fan-out dispatch every 1.6s
+        // for ~3 minutes (~36 per-peer sends/s sustained). Equal rates prove
+        // protection comes from demand, not from a smaller cost share.
+        for _ in 0..110u32 {
+            for key in [&junk, &subscribed, &read_hot] {
+                ring.report_contract_resource_usage(
+                    *key.id(),
+                    ResourceType::BroadcastMessagesSent,
+                    58.0,
+                );
+            }
+            tokio::time::advance(Duration::from_millis(1600)).await;
+        }
+
+        // The REAL sweep (the same call the 60s background sweep task makes).
+        let _ = ring.sweep_expired_hosting();
+
+        assert!(
+            !ring.is_hosting_contract(&junk),
+            "the zero-demand storm contract must be shed through the real \
+             reporter → meter → hosting_cost_pressure_axes → sweep seam"
+        );
+        assert!(
+            ring.is_hosting_contract(&subscribed),
+            "a subscribed contract storming at the SAME rate must survive \
+             (candidacy, not ranking, protects it)"
+        );
+        assert!(
+            ring.is_hosting_contract(&read_hot),
+            "a recently-GET-read contract storming at the SAME rate must \
+             survive (reads are demand — invariant 3)"
+        );
+    }
+
+    /// Everything a seam test needs kept alive for its whole run: the OpManager
+    /// plus the channel ends and task monitor whose drop would tear the Ring's
+    /// background tasks down mid-test.
+    struct SeamFixture {
+        op_manager: std::sync::Arc<crate::node::OpManager>,
+        node_events: tokio::sync::mpsc::Receiver<
+            either::Either<crate::message::NetMessage, crate::message::NodeEvent>,
+        >,
+        /// The remaining channel ends and the task monitor. Never read — held
+        /// only so dropping them does not tear the Ring's background tasks down
+        /// mid-test. Boxed opaquely because several of these types are private to
+        /// their own modules.
+        _keep_alive: Box<dyn std::any::Any + Send>,
+    }
+
+    /// A real `OpManager` over a real `Ring` (production `InstantTimeSrc`, real
+    /// background tasks), with the node-event receiver handed back so a test can
+    /// assert on EMITTED events rather than on internal bookkeeping. `id`
+    /// isolates the on-disk state in its own temp dir.
+    async fn seam_fixture(id: &str) -> SeamFixture {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        SeamFixture {
+            op_manager,
+            node_events: notification_rx.notifications_receiver,
+            _keep_alive: Box::new((
+                notification_rx.op_execution_receiver,
+                _ch_channel,
+                _wait_for_event,
+                result_router_rx,
+                task_monitor,
+            )),
+        }
+    }
+
+    /// Every contract id retracted by a `HostingAnnounce` queued on the node-event
+    /// channel so far. This is the wire-visible effect co-hosts act on: it is what
+    /// makes them drop us from their fan-out target set.
+    fn drain_retracted_ids(
+        fixture: &mut SeamFixture,
+    ) -> Vec<freenet_stdlib::prelude::ContractInstanceId> {
+        let mut retracted = Vec::new();
+        while let Ok(event) = fixture.node_events.try_recv() {
+            if let either::Either::Right(crate::message::NodeEvent::BroadcastHostingUpdate {
+                message: crate::message::NeighborHostingMessage::HostingAnnounce { removed, .. },
+            }) = event
+            {
+                retracted.extend(removed);
+            }
+        }
+        retracted
+    }
+
+    /// Run the maintenance loop's post-sweep step for one sweep result, in the
+    /// same order as `Ring::sweep_get_subscription_cache`: drop the upstream lease
+    /// for each expired key, THEN reclaim it. The order is load-bearing now that
+    /// the retraction treats a live lease as "still a host" — a helper that
+    /// skipped the unsubscribe would suppress the very retraction under test and
+    /// pass for the wrong reason.
+    fn reclaim_swept(
+        op_manager: &crate::node::OpManager,
+        swept: crate::ring::hosting::HostingSweepResult,
+    ) {
+        for (key, expected_generation) in swept.expired {
+            op_manager.ring.unsubscribe(&key);
+            crate::operations::reclaim_evicted_contract(op_manager, key, expected_generation);
+        }
+    }
+
+    /// #5059: a cost-pressure eviction must RETRACT the evicted contract's co-host
+    /// advertisement, not just drop its hosting-cache entry.
+    ///
+    /// Broadcast fan-out targets are resolved from `neighbor_hosting` (advertised
+    /// co-hosts) with no interest check, so an evicted-but-still-advertised
+    /// contract keeps being sent updates and keeps applying them. That burns the
+    /// CPU the eviction was supposed to reclaim, AND it bumps the state generation
+    /// on every apply — so the deferred `EvictContract` bails at
+    /// `RuntimePool::remove_contract`'s newer-generation guard and the retraction
+    /// wired behind that guard never runs. Field evidence in #5040: the storm
+    /// contract's per-update warn ran at ~10-11/s continuously through three
+    /// separate cost evictions of it.
+    ///
+    /// The assertion is on the EMITTED EFFECT — a `BroadcastHostingUpdate`
+    /// carrying `HostingAnnounce { removed: [junk] }` — rather than on
+    /// `my_contracts`, because the wire message is what makes co-hosts stop
+    /// sending.
+    ///
+    /// Nothing in this fixture consumes the `EvictContract` event, which is the
+    /// point: it stands in for the field case where reclamation never reaches its
+    /// own retraction. Before this fix the test sees no retraction at all.
+    ///
+    /// `start_paused` for the same reason as the sibling seam test above: the
+    /// virtual clock drives the meter, the sweep, and the background tasks
+    /// together. A background hosting sweep may shed `junk` before the explicit
+    /// sweep below; either way the retraction has to reach the channel, which is
+    /// why the assertion scans everything queued rather than a single event.
+    #[tokio::test(start_paused = true)]
+    async fn cost_evicted_contract_emits_a_co_host_advertisement_retraction() {
+        use crate::topology::meter::ResourceType;
+
+        let mut fixture = seam_fixture("cost-retraction-5059").await;
+        let op_manager = fixture.op_manager.clone();
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14101".parse().unwrap());
+        let ring = &op_manager.ring;
+
+        let junk = seam_key(1);
+        let subscribed = seam_key(2);
+
+        let _ = ring.host_contract(
+            junk,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        let _ = ring.host_contract(
+            subscribed,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        // Both advertised to co-hosts — the state this fix is about. Set directly
+        // (not via `announce_contract_hosted`) so the only `HostingAnnounce` the
+        // channel can carry is a retraction.
+        op_manager.neighbor_hosting.on_contract_hosted(&junk);
+        op_manager.neighbor_hosting.on_contract_hosted(&subscribed);
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&junk),
+            "precondition: the storm contract is advertised to co-hosts"
+        );
+
+        tokio::time::advance(super::hosting::COST_RATE_MIN_WINDOW + Duration::from_secs(1)).await;
+        assert!(!matches!(
+            ring.add_downstream_subscriber(
+                &subscribed,
+                crate::ring::interest::PeerKey(crate::transport::TransportPublicKey::from_bytes(
+                    [9u8; 32]
+                )),
+            ),
+            crate::ring::hosting::AddSubscriberOutcome::Rejected
+        ));
+
+        // The FX2j storm profile through the production reporter, identical for
+        // both contracts so demand — not cost share — decides who is shed.
+        for _ in 0..110u32 {
+            for key in [&junk, &subscribed] {
+                ring.report_contract_resource_usage(
+                    *key.id(),
+                    ResourceType::BroadcastMessagesSent,
+                    58.0,
+                );
+            }
+            tokio::time::advance(Duration::from_millis(1600)).await;
+        }
+
+        // The background hosting sweep may have shed `junk` (and reclaimed it)
+        // during the advances above, in which case this explicit sweep finds
+        // nothing left to evict and the retraction is already queued. Either way
+        // it has to be on the channel, which is why the drain below covers the
+        // whole run rather than only the window around this call. Nothing here
+        // ever announces hosting, so every `HostingAnnounce` on the channel is a
+        // retraction.
+        reclaim_swept(&op_manager, ring.sweep_expired_hosting());
+        assert!(
+            !ring.is_hosting_contract(&junk),
+            "precondition for the assertions below: the storm contract was shed"
+        );
+
+        let retracted = drain_retracted_ids(&mut fixture);
+        assert!(
+            retracted.contains(junk.id()),
+            "the cost-evicted contract must emit a co-host advertisement retraction \
+             — without it the fan-out never stops and the eviction reclaims nothing \
+             (#5059). Retractions seen: {retracted:?}"
+        );
+        assert!(
+            !retracted.contains(subscribed.id()),
+            "a contract that was never evicted must not be retracted"
+        );
+        assert!(
+            !op_manager.neighbor_hosting.is_hosted_locally(&junk),
+            "the evicted contract must also leave the locally-advertised set, or the \
+             ~5-min full-set re-request re-asserts the phantom advertisement"
+        );
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&subscribed),
+            "the surviving subscribed contract keeps its advertisement"
+        );
+    }
+
+    /// The eviction retraction must NOT fire for a contract that is hosted again,
+    /// wanted again, or back in the update mesh by the time it runs — the three
+    /// conditions that genuinely mean "still a host". Retracting any of them would
+    /// leave a fresh, in-mesh contract unadvertised, which the ~5-min full-set
+    /// re-request cannot heal because that exchange replays the same (wrong)
+    /// `my_contracts`.
+    ///
+    /// All three go through the real `reclaim_evicted_contract` funnel, but they
+    /// are stopped at different points: re-hosted and leased by the retraction
+    /// helper's own guard, in-use by `reclaim_evicted_contract`'s pre-existing
+    /// `contract_in_use` early return (the helper re-checks that one too, for the
+    /// window between that return and the removal — covered directly by
+    /// `on_contract_unhosted_unless_rehosted_retracts_only_when_still_unhosted`).
+    #[tokio::test(start_paused = true)]
+    async fn eviction_retraction_skips_a_rehosted_or_in_use_contract() {
+        let mut fixture = seam_fixture("cost-retraction-guards-5059").await;
+        let op_manager = fixture.op_manager.clone();
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14102".parse().unwrap());
+        let ring = &op_manager.ring;
+
+        // (1) Re-hosted: present in the hosting cache when the reclaim runs.
+        let rehosted = seam_key(4);
+        let _ = ring.host_contract(
+            rehosted,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        op_manager.neighbor_hosting.on_contract_hosted(&rehosted);
+
+        // (2) Back in use: absent from the hosting cache, but a downstream
+        // subscriber re-registered interest.
+        let in_use = seam_key(5);
+        op_manager.neighbor_hosting.on_contract_hosted(&in_use);
+        assert!(!matches!(
+            ring.add_downstream_subscriber(
+                &in_use,
+                crate::ring::interest::PeerKey(crate::transport::TransportPublicKey::from_bytes(
+                    [7u8; 32]
+                )),
+            ),
+            crate::ring::hosting::AddSubscriberOutcome::Rejected
+        ));
+        assert!(
+            !ring.is_hosting_contract(&in_use) && ring.contract_in_use(&in_use),
+            "precondition: in-use but not in the hosting cache"
+        );
+
+        // (3) Re-subscribed: no cache entry and no subscriber of its own, but a
+        // live upstream lease, so it IS in the update mesh. This is the SUBSCRIBE
+        // path's shape — `finalize_originator_subscribe` installs the lease, then
+        // announces on the body being present ON DISK, and the ring-level client
+        // subscription lands later from `client_events`. Without the lease check
+        // a pending-reclamation retry in that window retracts the announce right
+        // back out, leaving the node subscribed, holding the body, unadvertised.
+        let resubscribed = seam_key(6);
+        op_manager
+            .neighbor_hosting
+            .on_contract_hosted(&resubscribed);
+        ring.subscribe(resubscribed);
+        assert!(
+            !ring.is_hosting_contract(&resubscribed)
+                && !ring.contract_in_use(&resubscribed)
+                && ring.is_subscribed(&resubscribed),
+            "precondition: leased only — not cached, no subscriber of our own"
+        );
+
+        let _ = drain_retracted_ids(&mut fixture);
+        for key in [rehosted, in_use, resubscribed] {
+            let generation = ring.state_generation(&key);
+            crate::operations::reclaim_evicted_contract(&op_manager, key, generation);
+        }
+
+        let retracted = drain_retracted_ids(&mut fixture);
+        assert!(
+            retracted.is_empty(),
+            "none of a re-hosted, in-use, or leased contract may be retracted; \
+             got {retracted:?}"
+        );
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&rehosted),
+            "a contract re-hosted since the eviction decision keeps its advertisement"
+        );
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&in_use),
+            "a contract back in use since the eviction decision keeps its advertisement"
+        );
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&resubscribed),
+            "a contract holding a live upstream lease keeps its advertisement — it \
+             is in the update mesh, so it is a host under invariant 1"
+        );
+    }
+
+    /// Drift guard (#4861 Codex round-3): the meter's per-axis cost floors
+    /// ([`crate::topology::meter::ResourceType::cost_pressure_floor`]) and its
+    /// sustained window ([`crate::topology::meter::COST_SUSTAINED_WINDOW`]) are
+    /// MIRRORS — the authoritative constants live in `ring::hosting::cache`,
+    /// which is not nameable from `topology::meter` (that module is private to
+    /// `hosting`, itself private to `ring`), so the meter cannot import them.
+    /// This test reads the authoritative values through the `ring`-visible
+    /// surface — `build_cost_axes` (which binds each axis to its cache.rs floor
+    /// constant) and the re-exported `COST_RATE_MIN_WINDOW` — and asserts the
+    /// meter's mirrors match, so the insert-time above-floor detection can
+    /// never key on a floor/window that differs from the eviction decision's.
+    #[test]
+    fn meter_cost_floors_mirror_cache_source_of_truth() {
+        use crate::topology::meter::{COST_SUSTAINED_WINDOW, ResourceType};
+
+        fn empty_read() -> (
+            f64,
+            std::collections::HashMap<freenet_stdlib::prelude::ContractInstanceId, f64>,
+        ) {
+            (0.0, std::collections::HashMap::new())
+        }
+
+        // build_cost_axes argument/return order: cpu, fanout_bytes, messages.
+        let axes = super::hosting::build_cost_axes(empty_read(), empty_read(), empty_read());
+        assert_eq!(
+            axes[0].floor,
+            ResourceType::ExecCpuMicros
+                .cost_pressure_floor()
+                .expect("ExecCpuMicros is a cost axis"),
+            "CPU floor mirror drifted from cache.rs source of truth",
+        );
+        assert_eq!(
+            axes[1].floor,
+            ResourceType::BroadcastFanoutCost
+                .cost_pressure_floor()
+                .expect("BroadcastFanoutCost is a cost axis"),
+            "fan-out byte floor mirror drifted from cache.rs source of truth",
+        );
+        assert_eq!(
+            axes[2].floor,
+            ResourceType::BroadcastMessagesSent
+                .cost_pressure_floor()
+                .expect("BroadcastMessagesSent is a cost axis"),
+            "message floor mirror drifted from cache.rs source of truth",
+        );
+        assert_eq!(
+            super::hosting::COST_RATE_MIN_WINDOW,
+            COST_SUSTAINED_WINDOW,
+            "sustained-window mirror drifted from cache.rs COST_RATE_MIN_WINDOW",
+        );
+    }
+
+    /// Governance cost ingestion accepts ONLY `StateBytesWritten` and REJECTS
+    /// the three #4861 cost-eviction axes (and the peer/fuel axes). Pinning
+    /// this prevents silently re-feeding governance a popularity-scaled cost
+    /// axis, which reproduces the #4296 "popular contract banned for being
+    /// popular" false positive (see `governance_ingests_axis` rustdoc and the
+    /// `popular_contract_with_subscribers_not_evicted` sim test). Exhaustive so
+    /// a new ResourceType variant must be classified with the same guard.
+    #[test]
+    fn governance_ingests_only_state_bytes_written() {
+        use crate::topology::meter::ResourceType;
+        assert!(
+            super::governance_ingests_axis(ResourceType::StateBytesWritten),
+            "governance MUST ingest StateBytesWritten (its main-calibrated basis)"
+        );
+        for axis in [
+            ResourceType::ExecCpuMicros,
+            ResourceType::BroadcastFanoutCost,
+            ResourceType::BroadcastMessagesSent,
+        ] {
+            assert!(
+                !super::governance_ingests_axis(axis),
+                "governance MUST NOT ingest the #4861 cost-eviction axis {axis:?} \
+                 (popularity-scaled → resurrects #4296); it feeds the meter/sweep only"
+            );
+        }
+        for axis in [
+            ResourceType::InboundBandwidthBytes,
+            ResourceType::OutboundBandwidthBytes,
+            ResourceType::ExecFuelUnits,
+        ] {
+            assert!(
+                !super::governance_ingests_axis(axis),
+                "peer/fuel axis {axis:?} is not per-contract cost; governance must not ingest it"
+            );
+        }
+    }
+
+    /// Source-scrape pin: the governance feed in `report_contract_resource_usage_batch`
+    /// MUST stay gated by `governance_ingests_axis`, so a future edit can't drop
+    /// the gate and re-flood governance with the #4861 cost-eviction axes.
+    #[test]
+    fn governance_feed_is_gated_by_axis_allowlist() {
+        let src = include_str!("ring.rs");
+        let start = src
+            .find("fn report_contract_resource_usage_batch(")
+            .expect("report_contract_resource_usage_batch not found");
+        let body_end = src[start..]
+            .find("\n    // Note: there is intentionally no `ingest_contract_demand`")
+            .expect("end of report_contract_resource_usage_batch not found")
+            + start;
+        let body = &src[start..body_end];
+        let ingest = body
+            .find(".governance.ingest_cost(")
+            .expect("governance.ingest_cost call missing from the batch feed");
+        let gate = body
+            .find("if !governance_ingests_axis(")
+            .expect("governance feed MUST be gated by governance_ingests_axis (#4296 guard)");
+        assert!(
+            gate < ingest,
+            "the governance_ingests_axis gate MUST precede (guard) the \
+             ingest_cost call, else the #4861 axes re-flood governance and \
+             resurrect #4296"
         );
     }
 }

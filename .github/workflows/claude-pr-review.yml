@@ -82,20 +82,36 @@ name: Claude PR Rule Review
 # - claude-ci-analysis (in ci.yml): failure debugging
 
 on:
+  # DO NOT add `paths-ignore:` (or `paths:`) here. This workflow provides the
+  # required status context "Claude Rule Review". A workflow skipped by a path
+  # filter reports NOTHING, and GitHub treats a never-reported required context
+  # as "expected" rather than satisfied, so the merge queue refuses the PR entry
+  # permanently. Removed in #5571 (issue #5451) alongside the same filter on
+  # ci.yml; enforced by .github/scripts/check_required_check_path_filters.py.
+  # Consequence worth knowing: docs-only PRs now get a full rule review, which
+  # costs an LLM call and may raise WARNING findings (e.g. "Missing PR
+  # description sections") on a one-line docs change.
   pull_request_target:
     types: [opened, synchronize, ready_for_review, reopened, labeled]
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-      - 'LICENSE'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/FUNDING.yml'
   # Required by branch protection — merge queue expects this check to report.
   # The job skips the actual review in merge_group context (PR was already reviewed).
   merge_group:
 
+# The group key MUST include a merge_group fallback. `github.event.pull_request`
+# does not exist on a merge_group event, so a key of just `.pull_request.number`
+# collapses to the constant `claude-pr-review-` for EVERY queued PR — and with
+# cancel-in-progress, each new queue entry then cancels the previous entry's run
+# of this required check. A cancelled required check is not a reported check, so
+# the older entry goes UNMERGEABLE and silently falls out of the queue. Observed
+# 2026-08-04 with three PRs queued: #5160's run was cancelled 2s after starting,
+# by #5163's, and #5160 stalled at queue position 1.
+#
+# `merge_group.head_sha` is unique per queue entry, which is the right isolation
+# unit: entries are independent, so nothing should cancel anything here. run_id
+# is a belt-and-braces fallback for any future trigger with neither field — it is
+# unique per run, so an unrecognised event never shares a group.
 concurrency:
-  group: claude-pr-review-${{ github.event.pull_request.number }}
+  group: claude-pr-review-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
   cancel-in-progress: true
 
 jobs:

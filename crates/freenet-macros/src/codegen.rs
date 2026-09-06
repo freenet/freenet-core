@@ -314,6 +314,16 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             transport_keypair: Some(transport_keypair),
                             ..Default::default()
                         },
+                        // Harness nodes run in Network mode, where the local
+                        // event log is OFF by default (#4968). The failure
+                        // report this macro emits reads that log back
+                        // (`generate_failure_report` -> `aggregate_events` ->
+                        // `event_log_path`), so without this opt-in the event
+                        // section of every failing test's report is silently
+                        // empty. Diagnostics are the whole point of the log in
+                        // a test, and a temp-dir node pays none of the disk
+                        // cost that made it opt-in for real peers. See #4972.
+                        enable_event_log: Some(true),
                         ..Default::default()
                     };
 
@@ -456,6 +466,16 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             transport_keypair: Some(transport_keypair),
                             ..Default::default()
                         },
+                        // Harness nodes run in Network mode, where the local
+                        // event log is OFF by default (#4968). The failure
+                        // report this macro emits reads that log back
+                        // (`generate_failure_report` -> `aggregate_events` ->
+                        // `event_log_path`), so without this opt-in the event
+                        // section of every failing test's report is silently
+                        // empty. Diagnostics are the whole point of the log in
+                        // a test, and a temp-dir node pays none of the disk
+                        // cost that made it opt-in for real peers. See #4972.
+                        enable_event_log: Some(true),
                         ..Default::default()
                     };
 
@@ -501,6 +521,9 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
         let ws_port_var = format_ident!("ws_port_{}", idx);
         let origin_contracts_var = format_ident!("origin_contracts_{}", idx);
         let api_clients_var = format_ident!("api_clients_{}", idx);
+        // Same per-node `temp_N` the config setup created (see
+        // `generate_node_setup`), reused here to scope the webapp cache.
+        let temp_var = format_ident!("temp_{}", idx);
 
         builds.push(quote! {
             tracing::info!("Building node: {}", #node_label);
@@ -510,7 +533,16 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
             // release-then-rebind race window in parallel tests
             let ws_listener = freenet::test_utils::take_reserved_tcp_listener(#ws_port_var)
                 .expect("ws port should have been reserved");
-            let built_config = #config_var.build().await?;
+            let mut built_config = #config_var.build().await?;
+            // Point this node's unpacked-webapp cache at its own temp dir. The
+            // cache is LRU-size-bounded, so serving a web contract DELETES from
+            // whatever directory this names; left at the default it is the
+            // developer's real `~/.cache/freenet/webapp_cache`, and a test that
+            // fetches a shell page (tests/playwright_shell.rs does, on a plain
+            // `cargo test`) would evict it — including entries a node running
+            // as the same user is serving right now.
+            built_config.ws_api.webapp_cache_dir =
+                #temp_var.path().join("webapp_cache");
             let mut node_config = freenet::local_node::NodeConfig::new(built_config.clone()).await?;
             node_config.relay_ready_connections(Some(0));
             #connection_tuning
@@ -747,5 +779,145 @@ fn generate_tokio_attr(args: &FreenetTestArgs) -> TokenStream {
                 #[tokio::test(flavor = #flavor)]
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+
+    /// Every harness node must opt in to the local event log (#4972).
+    ///
+    /// Harness nodes run in Network mode, which is exactly the mode where the
+    /// event log is OFF by default (#4968). But this macro's failure report
+    /// reads that log back — `generate_failure_report` -> `aggregate_events`
+    /// -> `event_log_path`. Drop the opt-in and the report does not fail, it
+    /// just stops saying anything: the event section of every failing test's
+    /// report goes silently empty, which reads like "nothing interesting
+    /// happened" rather than "this diagnostic is switched off".
+    ///
+    /// Asserts against the GENERATED TOKENS rather than the source text, so
+    /// reformatting cannot quietly make it vacuous, and expects one opt-in per
+    /// node so that dropping it from only the gateway arm or only the peer arm
+    /// still trips it.
+    ///
+    /// The expected count is derived from `args.nodes.len()` rather than
+    /// hardcoded, but be precise about what that buys: only that editing the
+    /// fixture's node count keeps working without a manual literal bump. It
+    /// does NOT cover a newly-added config arm that this two-node fixture never
+    /// reaches — verified by mutation: adding a third arm without the opt-in
+    /// leaves this test green, because both the node count and both match
+    /// counts stay at 2. Unreached-arm coverage is a property of the FIXTURE,
+    /// and no token count against a single fixture can establish it.
+    ///
+    /// **That hole is not covered by any test.** A source-scrape guard for it
+    /// was written and then deleted, because text matching cannot tell a field
+    /// from prose. Three mutations defeated the final version: the opt-in named
+    /// in a trailing comment, in a `/* block comment */`, and — worst — an
+    /// innocuous production comment containing the words `mod tests`, which
+    /// truncated the scraped region before the peer arm so the guard went green
+    /// on exactly the bug it existed to catch.
+    ///
+    /// Two more defeated earlier or alternative versions: a literal in another
+    /// function (beat the single-function slice, later widened), and the opt-in
+    /// in a `///` doc comment (beat a `proc_macro2` lexer variant, since `///`
+    /// becomes `#[doc = "..."]` and the phrase survives in the string literal).
+    /// Each fix drew a new shape — which is the point: the problem is the
+    /// approach, not any one bug. A guard that looks like protection but isn't
+    /// is worse than none, because it stops the next person adding real
+    /// protection.
+    ///
+    /// (`warn_if_no_events` would still surface a TOTAL runtime blackout, but
+    /// it prints rather than fails, and would not catch a partial one where
+    /// only a new arm's nodes lack the opt-in.)
+    ///
+    /// So: **if you add a node-config arm here, add a fixture node that reaches
+    /// it.** If that ever needs enforcing, parse rather than match —
+    /// `syn::parse_file`, walking for an `ExprStruct` whose path ends in
+    /// `ConfigArgs`, since fields and doc attributes are structurally distinct
+    /// there (note the walk needs manual recursion or syn's `visit` feature,
+    /// which is not currently enabled). Better still, remove the duplication so
+    /// both arms build their `ConfigArgs` through one shared helper and there
+    /// is only one place to forget.
+    #[test]
+    fn every_harness_node_enables_the_event_log() {
+        let args: FreenetTestArgs = syn::parse2(quote! { nodes = ["gateway", "peer-1"] }).unwrap();
+        let expected = args.nodes.len();
+
+        let generated = generate_node_setup(&args).to_string();
+        let normalized: String = generated.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // Vacuity guard: if the fixture ever stops generating one ConfigArgs per
+        // node, the count below stops meaning "one opt-in per node". This also
+        // subsumes a bare "did we generate anything" check — a count of
+        // `expected` implies the literal is present.
+        assert_eq!(
+            normalized.matches("ConfigArgs{").count(),
+            expected,
+            "pin guard: expected one ConfigArgs per node, so this test is \
+             asserting against the wrong thing. Generated:\n{generated}"
+        );
+
+        let count = normalized.matches("enable_event_log:Some(true)").count();
+        assert_eq!(
+            count, expected,
+            "each of the {expected} harness nodes must set \
+             `enable_event_log: Some(true)` (found {count}). Network-mode nodes \
+             have the event log off by default (#4968) and #[freenet_test] reads \
+             it back for failure reports and for assert-absence tests, so \
+             dropping this silently empties both. See #4972.\nGenerated:\n{generated}"
+        );
+    }
+
+    /// Every harness node must redirect its unpacked-webapp cache into its own
+    /// temp dir.
+    ///
+    /// That cache is bounded by LRU EVICTION, so serving a web contract DELETES
+    /// from whatever directory the node is pointed at. Left at the default it is
+    /// the developer's real `~/.cache/freenet/webapp_cache`, and
+    /// `tests/playwright_shell.rs` fetches a shell page on a plain `cargo test`
+    /// — so dropping this makes the suite silently evict a real cache down to
+    /// the production budget, and, since the eviction guards are per-process
+    /// while the directory is per-user, evict entries a node running as the same
+    /// user is serving right now.
+    ///
+    /// This is the second attempt at that isolation. The first gated a temp-dir
+    /// redirect on `#[cfg(test)]`, which is FALSE in an integration test (the
+    /// lib is linked as an ordinary dependency there), so it covered unit tests
+    /// only and left the path above wide open. Hence a pin here, on the harness
+    /// that integration tests actually go through.
+    ///
+    /// Asserts against generated TOKENS, per the note on the test above, and
+    /// expects one assignment per node so dropping it from only the gateway arm
+    /// or only the peer arm still trips.
+    #[test]
+    fn every_node_isolates_its_webapp_cache() {
+        let args: FreenetTestArgs = syn::parse2(quote! { nodes = ["gateway", "peer-1"] }).unwrap();
+        let expected = args.nodes.len();
+
+        let generated = generate_node_builds(&args).to_string();
+        let normalized: String = generated.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // Vacuity guard: the count below only means "once per node" if the
+        // fixture really builds one server per node.
+        assert_eq!(
+            normalized
+                .matches("serve_client_api_with_listener_and_contracts")
+                .count(),
+            expected,
+            "pin guard: expected one server per node, so this test is asserting \
+             against the wrong thing. Generated:\n{generated}"
+        );
+
+        let count = normalized.matches("ws_api.webapp_cache_dir=").count();
+        assert_eq!(
+            count, expected,
+            "each of the {expected} harness nodes must point \
+             `ws_api.webapp_cache_dir` at its own temp dir (found {count}). The \
+             webapp cache is LRU-evicted, so without this a test that serves a \
+             web contract deletes from the developer's real cache.\n\
+             Generated:\n{generated}"
+        );
     }
 }

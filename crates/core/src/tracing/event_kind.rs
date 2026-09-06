@@ -8,6 +8,33 @@ use crate::{
     router::RouteEvent,
 };
 
+/// Inclusive upper bounds for the fixed contract-state size histogram used by
+/// the large-state diagnostics (#5090). The final bucket contains values above
+/// the current 50 MiB hard limit, making a persisted over-limit state visible
+/// without introducing a contract-key dimension.
+pub(crate) const STATE_SIZE_BUCKET_UPPER_BOUNDS: [u64; 8] = [
+    64 * 1024,
+    500 * 1024,
+    1024 * 1024,
+    3 * 1024 * 1024,
+    10 * 1024 * 1024,
+    25 * 1024 * 1024,
+    40 * 1024 * 1024,
+    50 * 1024 * 1024,
+];
+
+/// Number of fixed contract-state size buckets, including the unbounded final
+/// bucket above the largest inclusive upper bound.
+pub(crate) const STATE_SIZE_BUCKET_COUNT: usize = STATE_SIZE_BUCKET_UPPER_BOUNDS.len() + 1;
+
+/// Return the fixed histogram bucket for `size_bytes`.
+pub(crate) fn state_size_bucket(size_bytes: u64) -> usize {
+    STATE_SIZE_BUCKET_UPPER_BOUNDS
+        .iter()
+        .position(|upper| size_bytes <= *upper)
+        .unwrap_or(STATE_SIZE_BUCKET_UPPER_BOUNDS.len())
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 #[non_exhaustive]
@@ -1296,14 +1323,47 @@ pub(crate) enum GetEvent {
         /// Sub-operation GET (phantom-repair, renewal, related-fetch);
         /// excluded from client-findability metrics.
         is_sub_op: bool,
-        /// GET requests actually SENT before this terminal outcome. `1` means
-        /// the first peer answered; `0` is the convention for a LOCAL-cache
-        /// hit that never routed to the network (see
-        /// `emit_local_get_terminal_event`), letting analysts split "all
-        /// client GET successes" (`attempts >= 0`) from "network GET
-        /// findability" (`attempts >= 1`).
+        /// GET requests actually SENT before this terminal outcome — one per
+        /// `build_request`, taken from `driver.requests_sent`. `1` means the
+        /// terminal arrived on the first request sent; `0` is the convention
+        /// for a client GET served from a LOCAL copy that never entered the
+        /// driver at all (see `emit_local_get_terminal_event`), which is the
+        /// only way a `ClientTerminal` carries `0`.
+        ///
+        /// **Do not use `attempts` to split network from local successes.**
+        /// This comment used to recommend exactly that (`attempts >= 1` =
+        /// "network GET findability"); #4852 P2 abandoned the split in the
+        /// code but left the comment stale, and the stale advice then produced
+        /// a published GET success rate an order of magnitude off (#5248). It
+        /// is wrong because a loopback `LocalCompletion` — the driver's own
+        /// Request echoed back when the originator itself holds the contract —
+        /// increments `requests_sent` with no network round-trip, so
+        /// `attempts >= 1` counts those local completions as network
+        /// successes. The split the node uses is `hop_count` (see below and
+        /// [`crate::tracing::summarize_client_get_outcomes`], pinned by
+        /// `client_loopback_completion_counts_as_local`).
         attempts: usize,
-        /// Forward-path hop count when carried by the terminal reply.
+        /// Forward-path hop count when carried by the terminal reply, which in
+        /// practice means only the inline-`Found` terminal: `GetMsg::Response`
+        /// carries `hop_count`, `GetMsg::ResponseStreaming` does not. `None`
+        /// on the streaming, loopback-`LocalCompletion`, local-hit and
+        /// retry-exhausted paths; `Some(0)` when the reply reported no forward
+        /// hop (an originator loopback). `None` therefore does NOT mean "the
+        /// GET is known to have traversed zero hops", only that no hop count
+        /// was reported.
+        ///
+        /// `hop_count >= 1` is the network-vs-local test
+        /// [`crate::tracing::summarize_client_get_outcomes`] applies, and the
+        /// field is exported verbatim in the OTLP event body (`null` for
+        /// `None`), so a downstream consumer applying the same test computes
+        /// exactly what the node computes. Know its bias before quoting it as
+        /// a findability rate: because a streamed reply carries no hop count,
+        /// **every streaming (> 64 KB `streaming_threshold`) network success
+        /// is classified LOCAL**, so `hop_count >= 1` UNDER-counts network
+        /// successes wherever large contracts dominate (#5471). Neither field
+        /// gives an exact split — `attempts >= 1` over-counts by including
+        /// loopback completions, `hop_count >= 1` under-counts by excluding
+        /// streamed ones.
         hop_count: Option<usize>,
         /// Fragments received on the streaming path. `None` for non-streaming
         /// terminals and where no stream was ever claimed. On the streaming

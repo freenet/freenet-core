@@ -20,6 +20,17 @@ const MAX_WARNED_TOKENS: usize = 1000;
 /// that is no longer valid (e.g., after node restart).
 pub const AUTH_TOKEN_INVALID_ERROR: &str = "AUTH_TOKEN_INVALID";
 
+/// WebSocket application close code the node uses to tell the shell that the
+/// presented auth token is stale (e.g. a node restart wiped the in-memory token
+/// map). This is the shell's TRUSTED stale-token signal: it rides the close
+/// frame of a socket the shell itself opened to the node, so — unlike the error
+/// message BODY, which a contract's own `GetResponse` state could echo verbatim
+/// — a sandboxed contract cannot forge it. The shell watches for exactly this
+/// code on a server-initiated close to trigger an autonomous recovery reload
+/// (see `shell_bridge.js`). 4401 is in the WebSocket private-use application
+/// range (4000-4999) and deliberately mirrors HTTP 401 Unauthorized.
+pub const AUTH_TOKEN_INVALID_CLOSE_CODE: u16 = 4401;
+
 /// Interval for sending WebSocket ping frames to keep connection alive.
 /// Idle TCP connections may be closed by the OS, browser, or intermediate
 /// proxies after extended periods of inactivity. 30 seconds is a safe
@@ -101,7 +112,7 @@ use axum::{
     Extension, Router,
     extract::{
         Query, WebSocketUpgrade,
-        ws::{Message, WebSocket},
+        ws::{CloseFrame, Message, WebSocket},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -129,7 +140,7 @@ use crate::{
     },
 };
 
-use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
+use super::{ClientError, ClientEventsProxy, ClientId, ConnectionScope, HostResult, OpenRequest};
 use crate::client_events::user_op_rate_limit::UserOpRateLimiter;
 use crate::server::client_api::OriginContractMap;
 use crate::wasm_runtime::UserSecretContext;
@@ -539,6 +550,7 @@ impl WebSocketProxy {
         req: Box<ClientRequest<'static>>,
         auth_token: Option<AuthToken>,
         origin_contract: Option<ContractInstanceId>,
+        connection_scope: ConnectionScope,
         user_context: Option<UserSecretContext>,
     ) -> Option<OpenRequest<'static>> {
         let (tx, rx) =
@@ -560,6 +572,7 @@ impl WebSocketProxy {
                 .with_notification(tx)
                 .with_token(auth_token)
                 .with_origin_contract(origin_contract)
+                .with_connection_scope(connection_scope)
                 .with_user_context(user_context),
         )
     }
@@ -586,6 +599,7 @@ impl WebSocketProxy {
                 Ok(None)
             }
             ClientConnection::Request {
+                connection_scope,
                 client_id,
                 req,
                 auth_token,
@@ -640,6 +654,7 @@ impl WebSocketProxy {
                         req,
                         auth_token,
                         origin_contract,
+                        connection_scope,
                         user_context,
                     ) {
                         Some(r) => r,
@@ -649,6 +664,7 @@ impl WebSocketProxy {
                     OpenRequest::new(client_id, req)
                         .with_token(auth_token)
                         .with_origin_contract(origin_contract)
+                        .with_connection_scope(connection_scope)
                         .with_user_context(user_context)
                 };
                 Ok(Some(open_req))
@@ -772,24 +788,13 @@ pub(crate) enum UserTokenDecision {
     Local,
 }
 
-/// Whether a source IP is loopback (`127.0.0.0/8`, `::1`), after normalizing an
-/// IPv4-mapped IPv6 source (`::ffff:127.0.0.1`) from a dual-stack socket.
+/// Whether a source IP is loopback. A direct local browser, or a
+/// TLS-terminating reverse proxy colocated on the same host, both connect from
+/// loopback; anything off-host cannot forge it.
 ///
-/// Loopback is the trust anchor for honoring a durable per-user token: a direct
-/// local browser, or a TLS-terminating reverse proxy colocated on the same host,
-/// both connect from loopback. Anything off-host cannot forge a loopback source
-/// (the kernel sets it from the accepted socket — see `ConnectInfo<SocketAddr>`
-/// in `private_network_filter`), so it is a sound, non-spoofable signal that the
-/// plaintext HTTP port was NOT exposed to the network for this connection.
-pub(crate) fn is_loopback_source(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_loopback(),
-        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => v4.is_loopback(),
-            None => v6.is_loopback(),
-        },
-    }
-}
+/// Re-exported from [`crate::client_events::types`] so this file and
+/// [`ConnectionScope`] share ONE definition — see its rustdoc for why.
+pub(crate) use super::types::is_loopback_source;
 
 /// The security-critical gate: decide whether to honor a per-user `userToken`.
 ///
@@ -1096,9 +1101,20 @@ async fn connection_info(
         request_path = req.uri().path(),
         "connection_info middleware: resolved auth token, hosted-mode context, and encoding protocol",
     );
+    // ATTESTED-ORIGIN scope (GHSA-824h-7x5x-wfmf). Classified HERE, from the
+    // same kernel-observed `source_ip` the token gate above already reads, and
+    // NOT inside `websocket_commands`'s `on_upgrade` closure — that closure has
+    // no extractor and therefore no access to `ConnectInfo`, which is exactly
+    // why the connection's scope has to be captured at this layer and carried
+    // down as an extension (mirroring `user_context`).
+    //
+    // Fail closed: a missing `ConnectInfo` yields `Remote`, so a connection we
+    // cannot prove local never receives an attested application identity.
+    let connection_scope = ConnectionScope::from_source_ip(source_ip);
     req.extensions_mut().insert(encoding_protoc);
     req.extensions_mut().insert(auth_token);
     req.extensions_mut().insert(user_context);
+    req.extensions_mut().insert(connection_scope);
     // `streaming` query parameter is accepted but ignored — streaming is now
     // always enabled for payloads exceeding CHUNK_THRESHOLD (512 KiB).
 
@@ -1117,6 +1133,11 @@ async fn websocket_commands(
     // (hosted mode). `None` outside hosted mode or when no user token was
     // presented. Owned and moved into the connection task below.
     Extension(user_context): Extension<Option<UserSecretContext>>,
+    // Whether this connection is entitled to an attested application identity
+    // (GHSA-824h-7x5x-wfmf), classified in `connection_info` from the
+    // kernel-observed peer address. Moved into the connection task below and
+    // fixed for the connection's lifetime, exactly like `user_context`.
+    Extension(connection_scope): Extension<ConnectionScope>,
     // Per-node per-user operation rate limiter (#4561, P5 of #4381). Installed
     // as an `Extension` by `serve_client_api_in_impl` (the only path that has
     // the operator config). OPTIONAL: the standalone `create_router` test path
@@ -1189,6 +1210,7 @@ async fn websocket_commands(
             rs.clone(),
             auth_and_instance,
             user_context,
+            connection_scope,
             op_rate_limiter,
             activity_secrets_dir,
             token_is_invalid,
@@ -1221,6 +1243,7 @@ async fn notify_disconnect(
     request_sender: &WebSocketRequest,
     client_id: ClientId,
     auth_token: &Option<(AuthToken, ContractInstanceId)>,
+    connection_scope: ConnectionScope,
     api_version: ApiVersion,
 ) {
     tracing::debug!(%client_id, "Notifying node of disconnect for subscription cleanup");
@@ -1230,6 +1253,7 @@ async fn notify_disconnect(
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: auth_token.as_ref().map(|t| t.0.clone()),
             origin_contract: auth_token.as_ref().map(|t| t.1),
+            connection_scope,
             // Synthetic disconnect: no secret operations, so no user context.
             user_context: None,
             api_version,
@@ -1249,6 +1273,11 @@ async fn websocket_interface(
     // `ClientConnection::Request` so every request from this connection (and
     // only this connection) binds to the same user namespace.
     user_context: Option<UserSecretContext>,
+    // Whether this connection may receive an attested application identity
+    // (GHSA-824h-7x5x-wfmf). Classified once in `connection_info` from the
+    // kernel-observed peer address and immutable for the connection's life,
+    // like `user_context`; copied into every `ClientConnection::Request`.
+    connection_scope: ConnectionScope,
     // Per-node per-user op rate limiter (hosted mode, #4561). `None` on the
     // standalone/local paths that install no limiter. Shared across all of a
     // user's connections; consulted in `process_client_request` only when this
@@ -1318,8 +1347,25 @@ async fn websocket_interface(
         // (since auth_token=None), so the delegate receives origin=None and fails with
         // "missing message origin". The client handles AUTH_TOKEN_INVALID by reloading
         // the page to get a fresh token, so closing is the correct behavior.
-        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
-        if let Err(e) = server_sink.send(Message::Close(None)).await {
+        notify_disconnect(
+            &request_sender,
+            client_id,
+            &auth_token,
+            connection_scope,
+            api_version,
+        )
+        .await;
+        // Close with the trusted application code (not a bare close) so the shell
+        // can distinguish a stale-token rejection from any other disconnect and
+        // recover autonomously — see AUTH_TOKEN_INVALID_CLOSE_CODE. The serialized
+        // error above is still sent first (unchanged) for clients that decode it.
+        if let Err(e) = server_sink
+            .send(Message::Close(Some(CloseFrame {
+                code: AUTH_TOKEN_INVALID_CLOSE_CODE,
+                reason: AUTH_TOKEN_INVALID_ERROR.into(),
+            })))
+            .await
+        {
             tracing::debug!(error = %e, "Failed to send WebSocket close frame after auth error");
         }
         return Ok(());
@@ -1375,7 +1421,7 @@ async fn websocket_interface(
                 {
                     Err(err) => {
                         tracing::debug!(err = %err, "client channel closed");
-                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                        notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                         if let Err(e) = server_sink.send(Message::Close(None)).await {
                             tracing::debug!(error = %e, "Failed to send WebSocket close frame");
                         }
@@ -1390,6 +1436,7 @@ async fn websocket_interface(
                     &request_sender,
                     &mut auth_token.as_mut().map(|t| t.0.clone()),
                     auth_token.as_mut().map(|t| t.1),
+                    connection_scope,
                     user_context.as_ref(),
                     op_rate_limiter.as_ref(),
                     activity_secrets_dir.as_ref(),
@@ -1402,14 +1449,14 @@ async fn websocket_interface(
                     Ok(Some(error)) => {
                         if let Err(err) = server_sink.send(error).await {
                             tracing::debug!(err = %err, "error sending error response to client");
-                            notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                            notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                             return Err(err.into());
                         }
                     }
                     Ok(None) => continue,
                     Err(None) => {
                         tracing::debug!(%client_id, "client channel closed during request processing");
-                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                        notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                         if let Err(e) = server_sink.send(Message::Close(None)).await {
                             tracing::debug!(error = %e, "Failed to send WebSocket close frame");
                         }
@@ -1417,7 +1464,7 @@ async fn websocket_interface(
                     },
                     Err(Some(err)) => {
                         tracing::debug!(%client_id, err = %err, "client request error");
-                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                        notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                         return Err(err)
                     },
                 }
@@ -1428,7 +1475,7 @@ async fn websocket_interface(
                 let msg = match process_host_response(msg, client_id, &mut server_sink, &mut delegate_rate_limiter, &mut conn_state).await {
                     Ok(msg) => msg,
                     Err(err) => {
-                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                        notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                         return Err(err);
                     }
                 };
@@ -1442,7 +1489,7 @@ async fn websocket_interface(
                 let response = match response {
                     Ok(r) => r,
                     Err(err) => {
-                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                        notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                         return Err(err);
                     }
                 };
@@ -1456,14 +1503,14 @@ async fn websocket_interface(
                         Ok(res) => match res.into_fbs_bytes() {
                             Ok(b) => b,
                             Err(err) => {
-                                notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                                notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                                 return Err(err.into());
                             }
                         },
                         Err(err) => match err.into_fbs_bytes() {
                             Ok(b) => b,
                             Err(err) => {
-                                notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                                notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                                 return Err(err.into());
                             }
                         },
@@ -1471,14 +1518,14 @@ async fn websocket_interface(
                     EncodingProtocol::Native => match bincode::serialize(&response) {
                         Ok(b) => b,
                         Err(err) => {
-                            notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                            notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                             return Err(err.into());
                         }
                     },
                 };
                 if let Err(err) = send_response_message(&mut server_sink, serialized_res, &mut conn_state, stream_content).await {
                     tracing::debug!(err = %err, "error sending notification to client");
-                    notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                    notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                     return Err(err.into());
                 }
             }
@@ -1487,7 +1534,7 @@ async fn websocket_interface(
                 tracing::trace!(%client_id, "sending WebSocket ping to keep connection alive");
                 if let Err(err) = server_sink.send(Message::Ping(vec![].into())).await {
                     tracing::debug!(%client_id, %err, "ping failed, connection dead");
-                    notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                    notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                     return Err(err.into());
                 }
             }
@@ -1709,6 +1756,7 @@ async fn process_client_request(
     request_sender: &mpsc::Sender<ClientConnection>,
     auth_token: &mut Option<AuthToken>,
     origin_contract: Option<ContractInstanceId>,
+    connection_scope: ConnectionScope,
     user_context: Option<&UserSecretContext>,
     op_rate_limiter: Option<&UserOpRateLimiter>,
     activity_secrets_dir: Option<&crate::server::ActivitySecretsDir>,
@@ -1831,8 +1879,37 @@ async fn process_client_request(
                 backoff_ms = remaining.as_millis(),
                 "Rejecting delegate request due to repeated failures (retry after backoff)"
             );
+            // NOT `DelegateError::Missing`, which this used to send.
+            //
+            // `Missing` is what the executor returns when a delegate genuinely
+            // is not registered on this node. Sending it for a throttled
+            // request overloaded it with a second, incompatible meaning, and a
+            // client had no way to tell them apart:
+            //
+            //   - not registered  -> the app is built against a stale delegate
+            //                        key; the user must update it, and the
+            //                        developer needs to know.
+            //   - rate limited    -> transient; back off and retry.
+            //
+            // Those want opposite responses, and conflating them cost a real
+            // user: an app built against a re-keyed ghostkeys delegate told
+            // someone to go buy a Ghost Key they already owned
+            // (freenet/ghostkeys#21).
+            //
+            // `ExecutionError` carries a message rather than a key, which is
+            // fine here -- the client sent the request, so it knows which
+            // delegate. A dedicated `RateLimited { key, retry_after }` variant
+            // would be better still, but that is a freenet-stdlib change and
+            // this is the fix that does not need one.
             let error: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
-                DelegateError::Missing(delegate_req.key().clone()),
+                DelegateError::ExecutionError(
+                    format!(
+                        "delegate {} is rate limited after repeated failures; retry in {} ms",
+                        delegate_req.key(),
+                        remaining.as_millis()
+                    )
+                    .into(),
+                ),
             ))
             .into();
             let serialized = match conn_state.encoding_protoc {
@@ -1947,6 +2024,7 @@ async fn process_client_request(
             req: Box::new(req),
             auth_token: auth_token.clone(),
             origin_contract,
+            connection_scope,
             // Clone the connection's user context into this request. Every
             // request from this connection carries the SAME context, derived
             // once at upgrade; a client cannot vary it per-request.
@@ -2659,6 +2737,109 @@ mod tests {
         );
     }
 
+    /// End-to-end wire check (PR #4781): a connection that presents a
+    /// stale/invalid auth token is closed with the trusted application close
+    /// code `AUTH_TOKEN_INVALID_CLOSE_CODE` (4401). This is the shell's
+    /// UNFORGEABLE stale-token signal — it rides the close frame of a socket the
+    /// node itself closes, not the message BODY (which a contract's own
+    /// `GetResponse` state could echo, the spoof the earlier byte-scan design
+    /// allowed). The shell watches for exactly this code to recover autonomously.
+    #[tokio::test]
+    async fn invalid_auth_token_closes_with_4401_code() {
+        use axum::{Extension, Router, response::IntoResponse, routing::get};
+        use std::time::Duration;
+
+        // Fake node backend: answer every NewConnection with a fresh id so
+        // `new_client_connection` resolves and `websocket_interface` reaches the
+        // `token_is_invalid` close path.
+        let (req_tx, mut req_rx) = mpsc::channel::<ClientConnection>(4);
+        tokio::spawn(async move {
+            while let Some(conn) = req_rx.recv().await {
+                if let ClientConnection::NewConnection { callbacks, .. } = conn {
+                    if callbacks
+                        .send(HostCallbackResult::NewId {
+                            id: ClientId::next(),
+                        })
+                        .is_err()
+                    {
+                        // The connection under test hung up; nothing left to serve.
+                        break;
+                    }
+                }
+            }
+        });
+
+        async fn ws_handler(
+            ws: WebSocketUpgrade,
+            Extension(rs): Extension<WebSocketRequest>,
+        ) -> impl IntoResponse {
+            ws.on_upgrade(move |socket| async move {
+                // `token_is_invalid = true` drives the stale-token close path.
+                // The interface's own return value is not the signal under test:
+                // the assertion is the close CODE the client observes.
+                drop(
+                    websocket_interface(
+                        rs,
+                        None,
+                        None,
+                        ConnectionScope::Local,
+                        None,
+                        None,
+                        true,
+                        EncodingProtocol::Native,
+                        ApiVersion::V1,
+                        socket,
+                    )
+                    .await,
+                );
+            })
+        }
+
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .layer(Extension(WebSocketRequest(req_tx)));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Serving ends when the test drops the listener task; its result is
+            // teardown noise, not a signal.
+            drop(axum::serve(listener, app).await);
+        });
+
+        let (mut client, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("ws connect");
+
+        // The node sends the serialized error frame first, then the close frame;
+        // skip anything that is not a Close and read the close code.
+        let observed_close_code = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(frame) = client.next().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "the test reads the CLOSE frame only; every other tungstenite frame kind is deliberately skipped, and that stays right for any variant tungstenite adds"
+                )]
+                match frame.expect("ws frame") {
+                    tokio_tungstenite::tungstenite::Message::Close(Some(cf)) => {
+                        return Some(u16::from(cf.code));
+                    }
+                    tokio_tungstenite::tungstenite::Message::Close(None) => return None,
+                    _ => continue,
+                }
+            }
+            None
+        })
+        .await
+        .expect("timed out waiting for the close frame");
+
+        assert_eq!(
+            observed_close_code,
+            Some(AUTH_TOKEN_INVALID_CLOSE_CODE),
+            "an invalid auth token must close the socket with the trusted 4401 code"
+        );
+    }
+
     fn test_conn_state(encoding: EncodingProtocol) -> ConnectionState {
         ConnectionState {
             encoding_protoc: encoding,
@@ -3290,6 +3471,111 @@ mod tests {
         assert!(limiter.check_backoff(&key_b).is_some());
     }
 
+    /// A throttled delegate request must NOT be reported as a missing
+    /// delegate.
+    ///
+    /// `Missing` means "not registered on this node", which tells a client its
+    /// build references a delegate that no longer exists — an app-update
+    /// problem the developer needs to hear about. Throttling is transient and
+    /// wants a retry. Sending `Missing` for both left clients unable to
+    /// distinguish them, and cost a real user: an app built against a re-keyed
+    /// ghostkeys delegate told someone to buy a Ghost Key they already owned
+    /// (freenet/ghostkeys#21).
+    ///
+    /// Pins the variant rather than the wording, except for a substring that
+    /// makes the cause legible in a log.
+    #[test]
+    fn throttled_request_is_not_reported_as_a_missing_delegate() {
+        let key = DelegateKey::new([7u8; 32], CodeHash::new([7u8; 32]));
+        let remaining = Duration::from_millis(250);
+
+        // Mirrors what the backoff branch constructs.
+        let err = DelegateError::ExecutionError(
+            format!(
+                "delegate {} is rate limited after repeated failures; retry in {} ms",
+                key,
+                remaining.as_millis()
+            )
+            .into(),
+        );
+
+        assert!(
+            !matches!(err, DelegateError::Missing(_)),
+            "throttling must not masquerade as an unregistered delegate"
+        );
+        let DelegateError::ExecutionError(msg) = &err else {
+            panic!("expected ExecutionError, got {err:?}");
+        };
+        assert!(
+            msg.contains("rate limited"),
+            "the cause should be legible in the message: {msg}"
+        );
+
+        // And it carries no key, so it cannot be mistaken for a per-delegate
+        // failure by the tracker.
+        assert!(delegate_error_key(&err).is_none());
+    }
+
+    /// Pin the WIRING, not just the shape.
+    ///
+    /// The tests above construct the error by hand, so they prove what a
+    /// throttle rejection should look like but not that the backoff branch
+    /// actually builds one. A future edit could reinstate
+    /// `DelegateError::Missing` there and they would all still pass.
+    ///
+    /// Source-scrape instead (same idiom as `server.rs` and
+    /// `ring/update_rate_limit.rs`): the backoff branch must not name
+    /// `Missing`. Anchored on `check_backoff`, which is the branch's own
+    /// condition, so this survives the surrounding code being reorganised.
+    #[test]
+    fn backoff_branch_does_not_construct_a_missing_delegate_error() {
+        const SRC: &str = include_str!("websocket.rs");
+
+        let (body, _) = SRC
+            .split_once("\nmod tests {")
+            .expect("websocket.rs should have a tests module");
+
+        let idx = body
+            .find("rate_limiter.check_backoff(key_bytes)")
+            .expect("the delegate backoff branch should still exist");
+
+        // The branch is short; take a generous window rather than trying to
+        // brace-match.
+        let window = &body[idx..(idx + 2000).min(body.len())];
+
+        // Strip line comments before asserting. The branch carries a comment
+        // explaining why it does NOT use `Missing`, and a naive scrape cannot
+        // tell that apart from code that does -- which is exactly what this
+        // test caught on its first run.
+        let branch: String = window
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !branch.contains("DelegateError::Missing"),
+            "the backoff branch must not report a throttled request as a \
+             missing delegate -- `Missing` means the delegate is not \
+             registered, and conflating the two leaves clients unable to \
+             tell an app that needs updating from one that should retry \
+             (freenet/ghostkeys#21)"
+        );
+        assert!(
+            branch.contains("DelegateError::ExecutionError"),
+            "the backoff branch should report ExecutionError naming the cause"
+        );
+    }
+
+    /// The counterpart: a genuinely unregistered delegate still reports
+    /// `Missing`, and still carries its key for failure tracking.
+    #[test]
+    fn unregistered_delegate_still_reports_missing_with_its_key() {
+        let key = DelegateKey::new([9u8; 32], CodeHash::new([9u8; 32]));
+        let err = DelegateError::Missing(key.clone());
+        assert_eq!(delegate_error_key(&err), Some(key.bytes()));
+    }
+
     #[test]
     fn test_rate_limiter_escalating_backoff() {
         let mut limiter = DelegateRateLimiter::new();
@@ -3910,6 +4196,7 @@ mod tests {
             &tx,
             &mut auth_token,
             None,
+            ConnectionScope::Local,
             user_context,
             op_rate_limiter,
             None, // no activity stamping in rate-limit unit tests
@@ -4151,6 +4438,7 @@ mod tests {
                 req,
                 auth_token: None,
                 origin_contract: None,
+                connection_scope: ConnectionScope::Local,
                 user_context: None,
                 api_version: ApiVersion::V1,
             })
@@ -4177,5 +4465,43 @@ mod tests {
                 "expected a SubscriptionChannel callback for the delegate request, got {other:?}"
             ),
         }
+    }
+
+    /// GHSA-824h-7x5x-wfmf: the connection's scope must be captured in
+    /// `connection_info`, from the kernel-observed peer address.
+    ///
+    /// It cannot be captured in `websocket_commands`'s `on_upgrade` closure —
+    /// that closure takes no extractor, so `ConnectInfo` is not reachable from
+    /// it. A refactor that "simplifies" this by moving the classification down
+    /// into the upgrade path would have nothing to classify FROM and would have
+    /// to invent a default, which is exactly how a fail-open default gets
+    /// introduced. Pin the placement and the input.
+    #[test]
+    fn connection_scope_is_classified_in_connection_info_from_the_peer_address() {
+        let src = include_str!("websocket.rs");
+        let body = src
+            .split("async fn connection_info(")
+            .nth(1)
+            .expect("connection_info must exist");
+        let body = body
+            .split("\nasync fn websocket_commands(")
+            .next()
+            .unwrap_or(body);
+        // Bound defensively in case the neighbouring fn is renamed.
+        let body = body
+            .split("\n#[allow(clippy::too_many_arguments)]")
+            .next()
+            .unwrap_or(body);
+
+        assert!(
+            body.contains("ConnectionScope::from_source_ip(source_ip)"),
+            "connection_info must classify the scope from the kernel-observed \
+             ConnectInfo peer address, not from a header or a default"
+        );
+        assert!(
+            body.contains("req.extensions_mut().insert(connection_scope);"),
+            "the classified scope must be injected as a request extension so the \
+             upgrade path can move it into the connection task"
+        );
     }
 }

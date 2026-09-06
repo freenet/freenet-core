@@ -1,7 +1,20 @@
 name: CI
 
 # Cost optimization strategy (Ubicloud runners ~$0.13/run):
-# 1. Skip CI entirely for docs-only changes (paths-ignore)
+# 1. Skip CI entirely for docs-only changes on PUSH TO MAIN only (paths-ignore).
+#    NOT on `pull_request` — see the `on:` block below and #5451. A
+#    workflow-level path filter is the one optimization that can make a PR
+#    permanently unmergeable, so it is confined to the trigger where no
+#    required check is at stake.
+#    This is a REAL cost increase, not a relocation: since #5571 a docs-only PR
+#    pays the full PR suite (Clippy on ubicloud-standard-8; Unit & Integration,
+#    Simulation and NAT Validation on ubicloud-standard-16; the macOS/Windows
+#    unit jobs) PLUS a paid Claude rule review, on top of the merge_group run it
+#    already paid. That was accepted because docs-only merges are rare (15 in
+#    the year to 2026-09-05) and the alternative — gating each expensive STEP on
+#    a changed-files check — is a large, subtle diff on required checks, where a
+#    mistake makes them pass unconditionally. If docs-only PRs ever become
+#    frequent, that step-level version is the right answer, with data behind it.
 # 2. Skip expensive jobs on main push — PR already validated
 # 3. Skip NAT validation for dependabot PRs — Test is sufficient for version bumps
 # 4. Run fast checks (Fmt, Clippy) in parallel for quick fail-fast
@@ -25,13 +38,25 @@ on:
       - 'LICENSE'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/FUNDING.yml'
+  # DO NOT add `paths-ignore:` (or `paths:`) here. Six of the eight required
+  # status contexts come from this workflow (Fmt, Clippy, Rule Lint, Unit &
+  # Integration, Simulation, NAT Validation). A workflow skipped by a path
+  # filter reports NOTHING, and GitHub treats a never-reported required context
+  # as "expected", not as satisfied — so the merge queue refuses entry forever.
+  # A docs-only PR was therefore structurally unmergeable; #5322 sat blocked
+  # from 2026-08-14 until #5571 removed this. The `merge_group:` trigger below
+  # does not rescue it: that only runs for a PR already ADMITTED to the queue.
+  #
+  # This was easy to miss because `*.md` does not match at depth in GitHub path
+  # filters, so a PR touching `.claude/rules/foo.md` always ran full CI and
+  # merged normally (#5375). It bit only a PR whose EVERY file matched one of
+  # the removed patterns — `docs/**`, a ROOT-level `*.md`, `LICENSE`,
+  # `.github/ISSUE_TEMPLATE/**` or `.github/FUNDING.yml`. A PR touching just
+  # `LICENSE`, or just an issue template, was equally stuck.
+  #
+  # Enforced by .github/scripts/check_required_check_path_filters.py, run from
+  # the Rule Lint job below.
   pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-      - 'LICENSE'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/FUNDING.yml'
   merge_group:
 
 # Cancel in-progress runs when a new commit is pushed to the same branch.
@@ -175,14 +200,126 @@ jobs:
       - name: Self-test release.yml merge-queue auto-merge
         run: bash scripts/release_mergequeue_test.sh
 
+      # Regression gate for #5170: a merge_group-triggered workflow whose
+      # concurrency group does not vary per queue entry makes each new entry
+      # cancel the previous entry's required check, so the older entry goes
+      # UNMERGEABLE and stalls the queue — invisibly, since the PR itself still
+      # reads CLEAN. Pins that the linter still fires on the exact key that
+      # shipped, that this repo satisfies the invariant, and that the linter is
+      # still wired into rule_lint.
+      - name: Self-test merge-queue concurrency guard
+        run: bash scripts/merge_group_concurrency_test.sh
+
+      # Regression gate for #5451: a `paths-ignore` on the pull-request trigger
+      # of a workflow that provides a required status context makes every PR the
+      # filter excludes permanently unmergeable — the context is never reported,
+      # and GitHub reads never-reported as "expected" rather than satisfied.
+      # #5322 sat blocked by exactly this from 2026-08-14 until #5571. Pins that
+      # the linter still fires on the real pre-fix `on:` blocks (which #5571
+      # deletes from the repo, so nothing else records them), that it fires on
+      # the one-line flow form, that this repo satisfies both halves of the
+      # invariant, and that the linter is still wired into rule_lint with its
+      # coverage half enabled.
+      - name: Self-test required-check path-filter guard
+        run: bash scripts/required_check_path_filters_test.sh
+
+      # Regression gate for the release driver's cross-compile wait: under
+      # `set -euo pipefail` a bare `var=$(gh ...)` aborts the whole driver on a
+      # transient GitHub blip, AFTER the release publishes but BEFORE the
+      # gateways are updated and the release is announced. Pins that a failing
+      # `gh` makes the poll loop retry, while a genuinely failed attach job and
+      # an unknown publish gate still stop the release loudly.
+      - name: Self-test release wait_for_binaries gh resilience
+        run: bash scripts/release_wait_for_binaries_test.sh
+
+      # Release-driver RESUME state. Two regressions, both of the shape where a
+      # resumed release is wrong in a way the operator cannot see: the v0.2.42
+      # FDEV_VERSION double-bump, and the CRATES_PUBLISHED flag being set on
+      # `freenet` alone (which makes `publish_crates`'s early return skip the
+      # per-crate branch and strand `fdev` after a partial publish, while the
+      # driver reports success).
+      #
+      # NOTE this file EXISTED and PASSED for a long time without ever being
+      # run here -- it was referenced only in a comment further down, so it was
+      # scored by the assertion counter and executed by nothing. A test that
+      # does not run is not a gate, which is the same class of defect as the
+      # assertions it now protects.
+      - name: Self-test release driver resume state
+        run: bash scripts/release_state_restore_test.sh
+
+      # BEHAVIOURAL cover for release.sh, as distinct from the source pins in
+      # release_canary_wiring_test.sh. Two mutations defeated those pins while
+      # leaving their text intact: an unreachable fdev branch (the `cargo
+      # publish -p fdev` line still present, so the source scan's floor was
+      # satisfied, while fdev was stranded on EVERY release) and a second
+      # `publish_crates` call in a conditional form before the tag (the bare
+      # call still matching `^publish_crates$`). Both are properties, not
+      # patterns, so both are asserted by running the driver against stubs.
+      - name: Self-test release driver behaviour
+        run: bash scripts/release_driver_test.sh
+
+      # Pins the WIRING of the blocking pre-flight canary, which is what
+      # makes it a gate at all: it must run inside attach-to-release, after
+      # the assets upload, BEFORE the crates.io publish (the one irreversible
+      # step, moved here from release.yml so a blocked gate costs a deletable
+      # tag instead of a spent version number), and BEFORE
+      # `gh release edit --draft=false`, and
+      # not be disabled in place. Also pins release.sh's ATTACH_JOB_NAME
+      # against the job's name in cross-compile.yml -- the driver polls for
+      # that string and a rename on either side is otherwise silent.
+      - name: Self-test release canary wiring
+        run: bash scripts/release_canary_wiring_test.sh
+
+      # Regression gate for #5221/#5222: auto-update was broken fleet-wide for
+      # TWO releases (v0.2.120, v0.2.121) and nothing noticed, because every
+      # signal was one-sided — the release built, published, installed and ran.
+      # scripts/auto-update-canary.sh is the release canary that catches it;
+      # this pins its two-sided assertion. The load-bearing cases are the
+      # VACUOUS ones: a log with no update check, and a node running with
+      # auto-update disabled, both contain no error line and would sail past a
+      # "grep for the error" check. Fixtures are verbatim log lines from real
+      # v0.2.119 (healthy) and v0.2.121 (broken) runs.
+      - name: Self-test auto-update release canary
+        run: bash scripts/auto-update-canary_test.sh
+
+      # Lifecycle half of the same canary: drives the real `run_node_until_check`
+      # and `cmd_preflight` against a FAKE node binary. The pure test above
+      # cannot see process management, and that is where the two real bugs were
+      # — a gate that failed even a healthy binary, and a node left running
+      # after the gate returned (holding its ports, starving the next attempt).
+      # Case 4 is the load-bearing one: reintroduce the leak and it fails.
+      - name: Self-test auto-update canary lifecycle
+        run: bash scripts/auto-update-canary_lifecycle_test.sh
+
+      # Guards the shell-assertion counter further down THIS file. That
+      # alternation has been wrong three times and nothing in the repo
+      # exercised it, so each miss was found by a human noticing a wrong
+      # number. It fails in the rejecting direction: an under-counting lint
+      # turns away a fix: PR that does have a regression test, and the cheapest
+      # response for the author is to reshape a good test until the grep likes
+      # it. The test extracts the live regex rather than copying it.
+      - name: Self-test Rule Lint shell-assertion counter
+        run: bash scripts/rule_lint_shell_assertion_counter_test.sh
+
       # install.sh now sets up a supervised service by default (issue #4073) so
       # new nodes auto-update. The system-vs-user + lingering decision is the
       # load-bearing new logic; these smoke tests pin it without needing real
       # root/sudo. shellcheck guards the installer/uninstaller scripts too.
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # The canary scripts are linted here too. They were claimed shellcheck
+      # clean when they landed but were not actually in this list, so nothing
+      # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh
+        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh
+      # The PR-backlog sweep reports stalled PRs (see
+      # .github/workflows/pr-backlog-sweep.yml). Its self-test drives the ABORT
+      # paths -- failed query, empty listing the REST probe contradicts,
+      # truncated page -- which a healthy scheduled run never touches and which
+      # are the only thing standing between "nothing is stalled" and "the sweep
+      # is broken" looking identical.
+      - name: Self-test PR backlog sweep
+        run: bash scripts/pr-backlog-sweep_test.sh
       - name: Self-test install.sh service-mode decision
         run: sh scripts/test-install-sh.sh
       - name: Self-test uninstall.sh
@@ -262,6 +399,26 @@ jobs:
       # uses (must NOT flag, including the #4616 moved-test-module case).
       - name: Rules #1/#2/#3 linter self-test
         run: python3 .github/scripts/check_banned_patterns.py --self-test
+
+      # Self-test the merge-queue concurrency linter, then run it. Unlike the
+      # linters above this one is NOT diff-scoped — the invariant is a property
+      # of each workflow file as it stands, and checking all of them is cheap.
+      - name: Merge-queue concurrency linter self-test
+        run: python3 .github/scripts/check_merge_group_concurrency.py --self-test
+
+      - name: Check merge_group workflows vary their concurrency group
+        run: python3 .github/scripts/check_merge_group_concurrency.py .github/workflows
+
+      # Self-test the required-check path-filter linter, then run it. Like the
+      # concurrency linter above it is NOT diff-scoped — the invariant is a
+      # property of each workflow file as it stands. Guards #5451: a workflow
+      # skipped by a path filter reports NOTHING, and a required context that
+      # never reports is "expected" forever, so the merge queue refuses entry.
+      - name: Required-check path-filter linter self-test
+        run: python3 .github/scripts/check_required_check_path_filters.py --self-test
+
+      - name: Check required-check workflows carry no PR path filter
+        run: python3 .github/scripts/check_required_check_path_filters.py .github/workflows
 
       - name: Check for banned patterns in new code
         env:
@@ -353,22 +510,153 @@ jobs:
 
           if [ "$IS_FIX" -gt 0 ] && [ "$HAS_EXEMPT_LABEL" -eq 0 ]; then
             NEW_TESTS=$(echo "$ALL_ADDED_STRIPPED" | grep -cE "$TEST_ATTR_RE" || true)
-            # Some fixes are to shell tooling (e.g. scripts/release-agent/*.sh),
-            # whose regression tests are shell *_test.sh self-tests run in CI,
-            # not Rust #[test]s. Count added assertion lines (`check ...`) in
-            # added *_test.sh files so such fixes aren't forced to claim
-            # test-exempt. Without this, a genuine shell regression test scores
-            # zero against TEST_ATTR_RE (Rust-only) and the fix is wrongly
-            # rejected — the gap that hid the announce-to-river fix's own test.
-            NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' \
+            # Some fixes are to shell tooling, whose regression tests are shell
+            # *_test.sh self-tests, not Rust #[test]s. Without this they score
+            # zero against TEST_ATTR_RE and the fix is wrongly rejected — the gap
+            # that hid the announce-to-river fix's own test.
+            #
+            # WHAT THIS RECOGNISES, precisely: the SUCCESS-REPORTING LINE of an
+            # assertion, by prefix. Not assertions. A decorative
+            # `echo "ok - looks fine"` satisfies it, and so did `ok "..."` and a
+            # self-comparing `check "x" "a" "a"` before it was widened. What
+            # stops a decorative test is review and mutation-testing, not this
+            # grep; widening only adds spellings.
+            #
+            # The alternation was widened three times, each time stopping at the
+            # file in front of whoever was editing. It is now derived from an
+            # ENUMERATION of every `*_test.sh` in the repo rather than from the
+            # file at hand: `check` (6 files), `ok`/`bad` (lifecycle), `pass`
+            # (3 files), `expect`
+            # (rule_lint_shell_assertion_counter_test.sh), `echo "ok   - "`
+            # (all sites use that exact separator, so anchoring on it costs
+            # nothing while rejecting `echo "okay, starting"`), and
+            # `echo "PASS [...]"` (release_state_restore_test.sh). Both quote
+            # styles. `expect` is safe as a bare name only because nothing in
+            # `scripts/` drives the TCL `expect(1)`; check that before assuming
+            # it stays safe.
+            #
+            # RE-RUN THE ENUMERATION AFTER ADDING A TEST FILE, not just before
+            # adding a pattern. The commit that introduced
+            # `rule_lint_shell_assertion_counter_test.sh` -- the file whose
+            # whole job is to stop this counter under-counting -- wrote its 26
+            # assertions as bare `expect 1 ...` calls, which scored ZERO. The
+            # blind spot was reintroduced by the fix for it, in the same PR,
+            # and was caught by re-measuring rather than by reading.
+            #
+            # THE BARE-NAME FORMS ABOVE ARE NOT THE WHOLE VOCABULARY, and for a
+            # while this counter behaved as if they were. `[[:space:]]`
+            # immediately after `(check|ok|pass)` requires the helper's name to
+            # END there, so every underscore-suffixed helper scored zero:
+            # `gate_b_arm_case`, `version_ge_case`, `trigger_case`,
+            # `norm_case`, `timeout_guard_case`, `pin_marker`,
+            # `pin_warn_literal`, `check_vs_expected`, `check_call_count`,
+            # `check_fallback`, `test_restores_persisted_value`. Measured
+            # every `*_test.sh` in the repo at the time: the original form saw
+            # roughly three quarters of the assertion call sites and missed the
+            # rest, almost all of them in `auto-update-canary_test.sh`, whose
+            # parameterised cases are written almost entirely in that style. The
+            # patterns added below (a `check_`/`pin_`/`assert_`/`expect_`/`test_`
+            # prefix, a `_case` suffix, and bare `expect`) closed the gap with no
+            # false positives.
+            #
+            # NO EXACT FIGURES HERE ON PURPOSE. Three counts in this comment went
+            # stale inside this very PR, because every commit that adds an
+            # assertion moves them, and a number in a justification is the kind
+            # of sentence that tells the next reader to stop checking.
+            # `rule_lint_shell_assertion_counter_test.sh` RECOMPUTES the property
+            # that actually matters -- that no `*_test.sh` is invisible to this
+            # counter -- on every CI run, and fails naming the files. Definitions do not match either pattern (`foo() {` has no
+            # whitespace where the name ends), so declaring a helper still
+            # scores nothing, which is right.
+            #
+            # KNOWN FALSE NEGATIVES, left in rather than chased. All three are
+            # real in this repo today:
+            #   1. `printf`-style success reporting -- but ONLY the reporter's
+            #      DEFINITION line. An earlier version of this comment DELETED
+            #      this entry, on the stated ground that
+            #      `grep -rnE "printf .*['\"](ok|PASS)"` over scripts/ returned
+            #      nothing. It returns two:
+            #      `scripts/test-install-sh.sh` and `scripts/test-uninstall-sh.sh`,
+            #      both `pass() { printf 'PASS  %s\\n' "$1"; }`.
+            #      Those two files used to escape this counter entirely, because
+            #      the diff above was scoped to `**/*_test.sh` and they are named
+            #      `test-*.sh` -- a naming accident, not the absence of the
+            #      convention. `'scripts/test-*.sh'` above closes that; PR #4958
+            #      was rejected by this gate for having no test while adding ten
+            #      `check_eq` assertions to `test-install-sh.sh`, which this job
+            #      RUNS.
+            #      SCOPED to `scripts/` rather than `'**/test-*.sh'`: `*` crosses
+            #      `/` in a git pathspec, so the unscoped form ALSO matches
+            #      `docker/test-runner/entrypoint.sh` and `.../run.sh` -- docker
+            #      plumbing, not tests, and outside the self-test's `find`, so
+            #      nothing would audit them. A `fix:` PR adding a plausible
+            #      `check_image_exists` line to a docker wrapper would then
+            #      satisfy this gate with no test at all.
+            #      What remains a blind spot is narrower than it looks, and was
+            #      measured rather than assumed: their `pass "..."` and
+            #      `check_eq "..."` CALL SITES both score (via the `pass` and
+            #      `check_`-prefix alternatives), so neither file is invisible.
+            #      Only `pass() { printf ... }` itself scores zero -- which is
+            #      correct, since declaring a helper is not adding a test.
+            #      `rule_lint_shell_assertion_counter_test.sh` RECOMPUTES this
+            #      rather than trusting the sentence.
+            #   2. An assertion whose only added line is its FAIL branch.
+            #      Deliberate: counting FAIL would let a PR score by adding an
+            #      error message alone.
+            #   3. A new entry in a TABLE an existing assertion loops over.
+            #      `SIGPIPE_SCRIPTS=(...)` in auto-update-canary_test.sh is the
+            #      live instance. Adding a file there genuinely extends what is
+            #      audited, and the added line is a bare string.
+            # The error text below tells the contributor all three.
+            NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' 'scripts/test-*.sh' \
               | grep -E '^\+' | grep -vF '+++' \
-              | grep -cE '^\+[[:space:]]*check[[:space:]]' || true)
-            if [ "$NEW_TESTS" -eq 0 ] && [ "$NEW_SHELL_TESTS" -eq 0 ]; then
+              | grep -cE '^\+[[:space:]]*(check|ok|pass|expect)[[:space:]]|^\+[[:space:]]*echo[[:space:]]+["'"'"'](ok[[:space:]]+-|PASS[[:space:]])|^\+[[:space:]]*(check|pin|assert|expect|test)_[a-z0-9_]*([[:space:]]|$)|^\+[[:space:]]*[a-z_][a-z0-9_]*_case[[:space:]]' || true)
+            # Browser-asset fixes have the SAME problem the shell escape hatch
+            # above exists for, and it bit this check the first time a
+            # dashboard fix reached it. The regression tests for
+            # `crates/core/src/server/**/assets/**` are Node `*.test.mjs` and
+            # Playwright `*.spec.ts` — they are never Rust `#[test]`s, because
+            # the code under test is JavaScript the Rust suite cannot execute.
+            # Without this a `fix:` PR carrying real, mutation-tested browser
+            # coverage scores zero and is rejected.
+            #
+            # VOCABULARY IS ENUMERATED, not guessed from the file in front of
+            # me — the comment above records that guessing is how the shell
+            # counter under-counted three times. Measured across all 17
+            # `*.test.mjs` / `*.spec.ts` in the repo at time of writing:
+            # `check` (213 call sites), `expect` (175), `test` (43), `ok` (25,
+            # update_check.test.mjs), `eq` (9, table_filter.test.mjs). Both
+            # `await expect(...)` and bare `expect(...)` occur, hence the
+            # optional `await`.
+            #
+            # RE-RUN THAT ENUMERATION when adding a test file in a new style,
+            # rather than assuming these five names are the whole vocabulary.
+            #
+            # Same known weakness as the shell counter, stated rather than
+            # implied: this counts an assertion's CALL SITE, so a decorative
+            # `test("x", () => {})` satisfies it. What stops a decorative test
+            # is review and mutation-testing, not this grep.
+            NEW_JS_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*.test.mjs' '**/*.spec.ts' \
+              | grep -E '^\+' | grep -vF '+++' \
+              | grep -cE '^\+[[:space:]]*(await[[:space:]]+)?(check|expect|test|ok|eq)[[:space:]]*\(' || true)
+            if [ "$NEW_TESTS" -eq 0 ] && [ "$NEW_SHELL_TESTS" -eq 0 ] && [ "$NEW_JS_TESTS" -eq 0 ]; then
               ERRORS="$ERRORS
           ERROR: fix: PR must include at least one new regression test
           Add a test that reproduces the bug (fails without fix, passes with fix).
-          A Rust #[test]/#[tokio::test]/etc. or an added 'check' assertion in a
-          *_test.sh self-test both satisfy this.
+          Either satisfies this:
+            - a Rust #[test] / #[tokio::test] / etc.
+            - an added assertion in a Node *.test.mjs or Playwright *.spec.ts:
+              'check(...)', 'expect(...)', 'test(...)', 'ok(...)' or 'eq(...)'.
+              Browser-asset fixes have no Rust test to add — the Rust suite
+              cannot execute the JavaScript it serves.
+            - an added assertion in a *_test.sh self-test, written with any of the
+              conventions those files use: 'check ...', 'ok ...', 'pass ...',
+              'expect ...', a 'check_'/'pin_'/'assert_'/'expect_'/'test_'-prefixed helper, a
+              '*_case ...' helper, 'echo \"ok   - ...\"' or 'echo \"PASS ...\"'.
+              Known blind spots: an assertion whose only added line is its FAIL
+              branch, and a new entry in a table an existing assertion loops over
+              (e.g. SIGPIPE_SCRIPTS). If you have a real test the counter cannot
+              see, say so on the PR rather than reshaping the test to please this grep.
           If this fix genuinely cannot have a test, add the 'test-exempt' label with a justification comment."
             fi
           fi
@@ -389,7 +677,13 @@ jobs:
   clippy_check:
     name: Clippy
     runs-on: ubicloud-standard-8
-    timeout-minutes: 15
+    # Raised from 15 for the two added all-targets steps, which compile the test
+    # and bench targets the other steps skip. Measured on a warm
+    # `Swatinem/rust-cache` hit: 46s + 41s + 2m09s = 4m26s for the job with one
+    # all-targets step, so the headroom is not for the warm case -- it is for a
+    # cold cache, where the first step absorbs the full dependency build and the
+    # later steps each add an incremental pass on top.
+    timeout-minutes: 30
     # No dependencies - runs immediately in parallel with fmt_check
 
     env:
@@ -412,11 +706,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # `--all-targets` (= --lib --bins --tests --benches --examples) is a strict
+      # superset of the lib+bins this used to check, and it is what brings
+      # `cfg(test)` code under the gate. See the block below the trace-ot step for
+      # why that matters and what it still does not reach.
       - name: clippy
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
-        run: cargo clippy --locked -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       # Guards the opt-in `trace-ot` OpenTelemetry feature against silent
       # rot: it is excluded from the default build, so a refactor can break
@@ -427,6 +725,51 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: cargo clippy --locked -p freenet --features trace-ot -- -D warnings
+
+      # Until #5292 the clippy gate compiled neither `cfg(test)` code nor the
+      # bench targets, so every lint in a `mod tests` or a `benches/` file was
+      # unguarded. That was not hypothetical: the surface had rotted badly,
+      # including a bench that had not compiled since `PeerConnection::send`
+      # started returning `Result<usize>`, and several tests that discarded a
+      # `Result` carrying the test's own premise and so passed vacuously. #5279
+      # (643ee5d35) is the cleanup and records the measured counts; not repeated
+      # here, because this file outlives those numbers.
+      #
+      # A cleanup only holds if something can turn red when it regresses. Within
+      # one commit of that cleanup landing, #5269 reintroduced a denied lint in
+      # test code and every CI job stayed green.
+      #
+      # BOTH feature positions are needed, and this is the counterintuitive part:
+      # `--all-features` is NOT a maximal build. It does not subsume default
+      # features -- it CONTRADICTS them wherever code is
+      # `cfg(not(feature = ...))`, because turning a feature ON deletes its
+      # negated block. `broadcast_queue.rs` puts `mod queue` behind
+      # `cfg(not(feature = "simulation_tests"))`, so the all-features run
+      # cfg-deletes that module including the ~1,690 lines of `#[cfg(test)]`
+      # inside it -- which is where six discards of this very lint class were
+      # found. The default-features run above is the only thing that reaches
+      # them. Every negation-gated feature except `redb` is default-OFF, so that
+      # one run covers all of their negations at once (`simulation_tests`,
+      # `trace-ot`, `bench`).
+      #
+      # Conversely this step is the ONLY gate on the bench targets, which declare
+      # `required-features = ["bench"]` and so build under no other invocation,
+      # and on non-default-feature code (`sqlite`, `console-subscriber`,
+      # `test-network`, `jemalloc-prof`, `nightly_tests`). Do not "simplify" the
+      # two into one; neither subsumes the other.
+      #
+      # KNOWN GAP, not closed here: `redb` is default-ON, so the ~16
+      # `cfg(not(feature = "redb"))` / `cfg(all(feature = "sqlite",
+      # not(feature = "redb")))` sites are compiled by NO invocation in this
+      # workflow. Closing that needs `--no-default-features --features sqlite`,
+      # which does not build today (see the note at hosting.rs:5469, a
+      # pre-existing gap unrelated to this change).
+      #
+      - name: clippy (all targets, all features)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   # Windows compile check - catches missing imports, feature flags, and
   # platform-specific errors that Linux CI misses. Added after #3685 where
@@ -491,12 +834,84 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-        if: success() || steps.test.conclusion == 'failure'
+        # No `if:` here on purpose. This used to read
+        # `success() || steps.test.conclusion == 'failure'`, intending to save the
+        # cache even when tests failed -- but no step declares `id: test`, so
+        # `steps.test.conclusion` resolved to null and the whole condition
+        # collapsed to `success()`, the step default. A step `if:` also could not
+        # express that intent from HERE regardless, because this step runs BEFORE
+        # the tests; the save happens in this action's post hook.
+        #
+        # If you do want the cache saved after a failing test run, the supported
+        # way is this action's own `cache-on-failure: true` input ("Cache even if
+        # the build fails"), which its post hook honours -- NOT a resurrected
+        # `if:` here, and NOT a separate step.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # nextest is installed by the maintained action on every platform, NOT by
+      # a hand-rolled download. Worth not undoing: on 2026-08-12 the one-liners
+      # this replaced failed four times across four PRs and BOTH platforms
+      # within ~78 minutes, blocking the merge queue -- `curl: (56) Connection
+      # died` on Linux, `The response ended prematurely` from Invoke-WebRequest
+      # on Windows.
+      #
+      # WHAT THE LINUX SIGNATURE ACTUALLY MEANS. Two earlier versions of this
+      # comment got this wrong in opposite directions, so it is written from the
+      # emitting source rather than from inference. `Connection died, tried 5
+      # times before giving up` has exactly one emission site in libcurl,
+      # `Curl_retry_request()` in lib/transfer.c, and BOTH of its trigger
+      # branches are guarded by `bytecount + headerbytecount == 0` -- ZERO bytes
+      # received, headers included. So it is not a truncated transfer; it is
+      # "nothing arrived at all", from either a reused pooled connection the
+      # peer had already closed (branch 1) or an HTTP/2 REFUSED_STREAM (branch
+      # 2). The "5 times" is `#define CONN_MAX_RETRIES 5`, libcurl-internal, and
+      # unrelated to any `--retry` value.
+      #
+      # WHICH HOST IS AT FAULT IS NOT ESTABLISHED, and this comment deliberately
+      # does not claim one. Branch 2 needs no connection reuse, and get.nexte.st
+      # is served over HTTP/2, so the fault can occur on the redirector leg; it
+      # can equally occur on the shared asset leg
+      # (release-assets.githubusercontent.com), which BOTH the old and new paths
+      # traverse. What can be said is narrower: the new path removes one of the
+      # two hosts where this signature can arise. Do not upgrade that into
+      # "changed hosts, fixed it", and do not invert it into "the redirector was
+      # irrelevant" -- this comment has already been wrong both ways.
+      #
+      # The durable win is what WRAPS the download, and it is exactly the right
+      # response to a zero-bytes-on-connection fault: `retry curl --retry 10`
+      # inside a 10-iteration backoff loop (main.sh), plus a SHA256 checksum
+      # verified against the hash in the action's pinned manifest. NONE of the
+      # seven forms this replaced had any retry flag, and none verified what it
+      # extracted into $CARGO_HOME/bin before the next step executed it. On
+      # Windows the consequence was worst, because a single failure lost a
+      # ~34-minute job.
+      #
+      # `fallback: none` is deliberate: it keeps GITHUB_TOKEN out of the
+      # action's environment (action.yml only populates DEFAULT_GITHUB_TOKEN
+      # when fallback == 'cargo-binstall'). It costs nothing, because the
+      # fallback is unreachable for this tool anyway -- it is entered only when
+      # the manifest lacks the tool or the version/platform, never on a network
+      # or checksum failure, which `bail` under `set -e`.
+      #
+      # timeout-minutes bounds that retry budget: 11 attempts x curl --retry 10
+      # with no --retry-max-time can exceed any job budget here, and would be
+      # reported as a job timeout rather than as a failed download. Measured
+      # install time at this head is 1-2s, and 4s on Windows, so the 5-minute
+      # cap is ~75x headroom rather than a tight bound. (A step killed by
+      # timeout-minutes concludes `failure`, not `cancelled`, so the gates below
+      # skip and the job goes red -- which is the intended outcome. Note
+      # actions/runner#2432: step timeouts may be best-effort on Windows.)
+      #
+      # There are seven of these across ci.yml, playwright-shell.yml and
+      # simulation-nightly.yml; the others point here. See #5296.
       - name: Install nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: taiki-e/install-action@v2
+        id: install-nextest
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
 
       - name: Build
         env:
@@ -540,7 +955,13 @@ jobs:
             --profile ci -E 'not test(blocked_peers)'
 
       - name: Test blocked-peers (serial)
-        if: ${{ !cancelled() }}
+        # `!cancelled()` deliberately keeps this running after an earlier
+        # TEST failure, so a red test does not hide the rest of the suite.
+        # But it also ran after an INSTALL failure, where it died with
+        # `error: no such command: nextest` -- so the red check named this
+        # step, and a reader saw a plausible test regression instead of a
+        # tool-acquisition problem. Require the install to have succeeded.
+        if: ${{ !cancelled() && steps.install-nextest.conclusion == 'success' }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -553,7 +974,13 @@ jobs:
             -E 'test(blocked_peers)' -j 1
 
       - name: Test ping-types
-        if: ${{ !cancelled() }}
+        # `!cancelled()` deliberately keeps this running after an earlier
+        # TEST failure, so a red test does not hide the rest of the suite.
+        # But it also ran after an INSTALL failure, where it died with
+        # `error: no such command: nextest` -- so the red check named this
+        # step, and a reader saw a plausible test regression instead of a
+        # tool-acquisition problem. Require the install to have succeeded.
+        if: ${{ !cancelled() && steps.install-nextest.conclusion == 'success' }}
         # freenet-ping-types tests need the std feature (default).
         # Run separately since the main step uses --no-default-features.
         run: cargo nextest run -p freenet-ping-types --profile ci
@@ -585,12 +1012,89 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-        if: success() || steps.test.conclusion == 'failure'
+        # No `if:` here on purpose. This used to read
+        # `success() || steps.test.conclusion == 'failure'`, intending to save the
+        # cache even when tests failed -- but no step declares `id: test`, so
+        # `steps.test.conclusion` resolved to null and the whole condition
+        # collapsed to `success()`, the step default. A step `if:` also could not
+        # express that intent from HERE regardless, because this step runs BEFORE
+        # the tests; the save happens in this action's post hook.
+        #
+        # If you do want the cache saved after a failing test run, the supported
+        # way is this action's own `cache-on-failure: true` input ("Cache even if
+        # the build fails"), which its post hook honours -- NOT a resurrected
+        # `if:` here, and NOT a separate step.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
       - name: Install nextest
-        run: curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: taiki-e/install-action@v2
+        id: install-nextest
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
+
+      - name: Build freenet bin
+        run: cargo build --locked -p freenet --bin freenet
+
+      - name: Test service commands
+        run: cargo nextest run -p freenet --bin freenet --profile ci -E 'test(commands::service)'
+
+  # Windows unit tests for the wrapper's Windows-only code paths (named-mutex
+  # single-instance guard, process classification, etc). `windows_check` above
+  # only `cargo check`s — compilation is not verification of a `#[cfg(target_os
+  # = "windows")]` path (see .claude/rules/deployment.md) — so without this job
+  # the Windows-specific tests in commands::service would never actually run.
+  # Added alongside the #5132 fix (Windows wrapper had no single-instance
+  # guard at all), mirroring macos_unit above.
+  windows_unit:
+    name: Windows Service Unit
+    runs-on: windows-latest
+    # This job is new (introduced alongside the #5132 fix), so unlike
+    # macos_unit/windows_check it has no warm Swatinem cache from prior
+    # main-branch runs yet — a stone-cold Windows compile of the full
+    # freenet bin + test harness (wasmtime, tao, tray-icon, criterion,
+    # proptest, ...) does not finish in 30 minutes. 60 minutes gives this
+    # one-time cold start headroom; revisit downward once main has run
+    # this job at least once (cache only saves on `github.ref ==
+    # refs/heads/main`, see the cache step below).
+    timeout-minutes: 60
+    needs: fmt_check
+    # Same skip conditions as test_unit (see test_unit comment for details).
+    if: |
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+      !startsWith(github.head_ref, 'release/v')
+
+    env:
+      RUST_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Increase rustc stack size to prevent SIGSEGV during compilation
+      # 256MB required for LLVM optimization passes on large workspaces (rustc suggests this value)
+      RUST_MIN_STACK: 268435456
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        id: install-nextest
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
 
       - name: Build freenet bin
         run: cargo build --locked -p freenet --bin freenet
@@ -656,9 +1160,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.skip_check.outputs.skip != 'true'
 
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
       - name: Install nextest
+        uses: taiki-e/install-action@v2
+        id: install-nextest
         if: steps.skip_check.outputs.skip != 'true'
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
 
       # Build the simulation test binaries and fdev up-front in one cargo
       # invocation so they share a single compile of freenet/deps. Then the
@@ -905,9 +1416,16 @@ jobs:
         if: steps.skip_check.outputs.skip != 'true'
         run: docker pull alpine:latest
 
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
       - name: Install nextest
+        uses: taiki-e/install-action@v2
+        id: install-nextest
         if: steps.skip_check.outputs.skip != 'true'
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
 
       - name: Build
         if: steps.skip_check.outputs.skip != 'true'

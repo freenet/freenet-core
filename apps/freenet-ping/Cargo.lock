@@ -1696,7 +1696,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.2.100"
+version = "0.2.106"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1724,7 +1724,7 @@ dependencies = [
  "event-listener",
  "flatbuffers 25.12.19",
  "flate2",
- "freenet-stdlib 0.8.2",
+ "freenet-stdlib 0.8.4",
  "futures",
  "headers",
  "hex",
@@ -1815,7 +1815,7 @@ dependencies = [
  "clap",
  "freenet",
  "freenet-ping-types",
- "freenet-stdlib 0.8.2",
+ "freenet-stdlib 0.8.4",
  "freenet-test-network",
  "futures",
  "rand 0.9.3",
@@ -1835,7 +1835,7 @@ name = "freenet-ping-contract"
 version = "0.1.11"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib 0.8.2",
+ "freenet-stdlib 0.8.4",
  "serde_json",
 ]
 
@@ -1845,7 +1845,7 @@ version = "0.1.11"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib 0.8.2",
+ "freenet-stdlib 0.8.4",
  "humantime",
  "humantime-serde",
  "serde",
@@ -1882,9 +1882,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.8.2"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6014c3b45cbd33a81a779d4c9b8b8e676716bf302ccf9589d10ba8371aeaa63"
+checksum = "ffa7063130085b2319850c4407b6ae76de7b5a38cdd12e36a4684ff562cd1ceb"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -2152,11 +2152,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -2166,11 +2164,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -4292,14 +4292,15 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
 dependencies = [
  "bytes",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "lru-slab",
- "rand 0.9.3",
+ "rand 0.10.1",
+ "rand_pcg",
  "ring",
  "rustc-hash",
  "rustls",
@@ -4430,6 +4431,15 @@ checksum = "6a8615d50dcf34fa31f7ab52692afec947c4dd0ab803cc87cb3b0b4570ff7463"
 dependencies = [
  "num-traits",
  "rand 0.9.3",
+]
+
+[[package]]
+name = "rand_pcg"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core 0.10.1",
 ]
 
 [[package]]

@@ -574,6 +574,35 @@ impl LogFile {
         }
     }
 
+    /// Append an encoded batch to the active segment.
+    ///
+    /// Deliberately does NOT `fsync`. The event log is a local diagnostic
+    /// record, not authoritative state: nothing in the node reads it back to
+    /// make decisions, and losing the last few records to a power cut costs
+    /// nothing. A per-batch `sync_all()` (data *and* metadata) used to run here,
+    /// and because an append also changes the file size it forced a full
+    /// filesystem journal commit every `BATCH_SIZE` (5) events. Measured on a
+    /// live 0.2.111 peer that was 95% of ALL fsyncs the process issued and the
+    /// dominant source of a 4-6x write amplification, turning ~61 MiB/hour of
+    /// logical appends into hundreds of MiB/hour of real disk writes.
+    ///
+    /// Durability that actually matters is preserved elsewhere:
+    /// [`Self::rotate_segment`] still fsyncs the active segment before closing
+    /// it, so a completed segment is on disk before the next one opens, and
+    /// [`Self::load_segment_records`] already truncates a torn tail at the last
+    /// good record offset on startup. Readers are unaffected either way —
+    /// `read_all_events` sees written bytes through the page cache immediately;
+    /// fsync is about surviving power loss, not visibility.
+    ///
+    /// It DOES still `flush`. That is not a durability barrier: `tokio::fs::File`
+    /// keeps an internal buffer and hands writes to a background pool, so
+    /// without an explicit flush the bytes may not reach the OS at all and a
+    /// reader (or `std::fs::metadata`) can observe a zero-length segment. The
+    /// flush issues the `write(2)`, putting the data in the page cache where
+    /// readers see it immediately; the kernel then writes it back on its own
+    /// schedule instead of one journal commit per five events.
+    ///
+    /// do NOT re-add a per-batch fsync here — see #4968.
     pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         let _guard = FILE_LOCK.lock().await;
         let file = self.file.as_mut().unwrap();
@@ -582,8 +611,8 @@ impl LogFile {
             return Err(err);
         }
 
-        if let Err(err) = file.get_mut().sync_all().await {
-            tracing::error!("Failed syncing event log: {err}");
+        if let Err(err) = file.get_mut().flush().await {
+            tracing::error!("Failed flushing event log: {err}");
             return Err(err);
         }
         Ok(())
@@ -606,6 +635,178 @@ impl LogFile {
 
         Ok(batch_serialized_data)
     }
+
+    /// Unlink every `<base>.NNNNNNNNNN` segment beside `base`, reporting what
+    /// was freed. The base file itself is never touched — only the segments
+    /// matching the exact grammar [`Self::scan_segment_indices`] accepts, so a
+    /// neighbouring `_EVENT_LOG.backup`, `_EVENT_LOG.0000000001.tmp` or
+    /// `_EVENT_LOG_LOCAL.0000000000` survives.
+    ///
+    /// Mechanism only: it deletes whatever it is pointed at. The decision of
+    /// *whether* a sweep is allowed lives in
+    /// [`reclaim_orphaned_event_log`], which is the only production caller.
+    ///
+    /// Nothing here is propagated as an error: this runs on the startup path,
+    /// and neither a segment we cannot remove (bad permissions, a stray
+    /// directory occupying the name, a Windows share lock) nor an unreadable
+    /// directory may stop the node from booting. Both are counted in
+    /// `failures` and logged, so a non-zero count means bytes may remain
+    /// rather than the problem being swallowed. `NotFound` on the unlink is
+    /// not a failure — the file being gone is the outcome we wanted.
+    fn reclaim_segments(base: &Path) -> EventLogReclaim {
+        let mut outcome = EventLogReclaim::default();
+        let indices = match Self::scan_segment_indices(base) {
+            Ok(indices) => indices,
+            Err(e) => {
+                tracing::warn!(
+                    base = %base.display(),
+                    error = %e,
+                    "could not scan for orphaned event-log segments; skipping reclaim"
+                );
+                outcome.failures += 1;
+                return outcome;
+            }
+        };
+        for idx in indices {
+            // `scan_segment_indices` matched a NAME and returned a parsed
+            // index; this rebuilds the name from that index. Safe only because
+            // the grammar it matches is exactly `SEGMENT_INDEX_DIGITS` ASCII
+            // digits and `segment_path` formats with the same width, so the
+            // round-trip is byte-for-byte. This is an unlink: if you ever
+            // loosen that grammar (accepting a `+` sign, a shorter index, or
+            // non-ASCII digits), carry the matched `OsString` through instead,
+            // or this deletes a DIFFERENT file from the one that matched.
+            let path = Self::segment_path(base, idx);
+            // Size before unlink: after a successful remove there is nothing
+            // left to stat. A stat failure only costs byte accuracy, so it
+            // must not skip the removal.
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    outcome.files_removed += 1;
+                    outcome.bytes_reclaimed += size;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    outcome.failures += 1;
+                    tracing::warn!(
+                        segment = %path.display(),
+                        error = %e,
+                        "failed to remove orphaned event-log segment; leaving it in place"
+                    );
+                }
+            }
+        }
+        outcome
+    }
+}
+
+/// What a single [`reclaim_orphaned_event_log`] sweep did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EventLogReclaim {
+    /// Segment files successfully unlinked.
+    pub files_removed: usize,
+    /// Bytes freed, summed from each removed segment's size before unlink.
+    pub bytes_reclaimed: u64,
+    /// Segments we tried and failed to unlink, plus one if the directory scan
+    /// itself failed (in which case nothing was attempted). Startup continues
+    /// regardless; counted rather than swallowed so a non-zero value says
+    /// bytes may still be sitting on disk.
+    pub failures: usize,
+}
+
+/// Delete `_EVENT_LOG` segments left behind by a node that used to write the
+/// diagnostic event log, when this node is not writing it (#5035).
+///
+/// #4968 flipped the log OFF by default in network mode, but nothing removed
+/// what earlier releases had already written: measured 2026-07-29, 224 MB /
+/// 23 files on a user peer (17% of its data dir) and 412 MB / 24 files on the
+/// nova gateway, last written the day 0.2.112 deployed.
+///
+/// No running node reads these segments back — the log is a purely local
+/// forensic record, and `freenet service report` does not include it (nothing
+/// under `bin/commands/` references `_EVENT_LOG`).
+///
+/// They are still *readable*, and by more than one tool. Every reader has to be
+/// aimed at a path by a human or a test, none of them selects `_EVENT_LOG` on
+/// its own, and that is the whole of the claim:
+///
+/// - `fdev verify-state --log-file <path>` takes an arbitrary path, and
+///   `--log-directory` walks a tree accepting any file name *containing*
+///   `EVENT_LOG` (`verify_state.rs`; only its directory branch is
+///   `_EVENT_LOG_LOCAL`-specific), so pointing it at a network node's data dir
+///   does pick these up.
+/// - `EventLogAggregator::from_aof_files` / `AOFEventSource::new` likewise take
+///   caller-supplied paths. Its in-tree caller is the test harness, which aims
+///   it at `_EVENT_LOG` deliberately (`test_utils.rs::event_log_path`).
+///
+/// So the claim this reclaim rests on is "nothing reads these on its own", NOT
+/// "no possible reader". Once the log is off, these bytes are only ever read by
+/// someone who goes looking for them on purpose.
+///
+/// That distinction is load-bearing, because the deletion is irreversible and
+/// happens on the first restart after the upgrade. An operator who wants to
+/// KEEP existing history must turn the log back on before restarting; leaving
+/// it off means the history goes. See the guards below.
+///
+/// Returns `None` when no sweep is permitted, `Some(outcome)` when one ran.
+/// The two guards:
+///
+/// - **The log must be disabled.** An operator who deliberately turned it on
+///   (`--enable-event-log`) keeps every segment; this is the guard that must
+///   never regress, because getting it wrong destroys forensic history that
+///   was asked for.
+/// - **Network mode only.** In Local mode `Config::event_log()` resolves to
+///   `_EVENT_LOG_LOCAL`, which `fdev verify-state` reads. Local mode defaults
+///   the log ON so the first guard usually covers it, but an explicit
+///   `--enable-event-log false` on a local node would otherwise sweep the very
+///   segments that tooling consumes.
+///
+/// One-shot in the normal case: after the first disabled startup there is
+/// nothing left to remove, and the node writes no new segments while the log
+/// is off. A segment that cannot be removed is the exception — it is retried,
+/// and reported, on every subsequent startup until it goes away.
+pub(crate) fn reclaim_orphaned_event_log(
+    config: &crate::config::Config,
+) -> Option<EventLogReclaim> {
+    if config.event_log_enabled() {
+        return None;
+    }
+    if !matches!(config.mode, crate::contract::OperationMode::Network) {
+        return None;
+    }
+
+    let base = config.event_log();
+    let outcome = LogFile::reclaim_segments(&base);
+
+    // Silent when there was nothing to do, which is every startup after the
+    // first. `info!` and not `debug!`: `debug!` compiles out in release, and
+    // the reclaim is exactly the kind of one-off disk change an operator needs
+    // to see in a release build's log.
+    //
+    // Split by outcome rather than logging one message for both: a sweep that
+    // removed nothing and only accumulated failures is not a reclaim, and
+    // saying "reclaimed ... files_removed=0" in that case reads as success at
+    // exactly the moment an operator needs to see that bytes are still there.
+    if outcome.files_removed > 0 {
+        tracing::info!(
+            files_removed = outcome.files_removed,
+            bytes_reclaimed = outcome.bytes_reclaimed,
+            failures = outcome.failures,
+            base = %base.display(),
+            "reclaimed orphaned event-log segments (the diagnostic event log is \
+             disabled on this node, so nothing reads them automatically)"
+        );
+    } else if outcome.failures > 0 {
+        tracing::warn!(
+            failures = outcome.failures,
+            base = %base.display(),
+            "could not reclaim any orphaned event-log segments; they may still \
+             be using disk. This is retried on every startup while the event \
+             log stays disabled"
+        );
+    }
+    Some(outcome)
 }
 
 #[cfg(test)]
@@ -621,6 +822,305 @@ mod tests {
 
     fn ensure_records_ts() {
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
+    }
+
+    // ----------------------------------------------------------------------
+    // #5035: reclaiming orphaned `_EVENT_LOG` segments once the log is off.
+    // ----------------------------------------------------------------------
+
+    /// Write `len` bytes to `path`, returning `len` so callers can accumulate
+    /// the exact byte total the reclaim is expected to report.
+    fn write_file(path: &Path, len: usize) -> u64 {
+        std::fs::write(path, vec![b'x'; len]).expect("write fixture file");
+        len as u64
+    }
+
+    fn exists(dir: &Path, name: &str) -> bool {
+        dir.join(name).exists()
+    }
+
+    /// Seed a data dir with three `_EVENT_LOG` segments plus a set of
+    /// near-miss names that share the prefix but not the grammar, and the
+    /// zero-length `_EVENT_LOG` base stub `ConfigPathsArgs::build` writes.
+    /// Returns the byte total of the three real segments.
+    fn seed_segments_and_decoys(dir: &Path) -> u64 {
+        let mut expected = 0;
+        expected += write_file(&dir.join("_EVENT_LOG.0000000000"), 1_000);
+        expected += write_file(&dir.join("_EVENT_LOG.0000000001"), 2_000);
+        expected += write_file(&dir.join("_EVENT_LOG.0000004294"), 4_000);
+
+        // Base stub: written unconditionally at config build, and the file the
+        // active log would append to. Never a reclaim target.
+        write_file(&dir.join("_EVENT_LOG"), 0);
+        // `fdev verify-state` reads these; the prefix matches but the grammar
+        // does not (`_EVENT_LOG` is followed by `_`, not `.`).
+        write_file(&dir.join("_EVENT_LOG_LOCAL"), 500);
+        write_file(&dir.join("_EVENT_LOG_LOCAL.0000000000"), 500);
+        // Operator/tooling files that merely start with the same prefix.
+        write_file(&dir.join("_EVENT_LOG.backup"), 500);
+        write_file(&dir.join("_EVENT_LOG.0000000001.tmp"), 500);
+        write_file(&dir.join("_EVENT_LOG_notes.txt"), 500);
+        // Right length, wrong alphabet.
+        write_file(&dir.join("_EVENT_LOG.00000000ab"), 500);
+        // Nine digits and eleven digits: off-by-one on either side.
+        write_file(&dir.join("_EVENT_LOG.000000001"), 500);
+        write_file(&dir.join("_EVENT_LOG.00000000012"), 500);
+        expected
+    }
+
+    fn assert_decoys_survive(dir: &Path) {
+        for name in [
+            "_EVENT_LOG",
+            "_EVENT_LOG_LOCAL",
+            "_EVENT_LOG_LOCAL.0000000000",
+            "_EVENT_LOG.backup",
+            "_EVENT_LOG.0000000001.tmp",
+            "_EVENT_LOG_notes.txt",
+            "_EVENT_LOG.00000000ab",
+            "_EVENT_LOG.000000001",
+            "_EVENT_LOG.00000000012",
+        ] {
+            assert!(
+                exists(dir, name),
+                "{name} does not match the `<base>.<10 digits>` segment grammar and \
+                 must survive the reclaim (#5035)"
+            );
+        }
+    }
+
+    /// The mechanism removes exactly the files matching the segment grammar,
+    /// and reports the byte total it actually removed.
+    #[test]
+    fn reclaim_segments_removes_only_exact_segment_names() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        let expected_bytes = seed_segments_and_decoys(dir);
+
+        let outcome = LogFile::reclaim_segments(&dir.join("_EVENT_LOG"));
+
+        assert_eq!(
+            outcome,
+            EventLogReclaim {
+                files_removed: 3,
+                bytes_reclaimed: expected_bytes,
+                failures: 0,
+            },
+            "the reported outcome must match the three seeded segments exactly"
+        );
+        for name in [
+            "_EVENT_LOG.0000000000",
+            "_EVENT_LOG.0000000001",
+            "_EVENT_LOG.0000004294",
+        ] {
+            assert!(!exists(dir, name), "{name} should have been reclaimed");
+        }
+        assert_decoys_survive(dir);
+    }
+
+    /// A segment we cannot unlink is counted, logged, and does not stop the
+    /// sweep or panic. A directory occupying a segment name makes
+    /// `remove_file` fail deterministically (`EISDIR`) on every platform and
+    /// regardless of whether the test runs as root, unlike a chmod.
+    #[test]
+    fn reclaim_segments_counts_failures_without_panicking() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        let removable = write_file(&dir.join("_EVENT_LOG.0000000000"), 1_000)
+            + write_file(&dir.join("_EVENT_LOG.0000000002"), 3_000);
+        std::fs::create_dir(dir.join("_EVENT_LOG.0000000001")).unwrap();
+
+        let outcome = LogFile::reclaim_segments(&dir.join("_EVENT_LOG"));
+
+        assert_eq!(
+            outcome,
+            EventLogReclaim {
+                files_removed: 2,
+                bytes_reclaimed: removable,
+                failures: 1,
+            },
+            "the unremovable segment must be counted as a failure while the other \
+             two are still reclaimed, and its bytes must not be reported as freed"
+        );
+        assert!(
+            exists(dir, "_EVENT_LOG.0000000001"),
+            "the unremovable entry must still be there"
+        );
+    }
+
+    /// Nothing on disk, nothing reported — and no error out of a data dir that
+    /// does not exist yet.
+    #[test]
+    fn reclaim_segments_reports_nothing_when_there_is_nothing_to_do() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            LogFile::reclaim_segments(&temp_dir.path().join("_EVENT_LOG")),
+            EventLogReclaim::default()
+        );
+        assert_eq!(
+            LogFile::reclaim_segments(&temp_dir.path().join("no-such-dir/_EVENT_LOG")),
+            EventLogReclaim::default(),
+            "a missing directory is not a failure"
+        );
+    }
+
+    async fn build_config(
+        dir: &Path,
+        mode: crate::contract::OperationMode,
+    ) -> crate::config::Config {
+        crate::config::event_log_test_args(dir, mode)
+            .build()
+            .await
+            .expect("build Config")
+    }
+
+    /// THE guard: an operator who deliberately enabled the event log keeps
+    /// every segment. Losing forensic history that was explicitly asked for is
+    /// the one failure mode this change must never have.
+    #[tokio::test]
+    async fn reclaim_refuses_while_the_event_log_is_enabled() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        let mut args =
+            crate::config::event_log_test_args(dir, crate::contract::OperationMode::Network);
+        args.enable_event_log = Some(true);
+        let config = args.build().await.expect("build Config");
+        // `ConfigPathsArgs::build` (inside `build()`) writes the `_EVENT_LOG`
+        // stub, so seed the segments after it, not before.
+        seed_segments_and_decoys(dir);
+        assert!(config.event_log_enabled(), "precondition: log is ON");
+
+        let decision = reclaim_orphaned_event_log(&config);
+
+        assert_eq!(
+            decision, None,
+            "with the log enabled the reclaim must decline to run at all"
+        );
+        for name in [
+            "_EVENT_LOG.0000000000",
+            "_EVENT_LOG.0000000001",
+            "_EVENT_LOG.0000004294",
+        ] {
+            assert!(
+                exists(dir, name),
+                "{name} must survive: this node is still writing its event log"
+            );
+        }
+        assert_decoys_survive(dir);
+    }
+
+    /// The case the issue is about: a network node on the post-#4968 default
+    /// sweeps the segments an earlier release left behind.
+    #[tokio::test]
+    async fn reclaim_sweeps_segments_when_the_log_is_disabled() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        let config = build_config(dir, crate::contract::OperationMode::Network).await;
+        let expected_bytes = seed_segments_and_decoys(dir);
+        assert!(
+            !config.event_log_enabled(),
+            "precondition: network mode defaults the log OFF (#4968)"
+        );
+
+        let decision = reclaim_orphaned_event_log(&config);
+
+        assert_eq!(
+            decision,
+            Some(EventLogReclaim {
+                files_removed: 3,
+                bytes_reclaimed: expected_bytes,
+                failures: 0,
+            }),
+            "a disabled network node must sweep, and report what it freed"
+        );
+        assert_decoys_survive(dir);
+
+        // Idempotent: the second startup finds nothing and reports nothing.
+        assert_eq!(
+            reclaim_orphaned_event_log(&config),
+            Some(EventLogReclaim::default()),
+            "the sweep is one-shot; a later startup has nothing left to remove"
+        );
+    }
+
+    /// Local mode is where `fdev verify-state` reads `_EVENT_LOG_LOCAL`.
+    /// Disabling the log there must still not sweep those segments.
+    #[tokio::test]
+    async fn reclaim_never_touches_the_local_mode_event_log() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        let mut args =
+            crate::config::event_log_test_args(dir, crate::contract::OperationMode::Local);
+        args.enable_event_log = Some(false);
+        let config = args.build().await.expect("build Config");
+        assert!(
+            !config.event_log_enabled(),
+            "precondition: an explicit false disables the log even in local mode"
+        );
+        assert!(
+            config.event_log().ends_with("_EVENT_LOG_LOCAL"),
+            "precondition: local mode resolves to the _LOCAL base name"
+        );
+        let bytes = write_file(&dir.join("_EVENT_LOG_LOCAL.0000000000"), 1_000)
+            + write_file(&dir.join("_EVENT_LOG_LOCAL.0000000001"), 1_000);
+        assert!(bytes > 0);
+
+        let decision = reclaim_orphaned_event_log(&config);
+
+        assert_eq!(
+            decision, None,
+            "local mode must decline: fdev verify-state consumes _EVENT_LOG_LOCAL"
+        );
+        assert!(exists(dir, "_EVENT_LOG_LOCAL.0000000000"));
+        assert!(exists(dir, "_EVENT_LOG_LOCAL.0000000001"));
+    }
+
+    /// Source pin (#4968): `write_all` must NOT fsync on every batch.
+    ///
+    /// A `sync_all()` used to run after each `BATCH_SIZE` (5) events. Because
+    /// an append also changes the file size, that forced a full filesystem
+    /// journal commit per batch: measured on a live 0.2.111 peer it was 95% of
+    /// every fsync the process issued and the dominant source of a 4-6x write
+    /// amplification. Durability that matters is preserved by the fsync in
+    /// `rotate_segment` (a completed segment is on disk before the next opens)
+    /// and by the torn-tail truncation on load, both of which this pin leaves
+    /// free to keep syncing.
+    ///
+    /// A behavioral test can't catch a re-added fsync (it changes only I/O
+    /// scheduling, not observable output), so the pin reads the source.
+    #[test]
+    fn write_all_does_not_fsync_per_batch() {
+        let src = include_str!("aof.rs");
+        // Cut at `mod tests`, NOT at the first `#[cfg(test)]` — there are
+        // `#[cfg(test)]` constants near the top of this file, so cutting there
+        // would drop nearly all production code and make this pin vacuous.
+        let prod = src.split("mod tests").next().unwrap();
+
+        // Built with `concat!` so this needle cannot match its own source text.
+        let sig = concat!("pub async fn ", "write_all");
+        let start = prod
+            .find(sig)
+            .expect("pin guard: write_all not found in the production slice");
+        let after = &prod[start..];
+        // The next same-level item is `pub fn encode_batch`.
+        let end = after.find("\n    pub fn ").unwrap_or(after.len());
+        let body = &after[..end];
+
+        // Vacuity guard: prove we actually extracted the real function body
+        // rather than an empty or mis-sliced range, which would make the
+        // assertion below pass no matter what the code does.
+        assert!(
+            body.contains("write_all(data)"),
+            "pin guard: the extracted slice does not contain the append call, so \
+             the extraction is wrong and this pin proves nothing. Slice:\n{body}"
+        );
+
+        assert!(
+            !body.contains(concat!("sync", "_all")),
+            "write_all must NOT fsync per batch (#4968). Durability is already \
+             covered by rotate_segment's fsync and the torn-tail truncation on \
+             load; a per-batch fsync costs ~5x write amplification on every user \
+             peer for a purely diagnostic log. Offending body:\n{body}"
+        );
     }
 
     /// Count the `Route` records the log surfaces through its public reader.

@@ -9,7 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::GlobalRng;
 use crate::node::network_status::OpType;
+use crate::ring::interest::{
+    InterestRegistrationSource, InterestRemovalCause, MissingSummaryClass,
+    SummaryPopulationOutcome, SummaryPopulationSource,
+};
 use crate::ring::{Distance, Location, PeerKeyLocation};
+use crate::tracing::event_kind::STATE_SIZE_BUCKET_COUNT;
 pub(crate) use isotonic_estimator::{
     AdjustmentMode, EstimatorType, IsotonicEstimator, IsotonicEvent,
 };
@@ -125,10 +130,287 @@ pub(crate) struct PerOpCurves {
     pub transfer_rate_points: Vec<(f64, f64)>,
 }
 
+/// Compact, fixed-cardinality evidence for the large-state architecture
+/// decision (#5090).
+///
+/// Field names are intentionally short because every reporting peer sends this
+/// block every 30 minutes. Array orders are the corresponding enum `ALL`
+/// constants in `ring::interest`, receiver order is
+/// `[delta_changed, delta_noop, full_changed, full_noop]`, state-size order is
+/// `tracing::event_kind::STATE_SIZE_BUCKET_UPPER_BOUNDS` plus the overflow bin,
+/// queue order is documented at the population site, and shadow-rollup order is
+/// `tracing::telemetry::KnownShadowRollup::ALL`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub(crate) struct NetworkEfficiencyV1 {
+    /// Schema version.
+    pub v: u8,
+    /// Delivered missing-summary sends and bytes by `MissingSummaryClass`.
+    ///
+    /// Four rows changed MEANING (not definition, recording site, or position)
+    /// at #5117: the untracked staleness reset used to wipe a pair's recorded
+    /// removal, so a pair whose removal was recent but whose last untracked
+    /// observation was stale classified as "never seen before". Sends move
+    /// `UntrackedFirstObserved` → `UntrackedFirstRecreated` and, via the same
+    /// field's second reader, `TrackedFirstNew` → `TrackedFirstRecreated`; see
+    /// also [`Self::recreated`]. TOTALS are unaffected — only the splits — and
+    /// the First-vs-Repeat split is untouched. Read pre- and post-#5117 series
+    /// separately; a step at that boundary is the fix, not a regression.
+    pub ms_s: [u64; MissingSummaryClass::COUNT],
+    pub ms_b: [u64; MissingSummaryClass::COUNT],
+    /// First-send entry-age buckets: <1s, 1-9s, 10-59s, 1-4m59s, >=5m.
+    pub ms_age: [u64; 5],
+    /// SIZE histogram of delivered missing-summary payloads, log-4: <4 KiB,
+    /// <16 KiB, <64 KiB, <256 KiB, <1 MiB, >=1 MiB. Rows are `interest::SIZE_HIST_CLASSES` in order:
+    /// tracked_first_new, tracked_first_recreated, untracked_first_observed,
+    /// untracked_first_recreated. Not all ten classes — see that constant.
+    ///
+    /// Added because the 0.2.120 investigation found full-state BYTES rose ~63%
+    /// while full-state SEND COUNT rose only ~12% (#5153): every counter that
+    /// existed measured counts, so the axis that actually moved was invisible.
+    pub ms_size: [[u64; 6]; 4],
+    /// DELIVERED untracked sends bucketed by how long ago the pair's entry was
+    /// removed:
+    /// <10s, <1m, <5m, <20m, older, and finally "no record of a removal".
+    ///
+    /// `ms_age` cannot cover this population — `first_age_bucket` is computed
+    /// only on the tracked path — yet `untracked_first_observed` is the class
+    /// that grew and is ~4x the population `ms_age` sees.
+    pub ms_unt_age: [u64; 6],
+    /// Registration overwrites of populated/empty entries, and cap rejects.
+    pub reg_ow_k: [u64; InterestRegistrationSource::COUNT],
+    pub reg_ow_m: [u64; InterestRegistrationSource::COUNT],
+    pub reg_new_k: [u64; InterestRegistrationSource::COUNT],
+    pub reg_new_m: [u64; InterestRegistrationSource::COUNT],
+    pub reg_cap: [u64; InterestRegistrationSource::COUNT],
+    /// Successful removals by cause and current known/missing population.
+    pub removed: [u64; InterestRemovalCause::COUNT],
+    pub current: [u64; crate::ring::interest::SummaryMissingReason::COUNT + 1],
+    /// Recreated pairs by their preceding removal cause.
+    ///
+    /// Steps UP at #5117 for the same reason as [`Self::ms_s`] — the recorded
+    /// removal this counts is no longer wiped by the untracked staleness reset,
+    /// so recreations that were previously invisible are now counted. Read pre-
+    /// and post-#5117 series separately. Still an undercount either way: the
+    /// removal is only honoured within `INTEREST_TTL` and lives in a bounded LRU.
+    pub recreated: [u64; InterestRemovalCause::COUNT],
+    /// Summary-population outcomes by source then outcome.
+    pub populated: [[u64; SummaryPopulationOutcome::COUNT]; SummaryPopulationSource::COUNT],
+    /// Missing-pair history and active-attempt correlation overflows.
+    pub corr_ovf: [u64; 2],
+    /// Queue counters: capacity eviction, queued dedup, enqueue while active,
+    /// large-head incidents, large-head blocked ms, small-entry-ms over that
+    /// window, queued-large/actual-small count, queued-small/actual-large
+    /// count, their respective actual payload bytes, scheduled small/large
+    /// counts, their respective state bytes, then active-key tracking overflow.
+    ///
+    /// Several of these changed MEANING (not definition, recording site, or
+    /// position) at #4961, which split the drain per lane AND moved the
+    /// small/large split from the contract STATE size to the PREDICTED wire
+    /// payload. Read pre- and post-fix series separately:
+    ///   * scheduled small/large and their state-byte variants now partition by
+    ///     predicted payload, so a large-state contract sending deltas counts as
+    ///     SMALL. `scheduled_large` should fall by roughly the two thirds that
+    ///     was misrouted. The small-lane state bytes are no longer bounded by
+    ///     the 64 KiB threshold and are no longer a proxy for small-lane WIRE
+    ///     volume (they never were on the large side).
+    ///   * queued-large/actual-small was the pre-fix misclassification signal
+    ///     (64.5% of large-lane items); it should collapse toward zero.
+    ///   * queued-small/actual-large read 0 fleet-wide pre-fix and was close to
+    ///     structurally so (the lane came from the state size, which bounds the
+    ///     payload from above to within `MIN_FULL_STATE_SAVING_BYTES`); the one
+    ///     two ways it could fire were a delta exceeding the state by up to
+    ///     `MIN_FULL_STATE_SAVING_BYTES`, and the stale-dedup-lane defect fixed
+    ///     alongside this in #5108. It is now the payload-misprediction count and is EXPECTED to
+    ///     be non-zero. Those sends still take a large-lane permit before
+    ///     hitting the wire. It is a COUNT, not a rate: nothing counts correct
+    ///     predictions, and `scheduled_small` is not a usable denominator
+    ///     because it includes sends that return before payload selection.
+    ///   * small-entry-ms was small entries BLOCKED behind a large-lane permit
+    ///     wait; it is now merely small entries queued DURING one, since the
+    ///     small lane drains them concurrently. Collapsing toward zero is the
+    ///     fix landing — but read it narrowly: the observation is armed ONLY by
+    ///     the large lane's drain, so a small entry waiting on a small-lane
+    ///     permit (including one held by a send correcting its lane) opens no
+    ///     observation at all. A zero here is evidence about CROSS-lane
+    ///     blocking, not about small-lane latency in general.
+    ///   * large-head incidents/ms keep their trigger (the large drain waiting
+    ///     on an empty pool with small entries queued), but the pool has a
+    ///     second consumer now — a mispredicted small-lane send correcting its
+    ///     lane — so an incident no longer implies a large-lane ENTRY caused the
+    ///     exhaustion, and the sampled trigger can miss a wait that an upgrader
+    ///     won the race for. BOTH these and small-entry-ms are gated on a
+    ///     small-lane entry being queued, and that population widened with the
+    ///     lane definition (large-state delta sends are now small-lane
+    ///     entries), so all three move for a second reason as well.
+    ///   * active-key overflow STAYS structurally unreachable, but for a new
+    ///     reason: in-flight sends were capped by the 12+2 permits, and are now
+    ///     capped by those plus the lane-correction parking area (12), still an
+    ///     order of magnitude under the 256-key cap. It remains a pure invariant
+    ///     check — a non-zero value means a leaked tracking guard, NOT a
+    ///     scheduling backlog.
+    ///   * enqueue-while-pair-active keeps its definition, but the window it
+    ///     samples — how long a pair stays in `active` — now includes any
+    ///     lane-correction wait, so it inflates for a reason unrelated to
+    ///     enqueue behaviour.
+    pub queue: [u64; 15],
+    /// Successful apply counts by delta/full x changed/no-op x resulting-state
+    /// size bucket.
+    pub recv_n: [[u64; STATE_SIZE_BUCKET_COUNT]; 4],
+    /// Every received payload by delta/full x terminal outcome (changed,
+    /// no-op, dedup, backoff, failed) x incoming-payload size bucket. Delta's
+    /// five outcome rows come first, then full state's five rows.
+    pub recv_tn: [[u64; STATE_SIZE_BUCKET_COUNT]; 10],
+    pub recv_tb: [[u64; STATE_SIZE_BUCKET_COUNT]; 10],
+    /// Persisted state counts and bytes by fixed size bucket.
+    pub state_n: [u64; STATE_SIZE_BUCKET_COUNT],
+    pub state_b: [u64; STATE_SIZE_BUCKET_COUNT],
+    /// State inventory summary: count, max bytes, over-limit count,
+    /// over-limit bytes, hard limit, then pre-WASM and post-merge hard-limit
+    /// rejection count/max pairs.
+    pub state: [u64; 9],
+    /// Cost-eviction eligibility by state size: eligible zero-demand,
+    /// subscribed, recent-but-unsubscribed.
+    pub evict_n: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    pub evict_b: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    /// Monotonic actual eviction victims by byte-budget zero-demand,
+    /// byte-budget in-use, and cost-pressure reason × state-size bucket.
+    pub vict_n: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    pub vict_b: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    /// Per cost axis: total rate, floor, max attributed rate, max eligible
+    /// rate, and number of sustained attributed contracts.
+    pub cost: [[u64; 5]; 3],
+    /// Per cost axis × state-size bucket maximum attributed rate, first for
+    /// every hosted contract and then restricted to eviction-eligible ones.
+    pub cost_ba: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    pub cost_be: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    /// Local telemetry pipeline totals in the order documented where populated.
+    pub tel: [u64; 15],
+    /// Per known shadow rollup: generated/enqueue attempts, enqueue full,
+    /// enqueue closed, rate-limit admitted, aggregate-limit drop,
+    /// shadow-subbudget drop, backoff-buffer drop, retry truncation, final sent.
+    pub shadow: [[u64; 9]; 7],
+    /// Delivery path for this diagnostic block itself; order is documented in
+    /// `TelemetryLocalMetricsSnapshot::network_efficiency_delivery`.
+    pub eff: [u64; 8],
+    /// Monotonic hosting-BEGIN counts by CAUSE; row order is
+    /// `ring::hosting::HostingCause::ALL`: client GET, transit GET, sub-op GET,
+    /// client PUT, transit PUT, startup restore, unattributed.
+    ///
+    /// Answers "why did this peer BEGIN hosting this contract" in aggregate,
+    /// which nothing recorded before. The present-tense sibling is
+    /// `ring::HostingReason` (`freenet.node.contracts.hosted`), which
+    /// re-derives current demand on every collection instead of freezing
+    /// provenance at admission — see that enum's rustdoc for the split.
+    /// `AccessType` distinguishes only GET from PUT and
+    /// so cannot separate a client's own request from transit — the distinction
+    /// every hosting-policy decision rests on. In particular a subscribe-fetch
+    /// travels the ordinary GET driver as a sub-op, and was indistinguishable
+    /// from a plain GET until this split.
+    ///
+    /// Counted at the cache branch that inserts, so a refresh of an
+    /// already-hosted contract is NOT counted. `Other` (last row) is a leak
+    /// detector, not a category: it should be 0 in the field, and a nonzero
+    /// value means some production path began hosting without naming a cause.
+    pub host_begin: [u64; crate::ring::HostingCause::COUNT],
+    /// GAUGE (not a counter — do not difference): distribution of `read_count`
+    /// across the currently hosted set. Buckets: 0, 1, 2-3, 4-9, 10-99, >=100.
+    ///
+    /// `read_count` is half of the demand signal the subscriber-primary eviction
+    /// ranking is built on, and it previously reached only the node's own local
+    /// HTML dashboard — no `send_event` call site touched it — so the shape of
+    /// the signal the policy depends on was unobservable fleet-wide.
+    pub host_reads: [u64; crate::ring::READ_COUNT_HIST_BUCKETS],
+    /// GAUGE: distribution of `last_genuine_access` AGE across the currently
+    /// hosted set. Buckets: within the 5-minute cost window, <20 min, <2 h,
+    /// older, never genuinely accessed. Bucket 0 over the hosted-set total is
+    /// the share cost-pressure eviction currently treats as recently-accessed.
+    /// The other half of the previously node-local demand signal.
+    pub host_recency: [u64; crate::ring::GENUINE_ACCESS_RECENCY_BUCKETS],
+    /// SHADOW-MODE futile-repair detector (`crate::ring::futile_repair`): how
+    /// often does an anti-entropy heal leave the (contract, peer) edge still
+    /// diverged? A non-commutative contract merge cannot converge, so the
+    /// repair loop runs forever — seven contract instances were 32.7% of all
+    /// update applies on 2026-08-09 for exactly this reason. Aggregate only,
+    /// no per-contract or per-peer label.
+    ///
+    /// Order (`FutileRepairSnapshot::to_row`, which is the wire contract):
+    /// attempts, futile, productive, observations_unpaired,
+    /// attempts_superseded, attempts_discarded,
+    /// outcomes_probe_budget_exhausted, outcomes_probe_unavailable,
+    /// outcomes_after_long_gap, would_quarantine, edges_at_threshold,
+    /// tracked_edges, evictions, evictions_losing_streak.
+    ///
+    /// `would_quarantine` is the headline: edges that reached
+    /// `futile_repair::QUARANTINE_THRESHOLD` consecutive futile repairs.
+    /// NOTHING is quarantined — this release only measures.
+    ///
+    /// # Read these four rows BEFORE the headline
+    ///
+    /// Each is a way the headline can be wrong, in the direction named:
+    ///
+    /// * `outcomes_probe_budget_exhausted` — comparisons where "stale" was the
+    ///   conservative DEFAULT because the per-message WASM probe budget
+    ///   (`node::MAX_STALENESS_PROBES_PER_SUMMARIES` = 32) was spent, not a
+    ///   verdict. Excluded from `futile` for exactly this reason: it grows with
+    ///   peer breadth and node load, so a large value means the heal path is
+    ///   classifying load as staleness and any future gating threshold has to
+    ///   be set knowing that.
+    /// * `outcomes_probe_unavailable` — the same default, but because the
+    ///   contract's own `get_state_delta` errored or timed out. Contract or
+    ///   runtime health, not divergence.
+    /// * `outcomes_after_long_gap` — classified outcomes settled more than
+    ///   `futile_repair::LONG_GAP_THRESHOLD` after their attempt. Not a
+    ///   separate class (these ARE in `futile`/`productive`), but the longer the
+    ///   gap the likelier something other than our heal moved the state. On
+    ///   links still taking the byte-budgeted full-bytes fallback a contract is
+    ///   re-compared on the order of ten hours, so these can dominate; if they
+    ///   do, the headline is measuring rotation latency.
+    /// * `attempts_discarded` — attempts dropped unsettled because the peer's
+    ///   interest state was torn down after the disconnect grace period. An
+    ///   undercount, and the honest denominator for `futile + productive`
+    ///   alongside `attempts`.
+    ///
+    /// Then read `tracked_edges` against `futile_repair::EDGE_CAPACITY`
+    /// together with `evictions_losing_streak`: a saturated LRU makes every
+    /// futility count an undercount, which is how `ms_unt_age` became useless.
+    ///
+    /// # Two things a fleet aggregation gets wrong by default
+    ///
+    /// * **Every row is PER OBSERVER.** Divergence is symmetric — A sees B
+    ///   stale while B sees A stale — so both ends of a stuck edge heal it,
+    ///   observe futility, and count it. A fleet SUM of `would_quarantine` is
+    ///   roughly **2x** the number of distinct stuck edges, and nothing on the
+    ///   wire carries an edge identity to deduplicate with. Halve it, or treat
+    ///   it as an upper bound.
+    /// * **`futile : productive` is not a repair-efficacy ratio.** Attempts are
+    ///   recorded only for anti-entropy heals, but an edge also converges via
+    ///   the proximity-overlap heal or plain live UPDATE fan-out, neither of
+    ///   which records anything — so `productive` credits the outstanding
+    ///   anti-entropy heal for whatever actually fixed it. It says "converged
+    ///   by the next comparison", not "our heal converged it".
+    pub futile: [u64; crate::ring::futile_repair::SNAPSHOT_SCALARS],
+    /// Survival curve of consecutive-futility streaks over the rungs
+    /// `futile_repair::LADDER_RUNGS` (1, 2, 3, 4, 5, 8, 16, 32): entry `i`
+    /// counts streaks that REACHED rung `i`, at most once per rung per streak,
+    /// so the series is monotonically non-increasing and reads as "of the
+    /// streaks that got to 1, how many got to 32".
+    pub futile_ladder: [u64; crate::ring::futile_repair::LADDER_LEN],
+}
+
 /// Periodic snapshot of the router model state for telemetry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub(crate) struct RouterSnapshotInfo {
+    /// Versioned fixed-cardinality network-efficiency evidence. `None` on five
+    /// of every six router snapshots (the wide block exports every 30 minutes)
+    /// and before the production sources are initialized. As with the
+    /// snapshot's earlier added fields, this changes positional bincode AOF decoding:
+    /// buffered pre-upgrade RouterSnapshot records can be skipped once during
+    /// upgrade, while live/self-describing OTLP JSON is unaffected. The AOF
+    /// reader already treats an undecodable telemetry record as skippable.
+    #[serde(default)]
+    pub network_efficiency_v1: Option<NetworkEfficiencyV1>,
     pub failure_events: usize,
     pub success_events: usize,
     pub transfer_rate_events: usize,
@@ -265,6 +547,29 @@ pub(crate) struct RouterSnapshotInfo {
     /// Populated by `Ring` on the snapshot cadence. `None` until the ring is
     /// built. Per-node aggregate scalar.
     pub hosting_subscribed_evictions_total: Option<u64>,
+    /// Cost-pressure eviction falsifier (cost-aware eviction, #4861): monotonic
+    /// count of zero-demand contracts shed because their attributed update-work
+    /// cost (WASM CPU / broadcast fan-out) dominated the node's total on a cost
+    /// axis, independently of the byte budget. Disjoint from
+    /// `hosting_budget_evictions_total` (byte-budget-triggered only). A nonzero
+    /// differenced rate means the cost trigger is firing; a runaway rate means
+    /// the floors / share threshold are miscalibrated and churning cheap
+    /// contracts. Populated by `Ring` on the snapshot cadence. `None` until the
+    /// ring is built. Per-node aggregate scalar.
+    pub hosting_cost_evictions_total: Option<u64>,
+    /// Local `UpdateNotification` deliveries dropped because the subscriber's
+    /// channel was FULL (#4681). The subscriber's cached summary is invalidated
+    /// at the same time, so the next update resyncs it with full state; a
+    /// sustained nonzero rate means a client is not draining fast enough.
+    pub notifications_dropped_channel_full: Option<u64>,
+    /// Local `UpdateNotification` deliveries dropped because the subscriber's
+    /// channel was CLOSED (#4681). The subscriber is unregistered at that point.
+    pub notifications_dropped_channel_closed: Option<u64>,
+    /// Committed updates that found NO local subscriber (#4681/#5040). Normal
+    /// for contracts hosted on the network's behalf; surfaced as a counter
+    /// because logging it per occurrence produced 22k lines/day (#5040) and
+    /// `debug!` is compiled out of release builds.
+    pub notifications_no_local_subscriber: Option<u64>,
     /// Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d): the count of
     /// contracts registered as in-use via a downstream subscriber whose state is
     /// NOT present on disk (`contract_in_use && !contract_state_present`). After
@@ -297,6 +602,17 @@ pub(crate) struct RouterSnapshotInfo {
     pub terminal_consult_hits: Option<u64>,
     pub terminal_consult_resolved_found: Option<u64>,
     pub terminal_consult_still_not_found: Option<u64>,
+    /// Eviction-retraction emission counters (#5059). The retraction is what
+    /// makes co-hosts stop fanning updates at an evicted contract, and it is
+    /// emitted best-effort on the cap-2048 node-event channel. `dropped` rising
+    /// means evicted contracts keep receiving updates for up to one
+    /// interest-heartbeat interval (~5 min) before the full-set re-request heals
+    /// it — the difference between a slow heal and a failed fix, which the
+    /// `debug!` at the drop site cannot show because it compiles out in release.
+    /// Monotonic lifetime totals; `None` until the ring's snapshot task has
+    /// populated them.
+    pub hosting_retractions_emitted: Option<u64>,
+    pub hosting_retractions_dropped: Option<u64>,
     /// Computed-upstream vs. stored-`is_upstream`-flag divergence counters
     /// (hosting redesign piece D, #4642 / #4671). `comparisons` is the
     /// denominator (one per `send_unsubscribe_upstream`), `divergences` the times
@@ -405,6 +721,46 @@ pub(crate) struct RouterSnapshotInfo {
     pub broadcast_stream_attempts_total: Option<u64>,
     pub broadcast_stream_failures_total: Option<u64>,
     pub broadcast_stream_failures_last_snapshot: Option<u64>,
+    /// Contract-exec WASM counters, populated by `Ring` from the per-node
+    /// `ContractExecMetrics` the executor publishes into. These separate the
+    /// EXPENSIVE work (a WASM `summarize_state` / `get_state_delta`
+    /// invocation) from the cache hits that elide it — a distinction the only
+    /// prior production signal, a handler-entry span, could not make, which is
+    /// why every rate quoted across the #4473 / #4610 / #5040 / #5238 storm
+    /// investigations was undifferentiated. See
+    /// `ring::contract_exec_metrics` for the exact partition each arm belongs
+    /// to; briefly:
+    ///
+    /// - `*_fast_hits` — served from cache, no state load, no WASM
+    /// - `*_reload_hits` — state loaded and hashed, cache hit, no WASM
+    /// - `*_wasm_calls` — WASM ran, on the cached path (a true miss)
+    /// - `*_wasm_uncached` — WASM ran, at a site with no cache in front of it
+    ///
+    /// `*_total` are monotonic lifetime counters (the collector differences
+    /// them across the cadence); `*_last_snapshot` are the per-window deltas
+    /// `Ring` samples directly, so ONE snapshot answers "was this peer's
+    /// summarize load cache hits or real WASM work" without a stateful reader.
+    /// EVERY arm gets both, deliberately: emitting some arms as a delta and
+    /// others as a lifetime total, under parallel names, invites reading them as
+    /// comparable magnitudes and would understate exactly the uncached fan-out
+    /// arm most likely to dominate on a client-facing node.
+    /// `None` until the node has a `Ring`-backed executor.
+    pub contract_exec_summarize_fast_hits_total: Option<u64>,
+    pub contract_exec_summarize_reload_hits_total: Option<u64>,
+    pub contract_exec_summarize_wasm_calls_total: Option<u64>,
+    pub contract_exec_summarize_wasm_uncached_total: Option<u64>,
+    pub contract_exec_delta_fast_hits_total: Option<u64>,
+    pub contract_exec_delta_reload_hits_total: Option<u64>,
+    pub contract_exec_delta_wasm_calls_total: Option<u64>,
+    pub contract_exec_delta_wasm_uncached_total: Option<u64>,
+    pub contract_exec_summarize_fast_hits_last_snapshot: Option<u64>,
+    pub contract_exec_summarize_reload_hits_last_snapshot: Option<u64>,
+    pub contract_exec_summarize_wasm_calls_last_snapshot: Option<u64>,
+    pub contract_exec_summarize_wasm_uncached_last_snapshot: Option<u64>,
+    pub contract_exec_delta_fast_hits_last_snapshot: Option<u64>,
+    pub contract_exec_delta_reload_hits_last_snapshot: Option<u64>,
+    pub contract_exec_delta_wasm_calls_last_snapshot: Option<u64>,
+    pub contract_exec_delta_wasm_uncached_last_snapshot: Option<u64>,
     /// Placement-quality gauges (#4404 follow-up), populated by `Ring` on the
     /// snapshot cadence from the contracts this node hosts. They make the
     /// effect of the SubscribeHint placement migration observable: the migration
@@ -474,6 +830,21 @@ pub(crate) struct RouterSnapshotInfo {
     pub lattice_predecessor_distance: Option<f64>,
     pub lattice_probes_issued: Option<u64>,
     pub lattice_probe_improvements: Option<u64>,
+    /// Version-gate refusal counters (#5156), populated by `Ring` on the
+    /// snapshot cadence from `ConnectionManager::version_gate_refusal_stats`.
+    /// `supports_hash_first_summaries` and `supports_summary_first_put` both
+    /// fail closed to their full-bytes fallback for two causes with opposite
+    /// implications, previously indistinguishable in telemetry:
+    /// `*_declined_unknown_version` (the remote's negotiated version was never
+    /// recorded — documented on joiner->gateway `AckConnection` links, which
+    /// never self-heals as the fleet upgrades) vs `*_declined_pre_floor` (a
+    /// known version below the feature's minimum — self-heals as peers
+    /// upgrade). Monotonic lifetime totals, differenced by the collector.
+    /// `None` until the snapshot task populates them.
+    pub hash_first_summaries_declined_unknown_version: Option<u64>,
+    pub hash_first_summaries_declined_pre_floor: Option<u64>,
+    pub summary_first_put_declined_unknown_version: Option<u64>,
+    pub summary_first_put_declined_pre_floor: Option<u64>,
     /// Streamed-transfer (> 64 KB) abort counters, populated by `Ring` from the
     /// per-node `network_status` singleton on the snapshot cadence. They isolate
     /// the large-contract failure class (~50% of large fetches were failing)
@@ -1243,6 +1614,7 @@ impl Router {
     /// Produce a snapshot of the router model state for telemetry.
     pub fn snapshot(&self) -> RouterSnapshotInfo {
         RouterSnapshotInfo {
+            network_efficiency_v1: None,
             failure_events: self.failure_estimator.len(),
             success_events: self.response_start_time_estimator.len(),
             transfer_rate_events: self.transfer_rate_estimator.len(),
@@ -1344,6 +1716,10 @@ impl Router {
             hosting_disk_total_bytes: None,
             hosting_oom_valve_evictions_total: None,
             hosting_subscribed_evictions_total: None,
+            hosting_cost_evictions_total: None,
+            notifications_dropped_channel_full: None,
+            notifications_dropped_channel_closed: None,
+            notifications_no_local_subscriber: None,
             phantom_in_use_contracts: None,
             // Terminal advertisement-consult counters (piece C, #4646),
             // populated by Ring from the network_status singleton on the
@@ -1352,6 +1728,10 @@ impl Router {
             terminal_consult_hits: None,
             terminal_consult_resolved_found: None,
             terminal_consult_still_not_found: None,
+            // Eviction-retraction emission counters (#5059), same population
+            // path as the consult counters above.
+            hosting_retractions_emitted: None,
+            hosting_retractions_dropped: None,
             // Computed-upstream vs. stored-flag divergence counters (piece D,
             // #4642 / #4671), populated by Ring from the network_status
             // singleton on the snapshot cadence.
@@ -1396,6 +1776,22 @@ impl Router {
             // populated by Ring on the snapshot cadence (#4440).
             broadcast_stream_attempts_total: None,
             broadcast_stream_failures_total: None,
+            contract_exec_summarize_fast_hits_total: None,
+            contract_exec_summarize_reload_hits_total: None,
+            contract_exec_summarize_wasm_calls_total: None,
+            contract_exec_summarize_wasm_uncached_total: None,
+            contract_exec_delta_fast_hits_total: None,
+            contract_exec_delta_reload_hits_total: None,
+            contract_exec_delta_wasm_calls_total: None,
+            contract_exec_delta_wasm_uncached_total: None,
+            contract_exec_summarize_fast_hits_last_snapshot: None,
+            contract_exec_summarize_reload_hits_last_snapshot: None,
+            contract_exec_summarize_wasm_calls_last_snapshot: None,
+            contract_exec_summarize_wasm_uncached_last_snapshot: None,
+            contract_exec_delta_fast_hits_last_snapshot: None,
+            contract_exec_delta_reload_hits_last_snapshot: None,
+            contract_exec_delta_wasm_calls_last_snapshot: None,
+            contract_exec_delta_wasm_uncached_last_snapshot: None,
             broadcast_stream_failures_last_snapshot: None,
             // Placement-quality + placement-migration gauges populated by Ring on
             // the snapshot cadence (#4404 follow-up).
@@ -1423,6 +1819,12 @@ impl Router {
             lattice_predecessor_distance: None,
             lattice_probes_issued: None,
             lattice_probe_improvements: None,
+            // Version-gate refusal counters, populated by Ring on the
+            // snapshot cadence (#5156).
+            hash_first_summaries_declined_unknown_version: None,
+            hash_first_summaries_declined_pre_floor: None,
+            summary_first_put_declined_unknown_version: None,
+            summary_first_put_declined_pre_floor: None,
             // Streamed-transfer abort counters, populated by Ring from the
             // network_status singleton on the snapshot cadence (Group B).
             stream_recv_aborts_inactivity_total: None,
@@ -1581,6 +1983,66 @@ pub enum RouteOutcome {
 #[cfg(test)]
 mod tests {
     use crate::ring::Distance;
+
+    /// `NetworkEfficiencyV1`'s `futile` rustdoc, isolated from this test module
+    /// — the needles below appear here too, and a pin that matches its own
+    /// source can never fail.
+    fn futile_row_doc() -> &'static str {
+        const FULL: &str = include_str!("router.rs");
+        let start = FULL
+            .find("pub(crate) struct NetworkEfficiencyV1")
+            .expect("NetworkEfficiencyV1 not found");
+        let end = FULL[start..]
+            .find("pub futile_ladder")
+            .map(|off| start + off)
+            .expect("the futile row must still be declared on NetworkEfficiencyV1");
+        &FULL[start..end]
+    }
+
+    /// The `futile` row's rustdoc is the only place a reader of the fleet data
+    /// meets these counters, and several of them are wrong in a specific,
+    /// plausible direction if read naively. Each caveat below was a review
+    /// finding; each would regress into a wrong published number rather than a
+    /// failing test, so the doc is pinned like code.
+    #[test]
+    fn futile_row_doc_carries_the_reading_caveats() {
+        let doc = futile_row_doc();
+        for (needle, why) in [
+            (
+                "outcomes_probe_budget_exhausted",
+                "the load-correlated channel: past the 32-probe budget every \
+                 further contract reads as stale with no divergence at all, so \
+                 the reader has to be able to size it",
+            ),
+            (
+                "outcomes_after_long_gap",
+                "on byte-budgeted fallback links a contract is re-compared on \
+                 the order of ten hours, so the headline can be carried by \
+                 outcomes whose attempt is long stale",
+            ),
+            (
+                "attempts_discarded",
+                "attempts dropped at peer teardown are where the undercount \
+                 lives, and are the counter most likely to be non-zero",
+            ),
+            (
+                "PER OBSERVER",
+                "both ends of a diverged edge count the same stuck edge, so a \
+                 fleet SUM of would_quarantine is ~2x the distinct population",
+            ),
+            (
+                "not a repair-efficacy ratio",
+                "an edge also converges via the proximity-overlap heal or live \
+                 UPDATE fan-out, neither of which records an attempt, so \
+                 `productive` credits our heal for someone else's fix",
+            ),
+        ] {
+            assert!(
+                doc.contains(needle),
+                "the `futile` row rustdoc no longer mentions `{needle}` — {why}"
+            );
+        }
+    }
 
     use super::*;
 

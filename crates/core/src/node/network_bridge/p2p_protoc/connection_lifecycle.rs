@@ -1052,13 +1052,17 @@ impl P2pConnManager {
         // variants — e.g. the summary-first PUT probe's
         // `supports_summary_first_put` check. Keep this write paired with
         // the `self.connections.insert` above if that call site changes.
-        if let Some(version) = remote_version {
-            self.bridge
-                .op_manager
-                .ring
-                .connection_manager
-                .record_remote_version(peer_addr, version);
-        }
+        // Write the Option THROUGH — unconditionally, so a reconnection whose
+        // version is unknown CLEARS any stale entry rather than leaving us
+        // believing a downgraded peer is still current. Since #5161 a `None`
+        // here means the remote is genuinely below the version-carrying-ack
+        // floor, not that this path cannot observe it.
+        // See `ConnectionManager::record_remote_version`.
+        self.bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .record_remote_version(peer_addr, remote_version);
         // Only add to reverse lookup if we know the pub_key
         // For transient connections, this will be populated when identity is learned
         if let Some(ref peer) = peer_id {
@@ -1078,8 +1082,17 @@ impl P2pConnManager {
         // Use tokio::spawn directly instead of GlobalExecutor::spawn.
         // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
         // reliably poll tasks in certain test contexts (see issue #2709).
+        let outbound_mix = self.bridge.op_manager.outbound_mix.clone();
         tokio::spawn(async move {
-            peer_connection_listener(rx, connection, peer_addr, conn_events, conn_id).await;
+            peer_connection_listener(
+                rx,
+                connection,
+                peer_addr,
+                conn_events,
+                conn_id,
+                outbound_mix,
+            )
+            .await;
         });
         // Yield to allow the spawned peer_connection_listener task to start.
         // This is important because on some runtimes (especially in tests with boxed_local

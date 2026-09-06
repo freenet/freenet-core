@@ -38,9 +38,13 @@ printf "  %-30s  %s  %s\n" "--------" "----" "-------"
     check_endpoint "nova gateway (HTTP)"      "http://5.9.111.215:31337" &
     check_endpoint "nova gateway (HTTPS)"     "https://freenet.org"      &
     check_endpoint "vega gateway (HTTP)"      "http://vega.locut.us:31337" &
-    check_endpoint "river.freenet.org"        "https://river.freenet.org" &
+    # Trailing slash is DELIBERATE — do not "tidy" it away. The success band
+    # above is 200 <= code < 400, and `https://freenet.org/river` (no slash)
+    # answers 301, which would report green while asserting nothing but the
+    # redirect. Only the slashed form returns a real 200.
+    check_endpoint "freenet.org/river"        "https://freenet.org/river/" &
     check_endpoint "nova telemetry health"    "http://5.9.111.215:13133/health" &
-    check_endpoint "nova telemetry dashboard" "http://nova.locut.us:3133" &
+    check_endpoint "telemetry dashboard"      "https://telemetry.freenet.org" &
     wait
 }
 

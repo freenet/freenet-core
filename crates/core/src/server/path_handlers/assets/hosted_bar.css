@@ -40,8 +40,11 @@ iframe {
   position: relative;
   flex: 0 0 auto;
 }
-#fnbar button {
+#fnbar button,
+#fnbar a.act {
+  display: inline-block;
   font: inherit;
+  text-decoration: none;
   color: #222;
   background: #fff;
   border: 1px solid #cfcfcf;
@@ -49,8 +52,21 @@ iframe {
   padding: 3px 10px;
   cursor: pointer;
 }
-#fnbar button:hover {
+#fnbar button:hover,
+#fnbar a.act:hover {
   border-color: #999;
+}
+/* Primary migration action: emphasis by contrast, not colour, so it reads as
+   the default in the bar's near-monochrome palette while copy-the-URL stays a
+   plain secondary button. */
+#fnbar a.act-primary {
+  color: #fff;
+  background: #333;
+  border-color: #333;
+}
+#fnbar a.act-primary:hover {
+  background: #222;
+  border-color: #222;
 }
 #fnpop {
   position: absolute;
@@ -142,13 +158,24 @@ iframe {
   #fnbar .nt {
     color: #88888c;
   }
-  #fnbar button {
+  #fnbar button,
+  #fnbar a.act {
     color: #e6e6e8;
     background: #2c2c2f;
     border-color: #46464a;
   }
-  #fnbar button:hover {
+  #fnbar button:hover,
+  #fnbar a.act:hover {
     border-color: #6a6a6e;
+  }
+  #fnbar a.act-primary {
+    color: #1c1c1e;
+    background: #e6e6e8;
+    border-color: #e6e6e8;
+  }
+  #fnbar a.act-primary:hover {
+    background: #f4f4f6;
+    border-color: #f4f4f6;
   }
   #fnpop {
     background: #252528;

@@ -2,7 +2,20 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta http-equiv="refresh" content="3;url=/" />
+    <!--
+      Recovery redirect. This page is served (503) while the peer is up but not
+      yet rejoined to the ring. It can be rendered EITHER as a top-level document
+      (a user hitting a contract URL directly) OR inside a webapp's sandboxed
+      shell iframe (the app re-requesting its own content during the rejoin
+      window). A top-level instance should go to the dashboard at `/`; a FRAMED
+      instance must NOT — navigating an iframe to `/` yanks the running webapp to
+      the node root (which denies framing on hardened deployments -> "Refused to
+      display ... X-Frame-Options" -> broken tab). So the redirect is done in JS,
+      conditioned on whether we are the top document; a framed instance reloads
+      its OWN url in place until the peer rejoins and the app loads normally. The
+      <noscript> meta is the no-JS fallback (top-level dashboard redirect only).
+    -->
+    <noscript><meta http-equiv="refresh" content="3;url=/" /></noscript>
     <title>Connecting to Freenet</title>
     <link rel="icon" href="https://freenet.org/favicon.ico" />
     <style>
@@ -46,8 +59,87 @@
         alt="Freenet"
         class="logo"
       />
-      <h1>Connecting to Freenet...</h1>
-      <p>Redirecting to the <a href="/">dashboard</a>...</p>
+      <h1 id="title">Connecting to Freenet...</h1>
+      <p id="msg">
+        Your peer is reconnecting. This page will refresh automatically.
+      </p>
     </div>
+    <script>
+      // See the head comment. The redirect must be bounded and framing-aware:
+      //
+      //  - A top-level ordinary connecting page (no `_freload`) -> dashboard `/`.
+      //  - A page carrying the shell's `_freload` recovery marker (set by
+      //    shell_bridge.js's reload) is a recovery reload that momentarily landed
+      //    here while the peer rejoins the ring. Navigating it to `/` would
+      //    abandon the running app for the node dashboard, so instead retry the
+      //    contract URL in place — but ONLY within a bounded window. `_freload`
+      //    carries "<startMs>-<count>", so we can tell how long recovery has been
+      //    running and STOP once it exceeds RECOVERY_MAX_MS instead of reloading
+      //    every 3s forever: at top-level fall back to `/`, and framed stop and
+      //    tell the user to reload the tab. A framed page with no marker stamps a
+      //    start time and reloads once, so its retries become bounded too.
+      //
+      // connecting-recovery-decision:BEGIN — pure, extracted & unit-tested by
+      // crates/core/src/server/connecting_recovery.test.mjs. Keep it pure (only
+      // its params/locals) so the extraction works.
+      function connectingRecoveryDecision(search, atTop, now) {
+        var RECOVERY_MAX_MS = 120000; // 2 min: bound the retry-in-place loop
+        var m = /[?&]_freload=([^&]*)/.exec(search || '');
+        var recoveryStart = null;
+        if (m) {
+          var val = decodeURIComponent(m[1]);
+          var dash = val.indexOf('-');
+          var ts = parseInt(dash >= 0 ? val.slice(0, dash) : val, 10);
+          if (isFinite(ts)) recoveryStart = ts;
+        }
+        if (recoveryStart === null) {
+          // No recovery marker: ordinary connecting page. Top-level -> dashboard;
+          // framed -> stamp a start time so subsequent retries are wall-clock
+          // bounded (then retry in place).
+          return atTop ? { action: 'dashboard' } : { action: 'stamp' };
+        }
+        var elapsed = now - recoveryStart;
+        if (elapsed >= 0 && elapsed < RECOVERY_MAX_MS) {
+          return { action: 'retry' };
+        }
+        // Recovery window elapsed (or a bad/future timestamp): stop looping.
+        return atTop ? { action: 'dashboard' } : { action: 'giveup' };
+      }
+      // connecting-recovery-decision:END
+      setTimeout(function () {
+        var atTop;
+        try {
+          atTop = window.top === window.self;
+        } catch (e) {
+          // Cross-origin access to window.top can throw in some embeddings; if we
+          // can't prove we're top-level, treat as framed (never navigate to `/`).
+          atTop = false;
+        }
+        var d = connectingRecoveryDecision(location.search, atTop, Date.now());
+        if (d.action === 'dashboard') {
+          window.location.replace('/');
+        } else if (d.action === 'retry') {
+          window.location.reload();
+        } else if (d.action === 'stamp') {
+          try {
+            var u = new URL(location.href);
+            u.searchParams.set('_freload', String(Date.now()) + '-0');
+            window.location.replace(u.toString());
+          } catch (e) {
+            window.location.reload();
+          }
+        } else {
+          // giveup: framed, recovery window elapsed. Stop the loop and tell the
+          // user to reload the tab (the shell can't recover the frame in place).
+          var title = document.getElementById('title');
+          var msg = document.getElementById('msg');
+          if (title) title.textContent = 'Still connecting…';
+          if (msg) {
+            msg.textContent =
+              'Your peer is taking longer than usual to reconnect. Please reload this tab to try again.';
+          }
+        }
+      }, 3000);
+    </script>
   </body>
 </html>

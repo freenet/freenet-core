@@ -215,7 +215,8 @@ WHEN exchanging peer lists in sync protocols (e.g., interest sync):
   → Stale peer entries cause operations to be sent to dead nodes
 
 WHEN summarizing contracts in the InterestSync heartbeat handlers
-(handle_interest_sync_message: Interests / Summaries / ChangeInterests):
+(handle_interest_sync_message: Interests / Summaries / SummaryDigests /
+SummaryRequest / ChangeInterests):
   → ONLY call get_contract_summary for contracts we host OR actively serve
     AND for which we actually hold state:
     (is_hosting_contract || contract_in_use) && contract_state_present — go

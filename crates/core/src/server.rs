@@ -81,6 +81,11 @@ pub(crate) enum ClientConnection {
         req: Box<ClientRequest<'static>>,
         auth_token: Option<AuthToken>,
         origin_contract: Option<ContractInstanceId>,
+        /// Whether the issuing connection may receive an ATTESTED application
+        /// identity (GHSA-824h-7x5x-wfmf). Classified once at the HTTP layer
+        /// from the kernel-observed peer address, carried on the connection
+        /// like `user_context` so nothing in the request body can forge it.
+        connection_scope: crate::client_events::ConnectionScope,
         /// Per-connection per-user secret namespace (hosted mode, P2 of #4381),
         /// derived once at WS upgrade from the connection's user token. `None`
         /// outside hosted mode. Carried on the connection, never from the
@@ -251,158 +256,17 @@ fn is_ipv6_ula(addr: &std::net::Ipv6Addr) -> bool {
     (addr.segments()[0] & 0xfe00) == 0xfc00
 }
 
-pub mod local_node {
-    use freenet_stdlib::client_api::{ClientRequest, ErrorKind};
-    use std::net::SocketAddr;
-    use tower_http::trace::TraceLayer;
-
-    use crate::{
-        client_events::{ClientEventsProxy, OpenRequest, websocket::WebSocketProxy},
-        contract::{Executor, ExecutorError},
-    };
-
-    use super::{client_api::HttpClientApi, serve_dual_stack};
-
-    pub async fn run_local_node(mut executor: Executor, socket: SocketAddr) -> anyhow::Result<()> {
-        if !super::is_private_ip(&socket.ip()) {
-            anyhow::bail!(
-                "invalid ip: {}, only loopback and private network addresses are allowed",
-                socket.ip()
-            )
-        }
-        let (mut gw, gw_router) = HttpClientApi::as_router(&socket);
-        let (mut ws_proxy, ws_router) = WebSocketProxy::create_router(gw_router);
-
-        // Route through serve_dual_stack (not the bare single-socket bind) so
-        // this path also binds an IPv4+IPv6 companion pair for loopback/wildcard
-        // addresses — keeping every client-API serve path reachable over both
-        // families (#4330).
-        //
-        // `run_local_node` owns the server for the lifetime of the process (it
-        // loops forever below), so the abort guard is leaked deliberately: there
-        // is no graceful-shutdown hook on this path to hand it to.
-        let mut aborts = crate::util::AbortOnDrop::new();
-        serve_dual_stack(
-            socket,
-            ws_router.layer(TraceLayer::new_for_http()),
-            None,
-            &mut aborts,
-        )
-        .await?;
-        std::mem::forget(aborts);
-
-        // TODO: use combinator instead
-        // let mut all_clients =
-        //    ClientEventsCombinator::new([Box::new(ws_handle), Box::new(http_handle)]);
-        enum Receiver {
-            Ws,
-            Gw,
-        }
-        let mut receiver;
-        loop {
-            let req = crate::deterministic_select! {
-                req = ws_proxy.recv() => {
-                    receiver = Receiver::Ws;
-                    req?
-                },
-                req = gw.recv() => {
-                    receiver = Receiver::Gw;
-                    req?
-                },
-            };
-            let OpenRequest {
-                client_id: id,
-                request,
-                notification_channel,
-                token,
-                user_context,
-                ..
-            } = req;
-            tracing::trace!(cli_id = %id, "got request -> {request}");
-
-            let res = match *request {
-                ClientRequest::ContractOp(op) => {
-                    executor
-                        .contract_requests(op, id, notification_channel)
-                        .await
-                }
-                ClientRequest::DelegateOp(op) => {
-                    let origin_contract = token.and_then(|token| {
-                        gw.origin_contracts
-                            .get(&token)
-                            .map(|entry| entry.contract_id)
-                    });
-                    // `user_context` is `Some` only in hosted mode with a user
-                    // token; otherwise `None` keeps secrets `SecretScope::Local`.
-                    executor.delegate_request(
-                        op,
-                        origin_contract.as_ref(),
-                        None,
-                        user_context.as_ref(),
-                    )
-                }
-                ClientRequest::Disconnect { cause } => {
-                    if let Some(cause) = cause {
-                        tracing::info!("disconnecting cause: {cause}");
-                    }
-                    // fixme: token must live for a bit to allow reconnections
-                    // Drop the iter() guard before remove() to avoid holding a
-                    // DashMap shard guard across a mutating call on the same map
-                    // (clippy: `significant_drop_in_scrutinee`).
-                    // Safe: the outer caller serialises by `id`, so no concurrent
-                    // iter+remove on this shard is possible.
-                    let rm_token = gw.origin_contracts.iter().find_map(|entry| {
-                        let (k, origin) = entry.pair();
-                        (origin.client_id == id).then(|| k.clone())
-                    });
-                    if let Some(rm_token) = rm_token {
-                        gw.origin_contracts.remove(&rm_token);
-                    }
-                    continue;
-                }
-                ClientRequest::Authenticate { .. }
-                | ClientRequest::NodeQueries(_)
-                | ClientRequest::Close
-                | _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
-            };
-
-            match res {
-                Ok(res) => {
-                    match receiver {
-                        Receiver::Ws => ws_proxy.send(id, Ok(res)).await?,
-                        Receiver::Gw => gw.send(id, Ok(res)).await?,
-                    };
-                }
-                Err(err) if err.is_request() => {
-                    let err = ErrorKind::RequestError(err.unwrap_request());
-                    match receiver {
-                        Receiver::Ws => {
-                            ws_proxy.send(id, Err(err.into())).await?;
-                        }
-                        Receiver::Gw => {
-                            gw.send(id, Err(err.into())).await?;
-                        }
-                    };
-                }
-                Err(err) => {
-                    tracing::error!("{err}");
-                    let err = Err(ErrorKind::Unhandled {
-                        cause: format!("{err}").into(),
-                    }
-                    .into());
-                    match receiver {
-                        Receiver::Ws => {
-                            ws_proxy.send(id, err).await?;
-                        }
-                        Receiver::Gw => {
-                            gw.send(id, err).await?;
-                        }
-                    };
-                }
-            }
-        }
-    }
-}
+// `local_node::run_local_node` (a second, standalone client-API serve loop
+// that predated `node::run_local_node`) was DELETED with the
+// GHSA-824h-7x5x-wfmf fix. It was unreachable — `bin/freenet.rs` runs
+// `node::run_local_node` — and it carried a duplicate origin-resolution path
+// that re-derived a request's `origin_contract` by looking the connection's
+// auth token up in `HttpClientApi::origin_contracts`. That re-derivation read
+// the token and NOTHING about the connection it arrived on, so it could not
+// have honored the connection-scope gate; leaving it in place would have left
+// a second, silently-ungated way to obtain an attested identity for whoever
+// revived the entry point. `node::run_local_node` passes `OpenRequest`'s
+// `origin_contract` (and now its `connection_scope`) straight through instead.
 
 pub async fn serve_client_api(config: WebsocketApiConfig) -> std::io::Result<[BoxedClient; 2]> {
     let (gw, ws_proxy) = serve_client_api_in_impl(config, None).await?;
@@ -563,7 +427,17 @@ fn build_allowed_hosts(
     hosts.add_machine_hostname();
 
     if !bind_addr.is_unspecified() {
-        hosts.add(&bind_addr.to_string());
+        // Bracket IPv6 literals. A `Host` header carries `[::1]:7509`, never
+        // `::1:7509`, so the unbracketed forms `add` would otherwise insert are
+        // one dead entry plus one malformed one. Harmless (add_localhost has
+        // already inserted the bracketed `[::1]`), but this branch became the
+        // DEFAULT path when the client API moved to a loopback bind
+        // (GHSA-824h-7x5x-wfmf), so the junk now shows up in the
+        // `allowed_hosts` startup log on every node.
+        match bind_addr {
+            IpAddr::V6(v6) => hosts.add(&format!("[{v6}]")),
+            IpAddr::V4(v4) => hosts.add(&v4.to_string()),
+        }
     }
 
     for host in extra_allowed_hosts {
@@ -652,6 +526,7 @@ async fn serve_client_api_in_impl(
         &ws_socket,
         origin_contracts.clone(),
         crate::contract::user_input::pending_prompts(),
+        config.webapp_cache_dir.clone(),
     );
     let (ws_proxy, ws_router) =
         WebSocketProxy::create_router_with_origin_contracts(gw_router, origin_contracts);
@@ -1298,8 +1173,11 @@ mod tests {
 
     #[test]
     fn test_build_allowed_hosts_excludes_ipv6_unspecified() {
-        // :: is the new default bind address; verify it's excluded from allowlist
-        // but localhost variants are still included
+        // `::` is a wildcard bind (an explicit --ws-api-address, or the compat
+        // auto-widen; it stopped being the network-mode default in
+        // GHSA-824h-7x5x-wfmf). It must still be excluded from the Host
+        // allowlist — a wildcard names no host — while the localhost variants
+        // stay included.
         let hosts = build_allowed_hosts(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 7509, &[]);
         assert!(!hosts.contains("::"));
         assert!(!hosts.contains("[::]:7509"));
@@ -1396,5 +1274,105 @@ mod tests {
                 .unwrap();
             assert_eq!(body, MARKER, "wrong server answered {url}");
         }
+    }
+
+    /// The router must be built from the NODE'S configured webapp cache root.
+    ///
+    /// This one line is what makes every production node and every
+    /// `#[freenet_test]` node sweep its own directory. Substituting
+    /// `crate::config::default_webapp_cache_dir()` for
+    /// `config.webapp_cache_dir` here compiles, type-checks, and leaves the
+    /// whole suite green while silently reinstating a bug this change has
+    /// already fixed twice: `cargo test -p freenet` would go back to
+    /// LRU-EVICTING the developer's real `~/.cache/freenet/webapp_cache`, via
+    /// `tests/playwright_shell.rs`, which boots a real node and fetches a shell
+    /// page on a plain `cargo test`. A ready-made template for exactly that
+    /// substitution sits in `client_api.rs::as_router`, where the same call is
+    /// legitimate (standalone router composition).
+    ///
+    /// The threading is a compile-time guarantee against OMISSION only: the
+    /// parameter is required and has no default anywhere in the chain, so a
+    /// caller that supplies nothing does not build. It says nothing about
+    /// SUBSTITUTION, and substitution is the mutation that matters, so the call
+    /// site needs a pin of its own. Nothing else can catch it: a test that
+    /// observed the wrong root would be observing the developer's real cache,
+    /// which is precisely what must not happen.
+    #[test]
+    fn serve_client_api_builds_the_router_with_the_configured_webapp_cache_dir() {
+        let src = production_source();
+
+        let call = concat!("as_router_with_origin", "_contracts(");
+        assert_eq!(
+            src.matches(call).count(),
+            1,
+            "pin guard: expected exactly one router-construction call in this \
+             file, so this test is asserting against the wrong thing"
+        );
+        let args = call_arguments(&src, call);
+        assert!(
+            args.contains(concat!("config.webapp", "_cache_dir")),
+            "the router must be built from the node's configured cache root; \
+             found arguments `{args}`"
+        );
+
+        // And the substitution template must not exist in this file at all.
+        // `as_router` (client_api.rs) legitimately resolves the process-wide
+        // default; nothing on the node's serve path may.
+        assert!(
+            !src.contains(concat!("default_webapp", "_cache_dir")),
+            "server.rs must never resolve the process-wide webapp cache \
+             default: the node's serve path owns a directory it DELETES from, \
+             and its root has to come from the config so test nodes sweep their \
+             own temp dirs"
+        );
+    }
+
+    /// Production half of this file, comment-stripped and whitespace-collapsed,
+    /// for the source pin above.
+    ///
+    /// Cut at `mod tests {`, NOT at `#[cfg(test)]`: that attribute also sits on
+    /// individual test-only items (`path_handlers.rs` has three above its test
+    /// module), so cutting there lands wherever the first one happens to be and
+    /// silently truncates the slice a pin reads, which turns the pin vacuous
+    /// rather than red. Comments are dropped before collapsing so a `//` line
+    /// cannot run into the code below it, and whitespace is collapsed so
+    /// rustfmt re-wrapping a call's arguments cannot rot a needle. The needle
+    /// for the cut is split so it cannot match its own source through
+    /// `include_str!`.
+    fn production_source() -> String {
+        const FULL: &str = include_str!("server.rs");
+        let cutoff = FULL
+            .find(concat!("mod ", "tests {"))
+            .expect("server.rs must have a test module");
+        FULL[..cutoff]
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// The balanced-parenthesis argument list of the (single) call to
+    /// `call_prefix` within `src`.
+    fn call_arguments(src: &str, call_prefix: &str) -> String {
+        let start = src
+            .find(call_prefix)
+            .unwrap_or_else(|| panic!("could not find {call_prefix}"))
+            + call_prefix.len();
+        let mut depth: i32 = 1;
+        for (offset, ch) in src[start..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[start..start + offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated call to {call_prefix}");
     }
 }

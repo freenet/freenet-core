@@ -69,11 +69,20 @@ pub(crate) trait ContractStoreBridge {
     /// disk budget. See [`super::ContractStore::code_blob_stored`] (#4218).
     fn code_blob_stored(&self, code_hash: &CodeHash) -> bool;
 
+    /// The store's ONE ingress for the durable instance→code index.
+    ///
+    /// This is deliberately the only index-writing method on this trait. An
+    /// `ensure_key_indexed` sibling used to sit here, which wrote that row with
+    /// none of the preconditions `store_contract` enforces, so the executor's
+    /// "code already on disk, index this new instance" branch was an unguarded
+    /// second ingress to the row the guarded path protects. `store_contract`'s
+    /// own fast paths already do that indexing when the blob is present, so the
+    /// second entry point bought nothing and cost two invariants (see
+    /// `ContractStore::verify_contract_identity` and #5280). Do not add another
+    /// index writer here.
     fn store_contract(&mut self, contract: ContractContainer) -> Result<(), anyhow::Error>;
 
     fn remove_contract(&mut self, key: &ContractKey) -> Result<(), anyhow::Error>;
-
-    fn ensure_key_indexed(&mut self, key: &ContractKey) -> Result<(), anyhow::Error>;
 }
 
 /// Combined trait: WASM execution + contract storage. Implemented by `Runtime`
@@ -324,12 +333,32 @@ impl ContractRuntimeInterface for super::Runtime {
     }
 }
 
-/// Convert a WasmError from the engine into the appropriate RuntimeResult error.
-fn classify_result(result: Result<i64, WasmError>) -> RuntimeResult<i64> {
+/// Convert a `WasmError` from the engine into the canonical [`RuntimeResult`]
+/// error. Timeout and out-of-gas get their dedicated [`ContractExecError`]
+/// representations; everything else keeps the generic conversion.
+///
+/// Generic over the success type so it can normalize BOTH the merge/validate
+/// `i64` returns AND the guest-entry setup calls (`create_instance` →
+/// `InstanceHandle`, `initiate_buffer` → `i64`). Routing the guest-entry calls
+/// through here is load-bearing (#4864 round-5): an epoch interrupt during a
+/// runaway module start function / allocator surfaces as [`WasmError::Timeout`],
+/// and MUST normalize to [`ContractExecError::MaxComputeTimeExceeded`] — the same
+/// canonical representation the blocking merge path produces — so
+/// `ExecutorError::is_wasm_timeout` recognizes it and the merge-failure backoff
+/// picks the contract-wide Timeout class. The generic `WasmError` → `ContractError`
+/// conversion instead formats Timeout as "execution timeout", which
+/// `is_wasm_timeout` does NOT match, so the timeout would wrongly get the
+/// per-sender Invalid class.
+pub(crate) fn classify_result<T>(result: Result<T, WasmError>) -> RuntimeResult<T> {
     match result {
         Ok(value) => Ok(value),
         Err(WasmError::OutOfGas) => Err(ContractExecError::OutOfGas.into()),
         Err(WasmError::Timeout) => Err(ContractExecError::MaxComputeTimeExceeded.into()),
+        // #4864 round-6: a scheduler-overload timeout (guest never ran, blocking-
+        // pool saturation) maps to its own transient variant. The op_ctx_task
+        // record site excludes it from the merge-failure backoff, so it is NOT
+        // quarantined contract-wide the way a real Timeout is.
+        Err(WasmError::SchedulerOverloaded) => Err(ContractExecError::SchedulerOverloaded.into()),
         Err(e) => Err(e.into()),
     }
 }

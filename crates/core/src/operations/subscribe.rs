@@ -523,9 +523,28 @@ pub(super) async fn finalize_originator_subscribe(
         .get_peer_by_addr(upstream_addr)
     {
         let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
-        let is_new = op_manager
+        // Refresh-if-present, register-if-absent. A bare `register_peer_interest`
+        // inserts a fresh `PeerInterest` over an existing entry and WIPES its
+        // cached delta-sync summary, which then reports `NeverPopulated` and
+        // forces every subsequent broadcast to this peer back to full state.
+        // Renewals reach here at `SUBSCRIPTION_RENEWAL_INTERVAL` (120s) against
+        // an 8-minute lease, so the unguarded form clobbered ~30x per subscribed
+        // contract per hour. Same guard as `node.rs`'s Interests handler and the
+        // downstream registration below.
+        let is_new = if op_manager
             .interest_manager
-            .register_peer_interest(&key, peer_key, None, true);
+            .refresh_peer_interest_with_upstream(&key, &peer_key, true)
+        {
+            false
+        } else {
+            op_manager.interest_manager.register_peer_interest_from(
+                &key,
+                peer_key,
+                None,
+                true,
+                crate::ring::interest::InterestRegistrationSource::SubscribeOriginator,
+            )
+        };
         if is_new {
             // #4359 (MUST-FIX 1): this upstream peer is now a viable broadcast
             // target. If a fresh-contract PUT gave up with no targets and is
@@ -653,18 +672,42 @@ pub(crate) async fn register_downstream_subscriber(
         });
 
     if let Some(peer_key) = peer_key {
-        if op_manager
+        let outcome = op_manager
             .ring
-            .add_downstream_subscriber(key, peer_key.clone())
-        {
-            let is_new_peer = op_manager
+            .add_downstream_subscriber(key, peer_key.clone());
+        if !matches!(outcome, crate::ring::AddSubscriberOutcome::Rejected) {
+            // Register protocol interest WITHOUT clobbering an existing
+            // entry's cached summary: `register_peer_interest` inserts a
+            // fresh `PeerInterest` with `summary = None`, so calling it for
+            // an already-tracked peer (every ~8-min lease renewal, or a
+            // #4952 delivery-seeded co-host formally subscribing) wiped the
+            // summary and forced the next broadcast back to full state.
+            // One acquisition via the refresh's own bool — see
+            // `InterestManager::refresh_peer_interest` for why the
+            // `get_peer_interest(..).is_some()` form it replaces was both
+            // expensive (it clones the cached summary) and racy.
+            if !op_manager
                 .interest_manager
-                .register_peer_interest(key, peer_key, None, false);
-            // Only increment downstream count for genuinely new peers, not
-            // renewals. add_downstream_subscriber (hosting) returns true for
-            // both new and renewed peers, so use register_peer_interest's
-            // is_new return to avoid over-counting on renewal cycles.
-            if is_new_peer {
+                .refresh_peer_interest(key, &peer_key)
+            {
+                op_manager.interest_manager.register_peer_interest_from(
+                    key,
+                    peer_key,
+                    None,
+                    false,
+                    crate::ring::interest::InterestRegistrationSource::SubscribeDownstream,
+                );
+            }
+            // Key the demand-counter increment on HOSTING-map newness
+            // (NewAdd vs Renewal), NOT on interest-map newness: a #4952
+            // summary-upserted entry makes interest-map newness unreliable
+            // (a delivery-seeded co-host that later genuinely subscribes is
+            // not "new" there but IS new demand), and an interest entry that
+            // TTL-expired mid-lease would double-count on re-registration.
+            // The decrement side is keyed to hosting-map removal/expiry
+            // (`handle_unsubscribe_inbound`, lease sweep), so this pairing
+            // is exactly balanced.
+            if matches!(outcome, crate::ring::AddSubscriberOutcome::NewAdd) {
                 // #4359: a fresh-contract PUT whose initial broadcast found no
                 // targets is stashed by the fan-out handler. This new
                 // downstream subscriber is the first viable target — flush the
@@ -803,9 +846,23 @@ pub(super) async fn finalize_host_subscribe(
     // promptly. `is_new` marks a freshly-viable broadcast target → flush any
     // deferred fresh-contract broadcast (#4359), same as the originator.
     if let Some(peer_key) = upstream_peer {
-        let is_new = op_manager
+        // Refresh-if-present, register-if-absent — see the identical guard in
+        // `finalize_originator_subscribe`. A bare `register_peer_interest` here
+        // wipes the cached summary on every renewal.
+        let is_new = if op_manager
             .interest_manager
-            .register_peer_interest(&key, peer_key, None, true);
+            .refresh_peer_interest_with_upstream(&key, &peer_key, true)
+        {
+            false
+        } else {
+            op_manager.interest_manager.register_peer_interest_from(
+                &key,
+                peer_key,
+                None,
+                true,
+                crate::ring::interest::InterestRegistrationSource::SubscribeRelay,
+            )
+        };
         if is_new {
             op_manager.flush_pending_broadcast_on_interest(&key).await;
         }
@@ -877,10 +934,21 @@ pub(crate) async fn handle_unsubscribe_inbound(
 
     if let Some(peer) = &sender_peer {
         let was_downstream = op_manager.ring.remove_downstream_subscriber(&key, peer);
-        let was_interested = op_manager.interest_manager.remove_peer_interest(&key, peer);
-        // Only decrement downstream count if the peer was actually tracked,
-        // to stay in sync with the increment in register_downstream_subscriber.
-        if was_downstream || was_interested {
+        // Interest-entry removal is unconditional cleanup, but it must NOT
+        // gate the demand decrement: the counter increments only on a
+        // hosting-map NewAdd (`register_downstream_subscriber`), so decrement
+        // only on hosting-map removal. Interest entries exist for peers that
+        // never incremented demand — heartbeat `Interests` registrations and
+        // #4952 delivery-seeded co-hosts — and a late/duplicate Unsubscribe
+        // from one of those (or from a peer the lease sweep already
+        // decremented) would otherwise steal a decrement from a real
+        // subscriber's count and under-report demand to eviction ranking.
+        let _was_interested = op_manager.interest_manager.remove_peer_interest_for(
+            &key,
+            peer,
+            crate::ring::interest::InterestRemovalCause::Unsubscribe,
+        );
+        if was_downstream {
             let lost_interest = op_manager
                 .interest_manager
                 .remove_downstream_subscriber(&key);

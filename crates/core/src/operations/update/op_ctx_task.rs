@@ -12,18 +12,22 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use either::Either;
 use freenet_stdlib::client_api::{ContractResponse, ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
 use crate::client_events::HostResult;
-use crate::config::GlobalExecutor;
+use crate::config::{GlobalExecutor, GlobalRng};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::message::{DeltaOrFullState, InterestMessage, NetMessage, NodeEvent, Transaction};
 use crate::node::OpManager;
 use crate::operations::OpError;
 use crate::operations::bootstrap::bootstrap_gateway_target;
+use crate::ring::interest::RESYNC_REQUEST_MIN_INTERVAL;
 use crate::ring::{PeerKeyLocation, RingError};
 use crate::tracing::{NetEventLog, OperationFailure, state_hash_full};
 
@@ -174,6 +178,17 @@ async fn drive_client_update(
 ) -> Result<DriverOutcome, OpError> {
     let sender_addr = op_manager.ring.connection_manager.peer_addr()?;
 
+    // Whether this client update is a pure DELTA — the only convergence-proving
+    // merge, per the strictly-delta-only backoff-reset rule (#4861). Captured
+    // before `update_data` is moved into `update_contract` below; used to clear
+    // the merge-failure backoff when a local client's delta recovers a contract
+    // (#4864 review P2). A client full-state (State) update just replaces state
+    // and proves nothing, so it does NOT reset.
+    let is_delta_update = matches!(
+        &update_data,
+        UpdateData::Delta(_) | UpdateData::RelatedDelta { .. }
+    );
+
     // --- Find target peer (proximity cache → ring routing) ---
     // Mirrors request_update's target selection at update.rs:1871-1995.
 
@@ -270,21 +285,46 @@ async fn drive_client_update(
             // eviction). Surface the missing-params case explicitly
             // so operators can correlate the inconsistency, instead
             // of letting it bubble as an opaque OpError.
-            let UpdateExecution {
-                value: _,
-                summary,
-                changed,
-                ..
-            } = match super::update_contract(
+            let UpdateExecution { value: _, changed } = match super::update_contract(
                 op_manager,
                 key,
                 update_data,
                 related_contracts,
                 crate::contract::Priority::ClientLocal,
+                crate::node::ApplyOrigin::ClientLocal,
+                // #5147: no upstream sender, so nothing is covered. An EMPTY
+                // registration is not the same as no registration — it collapses
+                // any concurrent relayed coverage for this contract, so a local
+                // update is never suppressed against someone else's target list.
+                crate::ring::broadcast_coverage::BroadcastOrigin::local(),
             )
             .await
             {
-                Ok(execution) => execution,
+                Ok(execution) => {
+                    // A successful client-local DELTA merge proves the contract's
+                    // merge works now — clear any merge-failure backoff so inbound
+                    // broadcasts resume (#4864 review P2, delta-only).
+                    if is_delta_update {
+                        // Contract-wide clear only when the state advanced
+                        // (execution.changed) — a no-op client delta must not
+                        // wipe a live Timeout quarantine (#4864 round-4).
+                        op_manager
+                            .ring
+                            .merge_backoff
+                            .record_success_local(key.id(), execution.changed);
+                    } else if execution.changed {
+                        // #4864 round-9 item 3: a CHANGED client FULL-STATE apply
+                        // advances the state, invalidating the failed-payload MEMO's
+                        // premise — clear ONLY the memo (mirrors the relay + streaming
+                        // + resync paths). NOT a backoff reset (fork-flip no-reset
+                        // doctrine holds); gated on execution.changed.
+                        op_manager
+                            .ring
+                            .merge_backoff
+                            .invalidate_payload_memo(key.id());
+                    }
+                    execution
+                }
                 Err(err) if err.is_missing_contract_parameters() => {
                     tracing::error!(
                         tx = %client_tx,
@@ -326,11 +366,23 @@ async fn drive_client_update(
 
             // BroadcastStateChange is emitted automatically by the executor
             // inside update_contract → commit_state_update.
+            //
+            // #4923: fetch the contract's REAL summary for the client
+            // response — never the state relabeled as a summary. Fetched
+            // AFTER the update committed, so under concurrency it may
+            // describe a state slightly NEWER than the one this update
+            // produced (another update can land between commit and
+            // summarize). Harmless for consumers: the summary is an opaque
+            // advisory snapshot of "current state after your update", not a
+            // receipt for the exact merged bytes.
+            let summary = super::contract_summary_or_empty(
+                op_manager,
+                key,
+                crate::contract::Priority::ClientLocal,
+            )
+            .await;
             let host_result: HostResult = Ok(HostResponse::ContractResponse(
-                ContractResponse::UpdateResponse {
-                    key,
-                    summary: summary.clone(),
-                },
+                ContractResponse::UpdateResponse { key, summary },
             ));
             Ok(DriverOutcome::Publish(host_result))
         }
@@ -363,16 +415,42 @@ async fn drive_client_update(
                 update_data.clone(),
                 related_contracts.clone(),
                 crate::contract::Priority::ClientLocal,
+                crate::node::ApplyOrigin::ClientLocal,
+                // #5147: no upstream sender, so nothing is covered. An EMPTY
+                // registration is not the same as no registration — it collapses
+                // any concurrent relayed coverage for this contract, so a local
+                // update is never suppressed against someone else's target list.
+                crate::ring::broadcast_coverage::BroadcastOrigin::local(),
             )
             .await;
 
             let UpdateExecution {
                 value: updated_value,
-                summary,
                 changed: _,
-                ..
             } = match local_apply {
-                Ok(execution) => execution,
+                Ok(execution) => {
+                    // Successful client-local DELTA merge on the remote-target
+                    // path clears the backoff too (#4864 review P2, delta-only).
+                    if is_delta_update {
+                        // Contract-wide clear only when the state advanced
+                        // (execution.changed) — a no-op client delta must not
+                        // wipe a live Timeout quarantine (#4864 round-4).
+                        op_manager
+                            .ring
+                            .merge_backoff
+                            .record_success_local(key.id(), execution.changed);
+                    } else if execution.changed {
+                        // #4864 round-9 item 3: a CHANGED client FULL-STATE apply on
+                        // the remote-target path invalidates the failed-payload MEMO
+                        // premise — clear ONLY the memo (mirrors the other paths).
+                        // NOT a backoff reset; gated on execution.changed.
+                        op_manager
+                            .ring
+                            .merge_backoff
+                            .invalidate_payload_memo(key.id());
+                    }
+                    execution
+                }
                 Err(err) => {
                     // The wire format `UpdateMsg::RequestUpdate.value:
                     // WrappedState` carries a post-merge full state, so this
@@ -508,11 +586,18 @@ async fn drive_client_update(
                 "update: forwarded to target, operation complete"
             );
 
+            // #4923: same as the local-only arm — fetch the contract's REAL
+            // summary post-commit for the client response (may describe a
+            // slightly newer state under concurrency; harmless, see the
+            // local-only arm's comment).
+            let summary = super::contract_summary_or_empty(
+                op_manager,
+                key,
+                crate::contract::Priority::ClientLocal,
+            )
+            .await;
             let host_result: HostResult = Ok(HostResponse::ContractResponse(
-                ContractResponse::UpdateResponse {
-                    key,
-                    summary: summary.clone(),
-                },
+                ContractResponse::UpdateResponse { key, summary },
             ));
             Ok(DriverOutcome::Publish(host_result))
         }
@@ -672,6 +757,107 @@ pub(crate) async fn start_relay_request_update(
     Ok(())
 }
 
+/// Resolve an originator's target list against the peers we could ourselves
+/// broadcast this contract to (#5147).
+///
+/// Resolves against `advertised_cohost_pub_keys` — the exact set
+/// `get_broadcast_targets_update` draws from — rather than every connected
+/// peer, so the work is proportional to the fan-out (median 16-17) instead of
+/// the connection count, and a named peer we would never have targeted costs
+/// nothing.
+///
+/// `tx` is the transaction the list arrived on. The hashes are seeded with it,
+/// so resolving under any other transaction yields nothing; that is what stops
+/// a list from being replayed onto a different broadcast.
+///
+/// # Both halves are behind the #5147 version gate, including the sender
+///
+/// The sender exclusion needs no wire change of its own — it is a decision
+/// about our OWN fan-out — so it would ship unconditionally if left ungated.
+/// It is gated anyway, and deliberately:
+///
+/// * It has the same unsafe shape as the target list. Excluding the peer that
+///   delivered a payload assumes it holds what we are about to send, and on a
+///   merge path our post-merge state can be strictly newer than what it sent
+///   us. That is the same assumption the target list makes, so it deserves the
+///   same caution rather than inheriting the list's without its gate.
+/// * Ungated, it would reach every peer on the floor release with none of the
+///   machinery that makes the rest of this reviewable — no sim override, so no
+///   simulation could turn it off to get a baseline, and no version floor, so
+///   no staged rollout.
+///
+/// Gating on the SENDER's version is the coherent choice: if the peer that
+/// delivered this payload predates the feature, we are in the legacy world
+/// with it and behave toward it exactly as today. An unknown version fails
+/// closed, which on a gateway link is the common case until #5161 deploys.
+/// NOTE: `pub(crate)` rather than private, and deliberately NOT reached through
+/// a test-only shim, so a unit test in `node::op_state_manager` drives the real
+/// gate.
+///
+/// A test-gated item must not be introduced above this point in the file. The
+/// source-scrape pins below slice production code with `production_source`,
+/// which truncates the file at the first test-gate attribute, so an earlier one
+/// silently hides every function after it from those pins — they then fail with
+/// "could not find ...", or worse, pass vacuously. Note the attribute must not
+/// be spelled out in prose here either: `production_source` matches the literal
+/// text, so even a comment mentioning it truncates the slice. That is not
+/// hypothetical; writing this warning the obvious way broke four pins.
+pub(crate) fn resolve_covered_peers(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    tx: &Transaction,
+    sender_addr: SocketAddr,
+    covered: &crate::ring::broadcast_coverage::CoveredPeers,
+) -> crate::ring::broadcast_coverage::BroadcastOrigin {
+    // The two halves are gated SEPARATELY, and conflating them is what made the
+    // whole feature inert. See `BroadcastOrigin::relayed_list_only`.
+    //
+    // The covered LIST is self-gating: it rides only on the V2 variants, so a
+    // pre-floor sender hands us an empty one and suppresses nothing no matter
+    // what we do here. Holding a populated list IS proof the sender supports the
+    // feature — its own act, rather than our record of it.
+    //
+    // The sender EXCLUSION keeps the version gate — but as a ROLLOUT SWITCH,
+    // not as wire or semantic safety, and it is worth being exact because the
+    // obvious reading is wrong. Not sending a peer a message cannot break its
+    // decoding, so there is no wire-compat exposure to fail closed against; and
+    // the semantic worry (our post-merge state can be newer than what the
+    // sender gave us) is version-INDEPENDENT — a post-floor sender has exactly
+    // the same property, and that is the risk the list half accepts and the
+    // multi-writer simulation validates. What the gate buys is a staged rollout
+    // and a sim toggle, both of which are worth having on a change with this
+    // blast radius.
+    //
+    // Consequence to keep in view: on an unknown-version link we honour the
+    // sender's list while still echoing back to the sender itself — suppressing
+    // legs that are only probably redundant, while keeping the one that is
+    // certainly redundant. At the fleet median fan-out of 16-17 that is roughly
+    // 6% of legs left on the table, on the gateway links that matter most,
+    // until #5167 propagates.
+    let resolved = if covered.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        let candidates = op_manager.advertised_cohost_pub_keys(key);
+        covered.resolve(tx, candidates.iter())
+    };
+
+    if op_manager
+        .ring
+        .connection_manager
+        .supports_broadcast_target_list(sender_addr)
+    {
+        crate::ring::broadcast_coverage::BroadcastOrigin::relayed(sender_addr, resolved)
+    } else {
+        // Pre-floor or UNKNOWN sender version. Unknown is the common case, not a
+        // corner: a node does not learn its gateway's version until #5167
+        // propagates, and simulations default that ack gate OFF. Gating the list
+        // on this lookup too discarded a claim the message in hand had already
+        // proven honourable, which zeroed suppression on the highest-degree
+        // links in production and entirely in simulation.
+        crate::ring::broadcast_coverage::BroadcastOrigin::relayed_list_only(resolved)
+    }
+}
+
 /// Spawn a relay driver for a fresh inbound `UpdateMsg::BroadcastTo`.
 ///
 /// Same gates as `start_relay_request_update`. The driver applies the
@@ -679,6 +865,7 @@ pub(crate) async fn start_relay_request_update(
 /// `BroadcastStateChange` event fans out to other interested peers
 /// automatically — the driver itself never sends `BroadcastTo`
 /// downstream.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_relay_broadcast_to(
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
@@ -686,6 +873,9 @@ pub(crate) async fn start_relay_broadcast_to(
     payload: DeltaOrFullState,
     sender_summary_bytes: Vec<u8>,
     sender_addr: SocketAddr,
+    // Peers the sender says it already delivered to (#5147). Empty for the
+    // legacy `BroadcastTo`, which names none.
+    covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) -> Result<(), OpError> {
     #[cfg(any(test, feature = "testing"))]
     RELAY_UPDATE_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -732,6 +922,7 @@ pub(crate) async fn start_relay_broadcast_to(
         payload,
         sender_summary_bytes,
         sender_addr,
+        covered,
     ));
     Ok(())
 }
@@ -797,6 +988,7 @@ async fn run_relay_request_update(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_relay_broadcast_to(
     guard: RelayUpdateInflightGuard,
     op_manager: Arc<OpManager>,
@@ -805,6 +997,7 @@ async fn run_relay_broadcast_to(
     payload: DeltaOrFullState,
     sender_summary_bytes: Vec<u8>,
     sender_addr: SocketAddr,
+    covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) {
     let _guard = guard;
 
@@ -815,6 +1008,7 @@ async fn run_relay_broadcast_to(
         payload,
         sender_summary_bytes,
         sender_addr,
+        covered,
     )
     .await
     {
@@ -895,15 +1089,19 @@ async fn drive_relay_request_update(
         // update and needs to receive the result via subscription.
         let UpdateExecution {
             value: updated_value,
-            summary: _,
             changed,
-            ..
         } = super::update_contract(
             op_manager,
             key,
             UpdateData::State(State::from(value.clone())),
             related_contracts.clone(),
             crate::contract::Priority::NetworkRelay,
+            crate::node::ApplyOrigin::NetworkRelay,
+            // #5147: a `RequestUpdate` names no delivery targets (it is a
+            // routed request, not a fan-out), so this apply attests to no
+            // coverage. Registering empty is deliberate — see the two
+            // client-local sites.
+            crate::ring::broadcast_coverage::BroadcastOrigin::local(),
         )
         .await?;
 
@@ -1045,6 +1243,617 @@ async fn drive_relay_request_update(
     Ok(())
 }
 
+/// Why an inbound broadcast was dropped, for
+/// [`send_dropped_broadcast_resync_request`]'s telemetry.
+///
+/// The repair is identical for both — the sender's summary cache is poisoned
+/// the same way either way — but the OPERATOR reading `resync_request_sent`
+/// needs to tell them apart: a queue-full drop means this node's executor is
+/// saturated, a rate-limited drop means the `(sender, contract)` pair exceeded
+/// the dispatch budget in `crate::ring::update_rate_limit`. Those call for
+/// different responses, so they must not share one label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DroppedBroadcastReason {
+    /// `ContractQueueFull` from the executor (#4857).
+    QueueFull,
+    /// Refused by the per-(sender, contract) UPDATE dispatch rate limiter
+    /// in `node.rs` before any driver ran (#5510).
+    RateLimited,
+}
+
+impl DroppedBroadcastReason {
+    /// Stable telemetry label. `"queue_full"` is preserved verbatim from the
+    /// pre-#5510 log line so existing operator greps keep working.
+    fn as_str(self) -> &'static str {
+        match self {
+            DroppedBroadcastReason::QueueFull => "queue_full",
+            DroppedBroadcastReason::RateLimited => "rate_limited",
+        }
+    }
+}
+
+/// On a DROPPED inbound broadcast, emit a RATE-LIMITED `ResyncRequest` to the
+/// sender so it clears its poisoned summary cache of us and re-sends the change
+/// it believes we already have (#4857, #5510).
+///
+/// Two distinct drops land here, and the reason they need the SAME repair is
+/// the reason they are handled by one helper:
+///
+/// - `ContractQueueFull` at the executor (#4857) — the delta / full state
+///   reached this node but was never applied.
+/// - Refusal by the dispatch rate limiter in `node.rs` (#5510) — the payload
+///   never even reached a driver. `reason` distinguishes the two in telemetry;
+///   see `DroppedBroadcastReason`.
+///
+/// Both are SILENT to the sender: it cached its own summary as ours on send-Ok
+/// (`broadcast_queue.rs::record_delivery_to_interest`), so it believes we are
+/// current and will never re-send the dropped change. Since #5464 the payload
+/// is a true difference against that belief, so once the belief is wrong the
+/// lost entries are excluded from every LATER delta too — the divergence is
+/// permanent, not just delayed. Left unhealed, a rarely-changing field
+/// (member_info, a ban, a config) diverges until the InterestSync heartbeat
+/// happens to correct it, which is 300s at minimum and 40-75 min at field
+/// shared-set sizes since #5238/#5346. An inbound `ResyncRequest` makes the
+/// sender clear that cached summary (node.rs handler) and re-send full state.
+///
+/// The `ResyncRequest` this emits, and the `ResyncResponse` it provokes, both
+/// ride `NetMessageV1::InterestSync` — NOT `NetMessageV1::Update` — so neither
+/// is subject to the UPDATE dispatch rate limiter that caused the #5510 drop.
+/// The repair therefore cannot be silenced by the condition it repairs. do NOT
+/// move this repair onto an `Update` wire variant.
+///
+/// Issue #4251 suppressed this entirely because one request per dropped delta
+/// amplifies into a full-state storm onto the same saturated queue (~40
+/// ResyncRequests/sec on a hot contract). The rate limit
+/// (`InterestManager::begin_resync_request`) bounds that to at most one
+/// request per (contract, sender) per `RESYNC_REQUEST_MIN_INTERVAL`.
+///
+/// Shared by both broadcast drivers (`drive_relay_broadcast_to` and
+/// `drive_relay_broadcast_to_streaming`) and by the `node.rs` rate-limiter drop
+/// arm, so the three drop paths cannot drift. The queue-full callers keep
+/// auto-fetch suppressed (we already hold the contract; a GET onto the same
+/// saturated queue is pure amplification).
+///
+/// do NOT re-add an unthrottled emission — see #4251/#4857.
+pub(crate) async fn send_dropped_broadcast_resync_request(
+    op_manager: &OpManager,
+    key: ContractKey,
+    sender_addr: SocketAddr,
+    incoming_tx: Transaction,
+    reason: DroppedBroadcastReason,
+) {
+    // Gate 1 — per-(contract, sender)/30s throttle (#4857/#4862 + #4864 round-6).
+    // RESERVE the window atomically (`begin` checks AND records under the
+    // throttle's own lock) and return the reservation deadline on the throttle's
+    // OWN clock (the #4862 retry anchors to it). Two concurrent queue-full
+    // callbacks for the same (contract, sender) cannot both pass. If the global
+    // cap below then rejects, we `cancel` the reservation so the window is
+    // released (not burned).
+    let Some(reservation_deadline) = op_manager
+        .interest_manager
+        .begin_resync_request(&key, sender_addr)
+    else {
+        // Per-(contract, sender)/30s throttle (existing #4857 bound).
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            sender = %sender_addr,
+            event = "queue_full_resync_throttled",
+            reason = reason.as_str(),
+            "UPDATE relay: dropped-broadcast ResyncRequest throttled (rate limit) to avoid amplification"
+        );
+        return;
+    };
+
+    // ALSO subject to the GLOBAL per-contract emit cap (#4864 round-4 P1): the
+    // #4857 queue-full heal path previously bypassed it, so a saturated contract
+    // with many senders still emitted per-(contract, sender)/30s. Routing it
+    // through resync_emit_limiter bounds the contract's TOTAL queue-full resync
+    // emission. (This is NOT a mirror of the delta-failure path — that path is
+    // global-cap-only, with no per-sender throttle. The global suppression records
+    // the same `record_resync_request_suppressed` metric node.rs does.) On
+    // suppression, CANCEL the reservation so the per-sender window is released and
+    // the sender retries as soon as global tokens refill.
+    if !op_manager
+        .ring
+        .resync_emit_limiter
+        .check_and_record(*key.id())
+    {
+        op_manager
+            .interest_manager
+            .cancel_resync_request(&key, sender_addr);
+        crate::config::GlobalTestMetrics::record_resync_request_suppressed();
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            sender = %sender_addr,
+            event = "queue_full_resync_suppressed_global",
+            reason = reason.as_str(),
+            "UPDATE relay: dropped-broadcast ResyncRequest suppressed by global per-contract cap"
+        );
+        return;
+    }
+
+    // Both gates passed → the reservation stands (already recorded by `begin`).
+    tracing::info!(
+        tx = %incoming_tx,
+        contract = %key,
+        target = %sender_addr,
+        event = "resync_request_sent",
+        reason = reason.as_str(),
+        "UPDATE relay: sending rate-limited ResyncRequest after a dropped inbound \
+         broadcast (#4857/#5510)"
+    );
+    // #4864 round-8: record the outstanding request so the matching ResyncResponse
+    // from this peer is authorized ONCE at the receive arm; an unsolicited or
+    // replayed response finds no entry and is dropped without running WASM.
+    //
+    // #4863: this MUST stay ABOVE the retry spawn below. The retry's conditional
+    // gate READS this record to decide whether the first request already landed
+    // (the receive arm consumes it on a matching ResyncResponse), so a retry task
+    // that could observe a not-yet-written record would conclude "landed" and skip
+    // the heal. Recording first makes that race structurally impossible; pinned by
+    // `queue_full_resync_retry_is_bounded_and_reservation_scoped`. Recording is a
+    // non-blocking map insert, so it does not delay the spawn (#4862 P2).
+    // `false` = the strict cap rejected a brand-new key, so the request is
+    // UNCORRELATED. The retry's gate must then fall back to unconditional
+    // re-dispatch: `is_outstanding` would read `false` forever, and reading that
+    // as "landed" would silently disable the retry node-wide while the map is
+    // full. A re-dispatch still heals when uncorrelated — the responder clears
+    // its cached summary on the ResyncRequest itself (#4857), independently of
+    // our correlation record; only the full-state ResyncResponse needs it.
+    let correlated = op_manager
+        .ring
+        .outstanding_resync_requests
+        .record(*key.id(), sender_addr);
+
+    // #4862 (P2): the immediate ResyncRequest below rides a LOSSY path
+    // (`notify_node_event` → event loop → `P2pBridge::try_send`), which can drop
+    // it under the SAME backpressure that caused the queue-full drop. If dropped,
+    // the sender never clears its poisoned summary and a one-off change diverges
+    // until the ~5-min heartbeat. Schedule a BOUNDED trailing re-dispatch so the
+    // resync gets more chances to land — well before the heartbeat.
+    //
+    // Spawn CONCURRENTLY, BEFORE the blocking immediate enqueue below (#4862 P2):
+    // `notify_node_event(...).await` can consume up to NOTIFICATION_SEND_TIMEOUT
+    // (30s) under backpressure; spawning after it would let the task start with
+    // the window already gone (`now >= reservation_deadline`) and do nothing. The
+    // first attempt is a jittered delay out (never t=0), so it does not duplicate
+    // the immediate send, and it stays anchored to `reservation_deadline` (the
+    // throttle's own clock) so it can NEVER spill into a new reservation. The
+    // retries re-deliver the ONE already-authorized emit, so they do NOT
+    // re-consult the per-sender throttle or the global emit cap and do NOT
+    // re-record the correlation entry recorded above.
+    //
+    // #4863: each attempt is CONDITIONAL on that correlation entry still being
+    // outstanding, so a retry fires only while the first request is NOT observed
+    // to have landed.
+    //
+    // #4862 P1: gate the spawn on a node-wide retry-task slot so the throttle LRU
+    // evicting active reservations under key churn cannot spawn unbounded
+    // overlapping tasks. At cap ONLY the retry is skipped; the immediate send
+    // below still fires. Fire-and-forget; the slot guard frees on completion.
+    if let Some(slot) = op_manager.interest_manager.try_reserve_resync_retry_slot() {
+        let op_mgr = op_manager.clone();
+        GlobalExecutor::spawn(async move {
+            let _slot = slot; // frees the node-wide retry slot on task exit
+            resend_dropped_broadcast_resync_request(
+                &op_mgr,
+                key,
+                sender_addr,
+                incoming_tx,
+                reservation_deadline,
+                correlated,
+            )
+            .await;
+        });
+    }
+
+    // Immediate (first) ResyncRequest — blocking best-effort enqueue. The
+    // #4862 trailing retry above re-sends the SAME request and relies on the ONE
+    // correlation record made before the spawn — see
+    // `resend_dropped_broadcast_resync_request`.
+    if let Err(e) = op_manager
+        .notify_node_event(NodeEvent::SendInterestMessage {
+            target: sender_addr,
+            message: InterestMessage::ResyncRequest { key },
+        })
+        .await
+    {
+        tracing::warn!(
+            tx = %incoming_tx,
+            error = %e,
+            "UPDATE relay: failed to send dropped-broadcast ResyncRequest"
+        );
+    }
+}
+
+/// Maximum ADDITIONAL trailing re-dispatch attempts for a queue-full
+/// `ResyncRequest` after the immediate one (#4857 P2). Kept small so the whole
+/// retry burst for a single drop stays far below the #4251 storm: one
+/// reservation (see [`crate::ring::InterestManager::begin_resync_request`])
+/// dispatches at most `1 + QUEUE_FULL_RESYNC_MAX_RETRIES` ResyncRequests per
+/// (contract, peer) per `RESYNC_REQUEST_MIN_INTERVAL` (30s).
+const QUEUE_FULL_RESYNC_MAX_RETRIES: u32 = 2;
+
+/// Base inter-attempt delay for queue-full `ResyncRequest` retries (#4857 P2).
+///
+/// Linear backoff: the `attempt`-th retry waits ~`attempt * BASE` (±20%
+/// jitter), MEASURED ON THE THROTTLE'S CLOCK (see `resend_dropped_broadcast_resync_request`).
+/// The worst-case total span (`sum_{n=1..=MAX} n * BASE * 1.2` = 3 · 2s · 1.2 =
+/// 7.2s for the current constants) stays comfortably under
+/// `RESYNC_REQUEST_MIN_INTERVAL` (30s); the retry is ALSO hard-stopped at the
+/// reservation deadline regardless of span, so it can never spill into the next
+/// reservation. Pinned by `resync_retry_span_stays_within_throttle_window`.
+const QUEUE_FULL_RESYNC_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+
+/// Poll granularity for the injected-clock retry wait (#4857 P2).
+///
+/// The util `TimeSource` the throttle uses exposes only `now()` — no sleep — so
+/// `resend_dropped_broadcast_resync_request` waits by polling `interest_manager.now()`
+/// in bounded `tokio` increments until the injected clock reaches the attempt's
+/// target (or the reservation deadline). Small enough that a retry fires
+/// promptly once the clock reaches its target; large enough that wakeups stay
+/// negligible (a ~2s delay ⇒ ~20 polls, and the burst is throttle-bounded to
+/// one per (contract, peer) per 30s). Under an injected mock clock the wait
+/// advances only as the sim advances that clock, and `tokio` auto-advance
+/// interleaves this poll timer with the sim's own timers (bounded wakeups).
+const QUEUE_FULL_RESYNC_RETRY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Jittered delay before the `attempt`-th queue-full `ResyncRequest` retry
+/// (#4857 P2).
+///
+/// Linear backoff (`attempt * BASE`) with ±20% jitter via [`GlobalRng`]
+/// (deterministic under the simulation harness), so a load spike that drops
+/// broadcasts to MANY (contract, peer) pairs at once does not produce a
+/// synchronised retry wave onto the just-recovering bridge. Pure fn so the
+/// bounds are unit-testable without a runtime.
+fn jittered_resync_retry_delay(attempt: u32) -> Duration {
+    // Sample in [0.8, 1.2): at least the ±20% the retry/backoff rule mandates.
+    let factor: f64 = GlobalRng::random_range(0.8..1.2);
+    QUEUE_FULL_RESYNC_RETRY_BASE_DELAY.mul_f64(attempt as f64 * factor)
+}
+
+/// Trailing best-effort re-dispatch of a dropped-broadcast `ResyncRequest`
+/// (#4857 P2).
+///
+/// Runs as a short-lived fire-and-forget task spawned by
+/// [`send_dropped_broadcast_resync_request`] AFTER its immediate ResyncRequest,
+/// and ONLY when the throttle reservation was granted. It serves whichever drop
+/// caused that emit; the `queue_full_resync_retry_*` log events keep their
+/// pre-#5510 names (they are `debug!`, so they never reached a release build
+/// and no operator grep depends on them) rather than churning a mechanism this
+/// change does not alter. It re-dispatches the same
+/// ResyncRequest up to [`QUEUE_FULL_RESYNC_MAX_RETRIES`] times with jittered
+/// backoff so a resync dropped by the lossy event-loop → `P2pBridge::try_send`
+/// path still heals the divergence before the ~5-min heartbeat.
+///
+/// Anchored to the reservation window (#4857 P2, review P2-A/P2-B):
+/// `reservation_deadline` is the instant the throttle's window closes, on the
+/// SAME clock the throttle stamped it with (`interest_manager.now()` — the
+/// injected `hosting_time_source_override` in sims, the wall clock in prod).
+/// Both the inter-attempt delay and the stop condition are driven by that
+/// clock: each attempt waits until the injected clock reaches its jittered
+/// target, and the WHOLE task bails the moment the injected clock reaches
+/// `reservation_deadline`. So a burst can never cross into a new reservation —
+/// even if the caller's blocking `notify_node_event(...).await` consumed most
+/// of the window before this task was spawned — and sims that advance the
+/// injected clock see deterministic pacing. The util `TimeSource` has no sleep
+/// primitive, so the wait polls `now()` in bounded `tokio` increments
+/// ([`QUEUE_FULL_RESYNC_RETRY_POLL_INTERVAL`]).
+///
+/// DST liveness backstop: the injected deadline is PRIMARY, but a decoupled
+/// injected clock (`hosting_time_source_override`) that FREEZES before its
+/// deadline would leave the injected gates never firing and this poll spinning
+/// forever. So the task is ALSO floored at one reservation interval of tokio
+/// time (`RESYNC_REQUEST_MIN_INTERVAL` from `started`). In production the two
+/// clocks coincide and the injected stop fires first, so the floor is a no-op;
+/// it only takes effect when the injected clock stalls.
+///
+/// Conditional (#4863): each attempt re-dispatches ONLY while the caller's
+/// request is still outstanding in the correlation map. The `ResyncResponse`
+/// receive arm consumes that entry before applying, so its absence means the
+/// response arrived and was AUTHORIZED (not necessarily applied — the consume
+/// precedes the apply, which can still fail). Re-dispatching then would make the
+/// sender clear its summary and ship FULL STATE again onto a receiver whose
+/// queue was just full (up to [`QUEUE_FULL_RESYNC_MAX_RETRIES`] redundant
+/// full-state responses per drop). The check is READ-ONLY (`is_outstanding`,
+/// never `consume`): consuming the entry here would make the genuine response
+/// look unsolicited and be dropped without applying.
+///
+/// The gate applies ONLY when `correlated` — see the caller. An uncorrelated
+/// request (strict-cap rejection) reads `is_outstanding == false` forever, so
+/// gating on it unconditionally would disable this retry node-wide whenever the
+/// map is full.
+///
+/// Scale note: against a peer running >= v0.2.102 the responder's own
+/// `resync_response_limiter` already caps it at ONE full-state reply per
+/// (peer, contract) per 30s, and the whole retry burst lives inside one such
+/// window — so there the redundant responses were already suppressed at the
+/// source. The amplification this gate removes is reachable against peers older
+/// than that, i.e. it shrinks as the fleet upgrades. The gate is still worth
+/// having: it also stops the redundant REQUESTS, and it is the only bound that
+/// does not depend on the remote peer's version.
+///
+/// Storm bound (#4251 / #4864 cap): this fn RE-DELIVERS the one already-authorized
+/// emit — it deliberately does NOT call `begin_resync_request` (no new
+/// reservation), does NOT consume a `resync_emit_limiter` token (no new global
+/// emit), and does NOT re-record the correlation entry (the caller's one record
+/// authorizes the eventual response once; a redundant response is dropped by
+/// #4864 before WASM). All its sends belong to the single reservation already
+/// granted by the caller. Combined with the deadline stop, steady-state stays
+/// capped at one reservation (≤ `1 + MAX` sends) per (contract, peer) per window.
+///
+/// Uses the NON-blocking `try_notify_node_event` (bounded-channel rule): a
+/// dropped retry is covered by the next attempt or the heartbeat backstop, and
+/// blocking would keep the task alive up to `NOTIFICATION_SEND_TIMEOUT` (30s).
+///
+/// do NOT add a `begin_resync_request`/`resync_emit_limiter` call here, do NOT
+/// switch to a blocking `notify_node_event`, and do NOT drive the delay/deadline
+/// off a clock other than `interest_manager.now()` — see #4251/#4857/#4864.
+async fn resend_dropped_broadcast_resync_request(
+    op_manager: &OpManager,
+    key: ContractKey,
+    sender_addr: SocketAddr,
+    incoming_tx: Transaction,
+    reservation_deadline: Instant,
+    correlated: bool,
+) {
+    // Tokio-clock liveness backstop (DST safety). The injected `reservation_deadline`
+    // below is the PRIMARY stop, but if the injected clock is a DECOUPLED
+    // `hosting_time_source_override` that FREEZES before its deadline, the
+    // injected gates would never fire and this poll would spin forever (a
+    // `start_paused` test hangs; a real sim leaks a task per drop). tokio's clock
+    // always advances (or `start_paused` auto-advances), so cap the whole task at
+    // one reservation interval of tokio time as a floor. In production the two
+    // clocks coincide and the injected deadline — captured at reservation stamp,
+    // strictly before `started` — always fires first, so this floor is a no-op.
+    let started = tokio::time::Instant::now();
+    for attempt in 1..=QUEUE_FULL_RESYNC_MAX_RETRIES {
+        // Target wake time for THIS attempt, on the throttle's own clock, CLAMPED
+        // into the remaining reservation window (#4862 P2). A fixed
+        // `now + jittered_delay` could already be past `reservation_deadline` when
+        // the initial enqueue consumed most of the window — then the deadline
+        // check below returns with ZERO retries, exactly failing to heal the
+        // backpressure case. Clamping the delay to at most half the remaining
+        // window keeps the target strictly inside `[now, reservation_deadline)`,
+        // so a retry still fires (and the geometric shrink lets later attempts
+        // fit too). No-op in the common full-window case (jittered delay wins).
+        let now = op_manager.interest_manager.now();
+        let remaining = reservation_deadline.saturating_duration_since(now);
+        let delay = jittered_resync_retry_delay(attempt).min(remaining / 2);
+        let target = now + delay;
+
+        // Wait until the injected clock reaches `target`, bailing the instant it
+        // reaches the reservation deadline (P2-A). Interruptible-sleep note:
+        // this is an unmonitored fire-and-forget task (mirrors the step-6
+        // proactive-summary spawn) holding no locks or channel receivers; each
+        // poll sleep is cancel-safe, and the whole task is hard-bounded by BOTH
+        // the injected reservation deadline and the tokio backstop, so a runtime
+        // shutdown drops it cleanly.
+        loop {
+            let now = op_manager.interest_manager.now();
+            // PRIMARY stop: injected reservation window closed (P2-A/P2-B).
+            if now >= reservation_deadline {
+                tracing::debug!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    attempt,
+                    event = "queue_full_resync_retry_window_elapsed",
+                    "UPDATE relay: reservation window elapsed, stopping queue-full \
+                     ResyncRequest retries (#4857 P2)"
+                );
+                return;
+            }
+            if now >= target {
+                break;
+            }
+            // FLOOR: never depend solely on the injected clock — if it froze
+            // before its deadline, bail after one reservation interval of tokio
+            // time so the task can't spin. (No-op in prod; injected stop above
+            // fires first when the injected clock advances normally.)
+            if started.elapsed() >= RESYNC_REQUEST_MIN_INTERVAL {
+                tracing::debug!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    attempt,
+                    event = "queue_full_resync_retry_backstop",
+                    "UPDATE relay: tokio liveness backstop elapsed (injected clock \
+                     stalled), stopping queue-full ResyncRequest retries (#4857 P2)"
+                );
+                return;
+            }
+            tokio::time::sleep(QUEUE_FULL_RESYNC_RETRY_POLL_INTERVAL).await;
+        }
+
+        // #4863: CONDITIONAL re-dispatch. Every ResyncRequest makes the sender
+        // clear its cached summary of us and re-send FULL contract state, so a
+        // BLIND retry lands up to MAX redundant full-state ResyncResponses on a
+        // receiver whose queue was full moments ago. Re-dispatch only while the
+        // request is NOT observed to have landed.
+        //
+        // The signal is the #4864 round-8 correlation record: the ResyncResponse
+        // receive arm (node.rs) require-and-CONSUMES the (contract, sender) entry
+        // before applying, so its absence means the request landed, the sender
+        // answered, and we AUTHORIZED the answer. It observes authorization, not
+        // application — the receive arm consumes before applying and the apply can
+        // still fail — so this is not an end-to-end heal confirmation. It is still
+        // the right stop signal: a redundant response would be dropped by the
+        // consume-once gate anyway, so re-dispatching cannot repair a failed apply.
+        //
+        // Gated on `correlated` (#4863 review): when the strict cap rejected the
+        // record, `is_outstanding` reads false FOREVER, and treating that as
+        // "landed" would silently disable this retry node-wide while the map is
+        // full. Uncorrelated requests fall back to unconditional re-dispatch,
+        // which still heals — the responder clears its cached summary on the
+        // ResyncRequest itself (#4857), with no dependence on our record.
+        //
+        // Read-only on purpose: the retry must NOT consume the entry — that
+        // authorization belongs to the receive arm, and consuming it here would
+        // make the real response look unsolicited (dropped without applying).
+        //
+        // Return, don't continue: once the heal has landed every REMAINING
+        // attempt is redundant too, and returning frees the node-wide retry slot
+        // (#4862 P1) via its RAII guard instead of holding it for the rest of the
+        // window. The residual case this cannot cover is a request that landed but
+        // whose response is still in flight — bounded by the same `1 + MAX` cap as
+        // before, never worse than the blind retry it replaces.
+        if correlated
+            && !op_manager
+                .ring
+                .outstanding_resync_requests
+                .is_outstanding(*key.id(), sender_addr)
+        {
+            // info!, not debug!: `release_max_level_info` compiles debug out of
+            // release builds, and this is the ONLY field-visible signal of the
+            // gate's decision. Both the benefit (fewer redundant full-state
+            // resends) and the main risk (a gate that wrongly skips silently
+            // loses the #4857 heal) are unfalsifiable without it. Rate is
+            // bounded by the per-(contract, peer) reservation, so this cannot
+            // become a log storm.
+            tracing::info!(
+                tx = %incoming_tx,
+                contract = %key,
+                target = %sender_addr,
+                attempt,
+                event = "queue_full_resync_retry_skipped_landed",
+                "UPDATE relay: dropped-broadcast ResyncRequest already landed \
+                 (its ResyncResponse was consumed), skipping the redundant \
+                 full-state re-dispatch (#4863)"
+            );
+            return;
+        }
+
+        match op_manager.try_notify_node_event(NodeEvent::SendInterestMessage {
+            target: sender_addr,
+            message: InterestMessage::ResyncRequest { key },
+        }) {
+            Ok(()) => tracing::debug!(
+                tx = %incoming_tx,
+                contract = %key,
+                target = %sender_addr,
+                attempt,
+                event = "queue_full_resync_retry_sent",
+                "UPDATE relay: re-dispatched queue-full ResyncRequest (#4857 P2)"
+            ),
+            Err(e) => tracing::debug!(
+                tx = %incoming_tx,
+                contract = %key,
+                error = %e,
+                attempt,
+                event = "queue_full_resync_retry_dropped",
+                "UPDATE relay: queue-full ResyncRequest retry dropped (heartbeat backstops)"
+            ),
+        }
+    }
+}
+
+/// Seed our cache of a broadcast sender's summary from the wire field.
+///
+/// # Why an EMPTY wire field is never usable evidence
+///
+/// `sender_summary_bytes` is a bare `Vec<u8>` on the wire, so it cannot
+/// express "absent". Empty bytes arrive from **two** different causes and the
+/// receiver cannot tell them apart:
+///
+/// 1. **The sender could not summarize itself.** Every producer builds the
+///    field as `our_summary…unwrap_or_default()` (both arms of
+///    `broadcast_queue.rs`, plus the sim-path twins in
+///    `p2p_protoc/broadcast.rs`), so a `get_contract_summary` that returned
+///    `None` (WASM `summarize_state` error, or a contract-handler timeout at
+///    `BROADCAST_CH_TIMEOUT` under load) ships empty rather than omitting the
+///    field. This is the `PayloadArm::FullNoOurSummary` arm.
+/// 2. **The contract's summary genuinely IS empty.** Real contracts in this
+///    tree do this: `tests/test-app-1`'s container and deps return
+///    `StateSummary::from(vec![])` unconditionally, and `website-contract` /
+///    `freenet-ping` return it for empty state.
+///
+/// Neither is worth caching, for different reasons that happen to agree:
+///
+/// - In case 1 the bytes say nothing about what the peer holds, so caching
+///   them is simply false. `PeerInterest::summary_missing_reason` reports no
+///   reason for a *populated* entry, so the cache would look healthy while
+///   being wrong, and it would be invisible to the `tracked_missing_*`
+///   telemetry built to find exactly this class of staleness.
+/// - In case 2 the summary is real but carries zero information, and the
+///   fan-out path compares cached summaries **by bytes**
+///   (`plan_fanout_send`'s equal-summaries short circuit). Two peers that
+///   both summarize to empty would compare equal and skip the broadcast
+///   entirely, which is a wrongful skip: matching zero-information summaries
+///   prove nothing about convergence. Declining to cache turns that silent
+///   skip into a correct full-state send.
+///
+/// So the rule is "an empty summary is not usable evidence about the peer",
+/// which is right under either cause.
+///
+/// The sender side already takes this care — `record_delivery_to_interest`
+/// gates its own write on `if let Some(summary)` — so this closes the
+/// receiving half of the same asymmetry.
+///
+/// # Why skip rather than clear
+///
+/// Declining to cache must not destroy what we already hold. This function
+/// only ever adds information; it never removes any. That is deliberately
+/// different from [`SummaryMissingReason::ClearedByNoneReport`], which belongs
+/// to a peer that explicitly reported `None` in an InterestSync `Summaries`
+/// message: there the wire type IS `Option<Vec<u8>>`, so the `None` is a real
+/// claim about that peer and clearing is the right response.
+///
+/// For the same reason the empty path still refreshes an existing entry's TTL.
+/// A broadcast did arrive from this peer, which is liveness evidence even when
+/// the summary is not; without the refresh, an entry kept alive solely by
+/// empty-summary broadcasts would age out at `INTEREST_TTL`.
+///
+/// # Sibling sites
+///
+/// `node.rs`'s `ResyncResponse` handler also stores a possibly-empty summary,
+/// and that one is CORRECT as-is: its producer bails when it cannot summarize,
+/// so empty there is unambiguously a genuine empty summary rather than a
+/// failure. Do not "fix" it to match this function.
+///
+/// Returns whether a summary was cached.
+fn seed_sender_summary_from_broadcast(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    sender_summary_bytes: &[u8],
+    sender_addr: SocketAddr,
+) -> bool {
+    let Some(sender_pkl) = op_manager
+        .ring
+        .connection_manager
+        .get_peer_by_addr(sender_addr)
+    else {
+        return false;
+    };
+    let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
+
+    if sender_summary_bytes.is_empty() {
+        // Liveness without information: refresh an EXISTING entry's TTL, but
+        // never create one and never overwrite a good cached summary.
+        op_manager
+            .interest_manager
+            .refresh_peer_interest(key, &sender_key);
+        tracing::debug!(
+            contract = %key,
+            peer = %sender_addr,
+            "Broadcast carried an empty sender summary; refreshed the interest \
+             TTL but left the cached summary untouched"
+        );
+        return false;
+    }
+
+    // #4952: upsert — the sender self-reported this summary, and the fan-out
+    // sender population is by definition co-hosts we often don't
+    // interest-track. Seeding here lets OUR next broadcast to them be a delta
+    // without waiting for a delivered send.
+    op_manager.interest_manager.upsert_peer_summary_from(
+        key,
+        &sender_key,
+        StateSummary::from(sender_summary_bytes.to_vec()),
+        crate::ring::interest::SummaryPopulationSource::InboundBroadcast,
+    ) != crate::ring::interest::SummaryPopulationOutcome::RejectedAtCap
+}
+
 /// Inner driver for `BroadcastTo`. Mirrors `update.rs:595-825`.
 ///
 /// 1. Update sender's cached summary in `interest_manager`.
@@ -1054,6 +1863,7 @@ async fn drive_relay_request_update(
 ///    on full-state failure → `try_auto_fetch_contract`.
 /// 5. Telemetry: `update_broadcast_applied`.
 /// 6. Spawn proactive summary notification background task.
+#[allow(clippy::too_many_arguments)]
 async fn drive_relay_broadcast_to(
     op_manager: &OpManager,
     incoming_tx: Transaction,
@@ -1061,22 +1871,14 @@ async fn drive_relay_broadcast_to(
     payload: DeltaOrFullState,
     sender_summary_bytes: Vec<u8>,
     sender_addr: SocketAddr,
+    covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) -> Result<(), OpError> {
     let self_location = op_manager.ring.connection_manager.own_location();
 
-    let sender_summary = StateSummary::from(sender_summary_bytes.clone());
-
     // ── Step 1: update sender's cached summary ────────────────────────────
-    if let Some(sender_pkl) = op_manager
-        .ring
-        .connection_manager
-        .get_peer_by_addr(sender_addr)
-    {
-        let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
-        op_manager
-            .interest_manager
-            .update_peer_summary(&key, &sender_key, Some(sender_summary));
-    }
+    // Empty bytes mean the sender could not summarize itself, NOT that its
+    // summary is empty — see `seed_sender_summary_from_broadcast`.
+    seed_sender_summary_from_broadcast(op_manager, &key, &sender_summary_bytes, sender_addr);
 
     let (update_data, payload_bytes) = match &payload {
         DeltaOrFullState::Delta(bytes) => {
@@ -1100,6 +1902,9 @@ async fn drive_relay_broadcast_to(
         }
     };
     let is_delta = matches!(payload, DeltaOrFullState::Delta(_));
+    let mut receiver_terminal = op_manager
+        .payload_mix
+        .receiver_terminal_guard(is_delta, payload_bytes.len());
     let state_for_telemetry = WrappedState::from(payload_bytes.clone());
 
     // ── Step 2: telemetry — broadcast received ─────────────────────────────
@@ -1129,12 +1934,47 @@ async fn drive_relay_broadcast_to(
         is_delta,
         op_manager.interest_manager.now(),
     ) {
+        receiver_terminal.mark_dedup();
         tracing::debug!(
             tx = %incoming_tx,
             %key,
             "UPDATE relay: BroadcastTo skipped — duplicate payload (dedup hit)"
         );
         return Ok(());
+    }
+
+    // ── Step 3b: merge-failure backoff gate (#4861) ───────────────────────
+    //
+    // Quarantine "poison" contracts whose merges reliably fail/time out. While a
+    // contract is in cooldown (or this exact payload is known-failed) skip the
+    // WASM merge entirely and — critically — do NOT emit the ResyncRequest
+    // amplification or clear the sender's cached summary. Complete exactly like
+    // the dedup-skip path above. Cleared the instant a merge succeeds (below).
+    //
+    // The payload hash is computed EAGERLY even on the common Allow path (#4864
+    // review declined lazy-hash suggestion): a single ahash of the payload bytes
+    // is negligible next to the WASM merge it gates, and the hash is reused
+    // verbatim by `record_failure` in the error arm, so lazy computation would
+    // only duplicate the work on the failure path.
+    let payload_hash = crate::ring::merge_backoff::merge_payload_hash(is_delta, &payload_bytes);
+    match op_manager
+        .ring
+        .merge_backoff
+        .check(key.id(), sender_addr, payload_hash)
+    {
+        crate::ring::merge_backoff::MergeDecision::Allow => {}
+        decision @ (crate::ring::merge_backoff::MergeDecision::InBackoff
+        | crate::ring::merge_backoff::MergeDecision::KnownFailedPayload) => {
+            receiver_terminal.mark_backoff();
+            crate::config::GlobalTestMetrics::record_merge_suppressed_by_backoff();
+            tracing::debug!(
+                tx = %incoming_tx,
+                %key,
+                ?decision,
+                "UPDATE relay: BroadcastTo merge skipped — contract in merge-failure backoff"
+            );
+            return Ok(());
+        }
     }
 
     // ── Step 4: apply broadcast via WASM merge ────────────────────────────
@@ -1144,17 +1984,105 @@ async fn drive_relay_broadcast_to(
         update_data,
         RelatedContracts::default(),
         crate::contract::Priority::NetworkRelay,
+        crate::node::ApplyOrigin::NetworkRelay,
+        resolve_covered_peers(op_manager, &key, &incoming_tx, sender_addr, &covered),
     )
     .await;
 
     let UpdateExecution {
         value: updated_value,
-        summary: update_summary,
         changed,
-        ..
     } = match update_result {
-        Ok(result) => result,
+        Ok(result) => {
+            // Reset the merge-failure backoff ONLY on a successful DELTA merge
+            // (#4861): a delta that applies cleanly proves the incoming change
+            // was compatible with local state — genuine convergence. A
+            // successful FULL-STATE apply just replaces state and "succeeds"
+            // regardless of which fork it carries, so it proves nothing about
+            // convergence (the semantic fork-oscillation poison class flips
+            // forks on every full-state apply). Full-state broadcasts therefore
+            // do NOT reset here; the resync-apply path in node.rs does not reset
+            // either (see the note there).
+            if is_delta {
+                // Per-sender Invalid channel clears unconditionally on a clean
+                // delta apply (channel-trust); the contract-wide Timeout + memo
+                // clear only when the state ADVANCED (result.changed) — a no-op
+                // delta must not wipe a live Timeout quarantine (#4864 round-4).
+                op_manager.ring.merge_backoff.record_success_from_sender(
+                    key.id(),
+                    sender_addr,
+                    result.changed,
+                );
+                // Delta-incompat memo self-heal (HQk7 resync loop): a delta
+                // that applied cleanly proves the contract takes deltas, so
+                // drop the memo and its failure counter. Deliberately NOT
+                // gated on `result.changed` — a no-op delta apply still ran
+                // the contract's delta path successfully, which is the exact
+                // property the memo tracks. See `crate::ring::delta_incompat`.
+                op_manager
+                    .ring
+                    .delta_incompat
+                    .record_delta_success(key.id());
+            } else if result.changed {
+                // #4864 round-9 item 3: a CHANGED FULL-STATE broadcast apply
+                // advances the state, which invalidates the failed-payload MEMO's
+                // premise (a delta that failed against the OLD state may be valid
+                // against the NEW one). Mirror the streaming Ok arm and the
+                // resync-apply path in node.rs: clear ONLY the memo. This is NOT a
+                // backoff reset — no cooldown channel is touched — so the fork-flip
+                // no-reset doctrine still holds (a full-state merge carries the same
+                // fork ambiguity). Gated on result.changed so a no-op full-state
+                // apply does not needlessly re-admit known-bad payloads. Without
+                // this, a payload that failed against old state stayed
+                // KnownFailedPayload for up to FAILED_PAYLOAD_TTL (10min) after the
+                // full state advanced it — the non-streaming relay's omission.
+                op_manager
+                    .ring
+                    .merge_backoff
+                    .invalidate_payload_memo(key.id());
+            }
+            result
+        }
         Err(err) => {
+            // Record the merge failure for the per-contract backoff (#4861),
+            // but ONLY for genuine contract-exec failures (the merge ran and the
+            // contract rejected it or it timed out). `is_contract_exec_rejection`
+            // excludes queue-full (transient load) and missing-contract failures
+            // (healed by the auto-fetch below) — backing either off would be
+            // wrong. A timeout gets the longer Timeout-class cooldown.
+            //
+            // #4864 round-6: a SCHEDULER timeout (guest never ran, blocking-pool
+            // saturation) IS an exec rejection by cause-prefix, but the guest
+            // never executed the delta, so it must NOT be quarantined — exclude
+            // it here exactly like queue-full.
+            if err.is_contract_exec_rejection() && !err.is_scheduler_timeout() {
+                let class = if err.is_wasm_timeout() {
+                    crate::ring::merge_backoff::MergeFailureClass::Timeout
+                } else {
+                    crate::ring::merge_backoff::MergeFailureClass::Invalid
+                };
+                op_manager.ring.merge_backoff.record_failure(
+                    key.id(),
+                    sender_addr,
+                    class,
+                    payload_hash,
+                );
+                // Delta-incompatibility signal (HQk7 resync loop): an
+                // `Invalid`-class DELTA rejection is the receiver-side form of
+                // "this contract can't take deltas". We fan the same contract
+                // out to our own downstreams, so count it toward the
+                // sender-side memo that switches our broadcasts to full state.
+                // Timeout-class failures are load, not incompatibility — and
+                // full-state merges say nothing about deltas — so both are
+                // excluded. See `crate::ring::delta_incompat`.
+                if is_delta && class == crate::ring::merge_backoff::MergeFailureClass::Invalid {
+                    op_manager
+                        .ring
+                        .delta_incompat
+                        .note_delta_apply_failed(*key.id());
+                }
+            }
+
             // On benign stale-version rejection (not OOG/traps/validation
             // failures — see `is_invalid_update_rejection`), nudge the sender's
             // peer-summary cache of us toward Some(our_summary). Helper gates
@@ -1180,49 +2108,108 @@ async fn drive_relay_broadcast_to(
             // sender to resend full state onto the same saturated queue, and
             // auto-fetch enqueues a GET right back onto it. Skip both; still
             // surface the error to the caller for telemetry.
-            let queue_full = err.is_contract_queue_full();
+            //
+            // #4864 round-6: a scheduler timeout (guest never ran, blocking-pool
+            // saturation) is the SAME transient/load class — the delta was never
+            // applied and we still hold the contract — so it takes the identical
+            // heal path (resync, no auto-fetch). Keep the name `queue_full` so
+            // the downstream branch logic is untouched.
+            let queue_full = err.is_contract_queue_full() || err.is_scheduler_timeout();
 
             if is_delta && !queue_full {
+                // #5510: count THIS cause at the branch that DECIDES it, which
+                // is here — above the emit cap, not inside it.
+                //
+                // `GlobalTestMetrics::resync_requests()` is the total across
+                // every cause, and since this PR there are several, so a test
+                // asserting "no delta failed" cannot use the total without
+                // mistaking a rate-limited broadcast repair for the #2763
+                // summary-caching regression. But the counter must describe the
+                // FAILURE, not the emission: `simulation_integration.rs` reads
+                // it as "no delta failed to apply", and a delta that failed
+                // while the global cap happened to be exhausted failed just the
+                // same. Counting inside the `if` would have made the assertion
+                // quietly weaker exactly when the node is busy enough for the
+                // cap to bind — which is when a real regression is most likely.
+                // Same rule as `.claude/rules/bug-prevention-patterns.md`: the
+                // metric is produced by the code that makes the decision.
+                crate::config::GlobalTestMetrics::record_delta_failure_resync();
+
                 // Delta application failed → send ResyncRequest. Mirrors
-                // update.rs:710-758.
-                tracing::warn!(
-                    tx = %incoming_tx,
-                    contract = %key,
-                    sender = %sender_addr,
-                    error = %err,
-                    event = "delta_apply_failed",
-                    "UPDATE relay: delta apply failed, sending ResyncRequest"
-                );
-
-                if let Some(sender_pkl) = op_manager
+                // update.rs:710-758. Rate-limited per-contract (#4861): a poison
+                // contract that fails deltas from many senders must not drive a
+                // full-state resync storm. When the emit is suppressed, skip the
+                // sender summary-clear too — it is part of the resync handshake,
+                // so clearing it without emitting would just force the sender to
+                // full-state us on the next interest cycle.
+                if op_manager
                     .ring
-                    .connection_manager
-                    .get_peer_by_addr(sender_addr)
-                {
-                    let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
-                    op_manager
-                        .interest_manager
-                        .update_peer_summary(&key, &sender_key, None);
-                }
-
-                tracing::info!(
-                    tx = %incoming_tx,
-                    contract = %key,
-                    target = %sender_addr,
-                    event = "resync_request_sent",
-                    "UPDATE relay: sending ResyncRequest after delta failure"
-                );
-                if let Err(e) = op_manager
-                    .notify_node_event(NodeEvent::SendInterestMessage {
-                        target: sender_addr,
-                        message: InterestMessage::ResyncRequest { key },
-                    })
-                    .await
+                    .resync_emit_limiter
+                    .check_and_record(*key.id())
                 {
                     tracing::warn!(
                         tx = %incoming_tx,
-                        error = %e,
-                        "UPDATE relay: failed to send ResyncRequest"
+                        contract = %key,
+                        sender = %sender_addr,
+                        error = %err,
+                        event = "delta_apply_failed",
+                        "UPDATE relay: delta apply failed, sending ResyncRequest"
+                    );
+
+                    if let Some(sender_pkl) = op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_by_addr(sender_addr)
+                    {
+                        let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
+                        op_manager.interest_manager.clear_peer_summary(
+                            &key,
+                            &sender_key,
+                            crate::ring::interest::SummaryMissingReason::ClearedByDeltaApplyFailure,
+                        );
+                    }
+
+                    tracing::info!(
+                        tx = %incoming_tx,
+                        contract = %key,
+                        target = %sender_addr,
+                        event = "resync_request_sent",
+                        "UPDATE relay: sending ResyncRequest after delta failure"
+                    );
+                    // #4864 round-8: record the outstanding request so only the
+                    // matching ResyncResponse from this peer is authorized (once)
+                    // at the receive arm; unsolicited/replayed responses are
+                    // dropped without running WASM.
+                    //
+                    // The correlated/uncorrelated distinction only matters for the
+                    // queue-full retry's gate (#4863); this path has no retry, so
+                    // a strict-cap rejection just means the eventual response is
+                    // dropped as unsolicited and anti-entropy heals instead.
+                    let _correlated = op_manager
+                        .ring
+                        .outstanding_resync_requests
+                        .record(*key.id(), sender_addr);
+                    if let Err(e) = op_manager
+                        .notify_node_event(NodeEvent::SendInterestMessage {
+                            target: sender_addr,
+                            message: InterestMessage::ResyncRequest { key },
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            tx = %incoming_tx,
+                            error = %e,
+                            "UPDATE relay: failed to send ResyncRequest"
+                        );
+                    }
+                } else {
+                    crate::config::GlobalTestMetrics::record_resync_request_suppressed();
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        contract = %key,
+                        target = %sender_addr,
+                        event = "resync_request_suppressed",
+                        "UPDATE relay: ResyncRequest suppressed by per-contract rate limit"
                     );
                 }
             } else if !is_delta && !err.is_contract_exec_rejection() && !queue_full {
@@ -1235,13 +2222,19 @@ async fn drive_relay_broadcast_to(
                     AutoFetchReason::InboundRelay,
                 );
             } else if queue_full {
-                tracing::debug!(
-                    tx = %incoming_tx,
-                    contract = %key,
-                    sender = %sender_addr,
-                    event = "queue_full_amplification_suppressed",
-                    "UPDATE relay: per-contract queue saturated, suppressed ResyncRequest/auto-fetch to avoid amplification"
-                );
+                // Issue #4857: a queue-full drop is SILENT — the sender cached
+                // our summary on send-Ok and will never re-send the dropped
+                // change. Emit a rate-limited ResyncRequest so it re-syncs. The
+                // auto-fetch branch stays suppressed on queue-full (we already
+                // hold the contract). Shared with the streaming driver.
+                send_dropped_broadcast_resync_request(
+                    op_manager,
+                    key,
+                    sender_addr,
+                    incoming_tx,
+                    DroppedBroadcastReason::QueueFull,
+                )
+                .await;
             }
             return Err(err);
         }
@@ -1254,6 +2247,7 @@ async fn drive_relay_broadcast_to(
     );
 
     // ── Step 5: telemetry — broadcast applied ─────────────────────────────
+    receiver_terminal.mark_applied(changed, updated_value.len());
     if let Some(event) = NetEventLog::update_broadcast_applied(
         &incoming_tx,
         &op_manager.ring,
@@ -1274,6 +2268,19 @@ async fn drive_relay_broadcast_to(
         return Ok(());
     }
 
+    // Dashboard `updates_received` counter (issue #4828). Mirrors the
+    // streaming twin `drive_relay_broadcast_to_streaming`, and must stay
+    // in both: `broadcast_queue.rs` only picks the streaming variant above
+    // `streaming_threshold` (default 64 KB), so this non-streaming path
+    // carries every ordinary small delta — the normal River case. Before
+    // #4828 only the streaming twin recorded, so an actively-receiving
+    // subscriber displayed 0 (`cards.rs` renders `updates_received` as the
+    // ONLY UPDATE number for subscriber nodes).
+    //
+    // Placed after the `!changed` guard, matching the streaming twin: a
+    // broadcast that mutated nothing is not a received update.
+    crate::node::network_status::record_update_received();
+
     tracing::debug!(
         "UPDATE relay: contract {} @ {:?} updated via BroadcastTo",
         key,
@@ -1287,11 +2294,11 @@ async fn drive_relay_broadcast_to(
     // BackgroundTaskMonitor to match legacy timing semantics
     // (per-broadcast spawn, dies when complete). Per-broadcast
     // amplification is bounded by `should_send_summary_notification`'s
-    // 100ms-per-contract throttle inside the task.
+    // 100ms-per-contract throttle inside the task. The helper fetches the
+    // contract's REAL summary itself (#4923) — no caller-supplied value.
     let op_mgr = op_manager.clone();
-    let summary = update_summary.clone();
     GlobalExecutor::spawn(async move {
-        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr, summary).await;
+        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr).await;
     });
 
     Ok(())
@@ -1410,6 +2417,7 @@ pub(crate) async fn start_relay_request_update_streaming(
 
 /// Spawn a relay driver for a fresh inbound
 /// `UpdateMsg::BroadcastToStreaming`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_relay_broadcast_to_streaming(
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
@@ -1417,6 +2425,9 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
     stream_id: StreamId,
     total_size: u64,
     sender_addr: SocketAddr,
+    // Peers the sender says it already delivered to (#5147). Empty for the
+    // legacy `BroadcastToStreaming`.
+    covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) -> Result<(), OpError> {
     #[cfg(any(test, feature = "testing"))]
     RELAY_UPDATE_STREAMING_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1461,6 +2472,7 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
         stream_id,
         total_size,
         sender_addr,
+        covered,
     ));
     Ok(())
 }
@@ -1525,6 +2537,7 @@ async fn run_relay_request_update_streaming(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_relay_broadcast_to_streaming(
     guard: RelayUpdateStreamingInflightGuard,
     op_manager: Arc<OpManager>,
@@ -1533,6 +2546,7 @@ async fn run_relay_broadcast_to_streaming(
     stream_id: StreamId,
     total_size: u64,
     sender_addr: SocketAddr,
+    covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) {
     let _guard = guard;
 
@@ -1543,6 +2557,7 @@ async fn run_relay_broadcast_to_streaming(
         stream_id,
         total_size,
         sender_addr,
+        covered,
     )
     .await
     {
@@ -1666,15 +2681,17 @@ async fn drive_relay_request_update_streaming(
     // Step 4: apply update. BroadcastStateChange propagates automatically.
     let UpdateExecution {
         value: updated_value,
-        summary: _,
         changed,
-        ..
     } = super::update_contract(
         op_manager,
         key,
         UpdateData::State(State::from(value.clone())),
         related_contracts,
         crate::contract::Priority::NetworkRelay,
+        crate::node::ApplyOrigin::NetworkRelay,
+        // A streaming `RequestUpdateStreaming` names no delivery targets; see
+        // the non-streaming twin.
+        crate::ring::broadcast_coverage::BroadcastOrigin::local(),
     )
     .await?;
 
@@ -1736,6 +2753,7 @@ async fn drive_relay_broadcast_to_streaming(
     stream_id: StreamId,
     total_size: u64,
     sender_addr: SocketAddr,
+    covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) -> Result<(), OpError> {
     use crate::operations::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT};
 
@@ -1815,20 +2833,41 @@ async fn drive_relay_broadcast_to_streaming(
         sender_summary_bytes,
     } = payload;
 
-    // Step 4: update sender's cached summary.
-    let sender_summary = StateSummary::from(sender_summary_bytes.clone());
-    if let Some(sender_pkl) = op_manager
-        .ring
-        .connection_manager
-        .get_peer_by_addr(sender_addr)
-    {
-        let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
-        op_manager.interest_manager.update_peer_summary(
-            &key,
-            &sender_key,
-            Some(sender_summary.clone()),
-        );
-    }
+    apply_streaming_broadcast(
+        op_manager,
+        incoming_tx,
+        key,
+        state_bytes,
+        sender_summary_bytes,
+        sender_addr,
+        covered,
+    )
+    .await
+}
+
+/// Apply an assembled streaming full-state broadcast (steps 4-9 of
+/// `drive_relay_broadcast_to_streaming`): update the sender's cached summary,
+/// dedup, WASM-merge the full state, classify failures, and fan out the
+/// proactive summary. Extracted from the driver so the #4857 queue-full heal on
+/// the streaming path is unit-testable without the transport stream plumbing
+/// (steps 1-3: claim + assemble + deserialize).
+#[allow(clippy::too_many_arguments)]
+async fn apply_streaming_broadcast(
+    op_manager: &OpManager,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    state_bytes: Vec<u8>,
+    sender_summary_bytes: Vec<u8>,
+    sender_addr: SocketAddr,
+    covered: crate::ring::broadcast_coverage::CoveredPeers,
+) -> Result<(), OpError> {
+    let mut receiver_terminal = op_manager
+        .payload_mix
+        .receiver_terminal_guard(false, state_bytes.len());
+    // Step 4: update sender's cached summary. Same self-reported provenance
+    // and the same empty-means-could-not-summarize guard as the non-streaming
+    // BroadcastTo arm above.
+    seed_sender_summary_from_broadcast(op_manager, &key, &sender_summary_bytes, sender_addr);
 
     // Step 5: dedup cache BEFORE merge (mirrors non-streaming slice A
     // ordering — skipping WASM merge on duplicate broadcast is the key
@@ -1840,12 +2879,37 @@ async fn drive_relay_broadcast_to_streaming(
         false,
         op_manager.interest_manager.now(),
     ) {
+        receiver_terminal.mark_dedup();
         tracing::debug!(
             tx = %incoming_tx,
             %key,
             "UPDATE relay (driver streaming): BroadcastToStreaming skipped — duplicate payload (dedup hit)"
         );
         return Ok(());
+    }
+
+    // Step 5b: merge-failure backoff gate (#4861). Streaming broadcasts are
+    // always full state (`is_delta = false`) and never emit a ResyncRequest, so
+    // only the merge-skip applies. Cleared the instant a merge succeeds (below).
+    let stream_payload_hash = crate::ring::merge_backoff::merge_payload_hash(false, &state_bytes);
+    match op_manager
+        .ring
+        .merge_backoff
+        .check(key.id(), sender_addr, stream_payload_hash)
+    {
+        crate::ring::merge_backoff::MergeDecision::Allow => {}
+        decision @ (crate::ring::merge_backoff::MergeDecision::InBackoff
+        | crate::ring::merge_backoff::MergeDecision::KnownFailedPayload) => {
+            receiver_terminal.mark_backoff();
+            crate::config::GlobalTestMetrics::record_merge_suppressed_by_backoff();
+            tracing::debug!(
+                tx = %incoming_tx,
+                %key,
+                ?decision,
+                "UPDATE relay (driver streaming): merge skipped — contract in merge-failure backoff"
+            );
+            return Ok(());
+        }
     }
 
     let state_for_telemetry = WrappedState::from(state_bytes.clone());
@@ -1874,17 +2938,69 @@ async fn drive_relay_broadcast_to_streaming(
         UpdateData::State(State::from(state_bytes.clone())),
         RelatedContracts::default(),
         crate::contract::Priority::NetworkRelay,
+        crate::node::ApplyOrigin::NetworkRelay,
+        resolve_covered_peers(op_manager, &key, &incoming_tx, sender_addr, &covered),
     )
     .await;
 
     let UpdateExecution {
         value: updated_value,
-        summary: streaming_update_summary,
         changed,
-        ..
     } = match update_result {
-        Ok(exec) => exec,
+        Ok(exec) => {
+            // Strictly delta-only reset (#4861): a streaming full-state broadcast
+            // merge is mechanically the SAME operation as a ResyncResponse apply
+            // (a WASM merge of an incoming FULL STATE), so the fork-oscillation
+            // trap applies identically — a large forked contract would oscillate
+            // via streaming full states and reset its own backoff on every flip,
+            // so the backoff would never trip. Only a clean DELTA apply proves the
+            // receiver shared the sender's base (genuine convergence). Streaming
+            // is always full state, so it NEVER resets the backoff here; a
+            // recovered contract's entry simply ages out via the reaper if
+            // failures stop.
+            //
+            // BUT a state-advancing full-state apply (exec.changed) invalidates
+            // the failed-payload MEMO's premise: a delta that failed against the
+            // OLD state may be valid against the new one (#4864 round-4 P2). This
+            // clears ONLY the memo — NOT any cooldown channel — so it is NOT a
+            // backoff reset (the delta-only no-reset doctrine stands; the
+            // streaming pin still forbids resetting the backoff here).
+            if exec.changed {
+                op_manager
+                    .ring
+                    .merge_backoff
+                    .invalidate_payload_memo(key.id());
+            }
+            exec
+        }
         Err(err) => {
+            // Record poison-contract merge failures for the backoff (#4861),
+            // same classification as the non-streaming driver: only genuine
+            // contract-exec rejections, timeout → longer cooldown. #4864 round-6:
+            // exclude a scheduler timeout (guest never ran) just like the
+            // non-streaming driver — it must not quarantine the contract.
+            if err.is_contract_exec_rejection() && !err.is_scheduler_timeout() {
+                let class = if err.is_wasm_timeout() {
+                    crate::ring::merge_backoff::MergeFailureClass::Timeout
+                } else {
+                    crate::ring::merge_backoff::MergeFailureClass::Invalid
+                };
+                op_manager.ring.merge_backoff.record_failure(
+                    key.id(),
+                    sender_addr,
+                    class,
+                    stream_payload_hash,
+                );
+            }
+
+            // #4864 round-6: a scheduler timeout (guest never ran, blocking-pool
+            // saturation) is the SAME transient/load class as queue-full — heal
+            // via ResyncRequest, no auto-fetch (we still hold the contract).
+            // `log_broadcast_to_streaming_failure` already returns false for it
+            // (it is an exec rejection), so the auto-fetch branch stays
+            // suppressed; keep the name `queue_full` so the heal arm is untouched.
+            let queue_full = err.is_contract_queue_full() || err.is_scheduler_timeout();
+
             // Classify failure: real failure → self-heal via
             // try_auto_fetch_contract; benign stale-version rejection →
             // send_summary_back_on_rejection. Mirrors legacy at
@@ -1909,12 +3025,31 @@ async fn drive_relay_broadcast_to_streaming(
                     )
                     .await;
                 });
+            } else if queue_full {
+                // Issue #4857 on the STREAMING full-state path: identical
+                // poisoning to the non-streaming driver. A delivered streaming
+                // full-state broadcast caches the peer summary
+                // (broadcast_queue.rs → record_streaming_delivery →
+                // record_delivery_to_interest), so a queue-full drop here leaves
+                // the sender believing we are current while our subsequent CRDT
+                // deltas merge onto a diverged base WITHOUT error — the
+                // delta-apply-failure heal never fires. Emit the same
+                // rate-limited ResyncRequest as the non-streaming path.
+                send_dropped_broadcast_resync_request(
+                    op_manager,
+                    key,
+                    sender_addr,
+                    incoming_tx,
+                    DroppedBroadcastReason::QueueFull,
+                )
+                .await;
             }
             return Err(err);
         }
     };
 
     // Step 8: telemetry — broadcast applied + proactive summary.
+    receiver_terminal.mark_applied(changed, updated_value.len());
     if let Some(event) = NetEventLog::update_broadcast_applied(
         &incoming_tx,
         &op_manager.ring,
@@ -1942,10 +3077,11 @@ async fn drive_relay_broadcast_to_streaming(
         "UPDATE relay (driver streaming): BroadcastToStreaming applied (state changed)"
     );
 
+    // The helper fetches the contract's REAL summary itself (#4923) — no
+    // caller-supplied value.
     let op_mgr = op_manager.clone();
-    let summary = streaming_update_summary.clone();
     GlobalExecutor::spawn(async move {
-        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr, summary).await;
+        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr).await;
     });
 
     Ok(())
@@ -2338,6 +3474,274 @@ mod tests {
         );
     }
 
+    /// Pin (HQk7 resync loop): the BroadcastTo driver must feed the
+    /// delta-incompatibility memo on BOTH edges — arm it on an
+    /// `Invalid`-class DELTA rejection (receiver-side signal that the
+    /// contract can't take deltas) and clear it on a successful delta apply
+    /// (self-heal). If either call is dropped, the sender-side full-state
+    /// fallback in `broadcast_to_single_peer` either never arms (the doomed
+    /// delta → ResyncRequest → full-state loop resumes) or never heals (a
+    /// recovered contract is stuck on full-state sends until TTL expiry).
+    /// See `crate::ring::delta_incompat`.
+    #[test]
+    fn broadcast_to_feeds_delta_incompat_memo() {
+        let driver_src = broadcast_to_driver_src();
+
+        // Arm: inside the exec-rejection failure classification, gated on
+        // is_delta AND the Invalid class (Timeout is load, not
+        // incompatibility; full-state merges say nothing about deltas).
+        let arm_pos = driver_src
+            .find(".note_delta_apply_failed(")
+            .expect("drive_relay_broadcast_to must arm the delta-incompat memo on delta failure");
+        assert!(
+            driver_src.contains(
+                "if is_delta && class == crate::ring::merge_backoff::MergeFailureClass::Invalid"
+            ),
+            "the delta-incompat arm must be gated on is_delta AND the Invalid \
+             failure class — arming on Timeout (load) or full-state failures \
+             would flip healthy contracts to full-state fan-out"
+        );
+
+        // Clear: inside the `if is_delta` success arm, next to the backoff
+        // reset (the same delta-only convergence signal).
+        let clear_pos = driver_src
+            .find(".record_delta_success(")
+            .expect("drive_relay_broadcast_to must clear the delta-incompat memo on delta success");
+        let is_delta_gate_pos = driver_src
+            .find("if is_delta {")
+            .expect("is_delta success gate not found");
+        assert!(
+            is_delta_gate_pos < clear_pos && clear_pos < arm_pos,
+            "record_delta_success must sit inside the `if is_delta` success arm \
+             (delta-only signal), before the failure classification \
+             (order: is_delta gate {is_delta_gate_pos} < clear {clear_pos} < arm {arm_pos})"
+        );
+    }
+
+    /// Helper: return the source of `drive_relay_broadcast_to`'s body,
+    /// bounded to the next top-level `async fn` / test module.
+    #[cfg(test)]
+    fn broadcast_to_driver_src() -> &'static str {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_broadcast_to(")
+            .expect("drive_relay_broadcast_to not found");
+        let after = &src[start + 1..];
+        let end = after
+            .find("\nasync fn ")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .unwrap_or(after.len());
+        &src[start..start + 1 + end]
+    }
+
+    /// Pin (#4861): the merge-failure backoff gate MUST run AFTER the dedup
+    /// check and BEFORE `update_contract`. If it ran after the merge, a poison
+    /// contract would still re-run the (failing, expensive) WASM merge on every
+    /// inbound broadcast — the exact CPU churn the backoff exists to stop.
+    #[test]
+    fn broadcast_to_backoff_gate_runs_before_merge() {
+        let driver_src = broadcast_to_driver_src();
+        let dedup_pos = driver_src
+            .find("broadcast_dedup_cache.check_and_insert")
+            .expect("dedup check missing");
+        let backoff_pos = driver_src
+            .find(".check(key.id(), sender_addr, payload_hash)")
+            .expect("merge_backoff.check gate missing in BroadcastTo driver");
+        let merge_pos = driver_src
+            .find("super::update_contract(")
+            .expect("update_contract call missing");
+        assert!(
+            dedup_pos < backoff_pos && backoff_pos < merge_pos,
+            "merge_backoff.check MUST appear after the dedup check and before \
+             update_contract() (order: dedup {dedup_pos} < backoff {backoff_pos} \
+             < merge {merge_pos})"
+        );
+    }
+
+    /// Pin (#4861): the backoff reset MUST be gated on `is_delta` (only a
+    /// successful DELTA merge resets — a full-state apply proves nothing about
+    /// convergence, see the fork-oscillation note), and a failure MUST be
+    /// recorded — but ONLY for genuine contract-exec rejections. Gating
+    /// `record_failure` on `is_contract_exec_rejection()` excludes queue-full
+    /// (transient load) and missing-contract failures (healed by auto-fetch);
+    /// backing either off would block recovery.
+    #[test]
+    fn broadcast_to_backoff_records_success_and_gated_failure() {
+        let driver_src = broadcast_to_driver_src();
+        let success_pos = driver_src
+            .find(".record_success_from_sender(")
+            .expect("drive_relay_broadcast_to must clear the backoff on a successful merge");
+        // The reset must be gated on is_delta (delta-only convergence signal).
+        let is_delta_gate_pos = driver_src
+            .find("if is_delta {")
+            .expect("backoff reset must be gated on `if is_delta` (#4861)");
+        assert!(
+            is_delta_gate_pos < success_pos,
+            "merge_backoff.record_success_from_sender MUST be inside an `if is_delta` \
+             gate so a full-state apply does not reset the backoff (#4861 fork oscillation)"
+        );
+        let record_pos = driver_src
+            .find(".record_failure(")
+            .expect("merge_backoff.record_failure missing in BroadcastTo driver");
+        // The record_failure must be inside an is_contract_exec_rejection guard
+        // that ALSO excludes scheduler timeouts (#4864 round-6): a scheduler
+        // timeout is an exec rejection by cause-prefix but the guest never ran,
+        // so it must not create a backoff entry.
+        let guard_pos = driver_src
+            .find("if err.is_contract_exec_rejection() && !err.is_scheduler_timeout() {")
+            .expect(
+                "record_failure must be gated on \
+                 is_contract_exec_rejection() && !err.is_scheduler_timeout()",
+            );
+        assert!(
+            guard_pos < record_pos,
+            "merge_backoff.record_failure MUST be gated on \
+             is_contract_exec_rejection() so queue-full and missing-contract \
+             failures do NOT create a backoff entry (#4861)"
+        );
+        // #4864 round-6: the same guard must exclude a scheduler timeout via
+        // !err.is_scheduler_timeout() — the guest-never-ran case takes the
+        // transient (queue-full-style) path, never the contract quarantine.
+        assert!(
+            driver_src.contains("!err.is_scheduler_timeout()"),
+            "the record gate MUST exclude scheduler timeouts via \
+             !err.is_scheduler_timeout() (#4864 round-6): a queued-never-ran \
+             merge must not quarantine the contract"
+        );
+        assert!(
+            driver_src.contains("is_wasm_timeout()"),
+            "the failure class must distinguish a WASM timeout (longer cooldown) \
+             via is_wasm_timeout()"
+        );
+    }
+
+    /// Pin (#4861): the `ResyncRequest` emission on delta-apply failure MUST be
+    /// gated by the per-contract emit rate limiter, and the sender summary-clear
+    /// MUST live inside that gate (it is part of the resync handshake — clearing
+    /// it without emitting would force the sender to full-state us next cycle).
+    #[test]
+    fn broadcast_to_resync_emit_is_rate_limited() {
+        let driver_src = broadcast_to_driver_src();
+        // Match the field name (fmt-stable) rather than the full method call,
+        // which rustfmt may break across lines.
+        let gate_pos = driver_src
+            .find("resync_emit_limiter")
+            .expect("ResyncRequest emit must be gated by resync_emit_limiter");
+        let summary_clear_pos = driver_src
+            .find("clear_peer_summary(")
+            .expect("sender summary-clear missing");
+        assert!(
+            driver_src.contains("SummaryMissingReason::ClearedByDeltaApplyFailure"),
+            "the sender summary-clear must be tagged ClearedByDeltaApplyFailure \
+             so #4961 can attribute the full_no_their_summary_tracked arm to \
+             this path"
+        );
+        let resync_pos = driver_src
+            .find("InterestMessage::ResyncRequest")
+            .expect("ResyncRequest emission missing");
+        assert!(
+            gate_pos < summary_clear_pos && summary_clear_pos < resync_pos,
+            "emit rate-limit gate ({gate_pos}) must wrap BOTH the summary-clear \
+             ({summary_clear_pos}) and the ResyncRequest emission ({resync_pos})"
+        );
+        assert!(
+            driver_src.contains("record_resync_request_suppressed()"),
+            "the suppressed branch must record the resync-request-suppressed metric"
+        );
+    }
+
+    /// Pin (#4861): the streaming full-state merge path must carry the same
+    /// backoff gate + record wiring (a poison contract must be quarantined on
+    /// the streaming path too). The streaming merge logic lives in
+    /// `apply_streaming_broadcast` (steps 4-9), which
+    /// `drive_relay_broadcast_to_streaming` delegates to after assembling the
+    /// stream — scrape that function, not the thin transport wrapper.
+    #[test]
+    fn broadcast_to_streaming_has_backoff_wiring() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn apply_streaming_broadcast(")
+            .expect("apply_streaming_broadcast (streaming merge path) not found");
+        let after = &src[start + 1..];
+        let end = after
+            .find("\nasync fn ")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .unwrap_or(after.len());
+        let driver_src = &src[start..start + 1 + end];
+
+        // Match the args (fmt-stable) rather than `merge_backoff.check(`, which
+        // rustfmt breaks across lines here (the longer `stream_payload_hash`
+        // pushes the chain over the chain-width limit).
+        let backoff_pos = driver_src
+            .find(".check(key.id(), sender_addr, stream_payload_hash)")
+            .expect("streaming merge path missing merge_backoff.check gate");
+        let merge_pos = driver_src
+            .find("super::update_contract(")
+            .expect("streaming merge path missing update_contract");
+        assert!(
+            backoff_pos < merge_pos,
+            "streaming merge_backoff.check MUST run before update_contract"
+        );
+        // Strictly delta-only reset (#4861): streaming is always full state, and
+        // a full-state merge is the same fork-flippable operation as a resync
+        // apply, so the streaming path must NOT reset the backoff. (Assemble
+        // the needle so this literal is not a self-referential match.)
+        // Match any `record_success*` variant (record_success_from_sender /
+        // record_success_local) — the streaming full-state path must call none.
+        let record_success = concat!("record_", "success");
+        assert!(
+            !driver_src.contains(record_success),
+            "streaming path must NOT reset the backoff — a full-state merge is \
+             not convergence evidence (only a clean DELTA apply is). See #4861."
+        );
+        assert!(
+            driver_src.contains(".record_failure(")
+                && driver_src.contains("is_contract_exec_rejection()"),
+            "streaming path must record gated failures like the non-streaming driver"
+        );
+        // #4864 round-7: the streaming record gate MUST also exclude scheduler
+        // timeouts (the guest-never-ran, queued-on-a-saturated-pool case), exactly
+        // like the relay driver (pinned in
+        // broadcast_to_backoff_records_success_and_gated_failure). Without this
+        // needle a refactor dropping the exclusion from the streaming driver would
+        // silently re-quarantine a healthy contract on transient scheduler
+        // overload — the round-6/7 regression this exclusion exists to prevent.
+        assert!(
+            driver_src.contains("!err.is_scheduler_timeout()"),
+            "streaming record gate MUST exclude scheduler timeouts \
+             (!err.is_scheduler_timeout(), #4864 round-6/7): a queued-never-ran \
+             failure is transient load, not a contract fault — mirror of the relay pin"
+        );
+    }
+
+    /// Pin (#4864 review P2): a successful client-local DELTA merge in
+    /// `drive_client_update` MUST reset the merge-failure backoff (so a contract
+    /// a local client recovers stops suppressing inbound broadcasts), gated
+    /// delta-only (a client full-state update proves nothing).
+    #[test]
+    fn client_local_delta_success_resets_backoff() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_client_update(")
+            .expect("drive_client_update not found");
+        let after = &src[start + 1..];
+        let end = after
+            .find("\nasync fn ")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .unwrap_or(after.len());
+        let body = &src[start..start + 1 + end];
+        let success = concat!(".record_", "success_local(");
+        assert!(
+            body.contains(success),
+            "drive_client_update must reset the backoff on a successful merge via \
+             record_success_local (contract-wide only, not per-sender) (#4864 P2)"
+        );
+        assert!(
+            body.contains("is_delta_update"),
+            "the client-local backoff reset must be gated delta-only (is_delta_update)"
+        );
+    }
+
     /// Pin: both relay drivers MUST gate on
     /// `active_relay_update_txs` to reject duplicate inbound
     /// messages for an in-flight tx (amplification guard).
@@ -2561,8 +3965,8 @@ mod tests {
     fn broadcast_to_streaming_dedup_runs_before_merge() {
         let src = include_str!("op_ctx_task.rs");
         let start = src
-            .find("async fn drive_relay_broadcast_to_streaming(")
-            .expect("drive_relay_broadcast_to_streaming not found");
+            .find("async fn apply_streaming_broadcast(")
+            .expect("apply_streaming_broadcast not found");
         let after = &src[start + 1..];
         let end = after
             .find("\nasync fn ")
@@ -2579,50 +3983,2538 @@ mod tests {
         assert!(
             dedup_pos < merge_pos,
             "broadcast_dedup_cache.check_and_insert MUST appear before \
-             update_contract() in drive_relay_broadcast_to_streaming"
+             update_contract() in apply_streaming_broadcast"
         );
     }
 
-    /// Issue #4251 regression pin: `drive_relay_broadcast_to` MUST
-    /// gate ResyncRequest emission AND `try_auto_fetch_contract` on
-    /// `!err.is_contract_queue_full()`. The two amplification branches
-    /// are what turn a single saturated contract into a network-wide
-    /// storm — ResyncRequest asks the sender for full state (bigger
-    /// payload onto the same full queue), and auto-fetch enqueues a
-    /// GET right back onto the saturated handler.
+    /// Issue #4857 / #4251 reconciliation pin (+ #4864 round-4). On a queue-full
+    /// broadcast drop, BOTH broadcast drivers must emit a RATE-LIMITED
+    /// `ResyncRequest` — neither suppress it (permanent divergence, #4857) nor
+    /// emit it unthrottled (full-state storm, #4251). Both route through the
+    /// shared `send_dropped_broadcast_resync_request` helper, which gates the
+    /// `InterestMessage::ResyncRequest` emit behind BOTH the per-(contract, sender)
+    /// `begin_resync_request` throttle AND the global per-contract
+    /// `resync_emit_limiter` cap (each a `!gate { return; }` guard before the
+    /// emit). Auto-fetch stays suppressed on each driver's queue-full arm.
     #[test]
-    fn broadcast_to_suppresses_amplification_on_queue_full() {
+    fn broadcast_to_sends_throttled_resync_on_queue_full() {
+        let src = include_str!("op_ctx_task.rs");
+
+        // Slice a top-level `async fn NAME(` body out of the source (up to the
+        // next top-level `async fn` or the test module).
+        let fn_body = |name: &str| -> &str {
+            let start = src.find(name).unwrap_or_else(|| panic!("{name} not found"));
+            let after = &src[start + 1..];
+            // Terminate on ANY fn opener, not just `async fn` (review finding
+            // 19). Plain `fn`s sit between the async ones this pin slices —
+            // `jittered_resync_retry_delay` between the two resync fns,
+            // `seed_sender_summary_from_broadcast` before the broadcast driver
+            // — so an `async fn`-only terminator ran a slice straight through
+            // them into the NEXT async fn, and a gate deleted from the sliced
+            // function would still satisfy the pin as long as the same
+            // identifier appeared anywhere downstream. Taking the MINIMUM
+            // rather than the first match matters: the openers are not in
+            // source order.
+            let end = [
+                "\nasync fn ",
+                "\nfn ",
+                "\npub async fn ",
+                "\npub fn ",
+                "\npub(",
+            ]
+            .iter()
+            .filter_map(|kw| after.find(kw))
+            .chain(after.find("\n#[cfg(test)]"))
+            .min()
+            .unwrap_or(after.len());
+            &src[start..start + 1 + end]
+        };
+        // Slice the queue-full match arm (from `marker` up to its closing
+        // `return Err(err);`) out of a driver body.
+        let queue_full_arm = |body: &'static str, marker: &str| -> &'static str {
+            let arm_start = body
+                .find(marker)
+                .unwrap_or_else(|| panic!("queue-full arm `{marker}` missing"));
+            let arm_end = body[arm_start..]
+                .find("return Err(err);")
+                .expect("return after queue-full arm missing");
+            &body[arm_start..arm_start + arm_end]
+        };
+
+        // Non-streaming driver delegates to the helper and does NOT auto-fetch.
+        // #4864 round-6: the `queue_full` local now also folds in a scheduler
+        // timeout (transient load, same heal path), so the classification is
+        // `is_contract_queue_full() || is_scheduler_timeout()`.
+        let ns = fn_body("async fn drive_relay_broadcast_to(");
+        assert!(
+            ns.contains(
+                "let queue_full = err.is_contract_queue_full() || err.is_scheduler_timeout();"
+            ),
+            "drive_relay_broadcast_to must still classify queue-full and fold in \
+             scheduler timeouts (#4251, #4864 round-6)"
+        );
+        let ns_arm = queue_full_arm(ns, "} else if queue_full {");
+        assert!(
+            ns_arm.contains("send_dropped_broadcast_resync_request("),
+            "drive_relay_broadcast_to queue-full arm MUST delegate to \
+             send_dropped_broadcast_resync_request (heals #4857)"
+        );
+        assert!(
+            !ns_arm.contains("try_auto_fetch_contract"),
+            "drive_relay_broadcast_to queue-full arm must NOT auto-fetch (#4251)"
+        );
+
+        // Streaming path: the queue-full arm lives in `apply_streaming_broadcast`
+        // (steps 4-9, extracted from the driver for testability). It delegates to
+        // the SAME helper and does NOT auto-fetch (auto-fetch lives in the
+        // separate log_broadcast_to_streaming_failure branch). Missing arm ⇒
+        // #4857 open on the streaming full-state path.
+        assert!(
+            fn_body("async fn drive_relay_broadcast_to_streaming(")
+                .contains("apply_streaming_broadcast("),
+            "drive_relay_broadcast_to_streaming must delegate to \
+             apply_streaming_broadcast — otherwise the streaming apply/heal logic \
+             is unreachable"
+        );
+        // #4864 round-6: the streaming heal arm is now gated on the same
+        // `queue_full` local (queue-full OR scheduler timeout).
+        let st = fn_body("async fn apply_streaming_broadcast(");
+        assert!(
+            st.contains(
+                "let queue_full = err.is_contract_queue_full() || err.is_scheduler_timeout();"
+            ),
+            "apply_streaming_broadcast must classify queue-full and fold in \
+             scheduler timeouts (#4251, #4864 round-6)"
+        );
+        let st_arm = queue_full_arm(st, "} else if queue_full {");
+        assert!(
+            st_arm.contains("send_dropped_broadcast_resync_request("),
+            "apply_streaming_broadcast queue-full arm MUST delegate to \
+             send_dropped_broadcast_resync_request — otherwise #4857 stays OPEN on the \
+             streaming full-state path"
+        );
+        assert!(
+            !st_arm.contains("try_auto_fetch_contract"),
+            "streaming queue-full arm must NOT auto-fetch (#4251)"
+        );
+
+        // The shared helper gates the single emit behind BOTH the per-(contract,
+        // sender) throttle AND the global per-contract emit cap (#4251/#4857 +
+        // #4864 round-4). Each is a `!gate { return; }` guard that precedes the
+        // emit, so an unthrottled emission cannot re-open the #4251 storm. The
+        // per-sender throttle is RESERVED atomically (`begin`, records under the
+        // lock) then RELEASED (`cancel`) if the global cap rejects (#4864 round-6
+        // item 2), so concurrent callbacks can't both pass and a globally
+        // suppressed emit does not burn the window.
+        let helper = fn_body("async fn send_dropped_broadcast_resync_request(");
+        let per_sender = helper.find(".begin_resync_request(").expect(
+            "helper must RESERVE the per-sender throttle atomically via \
+             begin_resync_request (#4864 round-6 item 2)",
+        );
+        // Anchor on the CALL, not the bare identifier — a comment earlier in the
+        // helper mentions `resync_emit_limiter` before the real gate (#4864 round-6
+        // item 6c).
+        let global_cap = helper.find(".check_and_record(*key.id())").expect(
+            "helper must ALSO gate on the global per-contract emit cap \
+             (resync_emit_limiter.check_and_record, #4864 round-4)",
+        );
+        let emit = helper
+            .find("InterestMessage::ResyncRequest")
+            .expect("helper must emit InterestMessage::ResyncRequest (heal, #4857)");
+        let cancel = helper.find(".cancel_resync_request(").expect(
+            "helper must CANCEL the reservation when the global cap rejects, so the \
+             window is released (#4864 round-6 item 2)",
+        );
+        assert!(
+            per_sender < emit && global_cap < emit,
+            "the ResyncRequest emit ({emit}) MUST come AFTER both the per-sender \
+             throttle reservation ({per_sender}) and the global emit cap ({global_cap}), \
+             so an unthrottled emission cannot re-open the #4251 storm"
+        );
+        assert!(
+            per_sender < global_cap && global_cap < cancel && cancel < emit,
+            "the cancel ({cancel}) MUST be in the global-cap reject branch — after the \
+             reservation ({per_sender}) and the global cap ({global_cap}), before the \
+             emit ({emit}) — so a global-cap suppression releases the window (#4864 round-6)"
+        );
+    }
+
+    /// Drain the event-loop notification channel (non-blocking) and return the
+    /// targets of every `ResyncRequest(key)` emitted since the last drain.
+    fn drain_resync_targets(
+        rx: &mut crate::node::EventLoopNotificationsReceiver,
+        key: ContractKey,
+    ) -> Vec<SocketAddr> {
+        let mut targets = Vec::new();
+        while let Ok(ev) = rx.notifications_receiver.try_recv() {
+            if let Either::Right(NodeEvent::SendInterestMessage {
+                target,
+                message: InterestMessage::ResyncRequest { key: k },
+            }) = ev
+            {
+                if k == key {
+                    targets.push(target);
+                }
+            }
+        }
+        targets
+    }
+
+    /// Build a minimal real OpManager wired to a contract-handler stand-in that
+    /// answers every `UpdateQuery` with `ContractQueueFull` (the silent drop a
+    /// saturated receiver hits under load) and every `GetQuery` with "no state".
+    /// Returns the op_manager, the event-loop notification receiver (to observe
+    /// emitted `ResyncRequest`s), and a keep-alive guard holding the handler task
+    /// plus the channel halves that must outlive the op_manager. Mirrors
+    /// `op_state_manager.rs::build_reroot_test_op_manager`; shared by the #4857
+    /// queue-full behavioral tests for the non-streaming and streaming paths.
+    async fn build_queue_full_test_node(
+        id: &str,
+    ) -> (
+        Arc<OpManager>,
+        crate::node::EventLoopNotificationsReceiver,
+        Box<dyn std::any::Any>,
+    ) {
+        build_queue_full_test_node_with_clock(id, None).await
+    }
+
+    /// As [`build_queue_full_test_node`], but injects `override_clock` as the
+    /// node's `hosting_time_source_override` — the SAME clock the `InterestManager`
+    /// throttle uses (see `op_state_manager.rs`). A `SharedMockTimeSource` here
+    /// lets a test DECOUPLE the throttle's clock from tokio's, exercising the
+    /// #4857 P2 retry's injected-clock pacing and DST liveness backstop.
+    async fn build_queue_full_test_node_with_clock(
+        id: &str,
+        override_clock: Option<crate::util::time_source::DynTimeSource>,
+    ) -> (
+        Arc<OpManager>,
+        crate::node::EventLoopNotificationsReceiver,
+        Box<dyn std::any::Any>,
+    ) {
+        // Distinct `id` per caller: `ConfigArgs::build` derives a Local-mode data
+        // directory from it, so two concurrently-running tests sharing an id race
+        // on that directory (flaky "No such file or directory").
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let mut node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        // Decouple the throttle/hosting clock from tokio when a test asks for it.
+        node_config.hosting_time_source_override = override_clock;
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        let self_addr: SocketAddr = "127.0.0.1:12000".parse().unwrap();
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test(self_addr);
+
+        let handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in handler that serves exactly the two events this test drives; any other event is an unexpected-input panic, and enumerating all 20+ ContractHandlerEvent variants to reach the same panic would only rot"
+                )]
+                let response = match ev {
+                    ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
+                        key: None,
+                        response: Ok(StoreResponse {
+                            state: None,
+                            contract: None,
+                        }),
+                    },
+                    ContractHandlerEvent::UpdateQuery { .. } => {
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: Err(crate::contract::ExecutorError::other(
+                                crate::contract::ContractQueueFull,
+                            )),
+                            state_changed: false,
+                        }
+                    }
+                    other => panic!("unexpected handler event in stand-in: {other:?}"),
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let guard: Box<dyn std::any::Any> =
+            Box::new((handler, result_router_rx, task_monitor, wait_for_event));
+        (op_manager, notification_rx, guard)
+    }
+
+    /// Issue #4857 behavioral reproduction (non-streaming delta path): when an
+    /// inbound broadcast delta is dropped with `ContractQueueFull`,
+    /// `drive_relay_broadcast_to` MUST emit a `ResyncRequest` back to the sender
+    /// so it clears its poisoned summary cache and re-sends the dropped change —
+    /// and that emission MUST be rate-limited so a burst of drops does not
+    /// re-open the #4251 storm.
+    ///
+    /// On `origin/main` this test FAILS: the queue-full arm suppresses the
+    /// ResyncRequest entirely, so `first` is empty (the divergence is silent and
+    /// permanent). With the fix, the first drop emits exactly one ResyncRequest
+    /// and the immediate second drop is throttled.
+    ///
+    /// The drop is injected at the contract-handler seam (a stand-in handler
+    /// answers every `UpdateQuery` with `ContractQueueFull`) rather than by
+    /// saturating the real 100-slot fair queue, which is non-deterministic.
+    ///
+    /// Note (#4857 P2): each drop also spawns a trailing-retry task, but its
+    /// first re-dispatch is a jittered ~1.6-2.4s away on the throttle's clock —
+    /// far beyond this synchronous, non-`start_paused` test's wall-clock window
+    /// — so the immediate/throttled emit counts asserted here are unaffected.
+    #[tokio::test]
+    async fn queue_full_broadcast_emits_throttled_resync_request() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4857-delta").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([8u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12100".parse().unwrap();
+
+        // First broadcast delta → dropped queue-full → MUST emit a ResyncRequest.
+        let r1 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 2, 3]),
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![sender_addr],
+            "a queue-full drop MUST emit exactly one ResyncRequest to the sender \
+             so it clears its poisoned summary and re-sends (heals #4857)"
+        );
+
+        // Second broadcast with DIFFERENT delta bytes (so it is not a dedup hit)
+        // within the throttle window → still queue-full, but ResyncRequest is
+        // throttled (bounds the #4251 amplification).
+        let r2 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![4, 5, 6]),
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(
+            r2.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "second broadcast should still hit queue-full, got {r2:?}"
+        );
+        assert!(
+            drain_resync_targets(&mut notification_rx, key).is_empty(),
+            "a second queue-full drop within the throttle window MUST NOT emit \
+             another ResyncRequest (bounds #4251 amplification)"
+        );
+    }
+
+    /// Issue #4857 behavioral reproduction (STREAMING full-state path): the
+    /// large-room case the round-2 review flagged. A delivered streaming
+    /// full-state broadcast caches the peer summary, so a `ContractQueueFull`
+    /// drop here poisons the sender identically to the delta path — and the
+    /// streaming Err arm previously had NO resync branch. `apply_streaming_broadcast`
+    /// (steps 4-9 of `drive_relay_broadcast_to_streaming`) MUST now emit the same
+    /// throttled `ResyncRequest`.
+    ///
+    /// On `origin/main` (and on the round-1 fix, which only patched the
+    /// non-streaming driver) this FAILS: `first` is empty. With the round-2 fix
+    /// the first drop emits one ResyncRequest and the second is throttled.
+    ///
+    /// Note (#4857 P2): as in the delta test, the trailing-retry task's first
+    /// re-dispatch is ~1.6-2.4s out on the throttle's clock, well beyond this
+    /// synchronous non-`start_paused` test's window, so the counts asserted here
+    /// are unaffected.
+    #[tokio::test]
+    async fn queue_full_streaming_broadcast_emits_throttled_resync_request() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4857-streaming").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([9u8; 32]),
+            CodeHash::new([10u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12200".parse().unwrap();
+
+        // First streaming full-state → dropped queue-full → MUST emit a ResyncRequest.
+        let r1 = apply_streaming_broadcast(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            vec![1, 2, 3],
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![sender_addr],
+            "a queue-full streaming full-state drop MUST emit exactly one \
+             ResyncRequest (heals #4857 on the streaming path)"
+        );
+
+        // Second streaming full-state with DIFFERENT bytes (not a dedup hit)
+        // within the throttle window → still queue-full, ResyncRequest throttled.
+        let r2 = apply_streaming_broadcast(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            vec![4, 5, 6],
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(
+            r2.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "second streaming broadcast should still hit queue-full, got {r2:?}"
+        );
+        assert!(
+            drain_resync_targets(&mut notification_rx, key).is_empty(),
+            "a second streaming queue-full drop within the throttle window MUST \
+             NOT emit another ResyncRequest (bounds #4251 amplification)"
+        );
+    }
+
+    /// A generic contract-exec rejection: `is_contract_exec_rejection() == true`
+    /// (recorded by the merge backoff as the Invalid class) but NOT
+    /// `is_invalid_update_rejection` (so the driver does not spawn summary-back)
+    /// and NOT a wasm timeout. Used by the behavioral backoff-gate tests.
+    #[cfg(test)]
+    fn exec_reject_err(key: ContractKey) -> crate::contract::ExecutorError {
+        crate::contract::ExecutorError::from(
+            freenet_stdlib::client_api::RequestError::ContractError(
+                freenet_stdlib::client_api::ContractError::update_exec_error(
+                    key,
+                    "contract merge failed (test poison)",
+                ),
+            ),
+        )
+    }
+
+    /// A `ContractQueueFull` executor error (transient backpressure). Satisfies
+    /// `is_contract_queue_full()` but NOT `is_contract_exec_rejection()`, so the
+    /// backoff recording gate MUST skip it (queue-full is load, not poison).
+    fn queue_full_err() -> crate::contract::ExecutorError {
+        crate::contract::ExecutorError::other(crate::contract::ContractQueueFull)
+    }
+
+    /// What the exec-reject stand-in handler returns for a DELTA `UpdateQuery`.
+    #[derive(Clone, Copy)]
+    enum DeltaOutcome {
+        /// Fail with a contract-exec rejection (recorded by the backoff).
+        ExecReject,
+        /// Fail with `ContractQueueFull` (NOT recorded — transient load).
+        QueueFull,
+        /// Succeed with `state_changed: true` — a clean DELTA merge that advanced
+        /// state.
+        Success,
+        /// Succeed with `state_changed: false` — a NO-OP delta merge (e.g. an
+        /// idempotent re-apply). The state did NOT advance, so the contract-side
+        /// backoff clear must NOT fire (#4864 round-5 item 4).
+        SuccessNoChange,
+    }
+
+    /// Build a node whose stand-in contract handler resolves every DELTA
+    /// `UpdateQuery` per `delta_outcome` (fail-exec-reject / fail-queue-full /
+    /// succeed) and SUCCEEDS every full-state `UpdateQuery`, while counting the
+    /// `UpdateQuery` events that reach it. `GetSummaryQuery` (from the
+    /// post-success proactive-summary spawn) is answered benignly. The counter
+    /// lets a test assert whether the backoff PREVENTS executor invocation
+    /// (#4864 review testing H1 / P1).
+    async fn build_broadcast_test_node(
+        id: &str,
+        delta_outcome: DeltaOutcome,
+    ) -> (
+        Arc<OpManager>,
+        crate::node::EventLoopNotificationsReceiver,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        Box<dyn std::any::Any>,
+    ) {
+        use std::sync::atomic::Ordering;
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        let self_addr: SocketAddr = "127.0.0.1:12000".parse().unwrap();
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test(self_addr);
+
+        let update_query_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = update_query_count.clone();
+        let handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in handler that serves exactly the two events this test drives; any other event is an unexpected-input panic, and enumerating all 20+ ContractHandlerEvent variants to reach the same panic would only rot"
+                )]
+                let response = match ev {
+                    ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
+                        key: None,
+                        response: Ok(StoreResponse {
+                            state: None,
+                            contract: None,
+                        }),
+                    },
+                    ContractHandlerEvent::GetSummaryQuery { key } => {
+                        ContractHandlerEvent::GetSummaryResponse {
+                            key,
+                            summary: Ok(StateSummary::from(Vec::new())),
+                        }
+                    }
+                    ContractHandlerEvent::UpdateQuery { key, data, .. } => {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        let is_delta = matches!(
+                            &data,
+                            UpdateData::Delta(_) | UpdateData::RelatedDelta { .. }
+                        );
+                        if is_delta {
+                            match delta_outcome {
+                                DeltaOutcome::ExecReject => ContractHandlerEvent::UpdateResponse {
+                                    new_value: Err(exec_reject_err(key)),
+                                    state_changed: false,
+                                },
+                                DeltaOutcome::QueueFull => ContractHandlerEvent::UpdateResponse {
+                                    new_value: Err(queue_full_err()),
+                                    state_changed: false,
+                                },
+                                DeltaOutcome::Success => ContractHandlerEvent::UpdateResponse {
+                                    new_value: Ok(WrappedState::from(vec![1u8, 2, 3])),
+                                    state_changed: true,
+                                },
+                                DeltaOutcome::SuccessNoChange => {
+                                    ContractHandlerEvent::UpdateResponse {
+                                        new_value: Ok(WrappedState::from(vec![1u8, 2, 3])),
+                                        state_changed: false,
+                                    }
+                                }
+                            }
+                        } else {
+                            ContractHandlerEvent::UpdateResponse {
+                                new_value: Ok(WrappedState::from(vec![1u8, 2, 3])),
+                                state_changed: true,
+                            }
+                        }
+                    }
+                    other => {
+                        panic!("unexpected handler event in exec-reject stand-in: {other:?}")
+                    }
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let guard: Box<dyn std::any::Any> =
+            Box::new((handler, result_router_rx, task_monitor, wait_for_event));
+        (op_manager, notification_rx, update_query_count, guard)
+    }
+
+    /// Convenience wrapper: a node whose stand-in handler fails every delta with
+    /// a contract-exec rejection (the common case for the backoff-gate tests).
+    async fn build_exec_reject_test_node(
+        id: &str,
+    ) -> (
+        Arc<OpManager>,
+        crate::node::EventLoopNotificationsReceiver,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        Box<dyn std::any::Any>,
+    ) {
+        build_broadcast_test_node(id, DeltaOutcome::ExecReject).await
+    }
+
+    /// #5510: a delta that FAILS TO APPLY increments the delta-failure resync
+    /// counter, and a queue-full drop does NOT.
+    ///
+    /// This is what stops `test_full_state_send_no_incorrect_caching`'s new
+    /// assertion from being vacuous. That test asserts
+    /// `delta_failure_resyncs() == 0`, having previously asserted on the TOTAL
+    /// resync count; if the counter were never incremented the assertion would
+    /// pass forever and the #2763 summary-caching regression it guards would
+    /// walk straight through it. So: prove the counter FIRES on the cause it
+    /// names, and prove it does NOT fire on a different cause that also emits a
+    /// ResyncRequest — otherwise it would be the same over-broad proxy under a
+    /// new name.
+    #[tokio::test]
+    async fn a_failed_delta_is_counted_separately_from_a_queue_full_drop() {
+        // (a) FIRES on a delta-apply failure.
+        crate::config::GlobalTestMetrics::reset();
+        let (op_manager, mut notification_rx, _queries, _guard) =
+            build_broadcast_test_node("delta-failure-metric-5510", DeltaOutcome::ExecReject).await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([81u8; 32]),
+            CodeHash::new([82u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:13300".parse().unwrap();
+
+        let r = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 2, 3]),
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(r.is_err(), "the stand-in handler must reject the delta");
+        assert_eq!(
+            crate::config::GlobalTestMetrics::delta_failure_resyncs(),
+            1,
+            "a delta that failed to apply MUST be counted as a delta-failure \
+             resync — this is the #2763 signal, and a counter that never fires \
+             turns its assertion into a no-op"
+        );
+        drain_resync_targets(&mut notification_rx, key);
+
+        // (b) does NOT fire on a queue-full drop, which also emits a
+        //     ResyncRequest but is a different cause entirely.
+        crate::config::GlobalTestMetrics::reset();
+        let (qf_manager, mut qf_rx, _qf_guard) =
+            build_queue_full_test_node("delta-failure-metric-5510-qf").await;
+        let qf_key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([83u8; 32]),
+            CodeHash::new([84u8; 32]),
+        );
+        let qf_sender: SocketAddr = "127.0.0.1:13400".parse().unwrap();
+
+        let qf = drive_relay_broadcast_to(
+            &qf_manager,
+            Transaction::new::<UpdateMsg>(),
+            qf_key,
+            DeltaOrFullState::Delta(vec![4, 5, 6]),
+            Vec::new(),
+            qf_sender,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(
+            qf.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error, got {qf:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut qf_rx, qf_key),
+            vec![qf_sender],
+            "precondition: the queue-full drop DID emit a ResyncRequest, so this \
+             is a real discrimination test rather than a scenario with no resync"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::delta_failure_resyncs(),
+            0,
+            "a queue-full drop emits a ResyncRequest but NO delta failed, so it \
+             must not be counted as one — counting it would rebuild the same \
+             over-broad proxy #5510 replaced"
+        );
+    }
+
+    /// #4864 review (testing H1): the load-bearing #4861 behavior — the backoff
+    /// PREVENTS executor invocation in the REAL driver. After the (N=3) Invalid
+    /// threshold trips, the next broadcast's merge is SKIPPED: no additional
+    /// `UpdateQuery` reaches the handler, the suppression metric is bumped, and
+    /// no `ResyncRequest` is emitted while suppressed.
+    #[tokio::test]
+    async fn backoff_gate_skips_merge_after_invalid_threshold_trips() {
+        use std::sync::atomic::Ordering;
+        crate::config::GlobalTestMetrics::reset();
+        let (op_manager, mut notification_rx, update_queries, _guard) =
+            build_exec_reject_test_node("backoff-gate-4864").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([21u8; 32]),
+            CodeHash::new([22u8; 32]),
+        );
+        let sender: SocketAddr = "127.0.0.1:12200".parse().unwrap();
+
+        // Three consecutive delta failures (distinct bytes so none is a dedup
+        // hit) trip the Invalid threshold; each runs the merge → 1 UpdateQuery.
+        for bytes in [vec![1u8], vec![2u8], vec![3u8]] {
+            let r = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                key,
+                DeltaOrFullState::Delta(bytes),
+                Vec::new(),
+                sender,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
+            )
+            .await;
+            assert!(r.is_err(), "each poison delta must fail the merge");
+            let _ = drain_resync_targets(&mut notification_rx, key); // failure path may emit
+        }
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            3,
+            "3 failing merges reached the executor"
+        );
+        let suppressed_before = crate::config::GlobalTestMetrics::merges_suppressed_by_backoff();
+
+        // The 4th broadcast: the backoff has tripped → the merge is SKIPPED.
+        let r4 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![4u8]),
+            Vec::new(),
+            sender,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(
+            r4.is_ok(),
+            "a suppressed broadcast completes Ok (like a dedup skip)"
+        );
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            3,
+            "the suppressed merge MUST NOT reach the executor (no 4th UpdateQuery)"
+        );
+        assert!(
+            crate::config::GlobalTestMetrics::merges_suppressed_by_backoff() > suppressed_before,
+            "the suppressed merge MUST bump merges_suppressed_by_backoff"
+        );
+        assert!(
+            drain_resync_targets(&mut notification_rx, key).is_empty(),
+            "no ResyncRequest may be emitted while the merge is suppressed"
+        );
+    }
+
+    /// #4864 review (testing #2): a full-state success does NOT reset the backoff
+    /// (strictly delta-only). Two delta failures + a full-state success leave the
+    /// consecutive count intact, so a 3rd delta failure still trips (proving no
+    /// reset) and the following delta is suppressed.
+    #[tokio::test]
+    async fn full_state_success_does_not_reset_backoff() {
+        use std::sync::atomic::Ordering;
+        crate::config::GlobalTestMetrics::reset();
+        let (op_manager, mut notification_rx, update_queries, _guard) =
+            build_exec_reject_test_node("backoff-fullstate-noreset-4864").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([31u8; 32]),
+            CodeHash::new([32u8; 32]),
+        );
+        let sender: SocketAddr = "127.0.0.1:12300".parse().unwrap();
+
+        // Two delta failures (count = 2, below the trip threshold).
+        for bytes in [vec![1u8], vec![2u8]] {
+            let driven = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                key,
+                DeltaOrFullState::Delta(bytes),
+                Vec::new(),
+                sender,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
+            )
+            .await;
+            // Pin the PREMISE: these two must actually fail, or the backoff
+            // count below never advances and the test passes vacuously.
+            assert!(
+                driven.is_err(),
+                "the stand-in executor must reject this delta, got {driven:?}"
+            );
+            let _ = drain_resync_targets(&mut notification_rx, key);
+        }
+        // A full-state broadcast SUCCEEDS via the stand-in — but must NOT reset
+        // the consecutive count (strictly delta-only reset).
+        let ok = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::FullState(vec![9, 9, 9]),
+            Vec::new(),
+            sender,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "full-state merge should succeed via the stand-in"
+        );
+        let _ = drain_resync_targets(&mut notification_rx, key);
+
+        // A 3rd delta failure now trips (count 2 → 3), proving the success did
+        // NOT reset it to 0 (else the count would only reach 1 here).
+        let third = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![3u8]),
+            Vec::new(),
+            sender,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(
+            third.is_err(),
+            "the tripping delta must actually fail, got {third:?}"
+        );
+        let _ = drain_resync_targets(&mut notification_rx, key);
+        let queries_after_trip = update_queries.load(Ordering::Relaxed);
+
+        // The following delta is SUPPRESSED (merge skipped) — the backoff tripped
+        // across the full-state success, so the count was never reset.
+        let r = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![4u8]),
+            Vec::new(),
+            sender,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            queries_after_trip,
+            "the backoff tripped across the full-state success (no reset) — the \
+             following delta merge is skipped"
+        );
+    }
+
+    /// #4864 review P1 (the adversarial regression, driven through the REAL
+    /// driver): one sender tripping its Invalid channel must NOT suppress a
+    /// DIFFERENT sender's delta — the second sender's merge still reaches the
+    /// executor. A contract-wide gate would blackout the healthy sender here,
+    /// which is the peer-triggerable-blackout this per-sender rework prevents.
+    #[tokio::test]
+    async fn backoff_gate_is_scoped_per_sender_in_driver() {
+        use std::sync::atomic::Ordering;
+        crate::config::GlobalTestMetrics::reset();
+        let (op_manager, mut notification_rx, update_queries, _guard) =
+            build_exec_reject_test_node("backoff-per-sender-4864").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([41u8; 32]),
+            CodeHash::new([42u8; 32]),
+        );
+        let sender_a: SocketAddr = "127.0.0.1:12400".parse().unwrap();
+        let sender_b: SocketAddr = "127.0.0.1:12500".parse().unwrap();
+
+        // Sender A trips its own Invalid channel (3 consecutive delta failures).
+        for bytes in [vec![1u8], vec![2u8], vec![3u8]] {
+            let driven = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                key,
+                DeltaOrFullState::Delta(bytes),
+                Vec::new(),
+                sender_a,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
+            )
+            .await;
+            // Pin the PREMISE: A must actually fail 3 times, or it never trips
+            // and the per-sender scoping below is never exercised.
+            assert!(
+                driven.is_err(),
+                "the stand-in executor must reject A's delta, got {driven:?}"
+            );
+            let _ = drain_resync_targets(&mut notification_rx, key);
+        }
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            3,
+            "A's 3 failing merges reached the executor"
+        );
+
+        // A's next delta is now suppressed (A's channel tripped).
+        let ra = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![4u8]),
+            Vec::new(),
+            sender_a,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(ra.is_ok(), "A's suppressed broadcast completes Ok");
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            3,
+            "A's suppressed delta MUST NOT reach the executor"
+        );
+
+        // Sender B's delta (distinct payload) STILL reaches the executor — the
+        // contract stays live for healthy senders despite A's backoff. It fails
+        // via the stand-in, so B's channel starts counting, but the merge RAN.
+        let rb = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![5u8]),
+            Vec::new(),
+            sender_b,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        let _ = drain_resync_targets(&mut notification_rx, key);
+        assert!(
+            rb.is_err(),
+            "B's delta reaches the merge (fails via stand-in)"
+        );
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            4,
+            "B's delta MUST reach the executor despite A's per-sender backoff"
+        );
+    }
+
+    /// #4864 review item 7(b): `ContractQueueFull` is transient backpressure, not
+    /// poison — the driver's `is_contract_exec_rejection()` gate must NOT record
+    /// it, so no amount of consecutive queue-full failures trips the backoff.
+    /// Every delta keeps reaching the executor (no suppression).
+    #[tokio::test]
+    async fn queue_full_failures_do_not_trip_backoff() {
+        use std::sync::atomic::Ordering;
+        crate::config::GlobalTestMetrics::reset();
+        let (op_manager, mut notification_rx, update_queries, _guard) =
+            build_broadcast_test_node("backoff-queuefull-4864", DeltaOutcome::QueueFull).await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([51u8; 32]),
+            CodeHash::new([52u8; 32]),
+        );
+        let sender: SocketAddr = "127.0.0.1:12600".parse().unwrap();
+
+        // Five consecutive queue-full delta failures (well past the N=3 Invalid
+        // trip threshold). None may be recorded to the backoff.
+        for bytes in [vec![1u8], vec![2u8], vec![3u8], vec![4u8], vec![5u8]] {
+            let driven = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                key,
+                DeltaOrFullState::Delta(bytes),
+                Vec::new(),
+                sender,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
+            )
+            .await;
+            // Pin the PREMISE: every one of the five must be a queue-full
+            // failure, else "5 failures did not trip the backoff" proves nothing.
+            assert!(
+                driven.is_err(),
+                "the stand-in executor must report queue-full, got {driven:?}"
+            );
+            let _ = drain_resync_targets(&mut notification_rx, key);
+        }
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            5,
+            "every queue-full delta must still reach the executor — queue-full \
+             must NOT trip the backoff (it is transient load, not poison)"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::merges_suppressed_by_backoff(),
+            0,
+            "no merge may be suppressed — queue-full never records a backoff entry"
+        );
+        assert_eq!(
+            op_manager.ring.merge_backoff.contracts_in_backoff(),
+            0,
+            "no contract may be in backoff after only queue-full failures"
+        );
+    }
+
+    /// #4864 round-4 P1 (item 3): the #4857 queue-full resync heal must be bound
+    /// by the GLOBAL per-contract emit cap. A flood of DISTINCT senders (each
+    /// passing its own per-(contract, sender) throttle) sending queue-full deltas
+    /// for ONE contract must emit at most `EMIT_BURST` ResyncRequests total — not
+    /// one per sender. Without the global cap this would be one per sender.
+    #[tokio::test]
+    async fn queue_full_resync_flood_is_bounded_by_global_emit_cap() {
+        crate::config::GlobalTestMetrics::reset();
+        let (op_manager, mut notification_rx, _update_queries, _guard) =
+            build_broadcast_test_node("queuefull-emit-cap-4864", DeltaOutcome::QueueFull).await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([71u8; 32]),
+            CodeHash::new([72u8; 32]),
+        );
+        // Six DISTINCT senders (each clears its own per-sender throttle) each send
+        // a distinct-payload queue-full delta for the SAME contract.
+        let sender_count = 6u16;
+        for i in 0..sender_count {
+            let sender: SocketAddr = format!("127.0.0.1:{}", 13000 + i).parse().unwrap();
+            let driven = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                key,
+                DeltaOrFullState::Delta(vec![i as u8]),
+                Vec::new(),
+                sender,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
+            )
+            .await;
+            // Pin the PREMISE: each sender's delta must actually hit queue-full,
+            // or the emit cap below is never put under pressure.
+            assert!(
+                driven.is_err(),
+                "the stand-in executor must report queue-full, got {driven:?}"
+            );
+        }
+        // The global per-contract emit cap (EMIT_BURST = 2) bounds total emissions
+        // regardless of sender count — NOT one per sender.
+        let emissions = drain_resync_targets(&mut notification_rx, key);
+        let burst = crate::ring::resync_rate_limit::EMIT_BURST as usize;
+        assert_eq!(
+            emissions.len(),
+            burst,
+            "queue-full resync emissions ({}) must be bounded by the global \
+             per-contract cap (EMIT_BURST = {}), not one per sender ({sender_count})",
+            emissions.len(),
+            burst
+        );
+    }
+
+    /// Pin (#4864 round-4 item 3): the queue-full resync heal helper must route
+    /// through BOTH the per-(contract, sender) throttle AND the global
+    /// per-contract emit cap — the latter was the #4857 bypass.
+    #[test]
+    fn queue_full_resync_helper_goes_through_global_emit_cap() {
         let src = include_str!("op_ctx_task.rs");
         let start = src
-            .find("async fn drive_relay_broadcast_to(")
-            .expect("drive_relay_broadcast_to not found");
+            .find("async fn send_dropped_broadcast_resync_request(")
+            .expect("send_dropped_broadcast_resync_request not found");
         let after = &src[start + 1..];
         let end = after
             .find("\nasync fn ")
             .or_else(|| after.find("\n#[cfg(test)]"))
             .unwrap_or(after.len());
-        let driver_src = &src[start..start + 1 + end];
+        let body = &src[start..start + 1 + end];
+        assert!(
+            body.contains("resync_emit_limiter"),
+            "the queue-full resync helper must route through the GLOBAL \
+             per-contract emit cap (resync_emit_limiter) (#4864 round-4)"
+        );
+        assert!(
+            body.contains("begin_resync_request"),
+            "and keep the per-(contract, sender) throttle"
+        );
+    }
 
-        // Gate must be present; both amplification call sites must still
-        // exist (suppressed on queue-full, not deleted). Runtime gating
-        // behavior is covered by the update.rs tests; this is a structural
-        // pin so a refactor that drops the check fails CI.
+    /// #4864 round-8 pin (Codex P1): every PRODUCTION `ResyncRequest` emission
+    /// MUST be preceded by an `outstanding_resync_requests.record(...)` so the
+    /// receive arm can correlate (and consume) the matching `ResyncResponse`. A
+    /// future emit site that forgets to record would make its legitimate response
+    /// look unsolicited (a silent heal regression) — and the record is the whole
+    /// basis of the receive-side DoS gate, so it must never drift from the emit.
+    #[test]
+    fn every_production_resync_request_emit_records_outstanding() {
+        let src = include_str!("op_ctx_task.rs");
+        // Bound to PRODUCTION code (before the test module) so the mock emit in
+        // the harness below is not counted.
+        let prod_end = src.find("\nmod tests {").unwrap_or(src.len());
+        let prod = &src[..prod_end];
+
+        // EXEMPT the #4862 queue-full RETRY (`resend_dropped_broadcast_resync_request`).
+        // It RE-DELIVERS an emit whose `outstanding_resync_requests.record(...)`
+        // was ALREADY made by `send_dropped_broadcast_resync_request` (the initial). It
+        // deliberately does NOT re-record, because re-recording would re-authorize
+        // a REDUNDANT `ResyncResponse` — the opposite of round-8's drop-the-
+        // redundant intent (and would re-run the full-state WASM merge the record
+        // exists to bound). In the bridge-drop case the initial record is still
+        // outstanding when the retry's response arrives (so it IS authorized);
+        // once that record is consumed, a further retry's response is correctly
+        // dropped. So the retry's re-send is legitimately un-recorded — skip it.
+        let retry_start = prod
+            .find("async fn resend_dropped_broadcast_resync_request(")
+            .expect("resend_dropped_broadcast_resync_request (the #4862 retry) not found");
+        let retry_end = retry_start
+            + 1
+            + prod[retry_start + 1..]
+                .find("\nasync fn ")
+                .unwrap_or(prod.len() - retry_start - 1);
+
+        let mut emits = 0usize;
+        let mut cursor = 0usize;
+        while let Some(rel) = prod[cursor..].find("message: InterestMessage::ResyncRequest") {
+            let pos = cursor + rel;
+            cursor = pos + 1;
+            // Skip the exempt retry re-delivery (see above).
+            if (retry_start..retry_end).contains(&pos) {
+                continue;
+            }
+            emits += 1;
+            // Look back to the start of the ENCLOSING production fn for the record
+            // call that authorizes the ResyncResponse this emit will provoke
+            // (fmt-robust: match the field identifier, which survives
+            // line-wrapping of the method chain).
+            //
+            // This was a fixed 600-byte lookback until #4863 moved the queue-full
+            // helper's record ABOVE the retry spawn — the retry's conditional gate
+            // reads that record, so it must exist before the task can observe it —
+            // which pushed the record out of a byte window that was always an
+            // arbitrary proxy for "same statement sequence". Scoping to the
+            // enclosing fn keeps the real guarantee (an emit is preceded by its
+            // record, on the same code path) without the brittle distance.
+            // Anchor on the LAST fn-opening token before the emit. Must cover
+            // visibility-prefixed forms (`pub async fn`, `pub(crate) async fn`):
+            // matching only "\nasync fn "/"\nfn " would skip past a `pub` fn and
+            // anchor to an EARLIER one, whose window may contain an unrelated
+            // record — a false pass for exactly the regression this pin catches.
+            let fn_start = [
+                "\nasync fn ",
+                "\nfn ",
+                "\npub async fn ",
+                "\npub fn ",
+                "\npub(",
+            ]
+            .iter()
+            .filter_map(|kw| prod[..pos].rfind(kw))
+            .max()
+            .unwrap_or(0);
+            // Require the identifier to be part of an actual `.record(` call, not
+            // merely mentioned. #4863 added the first NON-recording use of this
+            // field (`is_outstanding`), so a bare identifier match would let a
+            // READ satisfy a pin whose entire purpose is to require a WRITE.
+            // Whitespace-stripped so rustfmt line-wrapping of the method chain
+            // cannot break the match.
+            let window: String = prod[fn_start..pos]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(
+                window.contains("outstanding_resync_requests.record("),
+                "a production ResyncRequest emit at byte {pos} is NOT preceded by an \
+                 outstanding_resync_requests.record(...) in the same fn — the \
+                 receive arm would drop its response as unsolicited (#4864 round-8)"
+            );
+        }
         assert!(
-            driver_src.contains("is_contract_queue_full()"),
-            "drive_relay_broadcast_to must call is_contract_queue_full() \
-             to gate the ResyncRequest / auto-fetch amplification — see \
-             issue #4251"
+            emits >= 2,
+            "expected at least the queue-full-helper and delta-failure ResyncRequest \
+             emit sites in production ({emits} found) — has the emit path moved?"
+        );
+    }
+
+    /// Guard (#4903 review / invariant 3): the UPDATE and broadcast paths must
+    /// NEVER stamp hosting recency. "UPDATE churn never counts as genuine
+    /// access" is what keeps a zero-demand storm contract cost-evictable
+    /// (`hosting-invariants.md` invariant 3: a storm contract whose only
+    /// activity is its own UPDATE churn stays evictable) — a future refactor
+    /// that routes an UPDATE through `host_contract` / `record_get_access` /
+    /// `touch_hosting` / `mark_local_client_access` would make storms
+    /// self-protecting and silently disarm cost-pressure eviction. This pin
+    /// scans the PRODUCTION regions of the update op modules, the broadcast
+    /// queue, AND the executor apply chokepoint (`executor_impl.rs`, #4903
+    /// review L3 — the PUT/UPDATE state-apply path, which today reports only
+    /// `ExecCpuMicros` and must never grow a recency stamp on the UPDATE side)
+    /// for any recency-stamping call, with comment text stripped so prose
+    /// references stay legal.
+    #[test]
+    fn update_and_broadcast_paths_never_stamp_hosting_recency() {
+        // Strip line comments so documentation may mention the forbidden
+        // calls without tripping the pin; only real code counts.
+        fn code_only(src: &str) -> String {
+            src.lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let sources: [(&str, &str); 4] = [
+            (
+                "operations/update/op_ctx_task.rs",
+                include_str!("op_ctx_task.rs"),
+            ),
+            ("operations/update.rs", include_str!("../update.rs")),
+            (
+                "node/network_bridge/broadcast_queue.rs",
+                include_str!("../../node/network_bridge/broadcast_queue.rs"),
+            ),
+            (
+                "contract/executor/runtime/executor_impl.rs",
+                include_str!("../../contract/executor/runtime/executor_impl.rs"),
+            ),
+        ];
+        // Every entry point that stamps hosting recency (`recency_seq` /
+        // `last_genuine_access`) or the local-client renewal lease
+        // (`local_client_last_access`). Matched as method calls (leading dot)
+        // so type/fn definitions elsewhere don't count.
+        let forbidden = [
+            ".host_contract(",
+            ".record_get_access(",
+            ".touch_hosting(",
+            ".touch_with_demand(",
+            ".record_contract_access(",
+            ".record_access(",
+            ".record_access_with_demand(",
+            ".mark_local_client_access(",
+        ];
+        for (name, src) in sources {
+            let prod_end = src.find("\nmod tests {").unwrap_or(src.len());
+            let prod = code_only(&src[..prod_end]);
+            for needle in forbidden {
+                assert!(
+                    !prod.contains(needle),
+                    "{name} production code must not call `{needle}` — an UPDATE/\
+                     broadcast path stamping hosting recency would let a storm \
+                     contract protect itself from cost eviction (invariant 3)"
+                );
+            }
+        }
+    }
+
+    /// #4864 round-4 (item 9): a memoized payload replayed through the REAL
+    /// `drive_relay_broadcast_to` by a SECOND sender is hard-skipped — the merge
+    /// never reaches the executor, that sender's Invalid channel never trips (its
+    /// OWN novel delta still merges), and no ResyncRequest is emitted. Seed the
+    /// memo directly with THREE DISTINCT payloads (so each replay is a genuine
+    /// memo hit rather than a `BroadcastDedupCache` hit — the dedup cache is
+    /// content-addressed too, so an identical replay would be swallowed by dedup
+    /// before reaching the backoff gate).
+    #[tokio::test]
+    async fn memoized_payload_replay_from_second_sender_is_hard_skipped() {
+        use std::sync::atomic::Ordering;
+        crate::config::GlobalTestMetrics::reset();
+        let (op_manager, mut notification_rx, update_queries, _guard) =
+            build_exec_reject_test_node("memo-replay-4864").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([83u8; 32]),
+            CodeHash::new([84u8; 32]),
+        );
+        let sender_a: SocketAddr = "127.0.0.1:13300".parse().unwrap();
+        let sender_b: SocketAddr = "127.0.0.1:13400".parse().unwrap();
+
+        // Seed the contract-wide memo with three distinct poison delta payloads
+        // (as if sender A had already failed them). record_failure memoizes each.
+        let poisons = [vec![91u8], vec![92u8], vec![93u8]];
+        for p in &poisons {
+            let h = crate::ring::merge_backoff::merge_payload_hash(true, p);
+            op_manager.ring.merge_backoff.record_failure(
+                key.id(),
+                sender_a,
+                crate::ring::merge_backoff::MergeFailureClass::Invalid,
+                h,
+            );
+        }
+
+        // Sender B replays each memoized payload: each is a hard memo skip.
+        for p in &poisons {
+            let r = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                key,
+                DeltaOrFullState::Delta(p.clone()),
+                Vec::new(),
+                sender_b,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
+            )
+            .await;
+            assert!(
+                r.is_ok(),
+                "a memoized-payload skip completes Ok (like a dedup skip)"
+            );
+        }
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            0,
+            "B's replays of memoized payloads MUST NOT reach the executor"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::merges_suppressed_by_backoff(),
+            poisons.len() as u64,
+            "each replay must be a memo skip (bumps merges_suppressed_by_backoff), \
+             not a dedup skip"
         );
         assert!(
-            driver_src.contains("InterestMessage::ResyncRequest"),
-            "drive_relay_broadcast_to should still contain the ResyncRequest \
-             branch (gated on !queue_full)"
+            drain_resync_targets(&mut notification_rx, key).is_empty(),
+            "a memo skip must NOT emit a ResyncRequest"
+        );
+
+        // B's channel never tripped — its OWN novel delta still reaches the merge.
+        let novel = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![94u8]),
+            Vec::new(),
+            sender_b,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        let _ = drain_resync_targets(&mut notification_rx, key);
+        assert!(
+            novel.is_err(),
+            "B's novel delta reaches the merge (fails via stand-in)"
+        );
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            1,
+            "B's novel delta MUST reach the executor — the memo skips never advanced \
+             B's channel"
+        );
+    }
+
+    /// #4864 review item 6: a successful client-local DELTA driven through the
+    /// REAL `drive_client_update` clears the CONTRACT-WIDE side (Timeout + memo)
+    /// via `record_success_local`, but must NOT clear a remote sender's Invalid
+    /// channel (a local success says nothing about that sender's fork).
+    #[tokio::test]
+    async fn client_local_delta_success_clears_contract_side_not_other_senders() {
+        let (op_manager, _notification_rx, _update_queries, _guard) =
+            build_broadcast_test_node("backoff-client-local-4864", DeltaOutcome::Success).await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([61u8; 32]),
+            CodeHash::new([62u8; 32]),
+        );
+        // Make the local node host the contract so drive_client_update's
+        // target=None path applies the update locally instead of erroring.
+        op_manager.ring.host_contract(
+            key,
+            100,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+
+        let remote_sender: SocketAddr = "127.0.0.1:12700".parse().unwrap();
+        let probe_sender: SocketAddr = "127.0.0.1:12800".parse().unwrap();
+
+        // Seed a contract-wide Timeout (trips at 1) and a remote sender's tripped
+        // Invalid channel (3 consecutive).
+        op_manager.ring.merge_backoff.record_failure(
+            key.id(),
+            remote_sender,
+            crate::ring::merge_backoff::MergeFailureClass::Timeout,
+            0x01,
+        );
+        for h in [0x11u64, 0x12, 0x13] {
+            op_manager.ring.merge_backoff.record_failure(
+                key.id(),
+                remote_sender,
+                crate::ring::merge_backoff::MergeFailureClass::Invalid,
+                h,
+            );
+        }
+        // Precondition: the contract-wide Timeout suppresses a fresh probe sender.
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), probe_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "seeded contract-wide Timeout should suppress before the client success"
+        );
+
+        // Drive a successful client-local DELTA through the real driver.
+        let outcome = drive_client_update(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            UpdateData::Delta(StateDelta::from(vec![7u8, 7, 7])),
+            RelatedContracts::default(),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "client-local delta merge should succeed via the stand-in: {outcome:?}"
+        );
+
+        // Contract-wide side (Timeout + memo) is cleared: the probe sender, which
+        // has no Invalid channel of its own, is now Allowed.
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), probe_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::Allow,
+            "record_success_local must clear the contract-wide Timeout + memo"
+        );
+        // But the remote sender's Invalid channel is UNTOUCHED — still suppressed.
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), remote_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "a local client's success must NOT clear a remote sender's Invalid \
+             channel (it says nothing about that sender's fork)"
+        );
+    }
+
+    /// #4864 round-4 addendum (CI rule-review): the client-path mirror of
+    /// `full_state_success_does_not_reset_backoff`. A successful client-local
+    /// FULL-STATE update (`is_delta_update == false`) driven through the REAL
+    /// `drive_client_update` must NOT reset the backoff — `record_success_local`
+    /// is gated `is_delta_update`, and a full-state apply is fork-flippable so it
+    /// proves nothing about convergence. Closes the bot warning that the
+    /// delta-only gating was source-scrape-only. (With round-4 item 1 the
+    /// contract-side clear also needs `changed`, but the `is_delta` gate fires
+    /// first, so this holds regardless of `changed`.)
+    #[tokio::test]
+    async fn client_local_full_state_success_does_not_reset_backoff() {
+        let (op_manager, _notification_rx, _update_queries, _guard) =
+            build_broadcast_test_node("backoff-client-fullstate-4864", DeltaOutcome::Success).await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([63u8; 32]),
+            CodeHash::new([64u8; 32]),
+        );
+        op_manager.ring.host_contract(
+            key,
+            100,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+
+        let remote_sender: SocketAddr = "127.0.0.1:15100".parse().unwrap();
+        let probe_sender: SocketAddr = "127.0.0.1:15200".parse().unwrap();
+
+        // Seed a contract-wide Timeout + a remote sender's tripped Invalid channel.
+        op_manager.ring.merge_backoff.record_failure(
+            key.id(),
+            remote_sender,
+            crate::ring::merge_backoff::MergeFailureClass::Timeout,
+            0x01,
+        );
+        for h in [0x11u64, 0x12, 0x13] {
+            op_manager.ring.merge_backoff.record_failure(
+                key.id(),
+                remote_sender,
+                crate::ring::merge_backoff::MergeFailureClass::Invalid,
+                h,
+            );
+        }
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), probe_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "seeded contract-wide Timeout should suppress before the client update"
+        );
+
+        // Drive a successful client-local FULL-STATE update (is_delta_update=false).
+        let outcome = drive_client_update(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            UpdateData::State(State::from(vec![9u8, 9, 9])),
+            RelatedContracts::default(),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "client-local full-state update should succeed via the stand-in: {outcome:?}"
+        );
+
+        // The backoff is NOT reset: the contract-wide Timeout still suppresses the
+        // probe (a full-state apply is not convergence evidence, delta-only reset).
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), probe_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "a client FULL-STATE success must NOT clear the contract-wide Timeout \
+             (record_success_local is gated is_delta_update)"
+        );
+        // ... and the remote sender's Invalid channel is likewise untouched.
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), remote_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "a client FULL-STATE success must NOT clear a remote sender's Invalid channel"
+        );
+    }
+
+    /// #4864 round-5 item 4: a successful client-local DELTA that did NOT advance
+    /// state (`state_changed == false`, e.g. an idempotent re-apply) driven
+    /// through the REAL `drive_client_update` must NOT clear the contract-side
+    /// backoff — `record_success_local` is gated `changed`, so a no-op success is
+    /// not a state-generation signal. This closes the round-4 no-op-wipe bug end
+    /// to end (previously not drivable: no harness variant returned Ok with
+    /// `state_changed: false`).
+    #[tokio::test]
+    async fn client_local_no_op_delta_success_does_not_clear_contract_side() {
+        let (op_manager, _notification_rx, _update_queries, _guard) = build_broadcast_test_node(
+            "backoff-client-nochange-4864",
+            DeltaOutcome::SuccessNoChange,
+        )
+        .await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([65u8; 32]),
+            CodeHash::new([66u8; 32]),
+        );
+        op_manager.ring.host_contract(
+            key,
+            100,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+
+        let remote_sender: SocketAddr = "127.0.0.1:15300".parse().unwrap();
+        let probe_sender: SocketAddr = "127.0.0.1:15400".parse().unwrap();
+
+        // Seed a contract-wide Timeout + a remote sender's tripped Invalid channel.
+        op_manager.ring.merge_backoff.record_failure(
+            key.id(),
+            remote_sender,
+            crate::ring::merge_backoff::MergeFailureClass::Timeout,
+            0x01,
+        );
+        for h in [0x11u64, 0x12, 0x13] {
+            op_manager.ring.merge_backoff.record_failure(
+                key.id(),
+                remote_sender,
+                crate::ring::merge_backoff::MergeFailureClass::Invalid,
+                h,
+            );
+        }
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), probe_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "seeded contract-wide Timeout should suppress before the client update"
+        );
+
+        // Drive a client-local DELTA (is_delta_update == true) that SUCCEEDS with
+        // state_changed == false via the stand-in.
+        let outcome = drive_client_update(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            UpdateData::Delta(StateDelta::from(vec![7u8, 7, 7])),
+            RelatedContracts::default(),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "no-op client-local delta should succeed via the stand-in: {outcome:?}"
+        );
+
+        // The contract-side backoff is NOT cleared (the state did not advance): the
+        // probe is still suppressed by the contract-wide Timeout.
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), probe_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "a no-op (changed=false) client delta success must NOT clear the \
+             contract-wide Timeout (record_success_local is gated on changed)"
+        );
+        // ... and the remote sender's Invalid channel is likewise untouched.
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), remote_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "a no-op client delta success must NOT clear a remote sender's Invalid channel"
+        );
+    }
+
+    /// Pin (#4864 round-5 item 4): the three success call sites must pass the REAL
+    /// `changed` field, not a literal `true` — a literal would re-introduce the
+    /// round-4 no-op-wipe bug (wiping the contract-side Timeout/memo on every
+    /// no-op merge) while passing every other test.
+    #[test]
+    fn success_sites_pass_real_changed_flag_not_a_literal() {
+        let src = include_str!("op_ctx_task.rs");
+        // Both drive_client_update success arms pass execution.changed.
+        let client = extract_fn_body(src, "async fn drive_client_update(");
+        let client_calls = client
+            .matches("record_success_local(key.id(), execution.changed)")
+            .count();
+        assert!(
+            client_calls >= 2,
+            "both drive_client_update success arms must pass the REAL \
+             execution.changed to record_success_local (found {client_calls}, \
+             expected >= 2) — not a literal `true` (#4864 round-5 item 4)"
         );
         assert!(
-            driver_src.contains("try_auto_fetch_contract"),
-            "drive_relay_broadcast_to should still contain the auto-fetch \
-             branch (gated on !queue_full)"
+            !client.contains("record_success_local(key.id(), true)"),
+            "drive_client_update must NOT hardcode `true` for the changed flag"
         );
+        // The relay broadcast success arm passes result.changed AS THE ARGUMENT of
+        // record_success_from_sender (anchored to the call, not a loose match on
+        // the whole body — #4864 round-6 item 6a).
+        let relay = broadcast_to_driver_src();
+        let call = relay.find(".record_success_from_sender(").expect(
+            "drive_relay_broadcast_to must clear the backoff via record_success_from_sender",
+        );
+        let call_args = &relay[call..(call + 160).min(relay.len())];
+        assert!(
+            call_args.contains("result.changed"),
+            "record_success_from_sender must be passed the REAL result.changed \
+             (found in its arg list), not a literal `true` (#4864 round-5 item 4)"
+        );
+    }
+
+    /// Pin (#4864 round-5 item 6): the CHANGED streaming full-state apply arm MUST
+    /// call `invalidate_payload_memo` inside the `if exec.changed` gate — same
+    /// reason as the node.rs resync-apply site: a state-advancing full-state apply
+    /// invalidates the memo's premise. Dropping it silently widens the staleness
+    /// corner to the full 10-min TTL. (The streaming path still must NOT reset the
+    /// backoff — covered by `broadcast_to_streaming_has_backoff_wiring`.)
+    #[test]
+    fn streaming_changed_apply_invalidates_payload_memo() {
+        let src = include_str!("op_ctx_task.rs");
+        let st = extract_fn_body(src, "async fn apply_streaming_broadcast(");
+        let changed_gate = st
+            .find("if exec.changed")
+            .expect("streaming Ok arm must gate on `if exec.changed`");
+        // Brace-match the `if exec.changed { ... }` block so we assert containment,
+        // not just relative order (#4864 round-6 item 6b).
+        let open_brace = changed_gate
+            + st[changed_gate..]
+                .find('{')
+                .expect("if exec.changed block must have a body");
+        let mut depth = 0usize;
+        let mut close_brace = None;
+        for (i, ch) in st[open_brace..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_brace = Some(open_brace + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close_brace = close_brace.expect("if exec.changed block must be balanced");
+        let invalidate = concat!("invalidate_", "payload_memo(");
+        let inv_pos = st.find(invalidate).expect(
+            "the CHANGED streaming full-state apply must call invalidate_payload_memo \
+             (#4864 round-5 item 6)",
+        );
+        assert!(
+            open_brace < inv_pos && inv_pos < close_brace,
+            "invalidate_payload_memo ({inv_pos}) must be INSIDE the `if exec.changed \
+             {{ .. }}` block ({open_brace}..{close_brace}) so a no-op streaming apply \
+             does not invalidate the memo"
+        );
+    }
+
+    /// #4864 round-9 item 3: the NON-streaming CHANGED full-state success arms
+    /// (relay `drive_relay_broadcast_to` + client `drive_client_update`) MUST also
+    /// invalidate the failed-payload memo (memo only, NO backoff reset), so a
+    /// payload that failed against old state doesn't stay KnownFailedPayload for up
+    /// to FAILED_PAYLOAD_TTL after a full state advances it — the omission the
+    /// streaming and resync-apply paths did NOT have. Mirror of
+    /// `streaming_changed_apply_invalidates_payload_memo` for the other two drivers.
+    #[test]
+    fn nonstreaming_changed_fullstate_success_invalidates_payload_memo() {
+        let src = include_str!("op_ctx_task.rs");
+        let invalidate = concat!("invalidate_", "payload_memo(");
+        for (fn_needle, changed_expr) in [
+            (
+                "async fn drive_relay_broadcast_to(",
+                "else if result.changed",
+            ),
+            ("async fn drive_client_update(", "else if execution.changed"),
+        ] {
+            let body = extract_fn_body(src, fn_needle);
+            let gate = body.find(changed_expr).unwrap_or_else(|| {
+                panic!(
+                    "`{fn_needle}` must have an `{changed_expr}` full-state success arm \
+                     (#4864 round-9 item 3)"
+                )
+            });
+            // Brace-match the else-if block; the memo invalidation must be INSIDE it
+            // (so a NO-op full-state apply does not invalidate the memo).
+            let open_brace = gate
+                + body[gate..]
+                    .find('{')
+                    .expect("else-if block must have a body");
+            let mut depth = 0usize;
+            let mut close = None;
+            for (i, ch) in body[open_brace..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open_brace + i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let close = close.expect("else-if block must be balanced");
+            let inv = body
+                .find(invalidate)
+                .unwrap_or_else(|| panic!("`{fn_needle}` must call invalidate_payload_memo"));
+            assert!(
+                open_brace < inv && inv < close,
+                "`{fn_needle}`: invalidate_payload_memo must be INSIDE the \
+                 `{changed_expr}` full-state block (memo-only, gated on changed)"
+            );
+        }
+    }
+
+    /// Issue #4857 (P2): the immediate queue-full `ResyncRequest` rides a lossy
+    /// path (event loop → `P2pBridge::try_send`) and can be dropped under the
+    /// same backpressure that caused the queue-full drop. If it is, the sender
+    /// never clears its poisoned summary and a one-off change diverges until the
+    /// ~5-min heartbeat. `send_dropped_broadcast_resync_request` therefore schedules a
+    /// BOUNDED trailing retry that re-dispatches the ResyncRequest within the
+    /// single reserved throttle window.
+    ///
+    /// This test drives ONE queue-full drop, then advances virtual time (which,
+    /// with no injected clock override, IS the throttle's clock) and asserts the
+    /// trailing retry re-emits exactly `QUEUE_FULL_RESYNC_MAX_RETRIES` additional
+    /// ResyncRequests (all to the original sender) — proving the resync heals
+    /// without waiting on the heartbeat, even though no further broadcast occurs
+    /// (the rarely-changing-field case). Time advances stay under the 30s
+    /// reservation deadline so the deadline gate does not trip here (the
+    /// deadline-stop behavior is covered by
+    /// `queue_full_resync_retry_stops_after_reservation_deadline`).
+    #[tokio::test(start_paused = true)]
+    async fn queue_full_resync_retry_redispatches_within_reservation() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4857-retry").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([9u8; 32]),
+            CodeHash::new([10u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12300".parse().unwrap();
+
+        // One queue-full drop → immediate ResyncRequest + a spawned trailing
+        // retry task. No second broadcast is issued (the rarely-changing field
+        // case), so the only way further ResyncRequests appear is the retry.
+        let r1 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 2, 3]),
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![sender_addr],
+            "the immediate (pre-retry) ResyncRequest must fire exactly once"
+        );
+
+        // Let the spawned retry task run through its bounded, jittered waits.
+        // The retry paces on the throttle's clock via a `now()`-poll, so advance
+        // the (paused) clock in small steps and yield between them to let the
+        // poll loop make progress; drain after each. 40 × 500ms = 20s total,
+        // safely under the 30s reservation deadline, and we stop as soon as both
+        // retries have fired. The extra rounds after that prove the retry does
+        // NOT keep emitting past the bound.
+        let mut retries = Vec::new();
+        for _ in 0..40 {
+            if retries.len() >= QUEUE_FULL_RESYNC_MAX_RETRIES as usize {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            retries.extend(drain_resync_targets(&mut notification_rx, key));
+        }
+
+        assert_eq!(
+            retries.len(),
+            QUEUE_FULL_RESYNC_MAX_RETRIES as usize,
+            "the trailing retry must re-dispatch the ResyncRequest exactly \
+             QUEUE_FULL_RESYNC_MAX_RETRIES times within the single reservation, \
+             so a bridge-dropped resync heals before the ~5-min heartbeat — and \
+             must NOT exceed that bound (storm bound #4251)"
+        );
+        assert!(
+            retries.iter().all(|t| *t == sender_addr),
+            "every retry ResyncRequest must target the original sender, got {retries:?}"
+        );
+    }
+
+    /// Issue #4863: the #4862 trailing retry must be CONDITIONAL — it must NOT
+    /// re-dispatch once the first queue-full `ResyncRequest` is observed to have
+    /// landed. Every `ResyncRequest` makes the sender clear its cached summary
+    /// of us and re-send FULL contract state, so a blind retry lands up to
+    /// `QUEUE_FULL_RESYNC_MAX_RETRIES` redundant full-state `ResyncResponse`s on
+    /// a receiver whose queue was full moments ago — the exact amplification the
+    /// #4251 storm bound exists to avoid.
+    ///
+    /// The observed-landed signal is the #4864 round-8 correlation record: the
+    /// `ResyncResponse` receive arm (`node.rs`) require-and-CONSUMES the
+    /// `(contract, sender)` entry before applying, so the entry's absence is an
+    /// END-TO-END confirmation that the request landed, the sender answered, and
+    /// we authorized the answer.
+    ///
+    /// This drives ONE queue-full drop, then simulates the response landing
+    /// exactly the way the receive arm does (consume the record), then advances
+    /// the throttle's clock across the whole retry burst window. NO retry may
+    /// fire. It also asserts the node-wide retry slot (#4862 P1) is RELEASED on
+    /// the skip rather than burned.
+    #[tokio::test(start_paused = true)]
+    async fn queue_full_resync_retry_skipped_once_response_landed() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4863-landed").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([17u8; 32]),
+            CodeHash::new([18u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12700".parse().unwrap();
+
+        let r1 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 2, 3]),
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![sender_addr],
+            "the immediate (pre-retry) ResyncRequest must fire exactly once"
+        );
+
+        // The sender's `ResyncResponse` arrives: `node.rs`'s receive arm
+        // require-and-consumes the outstanding correlation record before applying
+        // the full state. Doing exactly that here IS the "first request landed"
+        // event, from the retry's point of view.
+        assert!(
+            op_manager
+                .ring
+                .outstanding_resync_requests
+                .consume(*key.id(), sender_addr),
+            "the helper must have recorded the outstanding request, so the \
+             matching ResyncResponse is authorized once (#4864 round-8)"
+        );
+
+        // Advance the throttle's clock across the whole retry burst (20s, under
+        // the 30s reservation deadline) — the same pacing the blind-retry test
+        // uses to observe both retries.
+        let mut retries = Vec::new();
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            retries.extend(drain_resync_targets(&mut notification_rx, key));
+        }
+
+        assert!(
+            retries.is_empty(),
+            "the first ResyncRequest already landed (its ResyncResponse was \
+             received and consumed), so the trailing retry MUST NOT re-dispatch \
+             — each redundant request costs another full-state ResyncResponse \
+             onto a just-saturated receiver (#4863). Got {retries:?}"
+        );
+        assert_eq!(
+            op_manager.interest_manager.outstanding_resync_retries(),
+            0,
+            "skipping the retry must RELEASE the node-wide retry slot (the task \
+             returns and its RAII guard drops), never burn it (#4862 P1)"
+        );
+    }
+
+    /// Issue #4863 (edge case): the conditional gate is re-evaluated on EVERY
+    /// attempt, not just the first. When the `ResyncResponse` lands between
+    /// retry 1 and retry 2, retry 1 legitimately fired (nothing had landed yet)
+    /// but retry 2 MUST be skipped.
+    ///
+    /// This is the partial-heal case a first-attempt-only check would miss, and
+    /// it also proves the gate stops the burst rather than merely delaying it.
+    #[tokio::test(start_paused = true)]
+    async fn queue_full_resync_retry_stops_at_the_attempt_after_response_lands() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4863-midburst").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([19u8; 32]),
+            CodeHash::new([20u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12800".parse().unwrap();
+
+        let r1 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 2, 3]),
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![sender_addr],
+            "the immediate (pre-retry) ResyncRequest must fire exactly once"
+        );
+
+        // Nothing has landed yet → the FIRST retry must still fire (the #4857
+        // heal for a genuinely bridge-dropped request is preserved).
+        let mut retries = Vec::new();
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            retries.extend(drain_resync_targets(&mut notification_rx, key));
+            if !retries.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            retries.len(),
+            1,
+            "with nothing landed, the first trailing retry MUST still fire \
+             (preserves the #4857 heal), got {retries:?}"
+        );
+
+        // NOW the response lands (receive arm consumes the correlation record).
+        assert!(
+            op_manager
+                .ring
+                .outstanding_resync_requests
+                .consume(*key.id(), sender_addr),
+            "the outstanding record must still be present before the response lands"
+        );
+
+        // Advance across the remaining burst window; retry 2 must be skipped.
+        for _ in 0..30 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            retries.extend(drain_resync_targets(&mut notification_rx, key));
+        }
+        assert_eq!(
+            retries.len(),
+            1,
+            "once the response lands mid-burst, every REMAINING attempt must be \
+             skipped — the gate is re-evaluated per attempt (#4863). Got {retries:?}"
+        );
+        assert_eq!(
+            op_manager.interest_manager.outstanding_resync_retries(),
+            0,
+            "the retry task must exit and free its node-wide slot (#4862 P1)"
+        );
+    }
+
+    /// Issue #4857 (P2, review P2-A): the trailing retry burst is anchored to
+    /// the reservation deadline on the throttle's OWN clock. If the injected
+    /// clock crosses that deadline before a retry's target is reached, the retry
+    /// task MUST stop — never dispatching into a fresh reservation window. This
+    /// makes the #4251 `1 + MAX`-per-window bound rigorous even when the caller's
+    /// blocking `notify_node_event(...).await` consumed most of the window.
+    ///
+    /// Here the (paused) clock — which, with no override, IS the throttle's
+    /// clock — is advanced PAST the 30s `RESYNC_REQUEST_MIN_INTERVAL` before any
+    /// retry's jittered target elapses, so the deadline gate fires first and
+    /// NO retry is emitted.
+    #[tokio::test(start_paused = true)]
+    async fn queue_full_resync_retry_stops_after_reservation_deadline() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4857-deadline").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([11u8; 32]),
+            CodeHash::new([12u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12400".parse().unwrap();
+
+        let r1 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 2, 3]),
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![sender_addr],
+            "the immediate (pre-retry) ResyncRequest must fire exactly once"
+        );
+
+        // Let the retry task reach its first poll wait, then jump the clock PAST
+        // the 30s reservation deadline (RESYNC_REQUEST_MIN_INTERVAL, interest.rs).
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(35)).await;
+        // Give the task several scheduling turns to observe the elapsed deadline
+        // and return without dispatching.
+        let mut retries = Vec::new();
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+            retries.extend(drain_resync_targets(&mut notification_rx, key));
+        }
+
+        assert!(
+            retries.is_empty(),
+            "once the injected clock passes the reservation deadline, the retry \
+             MUST stop and emit no further ResyncRequests (P2-A), got {retries:?}"
+        );
+    }
+
+    /// Issue #4857 (P2, DST backstop): the retry gates on the injected throttle
+    /// clock, but that clock may be a DECOUPLED `hosting_time_source_override`
+    /// (`SharedMockTimeSource`) that a sim FREEZES before the reservation
+    /// deadline. If termination depended SOLELY on the injected clock, the poll
+    /// would spin forever (a `start_paused` test hangs; a real sim leaks a task
+    /// per drop). The tokio-clock liveness backstop must terminate the task
+    /// regardless.
+    ///
+    /// This test injects a mock clock, FREEZES it (never advances it) below the
+    /// deadline, then lets ONLY tokio time advance (`start_paused` auto-advance).
+    /// It asserts (a) the retry task TERMINATES within a bounded tokio budget —
+    /// a spin would make the `timeout` fail instead of hanging — and (b) NO
+    /// retry dispatches (the frozen injected clock never crosses a target).
+    #[tokio::test(start_paused = true)]
+    async fn queue_full_resync_retry_terminates_when_injected_clock_frozen() {
+        let (op_manager, mut notification_rx, _guard) = build_queue_full_test_node_with_clock(
+            "queue-full-resync-4857-frozen-clock",
+            Some(
+                Arc::new(crate::util::time_source::SharedMockTimeSource::new())
+                    as crate::util::time_source::DynTimeSource,
+            ),
+        )
+        .await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([13u8; 32]),
+            CodeHash::new([14u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12500".parse().unwrap();
+
+        // Deadline FAR in the injected-clock future: the mock is frozen at ~0,
+        // so `now >= target` and `now >= reservation_deadline` never hold and
+        // only the tokio backstop can stop the task.
+        let reservation_deadline = op_manager.interest_manager.now() + Duration::from_secs(30);
+
+        // This test drives the retry DIRECTLY, so it does what the real caller
+        // (`send_dropped_broadcast_resync_request`) does and records the outstanding
+        // request first.
+        //
+        // Note this record is INERT here, and deliberately so: the injected clock
+        // is frozen at ~0, so `now >= target` never holds and the wait loop can
+        // only exit via the tokio liveness backstop — the #4863 landed-gate below
+        // it is never reached. The record keeps the fixture faithful to the real
+        // caller (and makes the test strictly stricter if the gate ever does
+        // become reachable on this path) but it is NOT what makes this test pass,
+        // and this test does NOT cover the gate on the frozen-clock path.
+        let _correlated = op_manager
+            .ring
+            .outstanding_resync_requests
+            .record(*key.id(), sender_addr);
+
+        let op_mgr = op_manager.clone();
+        let handle = tokio::spawn(async move {
+            resend_dropped_broadcast_resync_request(
+                &op_mgr,
+                key,
+                sender_addr,
+                Transaction::new::<UpdateMsg>(),
+                reservation_deadline,
+                true,
+            )
+            .await;
+        });
+
+        // The mock clock stays FROZEN. Under `start_paused`, tokio auto-advances
+        // while everything is parked, driving the poll's sleeps and — via the
+        // backstop — the ~30s tokio floor. `timeout` converts a spin into a
+        // failure rather than an indefinite hang.
+        let terminated = tokio::time::timeout(Duration::from_secs(300), handle).await;
+        assert!(
+            terminated.is_ok(),
+            "the retry task MUST terminate via the tokio liveness backstop when \
+             the injected clock is frozen — a spin would hang here (DST safety, \
+             #4857 P2)"
+        );
+        terminated.unwrap().expect("retry task must not panic");
+
+        assert!(
+            drain_resync_targets(&mut notification_rx, key).is_empty(),
+            "a frozen injected clock never crosses a retry target, so no retry \
+             ResyncRequest should dispatch"
+        );
+    }
+
+    /// Issue #4862 (P1): the node-wide retry-task cap bounds outstanding retry
+    /// tasks even when the throttle LRU evicts active reservations under key
+    /// churn. Reserving up to the cap succeeds; the next reservation is refused
+    /// (so `send_dropped_broadcast_resync_request` skips the spawn — the immediate
+    /// ResyncRequest still sends); freeing a slot re-admits exactly one. The
+    /// outstanding count never exceeds the cap (hard CAS cap). Uses a per-node
+    /// OpManager so the count is isolated from other tests.
+    #[tokio::test]
+    async fn queue_full_resync_retry_slot_cap_bounds_outstanding_tasks() {
+        let (op_manager, _rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4857-cap").await;
+        let im = &op_manager.interest_manager;
+        let cap = crate::ring::interest::MAX_OUTSTANDING_QUEUE_FULL_RESYNC_RETRIES;
+
+        // Reserve up to the cap — simulating `cap` outstanding retry tasks that
+        // LRU churn would have spawned. Every reservation within the cap succeeds.
+        let mut slots = Vec::new();
+        for i in 0..cap {
+            let slot = im
+                .try_reserve_resync_retry_slot()
+                .unwrap_or_else(|| panic!("reservation {i} within the cap must succeed"));
+            slots.push(slot);
+        }
+        assert_eq!(
+            im.outstanding_resync_retries(),
+            cap,
+            "outstanding count must reach exactly the cap"
+        );
+
+        // At cap: a further reservation is refused (the caller skips the spawn;
+        // the immediate ResyncRequest is unaffected), and the count does NOT grow.
+        assert!(
+            im.try_reserve_resync_retry_slot().is_none(),
+            "at cap, a further retry-slot reservation MUST be refused (#4862 P1)"
+        );
+        assert_eq!(
+            im.outstanding_resync_retries(),
+            cap,
+            "a refused reservation must not increment the count (hard cap)"
+        );
+
+        // Freeing one slot re-admits exactly one.
+        slots.pop();
+        assert_eq!(
+            im.outstanding_resync_retries(),
+            cap - 1,
+            "dropping a slot guard must free it"
+        );
+        let readmit = im.try_reserve_resync_retry_slot();
+        assert!(
+            readmit.is_some(),
+            "a freed slot must re-admit exactly one reservation"
+        );
+        assert_eq!(
+            im.outstanding_resync_retries(),
+            cap,
+            "re-admission returns the count to the cap"
+        );
+
+        drop(slots);
+        drop(readmit);
+        assert_eq!(
+            im.outstanding_resync_retries(),
+            0,
+            "every slot guard frees its slot on drop"
+        );
+    }
+
+    /// Issue #4862 (P2): when the initial (blocking) enqueue consumes most of the
+    /// reservation window, a fixed `now + jittered_delay` first target would
+    /// already be PAST the deadline → the retry would return with ZERO attempts,
+    /// failing to heal the exact backpressure case. The clamp pulls the first
+    /// target into the remaining window so ≥1 retry still dispatches within
+    /// `[now, reservation_deadline)`.
+    ///
+    /// Simulated by calling the retry with a deadline only 500ms out (well below
+    /// a jittered attempt-1 delay of ~1.6-2.4s) and asserting a retry fires
+    /// before it — without the clamp, none would.
+    #[tokio::test(start_paused = true)]
+    async fn queue_full_resync_retry_fires_within_a_short_remaining_window() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4857-shortwindow").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([15u8; 32]),
+            CodeHash::new([16u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12600".parse().unwrap();
+
+        // Deadline only 500ms out — much less than jittered_resync_retry_delay(1)
+        // (~1.6-2.4s), so a fixed first target would exceed it.
+        let reservation_deadline = op_manager.interest_manager.now() + Duration::from_millis(500);
+        // Driving the retry DIRECTLY, so record the outstanding request the way
+        // the real caller (`send_dropped_broadcast_resync_request`) does — otherwise the
+        // #4863 landed-gate skips every attempt and this test would fail for a
+        // reason unrelated to the clamp it is pinning. (Unlike the frozen-clock
+        // test, the gate IS reachable here — the 500ms deadline clamps the first
+        // target to ~250ms, which the injected clock does reach.)
+        let _correlated = op_manager
+            .ring
+            .outstanding_resync_requests
+            .record(*key.id(), sender_addr);
+        let op_mgr = op_manager.clone();
+        let handle = tokio::spawn(async move {
+            resend_dropped_broadcast_resync_request(
+                &op_mgr,
+                key,
+                sender_addr,
+                Transaction::new::<UpdateMsg>(),
+                reservation_deadline,
+                true,
+            )
+            .await;
+        });
+
+        // Advance up to the deadline in small steps; a clamped retry must fire.
+        let mut fired = Vec::new();
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+            fired.extend(drain_resync_targets(&mut notification_rx, key));
+            if !fired.is_empty() {
+                break;
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the resend task must finish once the deadline passes")
+            .expect("the resend task must not panic");
+
+        assert!(
+            !fired.is_empty(),
+            "with a short remaining window the clamp must still fire ≥1 retry \
+             within [now, reservation_deadline) (#4862 P2), got none"
+        );
+        assert!(
+            fired.iter().all(|t| *t == sender_addr),
+            "retry must target the original sender, got {fired:?}"
+        );
+    }
+
+    /// Issue #4857 (P2) storm-bound pin: the trailing retry must (1) be spawned
+    /// only AFTER both rate-limit gates pass (the per-sender `begin_resync_request`
+    /// reservation and the global `resync_emit_limiter` emit cap), never on a
+    /// throttled/suppressed drop, and (2) create NO new reservation and stay
+    /// bounded, so the #4251 steady-state cap (≤ `1 + QUEUE_FULL_RESYNC_MAX_RETRIES`
+    /// ResyncRequests per (contract, peer) per 30s window) is preserved.
+    #[test]
+    fn queue_full_resync_retry_is_bounded_and_reservation_scoped() {
+        let src = include_str!("op_ctx_task.rs");
+        let fn_body = |name: &str| -> &str {
+            let start = src.find(name).unwrap_or_else(|| panic!("{name} not found"));
+            let after = &src[start + 1..];
+            // Terminate on ANY fn opener, not just `async fn` (review finding
+            // 19). Plain `fn`s sit between the async ones this pin slices —
+            // `jittered_resync_retry_delay` between the two resync fns,
+            // `seed_sender_summary_from_broadcast` before the broadcast driver
+            // — so an `async fn`-only terminator ran a slice straight through
+            // them into the NEXT async fn, and a gate deleted from the sliced
+            // function would still satisfy the pin as long as the same
+            // identifier appeared anywhere downstream. Taking the MINIMUM
+            // rather than the first match matters: the openers are not in
+            // source order.
+            let end = [
+                "\nasync fn ",
+                "\nfn ",
+                "\npub async fn ",
+                "\npub fn ",
+                "\npub(",
+            ]
+            .iter()
+            .filter_map(|kw| after.find(kw))
+            .chain(after.find("\n#[cfg(test)]"))
+            .min()
+            .unwrap_or(after.len());
+            &src[start..start + 1 + end]
+        };
+
+        // (1) The retry is scheduled only AFTER both rate-limit gates pass — the
+        // per-(contract, sender) throttle reservation (`begin_resync_request`) and
+        // the global per-contract emit cap (`resync_emit_limiter`, #4864) — so it
+        // never runs on a throttled or globally-suppressed drop.
+        let helper = fn_body("async fn send_dropped_broadcast_resync_request(");
+        let gate = helper
+            .find(".begin_resync_request(")
+            .expect("helper must gate on begin_resync_request (per-sender throttle, #4251)");
+        let global_cap = helper
+            .find("resync_emit_limiter")
+            .expect("helper must gate on the global per-contract emit cap (#4864)");
+        let spawn = helper
+            .find("resend_dropped_broadcast_resync_request(")
+            .expect("helper must schedule the trailing retry (heal #4857 P2)");
+        assert!(
+            gate < spawn && global_cap < spawn,
+            "the trailing-retry spawn MUST come AFTER both the begin_resync_request \
+             reservation and the global emit-cap gate, so retries only run within a \
+             granted, globally-authorized reservation (never on a throttled or \
+             suppressed drop)"
+        );
+        assert!(
+            helper.contains("GlobalExecutor::spawn("),
+            "the trailing retry must be a spawned background task"
+        );
+
+        // (1a) The retry spawn is gated on a node-wide slot (#4862 P1) so LRU
+        // churn cannot spawn unbounded overlapping retry tasks, and the slot is
+        // moved INTO the task (freed on completion via its Drop guard).
+        let reserve = helper.find("try_reserve_resync_retry_slot(").expect(
+            "retry spawn must be gated on interest_manager.try_reserve_resync_retry_slot() (#4862 P1)",
+        );
+        assert!(
+            reserve < spawn,
+            "the slot reservation must gate the spawn (P1): a spawn without a slot \
+             would defeat the node-wide retry-task cap"
+        );
+        assert!(
+            helper.contains("let _slot = slot;"),
+            "the retry slot guard must be moved into the spawned task so it frees \
+             on task completion (#4862 P1)"
+        );
+
+        // (1b) The retry is spawned CONCURRENTLY, BEFORE the blocking immediate
+        // enqueue (#4862 P2), so its timer runs DURING a backpressured send —
+        // otherwise a send that consumed the whole window would leave the task
+        // starting past the deadline with zero retries.
+        let immediate_send = helper
+            .find(".notify_node_event(")
+            .expect("helper must perform the immediate (blocking) ResyncRequest enqueue");
+        assert!(
+            spawn < immediate_send,
+            "the retry spawn MUST come BEFORE the blocking .notify_node_event() \
+             immediate send (#4862 P2), so the retry timer runs during a \
+             backpressured enqueue"
+        );
+
+        // The helper passes the reservation deadline into the retry so the burst
+        // is anchored to THIS reservation window (review P2-A).
+        assert!(
+            helper.contains("reservation_deadline"),
+            "the helper must thread the reservation deadline from \
+             begin_resync_request into the retry (anchor to the window, P2-A)"
+        );
+
+        // (1d) #4863: the correlation record MUST be written BEFORE the retry
+        // spawn. The retry's conditional gate READS that record to decide whether
+        // the first request already landed; a task spawned before the record
+        // exists could observe "absent", conclude "landed", and skip the heal.
+        let record = helper.find(".record(*key.id(), sender_addr)").expect(
+            "helper must record the outstanding request for receive-arm \
+             correlation (#4864 round-8)",
+        );
+        assert!(
+            record < spawn,
+            "the outstanding-request record ({record}) MUST precede the retry \
+             spawn ({spawn}) — the retry's #4863 conditional gate reads it, and a \
+             task that could observe a not-yet-written record would skip the heal"
+        );
+
+        // (2) The retry body RE-DELIVERS the one already-authorized emit: it must
+        // NOT re-consult the per-sender throttle (begin_resync_request), the
+        // global emit cap (resync_emit_limiter), re-record the correlation entry
+        // (`.record(`), or CONSUME it (`.consume(` — that one-shot authorization
+        // belongs to the receive arm; consuming it here would make the genuine
+        // ResyncResponse look unsolicited). So the retry creates no new
+        // reservation and consumes no extra global token (storm bound #4251 /
+        // #4864 cap).
+        let retry = fn_body("async fn resend_dropped_broadcast_resync_request(");
+        assert!(
+            !retry.contains("begin_resync_request")
+                && !retry.contains("resync_emit_limiter")
+                && !retry.contains(".record(")
+                && !retry.contains(".consume("),
+            "resend_dropped_broadcast_resync_request must NOT re-consult the throttle or \
+             the global emit cap, and must neither re-record NOR consume the \
+             outstanding-request entry — its sends belong to the caller's single \
+             granted reservation, and the entry's consumption belongs to the \
+             ResyncResponse receive arm (storm bound #4251 / #4864 cap)"
+        );
+
+        // (2a) #4863: every re-dispatch is GATED on the outstanding-request entry
+        // still being present (read-only). A blind retry re-sends a request that
+        // already landed, which makes the sender clear its summary and ship FULL
+        // STATE again onto a receiver whose queue was just full.
+        let landed_gate = retry.find("is_outstanding(").expect(
+            "the retry must gate each re-dispatch on \
+             outstanding_resync_requests.is_outstanding(...) (#4863)",
+        );
+        let retry_emit = retry
+            .find("try_notify_node_event(")
+            .expect("the retry must emit via the non-blocking try_notify_node_event");
+        assert!(
+            landed_gate < retry_emit,
+            "the #4863 landed-gate ({landed_gate}) MUST be checked BEFORE the \
+             re-dispatch ({retry_emit}) — checking after would send the redundant \
+             request anyway"
+        );
+        assert!(
+            retry.contains("in 1..=QUEUE_FULL_RESYNC_MAX_RETRIES"),
+            "the retry loop must be bounded by QUEUE_FULL_RESYNC_MAX_RETRIES"
+        );
+        assert!(
+            retry.contains("try_notify_node_event"),
+            "retries must use the NON-blocking try_notify_node_event \
+             (bounded-channel rule; blocking would pin the task up to 30s)"
+        );
+        // (3) Both the delay pacing and the stop condition are driven by the
+        // throttle's OWN clock (`interest_manager.now()`), not tokio's or a
+        // fresh wall clock, so sims that advance the injected clock are
+        // deterministic and the burst can never cross the reservation window
+        // (review P2-A/P2-B).
+        assert!(
+            retry.contains("interest_manager.now()"),
+            "the retry must pace + gate on interest_manager.now() (the throttle's \
+             injected clock), not tokio's independent clock (P2-B)"
+        );
+        assert!(
+            retry.contains("reservation_deadline"),
+            "the retry must stop once interest_manager.now() reaches the \
+             reservation deadline (P2-A)"
+        );
+        // (4) A tokio-clock liveness backstop floors the task at one reservation
+        // interval so a DECOUPLED injected clock that freezes before its deadline
+        // cannot make the poll spin forever (DST safety). The injected deadline
+        // above stays primary; this is purely an additional floor.
+        assert!(
+            retry.contains("started.elapsed()") && retry.contains("RESYNC_REQUEST_MIN_INTERVAL"),
+            "the retry must have a tokio-clock liveness backstop \
+             (started.elapsed() >= RESYNC_REQUEST_MIN_INTERVAL) so a frozen \
+             injected clock cannot make it spin — while keeping the injected \
+             reservation deadline as the primary stop"
+        );
+    }
+
+    /// Issue #4857 (P2): the whole trailing-retry burst, measured from
+    /// task-start on the throttle's clock, comfortably fits inside the single
+    /// 30s `RESYNC_REQUEST_MIN_INTERVAL` reservation. This is a belt-and-braces
+    /// check: the retry is ALSO hard-stopped at the reservation deadline (see
+    /// `queue_full_resync_retry_stops_after_reservation_deadline`), so it can
+    /// never spill into the next reservation even if this span check regressed.
+    /// Pins the worst-case span against the constants.
+    #[test]
+    fn resync_retry_span_stays_within_throttle_window() {
+        // Worst case = sum_{n=1..=MAX} n * BASE * 1.2 (largest jitter factor).
+        let max = QUEUE_FULL_RESYNC_MAX_RETRIES as u64;
+        let triangular = max * (max + 1) / 2; // sum of 1..=MAX
+        let worst_case = QUEUE_FULL_RESYNC_RETRY_BASE_DELAY.mul_f64(triangular as f64 * 1.2);
+        // RESYNC_REQUEST_MIN_INTERVAL is 30s (crate::ring::interest.rs); kept
+        // private there, so pin the literal here with a cross-reference.
+        assert!(
+            worst_case < Duration::from_secs(30),
+            "worst-case retry span {worst_case:?} must stay under the 30s \
+             RESYNC_REQUEST_MIN_INTERVAL reservation window (interest.rs)"
+        );
+        // #4863: the whole retry span must ALSO stay inside the correlation
+        // entry's TTL. The conditional gate reads `is_outstanding`, which goes
+        // false once the entry expires — so a TTL at or below the retry span
+        // would silently turn the #4862 heal into a no-op for later attempts
+        // (they would read "landed" and skip) with entirely green CI. Nothing
+        // else couples these two constants, so pin the relationship here.
+        assert!(
+            worst_case < crate::ring::resync_rate_limit::OUTSTANDING_RESYNC_TTL,
+            "worst-case retry span {worst_case:?} must stay under the outstanding \
+             correlation TTL {:?} — otherwise a later attempt reads its own \
+             expired entry as 'landed' and silently skips the #4862 heal (#4863)",
+            crate::ring::resync_rate_limit::OUTSTANDING_RESYNC_TTL
+        );
+    }
+
+    /// Issue #4857 (P2): the jittered retry delay must stay within the ±20%
+    /// band around `attempt * QUEUE_FULL_RESYNC_RETRY_BASE_DELAY` the
+    /// retry/backoff rule mandates — never below 0.8× (spin-loop guard) and
+    /// strictly below 1.2× (half-open `random_range`). Sampled across many
+    /// seeds so a bad jitter formula can't slip through on one lucky seed.
+    #[test]
+    fn jittered_resync_retry_delay_stays_within_bounds() {
+        for attempt in 1..=QUEUE_FULL_RESYNC_MAX_RETRIES {
+            let lo = QUEUE_FULL_RESYNC_RETRY_BASE_DELAY.mul_f64(attempt as f64 * 0.8);
+            let hi = QUEUE_FULL_RESYNC_RETRY_BASE_DELAY.mul_f64(attempt as f64 * 1.2);
+            for seed in 0..128u64 {
+                let _guard = GlobalRng::seed_guard(seed);
+                for _ in 0..16 {
+                    let d = jittered_resync_retry_delay(attempt);
+                    assert!(
+                        d >= lo,
+                        "delay {d:?} below 0.8× for attempt {attempt} (seed {seed})"
+                    );
+                    assert!(
+                        d < hi,
+                        "delay {d:?} at/above 1.2× for attempt {attempt} (seed {seed})"
+                    );
+                }
+            }
+        }
     }
 
     /// Issue #4251 follow-up: the four `run_relay_*` driver wrappers each
@@ -2681,8 +6573,8 @@ mod tests {
     fn broadcast_to_streaming_classifies_failures() {
         let src = include_str!("op_ctx_task.rs");
         let start = src
-            .find("async fn drive_relay_broadcast_to_streaming(")
-            .expect("drive_relay_broadcast_to_streaming not found");
+            .find("async fn apply_streaming_broadcast(")
+            .expect("apply_streaming_broadcast not found");
         let after = &src[start + 1..];
         let end = after
             .find("\nasync fn ")
@@ -2692,17 +6584,17 @@ mod tests {
 
         assert!(
             driver_src.contains("log_broadcast_to_streaming_failure"),
-            "drive_relay_broadcast_to_streaming must call \
+            "apply_streaming_broadcast must call \
              log_broadcast_to_streaming_failure for failure classification"
         );
         assert!(
             driver_src.contains("try_auto_fetch_contract"),
-            "drive_relay_broadcast_to_streaming must call try_auto_fetch_contract \
+            "apply_streaming_broadcast must call try_auto_fetch_contract \
              on real (non-benign) failures for self-heal"
         );
         assert!(
             driver_src.contains("send_summary_back_on_rejection"),
-            "drive_relay_broadcast_to_streaming must spawn \
+            "apply_streaming_broadcast must spawn \
              send_summary_back_on_rejection on is_invalid_update_rejection"
         );
     }
@@ -2714,8 +6606,8 @@ mod tests {
     fn broadcast_to_streaming_spawns_proactive_summary() {
         let src = include_str!("op_ctx_task.rs");
         let start = src
-            .find("async fn drive_relay_broadcast_to_streaming(")
-            .expect("drive_relay_broadcast_to_streaming not found");
+            .find("async fn apply_streaming_broadcast(")
+            .expect("apply_streaming_broadcast not found");
         let after = &src[start + 1..];
         let end = after
             .find("\nasync fn ")
@@ -2724,7 +6616,7 @@ mod tests {
         let driver_src = &src[start..start + 1 + end];
         assert!(
             driver_src.contains("send_proactive_summary_notification"),
-            "drive_relay_broadcast_to_streaming must spawn \
+            "apply_streaming_broadcast must spawn \
              send_proactive_summary_notification on successful state change"
         );
     }
@@ -2764,7 +6656,7 @@ mod tests {
         assert!(
             src.contains("pub(crate) fn log_broadcast_to_streaming_failure("),
             "log_broadcast_to_streaming_failure must remain pub(crate) — \
-             reused by drive_relay_broadcast_to_streaming"
+             reused by apply_streaming_broadcast"
         );
     }
 
@@ -2987,6 +6879,160 @@ mod tests {
         panic!("unterminated fn body for {signature_prefix}");
     }
 
+    /// Issue #4828: `record_update_received` must be recorded by BOTH
+    /// broadcast-apply paths, not just the streaming one. Before #4828 the
+    /// sole call site in the crate sat in the streaming path, but
+    /// `broadcast_queue.rs` only picks the streaming variant above
+    /// `streaming_threshold` (default 64 KB), so ordinary small deltas —
+    /// the normal River case — were invisible. `cards.rs` renders
+    /// `updates_received` as the ONLY UPDATE number for subscriber nodes,
+    /// so an actively-receiving subscriber displayed 0.
+    ///
+    /// Both paths must record AFTER their `if !changed` early-return, so
+    /// the counter tracks updates that actually mutated local state rather
+    /// than no-op re-broadcasts. The streaming path applies via the
+    /// extracted `apply_streaming_broadcast` helper (#4857), so its record
+    /// lives there and the streaming driver must delegate to it — pinned
+    /// below so the delegation cannot silently break the streaming record.
+    #[test]
+    fn both_broadcast_drivers_record_update_received() {
+        let full = include_str!("op_ctx_task.rs");
+        let src = production_source(full);
+        // Each broadcast path maps to the function that owns its `!changed`
+        // guard and its record call: the non-streaming driver records
+        // inline, the streaming driver records via `apply_streaming_broadcast`.
+        for sig in [
+            "async fn drive_relay_broadcast_to(",
+            "async fn apply_streaming_broadcast(",
+        ] {
+            let body = extract_fn_body(src, sig);
+            // Exactly once: a second call double-counts every changed
+            // broadcast on this path; zero calls rots the counter.
+            let record_calls = body.matches("record_update_received()").count();
+            assert_eq!(
+                record_calls, 1,
+                "{sig} must call record_update_received() EXACTLY once — \
+                 `updates_received` is the only UPDATE number the dashboard \
+                 shows for subscriber nodes, and broadcast_queue.rs picks the \
+                 NON-streaming variant for every payload under \
+                 streaming_threshold (64 KB), i.e. the normal small-delta \
+                 case. Found {record_calls}. Issue #4828."
+            );
+            // Must sit AFTER the entire `if !changed { ... }` guard block —
+            // not merely after some `return` inside it, which a nested
+            // early-return could fake. Brace-match the guard block and
+            // require the record after its closing `}`, so no in-block path
+            // can record a no-op re-broadcast as a received update.
+            let changed_guard = body
+                .find("if !changed {")
+                .unwrap_or_else(|| panic!("{sig} must keep its `if !changed` early-return"));
+            let guard_open = changed_guard
+                + body[changed_guard..]
+                    .find('{')
+                    .expect("the `!changed` guard must have an opening brace");
+            let guard_end = {
+                let bytes = body.as_bytes();
+                let mut depth = 0i32;
+                let mut end = None;
+                for (i, &b) in bytes.iter().enumerate().skip(guard_open) {
+                    match b {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                end.expect("the `!changed` guard block must have a matching closing brace")
+            };
+            let record_pos = body
+                .find("record_update_received()")
+                .expect("checked above");
+            assert!(
+                record_pos > guard_end,
+                "{sig} must call record_update_received() AFTER the entire \
+                 `if !changed` guard block (past its closing brace), so no \
+                 in-block early-return path can record on a no-op broadcast. \
+                 Issue #4828."
+            );
+        }
+        // The streaming driver records via the extracted helper (#4857), so
+        // it must delegate to apply_streaming_broadcast EXACTLY once and must
+        // NOT record directly — zero delegations means the streaming path
+        // never records (counter rots for large payloads); a direct call or a
+        // second delegation would double-count.
+        let streaming_driver = extract_fn_body(src, "async fn drive_relay_broadcast_to_streaming(");
+        let delegations = streaming_driver
+            .matches("apply_streaming_broadcast(")
+            .count();
+        assert_eq!(
+            delegations, 1,
+            "drive_relay_broadcast_to_streaming must delegate to \
+             apply_streaming_broadcast EXACTLY once (found {delegations}); \
+             that helper owns the streaming record_update_received() call \
+             (#4857). Zero means the streaming path never records; two would \
+             double-count. Issue #4828."
+        );
+        assert!(
+            !streaming_driver.contains("record_update_received()"),
+            "drive_relay_broadcast_to_streaming must NOT call \
+             record_update_received() directly — the record lives in \
+             apply_streaming_broadcast (#4857). A direct call here would \
+             double-count the streaming path. Issue #4828."
+        );
+    }
+
+    /// #5090: every received payload is terminally classified by an RAII guard,
+    /// and successful no-ops are marked before returning.
+    #[test]
+    fn both_broadcast_apply_paths_record_receiver_outcome_before_noop_return() {
+        let full = include_str!("op_ctx_task.rs");
+        let src = production_source(full);
+        for sig in [
+            "async fn drive_relay_broadcast_to(",
+            "async fn apply_streaming_broadcast(",
+        ] {
+            let body = extract_fn_body(src, sig);
+            assert_eq!(
+                body.matches("receiver_terminal_guard(").count(),
+                1,
+                "{sig} must create exactly one terminal receiver guard"
+            );
+            let record = body
+                .find("receiver_terminal.mark_applied(changed, updated_value.len())")
+                .unwrap_or_else(|| panic!("{sig} must classify successful apply outcome"));
+            let no_op_return = body
+                .find("if !changed {")
+                .unwrap_or_else(|| panic!("{sig} must retain its no-op early return"));
+            assert!(
+                record < no_op_return,
+                "{sig} must count a successfully executed no-op before returning"
+            );
+            for marker in [
+                "receiver_terminal.mark_dedup();",
+                "receiver_terminal.mark_backoff();",
+            ] {
+                let marker_offset = body.find(marker).unwrap_or_else(|| {
+                    panic!("{sig} must classify {marker} before its early return")
+                });
+                let return_offset =
+                    body[marker_offset..]
+                        .find("return Ok(());")
+                        .unwrap_or_else(|| {
+                            panic!("{sig} must retain the early return following {marker}")
+                        });
+                assert!(
+                    return_offset > 0,
+                    "{sig} must classify {marker} before its early return"
+                );
+            }
+        }
+    }
+
     /// Pin (telemetry accuracy / scope): `relayed_updates_total` counts
     /// relayed UPDATE *requests* only. Both request entries record
     /// `record_relayed_update`; the broadcast fan-out entries must NOT (they
@@ -3015,5 +7061,256 @@ mod tests {
                  relayed request)"
             );
         }
+    }
+
+    // ── Empty `sender_summary_bytes` must not poison the peer-summary cache ──
+    //
+    // Regression coverage for the poisoning already documented on
+    // `PayloadArm::FullNoOurSummary`: every producer builds the wire field as
+    // `our_summary…unwrap_or_default()`, so a sender that could not summarize
+    // itself ships empty bytes, and the receiver used to cache `Some(empty)`
+    // as that peer's summary.
+
+    /// Register a connected peer and return `(addr, PeerKey)`.
+    fn connect_test_peer(
+        op_manager: &OpManager,
+        port: u16,
+        loc: f64,
+    ) -> (SocketAddr, crate::ring::PeerKey) {
+        let keypair = crate::transport::TransportKeypair::new();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(loc),
+            addr,
+            keypair.public().clone(),
+            false,
+        );
+        (addr, crate::ring::PeerKey::from(keypair.public().clone()))
+    }
+
+    #[tokio::test]
+    async fn broadcast_with_empty_sender_summary_does_not_cache_an_empty_summary() {
+        let (op_manager, _rx, _h) =
+            build_queue_full_test_node_with_clock("empty-summary-no-cache", None).await;
+        let key = crate::operations::test_utils::make_contract_key(7);
+        let (addr, peer_key) = connect_test_peer(&op_manager, 12401, 0.3);
+
+        let cached = seed_sender_summary_from_broadcast(&op_manager, &key, &[], addr);
+
+        assert!(!cached, "an empty wire summary must not be cached");
+        assert_eq!(
+            op_manager
+                .interest_manager
+                .get_peer_summary(&key, &peer_key),
+            None,
+            "caching Some(empty) is the #4965-review poisoning: the entry then \
+             reports no SummaryMissingReason and looks healthy while being wrong"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_with_real_sender_summary_is_cached() {
+        let (op_manager, _rx, _h) =
+            build_queue_full_test_node_with_clock("empty-summary-real-cached", None).await;
+        let key = crate::operations::test_utils::make_contract_key(8);
+        let (addr, peer_key) = connect_test_peer(&op_manager, 12402, 0.4);
+
+        let cached = seed_sender_summary_from_broadcast(&op_manager, &key, &[1, 2, 3], addr);
+
+        assert!(cached, "a real summary must still be cached (#4952)");
+        assert_eq!(
+            op_manager
+                .interest_manager
+                .get_peer_summary(&key, &peer_key),
+            Some(StateSummary::from(vec![1u8, 2, 3])),
+            "the #4952 seeding behaviour must survive the empty-bytes guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_sender_summary_preserves_a_previously_cached_summary() {
+        // The load-bearing case for "skip, don't clear": a peer that already
+        // has a good cached summary must not lose it because ONE broadcast
+        // arrived from a sender that transiently could not summarize itself.
+        let (op_manager, _rx, _h) =
+            build_queue_full_test_node_with_clock("empty-summary-preserves", None).await;
+        let key = crate::operations::test_utils::make_contract_key(9);
+        let (addr, peer_key) = connect_test_peer(&op_manager, 12403, 0.5);
+
+        assert!(seed_sender_summary_from_broadcast(
+            &op_manager,
+            &key,
+            &[9, 9],
+            addr
+        ));
+
+        let cached = seed_sender_summary_from_broadcast(&op_manager, &key, &[], addr);
+
+        assert!(!cached);
+        assert_eq!(
+            op_manager
+                .interest_manager
+                .get_peer_summary(&key, &peer_key),
+            Some(StateSummary::from(vec![9u8, 9])),
+            "an empty broadcast field says the SENDER could not summarize \
+             itself; it is not a claim about the peer, so it must never \
+             discard a good cached summary (contrast ClearedByNoneReport, \
+             where the peer explicitly reported None)"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_sender_summary_from_an_unknown_peer_is_a_no_op() {
+        // Boundary: empty bytes AND an unresolvable sender. Must not panic and
+        // must not create an entry.
+        let (op_manager, _rx, _h) =
+            build_queue_full_test_node_with_clock("empty-summary-unknown-peer", None).await;
+        let key = crate::operations::test_utils::make_contract_key(10);
+        let unknown: SocketAddr = "127.0.0.1:12499".parse().unwrap();
+
+        assert!(!seed_sender_summary_from_broadcast(
+            &op_manager,
+            &key,
+            &[],
+            unknown
+        ));
+        assert!(!seed_sender_summary_from_broadcast(
+            &op_manager,
+            &key,
+            &[4, 2],
+            unknown
+        ));
+        assert!(
+            op_manager
+                .interest_manager
+                .get_interested_peers(&key)
+                .is_empty()
+        );
+    }
+
+    /// Source pin: BOTH broadcast receive paths must go through the guard.
+    ///
+    /// The pure tests above cannot catch a driver that re-inlines a bare
+    /// `upsert_peer_summary(&key, &sender_key, StateSummary::from(bytes))`,
+    /// which is exactly the shape being removed here and exactly the
+    /// `.claude/rules/operations.md` failure mode (#3791): a data-layer test
+    /// that stays green after the dispatch site is reverted.
+    #[test]
+    fn both_broadcast_receive_paths_route_through_the_empty_summary_guard() {
+        let src = include_str!("op_ctx_task.rs");
+        // Cut at `mod tests` (NOT `#[cfg(test)]`) so these needles cannot
+        // match this test module via `include_str!`.
+        let prod = &src[..src.find("\nmod tests {").expect("tests module not found")];
+
+        for func in [
+            "async fn drive_relay_broadcast_to(",
+            "async fn apply_streaming_broadcast(",
+        ] {
+            // Brace-matched, so the window is EXACTLY this function. An
+            // earlier version bounded it with `find("\nasync fn ")`, which
+            // over-read into the following functions: the positive needle
+            // could then be satisfied by a sibling's body, and the negative
+            // one could trip on unrelated code while naming the wrong function.
+            let body: String = extract_fn_body(prod, func)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+
+            assert!(
+                body.contains("seed_sender_summary_from_broadcast(op_manager,&key,&sender_summary_bytes,sender_addr)"),
+                "{func} must seed the sender summary through \
+                 seed_sender_summary_from_broadcast, which refuses EMPTY bytes \
+                 (not usable evidence about the peer under either cause) \
+                 instead of caching Some(empty)"
+            );
+            assert!(
+                !body.contains("upsert_peer_summary("),
+                "{func} must not re-inline a bare upsert_peer_summary — that \
+                 re-opens the empty-summary poisoning the guard exists to close"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_sender_summary_still_refreshes_an_existing_interest_ttl() {
+        // A broadcast arriving is liveness evidence even when its summary is
+        // not usable, so declining to cache must not let the entry age out at
+        // INTEREST_TTL. On main the unconditional upsert refreshed the TTL for
+        // free; this pins that we kept that side effect.
+        let (op_manager, _rx, _h) =
+            build_queue_full_test_node_with_clock("empty-summary-ttl", None).await;
+        let key = crate::operations::test_utils::make_contract_key(11);
+        let (addr, peer_key) = connect_test_peer(&op_manager, 12404, 0.6);
+
+        assert!(seed_sender_summary_from_broadcast(
+            &op_manager,
+            &key,
+            &[5, 5],
+            addr
+        ));
+        let before = op_manager
+            .interest_manager
+            .get_peer_interest(&key, &peer_key)
+            .expect("entry seeded")
+            .last_refreshed;
+
+        seed_sender_summary_from_broadcast(&op_manager, &key, &[], addr);
+
+        let entry = op_manager
+            .interest_manager
+            .get_peer_interest(&key, &peer_key)
+            .expect("entry must survive an empty-summary broadcast");
+        assert!(
+            entry.last_refreshed >= before,
+            "an empty-summary broadcast must still refresh the interest TTL"
+        );
+        assert_eq!(
+            entry.summary,
+            Some(StateSummary::from(vec![5u8, 5])),
+            "refreshing the TTL must not disturb the cached summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_sender_summary_does_not_create_an_interest_entry() {
+        // The other half: refresh what exists, never manufacture an entry from
+        // bytes that carry no information.
+        let (op_manager, _rx, _h) =
+            build_queue_full_test_node_with_clock("empty-summary-no-create", None).await;
+        let key = crate::operations::test_utils::make_contract_key(12);
+        let (addr, _peer_key) = connect_test_peer(&op_manager, 12405, 0.7);
+
+        seed_sender_summary_from_broadcast(&op_manager, &key, &[], addr);
+
+        assert!(
+            op_manager
+                .interest_manager
+                .get_interested_peers(&key)
+                .is_empty(),
+            "an empty summary must not manufacture an interest entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_byte_sender_summary_is_cached() {
+        // Boundary against the emptiness check: one byte is a real summary.
+        let (op_manager, _rx, _h) =
+            build_queue_full_test_node_with_clock("empty-summary-one-byte", None).await;
+        let key = crate::operations::test_utils::make_contract_key(13);
+        let (addr, peer_key) = connect_test_peer(&op_manager, 12406, 0.8);
+
+        assert!(seed_sender_summary_from_broadcast(
+            &op_manager,
+            &key,
+            &[0u8],
+            addr
+        ));
+        assert_eq!(
+            op_manager
+                .interest_manager
+                .get_peer_summary(&key, &peer_key),
+            Some(StateSummary::from(vec![0u8])),
+            "a single zero byte is a real summary, not an absent one"
+        );
     }
 }

@@ -1,16 +1,40 @@
 services:
   freenet-node:
-    build:
-      context: .
-      dockerfile: Dockerfile.yml
-    image: freenet-node:latest
-    environment:
-      - WS_API_PORT=7509
+    image: ghcr.io/freenet/freenet-core:latest
+    container_name: freenet-node
+
+    # Host networking, deliberately. Two things break under Docker's default
+    # bridge network, and neither is obvious from the outside:
+    #
+    # 1. The client API binds loopback (config.rs `resolve_ws_api_address`).
+    #    Under bridge that is the CONTAINER's loopback, so it is unreachable
+    #    from the host entirely and no browser can open a Freenet app. Under
+    #    host networking it is the host's loopback, reachable from this machine
+    #    only, which is the intended posture for a fully privileged API.
+    #
+    # 2. The node is a UDP peer. Bridge NAT rewrites the source port of
+    #    outbound packets so it stops matching the published port, which works
+    #    against hole punching and public-address discovery.
+    #
+    # This needs Linux. On Docker Desktop, see the bridge fallback in README.md,
+    # and note that it yields a node that contributes capacity but cannot serve
+    # apps to a browser.
     network_mode: host
+
     volumes:
-      - freenet-data:/root/.cache/freenet
+      - freenet-data:/data
+
     restart: unless-stopped
+
+    # The node drains in-flight operations for up to `shutdown_drain_secs`
+    # (30s by default) when it receives SIGTERM. Docker's default 10s stop
+    # timeout would SIGKILL it mid-drain on every stop and restart.
+    stop_grace_period: 45s
+
+    # The node self-updates. Freenet ships releases frequently, sometimes
+    # several times a day, and a node that falls below the network's
+    # min-compatible-version has its connections refused, so pulling a new
+    # image is a nice-to-have rather than the update mechanism. See README.md.
 
 volumes:
   freenet-data:
-    driver: local

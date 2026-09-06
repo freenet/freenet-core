@@ -25,7 +25,7 @@ pub(crate) use error::{Error, ensure_peer_ready};
 pub(crate) use proxy::BoxedClient;
 pub use proxy::ClientEventsProxy;
 pub(crate) use types::HostIncomingMsg;
-pub use types::{AuthToken, ClientId, HostResult, OpenRequest, RequestId};
+pub use types::{AuthToken, ClientId, ConnectionScope, HostResult, OpenRequest, RequestId};
 
 use either::Either;
 use freenet_stdlib::{
@@ -461,6 +461,73 @@ where
                     }
                 }
             },
+        }
+    }
+}
+
+/// Maps the contract handler's response to a client-driven `DelegateRequest`
+/// into either the values to hand back to the client, or the `Error` to
+/// propagate — logging exactly as the inline match this was extracted from
+/// did. Split out of `process_open_request`'s `DelegateOp` arm so the fix for
+/// #5263 (a genuine delegate execution failure must reach the client as
+/// `Err`, not an empty `Ok`) is unit-testable without constructing an
+/// `OpManager`.
+fn delegate_request_outcome(
+    res: Result<ContractHandlerEvent, crate::contract::ContractError>,
+    client_id: ClientId,
+    request_id: RequestId,
+    delegate_key: &DelegateKey,
+    msg_type: Option<&str>,
+) -> Result<Vec<OutboundDelegateMsg>, Error> {
+    match res {
+        Ok(ContractHandlerEvent::DelegateResponse(Ok(values))) => {
+            if let Some(mt) = msg_type {
+                tracing::info!(
+                    delegate = %delegate_key,
+                    msg_type = %mt,
+                    request_id = %request_id,
+                    outcome = "executed",
+                    "DelegateRequest dispatch"
+                );
+            }
+            Ok(values)
+        }
+        // Genuine delegate execution failure (#5263). Previously this arm
+        // didn't exist: a failure was indistinguishable from
+        // `Ok(ContractHandlerEvent::DelegateResponse(Ok(vec![])))`, so the
+        // client silently received an empty successful response instead of
+        // an error.
+        Ok(ContractHandlerEvent::DelegateResponse(Err(exec_err))) => {
+            tracing::error!(
+                client_id = %client_id,
+                request_id = %request_id,
+                delegate = %delegate_key,
+                error = %exec_err,
+                phase = "error",
+                "Delegate execution failed"
+            );
+            Err(Error::Executor(exec_err))
+        }
+        Err(err) => {
+            tracing::error!(
+                client_id = %client_id,
+                request_id = %request_id,
+                delegate = %delegate_key,
+                error = %err,
+                phase = "error",
+                "Delegate operation failed (contract error)"
+            );
+            Err(Error::Contract(err))
+        }
+        Ok(_) => {
+            tracing::error!(
+                client_id = %client_id,
+                request_id = %request_id,
+                delegate = %delegate_key,
+                phase = "error",
+                "Delegate operation failed (unexpected state)"
+            );
+            Err(Error::Op(OpError::UnexpectedOpState))
         }
     }
 }
@@ -1496,6 +1563,18 @@ async fn process_open_request(
                             request_id = %request_id,
                             "Unsupported contract operation"
                         );
+                        // `ContractRequest` is `#[non_exhaustive]`: a stdlib
+                        // bump can add a variant (e.g. `Unsubscribe`) that
+                        // this node's build doesn't know how to handle yet.
+                        // Falling through silently left the client waiting
+                        // forever with no response at all — surface a real
+                        // error instead so the client can tell "unsupported"
+                        // apart from "still in flight".
+                        return Err(Error::Node(
+                            "unsupported contract operation: this node does \
+                             not support the requested operation type"
+                                .to_string(),
+                        ));
                     }
                 }
             }
@@ -1508,6 +1587,26 @@ async fn process_open_request(
                 );
                 let delegate_key = req.key().clone();
 
+                // Who this connection is, from the perspective of delegate
+                // notification routing (GHSA-824h-7x5x-wfmf). Only a connection
+                // the node proved is local may receive a delegate's output.
+                // Locality is the WHOLE of the identity here — no contract id is
+                // carried, because keying delivery on one is unsafe (see
+                // `route_to_apps`).
+                //
+                // The executor dispatch further down is NOT handed this value —
+                // it receives the raw `origin_contract` alongside
+                // `connection_scope` and applies the gate itself, because it must
+                // also gate the two origin sources this layer cannot see
+                // (`caller_delegate` and the node's inherited-origins map). Both
+                // read the SAME `request.connection_scope`, so they agree on
+                // whether the caller is attestable.
+                let app_identity = if request.connection_scope.is_local() {
+                    crate::contract::delegate_app_registry::AppIdentity::Local
+                } else {
+                    crate::contract::delegate_app_registry::AppIdentity::Remote
+                };
+
                 // Register (or refresh) this app's routing path so the delegate
                 // can push notification-driven ApplicationMessages back to it
                 // (#3275). An app "registers with a delegate" by talking to it
@@ -1516,12 +1615,18 @@ async fn process_open_request(
                 // the path. UnregisterDelegate tears it down. RegisterDelegate
                 // (installing the delegate binary) does NOT register an app —
                 // it's an admin op, not an app conversation.
+                //
+                // The registration records `app_identity`: registering stays open
+                // to anyone (it is how a client asks to be pushed to), but only a
+                // LOCAL registration is ever a delivery target — see
+                // `delegate_app_registry::route_to_apps`.
                 match &req {
                     freenet_stdlib::client_api::DelegateRequest::ApplicationMessages { .. } => {
                         if let Some(sender) = &subscription_listener {
                             if !crate::contract::delegate_app_registry::register_app(
                                 &delegate_key,
                                 client_id,
+                                app_identity,
                                 sender.clone(),
                             ) {
                                 tracing::warn!(
@@ -1535,14 +1640,26 @@ async fn process_open_request(
                     freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(key) => {
                         crate::contract::delegate_app_registry::remove_delegate(key);
                     }
-                    // RegisterDelegate installs a delegate binary (admin op), not
-                    // an app conversation, so it registers no routing path. The
-                    // wildcard also absorbs future `#[non_exhaustive]` variants;
-                    // it exists ONLY to satisfy non_exhaustive (see
-                    // git-workflow.md) — new app-facing variants must be handled
-                    // explicitly above, not swept here.
+                    // RegisterDelegate and RegisterDelegateWithPredecessors both
+                    // INSTALL a delegate binary (admin ops), not an app
+                    // conversation, so neither registers a routing path — the
+                    // path is established by an ApplicationMessages request that
+                    // carries a notification channel (above), never by
+                    // registration. RegisterDelegateWithPredecessors's
+                    // node-side secret copy-forward (#4117) is unconditionally
+                    // disabled as of GHSA-824h-7x5x-wfmf (its origin_contract gate is
+                    // forgeable) — it was likewise never an app-routing event
+                    // even when active. Both are listed EXPLICITLY (not swept)
+                    // per this match's contract that
+                    // app-facing variants must be handled above the wildcard; the
+                    // wildcard remains ONLY to satisfy `#[non_exhaustive]` for
+                    // genuinely future variants (see git-workflow.md).
                     #[allow(clippy::wildcard_enum_match_arm)]
-                    freenet_stdlib::client_api::DelegateRequest::RegisterDelegate { .. } | _ => {}
+                    freenet_stdlib::client_api::DelegateRequest::RegisterDelegate { .. }
+                    | freenet_stdlib::client_api::DelegateRequest::RegisterDelegateWithPredecessors {
+                        ..
+                    }
+                    | _ => {}
                 }
 
                 // Derive a short discriminant tag for the INFO logs, but only when INFO is
@@ -1594,6 +1711,9 @@ async fn process_open_request(
                         freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
                             ..
                         } => "RegisterDelegate".to_string(),
+                        freenet_stdlib::client_api::DelegateRequest::RegisterDelegateWithPredecessors {
+                            ..
+                        } => "RegisterDelegateWithPredecessors".to_string(),
                         freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(_) => {
                             "UnregisterDelegate".to_string()
                         }
@@ -1612,57 +1732,31 @@ async fn process_open_request(
                     );
                 }
                 let origin_contract = request.origin_contract;
+                let connection_scope = request.connection_scope;
                 // Per-connection user secret namespace (hosted mode). Taken from
                 // the OpenRequest, which received it from the connection layer —
                 // NOT from anything inside `req`. Moving it into the event keeps
                 // it on a channel the delegate/client cannot reach.
                 let user_context = request.user_context;
 
-                let res = match op_manager
+                let handler_res = op_manager
                     .notify_contract_handler_prioritized(
                         ContractHandlerEvent::DelegateRequest {
                             req,
                             origin_contract,
+                            connection_scope,
                             user_context,
                         },
                         crate::contract::Priority::ClientLocal,
                     )
-                    .await
-                {
-                    Ok(ContractHandlerEvent::DelegateResponse(res)) => {
-                        if let Some(ref mt) = msg_type {
-                            tracing::info!(
-                                delegate = %delegate_key,
-                                msg_type = %mt,
-                                request_id = %request_id,
-                                outcome = "executed",
-                                "DelegateRequest dispatch"
-                            );
-                        }
-                        res
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            client_id = %client_id,
-                            request_id = %request_id,
-                            delegate = %delegate_key,
-                            error = %err,
-                            phase = "error",
-                            "Delegate operation failed (contract error)"
-                        );
-                        return Err(Error::Contract(err));
-                    }
-                    Ok(_) => {
-                        tracing::error!(
-                            client_id = %client_id,
-                            request_id = %request_id,
-                            delegate = %delegate_key,
-                            phase = "error",
-                            "Delegate operation failed (unexpected state)"
-                        );
-                        return Err(Error::Op(OpError::UnexpectedOpState));
-                    }
-                };
+                    .await;
+                let res = delegate_request_outcome(
+                    handler_res,
+                    client_id,
+                    request_id,
+                    &delegate_key,
+                    msg_type.as_deref(),
+                )?;
 
                 let host_response = Ok(HostResponse::DelegateResponse {
                     key: delegate_key.clone(),
@@ -1812,12 +1906,52 @@ async fn process_open_request(
             ClientRequest::Close => {
                 return Err(Error::Disconnected);
             }
-            ClientRequest::Authenticate { .. } | _ => {
+            // `Authenticate` DOES reach this dispatch in production (unlike
+            // `Disconnect`, which the websocket layer intercepts and returns
+            // early on) — `websocket.rs` captures the token into
+            // `auth_token` at the connection level and then forwards the
+            // request through to here (see `websocket.rs` around the
+            // `if let ClientRequest::Authenticate { token } = &req` check,
+            // just before `request_sender.send(...)`). Its effect already
+            // happened; no dispatch response is expected or awaited by the
+            // client. An earlier version of this catch-all folded
+            // `Authenticate` into the "unsupported" error path below,
+            // which meant every authentication returned an error to the
+            // client — and against a stdlib client older than the fix in
+            // freenet-stdlib#94, any `Err` response rejects ALL of that
+            // connection's in-flight requests. Keep this arm silent.
+            ClientRequest::Authenticate { .. } => {
+                return Ok(None);
+            }
+            // `StreamChunk` is named explicitly (rather than left to the
+            // bare wildcard) because it IS a currently-known variant, even
+            // though it never reaches this dispatch as itself in practice —
+            // the websocket layer always reassembles it into a different
+            // concrete request first, or returns early on an incomplete
+            // chunk (see `websocket.rs`'s `ClientRequest::StreamChunk`
+            // reassembly block). The trailing `_` covers only genuinely
+            // future variants from a stdlib bump.
+            ClientRequest::StreamChunk { .. } | _ => {
                 tracing::error!(
                     client_id = %client_id,
                     request_id = %request_id,
                     "Unsupported operation"
                 );
+                // Falling through silently left the client waiting forever
+                // with no response at all — surface a real error instead so
+                // the client can tell "unsupported" apart from "still in
+                // flight". Every currently-known variant is named above
+                // (including `Authenticate`, which stays silent, and
+                // `StreamChunk`, unreachable as noted above), so this arm
+                // is unreachable with today's stdlib; it exists purely as a
+                // forward-compatibility guard. See the source-scrape pin
+                // `client_request_catch_all_returns_error_not_silence` in
+                // `unsupported_request_tests` below.
+                return Err(Error::Node(
+                    "unsupported operation: this node does not support the \
+                     requested operation type"
+                        .to_string(),
+                ));
             }
         }
         Ok(None)
@@ -1975,6 +2109,503 @@ mod serve_during_gate_tests {
              blocking_subscribe — that silently downgrades an explicit \
              blocking_subscribe=true GET to fire-and-forget (#4524 regression). \
              Call args: {args_only:?}"
+        );
+    }
+
+    /// GHSA-824h-7x5x-wfmf: the app-routing registration must record WHO
+    /// registered, derived from the connection scope.
+    ///
+    /// The type system alone does not protect this: `AppIdentity::Local`
+    /// is constructible unconditionally, so a version that classified every
+    /// registration as `Local` would compile and would re-open the hole for
+    /// every off-host caller. This pins that the identity handed to
+    /// `register_app` is derived through `connection_scope.is_local()`, and that
+    /// the connection scope also reaches the executor.
+    #[test]
+    fn delegate_registration_binds_to_the_connection_scope() {
+        let src = include_str!("client_events.rs");
+        // Bound the scrape to the DelegateOp arm. An unbounded `split_once`
+        // would happily match this test's own assertion strings further down
+        // the file and pass vacuously.
+        let arm = src
+            .split("ClientRequest::DelegateOp(req) => {")
+            .nth(1)
+            .expect("the DelegateOp arm must exist");
+        let arm = arm
+            .split("\n            ClientRequest::")
+            .next()
+            .expect("the arm is bounded by the next ClientRequest arm");
+
+        let derivation = arm
+            .find("let app_identity = if request.connection_scope.is_local()")
+            .expect(
+                "the registration identity must be derived from \
+                 `connection_scope.is_local()`",
+            );
+        let registration = arm
+            .find("register_app(")
+            .expect("the DelegateOp arm must register the app routing path");
+        assert!(
+            derivation < registration,
+            "the scope gate must be applied BEFORE the value reaches register_app"
+        );
+
+        let register_call = &arm[registration..];
+        let register_call = register_call
+            .split(") {")
+            .next()
+            .expect("register_app call must be bounded");
+        assert!(
+            register_call.contains("app_identity"),
+            "register_app must receive the scope-derived identity, not a value \
+             built from `request.origin_contract` alone; got: {register_call}"
+        );
+
+        assert!(
+            arm.contains("let connection_scope = request.connection_scope;")
+                && arm.contains("connection_scope,\n                            user_context,"),
+            "the same connection scope must also reach the executor via \
+             ContractHandlerEvent::DelegateRequest"
+        );
+    }
+}
+
+/// Regression tests: an unsupported/unhandled request must reach the client
+/// as an error, never as silence.
+///
+/// Background: both `process_open_request` match statements — the
+/// `ContractRequest` dispatch and the outer `ClientRequest` dispatch — end
+/// in a catch-all arm required because `ContractRequest` and `ClientRequest`
+/// are `#[non_exhaustive]` (a stdlib bump can add a variant, e.g. the
+/// upcoming `ContractRequest::Unsubscribe`, that this node's build doesn't
+/// know how to handle yet). Before the fix, both catch-all arms only logged
+/// and fell through to `Ok(None)`. The outer `client_event_handling` loop
+/// (`client_events.rs`) treats `Ok(None)` as "nothing to send" — so a client
+/// whose request lands in either arm waits forever with no response and no
+/// error, rather than getting a clear "unsupported" error it can act on.
+#[cfg(test)]
+mod unsupported_request_tests {
+    use std::sync::Arc;
+
+    use freenet_stdlib::client_api::ClientRequest;
+
+    use super::{ClientId, OpenRequest, process_open_request};
+    use crate::config::ConfigArgs;
+    use crate::dev_tool::OperationMode;
+    use crate::node::OpManager;
+
+    /// Build a real `OpManager` backed by a temp-dir `Config`, mirroring
+    /// `pool_tests::identical_input_probe_tests::build_op_manager`.
+    /// `process_open_request` requires an `OpManager` to construct even
+    /// though the catch-all arm below returns before touching it.
+    async fn build_op_manager(id: &str) -> (Arc<OpManager>, Box<dyn std::any::Any>) {
+        let config_args = ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+
+        let guards: Box<dyn std::any::Any> = Box::new((
+            notification_rx,
+            ch_channel,
+            wait_for_event,
+            result_router_rx,
+            task_monitor,
+        ));
+        (op_manager, guards)
+    }
+
+    /// Regression guard for the bug caught in review of an earlier version
+    /// of this fix: `ClientRequest::Authenticate` MUST stay silent
+    /// (`Ok(None)`), not become an error. `Authenticate` DOES reach
+    /// `process_open_request` in production (`websocket.rs` forwards it
+    /// through after capturing the token — see the comment on the
+    /// `ClientRequest::Authenticate` arm above), so an earlier revision that
+    /// folded it into the "unsupported operation" catch-all made every
+    /// client authentication return an error. Against a stdlib client older
+    /// than the fix in freenet-stdlib#94, any `Err` response rejects ALL of
+    /// that connection's in-flight requests — so this one arm being wrong
+    /// broke every hosted-mode connection, not just Authenticate itself.
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticate_returns_ok_none_not_error() {
+        let (op_manager, _guards) = build_op_manager("authenticate-stays-silent").await;
+
+        let open_req = OpenRequest::new(
+            ClientId::FIRST,
+            Box::new(ClientRequest::Authenticate {
+                token: "irrelevant".to_string(),
+            }),
+        );
+
+        let result = process_open_request(open_req, op_manager, None).await.await;
+
+        assert!(
+            matches!(result, Ok(None)),
+            "Authenticate's effect already happened at the websocket layer; \
+             process_open_request must return Ok(None) (no dispatch \
+             response expected), not an error. Got: {result:?}"
+        );
+    }
+
+    /// Source-scrape pin for the outer `ClientRequest` catch-all (the plain
+    /// `_ =>` arm, now that `Authenticate` has its own explicit silent arm
+    /// above it).
+    ///
+    /// Why a source pin and not a behavioral test: every currently-known
+    /// `ClientRequest` variant has its own explicit arm somewhere in this
+    /// match (`ContractOp`, `DelegateOp`, `Disconnect`, `NodeQueries`,
+    /// `Close`, `Authenticate`), and `StreamChunk` never reaches this
+    /// dispatch as itself — the websocket layer always reassembles it into
+    /// a different concrete request first (see `websocket.rs`'s
+    /// `ClientRequest::StreamChunk` reassembly block) or returns early on an
+    /// incomplete chunk. So there is no `ClientRequest` value constructible
+    /// today that lands in the bare `_` arm; it exists purely as a
+    /// forward-compatibility guard for a stdlib bump adding a new variant.
+    ///
+    /// The invariant: the arm must `return Err(...)`, not merely log and
+    /// fall through — mirrors `contract_request_catch_all_returns_error_not_silence`
+    /// below for the sibling `ContractRequest` catch-all.
+    ///
+    /// Anchored on comment text (not code layout) and whitespace-insensitive
+    /// on the captured region, matching the convention in
+    /// `pool_subscriber_limit_error_resolves_real_key`
+    /// (`subscriber_limit_tests.rs`) — so `cargo fmt` reformatting this
+    /// block cannot break the anchors or the assertions.
+    #[test]
+    fn client_request_catch_all_returns_error_not_silence() {
+        let src = include_str!("client_events.rs");
+        let start = src
+            .find("// `StreamChunk` is named explicitly")
+            .expect("the `StreamChunk` comment before the catch-all arm not found");
+        let after = &src[start..];
+        let end = after
+            .find("GlobalExecutor::spawn(fut.instrument(")
+            .expect("the arm is bounded by process_open_request's closing spawn call");
+        let arm: String = after[..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        assert!(
+            arm.contains("ClientRequest::StreamChunk{..}|_=>{"),
+            "expected the catch-all arm to explicitly name `StreamChunk` \
+             alongside the wildcard, not found in: {arm:?}"
+        );
+        assert!(
+            arm.contains("returnErr("),
+            "the ClientRequest catch-all must return an error to the client, \
+             not merely log and fall through to `Ok(None)` — a client whose \
+             request lands here would wait forever with no response. \
+             Arm content: {arm:?}"
+        );
+    }
+
+    /// End-to-end proof that a real error returned by `process_open_request`
+    /// unblocks the CLIENT, not merely the internal `Result`: drives the
+    /// real `client_event_handling` loop (the function every production and
+    /// simulation node runs — see `node/p2p_impl.rs` and
+    /// `node/testing_impl/in_memory.rs`) with a minimal mock
+    /// `ClientEventsProxy`, and asserts the mock's `send()` — the ONLY way a
+    /// response reaches a client over the wire — is actually invoked.
+    ///
+    /// Driven via `ClientRequest::Close` (an existing, always-reachable
+    /// `Err(Error::Disconnected)` return, untouched by this PR) rather than
+    /// the new "unsupported operation" arms: after the `Authenticate`
+    /// mistake caught in review, neither `ClientRequest`'s nor
+    /// `ContractRequest`'s catch-all is reachable by any value this test can
+    /// construct (see the source-scrape pins for both).
+    ///
+    /// `Close`'s `Error::Disconnected` takes its own named branch in the
+    /// `results.push` closure (`Err(Error::Disconnected) => ...`), not the
+    /// generic `Err(err) =>` arm the new `Error::Node(...)` returns fall
+    /// into — but every branch of that inner match, named or generic,
+    /// produces the same `(cli_id, Err(_: ClientError))` shape, which then
+    /// flows through the ONE later `results.next()` arm that actually calls
+    /// `client_events.send(cli_id, Err(err)).await` — the step this test
+    /// exists to verify actually runs. That final delivery step has no
+    /// per-variant branching at all, so `Close` proves it just as directly
+    /// as `Error::Node` would.
+    #[tokio::test(flavor = "current_thread")]
+    async fn error_from_process_open_request_reaches_the_client() {
+        use freenet_stdlib::client_api::{ClientError, HostResponse};
+        use futures::FutureExt;
+        use futures::future::BoxFuture;
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+
+        /// Mock `ClientEventsProxy`: `recv()` yields one queued request then
+        /// parks forever (mirrors a real proxy idling after its client sent
+        /// everything it's going to send); `send()` forwards whatever the
+        /// node tried to deliver to the client into a channel the test reads.
+        struct MockProxy {
+            to_recv: Mutex<VecDeque<OpenRequest<'static>>>,
+            received_tx:
+                tokio::sync::mpsc::UnboundedSender<(ClientId, Result<HostResponse, ClientError>)>,
+        }
+
+        impl crate::client_events::ClientEventsProxy for MockProxy {
+            fn recv(&mut self) -> BoxFuture<'_, crate::client_events::types::HostIncomingMsg> {
+                async move {
+                    if let Some(req) = self.to_recv.lock().expect("lock poisoned").pop_front() {
+                        Ok(req)
+                    } else {
+                        // No more requests queued: park forever rather than
+                        // returning an error, so the loop just idles (as a
+                        // real proxy would between client messages) instead
+                        // of tearing down.
+                        std::future::pending().await
+                    }
+                }
+                .boxed()
+            }
+
+            fn send(
+                &mut self,
+                id: ClientId,
+                response: Result<HostResponse, ClientError>,
+            ) -> BoxFuture<'_, Result<(), ClientError>> {
+                // The test may have already dropped its receiver (e.g. after
+                // its single expected `send()`); a closed mock channel here
+                // just means "test is done looking", not a real error.
+                if self.received_tx.send((id, response)).is_err() {
+                    tracing::debug!("MockProxy: test receiver dropped, ignoring send");
+                }
+                async move { Ok(()) }.boxed()
+            }
+        }
+
+        let (op_manager, _guards) = build_op_manager("error-delivery-e2e").await;
+
+        let mut to_recv = VecDeque::new();
+        to_recv.push_back(OpenRequest::new(
+            ClientId::FIRST,
+            Box::new(ClientRequest::Close),
+        ));
+        let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+        let proxy = MockProxy {
+            to_recv: Mutex::new(to_recv),
+            received_tx,
+        };
+
+        let (client_responses_rx, _client_responses_tx) =
+            crate::contract::client_responses_channel();
+        let (node_controller_tx, _node_controller_rx) = tokio::sync::mpsc::channel(1);
+
+        // `client_event_handling` runs forever (`-> anyhow::Result<Infallible>`);
+        // spawn it and only ever inspect what it sends, never its own exit.
+        let _handle = tokio::spawn(crate::client_events::client_event_handling(
+            op_manager,
+            proxy,
+            client_responses_rx,
+            node_controller_tx,
+        ));
+
+        let (client_id, response) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), received_rx.recv())
+                .await
+                .expect(
+                    "client_event_handling never called send() within 10s — a real \
+                     client would never receive a response for its request",
+                )
+                .expect("the mock's response channel closed unexpectedly");
+
+        assert_eq!(client_id, ClientId::FIRST);
+        let err = response.expect_err("Close must surface Error::Disconnected to the client");
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("disconnect"),
+            "the error the client actually RECEIVES must reflect \
+             Error::Disconnected, got: {msg}"
+        );
+    }
+
+    /// Source-scrape pin for the twin `ContractRequest` catch-all (the
+    /// `ContractRequest` dispatch inside `ClientRequest::ContractOp`).
+    ///
+    /// Why a source pin and not a behavioral test: `ContractRequest` is
+    /// `#[non_exhaustive]` and currently has exactly four variants (`Put`,
+    /// `Update`, `Get`, `Subscribe`), each with its own explicit arm — so
+    /// there is no `ContractRequest` value constructible today that actually
+    /// lands in this catch-all (it exists only for a stdlib bump that adds a
+    /// variant this build predates, e.g. the upcoming `Unsubscribe`). The
+    /// behavioral test above exercises the SAME bug shape (silently falling
+    /// through to `Ok(None)`) via the sibling outer catch-all, which IS
+    /// reachable with a real value.
+    ///
+    /// The invariant: the arm must `return Err(...)`, not merely log and
+    /// fall through.
+    #[test]
+    fn contract_request_catch_all_returns_error_not_silence() {
+        let src = include_str!("client_events.rs");
+        let start = src
+            .find("\"Unsupported contract operation\"")
+            .expect("`Unsupported contract operation` log message not found");
+        let after = &src[start..];
+        let end = after
+            .find("ClientRequest::DelegateOp(req) => {")
+            .expect("the arm is bounded by the following ClientRequest::DelegateOp arm");
+        let arm = &after[..end];
+
+        assert!(
+            arm.contains("return Err("),
+            "the ContractRequest catch-all must return an error to the \
+             client, not merely log and fall through to `Ok(None)` — a \
+             client whose request lands here would wait forever with no \
+             response. Arm content: {arm:?}"
+        );
+    }
+}
+
+/// Unit tests for `delegate_request_outcome`, the mapping `process_open_request`
+/// uses to turn the contract handler's response to a client `DelegateRequest`
+/// into either the values to return or the `Error` to propagate. These drive
+/// the function directly — no `OpManager` needed — so the #5263 fix (a
+/// genuine delegate execution failure reaches the client as `Err`, not an
+/// empty `Ok`) is covered at the exact layer the client actually sees.
+#[cfg(test)]
+mod delegate_request_outcome_tests {
+    use super::*;
+    use freenet_stdlib::prelude::ApplicationMessage;
+
+    fn key() -> DelegateKey {
+        DelegateKey::new([3u8; 32], CodeHash::new([0u8; 32]))
+    }
+
+    #[test]
+    fn genuine_execution_failure_becomes_executor_error() {
+        let exec_err = crate::contract::ExecutorError::other(anyhow::anyhow!(
+            "missing message origin for message type: \"application message\""
+        ));
+        let res = delegate_request_outcome(
+            Ok(ContractHandlerEvent::DelegateResponse(Err(exec_err))),
+            ClientId::next(),
+            RequestId::new(),
+            &key(),
+            None,
+        );
+        assert!(
+            matches!(res, Err(Error::Executor(_))),
+            "a genuine delegate execution failure must reach the client as \
+             Err(Error::Executor(_)), not a fake success (#5263); got {res:?}"
+        );
+    }
+
+    /// The success arm must return the delegate's OWN values, not merely
+    /// something that is not an error.
+    ///
+    /// Passing only `vec![]` here would be vacuous: a mutation to
+    /// `Ok(_) => Ok(vec![])` discards every outbound message the delegate
+    /// produced and an emptiness-only assertion still passes. So this drives a
+    /// non-empty payload and asserts it arrives verbatim. `OutboundDelegateMsg`
+    /// is not `PartialEq`, hence the match on the payload rather than
+    /// `assert_eq!` on the Vec.
+    #[test]
+    fn successful_execution_returns_the_values() {
+        let payload = vec![7u8, 8, 9];
+        let res = delegate_request_outcome(
+            Ok(ContractHandlerEvent::DelegateResponse(Ok(vec![
+                OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload.clone())),
+            ]))),
+            ClientId::next(),
+            RequestId::new(),
+            &key(),
+            Some("ApplicationMessages"),
+        );
+        let values = res.expect("a successful response must not be an error");
+        assert_eq!(
+            values.len(),
+            1,
+            "the delegate's outbound messages must be returned, not dropped"
+        );
+        // `let ... else` rather than a `match` with a catch-all: this crate
+        // denies `clippy::wildcard_enum_match_arm`, and spelling out all seven
+        // sibling variants here would need editing every time one is added,
+        // for no gain -- the test only cares about the one it asked for.
+        let OutboundDelegateMsg::ApplicationMessage(msg) = &values[0] else {
+            panic!("expected the ApplicationMessage back, got {:?}", &values[0]);
+        };
+        assert_eq!(
+            msg.payload, payload,
+            "the payload must arrive verbatim; a success arm that substitutes \
+             its own value is the mutation this pins"
+        );
+    }
+
+    /// The companion to the above, and the one closest to #5263: a delegate
+    /// that legitimately produces NO outbound messages is still a SUCCESS.
+    /// This is the regression this PR could most plausibly cause — turning a
+    /// legitimate no-op response into a client-visible error.
+    #[test]
+    fn genuinely_empty_success_stays_ok() {
+        let res = delegate_request_outcome(
+            Ok(ContractHandlerEvent::DelegateResponse(Ok(vec![]))),
+            ClientId::next(),
+            RequestId::new(),
+            &key(),
+            Some("ApplicationMessages"),
+        );
+        assert!(
+            res.expect("an empty but successful response must not be an error")
+                .is_empty(),
+            "an empty Vec on a genuinely successful response is still correct — \
+             only a genuine failure should become Err"
+        );
+    }
+
+    #[test]
+    fn channel_level_contract_error_propagates_as_contract_error() {
+        let res = delegate_request_outcome(
+            Err(crate::contract::ContractError::NoEvHandlerResponse),
+            ClientId::next(),
+            RequestId::new(),
+            &key(),
+            None,
+        );
+        assert!(
+            matches!(res, Err(Error::Contract(_))),
+            "a channel-level failure (handler dropped, no response) must \
+             surface as Error::Contract; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn unexpected_response_variant_is_reported_as_unexpected_op_state() {
+        let res = delegate_request_outcome(
+            Ok(ContractHandlerEvent::ExportUserSecretsResponse(Ok(vec![]))),
+            ClientId::next(),
+            RequestId::new(),
+            &key(),
+            None,
+        );
+        assert!(
+            matches!(res, Err(Error::Op(OpError::UnexpectedOpState))),
+            "a response of the wrong ContractHandlerEvent variant must be \
+             reported, not silently accepted; got {res:?}"
         );
     }
 }

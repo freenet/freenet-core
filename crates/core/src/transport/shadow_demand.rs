@@ -138,6 +138,7 @@ pub(crate) fn classify(payload: &SymmetricMessagePayload) -> OutboundClass {
         SymmetricMessagePayload::ShortMessage { .. } => OutboundClass::Short,
         SymmetricMessagePayload::NoOp
         | SymmetricMessagePayload::AckConnection { .. }
+        | SymmetricMessagePayload::AckConnectionV2 { .. }
         | SymmetricMessagePayload::Ping { .. }
         | SymmetricMessagePayload::Pong { .. } => OutboundClass::MustFlow,
     }
@@ -632,12 +633,17 @@ mod tests {
         assert_eq!(outbound_delta(snap, snap), (0, 0, 0));
     }
 
+    // `#[serial]` because the broadcast-queue scheduling tests DO instantiate
+    // the production queue — `enqueue_in_lane` and `drain_lane` both publish
+    // this same process-global depth — and would otherwise land a store between
+    // this test's store and its load. The old "no concurrent writer exists in
+    // --lib tests" reasoning stopped holding when #4961 added those tests, so
+    // both sides carry the attribute. NAMED group, so this pairs only with
+    // those tests instead of joining the crate-wide serial group and
+    // reshuffling which unrelated tests run concurrently.
     #[test]
+    #[serial_test::serial(broadcast_queue_depth_gauge)]
     fn broadcast_queue_depth_gauge_round_trips() {
-        // Store-then-load is atomic and safe here: the only production
-        // writer (`broadcast_queue.rs`) is `#[cfg(not(feature =
-        // "simulation_tests"))]` and never instantiated in `--lib` unit
-        // tests, so no concurrent writer races this assertion.
         record_broadcast_queue_depth(42);
         assert_eq!(BROADCAST_QUEUE_DEPTH.load(Ordering::Relaxed), 42);
         record_broadcast_queue_depth(0);

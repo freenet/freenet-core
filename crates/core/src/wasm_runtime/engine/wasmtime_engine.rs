@@ -141,13 +141,14 @@
 //! We wrap with `block_on_async()` to maintain a synchronous interface for callers.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use wasmtime::{
-    Cache, CacheConfig, Caller, Config, Engine, Error as WasmtimeError, Instance, Linker, Module,
-    OptLevel, ResourceLimiter, Store,
+    Cache, CacheConfig, Caller, Config, Engine, EngineWeak, Error as WasmtimeError, Instance,
+    Linker, Module, OptLevel, ResourceLimiter, Store,
 };
 
 use super::{InstanceHandle, WasmEngine, WasmError};
@@ -302,7 +303,123 @@ const WASM_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// and refresh frequency. With the bounded per-instance reservation
 /// (~256 MiB, see #3986) the per-Store virtual memory budget is ~125 GiB,
 /// well within the address space limits that previously motivated this cap.
+///
+/// This bounds VIRTUAL memory and mapping COUNT only. It does NOT bound the
+/// arena's RESIDENT footprint, which is what OOM-kills a peer — see
+/// [`store_arena_budget_bytes`], the companion byte bound (#5268).
 const STORE_REFRESH_THRESHOLD: u64 = 500;
+
+/// Fraction of the memory the node may use that all Store arenas together may
+/// hold in retired-but-unreclaimed instance memory before refreshing.
+///
+/// The arena is pure slack: every byte in it belongs to an instance that has
+/// already finished. An eighth of the node's memory limit is a generous ceiling
+/// for slack while leaving refreshes infrequent enough not to matter.
+const STORE_ARENA_RAM_DIVISOR: usize = 8;
+
+/// Floor for the per-Store arena byte budget (4 MiB).
+///
+/// A thrash guard, not a target: at the measured ~3 MiB of linear memory retained
+/// per instance it still lets a Store retire an instance or so between refreshes,
+/// so a refresh never lands on literally every call.
+///
+/// Deliberately small, because it is the term that fights the budget rather than
+/// serving it. `pool_size × this` is a floor on node-wide arena slack that no
+/// memory limit can reduce, so a generous value re-creates in miniature the
+/// defect-3 shape it sits next to (a per-worker constant multiplied by a
+/// CPU-derived count). Where memory is scarce enough for it to bind — below
+/// roughly a 512 MiB limit at 16 workers — more frequent refreshes are the right
+/// trade; above that the RAM-scaled share binds and this is inert (a 2 GiB peer
+/// with 16 workers resolves to 16 MiB from the share, not from here).
+const STORE_ARENA_MIN_BYTES: usize = 4 * 1024 * 1024;
+
+/// Ceiling for the per-Store arena byte budget (256 MiB).
+///
+/// On an unconstrained host this is what binds, and it binds BEFORE
+/// [`STORE_REFRESH_THRESHOLD`] does: at the measured ~3 MiB of retained linear
+/// memory per instance it is reached after roughly 85 instances, not 500. That
+/// is the intended outcome — a quarter-gigabyte of memory belonging to instances
+/// that have already finished is enough slack for anyone, and refreshing at 85
+/// rather than 500 costs one extra `Store::new` per ~85 contract calls. The
+/// count threshold stays as the mapping-count backstop
+/// (`vm.max_map_count`), which byte accounting does not measure.
+///
+/// Raising this to ~1.5 GiB WOULD restore the old 500-instance cadence exactly,
+/// and is deliberately not done: the whole point of the byte bound is that an
+/// instance COUNT is the wrong unit for a resident-memory limit.
+const STORE_ARENA_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Retired-instance bytes ONE Store may accumulate before it is refreshed.
+///
+/// # Why a byte bound is needed at all
+///
+/// wasmtime arena-allocates instances inside a `Store`, so dropping an
+/// `Instance` frees nothing: its linear memory stays resident until the whole
+/// Store is replaced. RSS on a real peer is therefore a SAWTOOTH, not a ramp —
+/// `framework`'s fell 1.46 GiB within one second of a
+/// `Refreshing engine store … lifetime_instances=500` line. Peak height was set
+/// purely by [`STORE_REFRESH_THRESHOLD`], a fixed instance COUNT, so nothing in
+/// the node budgeted the arena's resident bytes; the existing comment budgets
+/// only VIRTUAL memory (~125 GiB, matching nova's `VmSize`). That is why kill
+/// intervals varied so wildly on one node (5.5 h vs 1.1 h): death depended on
+/// where a ramp happened to start. Issue #5268 defect 2.
+///
+/// # Sizing
+///
+/// `clamp(memory_limit / 8 / pool_size, 4 MiB, 256 MiB)`. It is divided by the
+/// pool size because there is one Store PER pool worker (up to 16), so the
+/// node-wide arena slack is the product; the memory limit comes from
+/// [`read_total_ram_bytes`](crate::wasm_runtime::read_total_ram_bytes), which
+/// already resolves `min(MemTotal, cgroup limit)` and so honours the shipped
+/// `MemoryMax=2G`. A 2 GiB peer with 16 workers resolves to 16 MiB per Store
+/// (256 MiB node-wide) from the RAM-scaled share; an unconstrained gateway
+/// saturates at [`STORE_ARENA_MAX_BYTES`].
+///
+/// # When ONE instance is as large as the whole budget
+///
+/// A contract may declare up to `DEFAULT_MAX_MEMORY_PAGES` (256 MiB) of linear
+/// memory, so a single instance can meet or exceed this budget by itself. Then
+/// every call to that contract ends in a Store refresh rather than a periodic
+/// one. That is deliberate, and it is the RIGHT outcome rather than a
+/// degenerate one: the alternative is retaining an arena already at or past the
+/// limit the node is trying not to exceed, which is the OOM this exists to
+/// prevent. Prompt reclamation is what a memory-constrained peer wants.
+///
+/// It is not free, though — a `Store::new` plus epoch re-arm per call — and it
+/// concentrates on exactly the large-contract, memory-constrained peers this
+/// work targets, so [`WasmtimeEngine::note_refresh_cadence`] makes it visible to
+/// an operator (rate-limited) instead of letting it be a silent CPU cost. The
+/// per-refresh work is small next to instantiating a module with tens of MiB of
+/// linear memory in the first place, which is why it is accepted rather than
+/// worked around with a floor scaled to observed instance size: such a floor
+/// would be `N × (up to 256 MiB) × pool_size` of guaranteed slack that no
+/// memory limit could reduce — reintroducing defect 3's shape to avoid a cost
+/// that is a fraction of the call it accompanies.
+fn store_arena_budget_bytes() -> usize {
+    let total_ram =
+        crate::wasm_runtime::read_total_ram_bytes().unwrap_or(STORE_ARENA_FALLBACK_TOTAL_RAM_BYTES);
+    store_arena_budget_for(total_ram, crate::config::runtime_pool_size().into())
+}
+
+/// Pure sizing math behind [`store_arena_budget_bytes`], split out so
+/// aggregate-commitment tests can ask what a hypothetical host would get instead
+/// of depending on the test machine's own RAM and core count. See
+/// `contract::executor::tests::cache_byte_budgets_are_aggregate_safe`, which has
+/// to include this term: there is one Store per pool worker, so the node-wide
+/// arena slack is `pool_size ×` this.
+pub(crate) fn store_arena_budget_for(total_ram: usize, pool_size: usize) -> usize {
+    (total_ram / STORE_ARENA_RAM_DIVISOR / pool_size.max(1))
+        .clamp(STORE_ARENA_MIN_BYTES, STORE_ARENA_MAX_BYTES)
+}
+
+/// Fallback total-RAM estimate (1 GiB) when the OS query fails, mirroring the
+/// module cache's own fallback.
+const STORE_ARENA_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Minimum gap between [`WasmtimeEngine::note_refresh_cadence`] warnings, so a
+/// peer running one large contract reports the condition periodically instead of
+/// once per call — which would be the very flood the warning is about.
+const CADENCE_WARN_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Maximum age of a Store before forced refresh, even with live instances.
 ///
@@ -315,6 +432,276 @@ const STORE_REFRESH_THRESHOLD: u64 = 500;
 /// (~3K instances/hr on a busy gateway) while being long enough that it
 /// should never fire under normal operation.
 const STORE_MAX_AGE: Duration = Duration::from_secs(4 * 3600);
+
+/// Period between global epoch increments (#4861).
+///
+/// Wasmtime's wall-clock timeout (`execute_wasm_blocking`) can only `abort()`
+/// the *tokio task* wrapping a contract call; it cannot stop synchronous WASM
+/// already running on the blocking thread, so a runaway guest (an infinite
+/// loop, a pathological merge) keeps burning a whole thread arbitrarily long
+/// after "WASM execution timed out". With `enable_metering = false` (the
+/// production default) there is no fuel to run out either. Epoch interruption
+/// is the mechanism that actually preempts the guest: wasmtime inserts an epoch
+/// check at every loop backedge and function entry, so once the engine's epoch
+/// passes a store's armed deadline the guest traps at the next check.
+///
+/// A single background thread increments the epoch of every live engine every
+/// `EPOCH_TICK_PERIOD`. Combined with a per-execution deadline of
+/// `ceil(max_execution_seconds / EPOCH_TICK_PERIOD)` ticks (see
+/// [`epoch_deadline_ticks`]) this bounds a runaway guest to roughly
+/// `max_execution_seconds` (+ up to one tick of slack) rather than unbounded.
+const EPOCH_TICK_PERIOD: Duration = Duration::from_millis(100);
+
+/// Process-start reference instant for the epoch-ticker heartbeat (#4864). Real
+/// wall clock on purpose: this measures a real background thread's liveness, not
+/// simulation time (consistent with the rest of this file's `Instant` usage).
+fn epoch_ticker_base() -> Instant {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    *BASE.get_or_init(Instant::now)
+}
+
+/// Milliseconds-since-[`epoch_ticker_base`] of the ticker's most recent loop
+/// iteration. `0` = the ticker has not completed an iteration yet.
+/// [`arm_epoch_deadline`] reads this to detect a DEAD ticker (#4864 review): if
+/// the ticker thread ever stops, epoch preemption is silently disabled, so a
+/// stale heartbeat must be loudly visible.
+static EPOCH_TICKER_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
+/// Total epoch-ticker iterations performed (observability metric).
+static EPOCH_TICKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Millis-since-base of the last emitted "ticker stale" ERROR (rate-limit).
+static EPOCH_TICKER_STALE_WARNED_MS: AtomicU64 = AtomicU64::new(0);
+/// Whether the process-wide epoch ticker thread has SUCCESSFULLY started
+/// (#4864 round-8). Set true only on a successful spawn; a failed spawn resets
+/// it so the NEXT `register_engine_for_epoch` retries. A `OnceLock` latched
+/// "started" even when the spawn FAILED, permanently disabling preemption after
+/// a single transient thread-exhaustion failure.
+static EPOCH_TICKER_STARTED: AtomicBool = AtomicBool::new(false);
+/// Millis-since-[`epoch_ticker_base`] of the FIRST time any store armed a
+/// deadline (#4864 round-8). `0` = no arm yet. Lets the liveness check flag a
+/// ticker that NEVER started (heartbeat stuck at 0) once we've been arming for
+/// well past the startup window, instead of staying silent forever.
+static EPOCH_FIRST_ARM_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Registry of live engines the epoch ticker drives.
+///
+/// Holds `EngineWeak` (not `Engine`) so a dropped engine is reclaimed: the
+/// ticker prunes any weak ref that no longer upgrades on its next pass, and the
+/// registry never keeps an otherwise-dead engine alive.
+fn epoch_engine_registry() -> &'static Mutex<Vec<EngineWeak>> {
+    static REG: OnceLock<Mutex<Vec<EngineWeak>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register `engine` with the global epoch ticker, starting the ticker thread
+/// on first use. Called once per freshly-created backend engine (in
+/// [`WasmtimeEngine::create_engine`]); clones sharing the same backend
+/// (`new_with_shared_backend`) share the one registered weak ref, since
+/// `increment_epoch` on a shared `Engine` covers all its stores.
+fn register_engine_for_epoch(engine: &Engine) {
+    epoch_engine_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(engine.weak());
+    start_epoch_ticker();
+}
+
+/// Claim the exclusive right to attempt the epoch-ticker spawn (#4864 round-8).
+/// Returns `true` for exactly the ONE caller that flips the flag false→true;
+/// every other caller (already started, or another thread mid-attempt) gets
+/// `false`. Factored out (pure over the injected flag) so the retry state machine
+/// is unit-testable without spawning a thread.
+fn epoch_ticker_try_claim(started: &AtomicBool) -> bool {
+    if started.load(Ordering::Acquire) {
+        return false;
+    }
+    started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// Release a claim after the spawn FAILED (#4864 round-8), so the next
+/// `register_engine_for_epoch` retries. Without this, a transient thread-spawn
+/// failure would latch "started" and permanently disable epoch preemption.
+fn epoch_ticker_reset_after_failed_spawn(started: &AtomicBool) {
+    started.store(false, Ordering::Release);
+}
+
+/// Lazily start the single process-wide epoch ticker thread, RETRYING on a
+/// failed spawn (#4864 round-8): a `OnceLock` latched even a failed spawn,
+/// permanently disabling preemption after one transient thread-exhaustion.
+fn start_epoch_ticker() {
+    if !epoch_ticker_try_claim(&EPOCH_TICKER_STARTED) {
+        return;
+    }
+    {
+        // Pin the heartbeat origin before the thread starts.
+        let _ = epoch_ticker_base();
+        let spawn = std::thread::Builder::new()
+            .name("wasm-epoch-ticker".to_string())
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(EPOCH_TICK_PERIOD);
+                    // Catch a transient panic in ONE iteration (#4864 review): a
+                    // panic escaping this loop would kill the thread and silently
+                    // disable epoch preemption for the whole process lifetime.
+                    // Log and keep ticking instead.
+                    let ticked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut reg = epoch_engine_registry()
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        // Increment every live engine's epoch; drop dead weak refs.
+                        reg.retain(|weak| match weak.upgrade() {
+                            Some(engine) => {
+                                engine.increment_epoch();
+                                true
+                            }
+                            None => false,
+                        });
+                    }));
+                    if ticked.is_err() {
+                        tracing::error!(
+                            "wasm-epoch-ticker iteration panicked; continuing (this \
+                             tick's epoch increments were skipped)"
+                        );
+                    }
+                    // Heartbeat + metric: the loop is alive (even a panicked
+                    // iteration means the thread survived catch_unwind).
+                    EPOCH_TICKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    EPOCH_TICKER_HEARTBEAT_MS.store(
+                        epoch_ticker_base().elapsed().as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
+                }
+            });
+        if let Err(e) = spawn {
+            // Thread-spawn failure (e.g. transient thread exhaustion). RESET the
+            // started flag so the next engine registration retries (#4864
+            // round-8) — a latched failure would permanently disable preemption.
+            // Meanwhile timeouts fall back to the wall-clock poll in
+            // `execute_wasm_blocking` (the pre-#4861 behavior) — degraded, not
+            // broken. The never-started liveness check in
+            // `detect_stale_epoch_ticker` makes a persistent failure loud.
+            epoch_ticker_reset_after_failed_spawn(&EPOCH_TICKER_STARTED);
+            tracing::error!(
+                "failed to spawn wasm-epoch-ticker thread: {e}; will retry on next \
+                 engine registration"
+            );
+        }
+    }
+}
+
+/// Cheap per-arm liveness check for the epoch ticker (#4864 review). If the
+/// ticker has ticked before but its heartbeat is now far older than the tick
+/// period, the thread is dead and epoch preemption is silently disabled — emit a
+/// rate-limited ERROR so the degradation is loudly visible. (Execution still
+/// falls back to the wall-clock poll in `execute_wasm_blocking`, so this is
+/// degraded, not broken.)
+/// Pure liveness decision for the epoch ticker (#4864 review + round-8), factored
+/// out so it is unit-testable without the global ticker statics. Reports the
+/// ticker DEAD when EITHER:
+/// - it ticked before but its heartbeat is now older than `stale_after_ms`
+///   (went-silent — the thread died); OR
+/// - it has NEVER ticked (`heartbeat_ms == 0`) AND we have been arming deadlines
+///   for longer than `stale_after_ms` since the first arm (never-started — e.g. a
+///   spawn failure the retry never got to re-attempt). `first_arm_ms == 0` (no
+///   arm yet) is never "dead": there is nothing to preempt.
+fn epoch_ticker_is_dead(
+    heartbeat_ms: u64,
+    first_arm_ms: u64,
+    now_ms: u64,
+    stale_after_ms: u64,
+) -> bool {
+    if heartbeat_ms == 0 {
+        first_arm_ms != 0 && now_ms.saturating_sub(first_arm_ms) > stale_after_ms
+    } else {
+        now_ms.saturating_sub(heartbeat_ms) > stale_after_ms
+    }
+}
+
+fn detect_stale_epoch_ticker() {
+    let now_ms = epoch_ticker_base().elapsed().as_millis() as u64;
+    // Record the FIRST-EVER arm time (never the 0 sentinel) so the never-started
+    // branch of `epoch_ticker_is_dead` can measure how long we've been arming
+    // without a single tick (#4864 round-8). Ignore the result: either this call
+    // set it, or a concurrent arm already did — both are correct.
+    let _prev =
+        EPOCH_FIRST_ARM_MS.compare_exchange(0, now_ms.max(1), Ordering::Relaxed, Ordering::Relaxed);
+
+    let heartbeat = EPOCH_TICKER_HEARTBEAT_MS.load(Ordering::Relaxed);
+    let first_arm = EPOCH_FIRST_ARM_MS.load(Ordering::Relaxed);
+    let stale_after_ms = 10 * EPOCH_TICK_PERIOD.as_millis() as u64;
+    if !epoch_ticker_is_dead(heartbeat, first_arm, now_ms, stale_after_ms) {
+        return; // healthy, or still inside the startup grace window
+    }
+
+    // The age we report: silence since the last tick, or (never-started) time
+    // since the first arm.
+    let heartbeat_age_ms = if heartbeat == 0 {
+        now_ms.saturating_sub(first_arm)
+    } else {
+        now_ms.saturating_sub(heartbeat)
+    };
+
+    // Emit at most ~once/60s (compare-and-swap so exactly one thread wins).
+    let last_warn = EPOCH_TICKER_STALE_WARNED_MS.load(Ordering::Relaxed);
+    // `last_warn == 0` is the zero-init sentinel ("never warned"), NOT a real
+    // warning at base-epoch 0: allow the FIRST warn unconditionally, else an
+    // early ticker death is silently suppressed until now_ms reaches 60_000.
+    let should_warn = last_warn == 0 || now_ms.saturating_sub(last_warn) >= 60_000;
+    if should_warn
+        && EPOCH_TICKER_STALE_WARNED_MS
+            .compare_exchange(last_warn, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::error!(
+            heartbeat_age_ms,
+            ticks_total = EPOCH_TICKS_TOTAL.load(Ordering::Relaxed),
+            never_started = heartbeat == 0,
+            "wasm-epoch-ticker appears DEAD — epoch preemption disabled; runaway \
+             guest timeouts now fall back to the wall-clock poll only"
+        );
+    }
+}
+
+/// Number of epoch ticks that make up one execution deadline: the store traps
+/// after this many [`Engine::increment_epoch`] calls (~`EPOCH_TICK_PERIOD`
+/// each). `ceil(max_execution_seconds / tick) + 1`, floored at 1 tick before the
+/// margin so a tiny configured timeout still gets at least one tick.
+///
+/// The `+ 1` is a phase-safety margin (#4864 review): the global ticker runs
+/// free and is NOT synchronized with arming, so the first increment after a
+/// deadline is armed can land anywhere in `[0, EPOCH_TICK_PERIOD)`. Without the
+/// margin a `ceil`-computed N-tick deadline could trap up to one whole tick
+/// EARLY (≈4.9s for a 5.0s budget), nondeterministically killing a guest that
+/// legitimately finishes in `[T - tick, T]`. The margin shifts the enforced
+/// window from `[T - tick, T]` to `[T, T + tick]` — never early, at most one
+/// tick (~100 ms) late.
+fn epoch_deadline_ticks(max_execution_seconds: f64) -> u64 {
+    let tick_secs = EPOCH_TICK_PERIOD.as_secs_f64();
+    let ticks = (max_execution_seconds / tick_secs).ceil();
+    (ticks as u64).max(1) + 1
+}
+
+/// Arm `store`'s epoch deadline for ONE guest execution.
+///
+/// Must be called before every call that runs guest (wasm) code. With epoch
+/// interruption enabled a store traps the instant the current engine epoch has
+/// reached its deadline, and the deadline is relative to the epoch at arm time —
+/// so an un-re-armed store inherits a stale (already-elapsed) deadline and the
+/// guest traps immediately. `epoch_deadline_trap()` selects trap-on-deadline
+/// (NOT `epoch_deadline_async_yield_and_update`): a runaway guest is killed, not
+/// paused-and-resumed.
+///
+/// Only GUEST code is interrupted — wasmtime's epoch checks live at wasm loop
+/// backedges and function entries. A blocking HOST-function call in progress is
+/// never cut off mid-flight; the trap can only fire once control returns to
+/// guest code. So a slow host call completes normally.
+fn arm_epoch_deadline(store: &mut Store<HostState>, ticks: u64) {
+    store.set_epoch_deadline(ticks);
+    store.epoch_deadline_trap();
+    // Piggyback a cheap dead-ticker health check on this already-per-call site.
+    detect_stale_epoch_ticker();
+}
 
 /// Wasmtime 27.x backend implementation.
 pub(crate) struct WasmtimeEngine {
@@ -334,9 +721,34 @@ pub(crate) struct WasmtimeEngine {
     enabled_metering: bool,
     /// Max fuel for each execution (computed from max_execution_seconds).
     max_fuel: u64,
+    /// Epoch-deadline ticks armed before each guest execution (#4861). Computed
+    /// once from `max_execution_seconds` (see [`epoch_deadline_ticks`]); the
+    /// store traps after this many global epoch increments if the guest hasn't
+    /// returned. This is the real preemption backstop behind the wall-clock
+    /// timeout — see [`EPOCH_TICK_PERIOD`].
+    epoch_deadline_ticks: u64,
     /// Instances created in the current Store; reset on `replace_store`.
     /// See [`STORE_REFRESH_THRESHOLD`].
     lifetime_instances: u64,
+    /// Linear-memory bytes belonging to instances that have finished but whose
+    /// allocation the current Store's arena still holds; reset on
+    /// `replace_store`. Measured at `drop_instance` time (memory only grows
+    /// within an instance's life, so the size at drop is its high-water mark)
+    /// and compared against [`Self::arena_budget_bytes`]. See
+    /// [`store_arena_budget_bytes`].
+    ///
+    /// Approximate on purpose: it counts the guest's linear memory, which
+    /// dominates, and misses instances leaked without engine cleanup — those
+    /// stay covered by [`STORE_REFRESH_THRESHOLD`] and [`STORE_MAX_AGE`].
+    retired_instance_bytes: u64,
+    /// Retired-instance bytes this Store may hold before it is refreshed.
+    /// Resolved once per engine from the node's memory limit and pool size.
+    arena_budget_bytes: u64,
+    /// Last time [`Self::note_refresh_cadence`] warned that refreshes are firing
+    /// after a single instance. Real wall-clock `Instant` deliberately: it
+    /// rate-limits an operator log line, not node behavior (same rationale as
+    /// `store_created_at` and the module cache's eviction-warning window).
+    last_cadence_warn: Option<Instant>,
     /// When the current Store was created. Used by [`STORE_MAX_AGE`] fallback.
     store_created_at: Instant,
     /// Production opt-in for offloading a cache-miss compile to a blocking
@@ -424,11 +836,15 @@ impl WasmEngine for WasmtimeEngine {
         Self::register_host_functions(&mut linker)?;
 
         // Create the store with HostState
+        let epoch_deadline_ticks = epoch_deadline_ticks(config.max_execution_seconds);
         let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
         store.limiter(|state| state); // Enable ResourceLimiter
         if enabled_metering {
             store.set_fuel(max_fuel).map_err(|e| anyhow::anyhow!(e))?;
         }
+        // Arm the initial deadline + select trap behavior; every guest call
+        // re-arms it (see `arm_epoch_deadline`).
+        arm_epoch_deadline(&mut store, epoch_deadline_ticks);
 
         // Host memory sharing is not yet implemented in the wasmtime backend.
         // Fail explicitly rather than silently degrading.
@@ -448,7 +864,11 @@ impl WasmEngine for WasmtimeEngine {
             max_execution_seconds: config.max_execution_seconds,
             enabled_metering,
             max_fuel,
+            epoch_deadline_ticks,
             lifetime_instances: 0,
+            retired_instance_bytes: 0,
+            arena_budget_bytes: store_arena_budget_bytes() as u64,
+            last_cadence_warn: None,
             store_created_at: Instant::now(),
             offload_compilation: config.offload_compilation,
         })
@@ -508,41 +928,60 @@ impl WasmEngine for WasmtimeEngine {
     fn create_instance(
         &mut self,
         module: &Module,
-        id: i64,
         req_bytes: usize,
     ) -> Result<InstanceHandle, WasmError> {
+        // Ids come from the one process-global allocator, never from the
+        // caller. See `native_api::NEXT_INSTANCE_ID` for why (#4213 / #5023).
+        let id = native_api::next_instance_id();
+        {
+            let store = self
+                .store
+                .as_mut()
+                .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
+
+            // Reset fuel if metering is enabled. (Pre-guest-entry; no arena
+            // residue if this fails, so no recovery needed on this early return.)
+            if self.enabled_metering {
+                store
+                    .set_fuel(self.max_fuel)
+                    .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
+            }
+        }
+
+        // The guest-entry half (instantiate + __frnt_set_id + ensure_memory) is
+        // factored out so we can RECOVER THE STORE on ANY guest-entry
+        // timeout/error before returning (#4864 round-9 item 2). Previously an
+        // epoch interrupt during __frnt_set_id returned via `?` AFTER the module
+        // was instantiated but BEFORE `instances.insert` / `lifetime_instances += 1`,
+        // so the store-refresh accounting never counted it: wasmtime's Store arena
+        // retained the dropped instance's allocation, and repeated init timeouts
+        // across fresh contract ids accumulated untracked arena memory that never
+        // triggered a count-based refresh.
+        let epoch_ticks = self.epoch_deadline_ticks;
         let store = self
             .store
             .as_mut()
             .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-
-        // Reset fuel if metering is enabled
-        if self.enabled_metering {
-            store
-                .set_fuel(self.max_fuel)
-                .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
-        }
-
-        // Instantiate the module using the pre-configured linker
-        // CRITICAL: Must use instantiate_async() because async_support(true) is enabled
-        let instance = block_on_async(self.linker.instantiate_async(&mut *store, module))
-            .map_err(|e| WasmError::Instantiation(e.to_string()))?;
-
-        // Call __frnt_set_id to set the instance ID (used for MEM_ADDR lookup)
-        // CRITICAL: Must use call_async() because async_support(true) is enabled
-        if let Some(set_id_func) = instance.get_func(&mut *store, "__frnt_set_id") {
-            let typed_func = set_id_func
-                .typed::<i64, ()>(&*store)
-                .map_err(|e| WasmError::Export(e.to_string()))?;
-            block_on_async(typed_func.call_async(&mut *store, id))
-                .map_err(|e| WasmError::Runtime(e.to_string()))?;
-        }
+        let instance = match Self::instantiate_and_init(
+            store,
+            &self.linker,
+            module,
+            id,
+            req_bytes,
+            epoch_ticks,
+        ) {
+            Ok(instance) => instance,
+            Err(e) => {
+                // The `store` borrow above ends with `match`, so recover_store
+                // (which reborrows &mut self) is free to replace the store and
+                // drop the failed instance's arena residue.
+                self.recover_store();
+                return Err(e);
+            }
+        };
 
         // Note: MEM_ADDR insertion is handled by RunningInstance::new in runtime.rs
         // which has the correct contract key. Do NOT insert here with a default key.
-
-        // Ensure sufficient memory for the request
-        Self::ensure_memory(store, &instance, req_bytes)?;
 
         self.instances.insert(id, instance);
         self.lifetime_instances += 1;
@@ -551,26 +990,56 @@ impl WasmEngine for WasmtimeEngine {
     }
 
     fn drop_instance(&mut self, handle: &InstanceHandle) {
+        // Charge this instance's linear memory to the arena BEFORE dropping the
+        // handle: the allocation outlives the instance (it is reclaimed only by
+        // replacing the whole Store), so this is what makes RSS a sawtooth
+        // rather than a ramp. See `retired_instance_bytes` (#5268).
+        self.retired_instance_bytes = self
+            .retired_instance_bytes
+            .saturating_add(self.instance_memory_bytes(handle.id));
         self.instances.remove(&handle.id);
         MEM_ADDR.remove(&handle.id);
 
         let threshold_exceeded = self.lifetime_instances >= STORE_REFRESH_THRESHOLD;
+        let arena_over_budget = self.retired_instance_bytes >= self.arena_budget_bytes;
         let store_expired = self.store_created_at.elapsed() >= STORE_MAX_AGE;
 
-        if self.instances.is_empty() && threshold_exceeded {
-            // Normal path: all instances dropped and threshold exceeded.
-            tracing::info!(
+        if self.instances.is_empty() && (threshold_exceeded || arena_over_budget) {
+            self.note_refresh_cadence(arena_over_budget);
+            // Normal path: all instances dropped and either bound exceeded.
+            //
+            // `debug!`, not `info!`: with the byte bound this is a routine event
+            // rather than a rare one. On a constrained host (16 MiB arena budget,
+            // ~3 MiB retained per instance) it fires roughly every 5 instances
+            // instead of every 500, which at `info!` would bury the operator log
+            // under a line every few seconds under load.
+            tracing::debug!(
                 lifetime_instances = self.lifetime_instances,
-                "Refreshing engine store to reclaim virtual memory"
+                retired_instance_bytes = self.retired_instance_bytes,
+                arena_budget_bytes = self.arena_budget_bytes,
+                reason = if arena_over_budget {
+                    "arena_bytes"
+                } else {
+                    "instance_count"
+                },
+                "Refreshing engine store to reclaim memory"
             );
             self.replace_store();
-        } else if threshold_exceeded && store_expired {
+        } else if (threshold_exceeded || arena_over_budget) && store_expired {
             // Safety net: orphaned instances (leaked without engine cleanup) are
             // preventing is_empty() from being true. After STORE_MAX_AGE, force
-            // a refresh to bound virtual memory growth. The orphaned Instance
-            // handles become invalid but they were already leaked and unusable.
+            // a refresh to bound memory growth. The orphaned Instance handles
+            // become invalid but they were already leaked and unusable.
+            //
+            // This arm takes EITHER bound, like the normal arm above: the leaked
+            // instance is exactly the case `retired_instance_bytes` claims to
+            // cover, and requiring the full 500-instance count here would have
+            // left the arena's resident bytes unbounded on the one path that
+            // reaches this code (#5268 review).
             tracing::warn!(
                 lifetime_instances = self.lifetime_instances,
+                retired_instance_bytes = self.retired_instance_bytes,
+                arena_budget_bytes = self.arena_budget_bytes,
                 orphaned_instances = self.instances.len(),
                 store_age_secs = self.store_created_at.elapsed().as_secs(),
                 "Force-refreshing engine store — orphaned instances preventing normal refresh"
@@ -607,13 +1076,17 @@ impl WasmEngine for WasmtimeEngine {
         let func = instance
             .get_typed_func::<u32, i64>(&mut *store, "__frnt__initiate_buffer")
             .map_err(|e| WasmError::Export(e.to_string()))?;
+        arm_epoch_deadline(store, self.epoch_deadline_ticks);
         // CRITICAL: Must use call_async() because async_support(true) is enabled
+        // An epoch interrupt here (a runaway allocator) is classified as a
+        // timeout, not a generic Runtime error (#4864 review).
         block_on_async(func.call_async(&mut *store, size))
-            .map_err(|e| WasmError::Runtime(e.to_string()))
+            .map_err(|e| classify_guest_entry_error(e, |e| WasmError::Runtime(e.to_string())))
     }
 
     fn call_void(&mut self, handle: &InstanceHandle, name: &str) -> Result<(), WasmError> {
         let enabled_metering = self.enabled_metering;
+        let epoch_ticks = self.epoch_deadline_ticks;
         let store = self
             .store
             .as_mut()
@@ -625,6 +1098,7 @@ impl WasmEngine for WasmtimeEngine {
         let func = instance
             .get_typed_func::<(), ()>(&mut *store, name)
             .map_err(|e| WasmError::Export(e.to_string()))?;
+        arm_epoch_deadline(store, epoch_ticks);
         // Use call_async because async_support(true) is enabled in the engine Config
         block_on_async(func.call_async(&mut *store, ()))
             .map_err(|e| classify_runtime_error(enabled_metering, store, e))
@@ -639,6 +1113,7 @@ impl WasmEngine for WasmtimeEngine {
         c: i64,
     ) -> Result<i64, WasmError> {
         let enabled_metering = self.enabled_metering;
+        let epoch_ticks = self.epoch_deadline_ticks;
         let store = self
             .store
             .as_mut()
@@ -650,6 +1125,7 @@ impl WasmEngine for WasmtimeEngine {
         let func = instance
             .get_typed_func::<(i64, i64, i64), i64>(&mut *store, name)
             .map_err(|e| WasmError::Export(e.to_string()))?;
+        arm_epoch_deadline(store, epoch_ticks);
         // Use call_async because async_support(true) is enabled in the engine Config
         block_on_async(func.call_async(&mut *store, (a, b, c)))
             .map_err(|e| classify_runtime_error(enabled_metering, store, e))
@@ -683,6 +1159,7 @@ impl WasmEngine for WasmtimeEngine {
             .get_typed_func::<(i64, i64, i64), i64>(&mut *store, name)
             .map_err(|e| WasmError::Export(e.to_string()))?;
 
+        arm_epoch_deadline(store, self.epoch_deadline_ticks);
         // Call the async-aware function using block_on_async
         let result = block_on_async(func.call_async(&mut *store, (a, b, c)));
         result.map_err(|e| classify_runtime_error(self.enabled_metering, store, e))
@@ -720,8 +1197,21 @@ impl WasmEngine for WasmtimeEngine {
             }
         };
 
+        // #4864 round-7: arm the epoch deadline INSIDE the blocking closure, as
+        // the guest's first act — NOT here, before the closure is enqueued.
+        // Arming before enqueue let the queue wait on a saturated blocking pool
+        // consume the epoch budget, so a queued job would insta-trap on start and
+        // a HEALTHY contract would be quarantined (contract-wide Timeout). Arming
+        // at guest-start makes the epoch budget (and the wall-clock backstop in
+        // execute_wasm_blocking) measure from when the guest actually runs. The
+        // wall-clock poll is a backstop; the epoch trap is what actually stops a
+        // runaway synchronous guest. Capture the tick budget by value since the
+        // closure can't borrow `self`.
+        let epoch_ticks = self.epoch_deadline_ticks;
+
         let result = execute_wasm_blocking(
             move || {
+                arm_epoch_deadline(&mut store, epoch_ticks);
                 // Use call_async because async_support(true) is enabled in the engine Config
                 let r = block_on_async(func.call_async(&mut store, (a, b)));
                 (r, store)
@@ -742,6 +1232,10 @@ impl WasmEngine for WasmtimeEngine {
             BlockingResult::Timeout => {
                 self.recover_store();
                 Err(WasmError::Timeout)
+            }
+            BlockingResult::QueuedTimeout => {
+                self.recover_store();
+                Err(WasmError::SchedulerOverloaded)
             }
             BlockingResult::Panic(err) => {
                 self.recover_store();
@@ -783,8 +1277,18 @@ impl WasmEngine for WasmtimeEngine {
             }
         };
 
+        // #4864 round-7: arm the epoch deadline INSIDE the blocking closure, as
+        // the guest's first act — NOT here, before the closure is enqueued (see
+        // call_2i64_blocking for the full rationale). This is the primary contract
+        // merge/validate path, so a pre-enqueue arm consumed by queue wait would
+        // quarantine a healthy contract under blocking-pool saturation. The wall-
+        // clock poll only aborts the tokio task; the epoch trap is what actually
+        // stops a runaway synchronous guest that ignores the timeout.
+        let epoch_ticks = self.epoch_deadline_ticks;
+
         let result = execute_wasm_blocking(
             move || {
+                arm_epoch_deadline(&mut store, epoch_ticks);
                 // Use call_async because async_support(true) is enabled in the engine Config
                 let r = block_on_async(func.call_async(&mut store, (a, b, c)));
                 (r, store)
@@ -805,6 +1309,10 @@ impl WasmEngine for WasmtimeEngine {
             BlockingResult::Timeout => {
                 self.recover_store();
                 Err(WasmError::Timeout)
+            }
+            BlockingResult::QueuedTimeout => {
+                self.recover_store();
+                Err(WasmError::SchedulerOverloaded)
             }
             BlockingResult::Panic(err) => {
                 self.recover_store();
@@ -871,6 +1379,41 @@ impl WasmtimeEngine {
             .any(|import| import.module() == "freenet_contract_io")
     }
 
+    /// Names of the contract entry points this instance is missing, if any.
+    ///
+    /// A module can compile and instantiate perfectly while exporting none of the
+    /// contract ABI. Every call against it then fails at execution time, which a
+    /// conformance run reads as "could not judge this contract" rather than "this is
+    /// not a contract" — so a run against the wrong file reports success. Resolving
+    /// the names up front turns that into a load error.
+    pub(crate) fn missing_contract_exports_for(
+        &mut self,
+        handle: &InstanceHandle,
+    ) -> Vec<&'static str> {
+        const CONTRACT_ABI: [&str; 4] = [
+            "validate_state",
+            "update_state",
+            "summarize_state",
+            "get_state_delta",
+        ];
+        // Fail CLOSED. Returning "nothing missing" when the store or the instance
+        // is absent reports a contract as having the full ABI without having looked,
+        // which is the one answer this function must never give: its whole purpose is
+        // to stop a module that is not a contract being read as a contract that
+        // merely could not be judged. Report the whole ABI as missing instead, so an
+        // unanswerable question surfaces as a refusal rather than as a pass.
+        let Some(store) = self.store.as_mut() else {
+            return CONTRACT_ABI.to_vec();
+        };
+        let Some(instance) = self.instances.get(&handle.id) else {
+            return CONTRACT_ABI.to_vec();
+        };
+        CONTRACT_ABI
+            .into_iter()
+            .filter(|name| instance.get_export(&mut *store, name).is_none())
+            .collect()
+    }
+
     /// Create a new backend engine that can be shared across multiple Runtime instances.
     pub(crate) fn create_backend_engine(config: &RuntimeConfig) -> Result<Engine, ContractError> {
         let (engine, _, _) = Self::create_engine(config)?;
@@ -899,11 +1442,13 @@ impl WasmtimeEngine {
         let mut linker = Linker::new(&backend);
         Self::register_host_functions(&mut linker)?;
 
+        let epoch_deadline_ticks = epoch_deadline_ticks(config.max_execution_seconds);
         let mut store = Store::new(&backend, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
         store.limiter(|state| state);
         if enabled_metering {
             store.set_fuel(max_fuel).map_err(|e| anyhow::anyhow!(e))?;
         }
+        arm_epoch_deadline(&mut store, epoch_deadline_ticks);
 
         if host_mem {
             return Err(anyhow::anyhow!(
@@ -922,7 +1467,11 @@ impl WasmtimeEngine {
             max_execution_seconds: config.max_execution_seconds,
             enabled_metering,
             max_fuel,
+            epoch_deadline_ticks,
             lifetime_instances: 0,
+            retired_instance_bytes: 0,
+            arena_budget_bytes: store_arena_budget_bytes() as u64,
+            last_cadence_warn: None,
             store_created_at: Instant::now(),
             offload_compilation: config.offload_compilation,
         })
@@ -936,6 +1485,16 @@ impl WasmtimeEngine {
         if config.enable_metering {
             wasmtime_config.consume_fuel(true);
         }
+
+        // Enable epoch-based interruption unconditionally (#4861). This is the
+        // only mechanism that actually preempts a synchronous runaway guest: the
+        // wall-clock timeout can only abort the wrapping tokio task, and metering
+        // (fuel) is off by default. Each store arms a per-execution deadline (see
+        // `arm_epoch_deadline`) and a background thread advances the epoch (see
+        // `register_engine_for_epoch` below / `EPOCH_TICK_PERIOD`). Note: this is
+        // part of the engine's compile-cache key, so enabling it recompiles
+        // cached modules once on upgrade.
+        wasmtime_config.epoch_interruption(true);
 
         // Set memory limits via config
         // async_stack_size must exceed max_wasm_stack
@@ -1056,7 +1615,72 @@ impl WasmtimeEngine {
         let engine =
             Engine::new(&wasmtime_config).map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
+        // Drive this engine's epoch from the global ticker so armed store
+        // deadlines actually elapse (#4861). Registered once per fresh backend
+        // engine; `new_with_shared_backend` reuses the already-registered one.
+        register_engine_for_epoch(&engine);
+
         Ok((engine, max_fuel, config.enable_metering))
+    }
+
+    /// Instantiate `module`, run its `__frnt_set_id`, and ensure request memory —
+    /// the guest-entry half of [`create_instance`], factored out so the caller can
+    /// RECOVER THE STORE on any guest-entry timeout/error before returning (#4864
+    /// round-9 item 2). Every guest entry here is immediately preceded by its own
+    /// `arm_epoch_deadline` (pinned by
+    /// `every_guest_entry_is_preceded_by_arm_epoch_deadline`, which now scrapes
+    /// this method).
+    fn instantiate_and_init(
+        store: &mut Store<HostState>,
+        linker: &Linker<HostState>,
+        module: &Module,
+        id: i64,
+        req_bytes: usize,
+        epoch_deadline_ticks: u64,
+    ) -> Result<Instance, WasmError> {
+        // Arm the epoch deadline before instantiation runs any guest start
+        // function (#4861); the store is reused across calls so a stale deadline
+        // would otherwise trap here.
+        arm_epoch_deadline(store, epoch_deadline_ticks);
+
+        // Instantiate the module using the pre-configured linker.
+        // CRITICAL: Must use instantiate_async() because async_support(true) is enabled.
+        // An epoch interrupt here (a runaway module start function) is classified
+        // as a timeout, not Instantiation (#4864 review); other errors keep it.
+        let instance =
+            block_on_async(linker.instantiate_async(&mut *store, module)).map_err(|e| {
+                classify_guest_entry_error(e, |e| WasmError::Instantiation(e.to_string()))
+            })?;
+
+        // Call __frnt_set_id to set the instance ID (used for MEM_ADDR lookup).
+        // CRITICAL: Must use call_async() because async_support(true) is enabled.
+        if let Some(set_id_func) = instance.get_func(&mut *store, "__frnt_set_id") {
+            let typed_func = set_id_func
+                .typed::<i64, ()>(&*store)
+                .map_err(|e| WasmError::Export(e.to_string()))?;
+            // Re-arm the epoch deadline before this SECOND guest call (#4864
+            // round-4 P2). The store is reused across calls, so without re-arming
+            // __frnt_set_id would inherit whatever ticks REMAIN from the
+            // instantiation deadline armed above — a module whose start function
+            // ran near the budget would leave set_id ~zero ticks and trap it
+            // spuriously.
+            //
+            // Adversarial ceiling (#4864 round-5 item 10): giving set_id a FRESH
+            // budget is correct per-call, but it means create_instance's worst-case
+            // GUEST CPU is ~2x max_execution_seconds (a start function running just
+            // under budget, then set_id running a fresh full budget). That is
+            // bounded at EXACTLY 2 guest entries — the pin enumerates every guest
+            // entry here, so the factor cannot silently grow.
+            arm_epoch_deadline(store, epoch_deadline_ticks);
+            block_on_async(typed_func.call_async(&mut *store, id)).map_err(|e| {
+                classify_guest_entry_error(e, |e| WasmError::Runtime(e.to_string()))
+            })?;
+        }
+
+        // Ensure sufficient memory for the request.
+        Self::ensure_memory(store, &instance, req_bytes)?;
+
+        Ok(instance)
     }
 
     /// Recover the engine after a timeout or panic that consumed the store.
@@ -1086,10 +1710,81 @@ impl WasmtimeEngine {
                 tracing::error!("Failed to set fuel on replacement store: {e}");
             }
         }
+        // Re-arm the epoch deadline on the fresh store; every guest call re-arms
+        // again, but arming here keeps the invariant "a live store always has a
+        // future deadline" (an un-armed epoch store traps immediately).
+        arm_epoch_deadline(&mut store, self.epoch_deadline_ticks);
         self.instances.clear();
         self.store = Some(store);
         self.lifetime_instances = 0;
+        self.retired_instance_bytes = 0;
         self.store_created_at = Instant::now();
+    }
+
+    /// Warn (rate-limited) when the arena bound is firing after a SINGLE
+    /// instance, i.e. one contract's linear memory alone meets or exceeds this
+    /// Store's whole arena budget, so every call to it now ends in a Store
+    /// refresh rather than a periodic one.
+    ///
+    /// Correct behaviour (see [`store_arena_budget_bytes`]) but not free, and it
+    /// lands on exactly the large-contract, memory-constrained peers this work
+    /// targets. Without a signal it would be an invisible CPU cost that looks
+    /// like "the node got slower after the upgrade" with nothing to point at; the
+    /// refresh line itself is `debug!` precisely because it is too frequent to
+    /// read, so the diagnosis has to come from here. `warn!` and rate-limited to
+    /// one line per [`CADENCE_WARN_INTERVAL`], so it is greppable without
+    /// becoming the flood it reports.
+    fn note_refresh_cadence(&mut self, arena_over_budget: bool) {
+        // `lifetime_instances` counts creations in the CURRENT Store and resets
+        // on every replace, so 1 here means this Store served exactly one call.
+        if !arena_over_budget || self.lifetime_instances > 1 {
+            return;
+        }
+        let now = Instant::now();
+        let due = self
+            .last_cadence_warn
+            .is_none_or(|prev| now.duration_since(prev) >= CADENCE_WARN_INTERVAL);
+        if !due {
+            return;
+        }
+        self.last_cadence_warn = Some(now);
+        tracing::warn!(
+            retired_instance_bytes = self.retired_instance_bytes,
+            arena_budget_bytes = self.arena_budget_bytes,
+            "A single contract instance's memory fills this worker's whole WASM \
+             arena budget, so its Store is being replaced on every call. Memory \
+             stays bounded, but each call pays an extra store rebuild. Raise the \
+             node's memory limit (MemoryMax) or lower FREENET_RUNTIME_POOL_SIZE \
+             to give each worker a larger arena budget."
+        );
+    }
+
+    /// Override the arena byte budget so a test can decide which of the two
+    /// refresh bounds is under examination, rather than inheriting the test
+    /// host's RAM and core count. Tests that pin the INSTANCE-COUNT threshold
+    /// set `u64::MAX` (arena bound disarmed); the arena test sets a small value.
+    #[cfg(test)]
+    fn set_arena_budget_for_test(&mut self, bytes: u64) {
+        self.arena_budget_bytes = bytes;
+    }
+
+    /// Current linear-memory size of a live instance, or 0 when it cannot be
+    /// read (already gone, no store, or no `memory` export).
+    ///
+    /// Used to charge a finishing instance's allocation to the Store arena; a
+    /// zero on an unreadable instance only under-counts, and the count/age
+    /// thresholds remain as backstops.
+    fn instance_memory_bytes(&mut self, id: i64) -> u64 {
+        let Some(store) = self.store.as_mut() else {
+            return 0;
+        };
+        let Some(instance) = self.instances.get(&id) else {
+            return 0;
+        };
+        instance
+            .get_memory(&mut *store, "memory")
+            .map(|memory| memory.data_size(&*store) as u64)
+            .unwrap_or(0)
     }
 
     fn compute_max_fuel(config: &RuntimeConfig) -> u64 {
@@ -1176,11 +1871,22 @@ impl WasmtimeEngine {
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
-        // Time namespace
+        // Time namespace.
+        //
+        // The two names come from `conformance::host_clock` rather than being
+        // written out here, because that module's detector — which decides
+        // whether a contract gets the #5465 deprecation warning, and what
+        // `fdev verify-merge` reports — matches on exactly these strings.
+        // Import resolution is byte-exact, so a literal here that drifted from
+        // the constants would leave the detector returning `false` forever: the
+        // node would warn about nothing and `fdev` would hand clean bills of
+        // health to contracts that do read the clock, with every test green.
+        // Sharing the constant is what makes that failure impossible rather
+        // than merely tested for.
         linker
             .func_wrap(
-                "freenet_time",
-                "__frnt__time__utc_now",
+                crate::conformance::HOST_CLOCK_NAMESPACE,
+                crate::conformance::HOST_CLOCK_IMPORT,
                 |mut caller: Caller<'_, HostState>, id: i64, ptr: i64| {
                     refresh_mem_addr_from_caller(&mut caller, id);
                     native_api::time::utc_now(id, ptr);
@@ -1486,12 +2192,50 @@ fn block_on_async<F: std::future::Future>(future: F) -> F::Output {
     }
 }
 
+/// True if `error` carries wasmtime's epoch-deadline interrupt trap
+/// (`Trap::Interrupt`) — our execution-timeout mechanism firing (#4861): the
+/// guest ran past its armed deadline and wasmtime interrupted it at an epoch
+/// check.
+fn is_epoch_interrupt(error: &WasmtimeError) -> bool {
+    error
+        .downcast_ref::<wasmtime::Trap>()
+        .is_some_and(|t| matches!(t, wasmtime::Trap::Interrupt))
+}
+
+/// Map an error from a GUEST-ENTRY call — instantiation (module start
+/// function), `__frnt_set_id`, or `__frnt__initiate_buffer` — to a
+/// [`WasmError`], routing an epoch-deadline interrupt to [`WasmError::Timeout`]
+/// (#4864 review). Without this, a runaway guest during the init/allocator phase
+/// would surface as `Instantiation`/`Runtime` — neither `is_wasm_timeout` (wrong
+/// merge-backoff cooldown class) nor even `is_contract_exec_rejection` (not
+/// recorded at all). Non-interrupt errors keep their original category via
+/// `otherwise`, preserving the existing error text.
+fn classify_guest_entry_error(
+    error: WasmtimeError,
+    otherwise: impl FnOnce(WasmtimeError) -> WasmError,
+) -> WasmError {
+    if is_epoch_interrupt(&error) {
+        tracing::warn!("WASM execution timed out (epoch deadline exceeded during guest entry)");
+        return WasmError::Timeout;
+    }
+    otherwise(error)
+}
+
 /// Classify a wasmtime Error, checking fuel status.
 fn classify_runtime_error(
     enabled_metering: bool,
     store: &mut Store<HostState>,
     error: WasmtimeError,
 ) -> WasmError {
+    // An epoch-deadline interrupt is our execution timeout (#4861). Classify it
+    // as a timeout (not a generic runtime error) so it flows to
+    // `ContractExecError::MaxComputeTimeExceeded` exactly like the wall-clock
+    // `BlockingResult::Timeout` path. Checked first because it is a timeout
+    // regardless of whether metering is on.
+    if is_epoch_interrupt(&error) {
+        tracing::warn!("WASM execution timed out (epoch deadline exceeded)");
+        return WasmError::Timeout;
+    }
     if enabled_metering {
         // Check if we ran out of fuel
         if let Ok(remaining) = store.get_fuel() {
@@ -1514,16 +2258,132 @@ type WasmResult = (Result<i64, WasmtimeError>, Store<HostState>);
 enum BlockingResult {
     Ok(i64, Store<HostState>),
     WasmError(WasmtimeError, Store<HostState>),
+    /// Wall-clock deadline fired while the guest was RUNNING (`started == true`)
+    /// — a real, contract-intrinsic timeout backing up the epoch trap. The
+    /// store is unrecoverable (the aborted task/thread still owns it), so the
+    /// caller recovers a fresh store like the other timeout arms.
     Timeout,
+    /// Wall-clock deadline fired while the closure was still QUEUED on a
+    /// saturated blocking pool (`started == false`) — the guest never ran
+    /// (#4864 round-6). Transient load, NOT a contract fault; the caller maps
+    /// it to [`WasmError::SchedulerOverloaded`] and recovers the store as with
+    /// `Timeout`.
+    QueuedTimeout,
     Panic(anyhow::Error),
+}
+
+/// Verdict from the wall-clock backstop poll in [`execute_wasm_blocking`].
+#[derive(Debug, PartialEq, Eq)]
+enum WallVerdict {
+    /// Neither bound exceeded yet — keep polling.
+    KeepWaiting,
+    /// The guest RAN and consumed its full budget (measured from guest-start,
+    /// not from enqueue) — a real, contract-intrinsic timeout backing up the
+    /// epoch trap. Quarantine-worthy.
+    GuestOverran,
+    /// The closure never got off the blocking-pool queue within the queue bound
+    /// — transient scheduler overload the guest never entered. NOT a contract
+    /// fault; must not be charged to the contract.
+    QueuedTooLong,
+}
+
+/// #4864 round-7: classify the wall-clock backstop, bounding queue wait and the
+/// per-guest compute budget SEPARATELY.
+///
+/// The epoch deadline is now armed INSIDE the blocking closure (at guest-start,
+/// see `call_2i64_blocking` / `call_3i64_blocking`), so the wall-clock loop
+/// measures the guest's budget from `started_at`, not from enqueue. That closes
+/// two failure modes under blocking-pool saturation:
+///
+/// - (a) A job that sat queued past `budget` and then ran would, if the budget
+///   were measured from enqueue (and the epoch armed pre-enqueue), insta-trip on
+///   start and be quarantined as a real timeout even though it is HEALTHY. Now a
+///   not-yet-started job that hits the queue bound is [`WallVerdict::QueuedTooLong`]
+///   (transient), and a job that starts gets its FULL budget from its own start.
+/// - (b) A job that started just before an enqueue-relative deadline would be
+///   classified as a real timeout after mere milliseconds of guest time. Now the
+///   guest must actually consume `budget` of run time to earn `GuestOverran`.
+///
+/// The total wall bound is `queue_wait + budget`, each individually `<= budget`.
+///
+/// - `started_at`: `Some(elapsed-at-guest-start)` once the guest began running,
+///   `None` while still queued.
+/// - `elapsed`: time since enqueue.
+/// - `budget`: both the per-guest compute budget AND the queue bound.
+fn classify_wall_timeout(
+    started_at: Option<Duration>,
+    elapsed: Duration,
+    budget: Duration,
+) -> WallVerdict {
+    match started_at {
+        // Guest is running: a real timeout only once it has consumed its full
+        // budget measured from its OWN start, not from enqueue.
+        Some(started_at) => {
+            if elapsed.saturating_sub(started_at) >= budget {
+                WallVerdict::GuestOverran
+            } else {
+                WallVerdict::KeepWaiting
+            }
+        }
+        // Never started: transient scheduler overload once queued past the bound.
+        None => {
+            if elapsed >= budget {
+                WallVerdict::QueuedTooLong
+            } else {
+                WallVerdict::KeepWaiting
+            }
+        }
+    }
 }
 
 fn execute_wasm_blocking<F>(f: F, max_execution_seconds: f64) -> BlockingResult
 where
     F: FnOnce() -> WasmResult + Send + 'static,
 {
-    let timeout = Duration::from_secs_f64(max_execution_seconds);
+    // `budget` bounds BOTH the queue wait (before the guest starts) and the
+    // guest's own compute time (after it starts), SEPARATELY — see
+    // `classify_wall_timeout`.
+    let budget = Duration::from_secs_f64(max_execution_seconds);
     let start = std::time::Instant::now();
+
+    // #4864 round-6/7: distinguish a guest that RAN and blew its budget (a real,
+    // contract-intrinsic timeout — the epoch backstop) from a closure that never
+    // got off the blocking-pool queue (a transient scheduler overload the guest
+    // never entered). The wrapper records `started_at` (ms since enqueue) then
+    // flips `started` as the closure's first acts; the CALLER's closure then arms
+    // the epoch deadline as ITS first act, so the guest's budget starts at
+    // guest-start, not at enqueue. A wall-clock fire with `started == false` means
+    // the guest never ran and the failure must NOT be charged to the contract.
+    let started = Arc::new(AtomicBool::new(false));
+    let started_at_ms = Arc::new(AtomicU64::new(0));
+    let started_for_guest = Arc::clone(&started);
+    let started_at_for_guest = Arc::clone(&started_at_ms);
+    // Contract WASM runs on a dedicated blocking thread (spawn_blocking, or a
+    // plain std::thread — see the match below), never on the calling thread, so
+    // a contract-clock override set by a test on the CALLER's thread would not
+    // otherwise be visible to `native_api::time::utc_now`. Capture it here, on
+    // the calling thread, and re-install it for the guest's thread only, for
+    // the duration of this one call. Production never overrides the clock, so
+    // this reads and forwards `None` — a no-op.
+    let clock_override = native_api::time::current_contract_clock_override();
+    let f = move || {
+        // Record started_at BEFORE flipping `started`, so the poll loop that
+        // observes started==true (SeqCst) is guaranteed to read a valid
+        // started_at.
+        started_at_for_guest.store(start.elapsed().as_millis() as u64, Ordering::SeqCst);
+        started_for_guest.store(true, Ordering::SeqCst);
+        let _clock_guard = clock_override.map(native_api::time::override_contract_clock);
+        f()
+    };
+
+    // Read the guest-start clock as `Some` only once the guest has actually
+    // started, so a stale started_at of 0 is never mistaken for a guest that
+    // began at t=0 while it is in fact still queued.
+    let read_started_at = || -> Option<Duration> {
+        started
+            .load(Ordering::SeqCst)
+            .then(|| Duration::from_millis(started_at_ms.load(Ordering::SeqCst)))
+    };
 
     // `block_in_place` (in the multi-thread arm below) is only legal on a
     // multi-threaded runtime; it PANICS on a current_thread runtime. Route a
@@ -1557,14 +2417,27 @@ where
                     };
                 }
 
-                if start.elapsed() >= timeout {
-                    tracing::warn!(
-                        timeout_secs = max_execution_seconds,
-                        elapsed_ms = start.elapsed().as_millis(),
-                        "WASM execution timed out"
-                    );
-                    task_handle.abort();
-                    return BlockingResult::Timeout;
+                match classify_wall_timeout(read_started_at(), start.elapsed(), budget) {
+                    WallVerdict::KeepWaiting => {}
+                    WallVerdict::GuestOverran => {
+                        task_handle.abort();
+                        tracing::warn!(
+                            timeout_secs = max_execution_seconds,
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "WASM execution timed out (guest running past its budget; epoch backstop)"
+                        );
+                        return BlockingResult::Timeout;
+                    }
+                    WallVerdict::QueuedTooLong => {
+                        task_handle.abort();
+                        tracing::warn!(
+                            timeout_secs = max_execution_seconds,
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "WASM execution timed out while QUEUED (guest never started; \
+                             blocking-pool saturation) — treated as transient, contract not quarantined"
+                        );
+                        return BlockingResult::QueuedTimeout;
+                    }
                 }
 
                 std::thread::sleep(Duration::from_millis(10));
@@ -1605,13 +2478,30 @@ where
                     }
                 }
 
-                if start.elapsed() >= timeout {
-                    tracing::warn!(
-                        timeout_secs = max_execution_seconds,
-                        elapsed_ms = start.elapsed().as_millis(),
-                        "WASM execution timed out (no tokio runtime)"
-                    );
-                    return BlockingResult::Timeout;
+                // Same started-flag classification as the multi-thread arm. The
+                // detached thread is left to finish and drop the store on its own
+                // (as before); only the RESULT classification differs by whether
+                // the guest ran.
+                match classify_wall_timeout(read_started_at(), start.elapsed(), budget) {
+                    WallVerdict::KeepWaiting => {}
+                    WallVerdict::GuestOverran => {
+                        tracing::warn!(
+                            timeout_secs = max_execution_seconds,
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "WASM execution timed out (guest running past its budget; epoch backstop, no tokio runtime)"
+                        );
+                        return BlockingResult::Timeout;
+                    }
+                    WallVerdict::QueuedTooLong => {
+                        tracing::warn!(
+                            timeout_secs = max_execution_seconds,
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "WASM execution timed out while QUEUED (guest never started; \
+                             blocking-pool saturation, no tokio runtime) — treated as transient, \
+                             contract not quarantined"
+                        );
+                        return BlockingResult::QueuedTimeout;
+                    }
                 }
 
                 std::thread::sleep(Duration::from_millis(10));
@@ -1678,7 +2568,7 @@ mod tests {
         let module = engine
             .compile(SIMPLE_WASM)
             .expect("offloaded compile should succeed");
-        let handle = engine.create_instance(&module, 0, 1024).unwrap();
+        let handle = engine.create_instance(&module, 1024).unwrap();
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
     }
@@ -1697,9 +2587,505 @@ mod tests {
         let module = engine
             .compile(SIMPLE_WASM)
             .expect("inline compile should succeed");
-        let handle = engine.create_instance(&module, 0, 1024).unwrap();
+        let handle = engine.create_instance(&module, 1024).unwrap();
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
+    }
+
+    /// WAT for a contract-shaped export that never returns — an infinite loop.
+    /// Signature `(i64,i64,i64)->i64` matches `call_3i64_blocking`'s typed call;
+    /// `unreachable` after the loop satisfies the result type regardless of the
+    /// loop's reachability analysis.
+    const INFINITE_LOOP_WAT: &str = r#"
+        (module
+          (func (export "spin") (param i64 i64 i64) (result i64)
+            (loop $l (br $l))
+            unreachable))
+    "#;
+
+    /// REGRESSION (#4861): epoch-based preemption must actually STOP a runaway
+    /// (infinite-loop) guest.
+    ///
+    /// With metering off (the production default) there is no fuel to exhaust,
+    /// and the wall-clock "timeout" in `execute_wasm_blocking` only aborts the
+    /// *tokio task* wrapping the call — the synchronous guest keeps burning its
+    /// blocking thread forever. Epoch interruption is the only thing that
+    /// preempts it. This test runs the infinite loop with **no wall-clock
+    /// wrapper at all**, so the ONLY thing that can make the call return is the
+    /// global epoch ticker tripping the store's armed deadline. If preemption
+    /// regresses, the call never returns and the test hangs (harness timeout =
+    /// failure).
+    #[test]
+    fn epoch_preemption_stops_infinite_loop() {
+        // create_backend_engine enables epoch_interruption AND registers the
+        // engine with the global epoch ticker (100ms period). Metering off.
+        let config = RuntimeConfig {
+            enable_metering: false,
+            ..RuntimeConfig::default()
+        };
+        let engine = WasmtimeEngine::create_backend_engine(&config).unwrap();
+        let module = Module::new(&engine, INFINITE_LOOP_WAT.as_bytes())
+            .expect("infinite-loop WAT must compile");
+
+        let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+        store.limiter(|s| s);
+        // Short deadline (2 ticks ≈ 200ms) so the test is fast; trap-on-deadline.
+        arm_epoch_deadline(&mut store, 2);
+
+        let instance = block_on_async(Linker::new(&engine).instantiate_async(&mut store, &module))
+            .expect("instantiation must succeed");
+        let func = instance
+            .get_typed_func::<(i64, i64, i64), i64>(&mut store, "spin")
+            .expect("spin export must exist");
+
+        let start = std::time::Instant::now();
+        let result = block_on_async(func.call_async(&mut store, (0, 0, 0)));
+        let elapsed = start.elapsed();
+
+        let err = result
+            .expect_err("infinite loop must be preempted by the epoch deadline, not run forever");
+        // Bounded return proves the guest was actually stopped (generous 5s
+        // ceiling = ~200ms deadline + ticker phase + CI slack).
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "epoch preemption took too long ({elapsed:?}) — guest was not stopped promptly"
+        );
+        // The trap must be the epoch interrupt, and classify as a timeout so it
+        // flows to ContractExecError::MaxComputeTimeExceeded.
+        assert!(
+            err.downcast_ref::<wasmtime::Trap>()
+                .is_some_and(|t| matches!(t, wasmtime::Trap::Interrupt)),
+            "preemption must surface as a Trap::Interrupt, got: {err:?}"
+        );
+        assert!(
+            matches!(
+                classify_runtime_error(false, &mut store, err),
+                WasmError::Timeout
+            ),
+            "epoch-deadline trap must classify as WasmError::Timeout"
+        );
+    }
+
+    /// #4864 review (fix 3): `epoch_deadline_ticks` = `ceil(secs / 100ms) + 1`,
+    /// the `+ 1` a phase-safety margin so a free-running ticker never traps a
+    /// guest EARLY. Boundary cases.
+    #[test]
+    fn epoch_deadline_ticks_has_phase_margin() {
+        // EPOCH_TICK_PERIOD is 100ms.
+        assert_eq!(epoch_deadline_ticks(5.0), 51, "5.0s → ceil(50)+1");
+        assert_eq!(epoch_deadline_ticks(0.05), 2, "0.05s → ceil(0.5)=1, +1");
+        assert_eq!(
+            epoch_deadline_ticks(0.1),
+            2,
+            "0.1s → ceil(1)=1, +1 (exact multiple)"
+        );
+        assert_eq!(epoch_deadline_ticks(0.0), 2, "degenerate 0 → floor 1, +1");
+        assert_eq!(epoch_deadline_ticks(1.0), 11, "1.0s → ceil(10)+1");
+        // A larger budget never gets fewer ticks.
+        assert!(epoch_deadline_ticks(10.0) > epoch_deadline_ticks(5.0));
+        // The margin is exactly one tick above the naive ceil for a whole-second
+        // budget (the case the review flagged for [4.9s, 5.0s] finishers).
+        assert_eq!(epoch_deadline_ticks(5.0) - 1, 50);
+    }
+
+    /// #4864 round-8: the epoch-ticker start is RETRYABLE — a claim whose spawn
+    /// succeeds latches "started"; a claim whose spawn FAILS is reset so a later
+    /// registration retries. Tests the pure state machine over a LOCAL flag (a
+    /// real thread-spawn failure is not forceable in a unit test).
+    #[test]
+    fn epoch_ticker_claim_retries_after_failed_spawn() {
+        use super::{epoch_ticker_reset_after_failed_spawn, epoch_ticker_try_claim};
+        let started = AtomicBool::new(false);
+
+        // The first caller claims the spawn; a concurrent/later caller does not.
+        assert!(
+            epoch_ticker_try_claim(&started),
+            "the first caller claims the spawn"
+        );
+        assert!(
+            !epoch_ticker_try_claim(&started),
+            "a second caller must NOT double-spawn while a claim stands"
+        );
+
+        // Simulate a FAILED spawn → reset → the next caller retries.
+        epoch_ticker_reset_after_failed_spawn(&started);
+        assert!(
+            epoch_ticker_try_claim(&started),
+            "after a failed spawn resets the flag, the next caller retries (not latched)"
+        );
+
+        // Simulate a SUCCESSFUL spawn → no reset → subsequent callers never re-spawn.
+        assert!(
+            !epoch_ticker_try_claim(&started),
+            "after a successful claim (no reset), the ticker is never re-spawned"
+        );
+    }
+
+    /// #4864 review + round-8: the epoch-ticker liveness decision, over injected
+    /// inputs (no global statics). Covers the went-silent case (ticked, then the
+    /// heartbeat aged out) AND the never-started case (heartbeat stuck at 0 while
+    /// we've been arming deadlines past the startup window — e.g. a spawn failure
+    /// the retry never re-attempted).
+    #[test]
+    fn epoch_ticker_is_dead_covers_silent_and_never_started() {
+        use super::epoch_ticker_is_dead;
+        let stale = 1000u64;
+
+        // No arm yet → nothing to preempt → never "dead".
+        assert!(!epoch_ticker_is_dead(0, 0, 5000, stale));
+
+        // Never ticked, but arming only just began (within the window) → alive.
+        assert!(!epoch_ticker_is_dead(0, 100, 100 + stale, stale));
+        // Never ticked, arming longer than the window → DEAD (never started).
+        assert!(epoch_ticker_is_dead(0, 100, 100 + stale + 1, stale));
+
+        // Ticked recently → alive.
+        assert!(!epoch_ticker_is_dead(5000, 100, 5000 + stale, stale));
+        // Ticked, then went silent past the window → DEAD.
+        assert!(epoch_ticker_is_dead(5000, 100, 5000 + stale + 1, stale));
+    }
+
+    /// #4864 round-8 pin: `start_epoch_ticker` must use the RETRYABLE claim/reset
+    /// form (compare_exchange on `EPOCH_TICKER_STARTED` + reset on spawn failure),
+    /// NOT a `OnceLock` that latches a failed spawn forever.
+    #[test]
+    fn start_epoch_ticker_uses_retryable_claim_not_oncelock() {
+        let src = include_str!("wasmtime_engine.rs");
+        let start = src
+            .find("fn start_epoch_ticker(")
+            .expect("start_epoch_ticker not found");
+        let after = &src[start..];
+        let end = after[1..]
+            .find("\nfn ")
+            .map(|i| i + 1)
+            .unwrap_or(after.len());
+        let body = &after[..end];
+        assert!(
+            body.contains("epoch_ticker_try_claim(&EPOCH_TICKER_STARTED)"),
+            "start_epoch_ticker must claim the spawn via epoch_ticker_try_claim (#4864 round-8)"
+        );
+        assert!(
+            body.contains("epoch_ticker_reset_after_failed_spawn(&EPOCH_TICKER_STARTED)"),
+            "start_epoch_ticker must RESET the flag on spawn failure so a later \
+             registration retries (#4864 round-8)"
+        );
+        assert!(
+            !body.contains("OnceLock"),
+            "start_epoch_ticker must NOT gate on a OnceLock — that latches a failed \
+             spawn forever and permanently disables epoch preemption"
+        );
+    }
+
+    /// WAT whose module START function loops forever — exercises an epoch
+    /// interrupt during the INSTANTIATION guest-entry phase.
+    const START_LOOP_WAT: &str = r#"
+        (module
+          (func $spin (loop (br 0)))
+          (start $spin))
+    "#;
+
+    /// REGRESSION (#4864 review, fix 4): an epoch interrupt during a guest-entry
+    /// phase — here a runaway module START function during `instantiate_async` —
+    /// must classify as `WasmError::Timeout`, NOT `Instantiation`. Otherwise the
+    /// merge backoff records the wrong cooldown class (or nothing at all).
+    #[test]
+    fn epoch_interrupt_during_instantiation_classifies_as_timeout() {
+        // Short budget so the test is fast: ceil(0.2/0.1)+1 = 3 ticks (~300ms).
+        let config = RuntimeConfig {
+            max_execution_seconds: 0.2,
+            enable_metering: false,
+            ..RuntimeConfig::default()
+        };
+        let mut engine = WasmtimeEngine::new(&config, false).expect("engine creation");
+        let module = engine
+            .compile(START_LOOP_WAT.as_bytes())
+            .expect("compile start-loop module");
+
+        let start = std::time::Instant::now();
+        // create_instance runs the start function via instantiate_async; the
+        // global epoch ticker preempts it once the armed 3-tick deadline elapses.
+        let result = engine.create_instance(&module, 0);
+        let elapsed = start.elapsed();
+
+        // `InstanceHandle` is not Debug, so match rather than `{result:?}`.
+        match &result {
+            Err(WasmError::Timeout) => {}
+            Err(other) => panic!(
+                "runaway module start function must classify as WasmError::Timeout, got {other:?}"
+            ),
+            Ok(_) => {
+                panic!("runaway module start function must time out, but instantiation succeeded")
+            }
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "instantiation-phase preemption should be prompt; took {elapsed:?}"
+        );
+    }
+
+    /// Source-scrape pin (#4864 review, fix 8 + round-4 P2): EVERY guest-entry
+    /// call site (`instantiate_async` / `call_async`) — not just the first — MUST
+    /// be preceded by an `arm_epoch_deadline(` since the previous guest entry in
+    /// the same function. The store is reused across calls, so a SECOND guest
+    /// call that is not re-armed inherits the first call's remaining epoch budget
+    /// (the `__frnt_set_id` case). This also future-proofs against a refactor
+    /// adding a guest-entry path without arming the deadline.
+    #[test]
+    fn every_guest_entry_is_preceded_by_arm_epoch_deadline() {
+        let src = include_str!("wasmtime_engine.rs");
+        for fn_name in [
+            // #4864 round-9 item 2: create_instance's guest entries moved into
+            // instantiate_and_init so the store can be recovered on a guest-entry
+            // timeout; scrape the new home of those entries.
+            "fn instantiate_and_init(",
+            "fn initiate_buffer(",
+            "fn call_void(",
+            "fn call_3i64(",
+            "fn call_3i64_async_imports(",
+            "fn call_2i64_blocking(",
+            "fn call_3i64_blocking(",
+        ] {
+            let start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("guest-entry method `{fn_name}` not found"));
+            let after = &src[start..];
+            let end = after
+                .find("\n    fn ")
+                .or_else(|| after.find("\n    pub(crate) fn "))
+                .unwrap_or(after.len());
+            let body = &after[..end];
+
+            // Every guest-entry occurrence (both call kinds), sorted. Match the
+            // method-call syntax (leading dot + open paren) so a prose mention of
+            // "call_async" in a doc comment is not treated as an entry.
+            let mut entries: Vec<usize> = body
+                .match_indices(".call_async(")
+                .chain(body.match_indices(".instantiate_async("))
+                .map(|(i, _)| i)
+                .collect();
+            entries.sort_unstable();
+            if entries.is_empty() {
+                continue;
+            }
+            // Real arm CALLS only (`arm_epoch_deadline(`), not prose/identifier
+            // mentions like this pin's own name.
+            let arms: Vec<usize> = body
+                .match_indices("arm_epoch_deadline(")
+                .map(|(i, _)| i)
+                .collect();
+            assert!(
+                !arms.is_empty(),
+                "`{fn_name}` runs guest code but never calls arm_epoch_deadline (#4864)"
+            );
+            // Each guest entry must have an arm SINCE the previous entry (before
+            // the first entry, `prev == 0`).
+            let mut prev = 0usize;
+            for entry_pos in entries {
+                assert!(
+                    arms.iter().any(|&a| a > prev && a < entry_pos),
+                    "`{fn_name}`: guest entry at {entry_pos} has no arm_epoch_deadline \
+                     since the previous guest entry ({prev}) — a store reused across \
+                     calls must be re-armed before EACH guest call (#4864 round-4)"
+                );
+                prev = entry_pos;
+            }
+        }
+    }
+
+    /// Source pin (#4213 / #5023): `create_instance` MUST allocate its instance
+    /// id from the one process-global allocator.
+    ///
+    /// The signature stops a CALLER passing an id, but nothing stops this
+    /// method itself from reverting to a per-engine counter, which is exactly
+    /// the shape that made ids collide across engines in one process. The
+    /// bounded-region scrape follows the `fn_body` convention used by
+    /// `create_instance_recovers_store_on_guest_entry_failure` below, including
+    /// the test-module cutoff that keeps either pin from scraping its own
+    /// source.
+    #[test]
+    fn create_instance_allocates_its_own_instance_id() {
+        // Cut the test module off BEFORE scraping. `include_str!` pulls in the
+        // whole file, this module included, and the needle below occurs here as
+        // a string literal. Without the cut, renaming `create_instance` would
+        // not panic: `find` would fall through to this function's own source,
+        // and the region would then be this test's tail -- whose assertion
+        // message contains `native_api::next_instance_id()`, so the pin would
+        // scrape its own error string and PASS while guarding nothing.
+        // Same remedy as `contract_ops.rs::production_source`; see #5450.
+        let full = include_str!("wasmtime_engine.rs");
+        let cutoff = full
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("wasmtime_engine.rs must have a top-level #[cfg(test)] mod tests");
+        let src = &full[..cutoff];
+        let start = src
+            .find("    fn create_instance(")
+            .expect("create_instance not found");
+        let body = &src[start..];
+        // `+ 1` because this `find` searches `body[1..]`, so its index is one
+        // short of the position in `body`. Without it the slice drops the byte
+        // before the next method -- harmless today (it is the ASCII newline
+        // closing this method), but `&body[..end]` would then slice at an
+        // arbitrary byte, and this file is full of multi-byte em dashes: one
+        // landing there turns the pin into a "byte index is not a char
+        // boundary" panic that says nothing about what it guards. Matches
+        // `create_instance_recovers_store_on_guest_entry_failure` below, which
+        // this test's rustdoc claims to follow.
+        let end = body[1..]
+            .find("\n    fn ")
+            .map(|i| i + 1)
+            .expect("create_instance body must end at the next method");
+        let body = &body[..end];
+        assert!(
+            body.contains("native_api::next_instance_id()"),
+            "create_instance must draw its instance id from \
+             native_api::next_instance_id(); a per-engine counter lets two \
+             engines in one process issue the same id, and drop_instance then \
+             evicts the other engine's live MEM_ADDR entry (#4213 / #5023)"
+        );
+    }
+
+    /// #4864 round-9 item 2 pin: `create_instance` MUST recover the store on a
+    /// guest-entry (instantiate / `__frnt_set_id`) failure. Without it, a timeout
+    /// that returns before `instances.insert` / `lifetime_instances += 1` leaves
+    /// the failed instance's allocation in the wasmtime Store arena uncounted, so
+    /// repeated init timeouts across fresh contract ids accumulate untracked arena
+    /// memory that never triggers a count-based refresh.
+    #[test]
+    fn create_instance_recovers_store_on_guest_entry_failure() {
+        // Same cutoff as `create_instance_allocates_its_own_instance_id` above,
+        // and for the same reason: `include_str!` pulls in this test module,
+        // whose source contains `fn create_instance(` as a string literal. With
+        // the whole file in scope, renaming the production method would let
+        // `find` fall through into the test module rather than panicking.
+        let full = include_str!("wasmtime_engine.rs");
+        let cutoff = full
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("wasmtime_engine.rs must have a top-level #[cfg(test)] mod tests");
+        let src = &full[..cutoff];
+        let start = src
+            .find("fn create_instance(")
+            .expect("create_instance not found");
+        let after = &src[start..];
+        let end = after[1..]
+            .find("\n    fn ")
+            .map(|i| i + 1)
+            .unwrap_or(after.len());
+        let body = &after[..end];
+
+        let call = body
+            .find("Self::instantiate_and_init(")
+            .expect("create_instance must delegate guest entry to instantiate_and_init");
+        let recover = body.find("self.recover_store();").expect(
+            "create_instance must recover the store on a guest-entry failure \
+             (#4864 round-9 item 2)",
+        );
+        assert!(
+            call < recover,
+            "recover_store must be in the instantiate_and_init error path (after the call)"
+        );
+        assert!(
+            body[recover..(recover + 120).min(body.len())].contains("return Err(e)"),
+            "the recovery arm must still return the guest-entry error (not swallow it)"
+        );
+    }
+
+    /// #4864 round-7 (Codex P1): the wall-clock backstop must bound queue wait and
+    /// per-guest compute budget SEPARATELY, measured from `started_at` (guest
+    /// start) rather than from enqueue. Encodes both failure modes the fix closes.
+    #[test]
+    fn classify_wall_timeout_bounds_queue_and_budget_separately() {
+        use super::{WallVerdict, classify_wall_timeout};
+        let budget = Duration::from_millis(100);
+
+        // Not started, under the queue bound → keep waiting.
+        assert_eq!(
+            classify_wall_timeout(None, Duration::from_millis(50), budget),
+            WallVerdict::KeepWaiting
+        );
+        // Not started, past the queue bound → transient (never charged to the
+        // contract). This is fix (a): a job that never got off the queue is not a
+        // contract fault.
+        assert_eq!(
+            classify_wall_timeout(None, Duration::from_millis(100), budget),
+            WallVerdict::QueuedTooLong
+        );
+        assert_eq!(
+            classify_wall_timeout(None, Duration::from_millis(250), budget),
+            WallVerdict::QueuedTooLong
+        );
+
+        // Started at t=0, guest under budget → keep waiting.
+        assert_eq!(
+            classify_wall_timeout(Some(Duration::ZERO), Duration::from_millis(50), budget),
+            WallVerdict::KeepWaiting
+        );
+        // Started at t=0, guest consumed its full budget → real timeout.
+        assert_eq!(
+            classify_wall_timeout(Some(Duration::ZERO), Duration::from_millis(100), budget),
+            WallVerdict::GuestOverran
+        );
+
+        // Fix (b): started LATE (queued 90ms) — total elapsed 150ms exceeds
+        // `budget`, but the guest has only run 60ms (< budget), so it is NOT a real
+        // timeout. Pre-fix (enqueue-relative) this would have fired GuestOverran
+        // after only 10ms of guest time, quarantining a healthy contract.
+        assert_eq!(
+            classify_wall_timeout(
+                Some(Duration::from_millis(90)),
+                Duration::from_millis(150),
+                budget
+            ),
+            WallVerdict::KeepWaiting
+        );
+        // Same late start, once the guest has run its full budget (90 + 100 = 190).
+        assert_eq!(
+            classify_wall_timeout(
+                Some(Duration::from_millis(90)),
+                Duration::from_millis(190),
+                budget
+            ),
+            WallVerdict::GuestOverran
+        );
+    }
+
+    /// #4864 round-7 pin: the blocking guest-entry paths MUST arm the epoch
+    /// deadline INSIDE the closure passed to `execute_wasm_blocking` (so the
+    /// budget starts at guest-start), not before it (which would let queue wait on
+    /// a saturated pool consume the budget and quarantine a healthy contract).
+    /// Asserts the `arm_epoch_deadline(` call in each fn sits AFTER the
+    /// `execute_wasm_blocking(` call. Complements
+    /// `every_guest_entry_is_preceded_by_arm_epoch_deadline`, which only checks the
+    /// arm precedes the guest entry textually (true both before and after the fix).
+    #[test]
+    fn blocking_paths_arm_epoch_inside_the_closure() {
+        let src = include_str!("wasmtime_engine.rs");
+        for fn_name in ["fn call_2i64_blocking(", "fn call_3i64_blocking("] {
+            let start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("`{fn_name}` not found"));
+            let rest = &src[start + fn_name.len()..];
+            // Bound the body at the next method or the impl close.
+            let end = ["\n    fn ", "\n}"]
+                .iter()
+                .filter_map(|needle| rest.find(needle))
+                .min()
+                .map(|i| start + fn_name.len() + i)
+                .unwrap_or(src.len());
+            let body = &src[start..end];
+
+            let ewb = body
+                .find("execute_wasm_blocking(")
+                .unwrap_or_else(|| panic!("`{fn_name}` must call execute_wasm_blocking"));
+            let arm = body
+                .find("arm_epoch_deadline(")
+                .unwrap_or_else(|| panic!("`{fn_name}` must arm the epoch deadline"));
+            assert!(
+                arm > ewb,
+                "`{fn_name}`: arm_epoch_deadline must be INSIDE the execute_wasm_blocking \
+                 closure (after the call), not before it — else queue wait consumes the \
+                 epoch budget and a healthy contract is quarantined (#4864 round-7)"
+            );
+        }
     }
 
     /// REGRESSION (issue #4441 fix-up): with `offload_compilation = true` on a
@@ -1724,7 +3110,7 @@ mod tests {
             .compile(SIMPLE_WASM)
             .expect("compile under current_thread+offload must succeed (no panic)");
         let handle = engine
-            .create_instance(&module, 0, 1024)
+            .create_instance(&module, 1024)
             .expect("module must be instantiable");
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
@@ -1774,7 +3160,7 @@ mod tests {
             .compile(SIMPLE_WASM)
             .expect("compile with no runtime + offload must succeed inline");
         let handle = engine
-            .create_instance(&module, 0, 1024)
+            .create_instance(&module, 1024)
             .expect("module must be instantiable");
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
@@ -1944,7 +3330,7 @@ mod tests {
         // default 10,000 limit. Without our ResourceLimiter override this would fail.
         for i in 0..10_001 {
             let handle = engine
-                .create_instance(&module, i, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -2295,7 +3681,7 @@ mod tests {
         );
 
         let handle = engine
-            .create_instance(&module, 999, 1024)
+            .create_instance(&module, 1024)
             .expect("create instance");
 
         let result = engine.call_3i64_async_imports(&handle, "process", 0, 0, 0);
@@ -2306,6 +3692,84 @@ mod tests {
         );
 
         engine.drop_instance(&handle);
+    }
+
+    /// Regression test for #4213 / #5023: instance ids are a PROCESS-GLOBAL
+    /// namespace, so one engine's instance churn must never disturb another
+    /// engine's LIVE instance.
+    ///
+    /// `MEM_ADDR` (and `DELEGATE_ENV`, `CONTRACT_IO`) are process-global maps
+    /// keyed by instance id, and `drop_instance` removes the entry for the id
+    /// it is handed. While `create_instance` took a caller-supplied id, the
+    /// engine tests in this module passed hand-picked ones: `0..10_001` in
+    /// `test_instance_limit_override_allows_many_instances`, and
+    /// `0..STORE_REFRESH_THRESHOLD` in the store-refresh tests. Their
+    /// `drop_instance` calls removed the `MEM_ADDR` entry of whatever LIVE
+    /// delegate or contract instance in a concurrently-running test had been
+    /// issued the same id. Every host function on the victim then returned
+    /// `ERR_NOT_IN_PROCESS`, which the stdlib collapses into "not found":
+    /// `SecretResult(None)` from `test_large_secret_data` and
+    /// `test_store_and_retrieve_secret`, `error_code: -1` from
+    /// `test_v2_delegate_update_existing_state`.
+    ///
+    /// Ids now come from `native_api::next_instance_id`, so a `create_instance`
+    /// CALLER can no longer pass one -- that surface is closed by the signature.
+    /// It is not closed everywhere: `InstanceHandle.id` is `pub(super)`, so code
+    /// inside `wasm_runtime` can still hand `drop_instance` a fabricated handle
+    /// (`delegate/test.rs` builds `InstanceHandle { id: 0 }` twice today, inert
+    /// only because `process_outbound` ignores it). What this test pins is the
+    /// one property still expressible at runtime, and the one a future change
+    /// could quietly break: the allocator is process-global, not per-engine. Two
+    /// live engines are never issued the same id, so B's churn leaves A's entry
+    /// intact.
+    #[test]
+    fn instance_ids_are_globally_unique_across_engines() {
+        use crate::wasm_runtime::runtime::{InstanceInfo, Key};
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let config = RuntimeConfig::default();
+
+        let mut engine_a = WasmtimeEngine::new(&config, false).unwrap();
+        let module_a = engine_a.compile(SIMPLE_WASM).unwrap();
+        let live = engine_a
+            .create_instance(&module_a, 1024)
+            .expect("engine A instance");
+        // `RunningInstance::new` is what records the MEM_ADDR entry in
+        // production; stand in for it so an eviction would be observable.
+        let (ptr, size) = engine_a.memory_info(&live).unwrap();
+        MEM_ADDR.insert(
+            live.id,
+            InstanceInfo::new(
+                ptr as i64,
+                size,
+                Key::Contract(ContractInstanceId::new([0u8; 32])),
+            ),
+        );
+
+        // A second engine churns instances the way the store-refresh and
+        // instance-limit tests do, while A's instance stays live.
+        let mut engine_b = WasmtimeEngine::new(&config, false).unwrap();
+        let module_b = engine_b.compile(SIMPLE_WASM).unwrap();
+        for _ in 0..64 {
+            let churn = engine_b
+                .create_instance(&module_b, 1024)
+                .expect("engine B instance");
+            assert_ne!(
+                churn.id, live.id,
+                "engine B was issued engine A's LIVE instance id; instance ids \
+                 must come from the one process-global allocator"
+            );
+            engine_b.drop_instance(&churn);
+        }
+
+        assert!(
+            MEM_ADDR.get(&live.id).is_some(),
+            "another engine's instance churn evicted a LIVE instance's MEM_ADDR \
+             entry; every host function on that instance would now return \
+             ERR_NOT_IN_PROCESS"
+        );
+
+        engine_a.drop_instance(&live);
     }
 
     /// Deterministic regression test for #3248: stale memory base pointer.
@@ -2344,10 +3808,12 @@ mod tests {
         "#;
 
         let module = engine.compile(wat.as_bytes()).unwrap();
-        let instance_id: i64 = 42_000;
         let handle = engine
-            .create_instance(&module, instance_id, 1024)
+            .create_instance(&module, 1024)
             .expect("create instance");
+        // The engine issues the id; `RunningInstance::new` is what normally
+        // records the MEM_ADDR entry, so stand in for it here.
+        let instance_id = handle.id;
 
         let (init_ptr, init_size) = engine.memory_info(&handle).unwrap();
         MEM_ADDR.insert(
@@ -2402,19 +3868,187 @@ mod tests {
         engine.drop_instance(&handle);
     }
 
+    /// REGRESSION (issue #5268 defect 2): the Store must be refreshed when the
+    /// arena's retained RESIDENT bytes reach the budget, WITHOUT waiting for
+    /// `STORE_REFRESH_THRESHOLD` instance creations.
+    ///
+    /// wasmtime arena-allocates instances, so dropping an `Instance` frees
+    /// nothing until the whole Store is replaced. With the fixed 500-instance
+    /// count as the only bound, peak RSS was set by that count and nothing
+    /// budgeted resident memory: a real peer's RSS fell 1.46 GiB the instant one
+    /// refresh fired, and peers died against the shipped 2 GiB `MemoryMax` long
+    /// before 500 was a sensible number.
+    ///
+    /// Without the byte bound this loop refreshes only at 500, so
+    /// `lifetime_instances` is still counting up when the assertion runs.
+    #[test]
+    fn store_refresh_fires_on_arena_bytes_before_instance_count() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(SIMPLE_WASM).unwrap();
+
+        // Charge one instance to learn what the arena actually retains per
+        // instance, then set a budget only a few instances wide.
+        let handle = engine.create_instance(&module, 1024).unwrap();
+        engine.drop_instance(&handle);
+        let per_instance = engine.retired_instance_bytes;
+        assert!(
+            per_instance > 0,
+            "an instance's linear memory must be measurable, else the byte bound \
+             can never fire"
+        );
+        engine.set_arena_budget_for_test(per_instance * 4);
+
+        let mut refreshes = 0;
+        let mut previous = engine.lifetime_instances;
+        // Far fewer creations than STORE_REFRESH_THRESHOLD: any refresh seen
+        // here is attributable to the byte bound alone.
+        let creations = 40;
+        assert!(creations < STORE_REFRESH_THRESHOLD);
+        for _ in 1..=creations {
+            let handle = engine.create_instance(&module, 1024).unwrap();
+            engine.drop_instance(&handle);
+            if engine.lifetime_instances <= previous {
+                refreshes += 1;
+                assert_eq!(
+                    engine.lifetime_instances, 0,
+                    "a refresh must reset the instance counter"
+                );
+                assert_eq!(
+                    engine.retired_instance_bytes, 0,
+                    "a refresh must reset the arena byte counter"
+                );
+            }
+            previous = engine.lifetime_instances;
+        }
+
+        assert!(
+            refreshes >= 5,
+            "a 4-instance arena budget must refresh repeatedly over {creations} \
+             instances, saw {refreshes}"
+        );
+        assert!(
+            engine.is_healthy(),
+            "engine must stay healthy across byte-budget refreshes"
+        );
+        let handle = engine
+            .create_instance(&module, 1024)
+            .expect("should create instance after byte-budget refresh");
+        engine.drop_instance(&handle);
+    }
+
+    /// A single instance whose linear memory alone meets the arena budget must
+    /// keep WORKING — refreshing the Store on every call, with memory bounded and
+    /// no wedge — rather than looping, erroring, or silently growing.
+    ///
+    /// A contract may declare up to `DEFAULT_MAX_MEMORY_PAGES` (256 MiB), and on
+    /// the 2 GiB / 16-worker shape this PR targets the arena budget is 16 MiB, so
+    /// "one instance is the whole budget" is a reachable production case, not a
+    /// contrived one (#5268 review, 5th lens). This pins that it degrades to
+    /// per-call reclamation — the correct trade for a memory-constrained peer —
+    /// instead of misbehaving.
+    #[test]
+    fn instance_larger_than_the_arena_budget_refreshes_every_call_and_keeps_working() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        // 160 pages = 10 MiB of linear memory, against a 1 MiB arena budget: one
+        // instance is TEN times the whole budget.
+        let wat = r#"
+        (module
+          (memory (export "memory") 160)
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            i64.const 0)
+          (func (export "__frnt_set_id") (param i64)))
+        "#;
+        let module = engine.compile(wat.as_bytes()).unwrap();
+        engine.set_arena_budget_for_test(1024 * 1024);
+
+        for i in 0..12 {
+            let handle = engine
+                .create_instance(&module, 1024)
+                .unwrap_or_else(|e| panic!("instance {i} must still be creatable: {e}"));
+            assert_eq!(
+                engine.lifetime_instances, 1,
+                "each call starts from a fresh Store, so it is the Store's first \
+                 instance"
+            );
+            engine.drop_instance(&handle);
+            assert_eq!(
+                engine.lifetime_instances, 0,
+                "an instance larger than the budget must trigger a refresh on \
+                 EVERY call"
+            );
+            assert_eq!(
+                engine.retired_instance_bytes, 0,
+                "the refresh must reset the arena accounting, so residue cannot \
+                 accumulate across calls"
+            );
+        }
+
+        assert!(
+            engine.is_healthy(),
+            "the engine must survive per-call store replacement"
+        );
+    }
+
+    /// The arena budget must be derived from the memory the node may use divided
+    /// by the number of Stores (one per pool worker), not from a constant — and
+    /// must land at its floor for the shape that OOMs today: a 2 GiB `MemoryMax`
+    /// on a many-core box.
+    #[test]
+    fn arena_budget_is_memory_derived_and_pool_divided() {
+        let budget = store_arena_budget_bytes();
+        assert!(
+            (STORE_ARENA_MIN_BYTES..=STORE_ARENA_MAX_BYTES).contains(&budget),
+            "arena budget {budget} must stay within \
+             [{STORE_ARENA_MIN_BYTES}, {STORE_ARENA_MAX_BYTES}]"
+        );
+
+        // Pure sizing math, independent of the test host (see #5268 defect 3 for
+        // why the pool size must divide it: it is CPU-derived and MemoryMax does
+        // not constrain CPU count).
+        let sized = store_arena_budget_for;
+        let two_gib = 2 * 1024 * 1024 * 1024;
+        assert_eq!(
+            sized(two_gib, 16),
+            two_gib / STORE_ARENA_RAM_DIVISOR / 16,
+            "a 2 GiB cap across 16 workers must resolve from the RAM-scaled \
+             share, with neither clamp binding"
+        );
+        assert!(
+            sized(two_gib, 16) * 16 <= two_gib / 4,
+            "node-wide arena slack on a 2 GiB peer must stay a modest fraction \
+             of the limit"
+        );
+        // The floor binds only where memory is genuinely scarce, and even then
+        // the node-wide slack stays bounded rather than becoming a
+        // per-worker constant times the core count.
+        let tiny = 256 * 1024 * 1024;
+        assert_eq!(sized(tiny, 16), STORE_ARENA_MIN_BYTES);
+        assert!(sized(tiny, 16) * 16 <= tiny / 4);
+        // A single-worker 2 GiB peer and a large unconstrained gateway both keep
+        // the generous ceiling, so this only bites the constrained many-core case.
+        assert_eq!(sized(two_gib, 1), STORE_ARENA_MAX_BYTES);
+        assert_eq!(sized(125 * 1024 * 1024 * 1024, 16), STORE_ARENA_MAX_BYTES);
+    }
+
     /// Verify that the Store is refreshed after STORE_REFRESH_THRESHOLD instances,
     /// reclaiming virtual memory from wasmtime's arena allocator.
     #[test]
     fn test_store_refresh_reclaims_virtual_memory() {
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        // Pin the arena byte bound OFF: this test examines the
+        // instance-COUNT threshold, which must not depend on the test host's
+        // RAM or core count (#5268).
+        engine.set_arena_budget_for_test(u64::MAX);
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
         // Create and drop exactly STORE_REFRESH_THRESHOLD instances.
         // The last drop_instance should trigger a store refresh.
         for i in 0..STORE_REFRESH_THRESHOLD {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -2431,7 +4065,7 @@ mod tests {
             "engine should be healthy after refresh"
         );
         let handle = engine
-            .create_instance(&module, 999_999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after refresh");
         engine.drop_instance(&handle);
     }
@@ -2442,6 +4076,10 @@ mod tests {
     fn test_store_not_refreshed_with_live_instances() {
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        // Pin the arena byte bound OFF: this test examines the
+        // instance-COUNT threshold, which must not depend on the test host's
+        // RAM or core count (#5268).
+        engine.set_arena_budget_for_test(u64::MAX);
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
         // First, burn through most of the threshold with create/drop cycles
@@ -2449,7 +4087,7 @@ mod tests {
         let burn = STORE_REFRESH_THRESHOLD - 3;
         for i in 0..burn {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -2459,7 +4097,7 @@ mod tests {
         let mut handles = Vec::new();
         for i in burn..STORE_REFRESH_THRESHOLD {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             handles.push(handle);
         }
@@ -2488,12 +4126,16 @@ mod tests {
     fn test_recover_store_resets_lifetime_instances() {
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        // Pin the arena byte bound OFF: this test examines the
+        // instance-COUNT threshold, which must not depend on the test host's
+        // RAM or core count (#5268).
+        engine.set_arena_budget_for_test(u64::MAX);
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
         // Create some instances to bump the counter
-        for i in 0..10 {
+        for _ in 0..10 {
             let handle = engine
-                .create_instance(&module, i, 1024)
+                .create_instance(&module, 1024)
                 .expect("should succeed");
             engine.drop_instance(&handle);
         }
@@ -2508,7 +4150,7 @@ mod tests {
 
         // Engine should still work after recovery
         let handle = engine
-            .create_instance(&module, 999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after recovery");
         engine.drop_instance(&handle);
     }
@@ -2522,12 +4164,16 @@ mod tests {
             ..Default::default()
         };
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        // Pin the arena byte bound OFF: this test examines the
+        // instance-COUNT threshold, which must not depend on the test host's
+        // RAM or core count (#5268).
+        engine.set_arena_budget_for_test(u64::MAX);
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
         // Create and drop enough instances to trigger refresh
         for i in 0..STORE_REFRESH_THRESHOLD {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -2537,7 +4183,7 @@ mod tests {
         // Verify that instance creation and WASM execution still work after
         // refresh — the replacement store must have fuel set correctly.
         let handle = engine
-            .create_instance(&module, 999_999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after metered refresh");
         engine.drop_instance(&handle);
     }
@@ -2594,6 +4240,10 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        // Pin the arena byte bound OFF: this test examines the instance-COUNT
+        // threshold, which must not depend on the test host's RAM or core count
+        // (#5268).
+        engine.set_arena_budget_for_test(u64::MAX);
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
         let baseline_maps = count_maps();
@@ -2601,7 +4251,7 @@ mod tests {
         // Create and drop instances just below the threshold (no refresh yet).
         for i in 0..STORE_REFRESH_THRESHOLD - 1 {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -2616,7 +4266,7 @@ mod tests {
 
         // One more instance hits the threshold and triggers refresh.
         let handle = engine
-            .create_instance(&module, STORE_REFRESH_THRESHOLD as i64, 1024)
+            .create_instance(&module, 1024)
             .expect("final instance should succeed");
         engine.drop_instance(&handle);
 
@@ -2711,7 +4361,7 @@ mod tests {
         "#;
         let module = engine.compile(wat.as_bytes()).unwrap();
 
-        let result = engine.create_instance(&module, 0, 1024);
+        let result = engine.create_instance(&module, 1024);
         assert!(
             result.is_err(),
             "Module declaring 5000 initial pages (>cap of 4096) must be \
@@ -2792,7 +4442,7 @@ mod tests {
         // taking the baseline so they don't get charged to the per-instance
         // measurement.
         {
-            let h = engine.create_instance(&module, -1, 1024).unwrap();
+            let h = engine.create_instance(&module, 1024).unwrap();
             engine.drop_instance(&h);
         }
         let baseline = read_vm_size_bytes();
@@ -2802,15 +4452,13 @@ mod tests {
         const N_INSTANCES: i64 = 4;
         let mut handles = Vec::with_capacity(N_INSTANCES as usize);
         for i in 0..N_INSTANCES {
-            let h = engine
-                .create_instance(&module, i, 1024)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "instance {i} should succeed (regression: wasmtime memory \
+            let h = engine.create_instance(&module, 1024).unwrap_or_else(|e| {
+                panic!(
+                    "instance {i} should succeed (regression: wasmtime memory \
                      reservation may be too large for the host's overcommit \
                      limit, see #3986): {e}"
-                    )
-                });
+                )
+            });
             handles.push(h);
         }
         let after = read_vm_size_bytes();

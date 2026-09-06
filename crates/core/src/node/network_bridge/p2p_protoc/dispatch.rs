@@ -1,7 +1,8 @@
 //! Event-loop dispatch for [`P2pConnManager`]: priority-select result
 //! routing and the per-message / per-event handlers it fans out to.
 //!
-//! Behavior-preserving extraction from `p2p_protoc.rs`.
+//! Extracted from `p2p_protoc.rs`. The extraction was behavior-preserving;
+//! `install_pending_op_callback` has since gained a live-incumbent guard.
 
 use super::*;
 
@@ -235,30 +236,7 @@ impl P2pConnManager {
     ) -> EventResult {
         match msg {
             Some((callback, msg, target_addr)) => {
-                // The driver task may have been cancelled between
-                // `op_execution_sender.send()` and our processing of the
-                // event — e.g. simulation teardown drops driver futures.
-                // When the response receiver is dropped before we reach
-                // here, the callback sender is closed; inserting it
-                // would leak `pending_op_results` until the 60s sweep,
-                // detectable as imbalance in #3100's regression guard
-                // `test_pending_op_results_bounded`. Skipping the
-                // insert keeps the HashMap bounded; the outbound
-                // request below still dispatches because the receiving
-                // peer's view of the operation is independent of the
-                // local driver's lifecycle.
-                if callback.is_closed() {
-                    tracing::debug!(
-                        tx = %msg.id(),
-                        "handle_op_execution: callback already closed (driver cancelled before insert); skipping"
-                    );
-                } else {
-                    state.pending_op_results.insert(*msg.id(), callback);
-                    crate::config::GlobalTestMetrics::record_pending_op_insert();
-                    crate::config::GlobalTestMetrics::record_pending_op_size(
-                        state.pending_op_results.len() as u64,
-                    );
-                }
+                install_pending_op_callback(state, *msg.id(), callback);
                 // When the driver supplied an explicit target, dispatch the
                 // message to that peer over the network instead of looping it
                 // back as a local InboundMessage. The reply still flows back
@@ -448,5 +426,87 @@ impl P2pConnManager {
         };
         state.pending_from_executor.insert(id);
         EventResult::Continue
+    }
+}
+
+/// Decide whether an `OpExecutionPayload`'s reply callback gets installed
+/// into `pending_op_results[tx]`.
+///
+/// Extracted from `handle_op_execution` so the install decision is unit
+/// testable without a full `P2pConnManager` (same pattern as
+/// `fail_awaiting_connection`).
+///
+/// The driver task may have been cancelled between
+/// `op_execution_sender.send()` and our processing of the
+/// event — e.g. simulation teardown drops driver futures.
+/// When the response receiver is dropped before we reach
+/// here, the callback sender is closed; inserting it
+/// would leak `pending_op_results` until the 60s sweep,
+/// detectable as imbalance in #3100's regression guard
+/// `test_pending_op_results_bounded`. Skipping the
+/// insert keeps the HashMap bounded; the outbound
+/// request still dispatches because the receiving
+/// peer's view of the operation is independent of the
+/// local driver's lifecycle.
+pub(super) fn install_pending_op_callback(
+    state: &mut EventListenerState,
+    tx: Transaction,
+    callback: Sender<WaiterReply>,
+) {
+    // INVARIANT: at most one LIVE waiter exists per tx per node.
+    //
+    // The live-incumbent branch below is only correct while that holds — it
+    // refuses the newcomer, so a second *legitimate* waiter for the same tx
+    // would be dropped rather than served. It holds today because
+    // `RetryDriver` allocates a fresh channel per attempt
+    // (`operations/op_ctx.rs:448`), and because sequential same-tx reuse drops
+    // the previous receiver in the producer task before the next payload is
+    // enqueued, so the incumbent is observed closed and replaced.
+    //
+    // `Transaction::NULL` is the one key that could collide by construction:
+    // it is returned as `msg.id()` for NeighborHosting / InterestSync /
+    // ReadyState / SubscribeHint. Those route via `network_bridge.send()`
+    // rather than `op_execution_sender`, so this is latent rather than live —
+    // but the consequence changed shape with this guard. Before, a NULL-keyed
+    // collision was last-writer-wins; now the first live waiter sticks and
+    // blocks every later one until the 60s sweep.
+    debug_assert!(
+        tx != *Transaction::NULL,
+        "install_pending_op_callback called with Transaction::NULL: every NULL-keyed \
+         op would share one slot, and the live-incumbent guard would block all but the first"
+    );
+    if callback.is_closed() {
+        tracing::debug!(
+            %tx,
+            "handle_op_execution: callback already closed (driver cancelled before insert); skipping"
+        );
+    } else if state
+        .pending_op_results
+        .get(&tx)
+        .is_some_and(|existing| !existing.is_closed())
+    {
+        // A LIVE waiter is already registered for this tx — never displace it.
+        //
+        // The `callback.is_closed()` guard above is NOT sufficient on its own.
+        // Producers such as `send_local_loopback` / `send_fire_and_forget` build a
+        // throwaway channel and drop its receiver, but the receiver is a NAMED binding
+        // that only drops when the producer's poll finishes — while the event loop can
+        // dequeue the payload inside that enqueue->drop window and observe
+        // `is_closed() == false`. Inserting then drops the ORIGINATOR's sender, its
+        // `recv()` yields `None` -> `OpError::NotificationError`, and the client is told
+        // "failed notifying, channel closed" for an operation that actually succeeded
+        // (the #4111 forbidden marker). Widens with event-loop starvation.
+        tracing::debug!(
+            %tx,
+            "handle_op_execution: a live waiter is already registered for this tx; \
+             not displacing it"
+        );
+        crate::config::GlobalTestMetrics::record_pending_op_skip();
+    } else {
+        state.pending_op_results.insert(tx, callback);
+        crate::config::GlobalTestMetrics::record_pending_op_insert();
+        crate::config::GlobalTestMetrics::record_pending_op_size(
+            state.pending_op_results.len() as u64
+        );
     }
 }

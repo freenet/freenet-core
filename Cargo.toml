@@ -7,7 +7,9 @@ members = [
 	"apps/freenet-ping/contracts/ping",
 	"tests/test-contract-integration",
 	"tests/test-contract-update-nochange",
-	"tests/test-contract-mock-aligned"
+	"tests/test-contract-mock-aligned",
+	"tests/test-contract-requires-related",
+	"tests/test-contract-delta-trap"
 ]
 
 [workspace.dependencies]
@@ -28,7 +30,7 @@ pav_regression = "0.7.0"
 renegade-ml = "0.3.3"
 pin-project = "1"
 thiserror = "2"
-ulid = { version = "1.1", features = ["serde"] }
+ulid = { version = "3.0", features = ["serde"] }
 zeroize = { version = "1.8", features = ["derive", "serde"] }
 
 # Async/networking
@@ -63,6 +65,7 @@ moka = { version = "0.12", features = ["sync"] }
 # File I/O
 directories = "6"
 dirs = "6"
+filetime = "0.2"
 flate2 = "1"
 notify = "8"
 tar = "0.4"
@@ -85,13 +88,31 @@ chrono = { version = "0.4", default-features = true }
 
 # Random
 rand = "0.9"
+rand_chacha = "0.9"
+
+# XEdDSA (Signal's construction): signs with the x25519 transport key so the
+# OTel collector can verify node identity against the SAME public key peers
+# and UIs see. Its rand 0.10 dep is exposed as `rand10` for the sign nonce.
+xeddsa = "1.1"
+rand10 = { package = "rand", version = "0.10", default-features = false, features = ["sys_rng"] }
+rand_core10 = { package = "rand_core", version = "0.10" }
 
 # Observability
+async-trait = "0.1"
 opentelemetry = "0.32"
+# Trait/types only (HttpClient for the per-request auth wrapper); its reqwest
+# integration targets reqwest 0.13 and the workspace is on 0.12, so no features.
+opentelemetry-http = "0.32"
 opentelemetry-jaeger = "0.22"
-opentelemetry-otlp = "0.32.0"
+opentelemetry-otlp = { version = "0.32.0", default-features = false }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 tracing = "0.1"
+# Bumping this? Re-read `rolling.rs`'s `impl io::Write for
+# RollingFileAppender` first. The log pruner's GC-exemption argument
+# (crates/core/src/tracing/tracer.rs::prune_log_files) depends on the
+# rollover check running BEFORE the buffer is written — audited at 0.2.5.
+# If that order ever flips, the exemption stops being bounded in bytes
+# and nothing in our test suite will notice.
 tracing-appender = "0.2"
 tracing-core = "0.1"
 tracing-opentelemetry = "0.33.0"
@@ -103,7 +124,7 @@ console-subscriber = "0.5.0"
 # stack-switching feature (undefined symbol wasmtime_continuation_start).
 # Disable default features and re-enable all defaults except stack-switching.
 # TODO: Re-enable default features once upstream fixes the linker regression.
-wasmtime = { version = "46", default-features = false, features = [
+wasmtime = { version = "47", default-features = false, features = [
     "anyhow", "async", "backtrace", "cache", "cranelift",
     "compile-time-builtins", "component-model", "component-model-async",
     "coredump", "debug", "debug-builtins", "demangle", "addr2line",
@@ -111,21 +132,34 @@ wasmtime = { version = "46", default-features = false, features = [
     "profiling", "runtime", "std", "threads", "wat",
 ] }
 # Lightweight WASM section parser used to reject debug-compiled contracts at
-# PUT time (see crates/core/src/client_events.rs::contains_debug_sections).
-# Pinned to the same minor wasmtime 45 already resolves transitively so cargo
-# reuses one copy rather than locking a second wasmparser build.
-wasmparser = "0.253"
+# PUT time (crates/core/src/client_events.rs::contains_debug_sections) and to
+# detect the deprecated host-clock import
+# (crates/core/src/conformance/host_clock.rs).
+#
+# This was pinned to match the copy wasmtime resolved transitively, so that
+# cargo reused one build. That is NO LONGER TRUE and the intent has not been
+# re-established: the lock now carries 0.244.0, 0.252.0 and 0.257.1, so we
+# parse with a different wasmparser from the one wasmtime validates with. It
+# is immaterial to both consumers today — each reads only section framing,
+# which is stable across these versions, and each runs immediately before a
+# real wasmtime validation that has the final say — but do not restate the
+# single-copy claim without re-checking `cargo tree -d -p wasmparser`.
+wasmparser = "0.257"
+# Test-only WAT assembler, so a fixture module can state its imports in text
+# rather than as hand-encoded LEB128. Already in the lock file: wasmtime's
+# "wat" feature above pulls the same crate, so this adds no new build.
+wat = "1"
 
 # Testing/simulation
 arbitrary = { version = "1", features = ["derive"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
-freenet-test-network = "0.1.22"
+freenet-test-network = "0.1.24"
 httptest = "0.16"
 proptest = "1"
 regex = "1"
 rstest = "0.26"
-serial_test = "3"
-statrs = "0.18"
+serial_test = "4"
+statrs = "0.19"
 test-log = "0.2"
 testresult = "0.4"
 turmoil = "0.7"
@@ -137,22 +171,41 @@ semver = { version = "1", features = ["serde"] }
 # Proc macros
 proc-macro2 = "1.0"
 quote = "1.0"
-syn = { version = "2.0", features = ["full", "extra-traits", "parsing"] }
+syn = { version = "3.0", features = ["full", "extra-traits", "parsing"] }
 
 # Platform-specific
 libc = "0.2"
 tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 winapi = "0.3"
-tao = { version = "0.35", default-features = false, features = ["rwh_06"] }
-wry = { version = "0.55", default-features = false, features = ["os-webview"] }
+tao = { version = "0.37", default-features = false, features = ["rwh_06"] }
+wry = { version = "0.56", default-features = false, features = ["os-webview"] }
 winreg = "0.56"
 tray-icon = "0.24"
 muda = "0.19"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
-freenet-stdlib = "0.8.2"
+# 0.8.4 adds `DelegateRequest::RegisterDelegateWithPredecessors` (stdlib PR #86),
+# consumed by the #4117 delegate secret copy-forward.
+#
+# 0.8.5 fixes the FlatBuffers client-request boundary (stdlib #85/#87/#88).
+# Behaviour changes for FBS clients, none for native ones:
+#   - `ContractKey.code` must be exactly 32 bytes; a wrong length is now
+#     rejected at the boundary instead of being hashed into a key that
+#     matched nothing and failing later as "Contract not in store".
+#   - Paths that used to panic on malformed input (instance-id length,
+#     delegate key/cipher/nonce length, four union discriminants) now
+#     return errors, so a bad request no longer kills the client's
+#     connection task.
+#   - OUTBOUND: `HostResponse` now writes `related_to` as raw 32 bytes
+#     where 0.8.4 wrote base58 ASCII. This fixes browser clients (the TS
+#     SDK reads the field as raw bytes) but is a wire change in the
+#     node->client direction.
+# Exposure is FBS-only: `client_events/websocket.rs` falls back to
+# Flatbuffers when no encoding is specified, and every first-party client
+# (fdev, riverctl, River UI, the test harness) explicitly pins native.
+freenet-stdlib = "0.8.5"
 
 # Crypto (secrets-at-rest KEK + DEK derivation, see crates/core/src/config/kek.rs).
 # `sha2` is already declared above (workspace-wide); only `hkdf` and `keyring`

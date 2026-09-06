@@ -820,10 +820,20 @@ pub(super) fn stop_service(system: bool) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 pub(super) fn restart_service(system: bool) -> Result<()> {
-    let system_mode = use_system_mode(system);
-    systemctl_with_hint(system_mode, &["restart", "freenet"], "restart service")?;
+    restart_service_quiet(system)?;
     println!("Freenet service restarted.");
     println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
+    Ok(())
+}
+
+/// `restart_service` without the user-facing success banner, for callers that
+/// know the node will not actually come up — `service disable` restarts the
+/// unit only so it re-reads the disable marker and parks idle, so announcing
+/// a dashboard URL that nothing is listening on would be a lie.
+#[cfg(target_os = "linux")]
+pub(super) fn restart_service_quiet(system: bool) -> Result<()> {
+    let system_mode = use_system_mode(system);
+    systemctl_with_hint(system_mode, &["restart", "freenet"], "restart service")?;
     Ok(())
 }
 

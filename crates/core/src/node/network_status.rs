@@ -48,14 +48,16 @@ pub type RingStatsProvider = Arc<dyn Fn() -> RingStatsSnapshot + Send + Sync + '
 /// `Ring::contract_ban_list` directly — no mirrored counter to rot.
 pub type BanListProvider = Arc<dyn Fn() -> BanListSnapshot + Send + Sync + 'static>;
 
-/// Provider for the demand-driven hosting snapshot (piece A, #4642). Same
-/// pattern as the other providers: registered at node startup, replaceable
-/// for multi-node test harnesses, read by `get_snapshot` on every dashboard
+/// Provider for the demand-driven hosting snapshot (#4642). Same pattern as
+/// the other providers: registered at node startup, replaceable for
+/// multi-node test harnesses, read by `get_snapshot` on every dashboard
 /// request. In production the closure captures `Arc<Ring>` and calls
 /// `Ring::dashboard_hosting_snapshot()`, which reads the canonical hosting
-/// cache (Greedy-Dual keep_score + capability-relative RAM budget) — the
-/// mechanism that actually governs retention now, replacing the dormant MAD
-/// governance detector (#4296).
+/// cache.
+///
+/// Retention is governed by the subscriber-primary sweep (`victim_order`).
+/// The demoted telemetry-only estimator (`keep_score` / `predicted_demand`)
+/// is deliberately not carried on these rows.
 pub type HostingProvider = Arc<dyn Fn() -> HostingSnapshot + Send + Sync + 'static>;
 
 /// Snapshot of ring-level statistics exposed to the dashboard.
@@ -77,9 +79,29 @@ pub struct RingStatsSnapshot {
     /// may be getting dropped — operators should watch this.
     pub updates_rate_limited: u64,
     /// Total relayed UPDATEs dropped because the limiter's tracking map
-    /// was at capacity (`MAX_TRACKED_PAIRS`). A non-zero value suggests
-    /// identity churn / admission pressure, distinct from per-pair rate.
+    /// was at capacity (`MAX_TRACKED_PAIRS`) and eviction could not free
+    /// a slot. Since #4981 this means the map is full *and* contended;
+    /// ordinary saturation shows up in `updates_capacity_evicted`.
     pub updates_capacity_dropped: u64,
+    /// Total tracked `(sender, contract)` pairs evicted to admit new
+    /// ones at capacity. This is the saturation signal: a busy node
+    /// relaying for more pairs than `MAX_TRACKED_PAIRS` shows this
+    /// climbing while `updates_capacity_dropped` stays flat, and no
+    /// legitimate UPDATE is dropped for it.
+    pub updates_capacity_evicted: u64,
+    /// Total relayed UPDATEs dropped because the sending peer was over
+    /// its budget for introducing brand-new `(sender, contract)` pairs.
+    /// This is the fresh-contract-id churn signal: unlike the counters
+    /// above it never counts a peer's traffic for contracts already
+    /// being tracked, so a non-zero value really does mean one peer is
+    /// presenting unfamiliar contract ids faster than the budget allows.
+    pub updates_sender_budget_dropped: u64,
+    /// Total relayed UPDATEs admitted for a brand-new pair WITHOUT a
+    /// budget check, because the per-sender budget's own map was full.
+    /// Should be zero. A non-zero value means the budget map is
+    /// undersized for this node's peer churn, so those senders are not
+    /// actually being bounded — the safety valve is firing.
+    pub updates_sender_budget_unmetered: u64,
     /// Nearest-neighbor ring lattice completeness (the "is greedy routing's base
     /// lattice present" signal). `lattice_has_successor` / `_predecessor` are
     /// whether this peer currently HOLDS (a side is FILLED with) its
@@ -109,6 +131,88 @@ pub struct RingStatsSnapshot {
     /// lattice and the improvement rate falls toward zero.
     pub lattice_probes_issued: u64,
     pub lattice_probe_improvements: u64,
+}
+
+/// The scalars this module owns directly, for the OTel metrics callbacks.
+///
+/// Deliberately NOT [`get_snapshot`]: that builds per-peer and per-contract
+/// vectors and formats failure HTML, and the SDK has no batch-callback API in
+/// 0.32 — every observable instrument gets its own callback, so the exporter
+/// would pay that cost once per instrument per collection cycle.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OtelStatusScalars {
+    pub connection_attempts: u32,
+    pub op_stats: OperationStats,
+}
+
+/// Read this module's own scalars, or `None` before [`init`] has run.
+///
+/// One accessor per SOURCE, not one snapshot over all of them. An observable
+/// instrument that skips a collection cycle exports nothing, which reads as
+/// "not known yet", while a zero is a real datapoint —
+/// `freenet.ring.connections = 0` before the ring provider registers is
+/// indistinguishable from a node that has lost every connection. But that
+/// decision has to be per-source: an earlier version `?`-chained all of them
+/// into one snapshot, so an unregistered ring provider silently zeroed the
+/// queue metrics too, which do not depend on it at all.
+pub(crate) fn otel_status_scalars() -> Option<OtelStatusScalars> {
+    let status = NETWORK_STATUS.get()?;
+    // Poison tolerance matches the writers in this module, which already keep
+    // going field-by-field. Propagating it instead would make every metric
+    // sourced here vanish permanently, silently, for the process's life.
+    let status = status.read().unwrap_or_else(|poisoned| {
+        POISON_REPORTED.call_once(|| {
+            tracing::warn!(
+                "network status lock is poisoned; metrics continue against \
+                 the last consistent state"
+            )
+        });
+        poisoned.into_inner()
+    });
+    Some(OtelStatusScalars {
+        connection_attempts: status.connection_attempts,
+        op_stats: status.op_stats.clone(),
+    })
+}
+
+/// Logged at most once — a poisoned lock stays poisoned, so this would
+/// otherwise fire on every collection cycle forever.
+static POISON_REPORTED: std::sync::Once = std::sync::Once::new();
+
+/// Live ring stats, or `None` before the provider is registered.
+pub(crate) fn otel_ring_stats() -> Option<RingStatsSnapshot> {
+    RING_STATS_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())
+}
+
+/// Hosted contracts partitioned by why they are held, or `None` before the
+/// provider is registered.
+///
+/// Its own accessor, read by exactly the two gauges that need it: this is an
+/// O(hosted) walk under the hosting-cache read lock, and folding it into a
+/// shared snapshot ran it once per observable callback — eighteen times a
+/// cycle to serve two of them.
+pub(crate) fn otel_hosting_reasons() -> Option<crate::ring::HostingReasonStats> {
+    HOSTING_REASON_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())
+}
+
+/// Source of the per-reason hosted-contract breakdown
+/// (`Ring::hosted_by_reason`). OTel-only; see [`otel_hosting_reasons`].
+pub type HostingReasonProvider =
+    Arc<dyn Fn() -> crate::ring::HostingReasonStats + Send + Sync + 'static>;
+
+static HOSTING_REASON_PROVIDER: parking_lot::RwLock<Option<HostingReasonProvider>> =
+    parking_lot::RwLock::new(None);
+
+/// Register the hosting-reason data source. Replaces any previously-registered
+/// provider.
+pub fn set_hosting_reason_provider(provider: HostingReasonProvider) {
+    *HOSTING_REASON_PROVIDER.write() = Some(provider);
 }
 
 static GOVERNANCE_PROVIDER: parking_lot::RwLock<Option<GovernanceProvider>> =
@@ -218,6 +322,8 @@ pub struct NetworkStatus {
     pub nat_stats: NatStats,
     /// Terminal advertisement-consult counters (hosting redesign piece C).
     pub terminal_consult_stats: TerminalConsultStats,
+    /// Eviction-retraction emission counters (#5059).
+    pub hosting_retraction_stats: HostingRetractionStats,
     /// Streamed-transfer abort counters (large-contract failure isolation).
     pub stream_abort_stats: StreamAbortStats,
     /// Relayed-operation counters (routing/hosting attribution).
@@ -352,12 +458,13 @@ pub enum ReconcileShadowSite {
 /// contracts the controller would keep alive but production merely deferred this
 /// tick — the intended per-tick reading, not a bug.
 ///
-/// `retract_diffs` CAVEAT: it measures collapse/renewal of a contract that was
-/// EVER announced, not one with a currently-live advertisement — `is_advertised`
-/// (`NeighborHostingManager::is_hosted_locally`) is effectively MONOTONIC in
-/// production today, because its only clearer (`on_contract_unhosted`) is
-/// dead/test-only until the flip wires the `Retract` action. So a nonzero
-/// `retract_diffs` reflects the missing retraction driver, as intended.
+/// `retract_diffs` CAVEAT: `is_advertised`
+/// (`NeighborHostingManager::is_hosted_locally`) IS cleared in production, by the
+/// eviction funnel (`operations::retract_advertisement_for_evicted_contract`, and
+/// the reclamation-side `on_contract_unhosted` behind it). What no on-`main`
+/// driver does is retract on COLLAPSE/RENEWAL teardown — the sites these stats
+/// shadow-compare — so a nonzero `retract_diffs` reflects that missing
+/// site-local retraction, as intended, not a live-advertisement leak.
 #[derive(Default, Clone, Copy)]
 pub struct ReconcileShadowStats {
     /// Total shadow comparisons performed at this site (the denominator — one
@@ -395,6 +502,25 @@ pub struct TerminalConsultStats {
     pub resolved_found: u64,
     /// A consult ran but the request still ended NotFound.
     pub still_not_found: u64,
+}
+
+/// Eviction-retraction emission counters (#5059).
+///
+/// The retraction that stops co-hosts fanning updates at an evicted contract is
+/// emitted best-effort on the cap-2048 node-event channel, and the drop is logged
+/// at `debug` — which is compiled out in release builds. A dropped retraction is
+/// self-healing (the ~5-min full-set re-request replays `my_contracts`), but a
+/// node under exactly the broadcast storm #5059 describes is when that channel is
+/// most likely to be full, so without these the field cannot tell a slow heal from
+/// a failed fix. Monotonic lifetime totals; the collector differences them.
+#[derive(Default)]
+pub struct HostingRetractionStats {
+    /// Eviction retractions handed to the node-event channel.
+    pub emitted: u64,
+    /// Eviction retractions dropped because that channel refused them. Healed by
+    /// the next interest-heartbeat full-set re-request; a sustained nonzero rate
+    /// means evicted contracts stay advertised for up to one heartbeat interval.
+    pub dropped: u64,
 }
 
 /// Streamed-transfer (> 64 KB `streaming_threshold`) abort counters, aggregated
@@ -494,7 +620,7 @@ pub struct ConnectedPeer {
 }
 
 /// Counters for each operation type: (success, failure).
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct OperationStats {
     pub gets: (u32, u32),
     pub puts: (u32, u32),
@@ -644,6 +770,7 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         op_stats: OperationStats::default(),
         nat_stats: NatStats::default(),
         terminal_consult_stats: TerminalConsultStats::default(),
+        hosting_retraction_stats: HostingRetractionStats::default(),
         stream_abort_stats: StreamAbortStats::default(),
         relayed_op_stats: RelayedOpStats::default(),
         connect_emit_stats: ConnectEmitStats::default(),
@@ -750,14 +877,36 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
 /// the matching outcome. Forgetting a call site silently rots the
 /// counter (issue #4009 / #4010 prior incidents). Current writers:
 ///
-/// - `node.rs::report_result` for legacy state-machine ops (PUT/GET/
-///   UPDATE/SUBSCRIBE that still flow through `OpManager.ops.*`).
-/// - `operations/get/op_ctx_task.rs` `Done` arm (client-initiated GET).
-/// - `operations/put/op_ctx_task.rs` `Done` arm (client-initiated PUT).
+/// - `operations/get/op_ctx_task.rs` `Done` arm (client-initiated GET;
+///   success flag from `host_result.is_ok()`), its `Exhausted` arm
+///   (records a failure — exhaustion publishes `NotFound`, having
+///   delivered no state), AND `deliver_outcome`'s `InfrastructureError`
+///   arm (records a failure — the `Unexpected`/`InfraError` terminal
+///   outcomes publish a synthesized client `Err`). GET cannot fold the
+///   success/exhaustion arms into an outcome-shape classifier the way
+///   PUT/UPDATE do: a dead-end publishes `Ok(HostResponse::…NotFound)`,
+///   so `matches!(Publish(Ok(_)))` would score it as a success (#4828).
+/// - `operations/put/op_ctx_task.rs::deliver_outcome` (client-initiated
+///   PUT; covers all `DriverOutcome` variants).
 /// - `operations/subscribe/op_ctx_task.rs::deliver_outcome` (client-
 ///   initiated SUBSCRIBE; covers all `DriverOutcome` variants).
 /// - `operations/update/op_ctx_task.rs::deliver_outcome` (client-
 ///   initiated UPDATE; covers all `DriverOutcome` variants).
+///
+/// `node.rs::report_result` is NOT a writer: the legacy `OpEnum` /
+/// mediator path is gone (see `crates/core/CLAUDE.md`), every op runs a
+/// task-per-tx driver, and its `Ok` branch has nothing left to report.
+/// It was listed here until #4828 — a stale entry on the very doc this
+/// section points auditors at.
+///
+/// Prefer the `deliver_outcome` funnel shape where the driver's outcome
+/// type can express failure: it is the one that did NOT rot. Recording
+/// in individual driver arms is how #4828 regrew #4009/#4010 on PUT —
+/// the success arms carried a hardcoded `true` and every failure arm was
+/// simply forgotten, making `op_stats.puts.1` unreachable. Each op's
+/// call site is pinned by a source-scrape test in its `op_ctx_task.rs`
+/// test module; those pins are the CI gate against the next migration
+/// silently dropping the call.
 ///
 /// Internal-only operations are intentionally NOT recorded; counting
 /// them would inflate the user-facing counter with background traffic
@@ -798,7 +947,30 @@ pub fn record_op_result(op_type: OpType, success: bool) {
     }
 }
 
-/// Record a broadcast update received via subscription streaming.
+/// Record a broadcast update that was received and actually changed local
+/// state.
+///
+/// # Required call sites
+///
+/// Manually-mirrored counter. BOTH broadcast-apply drivers in
+/// `operations/update/op_ctx_task.rs` must call this, each after its
+/// `if !changed` early-return (a no-op re-broadcast is not a received
+/// update):
+///
+/// - `drive_relay_broadcast_to` (`BroadcastTo` — every payload BELOW
+///   `streaming_threshold`, i.e. the ordinary small-delta case).
+/// - `drive_relay_broadcast_to_streaming` (`BroadcastToStreaming` —
+///   payloads at/above the threshold, default 64 KB).
+///
+/// Until #4828 only the streaming twin recorded, so ordinary small deltas
+/// — the normal River case — were invisible and an actively-receiving
+/// subscriber showed 0 (`server/home_page/cards.rs` renders
+/// `updates_received` as the ONLY UPDATE number for subscriber nodes).
+/// Pinned by `both_broadcast_drivers_record_update_received`.
+///
+/// Distinct from [`record_relayed_update`], which counts relayed UPDATE
+/// *requests* toward the key (`relayed_op_stats`) and deliberately does
+/// NOT count broadcast fan-out.
 pub fn record_update_received() {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
@@ -882,6 +1054,36 @@ pub fn terminal_consult_counts() -> Option<(u64, u64, u64, u64)> {
     let s = status.read().ok()?;
     let c = &s.terminal_consult_stats;
     Some((c.attempts, c.hits, c.resolved_found, c.still_not_found))
+}
+
+/// Record one eviction retraction accepted by the node-event channel (#5059).
+pub fn record_hosting_retraction_emitted() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.hosting_retraction_stats.emitted =
+                s.hosting_retraction_stats.emitted.saturating_add(1);
+        }
+    }
+}
+
+/// Record one eviction retraction the node-event channel refused (#5059). The
+/// interest-heartbeat full-set re-request heals it within one interval; a
+/// sustained rate here means evicted contracts stay advertised that long.
+pub fn record_hosting_retraction_dropped() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.hosting_retraction_stats.dropped =
+                s.hosting_retraction_stats.dropped.saturating_add(1);
+        }
+    }
+}
+
+/// `(emitted, dropped)` eviction-retraction totals for the snapshot cadence.
+pub fn hosting_retraction_counts() -> Option<(u64, u64)> {
+    let status = NETWORK_STATUS.get()?;
+    let s = status.read().ok()?;
+    let c = &s.hosting_retraction_stats;
+    Some((c.emitted, c.dropped))
 }
 
 /// Bump the fragment-progress histogram bucket for one receiver abort.
@@ -1291,6 +1493,11 @@ pub struct NetworkStatusSnapshot {
     pub health: HealthLevel,
     /// Live ring-level statistics: connection count, hosted contracts.
     pub ring_stats: RingStatsSnapshot,
+    /// Contract-handler fair-queue occupancy (#4917). Read from the queue's own
+    /// gauge at snapshot time rather than mirrored into `NetworkStatus`, so it
+    /// cannot drift from the canonical value the way a hand-maintained counter
+    /// does (`.claude/rules/bug-prevention-patterns.md`, #4009 / #4010).
+    pub fair_queue: crate::contract::FairQueueStats,
     /// Period transport metrics (current values, not reset on read).
     pub transport_snapshot: TransportSnapshot,
     /// Per-contract governance state (Phase 4). The dashboard's
@@ -1310,9 +1517,9 @@ pub struct NetworkStatusSnapshot {
     /// provider closure — no mirrored counter to rot. Empty when nothing
     /// is banned (the common case).
     pub ban_list: BanListSnapshot,
-    /// Demand-driven hosting state (piece A, #4642): the capability-relative
-    /// RAM budget + per-contract Greedy-Dual keep_score that actually governs
-    /// retention. Drives the "Demand-driven eviction" card. Read from the
+    /// Demand-driven hosting state (#4642): the capability-relative budgets
+    /// plus the per-contract rows the subscriber-primary eviction sweep
+    /// orders. Drives the "Demand-driven eviction" card. Read from the
     /// canonical hosting cache via the provider closure — no mirrored counter.
     pub hosting: HostingSnapshot,
 }
@@ -1522,14 +1729,26 @@ pub struct PeerSnapshot {
 pub struct ContractSnapshot {
     pub key_short: String,
     pub key_full: String,
-    /// `ContractKey.id().to_string()` — the 32-byte content hash
-    /// portion of the key. Distinct from `key_full` which carries
-    /// the full ContractKey encoding (instance id + parameters /
-    /// code-hash bookkeeping). Surfaced so the dashboard can
-    /// cross-reference this contract against
-    /// `GovernanceSnapshot.state_by_id`, which is keyed by
-    /// `ContractInstanceId::to_string()`. Codex review of
-    /// dashboard-polish PR caught the id/key string mismatch.
+    /// `ContractKey.id().to_string()` — the 32-byte instance id.
+    ///
+    /// Surfaced so the dashboard can cross-reference this contract against
+    /// `GovernanceSnapshot`, which is keyed by
+    /// `ContractInstanceId::to_string()`.
+    ///
+    /// NOT distinct from `key_full`, despite what this comment claimed until
+    /// 2026-08-21. `impl Display for ContractKey` delegates to
+    /// `self.instance` and `ContractKey::id()` returns `&self.instance`, so
+    /// `key.to_string()` and `key.id().to_string()` produce the SAME string
+    /// and the code-hash half reaches neither. The old wording ("Distinct
+    /// from `key_full` which carries the full ContractKey encoding") sent
+    /// three separate readers of the contract detail page down the same wrong
+    /// path — twice as a reported blocking bug, once as a fix for a case that
+    /// cannot occur.
+    ///
+    /// The field still earns its place: it states the intent explicitly, and
+    /// it keeps working if the Display impl ever changes. That equality is
+    /// pinned by `contract_key_display_equals_its_instance_id` in
+    /// `server/home_page.rs`, which fails if it stops holding.
     pub instance_id: String,
     pub subscribed_secs: u64,
     pub last_updated_secs: Option<u64>,
@@ -1542,12 +1761,12 @@ pub struct ContractSnapshot {
     pub in_use: bool,
 }
 
-/// Snapshot of the demand-driven hosting cache (piece A, #4642) for the
-/// local-peer dashboard. This is the mechanism that actually governs
-/// retention today — a capability-relative RAM budget plus a Greedy-Dual
-/// `keep_score` per contract (`ring/hosting/{cache,demand}.rs`) — and it
-/// replaced the dormant MAD `GovernanceManager` (#4296). Default (all zeros,
-/// no contracts) when the node hosts nothing yet or the provider is unset.
+/// Snapshot of the demand-driven hosting cache (#4642) for the local-peer
+/// dashboard: the capability-relative budgets plus the per-contract rows.
+/// Retention is governed by the subscriber-primary sweep
+/// (`ring/hosting/cache.rs::victim_order`) — fewest subscribers first, local
+/// above downstream, `recency_seq` breaking ties. Default (all zeros, no
+/// contracts) when the node hosts nothing yet or the provider is unset.
 #[derive(Default, Clone)]
 pub struct HostingSnapshot {
     /// Configured RAM-scaled byte budget for hosted contract state.
@@ -1586,6 +1805,32 @@ pub struct HostingSnapshot {
     /// real value — so the panel can distinguish "not yet computed" from a
     /// genuine (if enormous) budget.
     pub disk_budget_bytes: Option<u64>,
+    /// Configured resident-overhead budget (bytes, #5325): the RAM-scaled
+    /// ceiling on `contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`, a
+    /// pressure axis independent of `budget_bytes`/`used_bytes` (which cover
+    /// contract STATE bytes only, not the per-contract resident bookkeeping
+    /// overhead that scales with count). See
+    /// `.claude/rules/hosting-invariants.md` invariant 3.
+    pub resident_overhead_budget_bytes: u64,
+    /// Current estimated resident-overhead bytes (#5325): `contract_count *
+    /// ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`. Compare against
+    /// `resident_overhead_budget_bytes` the same way `used_bytes` is compared
+    /// against `budget_bytes`.
+    pub estimated_resident_overhead_bytes: u64,
+    /// The resident-overhead budget expressed as the contract COUNT it really
+    /// bounds (`resident_overhead_budget_bytes / 1 MiB-per-contract`).
+    ///
+    /// The dashboard renders this rather than the byte pair, because the byte
+    /// pair is not a memory measurement: the "used" side is
+    /// `contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`, so printing
+    /// it in MB reads to an operator as measured RAM when it is really a
+    /// contract-count ceiling. Derived in `HostingCache::contract_slot_budget`
+    /// so the per-contract constant keeps exactly one reader.
+    pub contract_slot_budget: u64,
+    /// Monotonic count of evictions where resident-overhead pressure was
+    /// active at decision time (#5325); may overlap with
+    /// `budget_evictions_total`.
+    pub resident_overhead_evictions_total: u64,
 }
 
 /// One hosted contract's demand-driven eviction row for the dashboard.
@@ -1595,14 +1840,35 @@ pub struct HostedContractEntry {
     pub key_full: String,
     /// Truncated key for display.
     pub key_short: String,
-    /// Greedy-Dual priority (`eviction_floor + predicted_demand`). Lowest evicts first.
-    pub keep_score: f64,
-    /// Stored per-contract read-demand estimate (reads/second).
-    pub predicted_demand: f64,
+    //
+    // `keep_score` / `predicted_demand` deliberately absent. They are the
+    // demoted telemetry-only Greedy-Dual estimator, which eviction does not
+    // read (see the "Demoted (telemetry-only) demand machinery" section of
+    // `ring/hosting/cache.rs`). The dashboard was their only consumer, and it
+    // presented them as the eviction ranking — describing a mechanism retired
+    // by the subscriber-primary rework, while the rows were really ordered by
+    // `recency_seq` (#4830). They remain on the cache-side
+    // `HostingContractScore`; do NOT re-add them here without a consumer that
+    // labels them as telemetry.
+    //
     /// Per-contract memory cost (state bytes).
     pub size_bytes: u64,
     /// Read accesses (GET/SUBSCRIBE) observed over this entry's residency.
     pub read_count: u32,
+    /// The entry's eviction recency clock — a per-run monotonic sequence.
+    ///
+    /// Reset by a real GET or PUT, and ALSO by `record_abandonment` when the
+    /// contract loses its last subscriber (a deliberate grace period, so a
+    /// just-unsubscribed contract is not evicted on a stale read accrued while
+    /// it sat in the subscription tier). It is therefore NOT purely a
+    /// last-access time, and must not be labelled as one.
+    ///
+    /// This is the field the cache actually sorts these rows by, and the only
+    /// real eviction-ranking input available on the dashboard — the subscriber
+    /// counts that outrank it are computed transiently during the sweep and
+    /// are not carried in the snapshot. Rendered so the table is ordered by a
+    /// column the reader can see.
+    pub recency_seq: u64,
     /// Whether the over-budget sweep would actually consider this contract for
     /// eviction: NOT pinned by demand (`contract_in_use`). There is no longer a
     /// `min_ttl` age gate (dropped 2026-07-08). The renderer badges "next to
@@ -1828,6 +2094,9 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
             .as_ref()
             .map(|provider| provider())
             .unwrap_or_default(),
+        // Read straight from the queue's gauge — no provider registration and
+        // no mirrored counter to keep in sync (#4917).
+        fair_queue: crate::contract::fair_queue_stats(),
     })
 }
 
