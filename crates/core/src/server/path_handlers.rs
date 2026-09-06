@@ -125,12 +125,6 @@ static CONTRACT_REFRESH_LOCKS: LazyLock<
     DashMap<ContractInstanceId, Arc<tokio::sync::Mutex<RefreshState>>>,
 > = LazyLock::new(DashMap::new);
 
-/// What a contract's refresh lock guards, beyond the decision itself.
-///
-/// Kept inside the mutex rather than in a map of its own because the mutex is
-/// already the thing that serializes refreshers for one contract, and a second
-/// map keyed by a contract id from the URL would be another unbounded per-key
-/// collection to bound (`.claude/rules/code-style.md`).
 /// Which terminal-absence answer a suppressed cold fetch should replay.
 ///
 /// `WebSocketApiError` carries no `Clone`/`Copy`, and its two terminal-absence
@@ -158,6 +152,12 @@ impl TerminalAbsenceKind {
     }
 }
 
+/// What a contract's refresh lock guards, beyond the decision itself.
+///
+/// Kept inside the mutex rather than in a map of its own because the mutex is
+/// already the thing that serializes refreshers for one contract, and a second
+/// map keyed by a contract id from the URL would be another unbounded per-key
+/// collection to bound (`.claude/rules/code-style.md`).
 #[derive(Default, Debug)]
 struct RefreshState {
     /// When a COLD fetch last failed, for which contract, and with which
