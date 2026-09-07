@@ -477,7 +477,22 @@ pub(super) struct DelegateCallEnv {
     /// mutability explicit rather than hiding it behind `#[allow(clippy::mut_from_ref)]`.
     secret_store: std::cell::UnsafeCell<*mut SecretsStore>,
     /// The delegate key, needed to scope secret access.
-    pub delegate_key: DelegateKey,
+    ///
+    /// PRIVATE, AND MUST STAY THAT WAY, and must never be reassigned after
+    /// [`DelegateCallEnv::new`]. The storage read binds this identity TWICE:
+    /// once in the file path (`secrets_store::store::scope_dir`) and once in
+    /// the DEK the blob is authenticated under (HKDF salted with
+    /// `delegate.encode()`). A [`secret_read_memo`](Self::secret_read_memo)
+    /// HIT binds it ZERO times — it is a 32-byte hash comparison and a return.
+    ///
+    /// So before the memo existed, reassigning this mid-call self-corrected:
+    /// you got the wrong path, or a Poly1305 tag that would not verify. The
+    /// AEAD was the backstop. With the memo, the same edit silently returns the
+    /// PREVIOUS identity's plaintext — in hosted mode, cross-tenant
+    /// disclosure. Nothing does this today; the point is that nothing can start
+    /// to without tripping
+    /// `the_call_env_identity_fields_are_never_reassigned`.
+    delegate_key: DelegateKey,
     /// Optional per-user secret namespace for this call, derived ONCE at the
     /// WS connection boundary from the connection's user token (hosted mode,
     /// P2 of #4381). When `Some`, the secret host functions
@@ -490,6 +505,12 @@ pub(super) struct DelegateCallEnv {
     /// the runtime from the connection context and is NEVER settable from
     /// inside the WASM sandbox, a delegate message, or any request body — that
     /// is the unforgeability invariant of the per-user namespace.
+    ///
+    /// Like [`delegate_key`](Self::delegate_key), this must never be reassigned
+    /// after construction: [`secret_read_memo`](Self::secret_read_memo) is keyed
+    /// on the secret hash ALONE, which is only sound because the scope this
+    /// field selects is fixed for the whole call. Pinned by
+    /// `the_call_env_identity_fields_are_never_reassigned`.
     user_context: Option<UserSecretContext>,
     /// Read-only pointer to the ContractStore for index lookups
     /// (ContractInstanceId → CodeHash). Valid only during synchronous process().
@@ -547,16 +568,54 @@ pub(super) struct DelegateCallEnv {
     /// [`DelegateCallEnv::invalidate_secret_memo`]), so a stale plaintext is
     /// never served.
     ///
-    /// One deliberate semantic change beyond the saved work: `has_secret` now
-    /// RETAINS the plaintext it decrypted for the rest of the call, where
-    /// before it dropped (and zeroized) it on return. That is a change in how
-    /// long secret material is resident, not only in how often it is
-    /// decrypted, so it is called out rather than folded into "fewer
-    /// decrypts". It is bounded by the same `process()` call, holds at most one
-    /// secret, and is the same material `get_secret` would hold a moment later
-    /// in the overwhelmingly common `has_secret`-then-`get_secret` pair — but a
-    /// delegate that probes existence and never reads keeps a plaintext in
-    /// memory that it previously did not.
+    /// # Residency: `has_secret` now retains a plaintext, deliberately
+    ///
+    /// `has_secret` answers one bit but decrypts in full (it always did). It
+    /// now KEEPS that plaintext for the rest of the call, where before it was
+    /// dropped and zeroized on return. This is a change in how long secret
+    /// material is resident, not only in how often it is decrypted, and it is a
+    /// stated tradeoff rather than an oversight:
+    ///
+    /// * **The delegate gains nothing.** It could call `get_secret` instead and
+    ///   get the real bytes into its own linear memory — larger, longer-lived,
+    ///   and not wiped by us. No privilege is added.
+    /// * **The exposure that moves is the HOST's.** A one-bit existence query
+    ///   now makes a full plaintext resident in node memory, which matters to a
+    ///   core dump, a swapped page, or a memory-disclosure bug elsewhere in the
+    ///   process.
+    /// * **It cannot be avoided for free.** stdlib's `get_secret` is
+    ///   `get_secret_len` -> `vec![0u8; len]` -> `get_secret` and never calls
+    ///   `has_secret`, so the three-decrypt case only arises when an author
+    ///   hand-writes `if ctx.has_secret(k) { ctx.get_secret(k) }` — and there
+    ///   `has_secret` IS the miss that populates the memo. Not populating on a
+    ///   miss would destroy exactly that 3 -> 1 saving, leaving 2 -> 1.
+    ///
+    /// The window is one `process()` call. That is NOMINALLY bounded by
+    /// `max_execution_seconds` (5 s), but not hard-bounded: the epoch trap
+    /// cannot fire inside a host call, so host time is not preemptible — see
+    /// freenet-core#5594, which documents exactly that.
+    ///
+    /// # What is and is not wiped
+    ///
+    /// The PLAINTEXT half is wiped: `Zeroizing<Vec<u8>>`'s drop covers the
+    /// initialized elements and `spare_capacity_mut()`, so even a truncated
+    /// AEAD tag tail in the spare capacity is cleared, and the value is MOVED
+    /// into the memo (no clone, no re-wrap), so exactly one copy exists at any
+    /// time.
+    ///
+    /// The `[u8; 32]` hash half is NOT wiped — it has no `Drop` and stays in
+    /// freed memory. That is correct rather than an omission: it is the
+    /// secret's identifier, already on disk in the clear as the bs58 filename
+    /// and enumerable through `list_secrets`. Do not describe the tuple as
+    /// "zeroized"; the plaintext is.
+    ///
+    /// The wipe-on-drop guarantee assumes panics UNWIND. `DelegateEnvGuard`
+    /// (and this field's own drop) run on the unwind path; with
+    /// `panic = "abort"` — commented out in the workspace `Cargo.toml`, but one
+    /// uncomment away — a panic would leave the plaintext unwiped in a dying
+    /// process. Noted because it is true today and would become silently false
+    /// after an unrelated release-profile change.
+    ///
     secret_read_memo: std::cell::RefCell<SecretReadMemo>,
 }
 
@@ -693,20 +752,28 @@ impl DelegateCallEnv {
     /// plaintext that already passed the Poly1305 tag check.
     ///
     /// The memo is keyed on the secret's 32-byte hash, which is what names the
-    /// on-disk file, so two different keys can never share an entry. The scope
-    /// needs no key: it is fixed for the lifetime of the `DelegateCallEnv`.
+    /// on-disk file, so two different keys can never share an entry. Neither
+    /// the delegate identity nor the scope is part of the key, and that is only
+    /// sound because BOTH are fixed for the lifetime of the
+    /// `DelegateCallEnv` — see the invariant on
+    /// [`delegate_key`](Self::delegate_key). A hit therefore performs no
+    /// identity check at all, where the storage read it replaces performs two
+    /// (path and DEK). That is the property this memo removes, and the
+    /// immutability of those two fields is what puts it back.
     fn with_secret<R>(
         &self,
         secret_id: &SecretsId,
         f: impl FnOnce(&[u8]) -> R,
     ) -> Result<R, SecretStoreError> {
         {
-            // The read borrow is held across `f`. `f` is always a local
-            // closure that copies bytes out and never re-enters the env, so
-            // this cannot conflict today. If a future caller passed an `f` that
-            // touched the memo, `RefCell` would panic — and a panic here
-            // unwinds out of a wasmtime host call, which is a worse failure
-            // than the borrow it is protecting. Keep `f` non-re-entrant.
+            // The read borrow is held across `f` on THIS path but not on the
+            // miss path below, where `f` runs with no borrow outstanding. That
+            // asymmetry is the hazard: an `f` that touched the memo would
+            // succeed on the first (miss) call and panic on the second (hit),
+            // which is nastier to diagnose than a uniform panic. `f` is always
+            // a local closure that copies bytes out and never re-enters, and a
+            // borrow panic here would unwind out of a wasmtime host call —
+            // worse than the borrow it protects. Keep `f` non-re-entrant.
             let memo = self.secret_read_memo.borrow();
             if let Some((hash, plaintext)) = memo.as_ref()
                 && hash == secret_id.hash()
@@ -2884,6 +2951,30 @@ mod secret_read_memo_tests {
     /// call would leave a `set_secret` followed by a `get_secret` inside ONE
     /// `process()` serving the pre-write plaintext, silently, with every other
     /// test still green.
+    /// The `delegate_secrets` module body, so discovery cannot stray into
+    /// another module's host functions.
+    fn delegate_secrets_module(src: &str) -> &str {
+        let start = src
+            .find("pub(super) mod delegate_secrets {")
+            .expect("delegate_secrets module not found");
+        let after = &src[start..];
+        let end = after
+            .find("\n}")
+            .expect("delegate_secrets module has no closing brace");
+        &after[..end]
+    }
+
+    /// Names of the `pub(crate) fn` host functions declared in `module`.
+    fn host_fn_names(module: &str) -> Vec<&str> {
+        module
+            .match_indices("    pub(crate) fn ")
+            .filter_map(|(i, m)| {
+                let rest = &module[i + m.len()..];
+                rest.find('(').map(|p| &rest[..p])
+            })
+            .collect()
+    }
+
     /// The source region of `name`: from its signature to its own closing
     /// brace, comments removed.
     ///
@@ -2919,18 +3010,77 @@ mod secret_read_memo_tests {
             .join("\n")
     }
 
+    /// Every host function in `delegate_secrets` that can change what a read
+    /// returns must drop the memo first.
+    ///
+    /// Derived from the code, NOT from a hard-coded name list: the set is
+    /// "functions whose body calls `secret_store_mut()`". A name list is green
+    /// by default for any NEW mutating host function, which is the same
+    /// silent-omission shape the pin exists to prevent. This way a new mutator
+    /// is failing by default until it invalidates.
     #[test]
     fn mutating_secret_host_fns_invalidate_the_memo() {
         let src = include_str!("native_api.rs");
-        for name in ["set_secret", "remove_secret"] {
-            let body = scraped_body(src, name);
+        let module = delegate_secrets_module(src);
+        let mutators: Vec<&str> = host_fn_names(module)
+            .into_iter()
+            .filter(|name| scraped_body(src, name).contains("secret_store_mut()"))
+            .collect();
+        assert!(
+            mutators.len() >= 2,
+            "expected at least set_secret and remove_secret to mutate the secret \
+             store; found {mutators:?} — if this is now empty the discovery is \
+             broken and every assertion below is vacuous"
+        );
+        for name in mutators {
             assert!(
-                body.contains("invalidate_secret_memo()"),
-                "{name} must call invalidate_secret_memo(): without it a write \
-                 followed by a read in the same process() call serves stale \
-                 plaintext from the memo"
+                scraped_body(src, name).contains("invalidate_secret_memo()"),
+                "{name} calls secret_store_mut(), so it can change what a read \
+                 returns, so it must call invalidate_secret_memo() first: \
+                 without it a write followed by a read in the same process() \
+                 call serves stale plaintext from the memo"
             );
         }
+    }
+
+    /// M1: the memo's key omits the delegate identity and the scope, which is
+    /// sound ONLY because both are fixed after construction.
+    ///
+    /// The storage read this memo replaces binds the delegate identity twice —
+    /// in the file path and in the DEK the blob is authenticated under. A memo
+    /// hit binds it zero times. So reassigning `delegate_key` mid-call, which
+    /// before this memo self-corrected via a failed AEAD tag, would now
+    /// silently return the previous identity's plaintext.
+    ///
+    /// The field is private, which stops any other module. This stops
+    /// `native_api` itself — `context_write` already takes a
+    /// `&mut DelegateCallEnv` out of `DELEGATE_ENV`, so the mutation path
+    /// exists in this file today and only convention keeps it off these two
+    /// fields.
+    #[test]
+    fn the_call_env_identity_fields_are_never_reassigned() {
+        let src = include_str!("native_api.rs");
+        for field in ["delegate_key", "user_context"] {
+            let needle = format!(".{field} =");
+            assert!(
+                !src.contains(&needle),
+                "`{needle}` appears in native_api.rs. These two fields fix the \
+                 delegate identity and the secret scope for the whole call, and \
+                 secret_read_memo is keyed on the secret hash ALONE on that \
+                 basis. Reassigning either leaves a memo entry belonging to the \
+                 previous identity — cross-tenant disclosure in hosted mode. If \
+                 you genuinely need to rebuild the identity, build a NEW \
+                 DelegateCallEnv, which starts with an empty memo"
+            );
+        }
+        // Non-vacuous: the same search must FIND the assignment form it is
+        // looking for, on a field where it is legitimate.
+        assert!(
+            src.contains("env.context = "),
+            "the `.field =` search form must be able to match at all; \
+             `context_write` assigns `env.context`, so if this fails the search \
+             is broken and the assertions above prove nothing"
+        );
     }
 
     /// The pin above is only as good as its region-bounding, so bound the

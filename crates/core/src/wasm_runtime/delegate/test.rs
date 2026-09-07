@@ -85,10 +85,17 @@ mod delegate2_messages {
 /// `Runtime` inline still inherit the production 5.0 s. They are not known to
 /// flake on it, and widening this to every delegate fixture is a larger change
 /// than the one flake in hand justified, so it was left deliberately rather
-/// than overlooked. Point them here if the same timeout shows up in them. It is generous but still bounded, so a delegate test that
-/// genuinely wedges fails rather than hanging forever. The tests that DO assert
-/// timeout behaviour live in `wasm_runtime::tests::execution_handling` and set
-/// their own budgets, so nothing here weakens that coverage.
+/// than overlooked. Point them here if the same timeout shows up in them.
+///
+/// 60 s is generous but still bounded, so a delegate test that genuinely wedges
+/// fails rather than hanging forever.
+///
+/// Nothing here weakens timeout coverage. The real epoch-trap coverage — a
+/// guest actually being interrupted — lives in `engine::wasmtime_engine`'s own
+/// tests, which drive WASM directly and set their own budgets.
+/// `wasm_runtime::tests::execution_handling` also asserts timeout behaviour,
+/// but it simulates a polling loop and never runs WASM, so it is untouched by
+/// this constant for a different reason than I first wrote here.
 ///
 /// This does not make the wall-clock accounting correct — a real delegate
 /// storing a large secret on a busy node can still be charged for the host's
