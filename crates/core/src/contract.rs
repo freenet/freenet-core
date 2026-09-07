@@ -2045,11 +2045,7 @@ where
             // ParkGuard is untouched and still owes a resume; carrying the epoch
             // is what lets that late resume be recognised as stale and dropped
             // rather than absorbed by whatever park exists by then (#5544 H1).
-            tracing::warn!(
-                delegate = %delegate_key,
-                epoch,
-                "Delegate park exceeded PARK_TTL — force-resuming"
-            );
+            let swept = delegate_key.clone();
             let _ = handle_delegate_resume(
                 &mut contract_handler,
                 &mut park_ctx,
@@ -2067,6 +2063,24 @@ where
                 },
             )
             .await;
+            // Logged AFTER the resume, not before, so nothing sits between
+            // `should_force_resume` and `take_matching` (the first statement of
+            // `handle_delegate_resume`) — that gap is the residual window this
+            // fix narrows, and the cheapest way to keep it narrow is to put
+            // nothing in it. On the service path this line is microseconds
+            // (`tracing_appender::non_blocking`, which drops on overflow), so
+            // this is keeping the window free of anything whose cost is not
+            // obviously bounded rather than a fix for a measured cost.
+            //
+            // The message text is UNCHANGED on purpose: it is the log signature
+            // operators grep for, paired with the later "Resume for a park that
+            // no longer exists" from the stale guard. Reword it and that pairing
+            // stops being findable.
+            tracing::warn!(
+                delegate = %swept,
+                epoch,
+                "Delegate park exceeded PARK_TTL — force-resuming"
+            );
         }
 
         // Drain completed off-loop EXPORTS (#4531 / #4381 P5): return/replace the
@@ -2157,10 +2171,32 @@ where
         // Buffered delegate resumes are work already in hand: never block in
         // the select while any remain, or they would wait on UNRELATED traffic
         // to wake the loop — and each one is holding a client responder, and
-        // possibly a human's answer, until it runs (#5554). The top of the next
-        // iteration drains at least one (the budget starts at
-        // MAX_RESUME_DRAIN_BATCH and every run costs at least 1), so this
-        // cannot spin: the buffer strictly shrinks.
+        // possibly a human's answer, until it runs (#5554).
+        //
+        // WHY THIS DOES NOT SPIN. Not because the buffer shrinks — it does not
+        // necessarily, and an earlier version of this comment claimed it did.
+        // `expired` and `should_force_resume` PUSH into it mid-iteration (they
+        // re-read the channel, which is the whole point of taking the
+        // receiver), so an iteration can end holding more than it started with.
+        // What makes it terminate is that reaching here at all means the batch
+        // above already ran at least one resume — a full delegate re-entry, not
+        // a poll — and the only thing that grows the buffer is a resume an
+        // off-loop task actually delivered, one per guard, each firing once.
+        // So every pass does bounded real work against a supply that only
+        // refills as fast as new parks are admitted. The loop is making
+        // progress, not waiting on itself, and the buffer does not need to
+        // shrink for that to hold.
+        //
+        // SECOND, LOAD-BEARING JOB (#5554): this `continue` is also what keeps
+        // a DECLINED sweep from spinning the select. The sweep can now decline
+        // a past-due park, so `next_sweep_deadline()` can stay in the past
+        // across an iteration — and `sleep_until` on a past deadline returns
+        // immediately, which would be a hot wake loop. It cannot reach the
+        // select: declining requires the park's resume to be in
+        // `delegate_resumes`, nothing between here and there pops from it, so
+        // the buffer is non-empty and this fires before the deadline is even
+        // computed. Keep the two together; moving this below `park_deadline`
+        // would reopen it.
         if !delegate_resumes.is_empty() {
             continue;
         }
@@ -7557,7 +7593,18 @@ mod hol_4391_tests {
     /// have caught this, because the property was never asserted. A guard being
     /// falsifiable is not evidence that it guards the thing you care about.
     ///
-    /// FALSIFY by deleting the `continue` guard, or by commenting it out.
+    /// The ORDERING assertion below is not a relapse into the mistake above,
+    /// and the difference is worth being explicit about. The claim that failed
+    /// was "the drain and the sweep are not separated by a suspension", which
+    /// is about duration and which source order cannot express. This one is
+    /// "the guard appears before the deadline is computed", which is a
+    /// statement about position and nothing else — no await, no timing, no
+    /// runtime behaviour in between. Position is the right tool for exactly
+    /// this shape and the wrong tool for the other; the lesson was never "never
+    /// assert order".
+    ///
+    /// FALSIFY by deleting the `continue` guard, commenting it out, or moving
+    /// it below `park_ctx.next_sweep_deadline()`.
     #[test]
     fn the_loop_never_idles_while_holding_delegate_resumes() {
         let squashed: String = contract_handling_body()
@@ -7565,11 +7612,26 @@ mod hol_4391_tests {
             .filter(|c| !c.is_whitespace())
             .collect();
 
+        let guard = "if!delegate_resumes.is_empty(){continue;}";
+        let guard_at = squashed.find(guard).unwrap_or_else(|| {
+            panic!(
+                "the loop must not block in the select! while buffered resumes \
+                 remain — each is holding a client responder, and possibly a \
+                 human's answer, until it runs (#5554)"
+            )
+        });
+        let deadline_at = squashed
+            .find("letpark_deadline=park_ctx.next_sweep_deadline();")
+            .expect("the loop must still compute the park sweep deadline");
         assert!(
-            squashed.contains("if!delegate_resumes.is_empty(){continue;}"),
-            "the loop must not block in the select! while buffered resumes \
-             remain — each is holding a client responder, and possibly a \
-             human's answer, until it runs (#5554)"
+            guard_at < deadline_at,
+            "the buffered-resume guard must run BEFORE the sweep deadline is \
+             armed. Since the sweep can now DECLINE a past-due park, \
+             `next_sweep_deadline()` can stay in the past across an iteration, \
+             and `sleep_until` on a past deadline returns immediately — a hot \
+             wake loop. Declining implies the park's resume is in \
+             `delegate_resumes`, so this guard is what keeps that unreachable \
+             (#5554)"
         );
     }
 

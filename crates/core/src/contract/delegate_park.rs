@@ -1298,6 +1298,14 @@ impl DelegateParkCtx {
     /// writes synchronously. What changed is the size of the hole: from a
     /// window bounded by a 60-second human wait to one bounded by two adjacent
     /// synchronous statements on the same task.
+    ///
+    /// **Absence of an await is not absence of a window.** "No `.await`
+    /// between" is exactly the sentence a later reader turns into
+    /// "impossible", and it is not: it bounds how long THIS task spends
+    /// between looking and removing, and says nothing about the other side.
+    /// `ParkGuard::deliver` runs on other worker threads and may `send()` at
+    /// any instant, including this one. The claim here is about duration, not
+    /// impossibility.
     pub(super) fn should_force_resume(
         &self,
         key: &DelegateKey,
@@ -1325,6 +1333,28 @@ fn absorb_delivered(
 }
 
 /// Whether `already_delivered` holds the resume for exactly this park.
+///
+/// **The epoch half is what does the work; the key half is redundant today.**
+/// `next_epoch` is ONE counter per registry ([`DelegateParkCtx::park`]
+/// increments it on every admission, not per delegate), so no two live parks
+/// can share an epoch and matching on epoch alone would already be exact. A
+/// mutation that drops the key comparison therefore survives every test, and
+/// that is a true fact about the code rather than a coverage gap — worth
+/// stating, because the pair reads as jointly load-bearing and a future reader
+/// would otherwise go looking for the test that pins it.
+///
+/// It is kept for two reasons. It is the assertion that makes the intent local
+/// — "this resume belongs to THIS park" — rather than something a reader has to
+/// go and confirm by finding the counter. And it is what stops the redundancy
+/// becoming a bug if `next_epoch` is ever made per-delegate, which is an
+/// entirely reasonable future change that would silently make epoch-only
+/// matching collide across delegates.
+///
+/// The direction that IS pinned, by
+/// `a_stale_buffered_resume_does_not_shield_the_current_park`, is the opposite
+/// one: matching on KEY alone is wrong, because a resume from an earlier park
+/// of the same delegate would shield the current one and disarm the backstop
+/// for exactly the delegate that has already needed it.
 fn resume_in_hand(
     already_delivered: &VecDeque<DelegateResume>,
     key: &DelegateKey,
