@@ -397,8 +397,25 @@ pub(super) const PARK_TTL: Duration = Duration::from_secs(90);
 /// still sum past the TTL. If that happened the loop's backstop sweep would
 /// force-resume the park while the task was still working, and the task's own
 /// result would then arrive for a park that no longer exists and be discarded.
-/// Bounding the task below the TTL means the guard always wins that race, so
-/// the TTL stays what it is meant to be — unreachable in practice.
+/// Bounding the task below the TTL gives the guard a 15 s MARGIN in that race.
+/// It is a margin, not a guarantee, and the difference matters: `parked_at` is
+/// stamped in [`DelegateParkCtx::park`] BEFORE the task is spawned, while the
+/// task's own `timeout(PARK_WORK_BUDGET, ..)` starts at its first poll. The
+/// two clocks are separated by however long the runtime takes to schedule the
+/// task, so what is checked below is arithmetic on nominal durations, not an
+/// ordering the scheduler is obliged to honour.
+///
+/// An earlier version of this said "the guard always wins that race". That is
+/// the same shape of over-strong claim whose sibling ("the `ParkGuard` always
+/// resumes the park first") is what hid #5554, so it is stated as a margin
+/// here. The residual it leaves is real but narrow: `run_user_input_prompts`
+/// pushes each answer into the shared sink as it arrives, while the guard does
+/// not `send()` until the whole body finishes, so between those two instants a
+/// human's answer exists and the sweep — which reads the CHANNEL, never the
+/// sink — cannot see it. If the task is starved past the margin the sweep
+/// force-resumes and that answer is discarded. Closing it properly is the same
+/// close [`DelegateParkCtx::should_force_resume`] already names: let the
+/// registry own a slot the guard writes synchronously.
 pub(super) const PARK_WORK_BUDGET: Duration = Duration::from_secs(75);
 
 /// The budget/TTL ordering above is load-bearing, so it is CHECKED rather than
@@ -730,8 +747,18 @@ impl ParkGuard {
             fetches,
         } = p;
 
-        let mut inbound = std::mem::take(&mut *answers.lock().unwrap());
-        let upserts = std::mem::take(&mut *fetches.lock().unwrap());
+        // POISON-TOLERANT, and that is the whole point of this guard. It runs
+        // from `Drop`, which is reached when the off-loop task PANICS — and the
+        // task panics while holding one of these very locks whenever it dies
+        // inside `run_user_input_prompts`' `sink.lock().unwrap().push(..)` or
+        // the fetch closure's. `lock().unwrap()` on a poisoned mutex panics,
+        // and a panic in `Drop` during unwinding ABORTS THE PROCESS. Recovering
+        // the inner value costs nothing and is correct here: the data behind
+        // the lock is a `Vec` that is only ever pushed to, so a writer that
+        // died mid-push left it consistent, and delivering whatever it holds is
+        // exactly what this path exists to do.
+        let mut inbound = std::mem::take(&mut *answers.lock().unwrap_or_else(|e| e.into_inner()));
+        let upserts = std::mem::take(&mut *fetches.lock().unwrap_or_else(|e| e.into_inner()));
 
         // TERMINAL RESULTS ARE PRODUCED HERE, not in the task body, so that
         // EVERY exit produces them — including a panic or a cancellation, which
@@ -902,10 +929,6 @@ impl DelegateParkCtx {
         self.parked.contains_key(key)
     }
 
-    /// The live epoch for `key`, for tests that need to end a park they did not
-    /// capture the epoch from. Deliberately test-only: production code always
-    /// has the epoch from `ParkAdmission::Admitted` or the resume itself, and a
-    /// helper that looked one up by key would defeat the identity check.
     /// Snapshot of what has been turned away, by cause.
     ///
     /// The running totals also ride on each refusal's own `warn!`/`info!`, so
@@ -916,6 +939,10 @@ impl DelegateParkCtx {
         self.refused
     }
 
+    /// The live epoch for `key`, for tests that need to end a park they did not
+    /// capture the epoch from. Deliberately test-only: production code always
+    /// has the epoch from `ParkAdmission::Admitted` or the resume itself, and a
+    /// helper that looked one up by key would defeat the identity check.
     #[cfg(test)]
     pub(super) fn epoch_of(&self, key: &DelegateKey) -> Option<u64> {
         self.parked.get(key).map(|e| e.epoch)
@@ -1132,8 +1159,8 @@ impl DelegateParkCtx {
         }
     }
 
-    /// End a park, returning its continuation and everything queued behind it.
-    /// End the park identified by `(key, epoch)`.
+    /// End the park identified by `(key, epoch)`, returning its continuation
+    /// and everything queued behind it.
     ///
     /// Returns `None` when the epoch does not match — a STALE resume, from an
     /// off-loop task whose park was already ended by the TTL backstop and whose
