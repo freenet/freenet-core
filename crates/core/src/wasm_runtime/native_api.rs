@@ -23,6 +23,11 @@ use crate::contract::storages::Storage;
 pub(super) static MEM_ADDR: LazyLock<DashMap<InstanceId, InstanceInfo>> =
     LazyLock::new(DashMap::default);
 
+/// One memoised secret read: the secret's 32-byte hash (the value that names
+/// its on-disk file) paired with the plaintext that hash decrypted to. See
+/// [`DelegateCallEnv::secret_read_memo`].
+type SecretReadMemo = Option<([u8; 32], zeroize::Zeroizing<Vec<u8>>)>;
+
 /// Per-instance delegate call environment.
 ///
 /// The runtime populates this before calling the delegate's `process` function.
@@ -541,7 +546,7 @@ pub(super) struct DelegateCallEnv {
     /// Every host function that can CHANGE what a read returns clears this (see
     /// [`DelegateCallEnv::invalidate_secret_memo`]), so a stale plaintext is
     /// never served.
-    secret_read_memo: std::cell::RefCell<Option<([u8; 32], zeroize::Zeroizing<Vec<u8>>)>>,
+    secret_read_memo: std::cell::RefCell<SecretReadMemo>,
 }
 
 // SAFETY: DelegateCallEnv is only inserted into DELEGATE_ENV immediately before
