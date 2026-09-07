@@ -125,7 +125,7 @@ const QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
 /// The asymmetry matters more than it looks because the coalescing marker is
 /// PER CONTRACT: a delegate writing across N contracts queues N distinct
 /// drains, so the worst case is N times this bound of dead loop, not one.
-const V2_BROADCAST_DRAIN_READ_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const V2_BROADCAST_DRAIN_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Count of V2 delegate broadcasts dropped because the drain could not read
 /// local state.

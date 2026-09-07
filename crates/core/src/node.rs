@@ -85,6 +85,12 @@ pub use network_bridge::{EventLoopExitReason, NetworkStats, reset_channel_id_cou
 use crate::topology::rate::Rate;
 use crate::transport::{TransportKeypair, TransportPublicKey};
 pub(crate) use op_state_manager::OpManager;
+// Re-exported so the V2 propagation tests can assert on the drain read's
+// outcome and its bound from outside `node`. Both were untestable from
+// `contract::executor::pool_tests` while these modules were private, which is
+// part of why the drain path had no behavioural coverage at all.
+pub(crate) use network_bridge::p2p_protoc::V2_BROADCAST_DRAIN_READ_TIMEOUT;
+pub(crate) use op_state_manager::DrainStateRead;
 
 mod network_bridge;
 

@@ -383,3 +383,86 @@ async fn v2_delegate_unchanged_write_meters_but_does_not_queue() {
          rewrite does not need, and the whole reason the flag is threaded through"
     );
 }
+
+/// #4549: the drain read must be BOUNDED, and the bound must be its own, not
+/// the contract handler's `CH_EV_RESPONSE_TIME_OUT` (300 s).
+///
+/// This is the test whose absence let a 5x widening of that bound ship. The
+/// mutation lens proved the point rather than argued it: replacing the passed
+/// `timeout` with `Duration::from_secs(300)` inside
+/// `read_state_for_broadcast_drain` SURVIVED the entire 5,440-test suite, as
+/// did replacing the constant with 1 ms. The suite was green for 1 ms, 2 s,
+/// 10 s and 300 s alike, so the rustdoc's central claim — "it is bounded" —
+/// was prose that nothing executed.
+///
+/// Why it matters more than a slow test: this read is awaited INLINE on the
+/// network event loop, so overrunning it stops the node processing UDP and
+/// connection events entirely. And no slow-iteration warning covers it —
+/// `SLOW_EVENT_THRESHOLD` is measured around `process_select_result`, while
+/// this arm runs after that elapsed time is taken. An unbounded await here is
+/// the #4549 wedge that took a gateway network-dead.
+///
+/// The harness never services the contract-handler channel, which is exactly
+/// the condition the bound exists for: a handler that cannot answer.
+///
+/// The ceiling asserted here is ABSOLUTE, not derived from the constant. A
+/// test that scaled with the value it guards would pass for any value — the
+/// self-referential shape that let `MAX_V2_DRAIN_RETRIES` 3 -> 100 survive
+/// elsewhere in this diff.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_drain_read_is_bounded_and_does_not_inherit_the_handler_timeout() {
+    use crate::node::DrainStateRead;
+
+    let (op_manager, _rx, _guards) = build_op_manager("v2-drain-bound").await;
+    let key = test_key(41);
+
+    let started = std::time::Instant::now();
+    let outcome = op_manager
+        .read_state_for_broadcast_drain(&key, std::time::Duration::from_secs(2))
+        .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(outcome, DrainStateRead::Unavailable),
+        "a handler that never answers must classify as Unavailable — the arm \
+         that retries — and NOT as NotHeld, which is a correct and final no-op. \
+         Conflating them silently discards a committed write. Got {outcome:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "the drain read must honour its own bound rather than inheriting the \
+         handler's 300 s CH_EV_RESPONSE_TIME_OUT. It ran for {elapsed:?}, which \
+         is the #4549 wedge: that time is spent inline on the network event \
+         loop, processing no packets and emitting no slow-iteration warning."
+    );
+}
+
+/// The drain bound must leave room for a handler that is merely BUSY.
+///
+/// The paired lower bound to the test above, and the two are only meaningful
+/// together. An upper-bound assertion alone is satisfied by a 1 ms timeout —
+/// which the mutation lens confirmed also survives the suite — and a 1 ms bound
+/// would classify every real read as `Unavailable`, so every V2 write would
+/// take the retry path and then be reported dropped. That is the opposite
+/// failure and just as silent.
+///
+/// Asserted against the CONSTANT the production arm actually passes, because
+/// the property under test is a property of that value.
+#[test]
+fn the_drain_bound_leaves_room_for_a_busy_handler() {
+    use crate::node::V2_BROADCAST_DRAIN_READ_TIMEOUT as BOUND;
+
+    assert!(
+        BOUND >= std::time::Duration::from_millis(500),
+        "a bound this tight classifies a merely-busy handler as Unavailable, so \
+         every V2 write takes the retry path and is then reported as a dropped \
+         broadcast. Got {BOUND:?}"
+    );
+    assert!(
+        BOUND <= std::time::Duration::from_secs(5),
+        "this read is awaited INLINE on the network event loop and no \
+         slow-iteration warning covers it, so the bound is a cap on how long \
+         the node stops processing packets. The marker coalesces PER CONTRACT, \
+         so a delegate writing N contracts costs N times this. Got {BOUND:?}"
+    );
+}
