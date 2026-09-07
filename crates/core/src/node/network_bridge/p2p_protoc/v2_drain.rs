@@ -189,6 +189,44 @@ pub(super) async fn run_v2_drain_retry(
     }
 }
 
+/// Spawn a V2 drain retry for `key` after `delay`.
+///
+/// A free function rather than an inline body in
+/// `<P2pConnManager as V2DrainCtx>::schedule_retry`, so that the WIRING — the
+/// `OpManager` clone, the shutdown token taken from the ring, and the spawn
+/// itself — is reachable from a test. Emptying `schedule_retry`'s body was the
+/// one mutation the recording-double tests could not see, because they replace
+/// the very impl that holds it.
+pub(super) fn spawn_v2_drain_retry(op_manager: &Arc<OpManager>, key: ContractKey, delay: Duration) {
+    let op_mgr = op_manager.clone();
+    let shutdown = op_manager.ring.shutdown_token();
+    tokio::spawn(run_v2_drain_retry(op_mgr, key, delay, shutdown));
+}
+
+/// The PRODUCTION side effects.
+///
+/// # What tests can and cannot reach here
+///
+/// The nine behavioural tests drive `RecordingCtx`, which REPLACES this impl —
+/// so they say nothing about it. That is the seam's cost, and it is the same
+/// shape as the mutation that started this work: emptying `schedule_retry` to
+/// `{}` stops every `Unavailable` drain retrying while every test stays green.
+///
+/// Two mitigations, and the honest limit:
+///
+/// * Each method is now a ONE-LINE delegation to something that is itself
+///   tested — `spawn_v2_drain_retry` behaviourally, `handle_broadcast_state_change`
+///   by its own suite. There is no logic left in here to get wrong.
+/// * `production_drain_ctx_delegates_rather_than_reimplementing` pins those
+///   three delegations as REAL CODE through the comment-stripping scanner, so
+///   an emptied body or a commented-out call fails.
+///
+/// LIMIT, stated rather than implied: that pin is a source scrape, and this
+/// file's own history is why that is worth distrusting. Genuinely executing
+/// this impl needs a constructed `P2pConnManager` — 25 fields including a
+/// transport, a bridge and an event register — and, worse, `fan_out` would
+/// still need a populated ring before a broadcast attempt were observable. That
+/// fixture is a larger piece of work than this change and is NOT done here.
 impl V2DrainCtx for P2pConnManager {
     fn v2_drain_retries_mut(&mut self) -> &mut HashMap<ContractKey, u8> {
         &mut self.v2_drain_retries
@@ -205,9 +243,7 @@ impl V2DrainCtx for P2pConnManager {
     }
 
     fn schedule_retry(&mut self, op_manager: &Arc<OpManager>, key: ContractKey, delay: Duration) {
-        let op_mgr = op_manager.clone();
-        let shutdown = op_manager.ring.shutdown_token();
-        tokio::spawn(run_v2_drain_retry(op_mgr, key, delay, shutdown));
+        spawn_v2_drain_retry(op_manager, key, delay);
     }
 }
 
@@ -369,6 +405,101 @@ mod tests {
              outcome leaks a map entry; more means a still-retrying path drops its own \
              counter, making the retry unbounded."
         );
+    }
+
+    /// The production `schedule_retry` wiring, driven for real.
+    ///
+    /// KILLS the seam review's Medium at one remove: `schedule_retry`'s body is
+    /// now a single call to this, and this is exercised end-to-end — the
+    /// `OpManager` clone, the shutdown token pulled from the ring, the spawn,
+    /// and the re-queue the spawned task performs.
+    ///
+    /// The recording double cannot reach any of that, because it REPLACES the
+    /// impl that holds it. This is the closest a test gets without constructing
+    /// a whole `P2pConnManager`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_v2_drain_retry_requeues_after_the_delay() {
+        let (op_manager, mut rx, _probe, _guards) =
+            harness("v2drain-spawnwire", StubReply::NoState).await;
+        let key = test_key(37);
+
+        spawn_v2_drain_retry(&op_manager, key, Duration::ZERO);
+
+        // Let the spawned task run. `current_thread` means it cannot progress
+        // until we yield.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut queued = Vec::new();
+        while let Ok(event) = rx.notifications_receiver.try_recv() {
+            if let either::Either::Right(NodeEvent::V2DelegateStateChanged { key }) = event {
+                queued.push(key);
+            }
+        }
+        assert_eq!(
+            queued,
+            vec![key],
+            "spawning a drain retry must actually re-queue the drain. If this is empty the \
+             spawn wiring is broken -- the clone, the shutdown token, or the spawn itself \
+             -- and every Unavailable drain silently stops retrying while the \
+             RecordingCtx tests stay green"
+        );
+    }
+
+    /// The production `V2DrainCtx` impl must DELEGATE, not reimplement.
+    ///
+    /// The nine behavioural tests drive `RecordingCtx`, which replaces this
+    /// impl, so none of them can see it. The seam review found exactly that:
+    /// empty `schedule_retry`'s body to `{}` and every `Unavailable` drain
+    /// stops retrying with the whole suite green.
+    ///
+    /// So each method is reduced to one delegation, and this asserts those
+    /// delegations exist AS REAL CODE — through the comment-stripping scanner,
+    /// because a `//`-only filter is what let four earlier pins in this
+    /// workstream pass against commented-out calls.
+    ///
+    /// This is a source scrape and is therefore the weaker half. It is here
+    /// because the alternative -- constructing a `P2pConnManager` and a
+    /// populated ring so `fan_out` is observable -- is a bigger piece of work
+    /// than this change. See the impl's own rustdoc for that limit.
+    #[test]
+    fn production_drain_ctx_delegates_rather_than_reimplementing() {
+        const SOURCE: &str = include_str!("v2_drain.rs");
+        let start = SOURCE
+            .find("impl V2DrainCtx for P2pConnManager {")
+            .expect("the production V2DrainCtx impl is gone — re-anchor this pin");
+        let rest = &SOURCE[start..];
+        let end = rest.find("\n#[cfg(test)]").expect(
+            "the test module no longer follows the impl — this pin bounds its scan \
+                     on it, and unbounded it would read its own assertion text and pass \
+                     vacuously. Re-anchor it.",
+        );
+        let body = strip_comments(&rest[..end]);
+
+        for (needle, why) in [
+            (
+                "&mut self.v2_drain_retries",
+                "the retry map must be the manager's own field; a fresh map per call makes \
+                 every drain look like a first attempt and the retry never bounds",
+            ),
+            (
+                "self.handle_broadcast_state_change(op_manager, key, new_state, false, false)",
+                "fan_out must hand the read state to the real fan-out with the same five \
+                 arguments the pre-extraction arm used; this is the leg whose absence is \
+                 #5479",
+            ),
+            (
+                "spawn_v2_drain_retry(op_manager, key, delay)",
+                "schedule_retry must actually spawn the retry. An empty body here stops \
+                 every Unavailable drain retrying, and no RecordingCtx test can see it \
+                 because the double replaces this impl",
+            ),
+        ] {
+            assert!(
+                body.contains(needle),
+                "the production V2DrainCtx impl must contain `{needle}` as real code \
+                 (not commented out, not in a string): {why}"
+            );
+        }
     }
 
     /// The marker clear must precede the state read, in source order too.
