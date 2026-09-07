@@ -79,8 +79,13 @@ mod delegate2_messages {
 /// the code under test. Measured on a 16-core box: 0 failures in 28 runs below
 /// load average 50, and failures on BOTH `main` and a feature branch above it.
 ///
-/// So the fixtures set the budget explicitly instead of inheriting the
-/// production one. It is generous but still bounded, so a delegate test that
+/// So `setup_runtime` sets the budget explicitly instead of inheriting the
+/// production one. NOT a completed sweep: `setup_v2_runtime_with_contract`,
+/// `setup_runtime_with_params`, `bare_runtime` and the tests that build a
+/// `Runtime` inline still inherit the production 5.0 s. They are not known to
+/// flake on it, and widening this to every delegate fixture is a larger change
+/// than the one flake in hand justified, so it was left deliberately rather
+/// than overlooked. Point them here if the same timeout shows up in them. It is generous but still bounded, so a delegate test that
 /// genuinely wedges fails rather than hanging forever. The tests that DO assert
 /// timeout behaviour live in `wasm_runtime::tests::execution_handling` and set
 /// their own budgets, so nothing here weakens that coverage.
