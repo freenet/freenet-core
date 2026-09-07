@@ -3067,6 +3067,39 @@ mod tests {
             "the marker triple must be serialised by the queue lock; without it a \
              concurrent caller can coalesce into a marker that is then rolled back",
         );
+
+        // THE GUARD MUST BE BOUND TO A LIVE NAME, not taken and dropped.
+        //
+        // Found by a reviewer defeating the first version of this pin: writing
+        //
+        //     drop(self.v2_delegate_broadcast_queue_lock.lock());
+        //
+        // leaves the needle present and still before the insert, so the pin
+        // passed while the lock was released immediately and the serialisation
+        // it exists to enforce was gone. `let _ = ...` does the same thing, and
+        // differs from the correct `let _serialise = ...` by one character --
+        // a known Rust footgun and exactly the edit an "unused variable"
+        // cleanup suggests.
+        let line_start = body[..lock].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let line = body[line_start..].lines().next().unwrap_or("").trim();
+        assert!(
+            !line.starts_with("drop("),
+            "the lock must be BOUND, not taken and dropped on the spot: a \
+             temporary guard is released at the end of the statement, so the \
+             insert and the enqueue below run unserialised. Found: {line:?}"
+        );
+        let binding = line
+            .strip_prefix("let ")
+            .and_then(|rest| rest.split('=').next())
+            .map(str::trim)
+            .unwrap_or("");
+        assert!(
+            binding != "_" && !binding.is_empty(),
+            "the lock guard must bind to a NAMED variable that lives to the end \
+             of the function. `let _ = ..` drops it immediately, which is the \
+             same defect as `drop(..)` and one character from correct. \
+             Found binding: {binding:?} in {line:?}"
+        );
         let insert = body
             .find("v2_delegate_broadcast_pending.insert(")
             .expect("the marker insert must still exist");
