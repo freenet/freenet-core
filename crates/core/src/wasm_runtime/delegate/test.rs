@@ -57,6 +57,45 @@ mod delegate2_messages {
     }
 }
 
+/// Execution budget for the delegate test fixtures.
+///
+/// `RuntimeConfig::max_execution_seconds` defaults to 5.0, which is a
+/// PRODUCTION policy — how long a delegate may occupy an executor — and it is
+/// enforced as WALL CLOCK: `epoch_deadline_ticks` turns it into 51 ticks of a
+/// 100 ms process-global epoch ticker. That clock keeps running while the guest
+/// is blocked inside a HOST call, and the epoch trap cannot fire until control
+/// returns to the guest, so the budget is spent on the node's own file I/O and
+/// XChaCha20-Poly1305 as much as on delegate code.
+///
+/// These fixtures assert functional behaviour, not that policy, and one of them
+/// sits on the boundary by construction: `test_large_secret_data` drives ~2 MiB
+/// of AEAD through host calls for a single 1 MiB secret, in a build where that
+/// crypto is monomorphised into `crates/core` at opt-level 0 — the
+/// `[profile.dev.package."*"] opt-level = 3` override in the workspace manifest
+/// covers dependency PACKAGES, not generic code instantiated in the local
+/// crate. On a loaded machine, or a CI runner running the suite in parallel
+/// under nextest, that legitimately exceeds 5 s of wall clock and the guest is
+/// epoch-trapped as `WasmError::Timeout` — a failure that says nothing about
+/// the code under test. Measured on a 16-core box: 0 failures in 28 runs below
+/// load average 50, and failures on BOTH `main` and a feature branch above it.
+///
+/// So the fixtures set the budget explicitly instead of inheriting the
+/// production one. It is generous but still bounded, so a delegate test that
+/// genuinely wedges fails rather than hanging forever. The tests that DO assert
+/// timeout behaviour live in `wasm_runtime::tests::execution_handling` and set
+/// their own budgets, so nothing here weakens that coverage.
+///
+/// This does not make the wall-clock accounting correct — a real delegate
+/// storing a large secret on a busy node can still be charged for the host's
+/// crypto and I/O. That is tracked separately; this constant only stops a unit
+/// test from being gated on it.
+fn delegate_fixture_config() -> super::super::runtime::RuntimeConfig {
+    super::super::runtime::RuntimeConfig {
+        max_execution_seconds: 60.0,
+        ..Default::default()
+    }
+}
+
 async fn setup_runtime(
     name: &str,
 ) -> Result<(DelegateContainer, Runtime, tempfile::TempDir), Box<dyn std::error::Error>> {
@@ -71,7 +110,14 @@ async fn setup_runtime(
     let delegate_store = DelegateStore::new(delegates_dir, 10_000, db.clone())?;
     let secret_store = SecretsStore::new(secrets_dir, Default::default(), db)?;
 
-    let mut runtime = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+    let mut runtime = Runtime::build_with_config(
+        contract_store,
+        delegate_store,
+        secret_store,
+        false,
+        delegate_fixture_config(),
+    )
+    .unwrap();
 
     let delegate = {
         let bytes = super::super::tests::get_test_module(name)?;
