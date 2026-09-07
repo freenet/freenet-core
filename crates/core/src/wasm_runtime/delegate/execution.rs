@@ -174,7 +174,7 @@ impl Runtime {
         // Read back the (possibly mutated) context before guard drops
         let updated_context = DELEGATE_ENV
             .get(&instance_id)
-            .map(|env| env.context.clone())
+            .map(|env| env.context.borrow().clone())
             .unwrap_or_default();
 
         let outbound = result?;

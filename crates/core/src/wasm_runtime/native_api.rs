@@ -471,7 +471,23 @@ pub mod error_codes {
 /// Host functions access this through the global `DELEGATE_ENV` map.
 pub(super) struct DelegateCallEnv {
     /// Mutable context bytes. The delegate reads/writes this via host functions.
-    pub context: Vec<u8>,
+    ///
+    /// Behind a `RefCell` so that writing it needs only a SHARED reference to
+    /// the env. That is not a style choice: it is what makes the identity
+    /// fields below immutable at the TYPE level rather than by convention.
+    ///
+    /// `context_write` was the sole reason a `&mut DelegateCallEnv` ever
+    /// existed (via `DELEGATE_ENV.get_mut`), and from a `&mut` to the struct
+    /// every field is reachable for rebinding. A source pin forbidding
+    /// `.delegate_key = ` caught assignment and nothing else — `mem::swap`,
+    /// `clone_from` and `let k = &mut env.delegate_key; *k = ..` all sailed
+    /// past it, which mutation review demonstrated. Enumerating rebinding
+    /// forms is an open set, the same mistake as enumerating item kinds.
+    ///
+    /// With this cell there is no `&mut DelegateCallEnv` anywhere in the
+    /// crate, so NO rebinding of any field compiles at all. See
+    /// `no_mutable_borrow_of_the_call_env_exists`.
+    pub(super) context: std::cell::RefCell<Vec<u8>>,
     /// Interior-mutable pointer to the runtime's SecretsStore. Valid only during
     /// the synchronous `process()` call. Uses `UnsafeCell` to make the interior
     /// mutability explicit rather than hiding it behind `#[allow(clippy::mut_from_ref)]`.
@@ -688,7 +704,7 @@ impl DelegateCallEnv {
         inherited_origins: SharedInheritedOrigins,
     ) -> Self {
         Self {
-            context,
+            context: std::cell::RefCell::new(context),
             secret_store: std::cell::UnsafeCell::new(secret_store as *mut SecretsStore),
             delegate_key,
             user_context,
@@ -1509,7 +1525,7 @@ pub(super) mod delegate_context {
             tracing::warn!("delegate call env not set for instance {id}");
             return error_codes::ERR_NOT_IN_PROCESS;
         };
-        let len = env.context.len();
+        let len = env.context.borrow().len();
         if len > i32::MAX as usize {
             return error_codes::ERR_CONTEXT_TOO_LARGE;
         }
@@ -1540,7 +1556,8 @@ pub(super) mod delegate_context {
             tracing::warn!("delegate call env not set for instance {id}");
             return error_codes::ERR_NOT_IN_PROCESS;
         };
-        let to_copy = env.context.len().min(len as usize);
+        let context = env.context.borrow();
+        let to_copy = context.len().min(len as usize);
         if to_copy == 0 {
             return 0;
         }
@@ -1553,7 +1570,7 @@ pub(super) mod delegate_context {
         // linear memory bounds, and `env.context` is a valid `Vec<u8>` with at least
         // `to_copy` bytes.
         unsafe {
-            std::ptr::copy_nonoverlapping(env.context.as_ptr(), dst, to_copy);
+            std::ptr::copy_nonoverlapping(context.as_ptr(), dst, to_copy);
         }
         to_copy as i32
     }
@@ -1579,12 +1596,15 @@ pub(super) mod delegate_context {
             tracing::warn!("instance mem space not recorded for {id}");
             return error_codes::ERR_NOT_IN_PROCESS;
         };
-        let Some(mut env) = DELEGATE_ENV.get_mut(&id) else {
+        // `get`, NOT `get_mut`: see the `context` field's rustdoc. A `&mut`
+        // here would put every other field — including the identity fields the
+        // secret memo's soundness rests on — back within reach of rebinding.
+        let Some(env) = DELEGATE_ENV.get(&id) else {
             tracing::warn!("delegate call env not set for instance {id}");
             return error_codes::ERR_NOT_IN_PROCESS;
         };
         if len == 0 {
-            env.context.clear();
+            env.context.borrow_mut().clear();
             return error_codes::SUCCESS;
         }
         let Some(src) =
@@ -1596,7 +1616,7 @@ pub(super) mod delegate_context {
         // SAFETY: `src` was validated by `validate_and_compute_ptr` to point to `len`
         // bytes within the WASM linear memory.
         let bytes = unsafe { std::slice::from_raw_parts(src, len as usize) };
-        env.context = bytes.to_vec();
+        *env.context.borrow_mut() = bytes.to_vec();
         error_codes::SUCCESS
     }
 }
@@ -2951,41 +2971,6 @@ mod secret_read_memo_tests {
     /// call would leave a `set_secret` followed by a `get_secret` inside ONE
     /// `process()` serving the pre-write plaintext, silently, with every other
     /// test still green.
-    /// The source region of `name`: from its signature to its own closing
-    /// brace, comments removed.
-    ///
-    /// Bounded by the function's OWN closing brace — the first line that is
-    /// exactly `    }` — rather than by guessing what item comes next. An
-    /// earlier version searched for the next `pub(crate) fn` and so ran ~50
-    /// lines past `remove_secret` into the private `collect_list_secrets` that
-    /// follows it, scraping a function this test says nothing about; a needle
-    /// anywhere in that overrun satisfied the assertion. Enumerating more item
-    /// kinds would only move the gap (`async fn`, `const fn`, a `type` alias,
-    /// or no following item at all would each reopen it). The closing brace is
-    /// immune to whatever follows, because it belongs to the function itself.
-    ///
-    /// Comments are stripped so prose merely MENTIONING the call cannot
-    /// satisfy a `contains`. The brace bound already excludes the successor's
-    /// doc comment, so this is defence in depth rather than the primary guard.
-    fn scraped_body(src: &str, name: &str) -> String {
-        let start = src
-            .find(&format!("pub(crate) fn {name}("))
-            .unwrap_or_else(|| panic!("{name} not found in native_api.rs"));
-        let after = &src[start..];
-        // `expect`, not `unwrap_or(len())`: every function here has a closing
-        // brace, so "not found" means the search is broken and the region has
-        // widened to end-of-file. Fail loudly rather than scraping the rest of
-        // the module and passing.
-        let end = after.find("\n    }").unwrap_or_else(|| {
-            panic!("no closing brace found for {name}; region-bounding is broken")
-        });
-        after[..end]
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     /// A read that FAILS must not populate the memo.
     ///
     /// `with_secret` propagates the store error with `?` before the memo
@@ -3036,76 +3021,52 @@ mod secret_read_memo_tests {
     ///
     /// The storage read this memo replaces binds the delegate identity twice —
     /// in the file path and in the DEK the blob is authenticated under. A memo
-    /// hit binds it zero times. So reassigning `delegate_key` mid-call, which
+    /// hit binds it zero times. So rebinding `delegate_key` mid-call, which
     /// before this memo self-corrected via a failed AEAD tag, would now
     /// silently return the previous identity's plaintext.
     ///
-    /// The field is private, which stops any other module. This stops
-    /// `native_api` itself — `context_write` already takes a
-    /// `&mut DelegateCallEnv` out of `DELEGATE_ENV`, so the mutation path
-    /// exists in this file today and only convention keeps it off these two
-    /// fields.
-    #[test]
-    fn the_call_env_identity_fields_are_never_reassigned() {
-        let src = include_str!("native_api.rs");
-        for field in ["delegate_key", "user_context"] {
-            let needle = format!(".{field} =");
-            assert!(
-                !src.contains(&needle),
-                "`{needle}` appears in native_api.rs. These two fields fix the \
-                 delegate identity and the secret scope for the whole call, and \
-                 secret_read_memo is keyed on the secret hash ALONE on that \
-                 basis. Reassigning either leaves a memo entry belonging to the \
-                 previous identity — cross-tenant disclosure in hosted mode. If \
-                 you genuinely need to rebuild the identity, build a NEW \
-                 DelegateCallEnv, which starts with an empty memo"
-            );
-        }
-        // Non-vacuous: the same search must FIND the assignment form it is
-        // looking for, on a field where it is legitimate.
-        assert!(
-            src.contains("env.context = "),
-            "the `.field =` search form must be able to match at all; \
-             `context_write` assigns `env.context`, so if this fails the search \
-             is broken and the assertions above prove nothing"
-        );
-    }
-
-    /// The pin above is only as good as its region-bounding, so bound the
-    /// bound.
+    /// The field being private stops any other module. This stops
+    /// `native_api` itself, and it does so at the TYPE level rather than by
+    /// scraping: with `context` behind a `RefCell`, nothing needs a
+    /// `&mut DelegateCallEnv`, so no field can be rebound by ANY means.
     ///
-    /// Note the first assertion, which is the whole point: an
-    /// absence check must also assert the thing is PRESENT to be absent from,
-    /// or it passes when the thing simply vanishes. Rename or delete
-    /// `collect_list_secrets` and, without that line, this guard would go on
-    /// passing for the wrong reason while a later regression in
-    /// `scraped_body` silently re-widened the window.
+    /// An earlier version of this pin asserted `.delegate_key = ` did not
+    /// appear. Mutation review defeated it with `mem::swap`, and `clone_from`
+    /// and `let k = &mut env.delegate_key; *k = ..` would have too — inside
+    /// `context_write`, the exact path the pin's own doc named. Enumerating
+    /// rebinding forms is an open set. This asserts the single closed fact the
+    /// whole property now rests on: no mutable borrow of the env is taken.
     #[test]
-    fn the_scraped_region_stops_at_the_end_of_the_function() {
+    fn no_mutable_borrow_of_the_call_env_exists() {
         let src = include_str!("native_api.rs");
-        assert!(
-            src.contains("fn collect_list_secrets("),
-            "this guard is written around `collect_list_secrets` being the \
-             private item that follows `remove_secret`. If it has been renamed \
-             or removed, re-point the guard at whatever now follows — do NOT \
-             delete it, or the absence check below becomes vacuous"
+        // Only the PRODUCTION half. This test's own message names the needle,
+        // so an unbounded search would count itself and fail — the same
+        // self-reference that makes a bare `split_once(anchor)` match a pin's
+        // own assertion string. Bounding here is also the right semantics: the
+        // property is about production code.
+        let production = &src[..src
+            .find("\n#[cfg(test)]")
+            .expect("no #[cfg(test)] marker found; the production/test split is broken")];
+        let call_sites = production.matches("DELEGATE_ENV.get_mut(").count();
+        assert_eq!(
+            call_sites, 0,
+            "`DELEGATE_ENV.get_mut(` gives a `&mut DelegateCallEnv`, and from \
+             one every field is reachable for rebinding — by assignment, \
+             `mem::swap`, `clone_from` or a `&mut` reborrow. `delegate_key` and \
+             `user_context` fix the delegate identity and the secret scope for \
+             the whole call, and `secret_read_memo` is keyed on the secret hash \
+             ALONE on that basis, so rebinding either leaves a memo entry \
+             belonging to the previous identity (cross-tenant disclosure in \
+             hosted mode). If you need to mutate a field, put THAT field behind \
+             a cell as `context` is — do not reintroduce the mutable borrow"
         );
 
-        let body = scraped_body(src, "remove_secret");
+        // Non-vacuous: the shared form must be present, or this test would
+        // pass just as well against a file that had no DELEGATE_ENV at all.
         assert!(
-            body.contains("fn remove_secret("),
-            "the region must actually contain remove_secret"
-        );
-        assert!(
-            body.trim_end().ends_with('}'),
-            "the region must end at remove_secret's own closing brace, not run \
-             on to end-of-file"
-        );
-        assert!(
-            !body.contains("fn collect_list_secrets("),
-            "remove_secret's region must stop before the PRIVATE \
-             `collect_list_secrets` that follows it; if it does not, the pin is \
-             asserting over a function it says nothing about"
+            production.contains("DELEGATE_ENV.get(&id)"),
+            "the shared-borrow form must appear; if it does not, the search is \
+             wrong and the assertion above proves nothing"
         );
     }
 }
