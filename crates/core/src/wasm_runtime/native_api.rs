@@ -684,13 +684,24 @@ pub(super) struct DelegateCallEnv {
 //     takes the shard WRITE lock, so `DelegateEnvGuard::drop` waits for any
 //     in-flight host call's guard to release; every dereference therefore
 //     happens-before that removal returns, which happens-before the pool moves
-//     the `Runtime`. NOTE that the creating thread is NOT parked on this path:
-//     it concurrently takes its own `Ref` to read back `context`
-//     (`delegate/execution.rs`). That is safe only because it touches `context`
-//     alone -- whose sole mutator goes through `get_mut`, a shard write lock --
-//     and never dereferences a raw pointer. Adding another field read there,
-//     e.g. of `creations_this_call`, would be a data race with no `unsafe` at
-//     the edit site.
+//     the `Runtime`.
+//
+//     THE CREATING THREAD MUST NOT TOUCH THE ENV WHILE A GUEST MAY STILL BE
+//     RUNNING. On the wall-clock-timeout path it returns with the guest still
+//     live on an abandoned blocking thread, so any access it makes there is a
+//     genuinely concurrent one. It makes exactly one access: the `context`
+//     read-back in `delegate/execution.rs`, and that sits AFTER the `?` so it
+//     runs only on the success path -- i.e. only once `execute_wasm_blocking`
+//     has JOINED the guest closure and the guest is provably finished.
+//
+//     Do not move it back above the `?`, and do not add a read of any other
+//     field beside it. `context` alone would survive such a move today, because
+//     its only mutator happens to take `get_mut` (a shard WRITE lock, which
+//     excludes the read-back's `get`) -- but that is one call site's habit, not
+//     an invariant this type enforces, and no other field has even that much.
+//     Giving `context` an interior-mutability wrapper, or reading a second
+//     field there, would be a cross-thread data race with no `unsafe` at the
+//     edit site to warn whoever writes it.
 //
 //  3. NO REFERENCE ESCAPES ITS GUARD. The four accessors are private and each is
 //     `&self -> &T`, so lifetime elision ties the result to the `Ref` that

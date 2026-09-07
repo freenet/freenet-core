@@ -195,13 +195,38 @@ impl Runtime {
         // V1 delegates use synchronous call.
         let result = self.exec_inbound(params, origin, msg, handle, api_version);
 
-        // Read back the (possibly mutated) context before guard drops
+        // Propagate the error BEFORE reading the context back. The `?` is
+        // deliberately ahead of the read, not behind it (#5480).
+        //
+        // On the wall-clock-timeout path this thread returns while the guest is
+        // STILL RUNNING on an abandoned blocking-pool thread, because
+        // `JoinHandle::abort()` cannot stop a `spawn_blocking` closure. Reading
+        // `context` here would therefore be a genuinely concurrent access to a
+        // field the abandoned guest can still write through `context_write`.
+        //
+        // It is not a data race as the field stands today -- the only mutator
+        // takes `DELEGATE_ENV.get_mut`, a shard WRITE lock, which excludes this
+        // `get` -- but that is a property of one call site in `native_api`, not
+        // of anything checked here. Moving any future `context` mutator to a
+        // shared borrow (an interior-mutability wrapper, say) would silently
+        // turn this line into a cross-thread race with no `unsafe` at either
+        // end. See the `unsafe impl Send/Sync for DelegateCallEnv` note.
+        //
+        // The read is pure waste on every error path regardless: `result?` used
+        // to discard it a line later. Skipping it costs nothing, removes the
+        // only concurrent touch of the env from this thread, and lets the
+        // SAFETY argument rest on "the guest thread alone reaches the env"
+        // rather than on a per-field exception.
+        let outbound = result?;
+
+        // Reached only on success, which means `execute_wasm_blocking` joined
+        // the guest closure: the guest has finished and nothing else can be
+        // touching the env.
         let updated_context = DELEGATE_ENV
             .get(&instance_id)
             .map(|env| env.context.borrow().clone())
             .unwrap_or_default();
 
-        let outbound = result?;
         Ok((outbound, updated_context))
     }
 
