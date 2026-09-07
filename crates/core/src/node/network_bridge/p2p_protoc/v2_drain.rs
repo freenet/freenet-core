@@ -396,8 +396,8 @@ mod tests {
 
     fn test_key(seed: u8) -> ContractKey {
         ContractKey::from_params_and_code(
-            &Parameters::from(vec![seed]),
-            &ContractCode::from(vec![seed, seed, seed]),
+            Parameters::from(vec![seed]),
+            ContractCode::from(vec![seed, seed, seed]),
         )
     }
 
@@ -476,7 +476,9 @@ mod tests {
                             anyhow::anyhow!("stub executor failure"),
                         )),
                     };
-                    let _ = ch_channel
+                    // The drain may already have timed out and stopped waiting; a
+                    // failed reply is expected in that case and is not the stub's problem.
+                    let _reply_sent = ch_channel
                         .send_to_sender(
                             id,
                             ContractHandlerEvent::GetResponse {

@@ -89,7 +89,12 @@ pub(crate) use op_state_manager::OpManager;
 // outcome and its bound from outside `node`. Both were untestable from
 // `contract::executor::pool_tests` while these modules were private, which is
 // part of why the drain path had no behavioural coverage at all.
+// `#[cfg(test)]`: both are reached only from `pool_tests`, so an unqualified
+// re-export is an unused import in a non-test build -- and CI runs clippy with
+// `-D warnings`, which turns that into a build failure.
+#[cfg(test)]
 pub(crate) use network_bridge::p2p_protoc::V2_BROADCAST_DRAIN_READ_TIMEOUT;
+#[cfg(test)]
 pub(crate) use op_state_manager::DrainStateRead;
 
 mod network_bridge;
