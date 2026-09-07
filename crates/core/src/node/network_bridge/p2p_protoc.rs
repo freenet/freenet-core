@@ -53,6 +53,7 @@ mod broadcast;
 mod connection_lifecycle;
 mod dispatch;
 mod migration;
+mod v2_drain;
 
 /// Represents the different ways the event loop can exit.
 ///
@@ -3036,147 +3037,28 @@ impl P2pConnManager {
                                 .await;
                             }
                             NodeEvent::V2DelegateStateChanged { key } => {
-                                // Clear the coalescing marker BEFORE the read.
-                                // A write landing during the read then queues a
-                                // fresh event instead of being folded into this
-                                // one, which is already past the point where it
-                                // could observe it. Clearing after the read
-                                // would drop that write's fan-out.
+                                // Extracted so it is reachable from a test —
+                                // see `v2_drain`, and the mutation results that
+                                // motivated it. Inline in this `select!` arm,
+                                // deleting the fan-out left the whole suite
+                                // green.
                                 //
-                                // The marker also stays clear for the whole
-                                // fan-out below, so a write landing mid-fan-out
-                                // queues a fresh event and re-sends bytes
-                                // already going out. Correct but wasteful, on
-                                // the sink #5147/#5153 exist to shrink.
-                                // Deliberate: holding the marker until the
-                                // fan-out completes would trade a duplicate
-                                // send for a DROPPED one, and a drop here is
-                                // unrecoverable until the next write.
-                                op_manager.clear_v2_delegate_broadcast_pending(&key);
-                                // The event carries no state; read what is
-                                // stored now. BOUNDED (#4549 — this runs inline
-                                // on the event loop) and three-way, because
-                                // "we do not hold it" and "the read failed"
-                                // need opposite handling.
-                                match op_manager
-                                    .read_state_for_broadcast_drain(
-                                        &key,
-                                        V2_BROADCAST_DRAIN_READ_TIMEOUT,
-                                    )
-                                    .await
-                                {
-                                    crate::node::op_state_manager::DrainStateRead::Found(
-                                        new_state,
-                                    ) => {
-                                        ctx.v2_drain_retries.remove(&key);
-                                        ctx.handle_broadcast_state_change(
-                                            &op_manager,
-                                            key,
-                                            new_state,
-                                            false,
-                                            false,
-                                        )
-                                        .await;
-                                    }
-                                    crate::node::op_state_manager::DrainStateRead::NotHeld => {
-                                        // Definitive: retrying cannot change it.
-                                        ctx.v2_drain_retries.remove(&key);
-                                        tracing::debug!(
-                                            contract = %key,
-                                            "V2 delegate broadcast drained for a contract we \
-                                             do not hold; nothing to send"
-                                        );
-                                    }
-                                    crate::node::op_state_manager::DrainStateRead::Unavailable => {
-                                        // The read is a GetQuery to the serial
-                                        // contract-handling loop, and the event
-                                        // being drained was queued by a delegate
-                                        // write that ran ON that loop — so this
-                                        // read waits for the delegate that
-                                        // caused it. A bounded retry recovers a
-                                        // delegate that was merely busy.
-                                        //
-                                        // Re-queueing is safe: the marker was
-                                        // cleared before the read, so a fresh
-                                        // write is free to queue its own event
-                                        // and at worst we fan out twice.
-                                        let attempt = ctx.v2_drain_retries.entry(key).or_insert(0);
-                                        // Linear backoff with +/-20% jitter so a
-                                        // burst of contracts failing together
-                                        // does not retry in lockstep against the
-                                        // one serial loop that was already too
-                                        // busy to answer (`code-style.md`).
-                                        let jitter_pct: u64 =
-                                            crate::config::GlobalRng::random_range(80u64..=120u64);
-                                        if let Some(delay) =
-                                            Self::plan_v2_drain_retry(*attempt, jitter_pct)
-                                        {
-                                            *attempt += 1;
-                                            let op_mgr = op_manager.clone();
-                                            let shutdown = op_manager.ring.shutdown_token();
-                                            tokio::spawn(async move {
-                                                // Interruptible: a >=1s plain
-                                                // sleep in a retry loop would
-                                                // keep this task alive past
-                                                // shutdown (`code-style.md`).
-                                                tokio::select! {
-                                                    _ = shutdown.cancelled() => return,
-                                                    _ = tokio::time::sleep(delay) => {}
-                                                }
-                                                // Through the marker-respecting
-                                                // API, not a raw emit: if a
-                                                // fresh write has already queued
-                                                // its own drain for this
-                                                // contract, this retry coalesces
-                                                // into it instead of adding a
-                                                // second event.
-                                                // NOTHING IS COUNTED HERE.
-                                                // This site used to count every
-                                                // non-`Queued` outcome as a
-                                                // dropped broadcast, which was
-                                                // wrong in both directions — see
-                                                // the arms. The drop WARN fires
-                                                // at powers of two, so inflating
-                                                // the counter with benign
-                                                // coalesces pushes the next
-                                                // milestone exponentially out of
-                                                // reach and a genuine drop then
-                                                // logs nothing at all.
-                                                match op_mgr.queue_v2_delegate_broadcast(key) {
-                                                    // The retry did its job.
-                                                    crate::node::op_state_manager::V2BroadcastQueued::Queued => {}
-                                                    // A fresh write queued its
-                                                    // own drain while we slept.
-                                                    // That drain re-reads stored
-                                                    // state, so this write is
-                                                    // announced by it. Nothing
-                                                    // was lost and nothing is
-                                                    // counted.
-                                                    crate::node::op_state_manager::V2BroadcastQueued::Coalesced => {}
-                                                    // A real drop, but already
-                                                    // counted and WARNed inside
-                                                    // the call. Counting it here
-                                                    // too would report one event
-                                                    // twice across two separate
-                                                    // counters.
-                                                    crate::node::op_state_manager::V2BroadcastQueued::EnqueueFailed => {}
-                                                }
-                                            });
-                                        } else {
-                                            // Retries exhausted. A write that
-                                            // already committed and already
-                                            // returned success to the delegate
-                                            // now goes unannounced.
-                                            //
-                                            // WARN, not debug: `release_max_level_info`
-                                            // compiles debug out, and a drop that
-                                            // leaves no evidence in a release build
-                                            // is the #4981 shape.
-                                            ctx.v2_drain_retries.remove(&key);
-                                            note_v2_broadcast_drain_dropped(&key);
-                                        }
-                                    }
-                                }
+                                // Linear backoff with +/-20% jitter so a burst
+                                // of contracts failing together does not retry
+                                // in lockstep against the one serial loop that
+                                // was already too busy to answer
+                                // (`code-style.md`). Drawn here, not inside, so
+                                // the retry arithmetic is deterministic under
+                                // test.
+                                let jitter_pct: u64 =
+                                    crate::config::GlobalRng::random_range(80u64..=120u64);
+                                v2_drain::handle_v2_delegate_state_changed(
+                                    &mut ctx,
+                                    &op_manager,
+                                    key,
+                                    jitter_pct,
+                                )
+                                .await;
                             }
                             NodeEvent::SyncStateToPeer {
                                 key,
@@ -5606,103 +5488,6 @@ pub(crate) mod tests {
                 "jitter must stay within the documented +/-20% band at attempt {attempts}"
             );
         }
-    }
-
-    /// Every terminal outcome of the V2 drain must drop its retry entry.
-    ///
-    /// `v2_drain_retries` is keyed by contract and bounded only by removal
-    /// discipline — there is no size cap (matching the neighbouring
-    /// `broadcast_retries`). So an arm that forgets to remove leaks one entry
-    /// per contract that ever hit it, and nothing else in the tree would catch
-    /// it: the map is not observable from any behavioural test of this loop.
-    ///
-    /// All three arms are terminal for the retry: `Found` sent it, `NotHeld` is
-    /// definitive, and the exhausted branch has given up. Only the still-retrying
-    /// branch may leave an entry in place.
-    #[test]
-    fn v2_drain_retry_entries_are_dropped_on_every_terminal_outcome() {
-        const SOURCE: &str = include_str!("p2p_protoc.rs");
-
-        let arm_anchor = "NodeEvent::V2DelegateStateChanged { key } => {";
-        let arm_start = SOURCE
-            .find(arm_anchor)
-            .expect("the V2DelegateStateChanged dispatch arm is gone — update this pin");
-        let after = &SOURCE[arm_start..];
-        let arm_end = after
-            .find("NodeEvent::SyncStateToPeer {")
-            .map(|p| arm_start + p)
-            .unwrap_or(SOURCE.len());
-        let arm = &SOURCE[arm_start..arm_end];
-
-        let removals = arm.matches("v2_drain_retries.remove(&key)").count();
-        assert_eq!(
-            removals, 3,
-            "expected exactly 3 `v2_drain_retries.remove(&key)` sites in the V2 drain arm \
-             (Found, NotHeld, and retries-exhausted); found {removals}. Fewer means a \
-             terminal outcome leaks one map entry per contract that reaches it, and the map \
-             has no size cap. More means a still-retrying path is dropping its own counter, \
-             which makes the retry unbounded."
-        );
-    }
-
-    /// The V2 drain must clear the coalescing marker BEFORE it reads state.
-    ///
-    /// This ordering is the whole lost-write story and nothing else pins it.
-    /// The behavioural tests in `v2_delegate_propagation_tests` drive the write
-    /// callback and call `clear_v2_delegate_broadcast_pending` THEMSELVES to
-    /// simulate the handler, so they never observe this site at all: moving the
-    /// clear below the read — the single edit that reopens the window — leaves
-    /// every one of them green.
-    ///
-    /// Why the order matters: between the read and the fan-out, a delegate may
-    /// write again. If the marker is still set at that moment the new write
-    /// coalesces into THIS drain, which has already read and cannot see it, and
-    /// its fan-out never happens. Clearing first means such a write queues a
-    /// fresh event instead. The cost is a possible duplicate fan-out; the
-    /// alternative is a silently dropped one, which is #5479 again.
-    #[test]
-    fn v2_drain_clears_marker_before_reading_state() {
-        const SOURCE: &str = include_str!("p2p_protoc.rs");
-
-        let arm_anchor = "NodeEvent::V2DelegateStateChanged { key } => {";
-        let arm_start = SOURCE
-            .find(arm_anchor)
-            .expect("the V2DelegateStateChanged dispatch arm is gone — update this pin");
-        // Bound at the next dispatch arm so a later arm's text cannot satisfy
-        // the assertion.
-        let after = &SOURCE[arm_start..];
-        // Bounded, and it must FAIL rather than fall through: an
-        // `unwrap_or(SOURCE.len())` would absorb the rest of the file including
-        // this test's own `expect` strings, which contain both needles in the
-        // passing order — a vacuous pass triggered by nothing worse than the
-        // arms being reordered.
-        let arm_end = arm_start
-            + after.find("NodeEvent::SyncStateToPeer {").expect(
-                "SyncStateToPeer arm no longer follows the V2 drain arm — this pin \
-                         bounds its search on it, and without a bound it would scan its own \
-                         assertion text and pass vacuously. Re-anchor it.",
-            );
-        // Strip line comments before searching: `arm.find(..)` matches inside a
-        // comment, so COMMENTING OUT the clear left this pin green. The call it
-        // guards is the whole lost-write story.
-        let arm: String = SOURCE[arm_start..arm_end]
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let arm = arm.as_str();
-
-        let clear_pos = arm.find("clear_v2_delegate_broadcast_pending(").expect(
-            "the V2 drain no longer clears the coalescing marker. Without the clear the              marker latches: every later write to this contract coalesces into a              broadcast that has already drained, and the contract stops propagating",
-        );
-        let read_pos = arm
-            .find("read_state_for_broadcast_drain(")
-            .expect("the V2 drain no longer reads state — update this pin");
-
-        assert!(
-            clear_pos < read_pos,
-            "the V2 drain must clear the coalescing marker (offset {clear_pos}) BEFORE              reading state (offset {read_pos}). Clearing afterwards means a write that              lands during the read coalesces into a drain that has already read past it,              and that write is never announced. Arm:\n{arm}"
-        );
     }
 
     /// Phase 7 egress self-block pin (#4300). `handle_broadcast_state_change`
