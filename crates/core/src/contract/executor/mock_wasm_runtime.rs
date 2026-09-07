@@ -85,6 +85,94 @@ pub(crate) struct MockWasmRuntime {
     /// Per-contract update_state overrides for testing the
     /// `requires(missing)` fetch-and-retry path.
     pub(crate) update_overrides: HashMap<ContractInstanceId, UpdateOverride>,
+    /// Scripted delegate runs (#5544). Each `execute_delegate_request` pops the
+    /// next entry; an exhausted script returns no messages, which the caller
+    /// reads as "the delegate is done".
+    pub(crate) delegate_script: DelegateScript,
+    /// One entry appended per `execute_delegate_request`, so a test can assert
+    /// HOW MANY times the delegate's `process()` was entered and in what order
+    /// relative to a park. This is what makes the per-delegate exclusion
+    /// falsifiable: the invariant is "no second entry while parked".
+    pub(crate) delegate_calls: DelegateCallLog,
+    /// Model of the runtime's real `DelegateContextCache` (#5544 S7).
+    ///
+    /// Keyed by `DelegateKey`, last-write-wins — deliberately the same shape as
+    /// the real thing, INCLUDING the property that makes it hazardous. Without
+    /// this the mock could only show that an extra `process()` happened; with
+    /// it, a test can show that the extra run CORRUPTED a parked continuation,
+    /// which is the thing that actually matters.
+    ///
+    /// Two exclusion bypasses (the notification path and the inter-delegate
+    /// hop) shipped in this PR's first round and were caught by review rather
+    /// than by a test, precisely because the mock modelled call counts and not
+    /// context continuity. Both are now caught by construction.
+    pub(crate) delegate_contexts: DelegateContexts,
+    /// What each invocation OBSERVED on entry, in order. The discriminator for
+    /// an interleaving bug: a resumed run must observe the context ITS OWN
+    /// pre-park run wrote, not one a foreign run left behind.
+    pub(crate) delegate_observations: DelegateObservations,
+}
+
+/// One scripted delegate invocation.
+#[derive(Default, Clone)]
+pub(crate) struct ScriptedRun {
+    /// Messages this invocation emits.
+    pub outbound: Vec<OutboundDelegateMsg>,
+    /// Context bytes this invocation writes on exit (`None` leaves it alone),
+    /// modelling the delegate's `ctx.write()`.
+    pub writes_context: Option<Vec<u8>>,
+}
+
+impl From<Vec<OutboundDelegateMsg>> for ScriptedRun {
+    fn from(outbound: Vec<OutboundDelegateMsg>) -> Self {
+        Self {
+            outbound,
+            writes_context: None,
+        }
+    }
+}
+
+/// What one invocation saw when it entered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DelegateObservation {
+    pub delegate_key: DelegateKey,
+    /// Inbound message kinds, so a test can tell WHICH logical run this was —
+    /// a `UserResponse` is a resume, a `ContractNotification` is the
+    /// notification path, and so on. Identifying the run by script position
+    /// would not work: the whole point of an interleaving bug is that the runs
+    /// arrive in a different order than intended.
+    pub inbound_kinds: Vec<&'static str>,
+    /// The context this invocation read on entry.
+    pub observed_context: Option<Vec<u8>>,
+}
+
+/// Shared handle to a mock delegate's scripted runs.
+pub(crate) type DelegateScript =
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<ScriptedRun>>>;
+
+/// Shared handle to the log of delegate invocations.
+pub(crate) type DelegateCallLog = std::sync::Arc<std::sync::Mutex<Vec<DelegateKey>>>;
+
+/// Shared handle to the modelled per-delegate context store.
+pub(crate) type DelegateContexts =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<DelegateKey, Vec<u8>>>>;
+
+/// Shared handle to the per-invocation observation log.
+pub(crate) type DelegateObservations = std::sync::Arc<std::sync::Mutex<Vec<DelegateObservation>>>;
+
+/// Name the inbound variants so an observation can identify its logical run.
+fn inbound_kind(msg: &InboundDelegateMsg<'_>) -> &'static str {
+    match msg {
+        InboundDelegateMsg::ApplicationMessage(_) => "ApplicationMessage",
+        InboundDelegateMsg::UserResponse(_) => "UserResponse",
+        InboundDelegateMsg::GetContractResponse(_) => "GetContractResponse",
+        InboundDelegateMsg::PutContractResponse(_) => "PutContractResponse",
+        InboundDelegateMsg::UpdateContractResponse(_) => "UpdateContractResponse",
+        InboundDelegateMsg::SubscribeContractResponse(_) => "SubscribeContractResponse",
+        InboundDelegateMsg::ContractNotification(_) => "ContractNotification",
+        InboundDelegateMsg::DelegateMessage(_) => "DelegateMessage",
+        _ => "Other",
+    }
 }
 
 impl ContractRuntimeInterface for MockWasmRuntime {
@@ -393,15 +481,80 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
 
     async fn execute_delegate_request(
         &mut self,
-        _req: DelegateRequest<'_>,
+        req: DelegateRequest<'_>,
         _origin_contract: Option<&ContractInstanceId>,
         _caller_delegate: Option<&DelegateKey>,
         _connection_scope: crate::client_events::ConnectionScope,
         _user_context: Option<&UserSecretContext>,
     ) -> Response {
-        Err(ExecutorError::other(anyhow::anyhow!(
-            "delegates not supported in MockWasmRuntime"
-        )))
+        // Scripted, for the #5544 park/resume tests. Without a script this
+        // stays the "not supported" error it has always been, so no existing
+        // test changes behaviour.
+        let key = req.key().clone();
+
+        // Model the real `DelegateContextCache` read-modify-write around every
+        // invocation (#5544 S7): read on entry, record what was seen, write on
+        // exit. Same key, same last-write-wins semantics as the runtime's.
+        let observed_context = self
+            .runtime
+            .delegate_contexts
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned();
+        // Only `ApplicationMessages` carries inbound to classify; the
+        // registration variants carry none. The wildcard is required by
+        // `#[non_exhaustive]` and is listed alongside the known variants so a
+        // future one is not silently swallowed.
+        let inbound_kinds: Vec<&'static str> = match &req {
+            DelegateRequest::ApplicationMessages { inbound, .. } => {
+                inbound.iter().map(inbound_kind).collect()
+            }
+            DelegateRequest::RegisterDelegate { .. }
+            | DelegateRequest::UnregisterDelegate(_)
+            | DelegateRequest::RegisterDelegateWithPredecessors { .. }
+            | _ => Vec::new(),
+        };
+
+        let script = self.runtime.delegate_script.lock().unwrap().pop_front();
+        let record = |rt: &MockWasmRuntime, writes: Option<Vec<u8>>| {
+            rt.delegate_calls.lock().unwrap().push(key.clone());
+            rt.delegate_observations
+                .lock()
+                .unwrap()
+                .push(DelegateObservation {
+                    delegate_key: key.clone(),
+                    inbound_kinds: inbound_kinds.clone(),
+                    observed_context: observed_context.clone(),
+                });
+            if let Some(bytes) = writes {
+                rt.delegate_contexts
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), bytes);
+            }
+        };
+
+        let Some(run) = script else {
+            if self.runtime.delegate_calls.lock().unwrap().is_empty() {
+                return Err(ExecutorError::other(anyhow::anyhow!(
+                    "delegates not supported in MockWasmRuntime"
+                )));
+            }
+            // Script exhausted after a real scripted run: the delegate has
+            // nothing more to say. Record the entry so exclusion assertions
+            // still see it.
+            record(&self.runtime, None);
+            return Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
+                key,
+                values: Vec::new(),
+            });
+        };
+        record(&self.runtime, run.writes_context);
+        Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
+            key,
+            values: run.outbound,
+        })
     }
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
@@ -439,6 +592,10 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             contract_store: contract_store.unwrap_or_default(),
             validate_overrides: HashMap::new(),
             update_overrides: HashMap::new(),
+            delegate_script: DelegateScript::default(),
+            delegate_calls: DelegateCallLog::default(),
+            delegate_contexts: DelegateContexts::default(),
+            delegate_observations: DelegateObservations::default(),
         };
 
         Executor::new(
@@ -469,6 +626,10 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             contract_store: InMemoryContractStore::default(),
             validate_overrides: HashMap::new(),
             update_overrides: HashMap::new(),
+            delegate_script: DelegateScript::default(),
+            delegate_calls: DelegateCallLog::default(),
+            delegate_contexts: DelegateContexts::default(),
+            delegate_observations: DelegateObservations::default(),
         };
 
         Executor::new(state_store, || Ok(()), OperationMode::Local, runtime, None).await
@@ -491,6 +652,10 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             contract_store: InMemoryContractStore::default(),
             validate_overrides: HashMap::new(),
             update_overrides: HashMap::new(),
+            delegate_script: DelegateScript::default(),
+            delegate_calls: DelegateCallLog::default(),
+            delegate_contexts: DelegateContexts::default(),
+            delegate_observations: DelegateObservations::default(),
         };
 
         Executor::new(
