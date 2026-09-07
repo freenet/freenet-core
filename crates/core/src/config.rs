@@ -5433,6 +5433,45 @@ impl GlobalTestMetrics {
     }
 }
 
+/// Install the logger for a short-lived CLI subcommand: stderr only, at
+/// `level`.
+///
+/// Separate from [`set_logger`] on purpose. `set_logger` serves the node, where
+/// output MUST keep going to the rolling log files (`freenet service report`
+/// collects them, and on Windows nothing captures stdout). Adding a "log to
+/// stderr instead" flag to that path would put a switch capable of silently
+/// disabling file logging on the node's only logging call — so the CLI gets its
+/// own entry point rather than a shared, mis-settable one.
+///
+/// See `tracing::tracer::init_cli_stderr_tracer` for why stderr specifically
+/// (#5244).
+pub fn set_cli_logger(level: tracing::level_filters::LevelFilter) {
+    #[cfg(feature = "trace")]
+    {
+        static CLI_LOGGER_SET: AtomicBool = AtomicBool::new(false);
+        if CLI_LOGGER_SET
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Release,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        // Best-effort: a CLI subcommand that cannot install a subscriber must
+        // still do its job. Failing the update because logging could not start
+        // would turn a diagnostics problem into an outage.
+        if let Err(e) = crate::tracing::tracer::init_cli_stderr_tracer(level) {
+            eprintln!("Warning: could not initialize logging for this command: {e}");
+        }
+    }
+    #[cfg(not(feature = "trace"))]
+    let _ = level;
+}
+
 pub fn set_logger(
     level: Option<tracing::level_filters::LevelFilter>,
     endpoint: Option<String>,

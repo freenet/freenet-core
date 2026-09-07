@@ -10,7 +10,7 @@ This is the core Freenet software that powers the network.
 - **GitHub**: [github.com/freenet/freenet-core](https://github.com/freenet/freenet-core)
 - **Documentation**: [GitHub README](https://github.com/freenet/freenet-core#readme)
 - **API Docs**: [docs.rs/freenet](https://docs.rs/freenet)
-- **Community**: [Matrix chat](https://matrix.to/#/#freenet:matrix.org)
+- **Community**: [Matrix chat](https://matrix.to/#/#freenet-locutus:matrix.org)
 
 ## Installation
 

@@ -7,8 +7,8 @@
     <img src="https://img.shields.io/crates/v/freenet.svg?style=flat-square"
     alt="Crates.io version" />
   </a>
-  <a href="https://matrix.to/#/#freenet:matrix.org">
-    <img src="https://img.shields.io/matrix/freenet:matrix.org?label=matrix&logo=matrix&style=flat-square" alt="matrix" />
+  <a href="https://matrix.to/#/#freenet-locutus:matrix.org">
+    <img src="https://img.shields.io/matrix/freenet-locutus:matrix.org?label=matrix&logo=matrix&style=flat-square" alt="matrix" />
   </a>
   <a href="https://docs.rs/freenet">
     <img src="https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square&label=api%20docs"
