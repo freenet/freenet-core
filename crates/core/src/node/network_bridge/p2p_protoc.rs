@@ -96,24 +96,36 @@ const QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
 /// `CH_EV_RESPONSE_TIME_OUT` (300 s), so an unbounded await here is the #4549
 /// wedge — a saturated contract handler stalls, then kills, the listener.
 ///
-/// Deliberately the SAME bound as the contract-handler round trips
-/// `handle_broadcast_state_change` makes three lines later on this very arm
-/// (`ring::interest::BROADCAST_CH_TIMEOUT`). An earlier version of this
-/// constant was 2 s, justified as "failing fast to protect the loop" — which
-/// was wrong twice over. The arm is already willing to spend `BROADCAST_CH_TIMEOUT`
-/// per target immediately afterwards, so a tighter cap here protected nothing;
-/// and it was the only one of the two whose expiry LOSES DATA, since it decides
-/// whether a committed write is announced at all. A cap 5x tighter than the
-/// call that follows it, on the only step that can drop a write, is the wrong
-/// way round.
+/// TIGHT ON PURPOSE, and it was briefly widened to `BROADCAST_CH_TIMEOUT`
+/// (10 s) on reasoning that does not hold. Recorded because the reasoning was
+/// plausible and will be re-invented otherwise.
 ///
-/// It also claimed the loop "warns at 100 ms of iteration time", which is not
-/// true of this await: `SLOW_EVENT_THRESHOLD` is measured around
-/// `process_select_result`, and the `NodeAction` dispatch that contains this
-/// arm runs after that elapsed time is taken. A stall here produces no slow-
-/// iteration warning at all, so nothing was observing the cost the tight bound
-/// was supposedly buying.
-const V2_BROADCAST_DRAIN_READ_TIMEOUT: Duration = crate::ring::interest::BROADCAST_CH_TIMEOUT;
+/// The widening argued that `handle_broadcast_state_change`, called three lines
+/// later on this same arm, already spends `BROADCAST_CH_TIMEOUT` per target, so
+/// a tighter cap here protected nothing. **That is false in a production
+/// build.** In production the handler resolves targets in memory and hands off
+/// to `BroadcastQueue::enqueue`, a mutex-guarded push; every
+/// `BROADCAST_CH_TIMEOUT` round trip lives in `broadcast_to_single_peer`, which
+/// runs inside the spawned `drain_lane` workers, OFF this loop. The function
+/// that does await per target inline, `broadcast_state_to_peers`, is
+/// `#[cfg(feature = "simulation_tests")]`. So the comparison was against a path
+/// the shipped binary does not take.
+///
+/// The second argument was that a stall here produces no slow-iteration warning
+/// — `SLOW_EVENT_THRESHOLD` is measured around `process_select_result`, and the
+/// `NodeAction` dispatch containing this arm runs after that elapsed time is
+/// taken. That part is TRUE, and it argues the opposite way: an unobserved
+/// stall needs a tighter bound, not a looser one, because nothing will tell an
+/// operator it happened.
+///
+/// What the bound trades. Expiry drops one broadcast, which is recoverable —
+/// the next write to the contract re-announces it, and anti-entropy repairs it
+/// otherwise. Overrunning starves the network event loop, which processes no
+/// UDP and no connection events while it waits, and that is not recoverable.
+/// The asymmetry matters more than it looks because the coalescing marker is
+/// PER CONTRACT: a delegate writing across N contracts queues N distinct
+/// drains, so the worst case is N times this bound of dead loop, not one.
+const V2_BROADCAST_DRAIN_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Count of V2 delegate broadcasts dropped because the drain could not read
 /// local state.
@@ -154,10 +166,12 @@ fn note_v2_broadcast_drain_dropped(key: &freenet_stdlib::prelude::ContractKey) {
              loop being held by the delegate that made this write — a delegate awaiting user \
              input holds it for a human-scale time and will not be recovered by retries \
              (#5544/#5554 remove that precondition). The write is committed locally; a peer \
-             hosting or using this contract re-learns it within about one anti-entropy \
-             round — up to INTEREST_HEARTBEAT_INTERVAL (300s), and STAGGERED rather than \
-             swept, since the heartbeat spreads its sends across the interval — or sooner \
-             on the delegate's next write. \
+             hosting or using this contract re-learns it EVENTUALLY via anti-entropy, \
+             or sooner on the delegate's next write. Eventually is the honest word: \
+             INTEREST_HEARTBEAT_INTERVAL (300s) is the heartbeat PERIOD, not a recovery \
+             bound — each exchange carries at most MAX_SUMMARY_ENTRIES_PER_MESSAGE \
+             entries, chosen by RANDOM ROTATION when a peer shares more contracts than \
+             that, so a busy node needs several rounds and the count is probabilistic. \
              Logged at power-of-two milestones (#4238)."
         );
     }
@@ -3116,15 +3130,36 @@ impl P2pConnManager {
                                                 // contract, this retry coalesces
                                                 // into it instead of adding a
                                                 // second event.
-                                                if !op_mgr.queue_v2_delegate_broadcast(key) {
-                                                    // The retry never got queued,
-                                                    // so the outcome is the same
-                                                    // as exhausting them: this
-                                                    // write goes unannounced.
-                                                    // Counted and WARNed for that
-                                                    // reason rather than dropped
-                                                    // quietly.
-                                                    note_v2_broadcast_drain_dropped(&key);
+                                                // NOTHING IS COUNTED HERE.
+                                                // This site used to count every
+                                                // non-`Queued` outcome as a
+                                                // dropped broadcast, which was
+                                                // wrong in both directions — see
+                                                // the arms. The drop WARN fires
+                                                // at powers of two, so inflating
+                                                // the counter with benign
+                                                // coalesces pushes the next
+                                                // milestone exponentially out of
+                                                // reach and a genuine drop then
+                                                // logs nothing at all.
+                                                match op_mgr.queue_v2_delegate_broadcast(key) {
+                                                    // The retry did its job.
+                                                    crate::node::op_state_manager::V2BroadcastQueued::Queued => {}
+                                                    // A fresh write queued its
+                                                    // own drain while we slept.
+                                                    // That drain re-reads stored
+                                                    // state, so this write is
+                                                    // announced by it. Nothing
+                                                    // was lost and nothing is
+                                                    // counted.
+                                                    crate::node::op_state_manager::V2BroadcastQueued::Coalesced => {}
+                                                    // A real drop, but already
+                                                    // counted and WARNed inside
+                                                    // the call. Counting it here
+                                                    // too would report one event
+                                                    // twice across two separate
+                                                    // counters.
+                                                    crate::node::op_state_manager::V2BroadcastQueued::EnqueueFailed => {}
                                                 }
                                             });
                                         } else {

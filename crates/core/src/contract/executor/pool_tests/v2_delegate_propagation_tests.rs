@@ -94,7 +94,7 @@ fn take_broadcasts(rx: &mut EventLoopNotificationsReceiver) -> Vec<ContractKey> 
     out
 }
 
-/// #5479: the installed V2 write callback must emit `BroadcastStateChange`
+/// #5479: the installed V2 write callback must emit `V2DelegateStateChanged`
 /// carrying the state that was written.
 ///
 /// Before the fix the callback could not have done this even in principle —
