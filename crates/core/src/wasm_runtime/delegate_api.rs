@@ -476,6 +476,43 @@ mod tests {
             }
         }
 
+        /// Create a DelegateCallEnv wired with BOTH the post-write callback and
+        /// the pre-write admission gate.
+        ///
+        /// The single-hook builders above cannot express a test that observes
+        /// how the two INTERACT — which of them runs first, and whether one
+        /// short-circuiting suppresses the other. See
+        /// `test_env_unchanged_rewrite_still_consults_the_disk_budget_gate`.
+        ///
+        /// # Safety
+        /// Caller must ensure the returned env does not outlive `self`.
+        unsafe fn make_env_with_callback_and_admit(
+            &mut self,
+            cb: super::super::runtime::StateWriteCallback,
+            admit: super::super::runtime::StateAdmitCallback,
+        ) -> DelegateCallEnv {
+            let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
+            // SAFETY: The caller guarantees the returned env does not outlive `self`,
+            // which keeps the borrowed `secret_store` and `contract_store` alive.
+            unsafe {
+                DelegateCallEnv::new(
+                    vec![],
+                    &mut self.secret_store,
+                    &self.contract_store,
+                    Some(self.db.clone()),
+                    Some(cb),
+                    Some(admit),
+                    delegate_key,
+                    &mut self.delegate_store,
+                    0,
+                    vec![],
+                    None,
+                    self.created_delegates_count.clone(),
+                    self.inherited_origins.clone(),
+                )
+            }
+        }
+
         /// Create a DelegateCallEnv with attested contracts for testing attestation inheritance.
         ///
         /// # Safety
@@ -788,12 +825,18 @@ mod tests {
         let contract_id = env_holder.store_contract(120, &[1, 2, 3]).await;
 
         let observed =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, usize)>::new()));
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
         let observed_for_cb = observed.clone();
-        let cb: super::super::runtime::StateWriteCallback =
-            std::sync::Arc::new(move |k: &ContractKey, state_size: usize| {
-                observed_for_cb.lock().unwrap().push((*k, state_size));
-            });
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            move |k: &ContractKey,
+                  new_state: &freenet_stdlib::prelude::WrappedState,
+                  _changed: bool| {
+                observed_for_cb
+                    .lock()
+                    .unwrap()
+                    .push((*k, new_state.as_ref().to_vec()));
+            },
+        );
 
         // SAFETY: `env_holder` is alive for the duration of this test.
         let env = unsafe { env_holder.make_env_with_callback(cb) };
@@ -812,10 +855,12 @@ mod tests {
             "callback must receive the written contract key"
         );
         assert_eq!(
-            calls[0].1, 3,
-            "callback must receive the on-disk state byte count (vec![4, 5, 6] = 3 bytes) — \
-             this pins the StateBytesWritten attribution to the actual write size and would \
-             catch a refactor that hardcodes the size or passes a stale length"
+            calls[0].1,
+            vec![4, 5, 6],
+            "callback must receive the state that was actually written. This pins BOTH the \
+             StateBytesWritten attribution (derived from its length) and the payload of the \
+             BroadcastStateChange the production callback emits (#5479), so a refactor that \
+             reconstructs or re-reads the state instead of passing the written one fails here"
         );
     }
 
@@ -828,12 +873,18 @@ mod tests {
         let contract_id = env_holder.store_contract(121, &[10, 20, 30]).await;
 
         let observed =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, usize)>::new()));
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
         let observed_for_cb = observed.clone();
-        let cb: super::super::runtime::StateWriteCallback =
-            std::sync::Arc::new(move |k: &ContractKey, state_size: usize| {
-                observed_for_cb.lock().unwrap().push((*k, state_size));
-            });
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            move |k: &ContractKey,
+                  new_state: &freenet_stdlib::prelude::WrappedState,
+                  _changed: bool| {
+                observed_for_cb
+                    .lock()
+                    .unwrap()
+                    .push((*k, new_state.as_ref().to_vec()));
+            },
+        );
 
         // SAFETY: `env_holder` is alive for the duration of this test.
         let env = unsafe { env_holder.make_env_with_callback(cb) };
@@ -852,8 +903,247 @@ mod tests {
             "callback must receive the updated contract key"
         );
         assert_eq!(
-            calls[0].1, 3,
-            "callback must receive the on-disk state byte count (vec![40, 50, 60] = 3 bytes)"
+            calls[0].1,
+            vec![40, 50, 60],
+            "callback must receive the state that was actually written — see the PUT sibling"
+        );
+    }
+
+    /// #5479: a byte-identical rewrite must report `content_changed = false`,
+    /// which is what suppresses the network fan-out.
+    ///
+    /// The hook itself still RUNS — that is deliberate and is the fix for the
+    /// eviction race. A V2 write commits to the raw `Storage` before the hook,
+    /// so the bookkeeping legs (notably `Ring::commit_state_write`, whose
+    /// generation bump tells a scheduled `EvictContract` the contract was
+    /// written after it was queued) are owed for a byte-identical rewrite too.
+    /// Only the fan-out is skipped, and the flag is how the hook knows.
+    ///
+    /// The V1 `UpsertResult::NoChange` short-circuit is not a precedent for
+    /// skipping the hook: V1 short-circuits BEFORE writing, so nothing
+    /// committed and nothing is owed.
+    ///
+    /// Every OTHER V2 test in this module writes each contract exactly once,
+    /// and `state_content_changed` returns `true` when no prior state exists —
+    /// so with the filter gutted to `true` the whole suite stayed green. Two
+    /// writes of the same bytes is the smallest shape that observes it.
+    #[tokio::test]
+    async fn test_env_identical_rewrite_reports_no_content_change() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(122, &[1, 2, 3]).await;
+
+        // Record (bytes, content_changed) per invocation.
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(Vec<u8>, bool)>::new()));
+        let observed_for_cb = observed.clone();
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            move |_k: &ContractKey,
+                  new_state: &freenet_stdlib::prelude::WrappedState,
+                  content_changed: bool| {
+                observed_for_cb
+                    .lock()
+                    .unwrap()
+                    .push((new_state.as_ref().to_vec(), content_changed));
+            },
+        );
+
+        // SAFETY: `env_holder` is alive for the duration of this test.
+        let env = unsafe { env_holder.make_env_with_callback(cb) };
+
+        // First write: no stored state matches, so this is a real change.
+        env.put_contract_state_sync(&contract_id, vec![7, 8, 9])
+            .expect("first V2 PUT should succeed");
+        // Second write, same bytes.
+        env.put_contract_state_sync(&contract_id, vec![7, 8, 9])
+            .expect("a byte-identical V2 PUT must still report success");
+        // Third write, changed again — the flag must not latch.
+        env.put_contract_state_sync(&contract_id, vec![7, 8, 10])
+            .expect("a changing V2 PUT after a no-op should succeed");
+
+        let calls = observed.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            3,
+            "the post-write hook must run for EVERY committed write, including a \
+             byte-identical one: the write has already landed in storage, so the \
+             generation bump that guards against an in-flight EvictContract reclaiming \
+             it is owed regardless of whether the content changed"
+        );
+        assert_eq!(
+            calls[0],
+            (vec![7, 8, 9], true),
+            "a first write of new content is a change"
+        );
+        assert_eq!(
+            calls[1],
+            (vec![7, 8, 9], false),
+            "a byte-identical rewrite must report content_changed = false — this is what \
+             suppresses the fan-out, and without it an idempotent delegate becomes one \
+             full network fan-out per message (#5479). If this reads true, \
+             `state_content_changed` has been gutted or bypassed"
+        );
+        assert_eq!(
+            calls[2],
+            (vec![7, 8, 10], true),
+            "a real change following a no-op must report true again — the filter \
+             suppresses, it does not latch"
+        );
+    }
+
+    /// #5479: a V2 write above `MAX_STATE_SIZE` must be rejected, and nothing
+    /// may land.
+    ///
+    /// `StateStore::{store,update}` enforce this ceiling and the V1 commit path
+    /// enforces it again before broadcasting, but the V2 bypass writes through
+    /// the raw `Storage`, which does not. Before #5479 an oversized V2 write was
+    /// a local-disk problem; now the same uncapped `WrappedState` would be cloned
+    /// into a `BroadcastStateChange` and put on the wire, where every recipient
+    /// rejects it at its own guard AFTER paying for the transfer.
+    #[tokio::test]
+    async fn test_env_oversized_state_is_rejected_and_nothing_is_written() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(123, &[1, 2, 3]).await;
+
+        // A callback that would panic if it ever ran: an oversized write must be
+        // refused BEFORE any post-write side effect, so this is unreachable.
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            |_k: &ContractKey, _s: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
+                panic!(
+                    "the post-write hook must not run for a state rejected by \
+                     check_state_size — the broadcast it emits is exactly what \
+                     the size ceiling exists to keep off the wire"
+                );
+            },
+        );
+
+        // SAFETY: `env_holder` is alive for the duration of this test.
+        let env = unsafe { env_holder.make_env_with_callback(cb) };
+
+        let oversized = vec![0u8; super::super::MAX_STATE_SIZE + 1];
+        let result = env.put_contract_state_sync(&contract_id, oversized);
+
+        match result {
+            Err(DelegateEnvError::StateTooLarge { size, limit }) => {
+                assert_eq!(size, super::super::MAX_STATE_SIZE + 1);
+                assert_eq!(limit, super::super::MAX_STATE_SIZE);
+            }
+            other => {
+                panic!("a V2 PUT over MAX_STATE_SIZE must fail with StateTooLarge, got {other:?}")
+            }
+        }
+
+        // `TestEnv::store_contract` seeded this contract with `[1, 2, 3]`, so
+        // asserting that exact value back is stronger than asserting `None`: it
+        // proves the rejected write did not partially overwrite existing state,
+        // not merely that it failed to create new state.
+        assert_eq!(
+            env.get_contract_state_sync(&contract_id).unwrap(),
+            Some(vec![1, 2, 3]),
+            "a rejected oversized V2 PUT must leave the previously-stored state \
+             untouched — the check runs before the raw `Storage` write, so \
+             nothing should have landed"
+        );
+
+        // The delegate-visible outcome, not just the Rust error. An oversized
+        // state is a CALLER error, so it maps to ERR_INVALID_PARAM rather than
+        // the ERR_STORE_ERROR the disk-budget rejection uses — a delegate
+        // branching on the code must be able to tell "you sent me something
+        // impossible" from "my disk is full".
+        assert_eq!(
+            super::super::native_api::delegate_contracts::delegate_env_error_to_code(
+                &DelegateEnvError::StateTooLarge {
+                    size: super::super::MAX_STATE_SIZE + 1,
+                    limit: super::super::MAX_STATE_SIZE,
+                }
+            ),
+            contract_error_codes::ERR_INVALID_PARAM as i64,
+        );
+    }
+
+    /// Gate interaction: a content-UNCHANGED rewrite must still be admitted by
+    /// the disk-budget gate, and suppressing the post-write hook must not
+    /// suppress the gate.
+    ///
+    /// `put_contract_state_sync` runs five sequenced steps — wrap,
+    /// `check_state_size`, `state_content_changed` (a DB read), the
+    /// disk-budget admit callback, `store_state_sync`, then the conditional
+    /// `after_state_write`. Each is covered on its own; nothing pins the
+    /// ORDER, so a reorder that moved the admit gate behind the no-change
+    /// short-circuit would silently stop metering identical rewrites and no
+    /// existing test would notice.
+    #[tokio::test]
+    async fn test_env_unchanged_rewrite_still_consults_the_disk_budget_gate() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(124, &[1, 2, 3]).await;
+
+        let admit_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admit_calls_for_cb = admit_calls.clone();
+        let admit: super::super::runtime::StateAdmitCallback =
+            std::sync::Arc::new(move |_k: &ContractKey, _size: usize, _is_update: bool| {
+                admit_calls_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            });
+
+        let write_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let write_calls_for_cb = write_calls.clone();
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            move |_k: &ContractKey, _s: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
+                write_calls_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+
+        // SAFETY: `env_holder` is alive for the duration of this test.
+        let env = unsafe { env_holder.make_env_with_callback_and_admit(cb, admit) };
+
+        // Rewrite the seeded bytes verbatim: unchanged content, so the
+        // post-write hook is suppressed — but the write still happens.
+        env.put_contract_state_sync(&contract_id, vec![1, 2, 3])
+            .expect("an unchanged V2 PUT should still succeed");
+
+        assert_eq!(
+            admit_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the disk-budget gate must run even for a content-unchanged \
+             rewrite: the raw `Storage` write still happens, so the write \
+             the gate exists to admit is still being made. A reorder that \
+             skipped it here would stop metering identical rewrites"
+        );
+        assert_eq!(
+            write_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the post-write hook must still RUN for unchanged content — the write \
+             committed, so its bookkeeping is owed. What the unchanged case skips is \
+             the fan-out, and the hook decides that from its `content_changed` \
+             argument; see test_env_identical_rewrite_reports_no_content_change"
+        );
+    }
+
+    /// Gate interaction: a state of EXACTLY `MAX_STATE_SIZE` must be admitted.
+    ///
+    /// `check_state_size` rejects `size > MAX_STATE_SIZE`, so the boundary
+    /// value itself is legal. An off-by-one to `>=` would be invisible to the
+    /// oversized test above, which uses `MAX_STATE_SIZE + 1`.
+    #[tokio::test]
+    async fn test_env_state_at_exactly_max_size_is_admitted() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(125, &[1, 2, 3]).await;
+
+        // SAFETY: `env_holder` is alive for the duration of this test.
+        let env = unsafe { env_holder.make_env() };
+
+        let at_limit = vec![0u8; super::super::MAX_STATE_SIZE];
+        let result = env.put_contract_state_sync(&contract_id, at_limit);
+        assert!(
+            result.is_ok(),
+            "a state of exactly MAX_STATE_SIZE is within the ceiling and must \
+             be accepted — `check_state_size` rejects `> MAX_STATE_SIZE`, not \
+             `>=`. Got {result:?}"
+        );
+        assert_eq!(
+            env.get_contract_state_sync(&contract_id)
+                .unwrap()
+                .map(|s| s.len()),
+            Some(super::super::MAX_STATE_SIZE),
+            "the boundary-size state must actually have landed"
         );
     }
 
@@ -986,10 +1276,13 @@ mod tests {
         // Wire the PRODUCTION invalidator as the callback — the exact shape used
         // in `Executor::from_config` / `from_config_with_shared_modules`.
         let invalidator = state_store.cache_invalidator();
-        let cb: super::super::runtime::StateWriteCallback =
-            std::sync::Arc::new(move |k: &ContractKey, _size: usize| {
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            move |k: &ContractKey,
+                  _new_state: &freenet_stdlib::prelude::WrappedState,
+                  _changed: bool| {
                 invalidator.invalidate(k);
-            });
+            },
+        );
 
         {
             // SAFETY: `env_holder` is alive for the duration of this test. The
@@ -1041,10 +1334,13 @@ mod tests {
         assert!(state_store.cached_state_hash(&key).is_some());
 
         let invalidator = state_store.cache_invalidator();
-        let cb: super::super::runtime::StateWriteCallback =
-            std::sync::Arc::new(move |k: &ContractKey, _size: usize| {
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            move |k: &ContractKey,
+                  _new_state: &freenet_stdlib::prelude::WrappedState,
+                  _changed: bool| {
                 invalidator.invalidate(k);
-            });
+            },
+        );
 
         {
             // SAFETY: see the PUT sibling test above (scoped to drop before the
@@ -1080,12 +1376,18 @@ mod tests {
         env_holder.contract_store.ensure_key_indexed(&key).unwrap();
 
         let observed =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, usize)>::new()));
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
         let observed_for_cb = observed.clone();
-        let cb: super::super::runtime::StateWriteCallback =
-            std::sync::Arc::new(move |k: &ContractKey, state_size: usize| {
-                observed_for_cb.lock().unwrap().push((*k, state_size));
-            });
+        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
+            move |k: &ContractKey,
+                  new_state: &freenet_stdlib::prelude::WrappedState,
+                  _changed: bool| {
+                observed_for_cb
+                    .lock()
+                    .unwrap()
+                    .push((*k, new_state.as_ref().to_vec()));
+            },
+        );
 
         // SAFETY: `env_holder` is alive for the duration of this test.
         let env = unsafe { env_holder.make_env_with_callback(cb) };
