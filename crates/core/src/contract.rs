@@ -4670,26 +4670,255 @@ mod tests {
     /// Used by the chokepoint pin to check what runs OFF the loop. Panics on a
     /// spawn form it does not recognise, so a new one is reviewed rather than
     /// silently skipped.
+    ///
+    /// THAT SENTENCE USED TO BE FALSE, in the two independent ways a scan like
+    /// this can be false, and both were demonstrated against the real file:
+    ///
+    ///  * It matched the fixed literals `spawn(` and `spawn_blocking(`, so any
+    ///    other spawn token was not matched AT ALL — not panicked on, skipped.
+    ///    `tokio::task::spawn_local(async move { .. })` placed inside
+    ///    `dispatch_delegate_request` (an ALLOWED function, so checks 1 and 2
+    ///    are satisfied) left the chokepoint pin GREEN, while the identical
+    ///    injection written `GlobalExecutor::spawn(` went red. `spawn_on`,
+    ///    `spawn_pinned` and `spawn_local` are all that shape, and enumerating
+    ///    `spawn_blocking(` as a second literal was itself evidence that the
+    ///    prefix problem was already known.
+    ///  * It bound the task body to "the first `{` within 40 characters after
+    ///    the paren", which is a guess about layout, not about syntax. Handing
+    ///    a pre-built future to a RECOGNISED spawn —
+    ///    `let fut = async move { .. }; GlobalExecutor::spawn(fut);` followed
+    ///    by any short block — latched the scan onto that unrelated block and
+    ///    never scanned the future at all. Also green.
+    ///
+    /// So the scan is now anchored on SYNTAX at both ends. Every identifier
+    /// containing `spawn` that is applied as a call is a candidate, and its
+    /// first argument must be a literal block-producing expression — `async
+    /// {`, `async move {`, a closure — whose brace is where the body starts.
+    /// Anything else reaches the panic the paragraph above promises, which is
+    /// the point: an unfamiliar spawn form is a thing to review, not a thing to
+    /// skip.
     pub(super) fn spawned_bodies(code: &str) -> Vec<&str> {
-        let mut out = Vec::new();
-        for pattern in ["spawn(", "spawn_blocking("] {
-            for (idx, m) in code.match_indices(pattern) {
-                let arg_start = idx + m.len();
-                let rel = code[arg_start..].find('{').unwrap_or_else(|| {
-                    panic!("a `{pattern}` at byte {idx} is never followed by a block")
-                });
-                assert!(
-                    rel < 40,
-                    "unrecognised spawn form at byte {idx}: this pin bounds a \
-                     spawned task by the block it is handed, and no block \
-                     follows within 40 characters. Teach it the new form rather \
-                     than letting a spawned task go unscanned."
-                );
-                let open = arg_start + rel;
-                out.push(&code[open..end_of_block(code, open)]);
+        fn is_ident(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        fn skip_ws(code: &str, mut i: usize) -> usize {
+            while code
+                .as_bytes()
+                .get(i)
+                .is_some_and(|b| b.is_ascii_whitespace())
+            {
+                i += 1;
             }
+            i
+        }
+        /// Consume `kw` at `i`, but only where it is a WHOLE identifier — so
+        /// `moved` is not read as `move` and the scan does not walk into the
+        /// middle of a name.
+        fn eat_kw(code: &str, i: usize, kw: &str) -> Option<usize> {
+            let end = i + kw.len();
+            let boundary = !code.as_bytes().get(end).copied().is_some_and(is_ident);
+            (code.get(i..end) == Some(kw) && boundary).then_some(end)
+        }
+
+        let bytes = code.as_bytes();
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(rel) = code[cursor..].find("spawn") {
+            let hit = cursor + rel;
+            // Widen to the whole identifier this occurrence sits in, so the
+            // candidate set is "every spawn-family name" rather than a list
+            // somebody has to remember to extend.
+            let mut start = hit;
+            while start > 0 && is_ident(bytes[start - 1]) {
+                start -= 1;
+            }
+            let mut name_end = hit + "spawn".len();
+            while bytes.get(name_end).copied().is_some_and(is_ident) {
+                name_end += 1;
+            }
+            cursor = name_end;
+            // Only a CALL spawns anything. A mention of the name in a type, a
+            // path or a binding spawns no task and has no body to scan.
+            if bytes.get(name_end) != Some(&b'(') {
+                continue;
+            }
+            let ident = &code[start..name_end];
+
+            let mut i = skip_ws(code, name_end + 1);
+            if let Some(next) = eat_kw(code, i, "async") {
+                i = skip_ws(code, next);
+            }
+            if let Some(next) = eat_kw(code, i, "move") {
+                i = skip_ws(code, next);
+            }
+            if bytes.get(i) == Some(&b'|') {
+                let close = i
+                    + 1
+                    + code[i + 1..].find('|').unwrap_or_else(|| {
+                        panic!(
+                            "`{ident}` at byte {start} opens a closure parameter \
+                             list that is never closed"
+                        )
+                    });
+                i = skip_ws(code, close + 1);
+            }
+            assert_eq!(
+                bytes.get(i),
+                Some(&b'{'),
+                "unrecognised spawn form: `{ident}` at byte {start} is not \
+                 handed a literal block (`async {{`, `async move {{`, or a \
+                 closure). This pin bounds a spawned task by the block it is \
+                 given, so a task handed a pre-built future or a named function \
+                 would go UNSCANNED — and an unscanned spawn is exactly how a \
+                 delegate run gets off the serial loop without this pin \
+                 noticing. Teach it the new form rather than letting it skip."
+            );
+            out.push(&code[i..end_of_block(code, i)]);
         }
         out
+    }
+
+    /// Whether the `fn ` at `at` opens a DECLARATION, rather than appearing in
+    /// a function-pointer type (`f: fn (u8)`), a path, or a string. True when
+    /// everything between the start of that line and `at` is whitespace or a
+    /// declaration modifier.
+    pub(super) fn is_fn_declaration(code: &str, at: usize) -> bool {
+        let line_start = code[..at].rfind('\n').map_or(0, |i| i + 1);
+        code[line_start..at].split_whitespace().all(|tok| {
+            matches!(tok, "async" | "const" | "unsafe" | "extern" | "pub")
+                || tok.starts_with("pub(")
+                || tok.starts_with('"') // extern "C"
+        })
+    }
+
+    /// The name of the nearest preceding `fn` DECLARATION, whatever modifiers
+    /// precede it, or `""` when there is none.
+    ///
+    /// THE SAME DEFECT AS `spawned_bodies`', one scan over, and it was live.
+    /// The version this replaced anchored on `"\nfn "` and `"\nasync fn "` —
+    /// a declaration in column 0 with no visibility prefix. This file's
+    /// production text contains `pub(crate) async fn contract_handling`,
+    /// `pub(crate) fn set_off_loop_fetch_override` and a dozen indented `impl`
+    /// methods, none of which that scan can see. So a
+    /// `.execute_delegate_request(` placed in a new `pub async fn` declared
+    /// immediately after an ALLOWED function was attributed to that allowed
+    /// function, and both of the chokepoint pin's first two checks passed.
+    /// `fn_region`'s own rustdoc already warns about this exact needle ("it
+    /// misses `pub async fn`, `pub(crate) async fn` and every other visibility
+    /// prefix"); the warning had simply never been applied here.
+    pub(super) fn enclosing_fn(code: &str, idx: usize) -> &str {
+        code[..idx]
+            .match_indices("fn ")
+            .filter(|(i, _)| is_fn_declaration(code, *i))
+            .last()
+            .map(|(i, m)| {
+                let after = &code[i + m.len()..];
+                after
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or("")
+            })
+            .unwrap_or("")
+    }
+
+    /// The scrape helpers above are themselves guards, so they get guards.
+    ///
+    /// Every one of these cases was found GREEN against the real file by a
+    /// post-merge audit of #5554 — that is, the chokepoint pin passed while the
+    /// invariant it names was violated. They are unit tests on synthetic source
+    /// rather than injections into this file because that is the only form that
+    /// SURVIVES: a one-off injection verifies the scan once, on the day it is
+    /// done, and this workstream has now found four separate pins that passed
+    /// while their invariant was broken. A scan nobody can re-falsify is the
+    /// thing that keeps going wrong.
+    #[test]
+    fn the_spawn_scan_sees_every_spawn_family_call() {
+        // The literal `spawn(`/`spawn_blocking(` list matched none of these, so
+        // each was silently skipped rather than reaching the panic the rustdoc
+        // promises. `spawn_local` is the one the audit actually demonstrated.
+        for token in [
+            "GlobalExecutor::spawn",
+            "tokio::task::spawn_local",
+            "tokio::task::spawn_blocking",
+            "handle.spawn_on",
+            "pool.spawn_pinned",
+        ] {
+            let code = format!("async fn allowed() {{ {token}(async move {{ NEEDLE }}); }}");
+            let bodies = spawned_bodies(&code);
+            assert_eq!(bodies.len(), 1, "`{token}` must be scanned, not skipped");
+            assert!(
+                bodies[0].contains("NEEDLE"),
+                "`{token}`'s task body must be what is scanned, got {:?}",
+                bodies[0]
+            );
+        }
+    }
+
+    /// A mention of a spawn-family name that is not a CALL spawns nothing, so
+    /// it must not be scanned — and must not panic either, or the pin fails on
+    /// perfectly ordinary code and gets softened by the next person to hit it.
+    #[test]
+    fn the_spawn_scan_ignores_names_that_are_not_calls() {
+        let code = "fn f() { let spawn_handle: JoinHandle<()> = h; drop(spawn_handle); }";
+        assert!(spawned_bodies(code).is_empty());
+    }
+
+    /// A closure body is a task body: `spawn_blocking(move || { .. })` must be
+    /// scanned through the parameter list, not stop at it.
+    #[test]
+    fn the_spawn_scan_bounds_a_closure_body() {
+        let code = "fn f() { spawn_blocking(move || { NEEDLE }); }";
+        let bodies = spawned_bodies(code);
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("NEEDLE"));
+    }
+
+    /// The second audit defeat, and the subtler one: it uses a RECOGNISED spawn
+    /// token. Bounding the body by "the first `{` within 40 characters" is a
+    /// guess about layout, so handing the spawn a pre-built future latched the
+    /// scan onto an unrelated nearby block and never scanned the task at all.
+    /// The scan must PANIC here, which is what its rustdoc has always claimed.
+    #[test]
+    #[should_panic(expected = "unrecognised spawn form")]
+    fn a_spawn_handed_a_prebuilt_future_panics_instead_of_scanning_the_next_block() {
+        let code = "fn f() { let fut = async move { NEEDLE }; \
+                    GlobalExecutor::spawn(fut); if c { let _x = 1; } }";
+        let _ = spawned_bodies(code);
+    }
+
+    /// The owner scan must see a declaration behind a visibility prefix. Where
+    /// it does not, a call in the new function is attributed to whichever
+    /// prefix-free declaration happens to precede it — which for a function
+    /// declared just after the chokepoint is the chokepoint itself, so checks 1
+    /// and 2 both report a true answer about the wrong function.
+    #[test]
+    fn the_owner_scan_sees_declarations_behind_a_visibility_prefix() {
+        for decl in [
+            "fn evil",
+            "async fn evil",
+            "pub fn evil",
+            "pub async fn evil",
+            "pub(crate) async fn evil",
+            "pub(super) fn evil",
+            "    fn evil", // an indented `impl` method
+        ] {
+            let code = format!("async fn allowed() {{}}\n{decl}() {{ NEEDLE }}\n");
+            let idx = code.find("NEEDLE").expect("needle");
+            assert_eq!(
+                enclosing_fn(&code, idx),
+                "evil",
+                "`{decl}` must be recognised as the enclosing declaration"
+            );
+        }
+    }
+
+    /// ...and must NOT mistake a function-pointer type or a path for one, or it
+    /// reports a nonsense owner and the pin fails on correct code.
+    #[test]
+    fn the_owner_scan_ignores_fn_that_is_not_a_declaration() {
+        let code = "async fn allowed() {\n    let f: fn (u8) = g;\n    NEEDLE\n}\n";
+        let idx = code.find("NEEDLE").expect("needle");
+        assert_eq!(enclosing_fn(code, idx), "allowed");
     }
 
     /// PIN: the NODE-WIDE "one delegate `process()` at a time" invariant, held
@@ -4725,30 +4954,23 @@ mod tests {
     /// chokepoint, or — the case checks 1 and 2 could not see — put either
     /// call inside a `GlobalExecutor::spawn` body WITHIN one of the four
     /// allowed functions. All three fail. Verified by doing all three.
+    ///
+    /// Two further falsifications, added after a post-merge audit found this
+    /// pin GREEN under both. Each defeated a SCAN rather than the property, so
+    /// the fix was to the scan and each now has its own unit test beside the
+    /// helper it belongs to:
+    ///  * `tokio::task::spawn_local(async move { ..chokepoint.. })` inside an
+    ///    allowed function — an unenumerated spawn token, skipped rather than
+    ///    panicked on (see `spawned_bodies`);
+    ///  * `.execute_delegate_request(` in a new `pub async fn` declared
+    ///    immediately after the chokepoint — a declaration form the owner scan
+    ///    could not see (see `enclosing_fn`).
     #[test]
     fn every_delegate_run_is_reached_from_the_serial_loop() {
         // Production text only, comments stripped. Both needles occur in this
         // test's own prose and in the module's doc comments, and a scrape that
         // counted those would report a true fact about the wrong text (#5450).
         let code = production_code();
-
-        // The nearest preceding `fn` declaration at statement position.
-        fn enclosing_fn(code: &str, idx: usize) -> &str {
-            code[..idx]
-                .rmatch_indices("\nfn ")
-                .next()
-                .into_iter()
-                .chain(code[..idx].rmatch_indices("\nasync fn ").next())
-                .max_by_key(|(i, _)| *i)
-                .map(|(i, m)| {
-                    let after = &code[i + m.len()..];
-                    after
-                        .split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .next()
-                        .unwrap_or("")
-                })
-                .unwrap_or("")
-        }
 
         // 1. The executor call is reached through ONE chokepoint.
         let chokepoint = "handle_delegate_with_contract_requests";
@@ -4993,6 +5215,17 @@ mod tests {
     ///  2. the notification path — which has no connection and therefore
     ///     hardcodes `Local` — is `InterDelegateDispatch::Suppressed`, so that
     ///     hardcoded value can never reach the hop.
+    ///
+    /// KNOWN LIMIT, the same one carried by
+    /// `consent_prompt_identity_comes_from_the_gated_origin`: property 1 is a
+    /// claim about the TOKEN at the call site, not about the value it carries.
+    /// It forbids the literal `ConnectionScope::Local` in the hop's arguments,
+    /// which rebinding `connection_scope` to that literal beforehand satisfies
+    /// while laundering the scope exactly as the literal would have. What it
+    /// does catch — the hop being changed to hardcode a scope, and the
+    /// scopeless notification path being allowed to reach it — is what it is
+    /// for; do not read it as proving the forwarded value is the originating
+    /// one.
     #[test]
     fn inter_delegate_hop_forwards_the_originating_scope() {
         // Comments stripped (`production_code`): without that, commenting the
@@ -5058,6 +5291,15 @@ mod tests {
     /// the gate being deleted or moved below its consumer, which it does. The
     /// region is bounded to the function so the pin cannot match its own
     /// assertion strings further down the file.
+    ///
+    /// KNOWN LIMIT, so nobody reads this as stronger than it is: it asserts
+    /// POSITION — the gate is present and precedes its consumer — and nothing
+    /// about dataflow. Re-shadowing `origin_contract` with the ungated value
+    /// between the two (`let origin_contract = raw_origin;`) leaves both
+    /// `find`s satisfied and the ordering true while the gate is inert, and
+    /// this pin stays green. Only a reader or a behavioural test closes that;
+    /// keep the gate as the LAST binding of `origin_contract` before the
+    /// prompt.
     ///
     /// It scrapes `production_code()`, which strips comments, and that is
     /// load-bearing rather than tidiness: the earlier version scraped raw text,
