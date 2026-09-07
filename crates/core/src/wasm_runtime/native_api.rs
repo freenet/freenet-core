@@ -525,9 +525,14 @@ pub(super) struct DelegateCallEnv {
     /// you got the wrong path, or a Poly1305 tag that would not verify. The
     /// AEAD was the backstop. With the memo, the same edit silently returns the
     /// PREVIOUS identity's plaintext — in hosted mode, cross-tenant
-    /// disclosure. Nothing does this today; the point is that nothing can start
-    /// to without tripping
-    /// `the_call_env_identity_fields_are_never_reassigned`.
+    /// disclosure.
+    ///
+    /// What holds it is the TYPE SYSTEM, not a convention: `context` is behind
+    /// a `RefCell`, so nothing needs a `&mut DelegateCallEnv`, so no field is
+    /// rebindable by any means — not assignment, not `mem::swap`, not
+    /// `clone_from`, not a `&mut` reborrow. Reintroducing a mutable borrow is
+    /// what would reopen this, and `no_mutable_borrow_of_the_call_env_exists`
+    /// is the pin over that one remaining route.
     delegate_key: DelegateKey,
     /// Optional per-user secret namespace for this call, derived ONCE at the
     /// WS connection boundary from the connection's user token (hosted mode,
@@ -545,8 +550,9 @@ pub(super) struct DelegateCallEnv {
     /// Like [`delegate_key`](Self::delegate_key), this must never be reassigned
     /// after construction: [`secret_read_memo`](Self::secret_read_memo) is keyed
     /// on the secret hash ALONE, which is only sound because the scope this
-    /// field selects is fixed for the whole call. Pinned by
-    /// `the_call_env_identity_fields_are_never_reassigned`.
+    /// field selects is fixed for the whole call. Held by the same mechanism:
+    /// no `&mut DelegateCallEnv` exists, so nothing can rebind this either.
+    /// See `no_mutable_borrow_of_the_call_env_exists`.
     user_context: Option<UserSecretContext>,
     /// Read-only pointer to the ContractStore for index lookups
     /// (ContractInstanceId → CodeHash). Valid only during synchronous process().
