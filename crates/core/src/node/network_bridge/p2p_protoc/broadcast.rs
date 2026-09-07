@@ -164,6 +164,50 @@ impl P2pConnManager {
     /// Base delay between broadcast retries (scaled by attempt number for linear backoff).
     const BROADCAST_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
+    /// Maximum retry attempts when a V2 delegate broadcast drain cannot read
+    /// the state it was going to send.
+    ///
+    /// Deliberately small, and deliberately NOT a fix for the whole failure.
+    /// The read is a `GetQuery` to the serial `contract_handling` loop, and the
+    /// event being drained was queued by a delegate write that ran ON that
+    /// loop — so the read waits for the delegate that caused it. Retrying
+    /// recovers a delegate that was merely busy for a few seconds.
+    ///
+    /// It does NOT recover a delegate that requests user input:
+    /// `handle_delegate_with_contract_requests` awaits `prompter.prompt(..)`
+    /// inline on that loop, so the hold is human-scale and three retries over a
+    /// few seconds cannot outlast it. That case is not retried into
+    /// submission — it is reported, counted, and healed by anti-entropy.
+    /// #5544/#5554 remove the precondition by parking delegates off the loop.
+    pub(super) const MAX_V2_DRAIN_RETRIES: u8 = 3;
+
+    /// Base delay between V2 drain retries, scaled by attempt number.
+    pub(super) const V2_DRAIN_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+
+    /// Decide whether a V2 drain retry happens, and after how long.
+    ///
+    /// Split out from the dispatch arm for the same reason `classify_drain_read`
+    /// was split out of the read: the policy is the part with a decision in it,
+    /// and inline in a `match` arm of the select loop it is unreachable from any
+    /// test. Source-order pins can assert the shape of that arm; only this can
+    /// assert that retries actually stop at the cap and that the jitter stays in
+    /// its documented band.
+    ///
+    /// `jitter_pct` is a parameter rather than a `GlobalRng` call inside, so the
+    /// arithmetic is deterministic under test while production still supplies a
+    /// random factor.
+    ///
+    /// Returns `None` once `attempts_so_far` has reached
+    /// [`Self::MAX_V2_DRAIN_RETRIES`], i.e. the caller must give up.
+    pub(super) fn plan_v2_drain_retry(attempts_so_far: u8, jitter_pct: u64) -> Option<Duration> {
+        if attempts_so_far >= Self::MAX_V2_DRAIN_RETRIES {
+            return None;
+        }
+        let attempt = attempts_so_far + 1;
+        let base = Self::V2_DRAIN_RETRY_BASE_DELAY * u32::from(attempt);
+        Some(base.mul_f64(jitter_pct as f64 / 100.0))
+    }
+
     /// Maximum entries in the no-target streak tracker. Prevents unbounded growth
     /// from network-influenced contract keys.
     const MAX_BROADCAST_STREAK_ENTRIES: usize = 256;

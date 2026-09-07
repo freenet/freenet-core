@@ -493,14 +493,17 @@ pub(super) struct DelegateCallEnv {
     /// contract state synchronously via host functions. ReDb is Arc<Database>
     /// internally, so cloning is cheap.
     state_store_db: Option<Storage>,
-    /// Optional callback invoked AFTER a successful V2 delegate state write
-    /// (`put_contract_state_sync` / `update_contract_state_sync`). Closes the
-    /// EvictContract re-host race for the V2 delegate write path by bumping
-    /// the per-contract generation token and refreshing the hosting-cache
-    /// snapshot — the V2 path bypasses the executor `state_store.{store,update}`
-    /// chokepoints where the four executor-side bump+refresh sites live, so
-    /// without this hook the V2 path leaves the race open. See
-    /// `super::runtime::StateWriteCallback`.
+    /// Optional callback invoked AFTER a successful, content-CHANGING V2
+    /// delegate state write (`put_contract_state_sync` /
+    /// `update_contract_state_sync`). The V2 path bypasses the executor's
+    /// `state_store.{store,update}` chokepoints, so this hook re-applies what
+    /// they do: it invalidates `StateStore`'s caches, bumps the per-contract
+    /// generation and refreshes the hosting-cache snapshot (closing the
+    /// EvictContract re-host race), reports StateBytesWritten, records the
+    /// contract-update timestamp, and — for a write that CHANGED the stored
+    /// bytes — queues the key-only `NodeEvent::V2DelegateStateChanged` that
+    /// propagates it (#5479). See `super::runtime::StateWriteCallback` and
+    /// `after_state_write`.
     state_write_callback: Option<super::runtime::StateWriteCallback>,
     /// Pre-write disk-budget admission gate for V2 delegate writes (#4683,
     /// PR 3). Runs BEFORE the raw `Storage` write in
@@ -552,6 +555,9 @@ pub(super) enum DelegateEnvError {
     StorageError(String),
     /// Pre-write disk-budget admission gate rejected the V2 write (#4683).
     DiskBudgetExceeded(String),
+    /// The state exceeds `MAX_STATE_SIZE`. Enforced here because the V2 path
+    /// bypasses `StateStore::{store,update}`, where the ceiling normally lives.
+    StateTooLarge { size: usize, limit: usize },
 }
 
 /// Errors that can occur during delegate creation via `create_delegate_sync`.
@@ -835,6 +841,169 @@ impl DelegateCallEnv {
         }
     }
 
+    /// Reject a V2 delegate write whose state exceeds `MAX_STATE_SIZE`.
+    ///
+    /// `StateStore::{store,update}` enforce this ceiling, and the V1 commit
+    /// path enforces it again before broadcasting. The V2 bypass writes
+    /// through the raw `Storage`, which does not — so before #5479 an
+    /// oversized V2 write was a local-disk problem, and after it the same
+    /// uncapped `WrappedState` would reach the fan-out and go on the wire,
+    /// where every recipient rejects it at its own guard AFTER paying for the
+    /// transfer. Enforcing it here, next to the disk-budget gate, keeps the
+    /// ceiling where the write is. (The queued event itself carries no state,
+    /// but the drain reads this value back and broadcasts it, so the ceiling is
+    /// still what keeps an oversized state off the wire.)
+    fn check_state_size(state_size: usize) -> Result<(), DelegateEnvError> {
+        if state_size > crate::wasm_runtime::MAX_STATE_SIZE {
+            return Err(DelegateEnvError::StateTooLarge {
+                size: state_size,
+                limit: crate::wasm_runtime::MAX_STATE_SIZE,
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether `new_state` differs from what is already stored for `key`.
+    ///
+    /// The V1 path never reaches commit-or-broadcast for a byte-identical
+    /// apply — `bridged_upsert_contract_state_inner` short-circuits to
+    /// `UpsertResult::NoChange`, and that filter is load-bearing rather than
+    /// incidental (`ring::broadcast_coverage` records that no-change applies
+    /// are ~97% of received contract bytes). Without the same filter here, the
+    /// ordinary delegate shape "on each message, recompute my state and store
+    /// it" — idempotent, writing identical bytes most of the time — would go
+    /// from zero network fan-out to one full fan-out per message. That is a
+    /// self-inflicted storm needing no attacker, so it is checked, at the cost
+    /// of one ReDb read per V2 write (the V1 path reads the current state
+    /// too).
+    ///
+    /// A read error is reported as CHANGED: failing towards an extra
+    /// broadcast is recoverable, failing towards a silent drop is the bug
+    /// #5479 is about.
+    ///
+    /// # This read and the write that follows it are NOT atomic
+    ///
+    /// The comparison happens here; the write happens further down
+    /// `put_contract_state_sync` / `update_contract_state_sync`. Nothing holds
+    /// a lock across the two, and this code owns nothing that makes the pair
+    /// safe. **Correctness depends on delegate `process()` being GLOBALLY
+    /// serialized by the contract-handling loop** — `execute_delegate_request`
+    /// is reached only from `handle_delegate_with_contract_requests`, whose
+    /// call sites all `await` it inline on that single-task loop with no
+    /// spawn, so two V2 delegate writes cannot run concurrently on a node.
+    ///
+    /// Were that to change, this gate could suppress a REAL change. The
+    /// interleaving is not the symmetric one it looks like: writer A whose own
+    /// bytes happen to equal what it reads decides "no change" and will
+    /// suppress; writer B then commits and broadcasts different bytes; A then
+    /// writes its own bytes and stays silent. Local state ends at A's value
+    /// while the network last heard B's, and nothing re-announces it until the
+    /// next write or the anti-entropy heartbeat. That is precisely the
+    /// idempotent-rewrite workload this gate exists to catch, so the racy case
+    /// would be the common case rather than an exotic one.
+    ///
+    /// # Per-delegate exclusion would NOT be enough
+    ///
+    /// Read this before concluding some newer delegate-concurrency mechanism
+    /// already covers this gate. **The racing pair is two DIFFERENT delegates
+    /// writing the same contract**, so an exclusion that serializes each
+    /// delegate against itself leaves the race fully intact. Only GLOBAL
+    /// serialization of delegate execution — or an atomic compare-and-write
+    /// here — closes it.
+    ///
+    /// #5544 (implemented by #5554) removes a node-wide stall by moving work
+    /// off this loop, and **preserves the global serialization above**: the
+    /// off-loop task captures neither a `ContractHandler` nor an executor, so
+    /// it structurally cannot invoke a delegate — its jobs (awaiting a human,
+    /// driving a sub-op GET) need neither, and a resumed `process()` always
+    /// runs back on the loop. Parking therefore opens a window in which a
+    /// different delegate may START, not one in which two may RUN. The gate
+    /// stays safe across that change.
+    ///
+    /// # The durable fix
+    ///
+    /// The guarantee above is an unenforced property of the contract-handling
+    /// loop, not an invariant this code holds. Nothing here fails if a future
+    /// change breaks it. The durable fix is to make the compare-and-write
+    /// atomic — fold the comparison into the same ReDb write transaction as
+    /// the store, the way `update_state_sync` already does its check-and-write
+    /// — so this gate stops depending on a caller-side property at all.
+    fn state_content_changed(
+        &self,
+        contract_key: &ContractKey,
+        new_state: &freenet_stdlib::prelude::WrappedState,
+    ) -> bool {
+        let Some(ref db) = self.state_store_db else {
+            return true;
+        };
+        match db.get_state_sync(contract_key) {
+            Ok(Some(existing)) => existing.as_ref() != new_state.as_ref(),
+            Ok(None) => true,
+            Err(e) => {
+                tracing::debug!(
+                    contract = %contract_key,
+                    error = %e,
+                    "could not read the stored state to test for a no-op V2 write; \
+                     treating it as changed"
+                );
+                true
+            }
+        }
+    }
+
+    /// The post-write sequence every V2 delegate state write owes, in one
+    /// place.
+    ///
+    /// A V2 write goes straight through the raw `Storage`, bypassing the
+    /// executor's `state_store.{store,update}` chokepoints — so every side
+    /// effect those chokepoints perform has to be re-applied here, and the
+    /// one that gets forgotten is silent. That has already happened twice:
+    /// the disk-budget admission gate (#4683) and network propagation
+    /// (#5479, where a V2 write returned success and the network never
+    /// learned of it). Hence one helper called from both write paths rather
+    /// than the sequence hand-inlined at each — the "manually-inlined
+    /// originator side effects" row in
+    /// `.claude/rules/bug-prevention-patterns.md`.
+    ///
+    /// Everything here is best-effort: the write has already committed, and
+    /// nothing below is worth rolling it back for. The installed callback
+    /// (see `super::runtime::StateWriteCallback` and
+    /// `contract::executor::runtime::v2_delegate_state_write_callback`)
+    /// invalidates the `StateStore` caches, runs `Ring::commit_state_write`,
+    /// and — only when `content_changed` — queues the fan-out that propagates
+    /// the write.
+    fn after_state_write(
+        &self,
+        contract_key: &ContractKey,
+        new_state: &freenet_stdlib::prelude::WrappedState,
+        content_changed: bool,
+    ) {
+        if !content_changed {
+            tracing::debug!(
+                contract = %contract_key,
+                event = "v2_delegate_write_no_content_change",
+                "V2 delegate rewrote identical state; no fan-out"
+            );
+        }
+        // ALWAYS invoked, including for a byte-identical rewrite — the hook
+        // decides for itself what the unchanged case skips.
+        //
+        // The V1 `UpsertResult::NoChange` short-circuit is NOT a precedent for
+        // returning early here, and the difference is the whole point: V1
+        // short-circuits BEFORE writing, so nothing committed and there is
+        // nothing to record. The V2 path has already written to the raw
+        // `Storage` by the time this runs, so the bookkeeping the hook performs
+        // — in particular `Ring::commit_state_write`, whose generation bump is
+        // what tells a scheduled `EvictContract` that the contract was written
+        // after it was queued (`pool.rs::remove_contract` guard 3) — is owed
+        // whether or not the CONTENT changed. Skipping it left a committed
+        // write invisible to that guard, so an in-flight eviction could reclaim
+        // a contract that had just been written.
+        if let Some(cb) = &self.state_write_callback {
+            cb(contract_key, new_state, content_changed);
+        }
+    }
+
     /// Store (PUT) contract state by instance ID.
     ///
     /// The contract's code hash must already be registered in the ContractStore
@@ -852,13 +1021,17 @@ impl DelegateCallEnv {
         };
 
         let contract_key = self.resolve_contract_key(instance_id)?;
-        // Capture the byte count BEFORE the move into store_state_sync —
-        // the callback needs it for governance attribution. The
-        // bug-prevention-patterns rule about "Manually-inlined originator
-        // side effects after a task-per-tx migration" applies here too:
-        // a future refactor that drops state_size from the callback path
-        // would silently undercount StateBytesWritten for V2 delegate PUT.
-        let state_size = state.len();
+        // Wrap BEFORE the admission gate so exactly one value is admitted,
+        // written, and handed to the post-write hook — `WrappedState` is
+        // `Arc<Vec<u8>>`, so the clone into `store_state_sync` below is a
+        // refcount bump, not a state copy. The "manually-inlined originator
+        // side effects" row in `.claude/rules/bug-prevention-patterns.md`
+        // applies here: a refactor that reconstructs the state for the hook
+        // instead of passing the written one is how these paths drift.
+        let new_state = freenet_stdlib::prelude::WrappedState::new(state);
+        let state_size = new_state.as_ref().len();
+        Self::check_state_size(state_size)?;
+        let content_changed = self.state_content_changed(&contract_key, &new_state);
 
         // Disk-budget admission gate (#4683): the V2 path bypasses the executor
         // `state_store` chokepoint where the gate normally runs, so apply it here
@@ -872,21 +1045,10 @@ impl DelegateCallEnv {
             }
         }
 
-        db.store_state_sync(
-            &contract_key,
-            freenet_stdlib::prelude::WrappedState::new(state),
-        )
-        .map_err(|e| DelegateEnvError::StorageError(e.to_string()))?;
+        db.store_state_sync(&contract_key, new_state.clone())
+            .map_err(|e| DelegateEnvError::StorageError(e.to_string()))?;
 
-        // V2 delegate write chokepoint: this path bypasses the executor's
-        // `state_store.store` call site where the bump+refresh+report
-        // happen. The callback (when wired) mirrors those side effects
-        // via `Ring::commit_state_write`. Failure here is best-effort —
-        // the write has already committed and we don't want to roll it
-        // back over a counter bump.
-        if let Some(cb) = &self.state_write_callback {
-            cb(&contract_key, state_size);
-        }
+        self.after_state_write(&contract_key, &new_state, content_changed);
 
         Ok(())
     }
@@ -905,9 +1067,11 @@ impl DelegateCallEnv {
         };
 
         let contract_key = self.resolve_contract_key(instance_id)?;
-        // Capture byte count BEFORE the move — same reason as
-        // put_contract_state_sync above.
-        let state_size = state.len();
+        // Wrap before the admission gate — see `put_contract_state_sync`.
+        let new_state = freenet_stdlib::prelude::WrappedState::new(state);
+        let state_size = new_state.as_ref().len();
+        Self::check_state_size(state_size)?;
+        let content_changed = self.state_content_changed(&contract_key, &new_state);
 
         // Disk-budget admission gate (#4683): apply the executor-chokepoint gate
         // that the V2 path bypasses, BEFORE the raw write. This is a V2 UPDATE —
@@ -923,18 +1087,9 @@ impl DelegateCallEnv {
         }
 
         // Atomic check-and-write in a single ReDb write transaction.
-        match db.update_state_sync(
-            &contract_key,
-            freenet_stdlib::prelude::WrappedState::new(state),
-        ) {
+        match db.update_state_sync(&contract_key, new_state.clone()) {
             Ok(true) => {
-                // V2 delegate write chokepoint: mirror the executor's
-                // `state_store.update` bump+refresh+report side effects
-                // via `Ring::commit_state_write`. See
-                // `put_contract_state_sync` for the rationale.
-                if let Some(cb) = &self.state_write_callback {
-                    cb(&contract_key, state_size);
-                }
+                self.after_state_write(&contract_key, &new_state, content_changed);
                 Ok(())
             }
             Ok(false) => Err(DelegateEnvError::NoExistingState),
@@ -2064,6 +2219,20 @@ pub(super) mod delegate_contracts {
             // A disk-budget rejection is a store-capacity failure from the
             // delegate's perspective — map to the generic store-error code.
             DelegateEnvError::DiskBudgetExceeded(_) => contract_error_codes::ERR_STORE_ERROR as i64,
+            // The delegate handed us a state larger than the protocol allows.
+            // That is a caller error, not a store failure, so it maps to
+            // ERR_INVALID_PARAM rather than ERR_STORE_ERROR — and to an
+            // EXISTING code rather than a new one, because a new negative
+            // return value is a wire-visible change to the V2 delegate API
+            // that a delegate branching on codes would not expect.
+            DelegateEnvError::StateTooLarge { size, limit } => {
+                tracing::warn!(
+                    state_size = size,
+                    limit,
+                    "V2 delegate write rejected: state exceeds MAX_STATE_SIZE"
+                );
+                contract_error_codes::ERR_INVALID_PARAM as i64
+            }
         }
     }
 
