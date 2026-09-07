@@ -1208,16 +1208,44 @@ impl DelegateParkCtx {
             .min()
     }
 
-    /// Keys whose park has outlived [`PARK_TTL`].
+    /// Keys whose park has outlived [`PARK_TTL`] AND whose result is not
+    /// already in the loop's hands.
     ///
     /// Returned rather than acted on so the caller (which owns the executor and
     /// the channel) performs the force-resume; this keeps the registry a pure
     /// data structure and unit-testable without a loop.
-    pub(super) fn expired(&self, now: tokio::time::Instant) -> Vec<(DelegateKey, u64)> {
+    ///
+    /// `already_delivered` is the loop's buffer of resumes it has taken off
+    /// `delegate_resume_rx` but not yet run. **A park listed there must not be
+    /// swept**, and this is the load-bearing half of the signature (#5554).
+    /// The sweep ends a park WITHOUT consuming the off-loop task's
+    /// [`ParkGuard`], so a resume that arrives afterwards is rejected by
+    /// [`Self::take_matching`] on epoch and dropped — including everything it
+    /// carries. That payload is `deliver()`'s output, which is where a human's
+    /// answer lives: force-resuming a park whose guard has ALREADY delivered
+    /// throws away the `UserResponse` the user gave and re-enters the delegate
+    /// with `inbound: Vec::new()`, so it is told nothing about the prompt it
+    /// asked — not even a denial. The backstop exists for a park that produced
+    /// NOTHING; one that produced an answer is not wedged, it is queued, and it
+    /// runs on the next iteration.
+    ///
+    /// Matching is by `(key, epoch)`, not key alone: a buffered resume from an
+    /// EARLIER park of the same delegate (one the backstop already swept) is
+    /// stale, carries nothing the live park is owed, and must not shield it.
+    pub(super) fn expired(
+        &self,
+        now: tokio::time::Instant,
+        already_delivered: &VecDeque<DelegateResume>,
+    ) -> Vec<(DelegateKey, u64)> {
         let mut out: Vec<(DelegateKey, u64)> = self
             .parked
             .iter()
             .filter(|(_, entry)| now.duration_since(entry.parked_at) >= PARK_TTL)
+            .filter(|(key, entry)| {
+                !already_delivered
+                    .iter()
+                    .any(|resume| resume.epoch == entry.epoch && resume.delegate_key == **key)
+            })
             .map(|(key, entry)| (key.clone(), entry.epoch))
             .collect();
         // Deterministic order: `HashMap` iteration is arbitrary, and a sweep
@@ -1542,15 +1570,151 @@ mod tests {
 
         tokio::time::advance(PARK_TTL - Duration::from_secs(1)).await;
         assert!(
-            ctx.expired(tokio::time::Instant::now()).is_empty(),
+            ctx.expired(tokio::time::Instant::now(), &VecDeque::new())
+                .is_empty(),
             "must not expire early — a park cut short would report a spurious \
              failure for work that was about to succeed"
         );
 
         tokio::time::advance(Duration::from_secs(2)).await;
         assert_eq!(
-            ctx.expired(tokio::time::Instant::now()),
+            ctx.expired(tokio::time::Instant::now(), &VecDeque::new()),
             vec![(k.clone(), ctx.epoch_of(&k).expect("parked"))]
+        );
+    }
+
+    /// #5554: the backstop must NOT sweep a park whose resume is already in the
+    /// loop's hands — because sweeping it throws away a human's Allow.
+    ///
+    /// This is the one case the rest of the suite could not see. The guard tests
+    /// prove `deliver()` preserves the answer the user gave;
+    /// `a_stale_resume_from_a_force_resumed_park_is_rejected` proves a resume
+    /// arriving after a sweep is DISCARDED (correct, from the registry's point
+    /// of view). Neither asks what the discarded resume was CARRYING. Put both
+    /// facts in one room and the answer is gone: the sweep ends the park without
+    /// consuming the guard, the guard's resume is then rejected on epoch, and
+    /// the delegate is re-entered with `inbound: Vec::new()` — told nothing
+    /// about the prompt it asked, which for a delegate that branches on the
+    /// answer is worse than a denial.
+    ///
+    /// It is reachable in ordinary operation: `PARK_WORK_BUDGET < PARK_TTL`
+    /// guarantees the off-loop TASK finishes in time, NOT that the loop DRAINS
+    /// its resume in time. The drain is capped at `MAX_RESUME_DRAIN_BATCH` (16)
+    /// while one `handle_delegate_resume` can cost 25 runs, and the sweep runs
+    /// in the same iteration, immediately after.
+    ///
+    /// FALSIFY by dropping the `already_delivered` filter from `expired`: the
+    /// first assertion then reports the park as expired. The third assertion is
+    /// the counterfactual that keeps the first from passing vacuously — with an
+    /// empty buffer this very park IS swept, so the exclusion is doing the work.
+    #[tokio::test(start_paused = true)]
+    async fn the_backstop_leaves_a_park_whose_answer_is_already_in_hand() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = DelegateParkCtx::new(tx.clone());
+        let k = key(1);
+        let ParkAdmission::Admitted { epoch } = ctx.park(k.clone(), continuation(), 0) else {
+            panic!("park must be admitted");
+        };
+
+        // The human clicks Allow and the off-loop task's guard delivers.
+        let (answers, fetches) = sinks();
+        answers.lock().unwrap().push(answer(1));
+        drop(ParkGuard::new(
+            tx,
+            k.clone(),
+            epoch,
+            vec![1],
+            Vec::new(),
+            answers,
+            fetches,
+        ));
+
+        // The loop takes it off the channel but runs out of budget before
+        // running it, so it sits in the buffer — and the park is still parked.
+        let mut buffered: VecDeque<DelegateResume> = VecDeque::new();
+        while let Ok(resume) = rx.try_recv() {
+            buffered.push_back(resume);
+        }
+        assert_eq!(buffered.len(), 1, "the guard must have delivered a resume");
+
+        tokio::time::advance(PARK_TTL + Duration::from_secs(1)).await;
+        assert!(
+            ctx.expired(tokio::time::Instant::now(), &buffered)
+                .is_empty(),
+            "a park whose resume is already buffered is QUEUED, not wedged; \
+             force-resuming it discards the answer that resume is carrying \
+             (#5554)"
+        );
+
+        // ...and what it is carrying really is the human's answer, not a denial.
+        let InboundDelegateMsg::UserResponse(response) = buffered[0]
+            .inbound
+            .iter()
+            .find(|m| matches!(m, InboundDelegateMsg::UserResponse(r) if r.request_id == 1))
+            .expect("the buffered resume must carry the answer for request 1")
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            &response.response[..],
+            b"allow".as_slice(),
+            "this is the answer the sweep would have thrown away"
+        );
+
+        // The counterfactual: the park IS past its TTL. Without the buffer to
+        // consult, the backstop sweeps it — so the exclusion above is load-
+        // bearing rather than a park that was never expiring.
+        assert_eq!(
+            ctx.expired(tokio::time::Instant::now(), &VecDeque::new()),
+            vec![(k.clone(), epoch)],
+            "the park really is past PARK_TTL"
+        );
+    }
+
+    /// The exclusion matches on `(key, epoch)`, not key alone.
+    ///
+    /// A buffered resume from an EARLIER park of the same delegate is stale: its
+    /// park was already ended, it carries nothing the CURRENT park is owed, and
+    /// letting it shield the current one would disarm the backstop for exactly
+    /// the delegate that has already needed it once — a genuinely wedged park
+    /// would then stay wedged forever.
+    ///
+    /// FALSIFY by dropping the `resume.epoch == entry.epoch` half of the filter:
+    /// the sweep then returns empty.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_buffered_resume_does_not_shield_the_current_park() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = DelegateParkCtx::new(tx);
+        let k = key(1);
+
+        let ParkAdmission::Admitted { epoch: first } = ctx.park(k.clone(), continuation(), 0)
+        else {
+            panic!("first park must be admitted");
+        };
+        // The backstop ended park #1; the delegate re-parked.
+        assert!(ctx.take_matching(&k, first).is_some());
+        let ParkAdmission::Admitted { epoch: second } = ctx.park(k.clone(), continuation(), 0)
+        else {
+            panic!("second park must be admitted");
+        };
+
+        // Park #1's guard finally fires, and its resume lands in the buffer.
+        let mut buffered: VecDeque<DelegateResume> = VecDeque::new();
+        buffered.push_back(DelegateResume {
+            delegate_key: k.clone(),
+            epoch: first,
+            cause: ResumeCause::Completed,
+            inbound: vec![answer(1)],
+            upserts: Vec::new(),
+            unresolved_upserts: Vec::new(),
+        });
+
+        tokio::time::advance(PARK_TTL + Duration::from_secs(1)).await;
+        assert_eq!(
+            ctx.expired(tokio::time::Instant::now(), &buffered),
+            vec![(k.clone(), second)],
+            "a resume for the PREVIOUS park says nothing about this one; the \
+             backstop must still fire"
         );
     }
 

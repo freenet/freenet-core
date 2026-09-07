@@ -1946,6 +1946,14 @@ where
     let (delegate_resume_tx, mut delegate_resume_rx) =
         tokio::sync::mpsc::unbounded_channel::<delegate_park::DelegateResume>();
     let mut park_ctx = delegate_park::DelegateParkCtx::new(delegate_resume_tx);
+    // Resumes taken off `delegate_resume_rx` but not yet run, because the
+    // per-iteration budget ran out. Held here rather than left in the channel
+    // so the TTL backstop below can SEE them: a park whose answer is already in
+    // hand must not be force-resumed (#5554). Bounded by the same thing that
+    // bounds the channel — one resume per park, parks capped at
+    // MAX_PARKED_DELEGATES plus the guards of already-swept parks.
+    let mut delegate_resumes: std::collections::VecDeque<delegate_park::DelegateResume> =
+        std::collections::VecDeque::new();
 
     loop {
         // Drain resumed (deferred) upserts so a completed off-loop fetch is
@@ -1969,10 +1977,24 @@ where
         // iteration for the same reason as the deferred-upsert drain — each
         // resume re-enters WASM — and interleaved with the fair queue so
         // resumes cannot head-of-line-block ordinary contract ops.
+        //
+        // Read the channel ONCE, up front, into `delegate_resumes`, and make
+        // both of this iteration's decisions from that buffer: which resumes to
+        // run now (bounded, below) and which parks the TTL backstop may
+        // force-resume (further below). Deciding them from one snapshot is what
+        // stops the backstop sweeping a park whose answer is already in hand —
+        // see `DelegateParkCtx::expired`, which discards a human's response if
+        // that happens (#5554). The buffer is what makes the two decisions
+        // consistent: the budget can leave resumes unrun (one resume costs up
+        // to 25 runs against a budget of 16), and the sweep runs in the SAME
+        // iteration, immediately after.
+        while let Ok(resume) = delegate_resume_rx.try_recv() {
+            delegate_resumes.push_back(resume);
+        }
         let mut resume_budget = MAX_RESUME_DRAIN_BATCH;
         while resume_budget > 0 {
-            match delegate_resume_rx.try_recv() {
-                Ok(resume) => {
+            match delegate_resumes.pop_front() {
+                Some(resume) => {
                     // Spend the WHOLE cost, including the pending requests
                     // drained behind the park — each is a full delegate run
                     // (#5544 S5).
@@ -1985,14 +2007,19 @@ where
                     .await;
                     resume_budget = resume_budget.saturating_sub(runs.max(1));
                 }
-                Err(_) => break,
+                None => break,
             }
         }
 
         // Backstop sweep for parks that neither completed nor were dropped
         // (see `PARK_TTL`). Force-resume them so a wedged delegate cannot stay
         // wedged: the resume drains its pending queue and answers its client.
-        for (delegate_key, epoch) in park_ctx.expired(tokio::time::Instant::now()) {
+        // Parks whose resume is sitting in `delegate_resumes` are EXCLUDED by
+        // `expired` — they are queued, not wedged, and force-resuming one loses
+        // the answer it is carrying (#5554).
+        for (delegate_key, epoch) in
+            park_ctx.expired(tokio::time::Instant::now(), &delegate_resumes)
+        {
             // Force-resume the park we OBSERVED, by epoch. The off-loop task's
             // ParkGuard is untouched and still owes a resume; carrying the epoch
             // is what lets that late resume be recognised as stale and dropped
@@ -2103,6 +2130,17 @@ where
                 Some(&mut park_ctx),
             )
             .await?;
+            continue;
+        }
+
+        // Buffered delegate resumes are work already in hand: never block in
+        // the select while any remain, or they would wait on UNRELATED traffic
+        // to wake the loop — and each one is holding a client responder, and
+        // possibly a human's answer, until it runs (#5554). The top of the next
+        // iteration drains at least one (the budget starts at
+        // MAX_RESUME_DRAIN_BATCH and every run costs at least 1), so this
+        // cannot spin: the buffer strictly shrinks.
+        if !delegate_resumes.is_empty() {
             continue;
         }
 
@@ -7234,20 +7272,24 @@ mod hol_4391_tests {
     ///
     /// LIMITATION, stated rather than papered over: this asserts the DEADLINE
     /// computation and that the loop consults it, not an end-to-end sweep on an
-    /// idle node. A decisive end-to-end test is not reachable today, because
-    /// `PARK_WORK_BUDGET` (75s) is deliberately below `PARK_TTL` (90s) so the
-    /// `ParkGuard` always resumes the park first — which is what makes the TTL a
-    /// backstop rather than a timeout. Reaching the sweep would need a park with
-    /// no live guard, which no production path can currently produce. The value
-    /// of the fix is that IF that ever becomes reachable, the backstop works.
+    /// idle node.
+    ///
+    /// An earlier version of this comment went further and said the sweep was
+    /// unreachable in production, because `PARK_WORK_BUDGET` (75s) is below
+    /// `PARK_TTL` (90s) so "the `ParkGuard` always resumes the park first".
+    /// **That was wrong, and it is the reasoning that hid #5554.** The budget
+    /// bounds when the off-loop TASK finishes; it says nothing about when the
+    /// loop DRAINS the resume the task produced. The drain is capped at
+    /// `MAX_RESUME_DRAIN_BATCH` (16) while one `handle_delegate_resume` can cost
+    /// 25 runs, so a resume can wait iterations while its park ages past the
+    /// TTL — a park with a guard that has already fired, which is exactly the
+    /// case the old sentence said could not exist. See
+    /// `delegate_park::tests::the_backstop_leaves_a_park_whose_answer_is_already_in_hand`.
     #[test]
     fn park_sweep_deadline_is_armed_and_the_loop_waits_on_it() {
         // The loop must consult the deadline, not sweep only on other traffic.
         let src = include_str!("contract.rs");
-        let body = src
-            .split("pub(crate) async fn contract_handling")
-            .nth(1)
-            .expect("contract_handling must exist");
+        let body = contract_handling_body(src);
         assert!(
             body.contains("park_ctx.next_sweep_deadline()"),
             "contract_handling must compute the park sweep deadline"
@@ -7256,6 +7298,72 @@ mod hol_4391_tests {
             body.contains("tokio::time::sleep_until(deadline)"),
             "the idle select! must WAIT on the park sweep deadline, or the \
              backstop cannot fire without unrelated traffic (#5544 B6)"
+        );
+    }
+
+    /// The text of `contract_handling`, bounded to that function.
+    ///
+    /// `include_str!` pulls in this test module too, so an unbounded
+    /// `split(signature).nth(1)` runs to EOF and a pin over it can be satisfied
+    /// by the pin's own assertion literal. The `\n}\n` end anchor is the
+    /// top-level closing brace: everything inside the function is indented.
+    fn contract_handling_body(src: &str) -> &str {
+        let start = src
+            .find("pub(crate) async fn contract_handling")
+            .expect("contract_handling must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("contract_handling must have a top-level closing brace");
+        &body[..end]
+    }
+
+    /// #5554: the TTL backstop must decide from the resumes the loop has ALREADY
+    /// taken off the channel, not from the registry alone.
+    ///
+    /// The registry-level guarantee is in
+    /// `delegate_park::tests::the_backstop_leaves_a_park_whose_answer_is_already_in_hand`:
+    /// `expired` excludes a park whose resume is in the buffer, because
+    /// force-resuming it discards the `UserResponse` that resume is carrying.
+    /// This pins the WIRING that makes the guarantee reachable — the loop must
+    /// actually drain into that buffer, and must do it BEFORE it sweeps.
+    /// Draining after the sweep would type-check and be exactly the bug.
+    ///
+    /// It also pins that a non-empty buffer never reaches the blocking
+    /// `select!`: those resumes are work in hand, each holding a client
+    /// responder, and waiting for unrelated traffic to wake the loop is the
+    /// stall this whole change exists to remove.
+    ///
+    /// FALSIFY by moving the drain below the sweep, or by deleting either the
+    /// drain or the `continue` guard.
+    #[test]
+    fn the_ttl_sweep_decides_from_the_resumes_the_loop_already_took() {
+        let src = include_str!("contract.rs");
+        let squashed: String = contract_handling_body(src)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        let drain =
+            "whileletOk(resume)=delegate_resume_rx.try_recv(){delegate_resumes.push_back(resume);}";
+        let sweep = "park_ctx.expired(tokio::time::Instant::now(),&delegate_resumes)";
+        let no_idle_with_work = "if!delegate_resumes.is_empty(){continue;}";
+
+        let drain_at = squashed.find(drain).unwrap_or_else(|| {
+            panic!("the loop must take every resume the channel holds into its buffer (#5554)")
+        });
+        let sweep_at = squashed.find(sweep).unwrap_or_else(|| {
+            panic!("the backstop sweep must consult that buffer, or it force-resumes parks whose answer is already in hand (#5554)")
+        });
+        assert!(
+            drain_at < sweep_at,
+            "the drain must run BEFORE the sweep: a buffer filled afterwards \
+             cannot protect the park the sweep just ended (#5554)"
+        );
+        assert!(
+            squashed.contains(no_idle_with_work),
+            "the loop must not block in the select! while buffered resumes \
+             remain — each is holding a client responder (#5554)"
         );
     }
 
