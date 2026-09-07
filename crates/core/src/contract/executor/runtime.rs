@@ -2984,42 +2984,99 @@ mod state_write_attribution_pin_tests {
     /// real code — the heuristic is: the line is not a comment AND the
     /// needle does not appear inside a double-quoted string on that line.
     fn count_call_sites(src: &str, needle: &str) -> usize {
-        src.lines()
-            .filter(|line| {
-                let trimmed = line.trim_start();
-                if trimmed.starts_with("//") {
-                    return false;
-                }
-                // Strip everything between matched double quotes so we
-                // don't count needle occurrences inside string literals
-                // (the test's own assertion messages contain the needles).
-                let stripped = strip_string_literals(line);
-                stripped.contains(needle)
-            })
-            .count()
+        let code = strip_comments_and_strings(src);
+        code.lines().filter(|line| line.contains(needle)).count()
     }
 
-    /// Replace the contents of every `"..."` on the line with empty
-    /// quotes so substring searches on the result skip string literals.
-    /// Handles escaped quotes pragmatically (rare in this codebase).
-    fn strip_string_literals(line: &str) -> String {
-        let mut out = String::with_capacity(line.len());
+    /// Blank out every COMMENT and every STRING LITERAL in `src`, preserving
+    /// line structure so line-based counting still works.
+    ///
+    /// # Why this replaced a line-prefix filter
+    ///
+    /// The previous version skipped a line only when its trimmed start was
+    /// `//`, and blanked string literals per line. That left two ways to
+    /// satisfy a pin without the code it guards:
+    ///
+    /// 1. **Block comments.** `/* op_manager.ring.record_contract_update(key); */`
+    ///    does not begin with `//`, so the needle stayed visible and the pin
+    ///    stayed green while the call was inert. A reviewer demonstrated this
+    ///    against `one_v2_delegate_write_callback_shared_by_both_executor_constructors`
+    ///    by block-commenting the call and watching it pass.
+    /// 2. **Trailing comments.** `foo(); // ... .commit_state_write() ...` has
+    ///    real code before the `//`, so the line was scanned in full and the
+    ///    needle inside the comment counted as a call site — which inflates an
+    ///    exact-count pin and can mask a genuine deletion.
+    ///
+    /// Both are the same defect: a scraper that skips SOME comments is not
+    /// skipping comments. That shape has now been found five times in this
+    /// workstream, which is why this is a single scanner rather than another
+    /// filter refinement.
+    ///
+    /// KNOWN LIMIT: raw strings (`r#"..."#`) are not recognised, so a needle
+    /// inside one would still count. None of the scraped sources contains one
+    /// (verified); if that changes, this needs a raw-string state.
+    fn strip_comments_and_strings(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut chars = src.chars().peekable();
         let mut in_string = false;
-        let mut prev_was_backslash = false;
-        for c in line.chars() {
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+        let mut prev_backslash = false;
+
+        while let Some(c) = chars.next() {
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                    out.push('\n');
+                }
+                continue;
+            }
+            if in_block_comment {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block_comment = false;
+                } else if c == '\n' {
+                    // Keep the newline so a multi-line block comment does not
+                    // splice two code lines into one.
+                    out.push('\n');
+                }
+                continue;
+            }
             if in_string {
-                if c == '"' && !prev_was_backslash {
+                if prev_backslash {
+                    prev_backslash = false;
+                } else if c == '\\' {
+                    prev_backslash = true;
+                } else if c == '"' {
                     in_string = false;
                     out.push('"');
                 }
-                // drop characters inside the string
-            } else if c == '"' {
+                if c == '\n' {
+                    out.push('\n');
+                }
+                continue;
+            }
+            if c == '/' {
+                match chars.peek() {
+                    Some('/') => {
+                        chars.next();
+                        in_line_comment = true;
+                        continue;
+                    }
+                    Some('*') => {
+                        chars.next();
+                        in_block_comment = true;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if c == '"' {
                 in_string = true;
                 out.push('"');
-            } else {
-                out.push(c);
+                continue;
             }
-            prev_was_backslash = c == '\\' && !prev_was_backslash;
+            out.push(c);
         }
         out
     }
