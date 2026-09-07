@@ -2157,15 +2157,33 @@ where
         // shrink for that to hold.
         //
         // SECOND, LOAD-BEARING JOB (#5554): this `continue` is also what keeps
-        // a DECLINED sweep from spinning the select. The sweep can now decline
-        // a past-due park, so `next_sweep_deadline()` can stay in the past
-        // across an iteration — and `sleep_until` on a past deadline returns
+        // a DECLINED sweep from spinning the select. The sweep can decline a
+        // past-due park, so `next_sweep_deadline()` can stay in the past across
+        // an iteration — and `sleep_until` on a past deadline returns
         // immediately, which would be a hot wake loop. It cannot reach the
         // select: declining requires the park's resume to be in
         // `delegate_resumes`, nothing between here and there pops from it, so
         // the buffer is non-empty and this fires before the deadline is even
         // computed. Keep the two together; moving this below `park_deadline`
         // would reopen it.
+        //
+        // THE SWEEP'S BUDGET IS A SECOND WAY TO LEAVE THE DEADLINE IN THE PAST,
+        // and this guard does NOT cover it — say so rather than let the
+        // paragraph above be read as covering both. A budget-deferred park
+        // leaves nothing in `delegate_resumes`, so the select is reached with a
+        // past deadline and wakes immediately. That is not a spin, and the
+        // reason is different from the one above: reaching the select with a
+        // past-due park left over means the sweep spent its whole budget, and
+        // every unit of that budget is charged only when `take_matching`
+        // succeeded — i.e. a park was actually ended. So each such wake does up
+        // to MAX_RESUME_DRAIN_BATCH delegate runs and strictly reduces the
+        // past-due set, and the fair queue gets a turn between them, which is
+        // the point of capping rather than looping inside the sweep.
+        //
+        // The zero-progress case is the one to check, and it is unreachable:
+        // spending nothing while past-due parks remain means every victim
+        // declined, and declining puts the resume in `delegate_resumes`, so
+        // this guard fires and the deadline is never computed.
         if !delegate_resumes.is_empty() {
             continue;
         }
@@ -8044,6 +8062,12 @@ mod hol_4391_tests {
     /// runtime behaviour in between. Position is the right tool for exactly
     /// this shape and the wrong tool for the other; the lesson was never "never
     /// assert order".
+    ///
+    /// SCOPE, since the sweep now has a budget: this guard covers the DECLINED
+    /// sweep only. A park deferred for budget leaves nothing in
+    /// `delegate_resumes` and does reach the select with a past deadline — that
+    /// is bounded by the budget being charged only for parks actually ended,
+    /// not by this guard, and the loop comment says so at more length.
     ///
     /// FALSIFY by deleting the `continue` guard, commenting it out, or moving
     /// it below `park_ctx.next_sweep_deadline()`.
