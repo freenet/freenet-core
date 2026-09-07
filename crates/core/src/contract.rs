@@ -7807,6 +7807,160 @@ mod hol_4391_tests {
         }
     }
 
+    /// A `ResolvedUpsert` for a PUT of `contract` whose off-loop fetch of
+    /// `related` came back as `fetched`.
+    fn resolved_put(
+        contract: ContractContainer,
+        related: ContractInstanceId,
+        fetched: Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>,
+    ) -> delegate_park::ResolvedUpsert {
+        delegate_park::ResolvedUpsert {
+            pending: delegate_park::PendingUpsert {
+                key: contract.key(),
+                update: Either::Left(WrappedState::new(b"a_state".to_vec())),
+                related_contracts: RelatedContracts::default(),
+                code: Some(contract),
+                is_put: true,
+                context: DelegateContext::default(),
+                missing: vec![related],
+            },
+            fetched,
+        }
+    }
+
+    /// The SUCCESS arm of `apply_resolved_upsert` — the happy path of one of
+    /// the two stalls #5544 removes, and it had no coverage at all.
+    ///
+    /// Found by mutation, not by reading: replacing
+    /// `Ok(UpsertOutcome::Completed(r)) => Ok(r)` with an unconditional `Err`
+    /// survived a fully green 5465-test suite. The only test that reaches this
+    /// function, `deferred_delegate_upsert_does_not_block_the_loop`, installs a
+    /// stub that ALWAYS resolves to `Err(missing_related)`, so `fetched` is
+    /// never `Ok` and the entire inject-and-rerun branch is unexecuted. That
+    /// test is decisive about the deferral HAPPENING; it says nothing about the
+    /// resume working.
+    ///
+    /// The regression that shipped undetected: a delegate PUT or UPDATE whose
+    /// related contracts ARE fetched successfully off-loop is told its write
+    /// failed — while the write lands. The delegate then sees an error for a
+    /// state change that actually happened, which is worse than either
+    /// outcome on its own.
+    ///
+    /// **Asserting that the state landed would NOT catch that**, which is why
+    /// this asserts the delegate-visible response instead: the store happens
+    /// inside `upsert_contract_state_deferrable`, BEFORE the arm that maps its
+    /// outcome, so the mutated arm still writes. What this arm decides is what
+    /// the DELEGATE is told.
+    ///
+    /// The same assertion also covers the other half of the branch: delete the
+    /// `inject_related_state` loop and the re-run's validate asks for the
+    /// related contract again, which the depth-1 cap converts to
+    /// `MissingRelated` — so the response goes to `Err` and this fails too.
+    ///
+    /// FALSIFY: map `Completed` to `Err`, or delete the injection loop.
+    #[tokio::test]
+    async fn a_resolved_delegate_upsert_reports_success_to_the_delegate() {
+        let _guard = TEST_GUARD.lock().await;
+
+        let contract_a = make_contract(b"resolved_upsert_a");
+        let key_a = contract_a.key();
+        let id_b = *make_contract(b"resolved_upsert_b").key().id();
+
+        // A asks for B once; once B's state is injected it validates.
+        let (mut handler, _send) = build_handler(vec![(
+            *key_a.id(),
+            ValidateOverride::RequestRelated(vec![id_b]),
+        )])
+        .await;
+
+        // The off-loop fetch SUCCEEDED — the case no other test constructs.
+        let resolved = resolved_put(
+            contract_a,
+            id_b,
+            Ok(vec![(id_b, WrappedState::new(b"b_state".to_vec()))]),
+        );
+        let msg = apply_resolved_upsert(&mut handler, resolved).await;
+
+        let InboundDelegateMsg::PutContractResponse(response) = msg else {
+            panic!("a resolved PUT must answer with PutContractResponse, got {msg:?}");
+        };
+        assert_eq!(
+            response.contract_id,
+            *key_a.id(),
+            "the response must name the contract the delegate asked about"
+        );
+        assert_eq!(
+            response.result,
+            Ok(()),
+            "a delegate whose related contracts WERE fetched must be told its \
+             write succeeded; reporting failure for a write that landed leaves \
+             the delegate acting on a state change it believes did not happen"
+        );
+    }
+
+    /// The depth-1 cap in the same function: a resumed upsert that asks for a
+    /// DIFFERENT, still-absent related contract is refused, not deferred a
+    /// second time.
+    ///
+    /// Unexecuted for the same reason as the success arm — nothing reached
+    /// `Ok(states)` — and it is the bound that stops a contract deferring
+    /// indefinitely while holding its delegate's exclusion open (#5544 B4).
+    /// Without it the park never ends and the loop is back to waiting on the
+    /// network, which is the stall this whole change removes.
+    ///
+    /// It has to ask for a contract that is NOT present, and that is the whole
+    /// difficulty. My first attempt used `AlwaysRequestRelated` for the SAME
+    /// contract the fetch had just resolved, and it never reached this arm: the
+    /// executor found the injected state, re-validated, and returned its own
+    /// `Err` for "additional related contracts after first round" — so the
+    /// function took the plain `Err(err) => Err(err)` arm and the test asserted
+    /// a true fact about a different branch. Naming a contract that was never
+    /// fetched is what makes `upsert_contract_state_deferrable` return
+    /// `Ok(DeferRelated(..))`, which is the input this arm exists to handle.
+    ///
+    /// The contrast with the test above is what keeps both non-vacuous: same
+    /// fixture, same successful fetch, and the only difference is whether the
+    /// contract asks for something new.
+    ///
+    /// FALSIFY: map `DeferRelated` to `Ok(...)`, or defer a second time.
+    #[tokio::test]
+    async fn a_resumed_upsert_needing_a_further_contract_is_refused_not_deferred_twice() {
+        let _guard = TEST_GUARD.lock().await;
+
+        let contract_a = make_contract(b"resolved_upsert_greedy_a");
+        let key_a = contract_a.key();
+        let id_b = *make_contract(b"resolved_upsert_greedy_b").key().id();
+        // Never fetched, never injected, never local.
+        let id_c = *make_contract(b"resolved_upsert_greedy_c").key().id();
+
+        // Whatever it is given, A asks for C — which nothing has resolved.
+        let (mut handler, _send) = build_handler(vec![(
+            *key_a.id(),
+            ValidateOverride::AlwaysRequestRelated(vec![id_c]),
+        )])
+        .await;
+
+        let resolved = resolved_put(
+            contract_a,
+            id_b,
+            Ok(vec![(id_b, WrappedState::new(b"b_state".to_vec()))]),
+        );
+        let msg = apply_resolved_upsert(&mut handler, resolved).await;
+
+        let InboundDelegateMsg::PutContractResponse(response) = msg else {
+            panic!("a resolved PUT must answer with PutContractResponse, got {msg:?}");
+        };
+        let err = response
+            .result
+            .expect_err("a second deferral must NOT be reported to the delegate as success");
+        assert!(
+            err.contains(&id_c.to_string()),
+            "the refusal must name the contract that could not be resolved — C, \
+             the one still missing, not B which was fetched — or the delegate \
+             cannot tell which dependency failed; got {err}"
+        );
+    }
+
     /// The second half of #5544: a delegate PUT whose contract asks for a
     /// related contract this node lacks used to await a network GET INLINE, up
     /// to RELATED_FETCH_TIMEOUT (10s), on the same serial loop. Smaller than
