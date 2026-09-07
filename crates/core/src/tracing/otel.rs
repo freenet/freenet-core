@@ -1445,6 +1445,115 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter, sources: RingSou
         })
         .build();
 
+    // Bootstrap-acceptance-churn counters (#4787): a restarted node's
+    // gateway connection lingers as transient, expires, and is reaped as a
+    // zombie before the onward CONNECT promotes it to the ring, cycling the
+    // joiner through repeated reconnects. Instrumentation only (the issue's
+    // "before a fix" step) — no acceptance behavior changes here. ACCEPTOR
+    // side: `event` distinguishes the transient lifecycle sites; a sustained
+    // high `transient_expired`:`promoted_to_ring` ratio is the churn
+    // signature. `promoted_to_ring` covers BOTH promotion paths and counts
+    // only promotions the ring actually accepted.
+    let _bootstrap_churn = meter
+        .u64_observable_counter("freenet.bootstrap.churn")
+        .with_description(
+            "Acceptor-side transient connection registration/expiry/promotion \
+             totals since startup (bootstrap-acceptance-churn instrumentation, #4787)",
+        )
+        .with_callback(move |observer| {
+            if let Some(status) = (sources.status_scalars)() {
+                observer.observe(
+                    status.bootstrap_transient_registered,
+                    &[KeyValue::new("event", "transient_registered")],
+                );
+                observer.observe(
+                    status.bootstrap_transient_expired,
+                    &[KeyValue::new("event", "transient_expired")],
+                );
+                observer.observe(
+                    status.bootstrap_promoted_to_ring,
+                    &[KeyValue::new("event", "promoted_to_ring")],
+                );
+            }
+        })
+        .build();
+
+    // JOINER side (#4787): time from process start to first reaching
+    // `min_connections`. The clock is anchored at
+    // `network_status::mark_process_start()`, called on the first line of the
+    // `freenet` binary's `main`, so this genuinely includes config load,
+    // storage open and the cached-peer fast-reconnect path — the startup work
+    // that can itself delay CONNECT. (A library embedding that never calls it
+    // gets the anchor at `network_status::init()`, i.e. node start.)
+    //
+    // `None` until reached, so this gauge has no datapoint for a node that has
+    // not bootstrapped. `freenet.bootstrap.completed` below is what makes that
+    // state visible rather than merely absent.
+    let _bootstrap_time_to_min_connections = meter
+        .f64_observable_gauge("freenet.bootstrap.time_to_min_connections_seconds")
+        .with_description(
+            "Seconds from process start to first reaching min_connections \
+             (bootstrap-acceptance-churn instrumentation, #4787)",
+        )
+        .with_callback(move |observer| {
+            if let Some(status) = (sources.status_scalars)() {
+                if let Some(elapsed) = status.bootstrap_time_to_min_connections {
+                    observer.observe(elapsed.as_secs_f64(), &[]);
+                }
+            }
+        })
+        .build();
+
+    // 1 once this process has reached `min_connections`, 0 before that (#4787
+    // finding 3). Without it a permanently-stuck joiner is indistinguishable
+    // from an old build or a dropped collector: both simply have no
+    // time_to_min_connections datapoint.
+    let _bootstrap_completed = meter
+        .u64_observable_gauge("freenet.bootstrap.completed")
+        .with_description(
+            "1 if this process has reached min_connections at least once, 0 if it \
+             never has (bootstrap-acceptance-churn instrumentation, #4787)",
+        )
+        .with_callback(move |observer| {
+            if let Some(status) = (sources.status_scalars)() {
+                let completed = u64::from(status.bootstrap_time_to_min_connections.is_some());
+                observer.observe(completed, &[]);
+            }
+        })
+        .build();
+
+    // Below-threshold join-loop rounds, split by what each round actually did
+    // (#4787). A node stuck below `min_connections` increments one of these
+    // every ~4s forever, so an unsplit total degrades into a process-uptime
+    // proxy; the split is the measurement. `connect_issued` = actively
+    // retrying and being refused, `backoff_blocked` = every gateway in
+    // exponential backoff, `no_target` = gateway transports look
+    // connected/pending while no real peers are acquired (the #4787 stall
+    // signature). Read alongside `freenet.bootstrap.completed`.
+    let _bootstrap_startup_rounds = meter
+        .u64_observable_counter("freenet.bootstrap.startup_rounds")
+        .with_description(
+            "Below-min_connections join-loop rounds since startup, by outcome \
+             (bootstrap-acceptance-churn instrumentation, #4787)",
+        )
+        .with_callback(move |observer| {
+            if let Some(status) = (sources.status_scalars)() {
+                observer.observe(
+                    status.bootstrap_startup_rounds_connect_issued,
+                    &[KeyValue::new("outcome", "connect_issued")],
+                );
+                observer.observe(
+                    status.bootstrap_startup_rounds_backoff_blocked,
+                    &[KeyValue::new("outcome", "backoff_blocked")],
+                );
+                observer.observe(
+                    status.bootstrap_startup_rounds_no_target,
+                    &[KeyValue::new("outcome", "no_target")],
+                );
+            }
+        })
+        .build();
+
     // Read from the dashboard's own cumulative op counters rather than
     // incremented at `record_op_result`: same instrument, one fewer thing that
     // can be forgotten at a new call site. `record_op_result` is itself a
@@ -1827,7 +1936,19 @@ mod tests {
             Some(crate::ring::HostingReasonStats::default())
         }
         fn scalars() -> Option<OtelStatusScalars> {
-            Some(OtelStatusScalars::default())
+            Some(OtelStatusScalars {
+                // `Some`, or the time-to-min-connections gauge emits no
+                // datapoint at all and its name goes unasserted — same
+                // reasoning as `lattice_successor_distance` above.
+                bootstrap_time_to_min_connections: Some(std::time::Duration::from_secs(7)),
+                bootstrap_transient_registered: 10,
+                bootstrap_transient_expired: 9,
+                bootstrap_promoted_to_ring: 1,
+                bootstrap_startup_rounds_connect_issued: 4,
+                bootstrap_startup_rounds_backoff_blocked: 3,
+                bootstrap_startup_rounds_no_target: 2,
+                ..Default::default()
+            })
         }
         RingSources {
             ring_stats: ring,
@@ -2837,6 +2958,11 @@ mod tests {
             "freenet.ring.lattice.neighbor.distance",
             "freenet.ring.lattice.probes",
             "freenet.contract.updates",
+            // Bootstrap-acceptance-churn instrumentation (#4787).
+            "freenet.bootstrap.churn",
+            "freenet.bootstrap.time_to_min_connections_seconds",
+            "freenet.bootstrap.completed",
+            "freenet.bootstrap.startup_rounds",
         ] {
             assert!(
                 names.contains(&expected),
@@ -2902,6 +3028,15 @@ mod tests {
             ),
             ("freenet.ring.lattice.probes", "result=issued"),
             ("freenet.ring.lattice.probes", "result=improvement"),
+            ("freenet.bootstrap.churn", "event=transient_registered"),
+            ("freenet.bootstrap.churn", "event=transient_expired"),
+            ("freenet.bootstrap.churn", "event=promoted_to_ring"),
+            ("freenet.bootstrap.startup_rounds", "outcome=connect_issued"),
+            (
+                "freenet.bootstrap.startup_rounds",
+                "outcome=backoff_blocked",
+            ),
+            ("freenet.bootstrap.startup_rounds", "outcome=no_target"),
             ("freenet.contract.updates", "result=accepted"),
             ("freenet.contract.updates", "result=rate_limited"),
             ("freenet.contract.updates", "result=capacity_dropped"),

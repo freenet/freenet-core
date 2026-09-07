@@ -892,6 +892,39 @@ pub(crate) struct RouterSnapshotInfo {
     /// Monotonic lifetime totals. `None` until the ring's snapshot task populates.
     pub connect_accepts_emitted: Option<u64>,
     pub connect_rejects_emitted: Option<u64>,
+    /// Bootstrap-acceptance-churn counters (#4787): a restarted node's
+    /// gateway connection lingers as transient, expires, and is later reaped
+    /// as a zombie before the onward CONNECT promotes it to the ring — the
+    /// joiner cycles through repeated reconnects before it acquires real
+    /// peers. These are the "instrumentation before a fix" step the issue
+    /// calls for, not a behavior change.
+    ///
+    /// `bootstrap_transient_registered` / `_expired` / `_promoted_to_ring` are
+    /// monotonic lifetime totals on the ACCEPTOR side; a sustained high
+    /// `_expired`:`_promoted_to_ring` ratio is the churn signature. Both
+    /// promotion paths are counted, and only when the ring actually accepted
+    /// the connection.
+    ///
+    /// The rest are JOINER-side. `bootstrap_time_to_min_connections_secs` is
+    /// time from process start to first reaching `min_connections`, recorded
+    /// once per process; `bootstrap_completed` disambiguates the `None` there —
+    /// `Some(false)` means this node has never bootstrapped, `None` means the
+    /// field wasn't reported at all. The three `bootstrap_startup_rounds_*`
+    /// fields partition below-threshold join-loop rounds by what each round
+    /// actually did (issued CONNECTs / blocked by gateway backoff / had no
+    /// target), which is what keeps a permanently-stuck joiner's count from
+    /// being an undifferentiated process-uptime proxy.
+    ///
+    /// Populated by `Ring` from the network_status singleton on the snapshot
+    /// cadence; `None` until the ring's snapshot task populates them.
+    pub bootstrap_transient_registered: Option<u64>,
+    pub bootstrap_transient_expired: Option<u64>,
+    pub bootstrap_promoted_to_ring: Option<u64>,
+    pub bootstrap_time_to_min_connections_secs: Option<f64>,
+    pub bootstrap_completed: Option<bool>,
+    pub bootstrap_startup_rounds_connect_issued: Option<u64>,
+    pub bootstrap_startup_rounds_backoff_blocked: Option<u64>,
+    pub bootstrap_startup_rounds_no_target: Option<u64>,
     /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
     pub per_op_curves: HashMap<String, PerOpCurves>,
     /// Renegade predictor diagnostics. These (and `renegade_accuracy_pairs`) are
@@ -1850,6 +1883,16 @@ impl Router {
             // cadence (firehose-retirement precursor).
             connect_accepts_emitted: None,
             connect_rejects_emitted: None,
+            // Bootstrap-acceptance-churn counters, populated by Ring on the
+            // snapshot cadence (#4787).
+            bootstrap_transient_registered: None,
+            bootstrap_transient_expired: None,
+            bootstrap_promoted_to_ring: None,
+            bootstrap_time_to_min_connections_secs: None,
+            bootstrap_completed: None,
+            bootstrap_startup_rounds_connect_issued: None,
+            bootstrap_startup_rounds_backoff_blocked: None,
+            bootstrap_startup_rounds_no_target: None,
             // Renegade predictor diagnostics
             renegade_failure_events: self.renegade_predictor.len(),
             renegade_response_time_events: self.renegade_predictor.stage_sizes().1,

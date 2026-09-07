@@ -63,6 +63,10 @@ Registered in `tracing/otel.rs::register_metrics`.
 | `freenet.contract.queue.depth.high_water` | gauge | — | `FairQueueStats` |
 | `freenet.contract.queue.rejected` | counter | `reason` | `FairQueueStats` |
 | `freenet.contract.queue.background_shed` | counter | — | `FairQueueStats` |
+| `freenet.bootstrap.churn` | counter | `event` | `NetworkStatus::bootstrap_churn_stats` (#4787) |
+| `freenet.bootstrap.time_to_min_connections_seconds` | gauge | — | `NetworkStatus::bootstrap_churn_stats` (#4787) |
+| `freenet.bootstrap.completed` | gauge | — | `NetworkStatus::bootstrap_churn_stats` (#4787) |
+| `freenet.bootstrap.startup_rounds` | counter | `outcome` | `NetworkStatus::bootstrap_churn_stats` (#4787) |
 
 Everything but the two histograms is an observable callback over state that
 already existed for the local dashboard.

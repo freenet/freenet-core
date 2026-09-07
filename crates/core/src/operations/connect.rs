@@ -106,6 +106,7 @@ use crate::config::{GlobalExecutor, GlobalRng};
 use crate::dev_tool::Location;
 use crate::message::{InnerMessage, NodeEvent, Transaction};
 use crate::node::OpManager;
+use crate::node::network_status::StartupRoundOutcome;
 use crate::operations::OpError;
 use crate::ring::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation};
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
@@ -1861,8 +1862,39 @@ pub(crate) async fn initial_join_procedure(
             }
         }
 
+        // Issue #4787 instrumentation (joiner-side): record how long it takes
+        // this process to first reach `bootstrap_threshold` connections, and
+        // classify every below-threshold round by what it actually did. The
+        // latency is measured from the process-start anchor inside
+        // `record_bootstrap_min_connections_reached`, NOT from here: a clock
+        // started at this point excludes the cached-peer fast-reconnect block
+        // above (up to CACHED_PEER_TIMEOUT) and all node startup before the
+        // spawn, so on a restart — the issue's own scenario — a successful
+        // cached reconnect would report ~0s for a bootstrap that took seconds.
+        let mut min_connections_reached = false;
+
         loop {
             let open_conns = op_manager.ring.open_connections();
+
+            if !min_connections_reached && open_conns >= bootstrap_threshold {
+                min_connections_reached = true;
+                crate::node::network_status::record_bootstrap_min_connections_reached();
+            }
+
+            // Has this round already been classified (#4787)? Each branch that
+            // decides what the round does records its own outcome BEFORE
+            // awaiting anything, so a CONNECT fan-out that hangs still leaves a
+            // counted round; whatever reaches the bottom unrecorded is a round
+            // that issued nothing, which is the "all gateways appear
+            // connected/pending" stall the issue was filed about and which the
+            // first version of this instrumentation could not see at all.
+            let mut round_recorded = false;
+            let mut record_round = |outcome: StartupRoundOutcome| {
+                if !round_recorded && !min_connections_reached {
+                    crate::node::network_status::record_bootstrap_startup_round(outcome);
+                }
+                round_recorded = true;
+            };
 
             let unconnected_gateways: Vec<_> =
                 op_manager.ring.is_not_connected(gateways.iter()).collect();
@@ -1972,6 +2004,7 @@ pub(crate) async fn initial_join_procedure(
                             open_connections = open_conns,
                             "All gateways in backoff, waiting before retry"
                         );
+                        record_round(StartupRoundOutcome::BackoffBlocked);
                         tokio::select! {
                             _ = tokio::time::sleep(effective_wait) => {},
                             _ = op_manager.gateway_backoff_cleared.notified() => {
@@ -1982,6 +2015,16 @@ pub(crate) async fn initial_join_procedure(
                     }
                 }
 
+                // #4787: `eligible_count == 0` can still reach here when every
+                // gateway was filtered for backoff but none reported a
+                // remaining duration, in which case the CONNECT fan-out below
+                // is empty and no CONNECT is issued. Classify by what actually
+                // happens, not by which branch we are in.
+                record_round(if eligible_count > 0 {
+                    StartupRoundOutcome::ConnectIssued
+                } else {
+                    StartupRoundOutcome::BackoffBlocked
+                });
                 tracing::info!(
                     "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways (skipped {} in backoff)",
                     open_conns,
@@ -2035,6 +2078,12 @@ pub(crate) async fn initial_join_procedure(
                 };
 
                 if !eligible.is_empty() {
+                    // #4787: these are CONNECT rounds too. They were uncounted
+                    // in the first version of this instrumentation, and they
+                    // are the rounds a stalled joiner actually issues — its
+                    // gateway transports are up, so the branch above (which
+                    // needs an UNCONNECTED gateway) never runs.
+                    record_round(StartupRoundOutcome::ConnectIssued);
                     tracing::info!(
                         eligible = eligible.len(),
                         total_gateways = gateways.len(),
@@ -2082,6 +2131,14 @@ pub(crate) async fn initial_join_procedure(
                 );
             }
 
+            // Nothing was issued this round (#4787). `record_round` is gated on
+            // `!min_connections_reached` so these stay startup-only counters: a
+            // later transient dip below `bootstrap_threshold` is ordinary
+            // post-bootstrap churn, not bootstrap. `min_connections_reached` is
+            // set at the top of this iteration, so reaching here with it false
+            // means `open_conns < bootstrap_threshold`.
+            record_round(StartupRoundOutcome::NoTarget);
+
             // Add random jitter to prevent thundering herd after gateway restart.
             // Without jitter, all peers that lose their gateway connection retry
             // at the same interval, causing synchronized reconnection storms.
@@ -2121,6 +2178,206 @@ mod tests {
     use super::*;
     use crate::transport::TransportKeypair;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    // --- #4787 joiner-side bootstrap instrumentation ---------------------
+    //
+    // These drive the REAL `initial_join_procedure` loop against a real
+    // `OpManager`, which is what the previous source-scrape pin could not do:
+    // a text assertion that a gate exists says nothing about whether the loop
+    // ever reaches it, and the two shapes below are exactly the cases where it
+    // did not.
+
+    /// Build a minimal but real `OpManager` for driving the join loop.
+    async fn bootstrap_test_op_manager(id: &str, own_addr: &str) -> Arc<OpManager> {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test(own_addr.parse().unwrap());
+        // The receivers above must outlive the loop under test, otherwise the
+        // CONNECT fan-out fails for the wrong reason. Leak them for the
+        // duration of the test process rather than threading them back out.
+        std::mem::forget((_notification_rx, _ch_channel, _result_router_rx));
+        op_manager
+    }
+
+    /// Run `body` with the process-global `NETWORK_STATUS` guard held.
+    ///
+    /// The guard is acquired and released in this SYNC frame and the async body
+    /// runs inside `block_on`, so the lock is never live across an `.await` in
+    /// an async fn — the shape `clippy::await_holding_lock` forbids — while
+    /// still serializing these tests against every other test that touches the
+    /// singleton.
+    fn with_network_status_lock<F>(body: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::node::network_status::init(0, HashSet::new(), "test".to_string());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(body);
+    }
+
+    fn bootstrap_gateway(port: u16) -> PeerKeyLocation {
+        let pub_key = TransportKeypair::new().public().clone();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+        PeerKeyLocation::new(pub_key, addr)
+    }
+
+    /// Total below-threshold rounds recorded so far, by category.
+    fn startup_round_totals() -> (u64, u64, u64) {
+        let b = crate::node::network_status::bootstrap_churn_counts()
+            .expect("network_status singleton initialized by the test");
+        (
+            b.startup_rounds_connect_issued,
+            b.startup_rounds_backoff_blocked,
+            b.startup_rounds_no_target,
+        )
+    }
+
+    /// Poll until the join loop has classified at least one round, or give up.
+    async fn wait_for_startup_round(deadline: Duration) -> (u64, u64, u64) {
+        let start = std::time::Instant::now();
+        loop {
+            let totals = startup_round_totals();
+            if totals.0 + totals.1 + totals.2 > 0 || start.elapsed() >= deadline {
+                return totals;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// The #4787 stall, reproduced: the joiner's gateway transports are UP (so
+    /// `is_not_connected` yields nothing) while the node sits far below
+    /// `min_connections`. The first version of this instrumentation put its
+    /// only increment inside `open_conns < threshold && unconnected_count > 0`,
+    /// so it recorded ZERO for the entire multi-minute stall it was added to
+    /// measure. The loop must classify this round.
+    #[test]
+    fn startup_rounds_counted_while_all_gateways_appear_connected() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("bootstrap-4787-stall", "127.0.0.1:14787").await;
+            let cm = &op_manager.ring.connection_manager;
+            let gateways = vec![bootstrap_gateway(24787), bootstrap_gateway(24788)];
+
+            // Make every gateway look connected — the stall's defining symptom.
+            for gw in &gateways {
+                let addr = gw.socket_addr().expect("gateway has an address");
+                assert!(
+                    cm.add_connection(
+                        Location::from_address(&addr),
+                        addr,
+                        gw.pub_key().clone(),
+                        false
+                    ),
+                    "test setup: gateway must be accepted into the ring"
+                );
+            }
+            assert_eq!(op_manager.ring.open_connections(), gateways.len());
+            assert!(
+                op_manager.ring.open_connections() < cm.min_connections,
+                "test setup: node must be below the bootstrap threshold"
+            );
+            assert_eq!(
+                op_manager.ring.is_not_connected(gateways.iter()).count(),
+                0,
+                "test setup: no gateway may look unconnected — that is the stall"
+            );
+
+            let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                .await
+                .expect("spawn join procedure");
+            let (issued, backoff, no_target) =
+                wait_for_startup_round(Duration::from_secs(10)).await;
+            handle.abort();
+
+            assert!(
+                issued + backoff + no_target > 0,
+                "the join loop must count a below-threshold round during the stall; \
+             got connect_issued={issued} backoff_blocked={backoff} no_target={no_target}"
+            );
+            // With 25 - 2 > 2 the loop routes CONNECTs through the connected
+            // gateways (`use_connected_as_routers`), a path the first version of
+            // this instrumentation also left uncounted.
+            assert!(
+                issued > 0,
+                "rounds routed through connected gateways must count as \
+             connect_issued; got connect_issued={issued} backoff_blocked={backoff} \
+             no_target={no_target}"
+            );
+
+            // And the joiner must be visibly un-bootstrapped rather than absent.
+            let b = crate::node::network_status::bootstrap_churn_counts().expect("initialized");
+            assert_eq!(
+                b.time_to_min_connections, None,
+                "a node that never reached min_connections must report no latency, \
+             while still being present in the snapshot"
+            );
+        });
+    }
+
+    /// The ordinary case still counts: gateways unconnected and not in backoff
+    /// means a real CONNECT round is issued to them.
+    #[test]
+    fn startup_rounds_counted_when_gateways_are_unconnected() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("bootstrap-4787-unconnected", "127.0.0.1:14789").await;
+            let gateways = vec![bootstrap_gateway(24790), bootstrap_gateway(24791)];
+            assert_eq!(
+                op_manager.ring.is_not_connected(gateways.iter()).count(),
+                gateways.len(),
+                "test setup: both gateways must look unconnected"
+            );
+
+            let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                .await
+                .expect("spawn join procedure");
+            let (issued, backoff, no_target) =
+                wait_for_startup_round(Duration::from_secs(10)).await;
+            handle.abort();
+
+            assert!(
+                issued > 0,
+                "a round that issues CONNECTs to unconnected gateways must count as \
+             connect_issued; got connect_issued={issued} backoff_blocked={backoff} \
+             no_target={no_target}"
+            );
+        });
+    }
 
     #[test]
     fn resolve_probe_gateway_addr_returns_known_socket() {
