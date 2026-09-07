@@ -37,6 +37,7 @@ mod delegate2_messages {
         RemoveSecret(Vec<u8>),
         WriteLargeContext(usize),
         StoreLargeSecret { key: Vec<u8>, size: usize },
+        ReadWriteRead { key: Vec<u8>, value: Vec<u8> },
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -2122,6 +2123,115 @@ async fn test_large_context_within_batch() -> Result<(), Box<dyn std::error::Err
 /// `refresh_mem_addr_from_caller`, the subsequent read uses a stale pointer
 /// and returns garbage data. Under full parallel test suite runs (~1600 tests)
 /// the relocation is more likely due to memory pressure.
+/// A write must invalidate the host's per-`process()` secret memo, observed
+/// through a real WASM guest rather than asserted about the source.
+///
+/// `get_secret_len` + `get_secret` both decrypt, so the host memoises the
+/// plaintext for the duration of one `process()` call. `set_secret` and
+/// `remove_secret` therefore have to clear it, or a read after a write in the
+/// same call is served the PRE-WRITE bytes.
+///
+/// This replaces a source-scrape pin that asserted both host functions
+/// contained `invalidate_secret_memo()`. That pin was defeatable by prose: the
+/// mutation review deleted both real calls, left the string in a trailing `//`
+/// comment, and the whole suite stayed green — the comment filter only
+/// stripped lines that BEGIN with `//`, not comment tails. Worse, deleting
+/// both calls killed exactly one test, the pin itself, so a string in a
+/// comment was the entire protection for the invariant.
+///
+/// Nothing reached these call sites behaviourally before, and the reason is
+/// narrow enough to be worth recording: `exec_inbound_with_env` builds one
+/// `DelegateCallEnv` per inbound message, so batching two messages gives two
+/// memos and cannot observe a stale one. The read, the write and the re-read
+/// all have to happen inside a single `process()`, which needs a guest
+/// handler — hence `ReadWriteRead` in `tests/test-delegate-2`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_invalidates_the_secret_memo_within_one_process_call()
+-> Result<(), Box<dyn std::error::Error>> {
+    use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+    let key = b"memo-invalidation".to_vec();
+
+    let send = |runtime: &mut Runtime,
+                msg: &InboundAppMessage|
+     -> Result<OutboundAppMessage, Box<dyn std::error::Error>> {
+        let payload = bincode::serialize(msg)?;
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        )?;
+        match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => Ok(bincode::deserialize(&m.payload)?),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
+                panic!("Expected ApplicationMessage, got {other:?}")
+            }
+        }
+    };
+
+    // Seed the key in an EARLIER call, so the read-write-read call below finds
+    // something to memoise on its first read.
+    let stored = send(
+        &mut runtime,
+        &InboundAppMessage::StoreSecret {
+            key: key.clone(),
+            value: b"before".to_vec(),
+        },
+    )?;
+    assert!(
+        matches!(stored, OutboundAppMessage::SecretStored),
+        "seeding the secret must succeed, got {stored:?}"
+    );
+
+    // One process() call: read (populates the memo), write, read again.
+    let observed = send(
+        &mut runtime,
+        &InboundAppMessage::ReadWriteRead {
+            key: key.clone(),
+            value: b"after".to_vec(),
+        },
+    )?;
+
+    match observed {
+        OutboundAppMessage::SecretResult(Some(bytes)) => assert_eq!(
+            bytes,
+            b"after".to_vec(),
+            "the read AFTER the write must see the written bytes. Reading \
+             `before` means set_secret did not invalidate the per-process() \
+             secret memo, so the guest was served the pre-write plaintext"
+        ),
+        other @ OutboundAppMessage::SecretResult(None)
+        | other @ OutboundAppMessage::CreateInboxResponse(_)
+        | other @ OutboundAppMessage::MessageSigned(_)
+        | other @ OutboundAppMessage::ContextData(_)
+        | other @ OutboundAppMessage::CounterValue(_)
+        | other @ OutboundAppMessage::SecretExists(_)
+        | other @ OutboundAppMessage::ContextWritten
+        | other @ OutboundAppMessage::ContextCleared
+        | other @ OutboundAppMessage::SecretStored
+        | other @ OutboundAppMessage::SecretRemoved
+        | other @ OutboundAppMessage::LargeContextWritten(_)
+        | other @ OutboundAppMessage::LargeSecretStored(_)
+        | other @ OutboundAppMessage::SecretStoreFailed => panic!(
+            "expected SecretResult(Some(..)) from the post-write read, got {other:?}. \
+             SecretResult(None) means the write or the re-read failed outright"
+        ),
+    }
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_large_secret_data() -> Result<(), Box<dyn std::error::Error>> {
     use delegate2_messages::{InboundAppMessage, OutboundAppMessage};

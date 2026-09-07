@@ -2951,30 +2951,6 @@ mod secret_read_memo_tests {
     /// call would leave a `set_secret` followed by a `get_secret` inside ONE
     /// `process()` serving the pre-write plaintext, silently, with every other
     /// test still green.
-    /// The `delegate_secrets` module body, so discovery cannot stray into
-    /// another module's host functions.
-    fn delegate_secrets_module(src: &str) -> &str {
-        let start = src
-            .find("pub(super) mod delegate_secrets {")
-            .expect("delegate_secrets module not found");
-        let after = &src[start..];
-        let end = after
-            .find("\n}")
-            .expect("delegate_secrets module has no closing brace");
-        &after[..end]
-    }
-
-    /// Names of the `pub(crate) fn` host functions declared in `module`.
-    fn host_fn_names(module: &str) -> Vec<&str> {
-        module
-            .match_indices("    pub(crate) fn ")
-            .filter_map(|(i, m)| {
-                let rest = &module[i + m.len()..];
-                rest.find('(').map(|p| &rest[..p])
-            })
-            .collect()
-    }
-
     /// The source region of `name`: from its signature to its own closing
     /// brace, comments removed.
     ///
@@ -3010,37 +2986,49 @@ mod secret_read_memo_tests {
             .join("\n")
     }
 
-    /// Every host function in `delegate_secrets` that can change what a read
-    /// returns must drop the memo first.
+    /// A read that FAILS must not populate the memo.
     ///
-    /// Derived from the code, NOT from a hard-coded name list: the set is
-    /// "functions whose body calls `secret_store_mut()`". A name list is green
-    /// by default for any NEW mutating host function, which is the same
-    /// silent-omission shape the pin exists to prevent. This way a new mutator
-    /// is failing by default until it invalidates.
-    #[test]
-    fn mutating_secret_host_fns_invalidate_the_memo() {
-        let src = include_str!("native_api.rs");
-        let module = delegate_secrets_module(src);
-        let mutators: Vec<&str> = host_fn_names(module)
-            .into_iter()
-            .filter(|name| scraped_body(src, name).contains("secret_store_mut()"))
-            .collect();
+    /// `with_secret` propagates the store error with `?` before the memo
+    /// write, so a plaintext that never passed its Poly1305 check is never
+    /// cached. Nothing held that: the stdlib short-circuits after
+    /// `get_secret_len?`, so no existing test probes a failing key twice, and
+    /// the mutation review confirmed that moving the cache above the `?`
+    /// survives the whole suite. If it were cached, a second `has_secret` on a
+    /// corrupted or wrong-DEK secret would answer 1 for a secret that cannot
+    /// be decrypted.
+    #[tokio::test]
+    async fn a_failed_read_does_not_populate_the_memo() {
+        let mut f = fixture().await;
+        let missing = SecretsId::new(b"never-stored".to_vec());
+        // SAFETY: `env` is dropped at the end of this test, before `f`.
+        let env = unsafe { env_of(&mut f) };
+
         assert!(
-            mutators.len() >= 2,
-            "expected at least set_secret and remove_secret to mutate the secret \
-             store; found {mutators:?} — if this is now empty the discovery is \
-             broken and every assertion below is vacuous"
+            env.with_secret(&missing, |_| ()).is_err(),
+            "reading a secret that was never stored must fail"
         );
-        for name in mutators {
-            assert!(
-                scraped_body(src, name).contains("invalidate_secret_memo()"),
-                "{name} calls secret_store_mut(), so it can change what a read \
-                 returns, so it must call invalidate_secret_memo() first: \
-                 without it a write followed by a read in the same process() \
-                 call serves stale plaintext from the memo"
-            );
-        }
+        assert!(
+            env.secret_read_memo.borrow().is_none(),
+            "a failed read must leave the memo EMPTY; caching the error path \
+             would let a later probe answer from a plaintext that never passed \
+             its AEAD tag check"
+        );
+
+        // And the memo still works afterwards, so the assertion above is not
+        // passing merely because the memo is broken.
+        env.secret_store_mut()
+            .store_secret(
+                &delegate_key(),
+                &missing,
+                SecretScope::Local,
+                Zeroizing::new(b"now-present".to_vec()),
+            )
+            .unwrap();
+        assert_eq!(read(&env, &missing), b"now-present".to_vec());
+        assert!(
+            env.secret_read_memo.borrow().is_some(),
+            "a successful read must populate the memo"
+        );
     }
 
     /// M1: the memo's key omits the delegate identity and the scope, which is
