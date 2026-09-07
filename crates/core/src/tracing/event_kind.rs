@@ -1145,6 +1145,77 @@ impl GetTerminalOutcome {
     }
 }
 
+/// Why the client GET retry loop gave up advancing to a new peer, carried by
+/// [`GetEvent::ClientTerminal`] on the `RetryLoopOutcome::Exhausted` path
+/// only (`None` on a terminal reply). This is the discriminator #5252 asked
+/// for: separating "we asked peers and none had it" from "we ran out of
+/// distinct peers to ask" was previously only a `debug!` log line
+/// (`crates/core/src/operations/get/op_ctx_task.rs`), which never runs in a
+/// release build (`release_max_level_info`) and was never wired to reach the
+/// telemetry collector even if it had.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub(crate) enum GetExhaustionReason {
+    /// `advance_to_next_peer` hit `MAX_RETRIES` peer advancements — the
+    /// retry budget, not candidate supply, ended the search.
+    RetryBudget,
+    /// `advance_to_next_peer` had budget remaining but neither
+    /// `k_closest_potentially_hosting` nor the bootstrap-gateway fallback
+    /// produced a candidate — the search ran out of distinct peers to ask
+    /// before it ran out of retries. A TOPOLOGY signal: this node has no
+    /// (further) usable routing option for the key.
+    NoRoutingCandidates,
+    /// The ring returned a candidate that carried no socket address, so it
+    /// was unusable as a wire target.
+    ///
+    /// **Expect zero of these. No current production path can produce one.**
+    /// This is defence-in-depth against a future regression, NOT an observed
+    /// condition — do not wait for a spike here as a ring-health signal, and
+    /// do not read its absence as evidence that anything was measured.
+    ///
+    /// The reason it cannot fire is upstream of this crate's GET code:
+    /// `k_closest_potentially_hosting` sources candidates only from
+    /// `ConnectionManager::get_connections_by_location`, and every production
+    /// write to `connections_by_location` stores a `PeerAddr::Known` —
+    /// `add_connection` and `update_peer_identity` both take a `SocketAddr`,
+    /// and `prune_connection` only removes. The getter hands back a clone, so
+    /// no caller can mutate a stored entry back to `PeerAddr::Unknown`
+    /// either. `socket_addr()` is therefore always `Some`, which makes
+    /// `k_closest_potentially_hosting`'s addressless branch — and this
+    /// variant with it — unreachable today.
+    ///
+    /// It is kept, and kept SEPARATE from `NoRoutingCandidates`, because the
+    /// two would need different investigations if the invariant ever broke:
+    /// an empty candidate set is a topology dead-end, whereas a malformed
+    /// entry in a non-empty set is a local ring defect. Should a sibling of
+    /// `add_connection` ever admit an addressless peer, this fires (with a
+    /// `warn!` at the return site in
+    /// `get::op_ctx_task::advance_to_next_peer`) instead of being silently
+    /// miscounted as a topology problem.
+    ///
+    /// Sequencing note for whoever revisits this: `k_closest_potentially_`
+    /// `hosting` deliberately ADMITS addressless candidates past its
+    /// addr-keyed filters (skip list, dedup, transient, readiness), so the
+    /// ring layer would pass one through. It is the router that then decides
+    /// their fate, and only above `MIN_EVENTS_FOR_PREDICTION`: below that
+    /// threshold it `filter_map`s on `peer.location()` and DROPS them, while
+    /// above it they survive with a default distance. So fixing the
+    /// insertion-side invariant is what would make this variant live —
+    /// nothing on the GET side needs to change.
+    AddresslessCandidate,
+}
+
+impl GetExhaustionReason {
+    /// Stable snake_case string for the OTLP/json export.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            GetExhaustionReason::RetryBudget => "retry_budget",
+            GetExhaustionReason::NoRoutingCandidates => "no_routing_candidates",
+            GetExhaustionReason::AddresslessCandidate => "addressless_candidate",
+        }
+    }
+}
+
 /// Why a streamed (> 64 KB `streaming_threshold`) GET transfer aborted before
 /// its state could be assembled and cached. Telemetry-only; carried on
 /// [`GetEvent::ClientTerminal`] so analysts can see WHERE large fetches fail
@@ -1379,6 +1450,41 @@ pub(crate) enum GetEvent {
         /// (the inline `GetSuccess`/`GetFailure` paths miss them — see #4796),
         /// so this is the only terminal that can carry the abort cause.
         stream_abort_cause: Option<StreamAbortCause>,
+        /// Why the retry loop gave up advancing to a new peer (#5252):
+        /// `Some` only on the `RetryLoopOutcome::Exhausted` path (`outcome`
+        /// is `NotFound` or `TimeoutExhausted`); `None` when a terminal reply
+        /// was actually received (`outcome = Success`, or a streaming
+        /// failure that still reached a terminal header). See
+        /// [`GetExhaustionReason`].
+        ///
+        /// **This event carries NO distinct-peer count, and `attempts` is not
+        /// one.** `attempts` is `driver.requests_sent` — REQUESTS SENT, one
+        /// per `build_request` — and two mechanisms send more than one
+        /// request to the SAME peer without an intervening peer advance:
+        /// the infra-retry arm in `operations::op_ctx` (`OpError::`
+        /// `NotificationError`) `continue`s WITHOUT calling
+        /// `driver.advance()`, and `drive_get_with_assembly_retry` re-enters
+        /// the loop after a streaming-assembly failure.
+        ///
+        /// Concretely: `infra_retries` is declared ONCE outside the retry
+        /// loop and never reset, so it is a whole-loop cap of
+        /// `MAX_INFRA_RETRIES` = 3 same-peer resends — not 3 per peer — and
+        /// production's own arithmetic is
+        /// `attempt_count.saturating_sub(infra_retries)`. So `attempts = 6`
+        /// can mean as few as THREE distinct peers were contacted, and fewer
+        /// still once `drive_get_with_assembly_retry` re-enters the loop with
+        /// a fresh `infra_retries` budget. The shortfall is not derivable
+        /// from this event. Do not quote `attempts` as a peer count; the
+        /// per-peer breakdown lives in the node's route events, not here.
+        ///
+        /// (An earlier revision did carry a `peer_advancements` field taken
+        /// from `advance_to_next_peer`'s `retries` counter, but `retries`
+        /// increments BEFORE the candidate lookup, so it overcounted by one
+        /// whenever the search ended without a candidate — review caught
+        /// this and the field was dropped rather than shipped with a
+        /// footnote. Mis-stating a peer count is the exact error #5252
+        /// exists to prevent.)
+        exhaustion_reason: Option<GetExhaustionReason>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,

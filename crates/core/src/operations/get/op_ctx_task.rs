@@ -288,6 +288,7 @@ async fn emit_get_terminal_event(
     fragments_received: Option<u32>,
     total_fragments: Option<u32>,
     stream_abort_cause: Option<StreamAbortCause>,
+    exhaustion_reason: Option<crate::tracing::GetExhaustionReason>,
 ) {
     if let Some(log_event) = crate::tracing::NetEventLog::get_terminal(
         &tx,
@@ -302,6 +303,7 @@ async fn emit_get_terminal_event(
         fragments_received,
         total_fragments,
         stream_abort_cause,
+        exhaustion_reason,
     ) {
         op_manager
             .ring
@@ -342,6 +344,7 @@ pub(crate) async fn emit_local_get_terminal_event(
         None,  // no stream: fragment/abort fields are streaming-only
         None,
         None,
+        None, // no exhaustion reason: this path never entered the retry loop
     )
     .await;
 }
@@ -434,6 +437,7 @@ async fn drive_client_get_inner(
         response_received_at: None,
         saw_not_found: false,
         requests_sent: 0,
+        exhaustion_reason: None,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -696,6 +700,7 @@ async fn drive_client_get_inner(
                     stream_fragments_received,
                     stream_total_fragments,
                     stream_abort_cause,
+                    None, // a terminal reply was received: not an exhaustion
                 )
                 .await;
             }
@@ -731,6 +736,7 @@ async fn drive_client_get_inner(
                     stream_fragments_received,
                     stream_total_fragments,
                     stream_abort_cause,
+                    None, // a terminal reply was received: not an exhaustion
                 )
                 .await;
             }
@@ -770,6 +776,7 @@ async fn drive_client_get_inner(
                 None, // no streaming header ever seen on the exhausted path
                 None,
                 None,
+                driver.exhaustion_reason,
             )
             .await;
             // Dashboard op_stats GET counter (issue #4828). Exhaustion
@@ -837,6 +844,16 @@ struct GetRetryDriver<'a> {
     /// exhaustion (a one-candidate/isolated search that sent a single
     /// request would otherwise report 2).
     requests_sent: usize,
+    /// Set by `advance()` when `advance_to_next_peer` returns an
+    /// exhaustion reason (#5252) — `None` until the retry loop actually
+    /// exhausts, at which point it discriminates "ran out of retries"
+    /// (`RetryBudget`) from "ran out of peers to ask"
+    /// (`NoRoutingCandidates`) from "the ring handed back a peer with no
+    /// wire address" (`AddresslessCandidate`, a local ring defect) for the
+    /// terminal-telemetry event. This is the enumerated replacement for a
+    /// `debug!` log line that never ran in a release build and was never
+    /// wired to reach the telemetry collector.
+    exhaustion_reason: Option<crate::tracing::GetExhaustionReason>,
 }
 
 /// Terminal value for the GET driver.
@@ -1032,11 +1049,14 @@ impl RetryDriver for GetRetryDriver<'_> {
             &mut self.tried,
             &mut self.retries,
         ) {
-            Some((next_target, _next_addr)) => {
+            Ok((next_target, _next_addr)) => {
                 self.current_target = next_target;
                 AdvanceOutcome::Next
             }
-            None => AdvanceOutcome::Exhausted,
+            Err(reason) => {
+                self.exhaustion_reason = Some(reason);
+                AdvanceOutcome::Exhausted
+            }
         }
     }
 }
@@ -1889,8 +1909,12 @@ async fn lookup_stored_key(
 
 /// Maximum routing rounds before giving up. Matches PUT's
 /// `MAX_PEER_ADVANCEMENTS_NON_STREAMING = 3` and SUBSCRIBE's driver.
-/// With typical ring fan-out of 3–5 peers per k_closest call, 3
-/// rounds covers 9–15 distinct peers. GET kept the legacy
+/// `advance_to_next_peer` calls `k_closest_potentially_hosting(..., 1)` and
+/// takes only `.next()`, discarding any further candidates the ring
+/// returned — so breadth is bounded by `MAX_RETRIES`, NOT by fan-out per
+/// call. 3 rounds plus the initial attempt covers at most 4 distinct peers
+/// (previously documented here as "9–15 distinct peers", which assumed each
+/// round fanned out to several peers; see #5252). GET kept the legacy
 /// `MAX_RETRIES` name because (a) GETs are never streaming today
 /// (no large-payload class on the wire), so the streaming/non-
 /// streaming split PUT needed doesn't apply, and (b) renaming would
@@ -1928,14 +1952,35 @@ fn carry_tried_into_visited(
     }
 }
 
+/// Advance to the next routing candidate, or report why the search
+/// stopped. The `Err` side is the enumerated replacement for #5252's
+/// dark `debug!` line, and it distinguishes THREE causes, which a caller
+/// threads into the terminal-telemetry event via `GetRetryDriver::advance`:
+///
+/// - [`GetExhaustionReason::RetryBudget`] — `MAX_RETRIES` spent; candidates
+///   may well still exist.
+/// - [`GetExhaustionReason::NoRoutingCandidates`] — budget left, but neither
+///   the ring nor the bootstrap-gateway fallback produced a candidate. A
+///   topology signal.
+/// - [`GetExhaustionReason::AddresslessCandidate`] — the ring produced a
+///   candidate with no socket address, unusable as a wire target. A local
+///   ring defect, NOT a topology problem. **No production path can produce
+///   this today** — every write to `connections_by_location` stores a known
+///   addr — so it is defence-in-depth against a future regression rather
+///   than a live signal. Kept separate because the two would need different
+///   investigations if the invariant broke (see the enum's docs).
+///
+/// [`GetExhaustionReason::RetryBudget`]: crate::tracing::GetExhaustionReason::RetryBudget
+/// [`GetExhaustionReason::NoRoutingCandidates`]: crate::tracing::GetExhaustionReason::NoRoutingCandidates
+/// [`GetExhaustionReason::AddresslessCandidate`]: crate::tracing::GetExhaustionReason::AddresslessCandidate
 fn advance_to_next_peer(
     op_manager: &OpManager,
     instance_id: &ContractInstanceId,
     tried: &mut Vec<std::net::SocketAddr>,
     retries: &mut usize,
-) -> Option<(PeerKeyLocation, std::net::SocketAddr)> {
+) -> Result<(PeerKeyLocation, std::net::SocketAddr), crate::tracing::GetExhaustionReason> {
     if *retries >= MAX_RETRIES {
-        return None;
+        return Err(crate::tracing::GetExhaustionReason::RetryBudget);
     }
     *retries += 1;
 
@@ -1957,7 +2002,7 @@ fn advance_to_next_peer(
                         "GET advance: ring empty — falling back to configured gateway"
                     );
                     tried.push(addr);
-                    Some((gw, addr))
+                    Ok((gw, addr))
                 }
                 None => {
                     tracing::debug!(
@@ -1966,24 +2011,37 @@ fn advance_to_next_peer(
                         retries = *retries,
                         "GET advance: no routing candidates — exhausted"
                     );
-                    None
+                    Err(crate::tracing::GetExhaustionReason::NoRoutingCandidates)
                 }
             };
         }
     };
     let Some(addr) = peer.socket_addr() else {
-        // Rare but possible — `k_closest_potentially_hosting` can return
-        // addressless candidates (ring.rs pushes them past the addr-gated
-        // filters), and an addressless pick is unusable as a wire target.
+        // UNREACHABLE TODAY — defence-in-depth, not an observed condition.
+        // `k_closest_potentially_hosting` does admit addressless candidates
+        // past its addr-keyed filters, but it can only ever be handed
+        // `PeerAddr::Known` entries: every production write to
+        // `ConnectionManager::connections_by_location` (`add_connection`,
+        // `update_peer_identity`) stores an addr, `prune_connection` only
+        // removes, and the getter returns a clone so no caller can mutate an
+        // entry back to `Unknown`. Expect a flat zero on this reason; do NOT
+        // treat its absence as a measured ring-health signal.
+        //
+        // Kept, and kept distinct from `NoRoutingCandidates`, so that if a
+        // future `add_connection` sibling ever admits an addressless peer
+        // this surfaces as its own class (a local ring defect in a non-empty
+        // candidate set) rather than being miscounted as a topology
+        // dead-end, which would send an analyst hunting for missing peers
+        // when the peers are present but malformed.
         tracing::warn!(
             %instance_id,
             peer = ?peer,
             "GET advance: selected routing candidate has no socket address — treating as exhausted"
         );
-        return None;
+        return Err(crate::tracing::GetExhaustionReason::AddresslessCandidate);
     };
     tried.push(addr);
-    Some((peer, addr))
+    Ok((peer, addr))
 }
 
 // --- Subscribe child ---
@@ -2281,6 +2339,7 @@ async fn drive_sub_op_get(
         response_received_at: None,
         saw_not_found: false,
         requests_sent: 0,
+        exhaustion_reason: None,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -2384,6 +2443,7 @@ async fn drive_sub_op_get(
                 streaming_assembly.fragments_received,
                 streaming_assembly.total_fragments,
                 streaming_assembly.abort_cause,
+                None, // a terminal reply was received: not an exhaustion
             )
             .await;
             result
@@ -2402,6 +2462,7 @@ async fn drive_sub_op_get(
                 None, // no streaming header ever seen on the exhausted path
                 None,
                 None,
+                driver.exhaustion_reason,
             )
             .await;
             SubOpGetOutcome::NotFound(cause)
@@ -4747,6 +4808,291 @@ mod tests {
         );
     }
 
+    /// #5252: the Exhausted arm of both GET drivers must forward WHY the
+    /// retry loop gave up (`driver.exhaustion_reason`) to the
+    /// terminal-telemetry event. This is the enumerated replacement for a
+    /// `debug!` log line that never ran in a release build
+    /// (`release_max_level_info`) and was never wired to reach an
+    /// `EventKind` even when it did. Source-scrape pin — a refactor that
+    /// drops this argument silently reverts the terminal event to carrying
+    /// no exhaustion discriminator at all. (An earlier version of this
+    /// field pair also forwarded a `peer_advancements` count derived from
+    /// `driver.retries`; review found that counter overcounts by one on the
+    /// `NoRoutingCandidates` path — the same overcount already documented
+    /// on the sibling `requests_sent` field — so it was dropped in favor of
+    /// the terminal event's existing, accurate `attempts` field.)
+    #[test]
+    fn exhausted_arm_forwards_exhaustion_reason() {
+        let src = production_source();
+        for entry in [
+            "async fn drive_client_get_inner(",
+            "async fn drive_sub_op_get(",
+        ] {
+            let body = extract_fn_body(src, entry);
+            // Pin the forward to the Exhausted ARM's own block — bounded on
+            // BOTH sides — not to "the first mention of the marker onwards".
+            // A left-bounded split is arm-ORDER dependent: it only excludes
+            // the Done arm while Done happens to be written first, and
+            // reordering the match (legal, and rustfmt will not stop it)
+            // would make the negative assertion vacuous AND leave a
+            // `driver.exhaustion_reason` moved into Done sitting inside the
+            // "exhausted" region. `extract_match_arm_block` walks braces, so
+            // `rest` below is the whole body minus this arm regardless of
+            // where the arm sits.
+            let (exhausted_arm, rest) =
+                extract_match_arm_block(body, "RetryLoopOutcome::Exhausted(");
+            assert!(
+                exhausted_arm.contains("driver.exhaustion_reason"),
+                "{entry}'s Exhausted arm must forward driver.exhaustion_reason \
+                 to emit_get_terminal_event (#5252)"
+            );
+            assert!(
+                !rest.contains("driver.exhaustion_reason"),
+                "{entry} must reference driver.exhaustion_reason ONLY in its \
+                 Exhausted arm — the Done arm passes None, because a terminal \
+                 reply was received and the search never exhausted"
+            );
+        }
+    }
+
+    // ── #5252: behavioural exhaustion-reason tests ───────────────────────
+    //
+    // These replace a source-scrape that counted literal occurrences of each
+    // variant inside `advance_to_next_peer`'s body. That guard did not
+    // guard: swapping the `RetryBudget` return with the addressless
+    // `NoRoutingCandidates` return preserved both counts, so the mutant
+    // passed. The tests below call the real function against a real
+    // `OpManager` and assert the reason it actually produces, so each cause
+    // is pinned to its own branch.
+
+    /// Build a real `OpManager` backed by a temp-dir `Config`, mirroring
+    /// `client_events::tests::build_op_manager`. The returned guard bundle
+    /// holds the channel endpoints open — drop it only when the test ends.
+    async fn build_op_manager(id: &str) -> (Arc<OpManager>, Box<dyn std::any::Any>) {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::dev_tool::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+
+        let guards: Box<dyn std::any::Any> = Box::new((
+            notification_rx,
+            ch_channel,
+            wait_for_event,
+            result_router_rx,
+            task_monitor,
+        ));
+        (op_manager, guards)
+    }
+
+    /// Budget spent: `advance_to_next_peer` must report `RetryBudget` — the
+    /// retry cap ended the search, and candidates may well still exist.
+    ///
+    /// This is the test the old source-scrape could not express. The
+    /// mutation it missed (swap this arm's return with the addressless
+    /// arm's) makes this call return `AddresslessCandidate` instead, which
+    /// fails here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn advance_to_next_peer_reports_retry_budget_when_budget_spent() {
+        let (op_manager, _guards) = build_op_manager("advance-retry-budget").await;
+        let instance_id = ContractInstanceId::new([3u8; 32]);
+        let mut tried: Vec<SocketAddr> = Vec::new();
+        let mut retries = MAX_RETRIES;
+
+        let outcome = advance_to_next_peer(&op_manager, &instance_id, &mut tried, &mut retries);
+
+        assert_eq!(
+            outcome.err(),
+            Some(crate::tracing::GetExhaustionReason::RetryBudget),
+            "a search that has spent MAX_RETRIES advancements must report \
+             RetryBudget, not a candidate-supply problem"
+        );
+        assert_eq!(
+            retries, MAX_RETRIES,
+            "the budget check must short-circuit BEFORE incrementing retries"
+        );
+    }
+
+    /// Budget left but nothing to ask: an empty ring with no configured
+    /// gateways must report `NoRoutingCandidates` — a topology signal.
+    #[tokio::test(flavor = "current_thread")]
+    async fn advance_to_next_peer_reports_no_routing_candidates_on_empty_ring() {
+        let (op_manager, _guards) = build_op_manager("advance-no-candidates").await;
+        assert_eq!(
+            op_manager.ring.connection_manager.connection_count(),
+            0,
+            "fixture must start with an empty ring"
+        );
+        assert!(
+            op_manager.configured_gateways.is_empty(),
+            "fixture must have no configured gateways, or the bootstrap \
+             fallback would supply a candidate and this branch never runs"
+        );
+
+        let instance_id = ContractInstanceId::new([4u8; 32]);
+        let mut tried: Vec<SocketAddr> = Vec::new();
+        let mut retries = 0usize;
+
+        let outcome = advance_to_next_peer(&op_manager, &instance_id, &mut tried, &mut retries);
+
+        assert_eq!(
+            outcome.err(),
+            Some(crate::tracing::GetExhaustionReason::NoRoutingCandidates),
+            "an empty ring with no gateway fallback must report \
+             NoRoutingCandidates"
+        );
+    }
+
+    /// The ring returned a candidate with no wire address: that must report
+    /// `AddresslessCandidate`, not `NoRoutingCandidates` — a malformed entry
+    /// in a NON-EMPTY candidate set is a local ring defect, and folding it
+    /// into the topology reason would send an analyst hunting for missing
+    /// peers when the peers are present.
+    ///
+    /// **This test constructs a state no production path can produce, and
+    /// that is deliberate.** It pins the branch→variant mapping (it catches
+    /// a swap of the two returns), but it is NOT evidence that the branch is
+    /// live. Every production write to `connections_by_location` stores a
+    /// `PeerAddr::Known`, so `socket_addr()` is always `Some` and this branch
+    /// is dead today — see `GetExhaustionReason::AddresslessCandidate` for
+    /// the full argument. Staging it therefore needs two things no
+    /// production path does:
+    ///
+    /// 1. `insert_raw_connection_for_test` to put a `PeerAddr::Unknown`
+    ///    connection in the ring at all — `add_connection`'s signature takes
+    ///    a `SocketAddr` and cannot express one.
+    /// 2. A router primed past `MIN_EVENTS_FOR_PREDICTION`. Below that
+    ///    threshold the router `filter_map`s on `peer.location()` and
+    ///    silently drops addressless candidates, so even a staged one would
+    ///    not reach the branch.
+    ///
+    /// Step 1 is the part that is unreachable in production; step 2 is a real
+    /// property of the router that would also apply if step 1 ever became
+    /// reachable.
+    #[tokio::test(flavor = "current_thread")]
+    async fn advance_to_next_peer_reports_addressless_candidate() {
+        let (op_manager, _guards) = build_op_manager("advance-addressless").await;
+
+        // Prime the router past MIN_EVENTS_FOR_PREDICTION (50) so it uses
+        // the prediction path, which ranks addressless peers (distance
+        // defaults to 0.5) instead of filtering them out.
+        {
+            let mut router = op_manager.ring.router.write();
+            for i in 0..60u16 {
+                router.add_event(RouteEvent {
+                    peer: PeerKeyLocation::new(
+                        crate::transport::TransportPublicKey::from_bytes([i as u8; 32]),
+                        SocketAddr::from(([127, 0, 0, 1], 40000 + i)),
+                    ),
+                    contract_location: Location::new(0.5),
+                    outcome: RouteOutcome::SuccessUntimed,
+                    op_type: None,
+                });
+            }
+        }
+
+        // The one connection in the ring has an UNKNOWN address.
+        op_manager
+            .ring
+            .connection_manager
+            .insert_raw_connection_for_test(
+                Location::new(0.25),
+                PeerKeyLocation::with_unknown_addr(
+                    crate::transport::TransportPublicKey::from_bytes([200u8; 32]),
+                ),
+            );
+
+        let instance_id = ContractInstanceId::new([5u8; 32]);
+        let mut tried: Vec<SocketAddr> = Vec::new();
+        let mut retries = 0usize;
+
+        let outcome = advance_to_next_peer(&op_manager, &instance_id, &mut tried, &mut retries);
+
+        assert_eq!(
+            outcome.err(),
+            Some(crate::tracing::GetExhaustionReason::AddresslessCandidate),
+            "an addressless routing candidate is a ring defect and must be \
+             reported as such, not folded into NoRoutingCandidates"
+        );
+        assert!(
+            tried.is_empty(),
+            "an unusable candidate must not be recorded as tried"
+        );
+    }
+
+    /// The driver wiring: `GetRetryDriver::advance` must copy the reason out
+    /// of `advance_to_next_peer` into `exhaustion_reason` and report
+    /// `Exhausted`. Without this the discriminator never reaches the
+    /// terminal event no matter how accurate `advance_to_next_peer` is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_retry_driver_advance_records_exhaustion_reason() {
+        let (op_manager, _guards) = build_op_manager("driver-records-reason").await;
+        let client_tx = Transaction::new::<GetMsg>();
+        let instance_id = ContractInstanceId::new([6u8; 32]);
+
+        let mut driver = GetRetryDriver {
+            op_manager: &op_manager,
+            instance_id,
+            htl: 1,
+            tried: Vec::new(),
+            retries: MAX_RETRIES,
+            current_target: op_manager.ring.connection_manager.own_location(),
+            attempt_visited: VisitedPeers::new(&client_tx),
+            request_sent_at: None,
+            response_received_at: None,
+            saw_not_found: false,
+            requests_sent: 0,
+            exhaustion_reason: None,
+        };
+
+        assert!(
+            matches!(driver.advance(), AdvanceOutcome::Exhausted),
+            "a driver with no budget left must report Exhausted"
+        );
+        assert_eq!(
+            driver.exhaustion_reason,
+            Some(crate::tracing::GetExhaustionReason::RetryBudget),
+            "advance() must record WHY it exhausted for the terminal event"
+        );
+
+        // Same driver, budget restored, empty ring: a different cause must
+        // be recorded, proving the field tracks the real reason rather than
+        // being pinned to one constant.
+        driver.retries = 0;
+        driver.exhaustion_reason = None;
+        assert!(matches!(driver.advance(), AdvanceOutcome::Exhausted));
+        assert_eq!(
+            driver.exhaustion_reason,
+            Some(crate::tracing::GetExhaustionReason::NoRoutingCandidates),
+            "an empty ring must be recorded as NoRoutingCandidates"
+        );
+    }
+
     /// Core-bug regression guard: a streaming (> 64 KB) GET success must be
     /// tagged `streamed=true`. The Done arm derives `streamed` from whether
     /// the terminal was `Terminal::Streaming` (delivered as
@@ -4909,6 +5255,57 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Isolate a single `match` arm's brace-delimited block, returning
+    /// `(arm_block, everything_else)`.
+    ///
+    /// Bounding an arm on BOTH sides is what makes a source pin
+    /// order-independent. Locating an arm by `body.find(marker)` and taking
+    /// the remainder of the function bounds it on the left only: it excludes
+    /// the sibling arms that happen to be written ABOVE it and none of the
+    /// ones below, so swapping two arms — a legal, formatter-invisible edit —
+    /// silently changes what the pin covers.
+    ///
+    /// Panics if the arm is not found or is not a block (`=> { .. }`); a pin
+    /// whose region has quietly become empty is worse than no pin.
+    fn extract_match_arm_block<'a>(body: &'a str, arm_marker: &str) -> (&'a str, String) {
+        let start = body
+            .find(arm_marker)
+            .unwrap_or_else(|| panic!("could not find match arm {arm_marker}"));
+        let brace_rel = body[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("{arm_marker} has no block"));
+        // Guard the `=> EXPR,` shape: without a block of its own the next `{`
+        // belongs to a LATER arm and the region would silently cover the
+        // wrong code.
+        let gap = &body[start..start + brace_rel];
+        assert!(
+            gap.contains("=>") && !gap.contains(';'),
+            "{arm_marker} must be a block arm (`=> {{ .. }}`) for this pin to \
+             bound a region; found: {gap:?}"
+        );
+        let block_start = start + brace_rel;
+        let bytes = body.as_bytes();
+        let mut depth: i32 = 0;
+        let mut i = block_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let arm = &body[start..=i];
+                        let mut rest = String::from(&body[..start]);
+                        rest.push_str(&body[i + 1..]);
+                        return (arm, rest);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unterminated match arm block for {arm_marker}");
     }
 
     /// Pin (telemetry accuracy): `start_relay_get` must gate
