@@ -229,7 +229,7 @@ mod tests {
     use crate::message::NodeEvent;
     use crate::node::EventLoopNotificationsReceiver;
     use freenet_stdlib::prelude::{ContractCode, Parameters};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
     /// What the stub contract handler answers a drain's `GetQuery` with.
     #[derive(Clone, Copy)]
@@ -404,17 +404,26 @@ mod tests {
     /// Build a real `OpManager` plus a stub contract handler that answers every
     /// `GetQuery` with `reply`.
     ///
-    /// `marker_set_at_read` records whether the coalescing marker was still set
-    /// at the moment the handler saw the read — which is how
-    /// `drain_clears_the_marker_before_reading_state` checks an ORDERING that
-    /// the source-order pin can only scrape.
+    /// The returned `Mutex<Option<bool>>` records whether the coalescing marker
+    /// was still set at the moment the handler served the read — which is how
+    /// `drain_clears_the_coalescing_marker_before_reading_state` checks an
+    /// ORDERING that the source-order pin can only scrape.
+    ///
+    /// It is THREE-valued on purpose. `None` means the read never reached the
+    /// handler at all, and that case must be distinguishable from "the read
+    /// happened and the marker was clear". With a plain `AtomicBool` starting
+    /// `false`, a drain that stopped reading entirely would leave the probe
+    /// `false` and satisfy an assertion of "the marker was clear at the read" —
+    /// passing because the event it describes never occurred. A guard asserting
+    /// the ABSENCE of something must also assert that the thing EXISTS to be
+    /// absent from.
     async fn harness(
         id: &str,
         reply: StubReply,
     ) -> (
         Arc<OpManager>,
         EventLoopNotificationsReceiver,
-        Arc<AtomicBool>,
+        Arc<Mutex<Option<bool>>>,
         Box<dyn std::any::Any>,
     ) {
         let config_args = ConfigArgs {
@@ -448,8 +457,8 @@ mod tests {
         );
         op_manager.ring.attach_op_manager(&op_manager);
 
-        let marker_set_at_read = Arc::new(AtomicBool::new(false));
-        let marker_probe = marker_set_at_read.clone();
+        let marker_at_read: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let marker_probe = marker_at_read.clone();
         let op_for_stub = op_manager.clone();
 
         // The stub handler. Answers GetQuery per `reply`, and snapshots the
@@ -457,11 +466,10 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
                 if let ContractHandlerEvent::GetQuery { instance_id, .. } = ev {
-                    marker_probe.store(
+                    *marker_probe.lock().unwrap() = Some(
                         op_for_stub
                             .v2_delegate_broadcast_pending
                             .contains(&instance_id),
-                        Ordering::SeqCst,
                     );
                     let response = match reply {
                         StubReply::Found(bytes) => Ok(StoreResponse {
@@ -493,7 +501,7 @@ mod tests {
 
         let guards: Box<dyn std::any::Any> =
             Box::new((wait_for_event, result_router_rx, task_monitor));
-        (op_manager, notification_rx, marker_set_at_read, guards)
+        (op_manager, notification_rx, marker_at_read, guards)
     }
 
     /// `Found` must fan the state out. KILLS MUTATION S1.
@@ -666,6 +674,32 @@ mod tests {
             "a cancelled retry must not re-queue; it must also not have waited out the \
              3600s delay, which is what this test finishing at all demonstrates"
         );
+
+        // THE POSITIVE HALF. Everything above is an assertion of absence, and an
+        // absence is satisfied by a harness that could never have observed the
+        // thing: a broken notification channel, a receiver already drained, a
+        // key that never matches. So prove the observation was POSSIBLE by
+        // running the same call with a live token and watching it queue.
+        run_v2_drain_retry(
+            op_manager.clone(),
+            key,
+            Duration::ZERO,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let mut queued_after = 0;
+        while let Ok(event) = rx.notifications_receiver.try_recv() {
+            if let either::Either::Right(NodeEvent::V2DelegateStateChanged { .. }) = event {
+                queued_after += 1;
+            }
+        }
+        assert_eq!(
+            queued_after, 1,
+            "an UNCANCELLED retry through the same harness must queue exactly one event. \
+             If this is 0 the harness cannot observe a re-queue at all, and the \
+             assertion above passed because nothing could ever have been seen — not \
+             because cancellation worked"
+        );
     }
 
     /// The marker is cleared BEFORE the read — asserted behaviourally.
@@ -682,7 +716,7 @@ mod tests {
     /// fan-out would never happen.
     #[tokio::test(flavor = "current_thread")]
     async fn drain_clears_the_coalescing_marker_before_reading_state() {
-        let (op_manager, _rx, marker_set_at_read, _guards) =
+        let (op_manager, _rx, marker_at_read, _guards) =
             harness("v2drain-order", StubReply::Found(&[1])).await;
         let key = test_key(36);
 
@@ -693,11 +727,19 @@ mod tests {
         let mut ctx = RecordingCtx::default();
         handle_v2_delegate_state_changed(&mut ctx, &op_manager, key, 100).await;
 
-        assert!(
-            !marker_set_at_read.load(Ordering::SeqCst),
-            "the coalescing marker must already be CLEAR when the state read is served. \
-             If it is still set, a write landing during the read coalesces into a drain \
-             that has already read past it, and that write is never announced (#5479)"
+        // Some(false) = the read WAS served, and the marker was already clear.
+        // None would mean the read never happened, in which case this test proves
+        // nothing about ordering — the positive half of the assertion.
+        assert_eq!(
+            *marker_at_read.lock().unwrap(),
+            Some(false),
+            "expected the read to be SERVED (not None) and the coalescing marker to be \
+             already CLEAR when it was. None means the drain never issued the read, so \
+             the ordering this test exists to check did not occur and a bare \
+             'marker was not set' assertion would have passed vacuously. Some(true) \
+             means the marker was still set at the read: a write landing during the read \
+             then coalesces into a drain that has already read past it, and that write is \
+             never announced (#5479)"
         );
         assert!(
             !op_manager.v2_delegate_broadcast_pending.contains(key.id()),
