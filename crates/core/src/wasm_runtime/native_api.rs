@@ -2867,24 +2867,85 @@ mod secret_read_memo_tests {
     /// call would leave a `set_secret` followed by a `get_secret` inside ONE
     /// `process()` serving the pre-write plaintext, silently, with every other
     /// test still green.
+    /// Every item in `delegate_secrets` is indented four spaces, so a
+    /// function's region ends at the next sibling at THAT indentation —
+    /// whatever its visibility.
+    ///
+    /// Bounding on `pub(crate) fn` alone silently swallows any private helper
+    /// that follows. `remove_secret` is succeeded by the private
+    /// `collect_list_secrets`, so a `pub(crate)`-only boundary ran ~50 lines
+    /// past the end of `remove_secret` and scraped a function this test says
+    /// nothing about: a needle anywhere in that overrun satisfied the
+    /// assertion. It looked sound only because `set_secret`'s successor
+    /// (`has_secret`) happens to be `pub(crate)`.
+    const ITEM_STARTS: [&str; 4] = [
+        "\n    fn ",
+        "\n    pub fn ",
+        "\n    pub(crate) fn ",
+        "\n    pub(super) fn ",
+    ];
+
+    /// The source region of `name`, comments removed.
+    ///
+    /// Comments are stripped because the successor's doc comment falls inside
+    /// the region (its `///` lines precede its `fn` line), so prose merely
+    /// MENTIONING the call would satisfy a raw `contains`. The pin is about
+    /// code.
+    fn scraped_body(src: &str, name: &str) -> String {
+        let start = src
+            .find(&format!("pub(crate) fn {name}("))
+            .unwrap_or_else(|| panic!("{name} not found in native_api.rs"));
+        let after = &src[start..];
+        // `expect`, not `unwrap_or(len())`: both functions checked here have a
+        // following sibling, so "no boundary found" means the search itself is
+        // broken and the region has widened to end-of-file. Fail loudly rather
+        // than quietly scraping the rest of the module and passing.
+        let end = ITEM_STARTS
+            .iter()
+            .filter_map(|marker| after[1..].find(marker).map(|i| i + 1))
+            .min()
+            .unwrap_or_else(|| {
+                panic!("no sibling item found after {name}; region-bounding is broken")
+            });
+        after[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn mutating_secret_host_fns_invalidate_the_memo() {
         let src = include_str!("native_api.rs");
         for name in ["set_secret", "remove_secret"] {
-            let start = src
-                .find(&format!("pub(crate) fn {name}("))
-                .unwrap_or_else(|| panic!("{name} not found in native_api.rs"));
-            let after = &src[start..];
-            let end = after[1..]
-                .find("\n    pub(crate) fn ")
-                .map(|i| i + 1)
-                .unwrap_or(after.len());
+            let body = scraped_body(src, name);
             assert!(
-                after[..end].contains("invalidate_secret_memo()"),
+                body.contains("invalidate_secret_memo()"),
                 "{name} must call invalidate_secret_memo(): without it a write \
                  followed by a read in the same process() call serves stale \
                  plaintext from the memo"
             );
         }
+    }
+
+    /// The pin above is only as good as its region-bounding, so bound the
+    /// bound: `remove_secret`'s region must stop before the private helper
+    /// that follows it. Without this, a future edit that reintroduces a
+    /// visibility-only boundary would silently widen the window again and the
+    /// pin would keep passing.
+    #[test]
+    fn the_scraped_region_stops_at_the_next_item_whatever_its_visibility() {
+        let src = include_str!("native_api.rs");
+        let body = scraped_body(src, "remove_secret");
+        assert!(
+            body.contains("fn remove_secret("),
+            "the region must actually contain remove_secret"
+        );
+        assert!(
+            !body.contains("fn collect_list_secrets("),
+            "remove_secret's region must stop at the PRIVATE `collect_list_secrets` \
+             that follows it; if it does not, the pin is asserting over a function \
+             it says nothing about"
+        );
     }
 }
