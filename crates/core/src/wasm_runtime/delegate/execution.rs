@@ -10,7 +10,7 @@ use crate::wasm_runtime::delegate_api::DelegateApiVersion;
 
 use super::super::engine::{InstanceHandle, WasmEngine};
 use super::super::native_api::{
-    CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, InstanceId,
+    CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, InstanceId, LIVE_DELEGATE_GUESTS,
 };
 use super::super::secrets_store::UserSecretContext;
 use super::super::{Runtime, RuntimeResult};
@@ -191,11 +191,22 @@ impl Runtime {
         // edit making the loop error-tolerant ("collect errors and continue",
         // "retry the message") would silently reintroduce it. Fail closed so
         // such an edit gets an error instead of undefined behaviour.
-        if DELEGATE_ENV.contains_key(&instance_id) {
+        //
+        // BOTH halves are needed, and `DELEGATE_ENV` alone is the WRONG test.
+        // `DelegateEnvGuard::drop` removes the env on every exit path of this
+        // function INCLUDING the wall-clock-timeout `Err`, so by the time a
+        // caller sees that error the entry is already gone while the guest is
+        // still running on an abandoned blocking thread. `contains_key` asks
+        // "is an env registered"; the question that matters is "is a guest
+        // running", and those diverged the moment the guest could outlive the
+        // call. `LIVE_DELEGATE_GUESTS` answers the second one — without it this
+        // check would read false in precisely the scenario its own comment
+        // above describes.
+        if DELEGATE_ENV.contains_key(&instance_id) || LIVE_DELEGATE_GUESTS.contains(&instance_id) {
             return Err(anyhow::anyhow!(
-                "delegate instance {instance_id} is already active in DELEGATE_ENV; \
-                 refusing to re-enter it while a previous guest may still be running \
-                 on an abandoned blocking thread (#5480)"
+                "delegate instance {instance_id} is already active (env registered, or a \
+                 guest still running on an abandoned blocking thread); refusing to \
+                 re-enter it (#5480)"
             )
             .into());
         }

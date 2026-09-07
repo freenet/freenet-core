@@ -1222,7 +1222,7 @@ impl WasmtimeEngine {
     /// The wall-clock backstop is not redundant with the epoch trap. The epoch
     /// interrupt only fires at a guest instruction boundary, so it cannot cut off
     /// a blocking HOST function in flight (a ReDb read/write, a secret-store
-    /// fsync) — see [`epoch_deadline_trap`] — and if the epoch ticker thread dies
+    /// fsync) — see [`arm_epoch_deadline`] — and if the epoch ticker thread dies
     /// (#4864) it does not fire at all.
     ///
     /// **Every entry point routes through here rather than hand-rolling a copy.**
@@ -1285,8 +1285,20 @@ impl WasmtimeEngine {
         // closure can't borrow `self`.
         let epoch_ticks = self.epoch_deadline_ticks;
 
+        // Registered HERE, on the calling thread, not inside the closure: see
+        // `native_api::LIVE_DELEGATE_GUESTS`. Registering inside would leave a
+        // window on the `QueuedTimeout` path, where the abort can lose the race
+        // and the closure runs after this call has already returned.
+        let live_guest = delegate_instance.map(LiveGuestRegistration::register);
+
         let result = execute_wasm_blocking(
             move || {
+                // MOVED into the closure so it drops when the guest finishes,
+                // and equally when the closure is dropped UNRUN by `abort()`.
+                // The binding is load-bearing: an unmentioned capture would not
+                // be moved in at all under Rust 2021 disjoint capture, and the
+                // registration would clear on the calling thread instead.
+                let _live_guest = live_guest;
                 // Installed BEFORE the guest runs and cleared by its `Drop` on
                 // every exit path (including a panic), so a reused blocking-pool
                 // thread never carries a stale delegate id into the next job.
@@ -2231,6 +2243,36 @@ impl GuestDelegateInstance {
 impl Drop for GuestDelegateInstance {
     fn drop(&mut self) {
         native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+    }
+}
+
+/// Marks an instance id as having a delegate guest that may still be executing,
+/// for as long as this value is alive.
+///
+/// Created on the CALLING thread and moved into the guest closure, so it clears
+/// on both outcomes: the closure running to completion (or unwinding), and the
+/// closure being dropped UNRUN when `abort()` beats it off the blocking-pool
+/// queue. See [`native_api::LIVE_DELEGATE_GUESTS`] for why neither half can move.
+///
+/// Distinct from [`GuestDelegateInstance`] on purpose. That one installs a
+/// THREAD-LOCAL and so must be constructed on the worker thread; this one is a
+/// process-global registration and must be constructed BEFORE the worker starts,
+/// or a `QueuedTimeout` whose abort loses the race leaves a window where the
+/// next message sees no live guest.
+struct LiveGuestRegistration {
+    instance_id: i64,
+}
+
+impl LiveGuestRegistration {
+    fn register(instance_id: i64) -> Self {
+        native_api::LIVE_DELEGATE_GUESTS.insert(instance_id);
+        Self { instance_id }
+    }
+}
+
+impl Drop for LiveGuestRegistration {
+    fn drop(&mut self) {
+        native_api::LIVE_DELEGATE_GUESTS.remove(&self.instance_id);
     }
 }
 

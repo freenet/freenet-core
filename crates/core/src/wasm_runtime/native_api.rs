@@ -37,6 +37,45 @@ type SecretReadMemo = Option<([u8; 32], zeroize::Zeroizing<Vec<u8>>)>;
 pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateCallEnv>> =
     LazyLock::new(DashMap::default);
 
+/// Instance ids whose delegate guest MAY STILL BE EXECUTING.
+///
+/// This exists because `DELEGATE_ENV` cannot answer the question that actually
+/// matters. `DelegateEnvGuard::drop` removes the env on EVERY exit path of
+/// `exec_inbound_with_env`, including the wall-clock-timeout `Err` — and on that
+/// path the guest is still running on an abandoned `spawn_blocking` thread,
+/// because `JoinHandle::abort()` cannot stop a closure that has started. So
+/// `DELEGATE_ENV.contains_key(id)` tests "is an env still registered", while the
+/// dangerous fact is "is a guest still running". Those were the same thing only
+/// while the guest could not outlive the call, which stopped being true in
+/// #5480.
+///
+/// One `RunningInstance` id is shared by every message in a batch
+/// (`delegate/interface.rs`), so without this an error-tolerant batch loop could
+/// insert a second env under an id whose first guest is still live, and the two
+/// threads would alias the same `SecretsStore`, `context` and
+/// `secret_read_memo`. The last of those holds decrypted secret plaintext, so
+/// the consequence is cross-value disclosure, not merely a panic.
+///
+/// LIFETIME. An entry is added on the CALLING thread before the guest closure is
+/// enqueued, and removed by a guard MOVED INTO that closure. That placement is
+/// deliberate and both halves matter:
+///
+///  - Adding it inside the closure would leave a gap. `execute_wasm_blocking`
+///    reports `QueuedTimeout` when its `started` flag is false, then aborts; if
+///    that abort loses the race the closure runs anyway, so a registration made
+///    inside it could land AFTER the caller had already returned and the next
+///    message had passed its check.
+///  - Removing it by dropping a captured guard covers both outcomes without a
+///    leak: if the closure runs, the guard drops when the guest finishes
+///    (including on panic-unwind); if `abort()` wins and the closure is dropped
+///    UNRUN, its captures drop with it and the id clears — correctly, since no
+///    guest ever ran.
+///
+/// The registration must therefore stay captured by the closure. Moving it out,
+/// or dropping it before the guest returns, silently reintroduces the hazard.
+pub(super) static LIVE_DELEGATE_GUESTS: LazyLock<dashmap::DashSet<InstanceId>> =
+    LazyLock::new(dashmap::DashSet::default);
+
 /// Global registry of delegate subscriptions to contracts.
 ///
 /// When a V2 delegate calls `subscribe_contract()`, the (contract, delegate) pair is
@@ -686,6 +725,24 @@ pub(super) struct DelegateCallEnv {
 //     happens-before that removal returns, which happens-before the pool moves
 //     the `Runtime`.
 //
+//     TWO THINGS THAT WRITE LOCK DOES NOT BUY.
+//
+//     It does not bound EFFECTS, only pointer validity. Between the wall clock
+//     firing and the removal completing, an abandoned guest can still finish a
+//     host call it had already entered — a `set_secret`, a
+//     `put_contract_state_sync`. Those writes land after the caller has been
+//     told the call timed out. That is not unsoundness, but do not read
+//     "removal bounds the dereferences" as "removal bounds what the guest did".
+//
+//     It is also a DEADLOCK EDGE. dashmap is writer-preferring, so once
+//     `remove` is waiting for the shard write lock, a new READ of that shard
+//     blocks behind it. A host function that took a second `DELEGATE_ENV.get`
+//     while already holding a `Ref` would therefore hang rather than merely
+//     contend. All 15 current call sites take exactly one guard and drop it
+//     before returning, which is the only reason this is safe today; a single
+//     nested `get` is the whole distance to a hung node. Keep every host
+//     function to one guard at a time.
+//
 //     THE CREATING THREAD MUST NOT TOUCH THE ENV WHILE A GUEST MAY STILL BE
 //     RUNNING. On the wall-clock-timeout path it returns with the guest still
 //     live on an abandoned blocking thread, so any access it makes there is a
@@ -731,15 +788,48 @@ pub(super) struct DelegateCallEnv {
 //      - One id IS reused WITHIN a batch. `delegate/interface.rs` creates a
 //        single `RunningInstance` and passes its id to `exec_inbound_with_env`
 //        for every message, so the insert runs again under the same id per
-//        message. The fail-closed `contains_key` check there is what makes that
-//        safe. Without it, an error-tolerant batch loop would re-insert under an
-//        id whose previous guest is still abandoned and running, and the two
-//        threads would alias the same stores.
+//        message. The fail-closed check there is what makes that safe. Without
+//        it, an error-tolerant batch loop would re-insert under an id whose
+//        previous guest is still abandoned and running, and the two threads
+//        would alias the same stores.
+//
+//        That check must consult `LIVE_DELEGATE_GUESTS`, not `DELEGATE_ENV`
+//        alone. `DelegateEnvGuard::drop` removes the env on EVERY exit path of
+//        `exec_inbound_with_env`, the wall-clock-timeout `Err` included, so
+//        `DELEGATE_ENV.contains_key` is already false at the moment the caller
+//        learns the call timed out — while the guest runs on. Presence of an env
+//        and liveness of a guest are different facts, and only the second one is
+//        dangerous.
 //
 // Keying instances by anything recycled (a pool slot, a code hash) breaks the
 // first half of 4 and makes these impls unsound.
+//
+// INTENDED END STATE: THE `Sync` IMPL SHOULD NOT EXIST. Read it as debt, not as
+// a settled design decision.
+//
+// `Send` is genuinely required. `Sync` is required only because
+// `DELEGATE_ENV` is a `DashMap`, and `DashMap<K, V>` demands `V: Send + Sync` to
+// be a `static`. Nothing in this crate ever wants to share a
+// `&DelegateCallEnv` between threads, so the impl buys no capability — it only
+// silences a check. The type now holds three separately `!Sync` fields
+// (`context`, `secret_read_memo`, `secret_store`/`delegate_store`), and the
+// silenced check is exactly the one that would have caught #5593 flipping
+// `context_write` from `get_mut` to `get`: `RefCell<Vec<u8>>` is `!Sync`
+// precisely so the compiler can object, and this impl is what stops it.
+//
+// The fix is structural rather than a better comment: move `DelegateCallEnv`
+// into wasmtime's `HostState`, which the `Store` already owns and hands to host
+// functions through `Caller`. That deletes this `Sync` impl, `DELEGATE_ENV`,
+// `CURRENT_DELEGATE_INSTANCE`, `LIVE_DELEGATE_GUESTS` and the whole
+// abandoned-guest hazard class in one move, because the env would then be owned
+// by the store the guest runs against instead of reachable from a process-global
+// map. Deliberately out of scope for #5480, which is about giving delegates the
+// safeguards contracts already have; tracked as the follow-up that retires the
+// reason this argument has to be written down at all.
 unsafe impl Send for DelegateCallEnv {}
-// SAFETY: as for `Send` directly above -- the two are one argument.
+// SAFETY: as for `Send` directly above -- the two are one argument. See the
+// "intended end state" note: this impl is debt, and only `DashMap`'s bound
+// requires it.
 unsafe impl Sync for DelegateCallEnv {}
 
 /// Typed errors from `DelegateCallEnv` contract operations.

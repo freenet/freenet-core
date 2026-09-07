@@ -5026,3 +5026,74 @@ async fn reentering_a_live_instance_id_fails_closed() -> Result<(), Box<dyn std:
 
     Ok(())
 }
+
+/// REGRESSION (#5480 review, F1): re-entry must be refused while a guest is
+/// still running, EVEN THOUGH its `DELEGATE_ENV` entry has already been removed.
+///
+/// This is the case the first version of the guard could not see.
+/// `DelegateEnvGuard::drop` removes the env on every exit path of
+/// `exec_inbound_with_env`, including the wall-clock-timeout `Err` — and on that
+/// path the guest is still running on an abandoned `spawn_blocking` thread,
+/// since `abort()` cannot stop a closure that has started. So by the time the
+/// batch loop sees the error, `DELEGATE_ENV.contains_key(id)` is already false
+/// while the dangerous condition — a live guest holding raw pointers to this
+/// runtime's stores — is still true.
+///
+/// A check on `DELEGATE_ENV` alone therefore reads false in exactly the
+/// scenario the guard exists for. `LIVE_DELEGATE_GUESTS` tracks the guest's own
+/// lifetime instead, which is the fact that matters.
+///
+/// Simulated by registering the id directly: reproducing it through a real
+/// abandoned guest would need an error-tolerant batch loop, which is precisely
+/// the future edit this guard is here to catch and which does not exist yet.
+#[tokio::test]
+async fn reentering_an_id_with_a_live_guest_fails_closed_even_with_no_env()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::super::engine::InstanceHandle;
+    use super::super::native_api::{DELEGATE_ENV, LIVE_DELEGATE_GUESTS};
+
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+
+    const LIVE_ID: i64 = i64::MAX - 54801;
+
+    let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::ReadContext)?;
+    let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload));
+    let handle = InstanceHandle { id: LIVE_ID };
+    let params: Parameters = vec![].into();
+
+    // The env is absent, exactly as `DelegateEnvGuard::drop` leaves it after a
+    // wall-clock timeout. Only the guest registration remains.
+    assert!(
+        !DELEGATE_ENV.contains_key(&LIVE_ID),
+        "precondition: no env under LIVE_ID, so a DELEGATE_ENV-only check would pass"
+    );
+    LIVE_DELEGATE_GUESTS.insert(LIVE_ID);
+
+    let result = runtime.exec_inbound_with_env(
+        delegate.key(),
+        &params,
+        None,
+        None,
+        &msg,
+        Vec::new(),
+        &handle,
+        LIVE_ID,
+        DelegateApiVersion::V2,
+    );
+
+    // Clear before asserting so a failure cannot strand a live-guest marker in
+    // the process-global set for every later test in this binary.
+    LIVE_DELEGATE_GUESTS.remove(&LIVE_ID);
+
+    let err = result.expect_err(
+        "re-entry must be refused while a guest is still live, even with the env already \
+         removed (#5480 review F1)",
+    );
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("already active"),
+        "expected the re-entry guard's error, got: {rendered}"
+    );
+
+    Ok(())
+}
