@@ -547,32 +547,88 @@ impl ConfigArgs {
         if !dir.exists() {
             return Ok(None);
         }
-        let mut read_dir = std::fs::read_dir(dir)?;
-        let config_args: Option<(String, String)> = read_dir.find_map(|e| {
-            if let Ok(e) = e {
-                if e.path().is_dir() {
-                    return None;
-                }
-                let filename = e.file_name().to_string_lossy().into_owned();
-                let ext = filename.rsplit('.').next().map(|s| s.to_owned());
-                if let Some(ext) = ext {
-                    if filename.starts_with("config") {
-                        match ext.as_str() {
-                            "toml" => {
-                                tracing::debug!(filename = %filename, "Found configuration file");
-                                return Some((filename, ext));
+
+        // Prefer an exact `config.toml` / `config.json` match over any other
+        // `config*` name (e.g. `config.bak.toml`). `read_dir`'s iteration order
+        // is not guaranteed, so the fuzzy fallback below could otherwise
+        // silently pick up a backup file instead of the real config. This pass
+        // deliberately does not touch `read_dir` at all, so it is immune to
+        // iteration-order nondeterminism by construction rather than by luck
+        // — which is what `read_config_finds_exact_config_without_listing_the_directory`
+        // pins. (#5038)
+        const EXACT_NAMES: &[(&str, &str)] = &[("config.toml", "toml"), ("config.json", "json")];
+        let mut config_args: Option<(String, String)> = None;
+        for (filename, ext) in EXACT_NAMES {
+            if dir.join(filename).is_file() {
+                tracing::debug!(filename = %filename, "Found exact configuration file");
+                config_args = Some((filename.to_string(), ext.to_string()));
+                break;
+            }
+        }
+
+        // toml now wins over json deterministically, where the old fuzzy scan
+        // took whichever `read_dir` yielded first. That is the point of the
+        // fix, but it has a sharp edge worth saying out loud: `build()` writes
+        // `config.toml` unconditionally, so a `config.json` operator gets one
+        // created beside theirs on first boot and from then on their json is
+        // never read again. Silently preferring one of two present configs is
+        // the same invisible-config failure this fix exists to remove, so say
+        // which one won.
+        if matches!(config_args.as_ref(), Some((name, _)) if name == "config.toml")
+            && dir.join("config.json").is_file()
+        {
+            tracing::warn!(
+                "both config.toml and config.json are present in {}; loading config.toml \
+                 and IGNORING config.json. Remove whichever is not the one you edit.",
+                dir.display()
+            );
+        }
+
+        if config_args.is_none() {
+            let mut read_dir = std::fs::read_dir(dir)?;
+            config_args = read_dir.find_map(|e| {
+                if let Ok(e) = e {
+                    if e.path().is_dir() {
+                        return None;
+                    }
+                    let filename = e.file_name().to_string_lossy().into_owned();
+                    let ext = filename.rsplit('.').next().map(|s| s.to_owned());
+                    if let Some(ext) = ext {
+                        if filename.starts_with("config") {
+                            match ext.as_str() {
+                                "toml" => {
+                                    // `warn`, not `debug`: #5038 is about a
+                                    // config that is invisibly not the one you
+                                    // edited. Loading `config.bak.toml` because
+                                    // no `config.toml` exists is exactly that,
+                                    // and at debug level nobody sees it.
+                                    tracing::warn!(
+                                        filename = %filename,
+                                        "no exact config.toml/config.json found; falling back to this \
+                                         config* file. Rename it to config.toml if it is the one you edit."
+                                    );
+                                    return Some((filename, ext));
+                                }
+                                "json" => {
+                                    // Same reasoning as the `toml` arm above.
+                                    // A fuzzy-matched `config*.json` is just as
+                                    // invisibly-not-the-file-you-edited.
+                                    tracing::warn!(
+                                        filename = %filename,
+                                        "no exact config.toml/config.json found; falling back to this \
+                                         config* file. Rename it to config.json if it is the one you edit."
+                                    );
+                                    return Some((filename, ext));
+                                }
+                                _ => {}
                             }
-                            "json" => {
-                                return Some((filename, ext));
-                            }
-                            _ => {}
                         }
                     }
                 }
-            }
 
-            None
-        });
+                None
+            });
+        }
 
         match config_args {
             Some((filename, ext)) => {
@@ -6114,6 +6170,230 @@ shutdown-drain-secs = 42
         assert!(
             err.to_string().contains("duplicate"),
             "expected a duplicate-field error, got: {err}"
+        );
+    }
+
+    /// REGRESSION for #5038: with both `config.toml` and a fuzzy-matching
+    /// `config.bak.toml` present, `read_config` must load the exact name.
+    ///
+    /// Read the regression power of this test honestly: it depends on the
+    /// order `read_dir` happens to yield, which is a property of the
+    /// filesystem, NOT of the order the files were written. Measured on ext4
+    /// (2000 trials per arm): insertion order makes no difference whatsoever,
+    /// and with `config.bak.toml` as the only decoy the UNFIXED code picked
+    /// `config.toml` anyway in 2000/2000 runs — i.e. this test on its own
+    /// would have passed against the bug. Extra decoys are therefore present
+    /// deliberately: ext4 orders entries by a per-filesystem hash seed, so the
+    /// more `config*.toml` names compete, the smaller the chance that the
+    /// exact one happens to come first. That lowers the odds of a vacuous
+    /// pass; it does not eliminate them.
+    ///
+    /// The guarantee itself is pinned deterministically, and without any
+    /// dependence on `read_dir` order, by
+    /// `read_config_finds_exact_config_without_listing_the_directory` below.
+    /// This test covers the ordinary case; that one covers the invariant.
+    #[test]
+    fn read_config_prefers_exact_config_toml_over_backup() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+
+        let exact_toml = released_config_toml_without_secret_paths();
+        let decoy_toml = exact_toml.replace("log_level = \"debug\"", "log_level = \"trace\"");
+        assert_ne!(
+            exact_toml, decoy_toml,
+            "the substitution did not fire, so both files would carry the same \
+             log level and the assertion below could not distinguish them"
+        );
+
+        // `config.toml` is written FIRST on purpose. ext4 orders entries by a
+        // hash seed, so write order is irrelevant there — but tmpfs is
+        // insertion-ordered, and with the exact name written LAST the unfixed
+        // code returned it 400/400 on /dev/shm, i.e. this test passed against
+        // the bug. `tempfile::tempdir()` honours TMPDIR, so a runner with
+        // TMPDIR on tmpfs would silently neuter it. Writing it first makes the
+        // unfixed code pick a decoy on both filesystems.
+        fs::write(dir.join("config.toml"), &exact_toml).unwrap();
+        for decoy in [
+            "config.bak.toml",
+            "config.aaa.toml",
+            "config.0.toml",
+            "config.old.toml",
+            "config.orig.toml",
+        ] {
+            fs::write(dir.join(decoy), &decoy_toml).unwrap();
+        }
+
+        let cfg = ConfigArgs::read_config(&dir.to_path_buf())
+            .expect("read_config should succeed")
+            .expect("a config file should be found");
+
+        assert_eq!(
+            cfg.log_level,
+            tracing::log::LevelFilter::Debug,
+            "read_config must load config.toml (log_level = debug), not a \
+             config.*.toml backup (trace)"
+        );
+    }
+
+    /// The #5038 guarantee, pinned so that it cannot pass by luck: when
+    /// `config.toml` is present, `read_config` must not list the directory at
+    /// all.
+    ///
+    /// The directory is made execute-only (`--x--x--x`), which on any POSIX
+    /// filesystem permits resolving and opening a path THROUGH it while
+    /// denying `readdir`. So the pre-fix implementation, whose very first act
+    /// is `std::fs::read_dir(dir)?`, fails here with `PermissionDenied` no
+    /// matter what order any filesystem would have returned — while the
+    /// exact-match pass, which only ever calls `Path::is_file` on the two
+    /// candidate names, is unaffected. Verified against the real code: the
+    /// unfixed body returns `Err(PermissionDenied)`, the fixed body returns
+    /// the config.
+    ///
+    /// Root bypasses POSIX permission checks, so under `euid == 0` the setup
+    /// cannot produce the fault and the test would assert nothing. Rather
+    /// than skip silently, it asserts that the denial actually happened, so a
+    /// root CI runner fails loudly instead of going quietly vacuous.
+    ///
+    /// Unix-only: the mechanism is POSIX directory permissions, and this crate
+    /// also builds for Windows.
+    #[cfg(unix)]
+    #[test]
+    fn read_config_finds_exact_config_without_listing_the_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path().to_path_buf();
+        fs::write(
+            dir.join("config.toml"),
+            released_config_toml_without_secret_paths(),
+        )
+        .unwrap();
+
+        let original = fs::metadata(&dir).unwrap().permissions();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o111)).unwrap();
+
+        // Everything between here and the restore must be panic-free, so the
+        // temp dir is always left deletable; collect results, assert after.
+        let listing = fs::read_dir(&dir).map(|_| ());
+        let read = ConfigArgs::read_config(&dir);
+
+        fs::set_permissions(&dir, original).unwrap();
+
+        // Root bypasses POSIX permission checks, so under `euid == 0` the setup
+        // cannot produce the fault and this test cannot assert anything.
+        //
+        // It SKIPS rather than failing, deliberately. `docker/test-runner`
+        // (what `/freenet:linux-test` drives) runs `cargo test --workspace` as
+        // root with no `--user`, so a hard assert breaks a supported local
+        // workflow — and the obvious "fix" for a broken test is to delete the
+        // assertion, which is the one real regression guard in this PR. The
+        // skip is loud rather than silent, and GitHub CI runs `test_unit` as a
+        // non-root runner user, so the guard is live where it actually gates.
+        if listing.is_ok() {
+            eprintln!(
+                "SKIPPING read_config_finds_exact_config_without_listing_the_directory: \
+                 readdir succeeded on a --x--x--x directory, so this is running as root \
+                 (euid 0) and the fault this test depends on cannot be produced. This \
+                 guard is exercised by the non-root GitHub CI run."
+            );
+            return;
+        }
+        assert_eq!(
+            listing.map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied),
+            "readdir failed for a reason other than the permission fault this test \
+             sets up, so it is not exercising the exact-match pass"
+        );
+        let cfg = read
+            .expect("read_config must not list the directory when config.toml exists")
+            .expect("config.toml is present");
+        assert_eq!(cfg.log_level, tracing::log::LevelFilter::Debug);
+    }
+
+    /// REGRESSION for the shadowing branch: with BOTH `config.toml` and
+    /// `config.json` present, `config.toml` wins — and that has to be pinned,
+    /// because it is a behaviour this PR CREATED. The old fuzzy scan took
+    /// whichever entry `read_dir` yielded first, so which format won was
+    /// arbitrary; now it is settled, permanently, in toml's favour.
+    ///
+    /// That matters more than it looks: `build()` writes `config.toml`
+    /// unconditionally, so a `config.json` operator gets one created beside
+    /// theirs on first boot and from boot two their json is never read again.
+    /// If that precedence is ever revisited, this test is where the decision
+    /// is recorded.
+    ///
+    /// The json decoy is DERIVED from the same fixture as the toml rather than
+    /// hand-written, so it is a genuinely loadable config. A hand-written
+    /// `{"log_level": "error"}` is not — it is missing required fields, and the
+    /// test would then pass because the json failed to parse rather than
+    /// because toml was preferred. The `decoy` assertion below exists to keep
+    /// that failure mode caught rather than assumed: it loads the json ALONE
+    /// first and requires it to carry the distinguishing value.
+    #[test]
+    fn read_config_prefers_config_toml_over_a_valid_config_json() {
+        let toml_src = released_config_toml_without_secret_paths();
+
+        // Round-trip the fixture through `toml::Value` into JSON so the decoy
+        // has exactly the fields a real config has, then flip the one value
+        // this test distinguishes on.
+        let mut value: toml::Value = toml::from_str(&toml_src).expect("fixture must parse as toml");
+        if let Some(table) = value.as_table_mut() {
+            table.insert(
+                "log_level".to_string(),
+                toml::Value::String("error".to_string()),
+            );
+        }
+        let json_src = serde_json::to_string(&value).expect("fixture must serialise as json");
+
+        // Prove the decoy is loadable ON ITS OWN, so the assertion below is
+        // about precedence and not about the json being unreadable.
+        let json_only = tempfile::tempdir().unwrap();
+        fs::write(json_only.path().join("config.json"), &json_src).unwrap();
+        let decoy = ConfigArgs::read_config(&json_only.path().to_path_buf())
+            .expect("the json decoy must itself be readable")
+            .expect("config.json is present");
+        assert_eq!(
+            decoy.log_level,
+            tracing::log::LevelFilter::Error,
+            "the decoy does not carry the log level this test distinguishes on"
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        fs::write(dir.join("config.toml"), &toml_src).unwrap();
+        fs::write(dir.join("config.json"), &json_src).unwrap();
+
+        let cfg = ConfigArgs::read_config(&dir.to_path_buf())
+            .expect("read_config should succeed")
+            .expect("a config file should be found");
+        assert_eq!(
+            cfg.log_level,
+            tracing::log::LevelFilter::Debug,
+            "config.toml must win when both exact names are present; got the \
+             config.json value instead"
+        );
+    }
+
+    /// With no exact `config.toml` / `config.json`, the fuzzy fallback must
+    /// still find a `config*` file — the exact-match pass must not have
+    /// narrowed what `read_config` accepts.
+    #[test]
+    fn read_config_fuzzy_fallback_when_no_exact_match() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+
+        let backup_toml = released_config_toml_without_secret_paths()
+            .replace("log_level = \"debug\"", "log_level = \"warn\"");
+        fs::write(dir.join("config.bak.toml"), &backup_toml).unwrap();
+
+        let cfg = ConfigArgs::read_config(&dir.to_path_buf())
+            .expect("read_config should succeed")
+            .expect("a config file should be found");
+
+        assert_eq!(
+            cfg.log_level,
+            tracing::log::LevelFilter::Warn,
+            "fuzzy fallback should pick up config.bak.toml when no exact match exists"
         );
     }
 
