@@ -2020,85 +2020,37 @@ where
                         resume,
                     )
                     .await;
-                    resume_budget = resume_budget.saturating_sub(runs.max(1));
+                    // A resume whose park is already gone did no work, but it
+                    // still costs one unit: charging zero would let a run of
+                    // stale resumes spin this batch without bound.
+                    resume_budget = resume_budget.saturating_sub(runs.unwrap_or(0).max(1));
                 }
                 None => break,
             }
         }
 
         // Backstop sweep for parks that neither completed nor were dropped
-        // (see `PARK_TTL`). Force-resume them so a wedged delegate cannot stay
-        // wedged: the resume drains its pending queue and answers its client.
+        // (see `PARK_TTL`). Extracted so its BUDGET is testable — see
+        // `sweep_expired_parks`, which also holds the reasoning that used to
+        // live here. It still runs at the top of the iteration, before the
+        // export/event/notification drains and the fair-queue pop, so nothing
+        // about the ordering this loop depends on has moved.
         //
-        // `expired` re-reads the resume channel ITSELF and excludes any park
-        // whose answer has arrived — it takes the receiver precisely so this
-        // decision cannot be made from the stale buffer the batch above
-        // snapshotted before it started awaiting (#5554).
-        for (delegate_key, epoch) in park_ctx.expired(
-            tokio::time::Instant::now(),
+        // Its budget is its OWN, not what the resume batch above has left. A
+        // node with a steady stream of resumes would otherwise never sweep, and
+        // the backstop exists precisely for the case where something is wedged.
+        // Worst case per iteration is therefore 2 x MAX_RESUME_DRAIN_BATCH
+        // delegate runs, both bounded constants.
+        sweep_expired_parks(
+            &mut contract_handler,
+            &mut park_ctx,
+            &prompter,
             &mut delegate_resume_rx,
             &mut delegate_resumes,
-        ) {
-            // ...and re-ask per victim, because THIS loop awaits too: a guard
-            // firing while park X is being force-resumed is invisible to the
-            // decision already made about park Y. No `.await` between this
-            // check and `take_matching` inside `handle_delegate_resume`.
-            if !park_ctx.should_force_resume(
-                &delegate_key,
-                epoch,
-                &mut delegate_resume_rx,
-                &mut delegate_resumes,
-            ) {
-                tracing::debug!(
-                    delegate = %delegate_key,
-                    epoch,
-                    "Park reached PARK_TTL but its resume arrived while an \
-                     earlier force-resume was running — running that instead, \
-                     so the answer it carries is not discarded (#5554)"
-                );
-                continue;
-            }
-            // Force-resume the park we OBSERVED, by epoch. The off-loop task's
-            // ParkGuard is untouched and still owes a resume; carrying the epoch
-            // is what lets that late resume be recognised as stale and dropped
-            // rather than absorbed by whatever park exists by then (#5544 H1).
-            let swept = delegate_key.clone();
-            let _ = handle_delegate_resume(
-                &mut contract_handler,
-                &mut park_ctx,
-                &prompter,
-                delegate_park::DelegateResume {
-                    delegate_key,
-                    epoch,
-                    cause: delegate_park::ResumeCause::TimedOut,
-                    inbound: Vec::new(),
-                    upserts: Vec::new(),
-                    // The sweep does not know what the task owed; that task's
-                    // own guard still fires and is rejected on epoch, so
-                    // nothing is answered twice.
-                    unresolved_upserts: Vec::new(),
-                },
-            )
-            .await;
-            // Logged AFTER the resume, not before, so nothing sits between
-            // `should_force_resume` and `take_matching` (the first statement of
-            // `handle_delegate_resume`) — that gap is the residual window this
-            // fix narrows, and the cheapest way to keep it narrow is to put
-            // nothing in it. On the service path this line is microseconds
-            // (`tracing_appender::non_blocking`, which drops on overflow), so
-            // this is keeping the window free of anything whose cost is not
-            // obviously bounded rather than a fix for a measured cost.
-            //
-            // The message text is UNCHANGED on purpose: it is the log signature
-            // operators grep for, paired with the later "Resume for a park that
-            // no longer exists" from the stale guard. Reword it and that pairing
-            // stops being findable.
-            tracing::warn!(
-                delegate = %swept,
-                epoch,
-                "Delegate park exceeded PARK_TTL — force-resuming"
-            );
-        }
+            tokio::time::Instant::now(),
+            MAX_RESUME_DRAIN_BATCH,
+        )
+        .await;
 
         // Drain completed off-loop EXPORTS (#4531 / #4381 P5): return/replace the
         // executor and answer the parked client. Bounded by MAX_CONCURRENT_EXPORTS
@@ -3382,6 +3334,136 @@ async fn send_delegate_response<CH>(
     }
 }
 
+/// Force-resume every park that has outlived [`delegate_park::PARK_TTL`],
+/// bounded by `budget` delegate runs. Returns the runs performed.
+///
+/// The backstop for parks that neither completed nor were dropped: the resume
+/// drains the park's pending queue and answers its client, so a wedged delegate
+/// cannot stay wedged.
+///
+/// THE BUDGET IS THE POINT, and it was missing. `expired` can return up to
+/// `MAX_PARKED_DELEGATES` (64) victims and one force-resume costs up to
+/// `1 + MAX_PENDING_PER_DELEGATE + MAX_PENDING_NOTIFICATION_CONTRACTS` (25)
+/// delegate runs, so this loop could execute **1600 WASM delegate runs** in a
+/// single pass with no fair-queue interleaving and no yield — every
+/// GET/PUT/UPDATE/subscribe on the node waiting behind it. The triggering
+/// condition is 64 parked delegates whose off-loop tasks are wedged, which is
+/// exactly what this backstop exists for. `handle_delegate_resume` returns its
+/// run count *specifically* so a caller can spend it, and its rustdoc says an
+/// unaccounted drain "could do many of them before the fair queue got a single
+/// turn — exactly the head-of-line blocking the batch cap exists to prevent";
+/// the sweep discarded it with `let _ =` sixty lines below the batch that
+/// spends it.
+///
+/// DEFERRING COSTS NOTHING, which is why a cap is the right shape here rather
+/// than a yield. `expired` is recomputed from scratch on every iteration, and
+/// `next_sweep_deadline()` for a park already past its TTL is an instant in the
+/// PAST, so `sleep_until` returns immediately and the loop comes straight back
+/// for the rest — after the fair queue has had its turn, which is the whole
+/// object. A deferred victim is re-listed, not dropped.
+///
+/// Extracted from `contract_handling` for one reason: the budget is only
+/// testable if something can call the sweep. `now` is a parameter for the same
+/// reason — the loop passes `Instant::now()`, and a test passes an instant past
+/// the TTL without having to pause the runtime clock and fight the
+/// `PARK_WORK_BUDGET` and `USER_INPUT_TIMEOUT` timers that auto-advance would
+/// fire first. See
+/// `the_ttl_sweep_is_bounded_and_leaves_the_rest_for_the_next_pass`.
+async fn sweep_expired_parks<CH, P>(
+    contract_handler: &mut CH,
+    park_ctx: &mut delegate_park::DelegateParkCtx,
+    prompter: &std::sync::Arc<P>,
+    delegate_resume_rx: &mut tokio::sync::mpsc::UnboundedReceiver<delegate_park::DelegateResume>,
+    delegate_resumes: &mut std::collections::VecDeque<delegate_park::DelegateResume>,
+    now: tokio::time::Instant,
+    budget: usize,
+) -> usize
+where
+    CH: ContractHandler + Send + 'static,
+    P: UserInputPrompter + 'static,
+{
+    let mut spent = 0usize;
+    // `expired` re-reads the resume channel ITSELF and excludes any park whose
+    // answer has arrived — it takes the receiver precisely so this decision
+    // cannot be made from the stale buffer the caller's resume batch
+    // snapshotted before it started awaiting (#5554).
+    for (delegate_key, epoch) in park_ctx.expired(now, delegate_resume_rx, delegate_resumes) {
+        if spent >= budget {
+            tracing::debug!(
+                spent,
+                budget,
+                "TTL sweep budget spent; the remaining past-due parks are \
+                 re-listed on the next iteration so the fair queue gets a turn"
+            );
+            break;
+        }
+        // ...and re-ask per victim, because THIS loop awaits too: a guard
+        // firing while park X is being force-resumed is invisible to the
+        // decision already made about park Y. No `.await` between this
+        // check and `take_matching` inside `handle_delegate_resume`.
+        if !park_ctx.should_force_resume(&delegate_key, epoch, delegate_resume_rx, delegate_resumes)
+        {
+            tracing::debug!(
+                delegate = %delegate_key,
+                epoch,
+                "Park reached PARK_TTL but its resume arrived while an \
+                 earlier force-resume was running — running that instead, \
+                 so the answer it carries is not discarded (#5554)"
+            );
+            continue;
+        }
+        // Force-resume the park we OBSERVED, by epoch. The off-loop task's
+        // ParkGuard is untouched and still owes a resume; carrying the epoch
+        // is what lets that late resume be recognised as stale and dropped
+        // rather than absorbed by whatever park exists by then (#5544 H1).
+        let swept = delegate_key.clone();
+        let runs = handle_delegate_resume(
+            contract_handler,
+            park_ctx,
+            prompter,
+            delegate_park::DelegateResume {
+                delegate_key,
+                epoch,
+                cause: delegate_park::ResumeCause::TimedOut,
+                inbound: Vec::new(),
+                upserts: Vec::new(),
+                // The sweep does not know what the task owed; that task's
+                // own guard still fires and is rejected on epoch, so
+                // nothing is answered twice.
+                unresolved_upserts: Vec::new(),
+            },
+        )
+        .await;
+        // NOTHING WAS FORCE-RESUMED, so nothing is charged and nothing is
+        // logged. Reachable when the delegate re-parked during an earlier
+        // victim's force-resume: `take_matching` then finds no park at this
+        // epoch and returns without touching anything. The `warn!` below fired
+        // unconditionally, counting sweeps that did not happen — which degrades
+        // exactly the pairing the comment on it describes.
+        let Some(runs) = runs else { continue };
+        spent = spent.saturating_add(runs.max(1));
+        // Logged AFTER the resume, not before, so nothing sits between
+        // `should_force_resume` and `take_matching` (the first statement of
+        // `handle_delegate_resume`) — that gap is the residual window #5554
+        // narrows, and the cheapest way to keep it narrow is to put nothing in
+        // it. On the service path this line is microseconds
+        // (`tracing_appender::non_blocking`, which drops on overflow), so this
+        // is keeping the window free of anything whose cost is not obviously
+        // bounded rather than a fix for a measured cost.
+        //
+        // The message text is UNCHANGED on purpose: it is the log signature
+        // operators grep for, paired with the later "Resume for a park that
+        // no longer exists" from the stale guard. Reword it and that pairing
+        // stops being findable.
+        tracing::warn!(
+            delegate = %swept,
+            epoch,
+            "Delegate park exceeded PARK_TTL — force-resuming"
+        );
+    }
+    spent
+}
+
 /// Re-enter a delegate whose park has resolved, then drain whatever queued
 /// behind it.
 ///
@@ -3389,12 +3471,24 @@ async fn send_delegate_response<CH>(
 /// WAIT happened off it. This is the counterpart to #4391's
 /// `handle_deferred_resume`.
 ///
-/// Returns the number of delegate runs performed, INCLUDING the pending
-/// requests drained behind the park. The loop spends that against its
-/// `MAX_RESUME_DRAIN_BATCH` budget (#5544 S5): each drained request is a full
-/// delegate run, so an unaccounted drain could do many of them before the fair
-/// queue got a single turn — exactly the head-of-line blocking the batch cap
-/// exists to prevent.
+/// `Some(runs)` is the number of delegate runs performed, INCLUDING the pending
+/// requests drained behind the park, and is always at least 1. `None` means no
+/// park matched `(key, epoch)`, so nothing ran at all.
+///
+/// EVERY caller spends the count against a budget (#5544 S5): each drained
+/// request is a full delegate run, so an unaccounted drain could do many of
+/// them before the fair queue got a single turn — exactly the head-of-line
+/// blocking the batch cap exists to prevent. That sentence was true of the
+/// resume batch and false of the TTL sweep, which discarded the count with
+/// `let _ =` while performing up to 1600 runs in one pass; see
+/// `sweep_expired_parks`.
+///
+/// `None` is distinguished from `Some(0)` rather than folded into it because
+/// the sweep needs the difference: it must log "force-resuming" only for a park
+/// it actually force-resumed, and a resume for a delegate that has since
+/// re-parked reaches this function and returns without touching anything.
+/// Deriving that from a zero count happens to work today and would break
+/// silently the first time a legitimate resume did no runs.
 ///
 /// Worst case for ONE resume is `1 + MAX_PENDING_PER_DELEGATE +
 /// MAX_PENDING_NOTIFICATION_CONTRACTS` runs: the resumed run itself, the queued
@@ -3408,7 +3502,7 @@ async fn handle_delegate_resume<CH, P>(
     park: &mut delegate_park::DelegateParkCtx,
     prompter: &std::sync::Arc<P>,
     resume: delegate_park::DelegateResume,
-) -> usize
+) -> Option<usize>
 where
     CH: ContractHandler + Send + 'static,
     P: UserInputPrompter + 'static,
@@ -3440,7 +3534,7 @@ where
             "Resume for a park that no longer exists (force-resumed by the TTL \
              backstop, or already ended) — dropping"
         );
-        return 0;
+        return None;
     };
     // The resumed run itself, plus one per pending request drained below.
     let mut runs = 1usize;
@@ -3615,7 +3709,7 @@ where
             }
         }
     }
-    runs
+    Some(runs)
 }
 
 /// Re-run a notification-driven delegate invocation that had been queued behind
@@ -7980,6 +8074,126 @@ mod hol_4391_tests {
              wake loop. Declining implies the park's resume is in \
              `delegate_resumes`, so this guard is what keeps that unreachable \
              (#5554)"
+        );
+    }
+
+    /// An empty continuation: enough to make a real park, and nothing more.
+    /// `handle_delegate_resume` on one of these completes without re-entering
+    /// the delegate (nothing to feed back), which is what keeps the sweep test
+    /// below about the BUDGET rather than about the executor.
+    fn park_continuation() -> delegate_park::Continuation {
+        delegate_park::Continuation {
+            iterations: 0,
+            params: Parameters::from(Vec::new()),
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+            inter_delegate: InterDelegateDispatch::Allowed,
+            accumulated: Vec::new(),
+            inbound_so_far: Vec::new(),
+            responder: None,
+            delivery: delegate_park::Delivery::Client,
+        }
+    }
+
+    /// M2: the TTL backstop must not perform an unbounded number of delegate
+    /// runs in a single pass.
+    ///
+    /// `expired` can return up to `MAX_PARKED_DELEGATES` (64) victims and one
+    /// force-resume costs up to `1 + MAX_PENDING_PER_DELEGATE +
+    /// MAX_PENDING_NOTIFICATION_CONTRACTS` (25) delegate runs, so the sweep
+    /// could execute 1600 WASM runs with no fair-queue interleaving and no
+    /// yield — every GET/PUT/UPDATE/subscribe on the node waiting behind it.
+    /// The triggering condition is 64 parked delegates whose off-loop tasks are
+    /// wedged, i.e. precisely what the backstop exists for.
+    ///
+    /// `handle_delegate_resume` returns its run count so the caller can spend
+    /// it, and the resume batch sixty lines above does; the sweep threw it away
+    /// with `let _ =`.
+    ///
+    /// FALSIFY by removing the budget check from `sweep_expired_parks`: the
+    /// first pass then clears every park and the second assertion goes red.
+    /// The third and fourth assertions are what stop that from being fixable by
+    /// simply sweeping FEWER parks — the deferred victims must still be swept,
+    /// and `expired` recomputing every pass is what makes deferring free.
+    #[tokio::test]
+    async fn the_ttl_sweep_is_bounded_and_leaves_the_rest_for_the_next_pass() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park_ctx = delegate_park::DelegateParkCtx::new(tx);
+        let mut buffered = std::collections::VecDeque::new();
+        let prompter = Arc::new(GatedPrompter {
+            gate: Arc::new(tokio::sync::Semaphore::new(0)),
+        });
+
+        // More victims than the budget, all past due at the same instant: the
+        // backstop's own scenario, scaled down.
+        let victims = MAX_RESUME_DRAIN_BATCH + 4;
+        for i in 0..victims {
+            let byte = u8::try_from(i).expect("victims fits in a byte");
+            let key = DelegateKey::new(
+                [byte; 32],
+                freenet_stdlib::prelude::CodeHash::new([byte; 32]),
+            );
+            assert!(
+                matches!(
+                    park_ctx.park(key, park_continuation(), 0),
+                    delegate_park::ParkAdmission::Admitted { .. }
+                ),
+                "every park must be admitted, or this test is measuring the cap"
+            );
+        }
+        assert_eq!(park_ctx.parked_count(), victims);
+
+        // Instant::now() is a PARAMETER precisely so this needs no paused
+        // clock: pausing would auto-advance to PARK_WORK_BUDGET and
+        // USER_INPUT_TIMEOUT first, neither of which is what is under test.
+        let past_due =
+            tokio::time::Instant::now() + delegate_park::PARK_TTL + Duration::from_secs(1);
+
+        let spent = sweep_expired_parks(
+            &mut handler,
+            &mut park_ctx,
+            &prompter,
+            &mut rx,
+            &mut buffered,
+            past_due,
+            MAX_RESUME_DRAIN_BATCH,
+        )
+        .await;
+        assert_eq!(
+            spent, MAX_RESUME_DRAIN_BATCH,
+            "one sweep must spend its budget and stop, not run every past-due \
+             park it can find"
+        );
+        assert_eq!(
+            park_ctx.parked_count(),
+            victims - MAX_RESUME_DRAIN_BATCH,
+            "the over-budget victims must still be PARKED. Without the budget \
+             this pass force-resumes all {victims} of them — up to 25 delegate \
+             runs each, on the serial loop, with the fair queue getting no turn"
+        );
+
+        // Deferred, not dropped: `expired` is recomputed every pass, so the
+        // rest are swept on the next one. That is what makes capping the right
+        // shape here rather than a yield.
+        let spent = sweep_expired_parks(
+            &mut handler,
+            &mut park_ctx,
+            &prompter,
+            &mut rx,
+            &mut buffered,
+            past_due,
+            MAX_RESUME_DRAIN_BATCH,
+        )
+        .await;
+        assert_eq!(spent, victims - MAX_RESUME_DRAIN_BATCH);
+        assert_eq!(
+            park_ctx.parked_count(),
+            0,
+            "a deferred victim must be re-listed and swept, not skipped — the \
+             backstop still has to un-wedge every wedged delegate"
         );
     }
 
