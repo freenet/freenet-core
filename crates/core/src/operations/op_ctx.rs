@@ -818,8 +818,19 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
                     AdvanceOutcome::Exhausted => {
+                        // Do NOT say "exhausted all peers": `advance()` also
+                        // reports Exhausted when the RETRY BUDGET ran out,
+                        // where candidates may well remain (#5252 — this
+                        // string sits right beside the new `exhaustion_reason`
+                        // field in an analyst's view, so conflating the two
+                        // here undoes the discriminator). Count peer attempts,
+                        // not raw attempts, to match the sibling arms above —
+                        // `attempt_count` includes same-peer infra-retries.
+                        let peer_attempts = attempt_count.saturating_sub(infra_retries);
                         return RetryLoopOutcome::Exhausted(format!(
-                            "{op_label} exhausted all peers after {attempt_count} attempts"
+                            "{op_label} stopped advancing after {peer_attempts} peer \
+                             attempt(s) ({infra_retries} infra-retries on same peer); \
+                             last peer replied retry"
                         ));
                     }
                 }

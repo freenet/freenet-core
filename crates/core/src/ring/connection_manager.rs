@@ -2266,15 +2266,18 @@ impl ConnectionManager {
     /// addr-keyed bookkeeping.
     ///
     /// This is the ONLY way to stage an ADDRESSLESS ([`PeerAddr::Unknown`])
-    /// connection: `add_connection`'s signature takes a `SocketAddr`, so it
-    /// cannot express one — yet `Ring::k_closest_potentially_hosting`
-    /// deliberately admits addressless candidates (see its
-    /// addressless-candidate branch), and the GET retry driver has a
-    /// dedicated exhaustion reason for what happens when the router then
-    /// hands one back. Used by
-    /// `operations::get::op_ctx_task`'s `advance_to_next_peer` tests to
-    /// exercise that branch for real instead of asserting on its source
-    /// text.
+    /// connection, and that is precisely because production cannot: every
+    /// other write to `connections_by_location` stores a known addr
+    /// (`add_connection` and `update_peer_identity` both take a
+    /// `SocketAddr`; `prune_connection` only removes), and the getter hands
+    /// back a clone so no caller can mutate a stored entry back to
+    /// `Unknown`. `Ring::k_closest_potentially_hosting` nonetheless carries
+    /// an addressless-candidate branch, and the GET retry driver a matching
+    /// `GetExhaustionReason::AddresslessCandidate`, as defence-in-depth. This
+    /// helper exists so those can be tested against real behaviour rather
+    /// than source text — it manufactures a state the rest of the system is
+    /// supposed to make impossible, so DO NOT read its existence as evidence
+    /// that the state occurs.
     ///
     /// Deliberately skips the capacity cap, `location_for_peer`, readiness
     /// and reservation bookkeeping — it is a fixture, not a substitute for

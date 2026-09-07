@@ -1165,17 +1165,43 @@ pub(crate) enum GetExhaustionReason {
     /// before it ran out of retries. A TOPOLOGY signal: this node has no
     /// (further) usable routing option for the key.
     NoRoutingCandidates,
-    /// The ring DID return a candidate, but it carried no socket address, so
-    /// it was unusable as a wire target. A LOCAL RING DEFECT, not a topology
-    /// problem — `k_closest_potentially_hosting` deliberately admits
-    /// addressless candidates (they bypass every addr-keyed filter: skip
-    /// list, dedup, transient, readiness) in the hope they gain an address by
-    /// send time, and the router only ranks them once it has left the
-    /// distance-only regime, which drops them. Split out of
-    /// `NoRoutingCandidates` because a spike here needs a DIFFERENT
-    /// investigation: the peer set is not empty, its entries are malformed.
-    /// Emitted alongside a `warn!` at the return site in
-    /// `get::op_ctx_task::advance_to_next_peer`.
+    /// The ring returned a candidate that carried no socket address, so it
+    /// was unusable as a wire target.
+    ///
+    /// **Expect zero of these. No current production path can produce one.**
+    /// This is defence-in-depth against a future regression, NOT an observed
+    /// condition — do not wait for a spike here as a ring-health signal, and
+    /// do not read its absence as evidence that anything was measured.
+    ///
+    /// The reason it cannot fire is upstream of this crate's GET code:
+    /// `k_closest_potentially_hosting` sources candidates only from
+    /// `ConnectionManager::get_connections_by_location`, and every production
+    /// write to `connections_by_location` stores a `PeerAddr::Known` —
+    /// `add_connection` and `update_peer_identity` both take a `SocketAddr`,
+    /// and `prune_connection` only removes. The getter hands back a clone, so
+    /// no caller can mutate a stored entry back to `PeerAddr::Unknown`
+    /// either. `socket_addr()` is therefore always `Some`, which makes
+    /// `k_closest_potentially_hosting`'s addressless branch — and this
+    /// variant with it — unreachable today.
+    ///
+    /// It is kept, and kept SEPARATE from `NoRoutingCandidates`, because the
+    /// two would need different investigations if the invariant ever broke:
+    /// an empty candidate set is a topology dead-end, whereas a malformed
+    /// entry in a non-empty set is a local ring defect. Should a sibling of
+    /// `add_connection` ever admit an addressless peer, this fires (with a
+    /// `warn!` at the return site in
+    /// `get::op_ctx_task::advance_to_next_peer`) instead of being silently
+    /// miscounted as a topology problem.
+    ///
+    /// Sequencing note for whoever revisits this: `k_closest_potentially_`
+    /// `hosting` deliberately ADMITS addressless candidates past its
+    /// addr-keyed filters (skip list, dedup, transient, readiness), so the
+    /// ring layer would pass one through. It is the router that then decides
+    /// their fate, and only above `MIN_EVENTS_FOR_PREDICTION`: below that
+    /// threshold it `filter_map`s on `peer.location()` and DROPS them, while
+    /// above it they survive with a default distance. So fixing the
+    /// insertion-side invariant is what would make this variant live —
+    /// nothing on the GET side needs to change.
     AddresslessCandidate,
 }
 
@@ -1437,12 +1463,18 @@ pub(crate) enum GetEvent {
         /// request to the SAME peer without an intervening peer advance:
         /// the infra-retry arm in `operations::op_ctx` (`OpError::`
         /// `NotificationError`) `continue`s WITHOUT calling
-        /// `driver.advance()`, adding up to `MAX_INFRA_RETRIES` = 3 extra
-        /// requests to the peer already being asked, and
-        /// `drive_get_with_assembly_retry` re-enters the loop after a
-        /// streaming-assembly failure. So `attempts = 6` can mean as few as
-        /// ~4 distinct peers were contacted, and the shortfall is not
-        /// derivable from this event. Do not quote it as a peer count; the
+        /// `driver.advance()`, and `drive_get_with_assembly_retry` re-enters
+        /// the loop after a streaming-assembly failure.
+        ///
+        /// Concretely: `infra_retries` is declared ONCE outside the retry
+        /// loop and never reset, so it is a whole-loop cap of
+        /// `MAX_INFRA_RETRIES` = 3 same-peer resends — not 3 per peer — and
+        /// production's own arithmetic is
+        /// `attempt_count.saturating_sub(infra_retries)`. So `attempts = 6`
+        /// can mean as few as THREE distinct peers were contacted, and fewer
+        /// still once `drive_get_with_assembly_retry` re-enters the loop with
+        /// a fresh `infra_retries` budget. The shortfall is not derivable
+        /// from this event. Do not quote `attempts` as a peer count; the
         /// per-peer breakdown lives in the node's route events, not here.
         ///
         /// (An earlier revision did carry a `peer_advancements` field taken

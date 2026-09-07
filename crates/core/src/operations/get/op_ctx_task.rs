@@ -1964,8 +1964,11 @@ fn carry_tried_into_visited(
 ///   topology signal.
 /// - [`GetExhaustionReason::AddresslessCandidate`] — the ring produced a
 ///   candidate with no socket address, unusable as a wire target. A local
-///   ring defect, NOT a topology problem; kept separate because the two
-///   need different investigations (see the enum's docs).
+///   ring defect, NOT a topology problem. **No production path can produce
+///   this today** — every write to `connections_by_location` stores a known
+///   addr — so it is defence-in-depth against a future regression rather
+///   than a live signal. Kept separate because the two would need different
+///   investigations if the invariant broke (see the enum's docs).
 ///
 /// [`GetExhaustionReason::RetryBudget`]: crate::tracing::GetExhaustionReason::RetryBudget
 /// [`GetExhaustionReason::NoRoutingCandidates`]: crate::tracing::GetExhaustionReason::NoRoutingCandidates
@@ -2014,13 +2017,22 @@ fn advance_to_next_peer(
         }
     };
     let Some(addr) = peer.socket_addr() else {
-        // Rare but possible — `k_closest_potentially_hosting` can return
-        // addressless candidates (ring.rs pushes them past the addr-gated
-        // filters), and an addressless pick is unusable as a wire target.
-        // Reported as its own reason, NOT as `NoRoutingCandidates`: the
-        // candidate set was not empty, so this is a local ring defect rather
-        // than a topology dead-end, and conflating them sends an analyst
-        // hunting for missing peers when the peers are there but malformed.
+        // UNREACHABLE TODAY — defence-in-depth, not an observed condition.
+        // `k_closest_potentially_hosting` does admit addressless candidates
+        // past its addr-keyed filters, but it can only ever be handed
+        // `PeerAddr::Known` entries: every production write to
+        // `ConnectionManager::connections_by_location` (`add_connection`,
+        // `update_peer_identity`) stores an addr, `prune_connection` only
+        // removes, and the getter returns a clone so no caller can mutate an
+        // entry back to `Unknown`. Expect a flat zero on this reason; do NOT
+        // treat its absence as a measured ring-health signal.
+        //
+        // Kept, and kept distinct from `NoRoutingCandidates`, so that if a
+        // future `add_connection` sibling ever admits an addressless peer
+        // this surfaces as its own class (a local ring defect in a non-empty
+        // candidate set) rather than being miscounted as a topology
+        // dead-end, which would send an analyst hunting for missing peers
+        // when the peers are present but malformed.
         tracing::warn!(
             %instance_id,
             peer = ?peer,
@@ -4817,25 +4829,28 @@ mod tests {
             "async fn drive_sub_op_get(",
         ] {
             let body = extract_fn_body(src, entry);
-            // Pin the forward to the Exhausted ARM, not merely to somewhere
-            // in a 400-line function: split the body at the arm marker and
-            // require the reference on the Exhausted side only. A body-wide
-            // `contains` would still pass if the argument migrated to the
-            // Done arm (where it must stay `None` — a terminal reply is not
-            // an exhaustion).
-            let split = body
-                .find("RetryLoopOutcome::Exhausted(")
-                .unwrap_or_else(|| panic!("{entry} must have an Exhausted arm"));
-            let (before_arm, exhausted_arm) = body.split_at(split);
+            // Pin the forward to the Exhausted ARM's own block — bounded on
+            // BOTH sides — not to "the first mention of the marker onwards".
+            // A left-bounded split is arm-ORDER dependent: it only excludes
+            // the Done arm while Done happens to be written first, and
+            // reordering the match (legal, and rustfmt will not stop it)
+            // would make the negative assertion vacuous AND leave a
+            // `driver.exhaustion_reason` moved into Done sitting inside the
+            // "exhausted" region. `extract_match_arm_block` walks braces, so
+            // `rest` below is the whole body minus this arm regardless of
+            // where the arm sits.
+            let (exhausted_arm, rest) =
+                extract_match_arm_block(body, "RetryLoopOutcome::Exhausted(");
             assert!(
                 exhausted_arm.contains("driver.exhaustion_reason"),
                 "{entry}'s Exhausted arm must forward driver.exhaustion_reason \
                  to emit_get_terminal_event (#5252)"
             );
             assert!(
-                !before_arm.contains("driver.exhaustion_reason"),
-                "{entry}'s Done arm must pass None for exhaustion_reason — a \
-                 terminal reply was received, so the search never exhausted"
+                !rest.contains("driver.exhaustion_reason"),
+                "{entry} must reference driver.exhaustion_reason ONLY in its \
+                 Exhausted arm — the Done arm passes None, because a terminal \
+                 reply was received and the search never exhausted"
             );
         }
     }
@@ -4953,19 +4968,32 @@ mod tests {
         );
     }
 
-    /// The ring returned a candidate, but it has no wire address. That is a
-    /// LOCAL RING DEFECT, not a topology dead-end, so it must report
-    /// `AddresslessCandidate` — the split this PR introduces. Before the
-    /// split an analyst saw `no_routing_candidates` and went looking for
-    /// missing peers when the peers were present but malformed.
+    /// The ring returned a candidate with no wire address: that must report
+    /// `AddresslessCandidate`, not `NoRoutingCandidates` — a malformed entry
+    /// in a NON-EMPTY candidate set is a local ring defect, and folding it
+    /// into the topology reason would send an analyst hunting for missing
+    /// peers when the peers are present.
     ///
-    /// Reaching this branch needs two things the production code documents
-    /// but no previous test exercised: an addressless connection in the ring
-    /// (`k_closest_potentially_hosting` admits those past every addr-keyed
-    /// filter), and a router that has left its distance-only regime — below
-    /// `MIN_EVENTS_FOR_PREDICTION` the router `filter_map`s on
-    /// `peer.location()` and silently drops addressless candidates, so the
-    /// branch is unreachable on a cold node.
+    /// **This test constructs a state no production path can produce, and
+    /// that is deliberate.** It pins the branch→variant mapping (it catches
+    /// a swap of the two returns), but it is NOT evidence that the branch is
+    /// live. Every production write to `connections_by_location` stores a
+    /// `PeerAddr::Known`, so `socket_addr()` is always `Some` and this branch
+    /// is dead today — see `GetExhaustionReason::AddresslessCandidate` for
+    /// the full argument. Staging it therefore needs two things no
+    /// production path does:
+    ///
+    /// 1. `insert_raw_connection_for_test` to put a `PeerAddr::Unknown`
+    ///    connection in the ring at all — `add_connection`'s signature takes
+    ///    a `SocketAddr` and cannot express one.
+    /// 2. A router primed past `MIN_EVENTS_FOR_PREDICTION`. Below that
+    ///    threshold the router `filter_map`s on `peer.location()` and
+    ///    silently drops addressless candidates, so even a staged one would
+    ///    not reach the branch.
+    ///
+    /// Step 1 is the part that is unreachable in production; step 2 is a real
+    /// property of the router that would also apply if step 1 ever became
+    /// reachable.
     #[tokio::test(flavor = "current_thread")]
     async fn advance_to_next_peer_reports_addressless_candidate() {
         let (op_manager, _guards) = build_op_manager("advance-addressless").await;
@@ -5227,6 +5255,57 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Isolate a single `match` arm's brace-delimited block, returning
+    /// `(arm_block, everything_else)`.
+    ///
+    /// Bounding an arm on BOTH sides is what makes a source pin
+    /// order-independent. Locating an arm by `body.find(marker)` and taking
+    /// the remainder of the function bounds it on the left only: it excludes
+    /// the sibling arms that happen to be written ABOVE it and none of the
+    /// ones below, so swapping two arms — a legal, formatter-invisible edit —
+    /// silently changes what the pin covers.
+    ///
+    /// Panics if the arm is not found or is not a block (`=> { .. }`); a pin
+    /// whose region has quietly become empty is worse than no pin.
+    fn extract_match_arm_block<'a>(body: &'a str, arm_marker: &str) -> (&'a str, String) {
+        let start = body
+            .find(arm_marker)
+            .unwrap_or_else(|| panic!("could not find match arm {arm_marker}"));
+        let brace_rel = body[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("{arm_marker} has no block"));
+        // Guard the `=> EXPR,` shape: without a block of its own the next `{`
+        // belongs to a LATER arm and the region would silently cover the
+        // wrong code.
+        let gap = &body[start..start + brace_rel];
+        assert!(
+            gap.contains("=>") && !gap.contains(';'),
+            "{arm_marker} must be a block arm (`=> {{ .. }}`) for this pin to \
+             bound a region; found: {gap:?}"
+        );
+        let block_start = start + brace_rel;
+        let bytes = body.as_bytes();
+        let mut depth: i32 = 0;
+        let mut i = block_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let arm = &body[start..=i];
+                        let mut rest = String::from(&body[..start]);
+                        rest.push_str(&body[i + 1..]);
+                        return (arm, rest);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unterminated match arm block for {arm_marker}");
     }
 
     /// Pin (telemetry accuracy): `start_relay_get` must gate
