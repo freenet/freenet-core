@@ -1217,7 +1217,9 @@ impl DelegateParkCtx {
     ///
     /// `already_delivered` is the loop's buffer of resumes it has taken off
     /// `delegate_resume_rx` but not yet run. **A park listed there must not be
-    /// swept**, and this is the load-bearing half of the signature (#5554).
+    /// swept**, and this is the load-bearing half of the signature. (Every
+    /// "#5554" below is the PR that added parking, where this was found in
+    /// review, not a typo for the #5544 issue the rest of this file cites.)
     /// The sweep ends a park WITHOUT consuming the off-loop task's
     /// [`ParkGuard`], so a resume that arrives afterwards is rejected by
     /// [`Self::take_matching`] on epoch and dropped — including everything it
