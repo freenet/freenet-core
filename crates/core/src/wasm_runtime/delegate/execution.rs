@@ -10,7 +10,8 @@ use crate::wasm_runtime::delegate_api::DelegateApiVersion;
 
 use super::super::engine::{InstanceHandle, WasmEngine};
 use super::super::native_api::{
-    CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, InstanceId, LIVE_DELEGATE_GUESTS,
+    CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, DelegateEnvSlot, InstanceId,
+    LIVE_DELEGATE_GUESTS,
 };
 use super::super::secrets_store::UserSecretContext;
 use super::super::{Runtime, RuntimeResult};
@@ -211,7 +212,7 @@ impl Runtime {
             .into());
         }
 
-        DELEGATE_ENV.insert(instance_id, env);
+        DELEGATE_ENV.insert(instance_id, DelegateEnvSlot::new(env));
         CURRENT_DELEGATE_INSTANCE.with(|c| c.set(instance_id));
 
         // Create RAII guard to ensure cleanup on all exit paths (including panic)

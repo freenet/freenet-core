@@ -4943,7 +4943,7 @@ mod hosted_user_secrets {
 #[tokio::test]
 async fn reentering_a_live_instance_id_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
     use super::super::engine::InstanceHandle;
-    use super::super::native_api::{DELEGATE_ENV, DelegateCallEnv};
+    use super::super::native_api::{DELEGATE_ENV, DelegateCallEnv, DelegateEnvSlot};
 
     let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
 
@@ -4997,7 +4997,7 @@ async fn reentering_a_live_instance_id_fails_closed() -> Result<(), Box<dyn std:
             runtime.inherited_origins.clone(),
         )
     };
-    DELEGATE_ENV.insert(LIVE_ID, env);
+    DELEGATE_ENV.insert(LIVE_ID, DelegateEnvSlot::new(env));
 
     let result = runtime.exec_inbound_with_env(
         delegate.key(),
@@ -5093,6 +5093,72 @@ async fn reentering_an_id_with_a_live_guest_fails_closed_even_with_no_env()
     assert!(
         rendered.contains("already active"),
         "expected the re-entry guard's error, got: {rendered}"
+    );
+
+    Ok(())
+}
+
+/// REGRESSION (#5480 review): `exec_inbound_with_env` must have finished its
+/// cleanup by the time it RETURNS — on the error path as much as the success
+/// path — not merely "eventually".
+///
+/// This pins the fact that makes the #5554 interaction safe, and which nothing
+/// else states. #5554 parks delegates off the serial `contract_handling` loop,
+/// so a delegate's round trip can now span two loop iterations; its own comment
+/// notes that the serial loop was the ONLY thing guaranteeing one `process()`
+/// per delegate. What keeps that sound is ordering: `_guard` is a local of
+/// `exec_inbound_with_env`, so `DELEGATE_ENV` is cleared strictly before the
+/// `Err` reaches `inbound_app_message`, before `DelegateRunOutcome::Failed`, and
+/// therefore before a park can release a queued run for the same delegate.
+///
+/// That is the placement of one local variable, load-bearing across two merged
+/// changes, and until this test nothing checked it. A `std::mem::forget(_guard)`
+/// — or hoisting the guard into the caller to "clean up once per batch" — would
+/// leave the entry live past the return with no other alarm.
+#[tokio::test]
+async fn env_cleanup_completes_before_the_call_returns() -> Result<(), Box<dyn std::error::Error>> {
+    use super::super::engine::InstanceHandle;
+    use super::super::native_api::{DELEGATE_ENV, LIVE_DELEGATE_GUESTS};
+
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+
+    const ID: i64 = i64::MAX - 54802;
+
+    let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::ReadContext)?;
+    let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload));
+    let handle = InstanceHandle { id: ID };
+    let params: Parameters = vec![].into();
+
+    // Fails inside `exec_inbound` (no engine instance under this handle), which
+    // is the path that matters: the guard must still have run.
+    let result = runtime.exec_inbound_with_env(
+        delegate.key(),
+        &params,
+        None,
+        None,
+        &msg,
+        Vec::new(),
+        &handle,
+        ID,
+        DelegateApiVersion::V2,
+    );
+    assert!(
+        result.is_err(),
+        "fixture precondition: this call is expected to fail, so the assertions \
+         below are about the ERROR path"
+    );
+
+    assert!(
+        !DELEGATE_ENV.contains_key(&ID),
+        "`exec_inbound_with_env` returned with its DELEGATE_ENV entry still \
+         present. `_guard` must drop inside this function, before the error \
+         reaches `inbound_app_message` and before #5554's park can release a \
+         queued run for the same delegate"
+    );
+    assert!(
+        !LIVE_DELEGATE_GUESTS.contains(&ID),
+        "no guest ever started for this call, so nothing may be left registered \
+         as live — a stale entry here would refuse every later call on this id"
     );
 
     Ok(())

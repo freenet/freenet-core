@@ -34,7 +34,7 @@ type SecretReadMemo = Option<([u8; 32], zeroize::Zeroizing<Vec<u8>>)>;
 /// Host functions for context and secret access read/write through this.
 /// After `process` returns, the runtime reads back the (possibly mutated) context
 /// and removes the entry.
-pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateCallEnv>> =
+pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateEnvSlot>> =
     LazyLock::new(DashMap::default);
 
 /// Instance ids whose delegate guest MAY STILL BE EXECUTING.
@@ -804,33 +804,58 @@ pub(super) struct DelegateCallEnv {
 // Keying instances by anything recycled (a pool slot, a code hash) breaks the
 // first half of 4 and makes these impls unsound.
 //
-// INTENDED END STATE: THE `Sync` IMPL SHOULD NOT EXIST. Read it as debt, not as
-// a settled design decision.
+// WHY THIS LIVES ON A WRAPPER AND NOT ON `DelegateCallEnv` ITSELF. The bound
+// that forces an `unsafe impl` here is narrow and purely structural:
+// `DELEGATE_ENV` is a `static`, statics must be `Sync`, and `DashMap<K, V>` is
+// `Sync` only when `V: Send + Sync`. Nothing in this crate ever wants to SHARE a
+// `&DelegateCallEnv` between threads — every access is single-threaded under a
+// map guard, per 2 above. So the impl satisfies a container's bound; it does not
+// assert that the environment is safe to use concurrently, and putting it on
+// `DelegateCallEnv` said the second thing while meaning the first.
 //
-// `Send` is genuinely required. `Sync` is required only because
-// `DELEGATE_ENV` is a `DashMap`, and `DashMap<K, V>` demands `V: Send + Sync` to
-// be a `static`. Nothing in this crate ever wants to share a
-// `&DelegateCallEnv` between threads, so the impl buys no capability — it only
-// silences a check. The type now holds three separately `!Sync` fields
-// (`context`, `secret_read_memo`, `secret_store`/`delegate_store`), and the
-// silenced check is exactly the one that would have caught #5593 flipping
-// `context_write` from `get_mut` to `get`: `RefCell<Vec<u8>>` is `!Sync`
-// precisely so the compiler can object, and this impl is what stops it.
+// Confining it to `DelegateEnvSlot` leaves `DelegateCallEnv` itself `!Send` and
+// `!Sync`, so any FUTURE code that tries to share or move one for some other
+// reason is rejected by the compiler instead of being silently absorbed by an
+// impl written for `DashMap`. Only the one storage location opts out, and it is
+// the location whose safety argument is written above.
 //
-// The fix is structural rather than a better comment: move `DelegateCallEnv`
-// into wasmtime's `HostState`, which the `Store` already owns and hands to host
-// functions through `Caller`. That deletes this `Sync` impl, `DELEGATE_ENV`,
-// `CURRENT_DELEGATE_INSTANCE`, `LIVE_DELEGATE_GUESTS` and the whole
-// abandoned-guest hazard class in one move, because the env would then be owned
-// by the store the guest runs against instead of reachable from a process-global
-// map. Deliberately out of scope for #5480, which is about giving delegates the
-// safeguards contracts already have; tracked as the follow-up that retires the
-// reason this argument has to be written down at all.
-unsafe impl Send for DelegateCallEnv {}
-// SAFETY: as for `Send` directly above -- the two are one argument. See the
-// "intended end state" note: this impl is debt, and only `DashMap`'s bound
-// requires it.
-unsafe impl Sync for DelegateCallEnv {}
+// This is a narrowing, not the fix. The fix is to stop holding the environment
+// in a process-global map at all — move it into wasmtime's `HostState`, which
+// the `Store` already owns and hands to host functions through `Caller`, which
+// would delete this impl, `DELEGATE_ENV`, `CURRENT_DELEGATE_INSTANCE`,
+// `LIVE_DELEGATE_GUESTS` and the whole abandoned-guest hazard class together.
+// Tracked as #5604; out of scope for #5480.
+//
+// One correction worth recording, because the opposite is easy to assume: the
+// `RefCell<Vec<u8>>` that #5593 gave `context` is NOT why this type is `!Sync`,
+// and it is not what made these impls necessary. `UnsafeCell<*mut SecretsStore>`,
+// `UnsafeCell<*mut DelegateStore>` and `*const ContractStore` are each `!Sync`
+// on their own and all predate that PR. The `RefCell` was a fourth reason, not
+// the first. This impl has been suppressing the check for far longer than the
+// #5593/#5480 pair.
+pub(super) struct DelegateEnvSlot(DelegateCallEnv);
+
+impl DelegateEnvSlot {
+    pub(super) fn new(env: DelegateCallEnv) -> Self {
+        Self(env)
+    }
+}
+
+// SAFETY: the argument in points 1-4 above, which is what makes it sound to
+// reach a `DelegateCallEnv` through `DELEGATE_ENV` at all. These impls exist
+// solely to meet `DashMap`'s `V: Send + Sync` bound for that `static`; they are
+// NOT a claim that a `&DelegateCallEnv` may be shared across threads.
+unsafe impl Send for DelegateEnvSlot {}
+// SAFETY: as for `Send` directly above -- the two are one argument.
+unsafe impl Sync for DelegateEnvSlot {}
+
+impl std::ops::Deref for DelegateEnvSlot {
+    type Target = DelegateCallEnv;
+
+    fn deref(&self) -> &DelegateCallEnv {
+        &self.0
+    }
+}
 
 /// Typed errors from `DelegateCallEnv` contract operations.
 ///

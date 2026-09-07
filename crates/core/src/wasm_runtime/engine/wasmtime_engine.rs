@@ -1246,6 +1246,12 @@ impl WasmtimeEngine {
         delegate_instance: Option<i64>,
     ) -> Result<i64, WasmError>
     where
+        // `Sync` is REQUIRED and is not an over-claim, despite this change
+        // being about not over-claiming `Sync` elsewhere. It is wasmtime's own
+        // bound: `TypedFunc::<Params, Results>::call_async` requires
+        // `Params: Sync` (wasmtime-47.0.3 `runtime/func/typed.rs:135`).
+        // Removing it fails to compile at the `func.call_async` below —
+        // verified, not assumed. Do not "tidy" it away.
         P: wasmtime::WasmParams + Send + Sync + 'static,
     {
         let enabled_metering = self.enabled_metering;
