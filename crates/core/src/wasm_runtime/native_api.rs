@@ -546,6 +546,17 @@ pub(super) struct DelegateCallEnv {
     /// Every host function that can CHANGE what a read returns clears this (see
     /// [`DelegateCallEnv::invalidate_secret_memo`]), so a stale plaintext is
     /// never served.
+    ///
+    /// One deliberate semantic change beyond the saved work: `has_secret` now
+    /// RETAINS the plaintext it decrypted for the rest of the call, where
+    /// before it dropped (and zeroized) it on return. That is a change in how
+    /// long secret material is resident, not only in how often it is
+    /// decrypted, so it is called out rather than folded into "fewer
+    /// decrypts". It is bounded by the same `process()` call, holds at most one
+    /// secret, and is the same material `get_secret` would hold a moment later
+    /// in the overwhelmingly common `has_secret`-then-`get_secret` pair — but a
+    /// delegate that probes existence and never reads keeps a plaintext in
+    /// memory that it previously did not.
     secret_read_memo: std::cell::RefCell<SecretReadMemo>,
 }
 
@@ -690,6 +701,12 @@ impl DelegateCallEnv {
         f: impl FnOnce(&[u8]) -> R,
     ) -> Result<R, SecretStoreError> {
         {
+            // The read borrow is held across `f`. `f` is always a local
+            // closure that copies bytes out and never re-enters the env, so
+            // this cannot conflict today. If a future caller passed an `f` that
+            // touched the memo, `RefCell` would panic — and a panic here
+            // unwinds out of a wasmtime host call, which is a worse failure
+            // than the borrow it is protecting. Keep `f` non-re-entrant.
             let memo = self.secret_read_memo.borrow();
             if let Some((hash, plaintext)) = memo.as_ref()
                 && hash == secret_id.hash()
@@ -2867,46 +2884,34 @@ mod secret_read_memo_tests {
     /// call would leave a `set_secret` followed by a `get_secret` inside ONE
     /// `process()` serving the pre-write plaintext, silently, with every other
     /// test still green.
-    /// Every item in `delegate_secrets` is indented four spaces, so a
-    /// function's region ends at the next sibling at THAT indentation —
-    /// whatever its visibility.
+    /// The source region of `name`: from its signature to its own closing
+    /// brace, comments removed.
     ///
-    /// Bounding on `pub(crate) fn` alone silently swallows any private helper
-    /// that follows. `remove_secret` is succeeded by the private
-    /// `collect_list_secrets`, so a `pub(crate)`-only boundary ran ~50 lines
-    /// past the end of `remove_secret` and scraped a function this test says
-    /// nothing about: a needle anywhere in that overrun satisfied the
-    /// assertion. It looked sound only because `set_secret`'s successor
-    /// (`has_secret`) happens to be `pub(crate)`.
-    const ITEM_STARTS: [&str; 4] = [
-        "\n    fn ",
-        "\n    pub fn ",
-        "\n    pub(crate) fn ",
-        "\n    pub(super) fn ",
-    ];
-
-    /// The source region of `name`, comments removed.
+    /// Bounded by the function's OWN closing brace — the first line that is
+    /// exactly `    }` — rather than by guessing what item comes next. An
+    /// earlier version searched for the next `pub(crate) fn` and so ran ~50
+    /// lines past `remove_secret` into the private `collect_list_secrets` that
+    /// follows it, scraping a function this test says nothing about; a needle
+    /// anywhere in that overrun satisfied the assertion. Enumerating more item
+    /// kinds would only move the gap (`async fn`, `const fn`, a `type` alias,
+    /// or no following item at all would each reopen it). The closing brace is
+    /// immune to whatever follows, because it belongs to the function itself.
     ///
-    /// Comments are stripped because the successor's doc comment falls inside
-    /// the region (its `///` lines precede its `fn` line), so prose merely
-    /// MENTIONING the call would satisfy a raw `contains`. The pin is about
-    /// code.
+    /// Comments are stripped so prose merely MENTIONING the call cannot
+    /// satisfy a `contains`. The brace bound already excludes the successor's
+    /// doc comment, so this is defence in depth rather than the primary guard.
     fn scraped_body(src: &str, name: &str) -> String {
         let start = src
             .find(&format!("pub(crate) fn {name}("))
             .unwrap_or_else(|| panic!("{name} not found in native_api.rs"));
         let after = &src[start..];
-        // `expect`, not `unwrap_or(len())`: both functions checked here have a
-        // following sibling, so "no boundary found" means the search itself is
-        // broken and the region has widened to end-of-file. Fail loudly rather
-        // than quietly scraping the rest of the module and passing.
-        let end = ITEM_STARTS
-            .iter()
-            .filter_map(|marker| after[1..].find(marker).map(|i| i + 1))
-            .min()
-            .unwrap_or_else(|| {
-                panic!("no sibling item found after {name}; region-bounding is broken")
-            });
+        // `expect`, not `unwrap_or(len())`: every function here has a closing
+        // brace, so "not found" means the search is broken and the region has
+        // widened to end-of-file. Fail loudly rather than scraping the rest of
+        // the module and passing.
+        let end = after.find("\n    }").unwrap_or_else(|| {
+            panic!("no closing brace found for {name}; region-bounding is broken")
+        });
         after[..end]
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
@@ -2929,23 +2934,40 @@ mod secret_read_memo_tests {
     }
 
     /// The pin above is only as good as its region-bounding, so bound the
-    /// bound: `remove_secret`'s region must stop before the private helper
-    /// that follows it. Without this, a future edit that reintroduces a
-    /// visibility-only boundary would silently widen the window again and the
-    /// pin would keep passing.
+    /// bound.
+    ///
+    /// Note the first assertion, which is the whole point: an
+    /// absence check must also assert the thing is PRESENT to be absent from,
+    /// or it passes when the thing simply vanishes. Rename or delete
+    /// `collect_list_secrets` and, without that line, this guard would go on
+    /// passing for the wrong reason while a later regression in
+    /// `scraped_body` silently re-widened the window.
     #[test]
-    fn the_scraped_region_stops_at_the_next_item_whatever_its_visibility() {
+    fn the_scraped_region_stops_at_the_end_of_the_function() {
         let src = include_str!("native_api.rs");
+        assert!(
+            src.contains("fn collect_list_secrets("),
+            "this guard is written around `collect_list_secrets` being the \
+             private item that follows `remove_secret`. If it has been renamed \
+             or removed, re-point the guard at whatever now follows — do NOT \
+             delete it, or the absence check below becomes vacuous"
+        );
+
         let body = scraped_body(src, "remove_secret");
         assert!(
             body.contains("fn remove_secret("),
             "the region must actually contain remove_secret"
         );
         assert!(
+            body.trim_end().ends_with('}'),
+            "the region must end at remove_secret's own closing brace, not run \
+             on to end-of-file"
+        );
+        assert!(
             !body.contains("fn collect_list_secrets("),
-            "remove_secret's region must stop at the PRIVATE `collect_list_secrets` \
-             that follows it; if it does not, the pin is asserting over a function \
-             it says nothing about"
+            "remove_secret's region must stop before the PRIVATE \
+             `collect_list_secrets` that follows it; if it does not, the pin is \
+             asserting over a function it says nothing about"
         );
     }
 }
