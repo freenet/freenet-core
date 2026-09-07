@@ -714,6 +714,71 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// #5544 P1b: a prompt future dropped mid-await must not leave its registry
+    /// entry behind.
+    ///
+    /// `PARK_WORK_BUDGET` bounds a parked delegate's whole off-loop body and its
+    /// prompts run sequentially inside it, so a slow first prompt leaves the
+    /// second cancelled while it waits for a human — after `pending.insert`,
+    /// before the explicit `pending.remove`. Nothing sweeps `pending`, so each
+    /// orphan is permanent, and `MAX_PENDING_PROMPTS` of them auto-deny every
+    /// later permission request on the node, for every delegate, forever.
+    /// `PromptEntryGuard` is the only thing standing between that and a user;
+    /// this is the only test of it.
+    ///
+    /// Cancellation is driven by dropping the future between polls rather than
+    /// by a timer: the entry is inserted on the first poll (the first await is
+    /// the wait for the human), so the drop lands in exactly the window the
+    /// budget cancels in, with no wall-clock dependence.
+    ///
+    /// FALSIFY by neutering the guard's body — `if false && self.pending.remove(
+    /// &self.nonce).is_some()`, the mutation that survived the whole 5465-test
+    /// suite before this test existed. Both assertions go red.
+    #[tokio::test]
+    async fn a_prompt_cancelled_mid_await_removes_its_pending_entry() {
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let prompter = noop_prompter(pending.clone());
+        let req = make_test_request("Allow this?", vec!["Allow", "Deny"]);
+
+        let mut prompting = Box::pin(prompter.prompt(&req, "dkey", webapp("cid")));
+        assert!(
+            futures::poll!(prompting.as_mut()).is_pending(),
+            "the prompt must be waiting for a human, not resolved"
+        );
+        let nonce = pending
+            .iter()
+            .next()
+            .expect("the prompt must have registered a pending entry")
+            .key()
+            .clone();
+
+        // Subscribe before the drop: the guard must also retire the prompt in
+        // the UI, or every tab keeps showing a dialog nothing can answer.
+        let mut events = prompt_events().subscribe();
+        drop(prompting);
+
+        assert!(
+            pending.is_empty(),
+            "a cancelled prompt must not leave its entry behind: nothing sweeps \
+             `pending`, so MAX_PENDING_PROMPTS orphans auto-deny every later \
+             permission request on this node (#5544 P1b)"
+        );
+        // The broadcast is process-global and shared with other tests, so match
+        // on OUR nonce rather than on the next event to arrive.
+        let mut removed = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(&event, PromptEvent::Removed { nonce: n } if *n == nonce) {
+                removed = true;
+                break;
+            }
+        }
+        assert!(
+            removed,
+            "the guard must emit Removed for the cancelled prompt so open tabs \
+             stop displaying a dialog that can no longer be answered"
+        );
+    }
+
     #[test]
     fn test_nonce_is_32_hex_chars() {
         let nonce = generate_nonce();
