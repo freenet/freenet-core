@@ -722,8 +722,9 @@ pub(super) struct DelegateCallEnv {
 //  4. NO ENV IS INSERTED UNDER AN ID WHOSE GUEST MAY STILL BE RUNNING. This is
 //     what stands between the design and an aliased `&mut SecretsStore` across
 //     two threads, and it needs BOTH halves:
-//      - Ids are not recycled. `INSTANCE_ID` (`wasm_runtime::runtime`) is a
-//        monotonic `AtomicI64`, so an abandoned thread's `get(&old_id)` misses
+//      - Ids are not recycled. `NEXT_INSTANCE_ID` (this module, allocated by
+//        `next_instance_id`) is a monotonic `AtomicI64`, so an abandoned
+//        thread's `get(&old_id)` misses
 //        rather than resolving to a LATER call's env. (`fetch_add` does wrap in
 //        principle. At one increment per instance that is not reachable in a
 //        process lifetime, but it is an assumption, not a proof.)

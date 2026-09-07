@@ -16,9 +16,25 @@ use super::super::secrets_store::UserSecretContext;
 use super::super::{Runtime, RuntimeResult};
 use super::error::DelegateExecError;
 
-/// RAII guard that ensures cleanup of delegate environment state.
-/// When dropped, it clears the thread-local instance ID and removes the
-/// entry from the global DELEGATE_ENV map.
+/// RAII guard that removes the instance's entry from the global `DELEGATE_ENV`
+/// map on every exit path, including a panic.
+///
+/// That removal is the load-bearing half, and it is what bounds the lifetime of
+/// the raw store pointers the env holds: `DashMap::remove` takes the shard WRITE
+/// lock, so it waits for any host call still holding a `Ref` before returning.
+///
+/// It also clears `CURRENT_DELEGATE_INSTANCE`, but note what that does and does
+/// not do since #5480. The thread-local a delegate host function actually reads
+/// is the one on the BLOCKING-POOL thread running the guest, installed and
+/// cleared by `GuestDelegateInstance` in `wasmtime_engine.rs`. This clear (and
+/// the matching `set` in `exec_inbound_with_env`) touches the CALLING thread's
+/// copy, which no host function consults on the delegate path.
+///
+/// They are kept rather than deleted because they cost nothing and keep the
+/// calling thread's thread-local honest for any path that ever runs a guest
+/// inline. Do not read them as the mechanism that makes host-function dispatch
+/// work — that is `GuestDelegateInstance`, and a change there is what would
+/// break dispatch.
 pub(super) struct DelegateEnvGuard {
     instance_id: InstanceId,
 }
