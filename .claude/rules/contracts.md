@@ -54,11 +54,32 @@ V2: Async host functions — delegates call contract methods directly:
 
 ### WASM Call Modes
 
+All four guest entry points share ONE body, `call_typed_blocking` in
+`engine/wasmtime_engine.rs`. Delegates ran "sync, on the calling thread" until
+#5480; they no longer do, and nothing should reintroduce a per-entry-point copy.
+
 ```
-call_3i64()              — Sync, same thread (delegates V1)
-call_3i64_async_imports() — For modules with async host function imports (delegates V2)
-call_*_blocking()        — spawn_blocking + timeout (contracts)
+call_3i64()               — delegates V1
+call_3i64_async_imports() — delegates V2 (modules with async host-function imports)
+call_2i64_blocking()      — contracts
+call_3i64_blocking()      — contracts
+        ↓ all four
+call_typed_blocking()     — spawn_blocking + wall-clock backstop + panic capture
 ```
+
+Two consequences for anything touching the delegate path:
+
+- **A delegate guest can outlive its call.** On the wall-clock-timeout path
+  `exec_inbound_with_env` returns while the guest is still running, because
+  `JoinHandle::abort()` cannot stop a `spawn_blocking` closure that has started.
+  Ask "is a guest still running", not "is its env still registered" — those are
+  different facts (`native_api::LIVE_DELEGATE_GUESTS`).
+- **Delegate host functions run on a blocking-pool thread**, so they find their
+  env through a thread-local installed on THAT thread by `GuestDelegateInstance`,
+  not on the caller's.
+
+The pins `every_guest_entry_is_preceded_by_arm_epoch_deadline` and
+`blocking_paths_arm_epoch_inside_the_closure` enforce the single-body structure.
 
 ## WASM Execution Rules
 
