@@ -4453,6 +4453,170 @@ mod tests {
         ContractKey::from_params_and_code(&params, &code)
     }
 
+    /// This file's PRODUCTION text: everything above the first test module,
+    /// with comments removed.
+    ///
+    /// Every source-scrape pin in this file must start here. Two vacuity traps
+    /// have shipped in this repo, and one shared helper is cheaper than
+    /// remembering both at each pin:
+    ///
+    ///  * `include_str!` pulls in the test modules, so a pin's own assertion
+    ///    literal can satisfy the pin (#5450). `mod tests` is the FIRST test
+    ///    module in this file, so truncating there removes `hol_4391_tests`
+    ///    too.
+    ///  * **A commented-out call is still text.** A scrape that does not strip
+    ///    comments cannot tell `foo();` from `// foo();`, so it stays green
+    ///    over a call that no longer runs — and commenting a line out is
+    ///    exactly what someone does while debugging, which is precisely when
+    ///    the pin is the only thing still watching. Three #5554-era pins in
+    ///    this file were defeatable that way, including the GHSA-824h-7x5x-wfmf
+    ///    consent gate; a pin that lets a security gate be commented out is
+    ///    worse than no pin, because it reads as coverage.
+    pub(super) fn production_code() -> String {
+        let full = include_str!("contract.rs");
+        let prod = full.split("\nmod tests {").next().unwrap_or(full);
+        strip_comments(prod)
+    }
+
+    /// Remove `//` line comments and `/* */` block comments, preserving
+    /// newlines so line-oriented reasoning still works.
+    ///
+    /// Block comments as well as line comments: `/* */` around a call is the
+    /// same defeat one syntax over, and a guard that catches only the variant
+    /// you thought of is a search with a blind spot.
+    ///
+    /// Known limits, both of which fail in the LOUD direction. It is not a Rust
+    /// lexer, so a `//` inside a string literal starts a "comment" and the rest
+    /// of that line is dropped; and Rust block comments nest, which this does
+    /// not model. Either can only REMOVE text a pin looks for, turning a pin
+    /// red rather than green — never the reverse.
+    pub(super) fn strip_comments(src: &str) -> String {
+        enum S {
+            Code,
+            Line,
+            Block,
+        }
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut state = S::Code;
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            match state {
+                S::Code => {
+                    if c == '/' && next == Some('/') {
+                        state = S::Line;
+                        i += 2;
+                        continue;
+                    }
+                    if c == '/' && next == Some('*') {
+                        state = S::Block;
+                        i += 2;
+                        continue;
+                    }
+                    out.push(c);
+                }
+                S::Line => {
+                    if c == '\n' {
+                        state = S::Code;
+                        out.push('\n');
+                    }
+                }
+                S::Block => {
+                    if c == '*' && next == Some('/') {
+                        state = S::Code;
+                        i += 2;
+                        continue;
+                    }
+                    if c == '\n' {
+                        out.push('\n');
+                    }
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Byte index just past the `}` matching the `{` at `open`.
+    ///
+    /// Panics rather than returning on unbalanced braces: a scrape that cannot
+    /// bound its region must fail loudly, never silently scan the rest of the
+    /// file.
+    pub(super) fn end_of_block(code: &str, open: usize) -> usize {
+        let bytes = code.as_bytes();
+        assert_eq!(
+            bytes.get(open),
+            Some(&b'{'),
+            "end_of_block must be given the index of an opening brace"
+        );
+        let mut depth = 0usize;
+        for (i, b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces from byte {open}: the scrape cannot bound this block");
+    }
+
+    /// The text of one function, bounded by BRACE MATCHING rather than by the
+    /// next `fn` keyword.
+    ///
+    /// Bounding on "the next `\nasync fn `" looks equivalent and is not: it
+    /// misses `pub async fn`, `pub(crate) async fn` and every other visibility
+    /// prefix, and a miss widens the region to the end of the file instead of
+    /// failing — which turns a `contains` assertion vacuous. Brace matching
+    /// cannot widen.
+    pub(super) fn fn_region<'a>(code: &'a str, signature: &str) -> &'a str {
+        let start = code.find(signature).unwrap_or_else(|| {
+            panic!(
+                "`{signature}` must exist in the production text of contract.rs. \
+                 If it was renamed, give this pin the new name — do not let it \
+                 quietly scan nothing."
+            )
+        });
+        let open = start
+            + code[start..]
+                .find('{')
+                .unwrap_or_else(|| panic!("`{signature}` must have a body"));
+        &code[start..end_of_block(code, open)]
+    }
+
+    /// The body of every task this file spawns off the serial loop.
+    ///
+    /// Used by the chokepoint pin to check what runs OFF the loop. Panics on a
+    /// spawn form it does not recognise, so a new one is reviewed rather than
+    /// silently skipped.
+    pub(super) fn spawned_bodies(code: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        for pattern in ["spawn(", "spawn_blocking("] {
+            for (idx, m) in code.match_indices(pattern) {
+                let arg_start = idx + m.len();
+                let rel = code[arg_start..].find('{').unwrap_or_else(|| {
+                    panic!("a `{pattern}` at byte {idx} is never followed by a block")
+                });
+                assert!(
+                    rel < 40,
+                    "unrecognised spawn form at byte {idx}: this pin bounds a \
+                     spawned task by the block it is handed, and no block \
+                     follows within 40 characters. Teach it the new form rather \
+                     than letting a spawned task go unscanned."
+                );
+                let open = arg_start + rel;
+                out.push(&code[open..end_of_block(code, open)]);
+            }
+        }
+        out
+    }
+
     /// PIN: the NODE-WIDE "one delegate `process()` at a time" invariant, held
     /// by the shape of the call graph and by nothing else.
     ///
@@ -4482,24 +4646,16 @@ mod tests {
     /// is awaited from `contract_handling` and then to say so here.
     ///
     /// FALSIFY: add a call to `handle_delegate_with_contract_requests` in a new
-    /// function (for instance inside a `GlobalExecutor::spawn` body), or call
-    /// `execute_delegate_request` from anywhere but the chokepoint. Either
-    /// fails. Verified by doing both.
+    /// function, call `execute_delegate_request` from anywhere but the
+    /// chokepoint, or — the case checks 1 and 2 could not see — put either
+    /// call inside a `GlobalExecutor::spawn` body WITHIN one of the four
+    /// allowed functions. All three fail. Verified by doing all three.
     #[test]
     fn every_delegate_run_is_reached_from_the_serial_loop() {
         // Production text only, comments stripped. Both needles occur in this
         // test's own prose and in the module's doc comments, and a scrape that
         // counted those would report a true fact about the wrong text (#5450).
-        let full = include_str!("contract.rs");
-        let prod = full.split("\nmod tests {").next().unwrap_or(full);
-        let code: String = prod
-            .lines()
-            .map(|line| match line.find("//") {
-                Some(i) => &line[..i],
-                None => line,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let code = production_code();
 
         // The nearest preceding `fn` declaration at statement position.
         fn enclosing_fn(code: &str, idx: usize) -> &str {
@@ -4568,6 +4724,44 @@ mod tests {
             !callers.is_empty(),
             "the scrape found no callers at all, so it is measuring nothing"
         );
+
+        // 3. Neither needle may appear inside a SPAWNED task.
+        //
+        //    Checks 1 and 2 ask only which TOP-LEVEL function encloses a call,
+        //    so a `GlobalExecutor::spawn(async move { ... })` block placed
+        //    inside one of the four allowed functions passes both unchanged —
+        //    while doing exactly what the message above says breaks the
+        //    invariant ("a call from a spawned task, a pooled executor or a
+        //    second loop"). The guard returned a true answer about the wrong
+        //    thing, which is the defect this workstream keeps finding.
+        //
+        //    The "does it exist to be absent from" half is carried by the two
+        //    assertions above: `.execute_delegate_request(` is pinned at
+        //    exactly 2 occurrences and `callers` is pinned non-empty, so
+        //    neither needle can be renamed away while this check reports a
+        //    clean zero. `spawned_bodies` panics on an unrecognised spawn form
+        //    rather than skipping it, and the assertion below pins that it
+        //    found some.
+        let spawned = spawned_bodies(&code);
+        assert!(
+            !spawned.is_empty(),
+            "this file spawns tasks off the loop (the park task, the deferred \
+             fetch, the export) and the scan found none — it is measuring \
+             nothing, so a delegate run inside a spawned task would pass"
+        );
+        for body in &spawned {
+            for needle in [chokepoint, ".execute_delegate_request("] {
+                assert!(
+                    !body.contains(needle),
+                    "`{needle}` appears inside a SPAWNED task body. Whatever \
+                     top-level function encloses the spawn, the spawned block \
+                     does not run on the serial loop, so this breaks the \
+                     node-wide one-`process()`-at-a-time invariant that #5490's \
+                     broadcast marker and `state_content_changed`'s \
+                     read-then-write both rest on. Body: {body}"
+                );
+            }
+        }
     }
 
     /// Pin: a wrong response variant must NOT be reported to the client as a
@@ -4726,15 +4920,23 @@ mod tests {
     ///     hardcoded value can never reach the hop.
     #[test]
     fn inter_delegate_hop_forwards_the_originating_scope() {
-        let src = include_str!("contract.rs");
-        let body = src
-            .split("async fn handle_delegate_with_contract_requests")
-            .nth(1)
-            .expect("handle_delegate_with_contract_requests must exist");
-        let body = body
-            .split("\nasync fn ")
-            .next()
-            .expect("bounded by the next free function");
+        // Comments stripped (`production_code`): without that, commenting the
+        // hop out left every assertion below satisfied by the commented text,
+        // so the scope-laundering bug could be reinstated under a green pin.
+        let src = production_code();
+        let body = fn_region(&src, "async fn handle_delegate_with_contract_requests");
+
+        // The forbidden literal must EXIST somewhere in production, or the
+        // negative assertion below is satisfied by a rename rather than by the
+        // code being right. It legitimately appears on the notification path,
+        // which is the third assertion's whole subject.
+        assert!(
+            src.contains("ConnectionScope::Local"),
+            "the literal this pin forbids at the hop no longer appears anywhere \
+             in production. Either the variant was renamed — in which case this \
+             pin now forbids nothing — or the notification path stopped \
+             hardcoding it, in which case rewrite this pin deliberately."
+        );
 
         // Isolate the hop's own executor call.
         let hop = body
@@ -4758,14 +4960,7 @@ mod tests {
         );
 
         // And the scopeless caller must not be able to reach it at all.
-        let notification = src
-            .split("async fn handle_delegate_notification")
-            .nth(1)
-            .expect("handle_delegate_notification must exist");
-        let notification = notification
-            .split("\nasync fn ")
-            .next()
-            .expect("bounded by the next free function");
+        let notification = fn_region(&src, "async fn handle_delegate_notification");
         assert!(
             notification.contains("InterDelegateDispatch::Suppressed"),
             "the notification path hardcodes ConnectionScope::Local, so it MUST \
@@ -4788,17 +4983,17 @@ mod tests {
     /// the gate being deleted or moved below its consumer, which it does. The
     /// region is bounded to the function so the pin cannot match its own
     /// assertion strings further down the file.
+    ///
+    /// It scrapes `production_code()`, which strips comments, and that is
+    /// load-bearing rather than tidiness: the earlier version scraped raw text,
+    /// so commenting the gate out left both `find`s satisfied and the ordering
+    /// assertion true, and the pin stayed green with the gate GONE. A pin that
+    /// lets a security gate be commented out is worse than no pin, because it
+    /// reads as coverage.
     #[test]
     fn consent_prompt_identity_comes_from_the_gated_origin() {
-        let src = include_str!("contract.rs");
-        let body = src
-            .split("async fn handle_delegate_with_contract_requests")
-            .nth(1)
-            .expect("handle_delegate_with_contract_requests must exist");
-        let body = body
-            .split("\nasync fn ")
-            .next()
-            .expect("bounded by the next free function");
+        let src = production_code();
+        let body = fn_region(&src, "async fn handle_delegate_with_contract_requests");
 
         let gate = body
             .find("let origin_contract = if connection_scope.is_local()")
@@ -7288,8 +7483,8 @@ mod hol_4391_tests {
     #[test]
     fn park_sweep_deadline_is_armed_and_the_loop_waits_on_it() {
         // The loop must consult the deadline, not sweep only on other traffic.
-        let src = include_str!("contract.rs");
-        let body = contract_handling_body(src);
+        let src = contract_handling_body();
+        let body = src.as_str();
         assert!(
             body.contains("park_ctx.next_sweep_deadline()"),
             "contract_handling must compute the park sweep deadline"
@@ -7301,21 +7496,18 @@ mod hol_4391_tests {
         );
     }
 
-    /// The text of `contract_handling`, bounded to that function.
+    /// The text of `contract_handling`, comment-stripped and bounded to that
+    /// function.
     ///
-    /// `include_str!` pulls in this test module too, so an unbounded
-    /// `split(signature).nth(1)` runs to EOF and a pin over it can be satisfied
-    /// by the pin's own assertion literal. The `\n}\n` end anchor is the
-    /// top-level closing brace: everything inside the function is indented.
-    fn contract_handling_body(src: &str) -> &str {
-        let start = src
-            .find("pub(crate) async fn contract_handling")
-            .expect("contract_handling must exist");
-        let body = &src[start..];
-        let end = body
-            .find("\n}\n")
-            .expect("contract_handling must have a top-level closing brace");
-        &body[..end]
+    /// Both halves are load-bearing, and both are shared with `mod tests` so
+    /// there is one implementation rather than a second that drifts. Comment
+    /// stripping is what stops a pin over this region being satisfied by a
+    /// commented-out call — the defeat that was found in three sibling pins in
+    /// this file; the region bound is what stops it being satisfied by a pin's
+    /// own assertion literal further down (#5450).
+    fn contract_handling_body() -> String {
+        let code = super::tests::production_code();
+        super::tests::fn_region(&code, "pub(crate) async fn contract_handling").to_string()
     }
 
     /// #5554: the TTL backstop must decide from the resumes the loop has ALREADY
@@ -7334,12 +7526,13 @@ mod hol_4391_tests {
     /// responder, and waiting for unrelated traffic to wake the loop is the
     /// stall this whole change exists to remove.
     ///
-    /// FALSIFY by moving the drain below the sweep, or by deleting either the
-    /// drain or the `continue` guard.
+    /// FALSIFY by moving the drain below the sweep, by deleting either the
+    /// drain or the `continue` guard, or by commenting the drain out — the
+    /// last of which this pin missed until `contract_handling_body` started
+    /// stripping comments.
     #[test]
     fn the_ttl_sweep_decides_from_the_resumes_the_loop_already_took() {
-        let src = include_str!("contract.rs");
-        let squashed: String = contract_handling_body(src)
+        let squashed: String = contract_handling_body()
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
