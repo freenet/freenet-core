@@ -204,13 +204,21 @@ impl Runtime {
         // `context` here would therefore be a genuinely concurrent access to a
         // field the abandoned guest can still write through `context_write`.
         //
-        // It is not a data race as the field stands today -- the only mutator
-        // takes `DELEGATE_ENV.get_mut`, a shard WRITE lock, which excludes this
-        // `get` -- but that is a property of one call site in `native_api`, not
-        // of anything checked here. Moving any future `context` mutator to a
-        // shared borrow (an interior-mutability wrapper, say) would silently
-        // turn this line into a cross-thread race with no `unsafe` at either
-        // end. See the `unsafe impl Send/Sync for DelegateCallEnv` note.
+        // That IS a data race if the read happens above the `?`, and it became
+        // one in #5593: `context` is now a `RefCell<Vec<u8>>` and
+        // `context_write` mutates it through `DELEGATE_ENV.get` -- a shard READ
+        // lock -- plus `borrow_mut()`. Shard read locks are SHARED, so nothing
+        // separates the two threads any more. `RefCell`'s borrow flag is a
+        // non-atomic `Cell<isize>`, so its own runtime check cannot detect the
+        // overlap; and `to_vec()` reallocating the `Vec` while `clone()` reads
+        // it is a use-after-free of the old buffer. `RefCell` is `!Sync`, but
+        // the `unsafe impl Sync for DelegateCallEnv` overrides that, so the
+        // compiler says nothing and there is no `unsafe` at either edit site.
+        //
+        // Before #5593 the mutator took `get_mut`, a shard WRITE lock, and the
+        // ordering here did not matter. That was one call site's habit rather
+        // than an invariant, which is exactly why it stopped holding. Do not
+        // restore the habit as the defence; keep the read below the `?`.
         //
         // The read is pure waste on every error path regardless: `result?` used
         // to discard it a line later. Skipping it costs nothing, removes the
@@ -535,5 +543,69 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pins {
+    /// Source-scrape pin (#5480): in `exec_inbound_with_env`, the `?` that
+    /// propagates the call's result MUST come BEFORE the `context` read-back.
+    ///
+    /// This is an ordering the compiler cannot enforce and that reads as a
+    /// harmless rearrangement. It is not. On the wall-clock-timeout path the
+    /// creating thread returns while the guest is still running on an abandoned
+    /// `spawn_blocking` thread, so a read placed above the `?` runs concurrently
+    /// with `native_api`'s `context_write`. Since #5593 both sides take only a
+    /// SHARED `DELEGATE_ENV.get` and reach the `Vec` through a `RefCell`, whose
+    /// borrow flag is a non-atomic `Cell<isize>` — a data race that `RefCell`'s
+    /// own check cannot detect, that `!Sync` would normally catch, and that the
+    /// `unsafe impl Sync for DelegateCallEnv` suppresses. Neither edit site
+    /// needs `unsafe`, so nothing else would flag the change.
+    ///
+    /// Below the `?` the read is reached only on success, which means
+    /// `execute_wasm_blocking` joined the guest closure and the guest is
+    /// provably finished.
+    #[test]
+    fn context_readback_happens_after_the_result_is_propagated() {
+        let src = include_str!("execution.rs");
+        let start = src
+            .find("fn exec_inbound_with_env(")
+            .expect("`exec_inbound_with_env` not found — this pin has drifted");
+        // Bound at the next method so a later `?` cannot satisfy the assertion.
+        let rest = &src[start..];
+        let end = ["\n    pub(super) fn ", "\n    fn ", "\n}"]
+            .iter()
+            .filter_map(|needle| rest.find(needle))
+            .min()
+            .map(|off| start + off)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+
+        // Fail closed if the window was truncated: a shortened window would let
+        // the "read-back is present" lookup miss and turn this pin vacuous.
+        let opens = body.matches('{').count();
+        let closes = body.matches('}').count();
+        assert_eq!(
+            opens, closes,
+            "`exec_inbound_with_env`: scraped window is truncated ({opens} `{{` vs \
+             {closes} `}}`), so this pin would pass vacuously. Widen the end \
+             delimiters; do NOT delete the check."
+        );
+
+        let propagate = body
+            .find("let outbound = result?;")
+            .expect("`exec_inbound_with_env` must propagate the call result with `?`");
+        let readback = body
+            .find("DELEGATE_ENV\n            .get(&instance_id)")
+            .expect("`exec_inbound_with_env` must read the context back from DELEGATE_ENV");
+
+        assert!(
+            propagate < readback,
+            "the `context` read-back must sit AFTER `let outbound = result?;`. Above \
+             it, the read runs on the wall-clock-timeout path while the guest is \
+             still live on an abandoned blocking thread, racing `context_write` on \
+             a `RefCell` that `unsafe impl Sync` has stripped the protection from \
+             (#5480, #5593). Nothing but this pin would catch the move."
+        );
     }
 }

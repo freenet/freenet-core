@@ -694,14 +694,20 @@ pub(super) struct DelegateCallEnv {
 //     runs only on the success path -- i.e. only once `execute_wasm_blocking`
 //     has JOINED the guest closure and the guest is provably finished.
 //
-//     Do not move it back above the `?`, and do not add a read of any other
-//     field beside it. `context` alone would survive such a move today, because
-//     its only mutator happens to take `get_mut` (a shard WRITE lock, which
-//     excludes the read-back's `get`) -- but that is one call site's habit, not
-//     an invariant this type enforces, and no other field has even that much.
-//     Giving `context` an interior-mutability wrapper, or reading a second
-//     field there, would be a cross-thread data race with no `unsafe` at the
-//     edit site to warn whoever writes it.
+//     DO NOT MOVE IT BACK ABOVE THE `?`, and do not add a read of any other
+//     field beside it. That is not a style preference: since #5593 `context` is
+//     a `RefCell<Vec<u8>>` whose mutator (`context_write`) takes `DELEGATE_ENV
+//     .get` -- a SHARED shard lock -- and then `borrow_mut()`. Above the `?`,
+//     the read-back's `get` + `borrow()` would run concurrently with that on
+//     the timeout path: a race on `RefCell`'s non-atomic borrow flag, which its
+//     own runtime check cannot detect, and a use-after-free of the `Vec` buffer
+//     when `to_vec()` reallocates under `clone()`.
+//
+//     Note how little would warn you. `RefCell<Vec<u8>>` is `!Sync`, so the
+//     compiler WOULD reject this type -- except that the `Sync` impl below
+//     overrides exactly that check, and neither edit site needs `unsafe`. The
+//     ordering of these two lines is load-bearing and nothing but this comment
+//     says so.
 //
 //  3. NO REFERENCE ESCAPES ITS GUARD. The four accessors are private and each is
 //     `&self -> &T`, so lifetime elision ties the result to the `Ref` that
