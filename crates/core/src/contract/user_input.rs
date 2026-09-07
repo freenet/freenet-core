@@ -402,6 +402,21 @@ impl UserInputPrompter for DashboardPrompter {
                 response_tx: tx,
             },
         );
+        // CANCELLATION SAFETY (#5544 P1b). The removal below runs only if this
+        // future is polled to completion. #5544 wraps a delegate's prompts in a
+        // PARK_WORK_BUDGET timeout, so a second prompt can be DROPPED here —
+        // after the insert, before the removal — and the entry then persists
+        // forever, because nothing sweeps `pending`. Thirty-two of those fill
+        // MAX_PENDING_PROMPTS, after which every later permission request on
+        // this node is auto-denied, for every delegate, permanently.
+        //
+        // The guard removes on drop, so insert and removal are paired wherever
+        // the future ends. The explicit cleanup below still runs on the normal
+        // path; `PendingPrompts` is a DashMap and a second remove is a no-op.
+        let _cancel_guard = PromptEntryGuard {
+            pending: self.pending.clone(),
+            nonce: nonce.clone(),
+        };
 
         // Fire the broadcast Added event AFTER the DashMap insert so any
         // subscriber that wakes up on the event can immediately find the entry
@@ -465,6 +480,37 @@ impl UserInputPrompter for DashboardPrompter {
                 tracing::warn!(nonce = %nonce, "Permission prompt timed out after 60s");
                 None
             }
+        }
+    }
+}
+
+/// Removes a pending-prompt registry entry if its prompt future is dropped
+/// before it can clean up after itself (#5544 P1b).
+///
+/// Exists because a cancelled prompt is now reachable: #5544 bounds a parked
+/// delegate's off-loop work with `PARK_WORK_BUDGET`, and prompts run
+/// sequentially inside it, so a slow first prompt can leave a second one
+/// cancelled mid-await. Without this, that entry is never removed and never
+/// swept, and 32 of them disable permission prompting node-wide.
+struct PromptEntryGuard {
+    pending: PendingPrompts,
+    nonce: String,
+}
+
+impl Drop for PromptEntryGuard {
+    fn drop(&mut self) {
+        if self.pending.remove(&self.nonce).is_some() {
+            // Only reachable on the cancelled path: the normal path removes the
+            // entry before this guard drops, so a hit here means the future was
+            // dropped mid-await.
+            tracing::warn!(
+                "Permission prompt was cancelled before it completed; removed its \
+                 registry entry so it cannot accumulate toward MAX_PENDING_PROMPTS \
+                 (#5544 P1b)"
+            );
+            emit_prompt_event(PromptEvent::Removed {
+                nonce: self.nonce.clone(),
+            });
         }
     }
 }
@@ -666,6 +712,71 @@ mod tests {
         let req = make_test_request("Over limit", vec!["Allow"]);
         let result = prompter.prompt(&req, "dkey", webapp("cid")).await;
         assert!(result.is_none());
+    }
+
+    /// #5544 P1b: a prompt future dropped mid-await must not leave its registry
+    /// entry behind.
+    ///
+    /// `PARK_WORK_BUDGET` bounds a parked delegate's whole off-loop body and its
+    /// prompts run sequentially inside it, so a slow first prompt leaves the
+    /// second cancelled while it waits for a human — after `pending.insert`,
+    /// before the explicit `pending.remove`. Nothing sweeps `pending`, so each
+    /// orphan is permanent, and `MAX_PENDING_PROMPTS` of them auto-deny every
+    /// later permission request on the node, for every delegate, forever.
+    /// `PromptEntryGuard` is the only thing standing between that and a user;
+    /// this is the only test of it.
+    ///
+    /// Cancellation is driven by dropping the future between polls rather than
+    /// by a timer: the entry is inserted on the first poll (the first await is
+    /// the wait for the human), so the drop lands in exactly the window the
+    /// budget cancels in, with no wall-clock dependence.
+    ///
+    /// FALSIFY by neutering the guard's body — `if false && self.pending.remove(
+    /// &self.nonce).is_some()`, the mutation that survived the whole 5465-test
+    /// suite before this test existed. Both assertions go red.
+    #[tokio::test]
+    async fn a_prompt_cancelled_mid_await_removes_its_pending_entry() {
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let prompter = noop_prompter(pending.clone());
+        let req = make_test_request("Allow this?", vec!["Allow", "Deny"]);
+
+        let mut prompting = Box::pin(prompter.prompt(&req, "dkey", webapp("cid")));
+        assert!(
+            futures::poll!(prompting.as_mut()).is_pending(),
+            "the prompt must be waiting for a human, not resolved"
+        );
+        let nonce = pending
+            .iter()
+            .next()
+            .expect("the prompt must have registered a pending entry")
+            .key()
+            .clone();
+
+        // Subscribe before the drop: the guard must also retire the prompt in
+        // the UI, or every tab keeps showing a dialog nothing can answer.
+        let mut events = prompt_events().subscribe();
+        drop(prompting);
+
+        assert!(
+            pending.is_empty(),
+            "a cancelled prompt must not leave its entry behind: nothing sweeps \
+             `pending`, so MAX_PENDING_PROMPTS orphans auto-deny every later \
+             permission request on this node (#5544 P1b)"
+        );
+        // The broadcast is process-global and shared with other tests, so match
+        // on OUR nonce rather than on the next event to arrive.
+        let mut removed = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(&event, PromptEvent::Removed { nonce: n } if *n == nonce) {
+                removed = true;
+                break;
+            }
+        }
+        assert!(
+            removed,
+            "the guard must emit Removed for the cancelled prompt so open tabs \
+             stop displaying a dialog that can no longer be answered"
+        );
     }
 
     #[test]
