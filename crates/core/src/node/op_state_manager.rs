@@ -231,6 +231,9 @@ pub(crate) struct OpManager {
     /// landing during the read queues a fresh event rather than being folded
     /// into one already in flight.
     pub(crate) v2_delegate_broadcast_pending: Arc<dashmap::DashSet<ContractInstanceId>>,
+    /// Serialises the marker insert / enqueue / rollback triple in
+    /// [`OpManager::queue_v2_delegate_broadcast`]. See that function.
+    v2_delegate_broadcast_queue_lock: Arc<Mutex<()>>,
     /// Request router for client request deduplication.
     ///
     /// This is initialized lazily from `client_event_handling` because the router is only
@@ -360,6 +363,7 @@ impl Clone for OpManager {
             update_propagation_stats: self.update_propagation_stats.clone(),
             pending_broadcasts: self.pending_broadcasts.clone(),
             v2_delegate_broadcast_pending: self.v2_delegate_broadcast_pending.clone(),
+            v2_delegate_broadcast_queue_lock: self.v2_delegate_broadcast_queue_lock.clone(),
             request_router: self.request_router.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             stream_progress_registry: self.stream_progress_registry.clone(),
@@ -418,6 +422,32 @@ impl Drop for ClientOpGuard {
         // the drain notices counter==0.
         self.counter.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// Outcome of [`OpManager::queue_v2_delegate_broadcast`].
+///
+/// Three outcomes, not two, because a `bool` conflated the one case where
+/// NOTHING WENT WRONG with the one case where a write goes unannounced — and
+/// the caller then counted both as drops. Coalescing is the common, healthy
+/// path on any node whose delegate writes the same contract twice in quick
+/// succession, so counting it poisoned the very signal that exists to make a
+/// real drop visible: the drop WARN fires at powers of two, so inflating the
+/// counter with non-events pushes the next milestone exponentially further out
+/// and a genuine drop then logs nothing at all (#4981's shape, arrived at from
+/// the opposite direction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum V2BroadcastQueued {
+    /// An event was enqueued; a drain will run for this contract.
+    Queued,
+    /// A drain was already outstanding for this contract and had not yet run.
+    /// **Nothing was lost:** the drain re-reads stored state rather than
+    /// carrying a snapshot, so it announces this write too.
+    Coalesced,
+    /// The notification channel would have blocked, and the marker was
+    /// released. This write goes unannounced. Already counted and WARNed by
+    /// `note_v2_broadcast_enqueue_dropped` inside the call, so a caller must
+    /// NOT count it a second time.
+    EnqueueFailed,
 }
 
 /// Outcome of a bounded state read on the V2 broadcast drain path.
@@ -481,9 +511,10 @@ fn note_v2_broadcast_enqueue_dropped(key: &ContractKey, err: &OpError) {
             error = %err,
             dropped_total = dropped,
             "V2 delegate state-change broadcast dropped: notification channel would block. \
-             The write is committed locally; the network learns of it on the next write or \
-             within about one anti-entropy round (up to 300s, staggered across peers rather \
-             than swept). Logged at power-of-two milestones (#4238)."
+             The write is committed locally; the network learns of it on the next write, \
+             or eventually via anti-entropy — 300s is the heartbeat PERIOD, not a \
+             recovery bound, since each exchange is capped and randomly sampled. \
+             Logged at power-of-two milestones (#4238)."
         );
     }
 }
@@ -674,6 +705,7 @@ impl OpManager {
                 crate::operations::update::pending_broadcast::PendingBroadcastStore::new(),
             ),
             v2_delegate_broadcast_pending: Arc::new(dashmap::DashSet::new()),
+            v2_delegate_broadcast_queue_lock: Arc::new(Mutex::new(())),
             request_router,
             orphan_stream_registry,
             stream_progress_registry: Arc::new(StreamProgressRegistry::new()),
@@ -1072,39 +1104,59 @@ impl OpManager {
     /// worse than a dropped broadcast. A drop is recoverable — the next write
     /// or a summary-mismatch resync re-announces the state.
     ///
-    /// # The marker insert and the enqueue are not atomic
+    /// # The marker insert and the enqueue are made atomic by a lock
     ///
-    /// `insert` and `try_notify_node_event` are two steps, and the rollback
-    /// below reads the marker a third time. Nothing here is a transaction, so
-    /// this is safe only because the write path is SERIAL: the sole caller is a
-    /// WASM host call executing on `contract_handling`, one delegate at a time.
+    /// `insert`, `try_notify_node_event` and the rollback below are three
+    /// operations, and the coalescing contract depends on another caller never
+    /// observing the marker between them. A short mutex supplies that.
     ///
-    /// Recorded because that is the THIRD safety argument on this path resting
-    /// on the same serial loop — the other two are the drain's bounded read and
-    /// the coalescing contract — and #5544/#5554 are actively removing the loop
-    /// as a stall point. Parking does NOT remove the serialisation (one
-    /// `process()` still runs at a time, and the parked task holds no
-    /// `ContractHandler`, which the borrow checker enforces), so the argument
-    /// survives that change. It would not survive a genuinely concurrent
-    /// writer, and the failure would be silent rather than loud:
+    /// IT USED TO SAY THE SERIAL LOOP SUPPLIED IT, AND THAT WAS FALSE — the
+    /// comment asserted "the sole caller is a WASM host call executing on
+    /// `contract_handling`", and this very PR added a second caller: the drain
+    /// retry in `p2p_protoc`, which runs inside `tokio::spawn` on the
+    /// multi-threaded runtime. So the PR shipped the concurrent writer its own
+    /// safety argument said the protocol could not survive. Two reviewers found
+    /// it independently; it is recorded here rather than quietly corrected
+    /// because the shape is the one worth recognising — a true claim ("the
+    /// write path is serial") about the wrong set (the write path was, the
+    /// caller set was not).
     ///
-    /// * writer A inserts the marker and is preempted before its enqueue;
-    /// * writer B sees the id present, coalesces, and returns `false` — the
-    ///   correct answer only if A's broadcast actually happens;
-    /// * A's enqueue then fails, so A clears the marker and logs ONE drop.
+    /// The sequence it made reachable, all of it silent:
     ///
-    /// B's write is now unannounced with nothing recorded about it, and the
-    /// drop counter under-reports by exactly the number of coalesced writers.
-    /// Anyone making this path concurrent must replace the pair with a single
-    /// atomic transition (e.g. keep the marker owned by the enqueuer and clear
-    /// it only at the drain, per `clear_v2_delegate_broadcast_pending`), not
-    /// add a lock around the two steps as they stand.
-    pub(crate) fn queue_v2_delegate_broadcast(&self, key: ContractKey) -> bool {
+    /// * retry task R inserts the marker and is preempted before its enqueue;
+    /// * delegate write W, on the loop, sees the marker present, coalesces, and
+    ///   returns `Coalesced` — correct only if R's broadcast actually happens;
+    /// * R's enqueue fails, so R rolls the marker back and counts ONE drop.
+    ///
+    /// No event exists, so no drain runs and no retry is scheduled for either.
+    /// W's committed write is never announced, the delegate was told it
+    /// succeeded, and the counter reports one loss where there were at least
+    /// two. Reachability needs the notification channel full during the
+    /// interleave — which is precisely the condition the retry exists for.
+    ///
+    /// With the lock held across all three steps, a caller sees either no
+    /// marker, or a marker whose enqueue has already succeeded. It never sees
+    /// one that is about to be rolled back, so a coalesce is always a real
+    /// promise. The lock is uncontended in the common case and covers no
+    /// `.await`.
+    ///
+    /// An earlier version of this comment claimed a lock here would be the
+    /// wrong fix and that only "marker owned by the enqueuer, cleared at the
+    /// drain" would do. That was also wrong: the drain deliberately clears the
+    /// marker BEFORE its read, so that a write landing during the read is not
+    /// swallowed, and moving the clear to after the read would trade this bug
+    /// for that one.
+    pub(crate) fn queue_v2_delegate_broadcast(&self, key: ContractKey) -> V2BroadcastQueued {
+        // Held across insert, enqueue and rollback. See this function's docs:
+        // without it, a caller can coalesce into a marker that is about to be
+        // rolled back, and its write is then never announced.
+        let _serialise = self.v2_delegate_broadcast_queue_lock.lock();
+
         // `insert` returns false when the id was already present, i.e. a
         // broadcast is queued and undrained: coalesce into it and enqueue
         // nothing.
         if !self.v2_delegate_broadcast_pending.insert(*key.id()) {
-            return false;
+            return V2BroadcastQueued::Coalesced;
         }
         if let Err(err) =
             self.try_notify_node_event(crate::message::NodeEvent::V2DelegateStateChanged { key })
@@ -1116,9 +1168,9 @@ impl OpManager {
             // lifetime.
             self.v2_delegate_broadcast_pending.remove(key.id());
             note_v2_broadcast_enqueue_dropped(&key, &err);
-            return false;
+            return V2BroadcastQueued::EnqueueFailed;
         }
-        true
+        V2BroadcastQueued::Queued
     }
 
     /// Read the current stored state for `key` for a V2 broadcast drain,
@@ -1154,10 +1206,33 @@ impl OpManager {
     ///
     /// That case is bounded, not silent: it is counted and WARNed at the drain
     /// site, and a peer hosting or actively using the contract re-learns the
-    /// state within about one anti-entropy round — up to
-    /// `INTEREST_HEARTBEAT_INTERVAL` (300 s), staggered rather than swept,
-    /// since the heartbeat spreads its sends across the interval
-    /// (`spread_delay = INTEREST_HEARTBEAT_INTERVAL / num_peers`).
+    /// state EVENTUALLY, and "eventually" is the strongest word available here.
+    /// An earlier version of this comment said "within one anti-entropy round
+    /// (300 s)", and a later one softened it to "up to 300 s, staggered". Both
+    /// were wrong in the same way: `INTEREST_HEARTBEAT_INTERVAL` is the PERIOD
+    /// at which the heartbeat fires, not a bound on when a given contract is
+    /// repaired.
+    ///
+    /// Two things break the bound, neither visible from this file:
+    ///
+    /// * **The exchange is capped and randomly sampled.** A summary reply
+    ///   carries at most `MAX_SUMMARY_ENTRIES_PER_MESSAGE` entries; when a peer
+    ///   shares more contracts than that, the list is rotated by a RANDOM
+    ///   offset and truncated (`node.rs`, the `Summaries` arm). So a node with
+    ///   many contracts covers them across several rounds, and the number of
+    ///   rounds is probabilistic rather than `ceil(N / cap)`.
+    /// * **The repair needs local interest too.** The exchange only reaches
+    ///   contracts in the interest-hash intersection that pass
+    ///   `has_local_interest`. The live broadcast path has no such condition —
+    ///   since #4642 step 9 it is advertised-co-hosts-only. The two sets are
+    ///   related through the interest index rather than identical, so the peer
+    ///   superset argument below is about PEERS while the quantity that
+    ///   actually matters is the (peer, contract) pair.
+    ///
+    /// This matters because this paragraph is the entire justification for
+    /// dropping a write that already committed and already returned success to
+    /// the delegate. An operator reading "300 s" will wait five minutes for a
+    /// self-heal that may take considerably longer.
     ///
     /// That recovery covers the right PEERS, not merely the right contracts,
     /// and the two are not the same claim. The heartbeat enumerates every
@@ -1181,13 +1256,26 @@ impl OpManager {
         timeout: std::time::Duration,
     ) -> DrainStateRead {
         use crate::contract::ContractHandlerEvent;
+        // BACKGROUND, not the `NetworkRelay` default (#4534). This read is
+        // best-effort by construction — its whole failure story is "the write
+        // goes unannounced and anti-entropy repairs it" — so under queue
+        // pressure it must be shed BEFORE genuine relayed peer operations, not
+        // compete with them. `NetworkRelay` is not shed first; only
+        // `ClientLocal` gets the reserve.
+        //
+        // The sibling this path is otherwise modelled on, the periodic interest
+        // -sync summarize, already uses `Background` for exactly this reason.
+        // And the pressure is self-inflicted if it is not: the coalescing
+        // marker is per contract, so a delegate writing N contracts issues N
+        // of these at an already-saturated handler.
         match self
-            .notify_contract_handler_with_timeout(
+            .notify_contract_handler_with_timeout_prioritized(
                 ContractHandlerEvent::GetQuery {
                     instance_id: *key.id(),
                     return_contract_code: false,
                 },
                 timeout,
+                crate::contract::Priority::Background,
             )
             .await
         {
@@ -1726,6 +1814,23 @@ impl OpManager {
     ) -> Result<ContractHandlerEvent, ContractError> {
         self.ch_outbound
             .send_to_handler_with_timeout(msg, timeout, crate::contract::Priority::DEFAULT)
+            .await
+    }
+
+    /// As [`Self::notify_contract_handler_with_timeout`], but at an explicit
+    /// priority class (#4534).
+    ///
+    /// Exists because `Priority::DEFAULT` is `NetworkRelay`, which the fair
+    /// queue does NOT shed first — correct for relayed peer operations, wrong
+    /// for best-effort maintenance work that is explicitly allowed to fail.
+    pub async fn notify_contract_handler_with_timeout_prioritized(
+        &self,
+        msg: ContractHandlerEvent,
+        timeout: std::time::Duration,
+        priority: crate::contract::Priority,
+    ) -> Result<ContractHandlerEvent, ContractError> {
+        self.ch_outbound
+            .send_to_handler_with_timeout(msg, timeout, priority)
             .await
     }
 
@@ -2914,6 +3019,64 @@ mod tests {
     /// is GONE — the collapse DECISION now DRIVES one level up
     /// (`reconcile_wants_collapse` at the callers), so the function must no longer
     /// build a reconcile snapshot or run the action-set comparator here.
+    /// PIN: the marker triple in `queue_v2_delegate_broadcast` is serialised.
+    ///
+    /// The function inserts a marker, enqueues an event, and rolls the marker
+    /// back if the enqueue fails. A caller that observes the marker BETWEEN the
+    /// insert and a failed enqueue coalesces into a promise that will not be
+    /// kept, and its committed write is never announced — silently, and with
+    /// the drop counter under-reporting by exactly the number of coalescers.
+    ///
+    /// This is not hypothetical. The function's doc used to assert the triple
+    /// was safe because "the sole caller is a WASM host call executing on
+    /// `contract_handling`", while this same PR added a second caller inside a
+    /// `tokio::spawn` on the multi-threaded runtime. The claim was true of the
+    /// WRITE PATH and false of the CALLER SET.
+    ///
+    /// Pinned from source because the race needs two threads interleaving at a
+    /// specific instruction with a full notification channel — reliably
+    /// unreproducible in a unit test. What IS checkable is that the lock is
+    /// still taken, and taken BEFORE the insert.
+    ///
+    /// FALSIFY: delete the `lock()` line, or move it below the `insert`.
+    /// Verified both fail.
+    #[test]
+    fn queue_v2_delegate_broadcast_serialises_its_marker_triple() {
+        const SRC: &str = include_str!("op_state_manager.rs");
+        let start = SRC
+            .find("pub(crate) fn queue_v2_delegate_broadcast(")
+            .expect("queue_v2_delegate_broadcast must exist");
+        let rest = &SRC[start + 1..];
+        let end = rest
+            .find("\n    pub")
+            .map(|e| start + 1 + e)
+            .unwrap_or(SRC.len());
+        // Strip line comments: every needle below also appears in this
+        // function's own prose, and a scrape that counted those would report a
+        // true fact about the wrong text.
+        let body: String = SRC[start..end]
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let lock = body.find("v2_delegate_broadcast_queue_lock.lock()").expect(
+            "the marker triple must be serialised by the queue lock; without it a \
+             concurrent caller can coalesce into a marker that is then rolled back",
+        );
+        let insert = body
+            .find("v2_delegate_broadcast_pending.insert(")
+            .expect("the marker insert must still exist");
+        assert!(
+            lock < insert,
+            "the lock must be acquired BEFORE the marker insert, or the window \
+             it exists to close is still open"
+        );
+    }
+
     #[test]
     fn send_unsubscribe_upstream_drives_off_stored_upstream_after_flip() {
         const SRC: &str = include_str!("op_state_manager.rs");

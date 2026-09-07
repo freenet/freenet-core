@@ -456,10 +456,18 @@ fn install_v2_delegate_state_write_hooks(
 ///   next to the write rather than after it, and live in
 ///   `native_api::{state_content_changed, check_state_size}`.
 /// - **Hosting registration.** A V2 write does not make this node a host, so
-///   the emitted broadcast is still dropped by
-///   `should_summarize_or_broadcast` for a contract held only because a
+///   the emitted broadcast is still dropped by `should_broadcast_contract` (the
+///   `should_summarize_or_broadcast` gate, applied at the per-peer send in
+///   `broadcast_queue::broadcast_to_single_peer` — not in
+///   `handle_broadcast_state_change`) for a contract held only because a
 ///   delegate wrote it. That is **#4669** (a delegate subscription must
 ///   register demand), not this fix.
+/// - **Contract validation, and any check on WHICH contract a delegate may
+///   write.** The V1 path reaches the network only after
+///   `bridged_upsert_contract_state` has run the contract's own
+///   `validate_state`/`update_state`; this path does not, and this fix turns
+///   that from a local-disk question into a network one. Tracked separately;
+///   receivers still merge through their own contract, which bounds it.
 pub(super) fn v2_delegate_state_write_callback(
     cache_invalidator: crate::wasm_runtime::StateCacheInvalidator,
     op_manager: Option<Arc<OpManager>>,
@@ -489,11 +497,21 @@ pub(super) fn v2_delegate_state_write_callback(
             // hand-written copies of one decision.
             //
             // KNOWN LIMIT, and it is the case #5467 cares about: the event is
-            // dropped downstream by `handle_broadcast_state_change`'s
-            // `Ring::should_summarize_or_broadcast` gate unless this node is
-            // hosting the contract or it is `contract_in_use` — and a DELEGATE
-            // subscription is neither (`ring::hosting::contract_in_use` counts
-            // client subscriptions and downstream subscribers only). So a
+            // dropped downstream by the `Ring::should_summarize_or_broadcast`
+            // gate unless this node is hosting the contract or it is
+            // `contract_in_use` — and a DELEGATE subscription is neither
+            // (`ring::hosting::contract_in_use` counts client subscriptions and
+            // downstream subscribers only).
+            //
+            // WHERE THAT GATE ACTUALLY IS, because two independent readers have
+            // now looked in the wrong place and concluded it was absent: NOT in
+            // `handle_broadcast_state_change`, which is where this comment used
+            // to send them. It is one layer down, at the per-peer send in
+            // `broadcast_queue::broadcast_to_single_peer`, wrapped in the
+            // one-line `should_broadcast_contract` — so grepping
+            // `broadcast.rs` for the inner name finds only a comment. A
+            // limitation stated where it cannot be verified reads, to the next
+            // reader who checks, as one that was fixed or imagined. So a
             // contract this node holds ONLY because a delegate wrote it still
             // does not propagate. Making a delegate subscription register
             // demand is #4669 and is a hosting-invariants decision, not
@@ -547,7 +565,11 @@ pub(super) fn v2_delegate_state_write_callback(
             // its own marker; the rate-limited `notify_node_event:
             // Notification channel full for too long` ERROR in
             // op_state_manager.rs is the sustained-back-pressure alert.
-            op_manager.queue_v2_delegate_broadcast(*key);
+            // Outcome deliberately discarded: all three are correct here.
+            // `Coalesced` means an undrained broadcast already covers this
+            // write, and `EnqueueFailed` has already been counted and WARNed
+            // inside the call.
+            let _ = op_manager.queue_v2_delegate_broadcast(*key);
         },
     )
 }
