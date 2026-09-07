@@ -407,6 +407,86 @@ mod tests {
         );
     }
 
+    /// All THREE `V2BroadcastQueued` outcomes must be distinguishable.
+    ///
+    /// KILLS MUTATION N6. Returning `Coalesced` where `EnqueueFailed` belongs
+    /// survived the full suite: nothing anywhere observed the difference, so a
+    /// two-valued signal was replaced by a three-valued one that no test could
+    /// tell apart. The arms are not cosmetic -- `run_v2_drain_retry` branches on
+    /// them, and the branch exists because conflating them mis-counts drops:
+    /// `Coalesced` is benign (a fresh write queued its own drain, so this write
+    /// IS announced) while `EnqueueFailed` is a real lost broadcast. Counting a
+    /// coalesce as a drop pushes the power-of-two WARN milestone exponentially
+    /// out of reach, so a genuine drop then logs nothing at all.
+    ///
+    /// Each arm is checked together with its marker side effect, because the
+    /// return value and the marker have to agree: a `Coalesced` that released
+    /// the marker, or an `EnqueueFailed` that held it, is the latch bug.
+    #[tokio::test(flavor = "current_thread")]
+    async fn queue_v2_delegate_broadcast_distinguishes_its_three_outcomes() {
+        let (op_manager, rx, _probe, _guards) =
+            harness("v2drain-queue-outcomes", StubReply::NoState).await;
+        let first = test_key(41);
+
+        // 1. Nothing queued for this contract yet -> Queued, marker taken.
+        assert!(
+            matches!(
+                op_manager.queue_v2_delegate_broadcast(first),
+                V2BroadcastQueued::Queued
+            ),
+            "the first write for a contract must report Queued"
+        );
+        assert!(
+            op_manager
+                .v2_delegate_broadcast_pending
+                .contains(first.id()),
+            "a Queued broadcast must hold the coalescing marker until the drain clears it"
+        );
+
+        // 2. Same contract, still undrained -> Coalesced. NOT a drop: the
+        //    outstanding drain re-reads stored state, so this write is announced
+        //    by it.
+        assert!(
+            matches!(
+                op_manager.queue_v2_delegate_broadcast(first),
+                V2BroadcastQueued::Coalesced
+            ),
+            "a repeat write while a broadcast is undrained must report Coalesced, not \
+             Queued and not EnqueueFailed -- it is benign and must not be counted as a \
+             dropped broadcast"
+        );
+        assert!(
+            op_manager
+                .v2_delegate_broadcast_pending
+                .contains(first.id()),
+            "coalescing must LEAVE the marker set; releasing it here would let the next \
+             write queue a second event for a broadcast that has not drained"
+        );
+
+        // 3. Channel closed -> EnqueueFailed, marker released. A fresh contract,
+        //    so the insert succeeds and the failure is genuinely the enqueue.
+        drop(rx);
+        let second = test_key(42);
+        assert!(
+            matches!(
+                op_manager.queue_v2_delegate_broadcast(second),
+                V2BroadcastQueued::EnqueueFailed
+            ),
+            "a failed enqueue must report EnqueueFailed and NOT Coalesced. Reporting a \
+             real lost broadcast as a benign coalesce is mutation N6: the drop goes \
+             uncounted, and because the WARN fires at powers of two, an inflated or \
+             deflated counter means a genuine drop logs nothing at all"
+        );
+        assert!(
+            !op_manager
+                .v2_delegate_broadcast_pending
+                .contains(second.id()),
+            "a failed enqueue must RELEASE the marker. Left set it latches the contract: \
+             every later write coalesces into a broadcast that was never queued and will \
+             never drain, so the contract stops propagating for the process lifetime"
+        );
+    }
+
     /// The production `schedule_retry` wiring, driven for real.
     ///
     /// KILLS the seam review's Medium at one remove: `schedule_retry`'s body is
