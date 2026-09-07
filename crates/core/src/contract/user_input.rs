@@ -765,17 +765,39 @@ mod tests {
         );
         // The broadcast is process-global and shared with other tests, so match
         // on OUR nonce rather than on the next event to arrive.
+        //
+        // `Lagged` is CONTINUED, not treated as end-of-stream. `PROMPT_EVENTS`
+        // is process-global with a capacity of `PROMPT_EVENT_CAPACITY`, shared
+        // with every other test in this binary running in parallel, so this
+        // receiver can fall behind through no fault of the code under test.
+        // `while let Ok(..)` broke on that arm, which made a lagged receiver
+        // report `removed == false` and fail with a message accusing
+        // `PromptEntryGuard` of never emitting `Removed` — a false accusation
+        // about a guard that had worked. Only `Empty`/`Closed` end the drain.
         let mut removed = false;
-        while let Ok(event) = events.try_recv() {
-            if matches!(&event, PromptEvent::Removed { nonce: n } if *n == nonce) {
-                removed = true;
-                break;
+        let mut lagged = 0u64;
+        loop {
+            match events.try_recv() {
+                Ok(event) => {
+                    if matches!(&event, PromptEvent::Removed { nonce: n } if *n == nonce) {
+                        removed = true;
+                        break;
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    lagged += skipped;
+                }
+                Err(_) => break,
             }
         }
         assert!(
             removed,
             "the guard must emit Removed for the cancelled prompt so open tabs \
-             stop displaying a dialog that can no longer be answered"
+             stop displaying a dialog that can no longer be answered. \
+             (Receiver lagged by {lagged} events; if that is non-zero this \
+             binary published more than PROMPT_EVENT_CAPACITY prompt events \
+             between the subscribe above and this drain, and the failure is \
+             the shared channel rather than the guard.)"
         );
     }
 
