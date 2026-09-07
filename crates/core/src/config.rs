@@ -610,6 +610,14 @@ impl ConfigArgs {
                                     return Some((filename, ext));
                                 }
                                 "json" => {
+                                    // Same reasoning as the `toml` arm above.
+                                    // A fuzzy-matched `config*.json` is just as
+                                    // invisibly-not-the-file-you-edited.
+                                    tracing::warn!(
+                                        filename = %filename,
+                                        "no exact config.toml/config.json found; falling back to this \
+                                         config* file. Rename it to config.json if it is the one you edit."
+                                    );
                                     return Some((filename, ext));
                                 }
                                 _ => {}
@@ -6300,6 +6308,70 @@ shutdown-drain-secs = 42
             .expect("read_config must not list the directory when config.toml exists")
             .expect("config.toml is present");
         assert_eq!(cfg.log_level, tracing::log::LevelFilter::Debug);
+    }
+
+    /// REGRESSION for the shadowing branch: with BOTH `config.toml` and
+    /// `config.json` present, `config.toml` wins — and that has to be pinned,
+    /// because it is a behaviour this PR CREATED. The old fuzzy scan took
+    /// whichever entry `read_dir` yielded first, so which format won was
+    /// arbitrary; now it is settled, permanently, in toml's favour.
+    ///
+    /// That matters more than it looks: `build()` writes `config.toml`
+    /// unconditionally, so a `config.json` operator gets one created beside
+    /// theirs on first boot and from boot two their json is never read again.
+    /// If that precedence is ever revisited, this test is where the decision
+    /// is recorded.
+    ///
+    /// The json decoy is DERIVED from the same fixture as the toml rather than
+    /// hand-written, so it is a genuinely loadable config. A hand-written
+    /// `{"log_level": "error"}` is not — it is missing required fields, and the
+    /// test would then pass because the json failed to parse rather than
+    /// because toml was preferred. The `decoy` assertion below exists to keep
+    /// that failure mode caught rather than assumed: it loads the json ALONE
+    /// first and requires it to carry the distinguishing value.
+    #[test]
+    fn read_config_prefers_config_toml_over_a_valid_config_json() {
+        let toml_src = released_config_toml_without_secret_paths();
+
+        // Round-trip the fixture through `toml::Value` into JSON so the decoy
+        // has exactly the fields a real config has, then flip the one value
+        // this test distinguishes on.
+        let mut value: toml::Value = toml::from_str(&toml_src).expect("fixture must parse as toml");
+        if let Some(table) = value.as_table_mut() {
+            table.insert(
+                "log_level".to_string(),
+                toml::Value::String("error".to_string()),
+            );
+        }
+        let json_src = serde_json::to_string(&value).expect("fixture must serialise as json");
+
+        // Prove the decoy is loadable ON ITS OWN, so the assertion below is
+        // about precedence and not about the json being unreadable.
+        let json_only = tempfile::tempdir().unwrap();
+        fs::write(json_only.path().join("config.json"), &json_src).unwrap();
+        let decoy = ConfigArgs::read_config(&json_only.path().to_path_buf())
+            .expect("the json decoy must itself be readable")
+            .expect("config.json is present");
+        assert_eq!(
+            decoy.log_level,
+            tracing::log::LevelFilter::Error,
+            "the decoy does not carry the log level this test distinguishes on"
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        fs::write(dir.join("config.toml"), &toml_src).unwrap();
+        fs::write(dir.join("config.json"), &json_src).unwrap();
+
+        let cfg = ConfigArgs::read_config(&dir.to_path_buf())
+            .expect("read_config should succeed")
+            .expect("a config file should be found");
+        assert_eq!(
+            cfg.log_level,
+            tracing::log::LevelFilter::Debug,
+            "config.toml must win when both exact names are present; got the \
+             config.json value instead"
+        );
     }
 
     /// With no exact `config.toml` / `config.json`, the fuzzy fallback must
