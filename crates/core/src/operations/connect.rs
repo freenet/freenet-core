@@ -2228,6 +2228,28 @@ mod tests {
         op_manager
     }
 
+    /// Run `body` with the process-global `NETWORK_STATUS` guard held.
+    ///
+    /// The guard is acquired and released in this SYNC frame and the async body
+    /// runs inside `block_on`, so the lock is never live across an `.await` in
+    /// an async fn — the shape `clippy::await_holding_lock` forbids — while
+    /// still serializing these tests against every other test that touches the
+    /// singleton.
+    fn with_network_status_lock<F>(body: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::node::network_status::init(0, HashSet::new(), "test".to_string());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(body);
+    }
+
     fn bootstrap_gateway(port: u16) -> PeerKeyLocation {
         let pub_key = TransportKeypair::new().public().clone();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
@@ -2263,101 +2285,98 @@ mod tests {
     /// only increment inside `open_conns < threshold && unconnected_count > 0`,
     /// so it recorded ZERO for the entire multi-minute stall it was added to
     /// measure. The loop must classify this round.
-    #[tokio::test]
-    async fn startup_rounds_counted_while_all_gateways_appear_connected() {
-        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        crate::node::network_status::init(0, HashSet::new(), "test".to_string());
+    #[test]
+    fn startup_rounds_counted_while_all_gateways_appear_connected() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("bootstrap-4787-stall", "127.0.0.1:14787").await;
+            let cm = &op_manager.ring.connection_manager;
+            let gateways = vec![bootstrap_gateway(24787), bootstrap_gateway(24788)];
 
-        let op_manager = bootstrap_test_op_manager("bootstrap-4787-stall", "127.0.0.1:14787").await;
-        let cm = &op_manager.ring.connection_manager;
-        let gateways = vec![bootstrap_gateway(24787), bootstrap_gateway(24788)];
-
-        // Make every gateway look connected — the stall's defining symptom.
-        for gw in &gateways {
-            let addr = gw.socket_addr().expect("gateway has an address");
+            // Make every gateway look connected — the stall's defining symptom.
+            for gw in &gateways {
+                let addr = gw.socket_addr().expect("gateway has an address");
+                assert!(
+                    cm.add_connection(
+                        Location::from_address(&addr),
+                        addr,
+                        gw.pub_key().clone(),
+                        false
+                    ),
+                    "test setup: gateway must be accepted into the ring"
+                );
+            }
+            assert_eq!(op_manager.ring.open_connections(), gateways.len());
             assert!(
-                cm.add_connection(
-                    Location::from_address(&addr),
-                    addr,
-                    gw.pub_key().clone(),
-                    false
-                ),
-                "test setup: gateway must be accepted into the ring"
+                op_manager.ring.open_connections() < cm.min_connections,
+                "test setup: node must be below the bootstrap threshold"
             );
-        }
-        assert_eq!(op_manager.ring.open_connections(), gateways.len());
-        assert!(
-            op_manager.ring.open_connections() < cm.min_connections,
-            "test setup: node must be below the bootstrap threshold"
-        );
-        assert_eq!(
-            op_manager.ring.is_not_connected(gateways.iter()).count(),
-            0,
-            "test setup: no gateway may look unconnected — that is the stall"
-        );
+            assert_eq!(
+                op_manager.ring.is_not_connected(gateways.iter()).count(),
+                0,
+                "test setup: no gateway may look unconnected — that is the stall"
+            );
 
-        let handle = initial_join_procedure(op_manager.clone(), &gateways)
-            .await
-            .expect("spawn join procedure");
-        let (issued, backoff, no_target) = wait_for_startup_round(Duration::from_secs(10)).await;
-        handle.abort();
+            let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                .await
+                .expect("spawn join procedure");
+            let (issued, backoff, no_target) =
+                wait_for_startup_round(Duration::from_secs(10)).await;
+            handle.abort();
 
-        assert!(
-            issued + backoff + no_target > 0,
-            "the join loop must count a below-threshold round during the stall; \
+            assert!(
+                issued + backoff + no_target > 0,
+                "the join loop must count a below-threshold round during the stall; \
              got connect_issued={issued} backoff_blocked={backoff} no_target={no_target}"
-        );
-        // With 25 - 2 > 2 the loop routes CONNECTs through the connected
-        // gateways (`use_connected_as_routers`), a path the first version of
-        // this instrumentation also left uncounted.
-        assert!(
-            issued > 0,
-            "rounds routed through connected gateways must count as \
+            );
+            // With 25 - 2 > 2 the loop routes CONNECTs through the connected
+            // gateways (`use_connected_as_routers`), a path the first version of
+            // this instrumentation also left uncounted.
+            assert!(
+                issued > 0,
+                "rounds routed through connected gateways must count as \
              connect_issued; got connect_issued={issued} backoff_blocked={backoff} \
              no_target={no_target}"
-        );
+            );
 
-        // And the joiner must be visibly un-bootstrapped rather than absent.
-        let b = crate::node::network_status::bootstrap_churn_counts().expect("initialized");
-        assert_eq!(
-            b.time_to_min_connections, None,
-            "a node that never reached min_connections must report no latency, \
+            // And the joiner must be visibly un-bootstrapped rather than absent.
+            let b = crate::node::network_status::bootstrap_churn_counts().expect("initialized");
+            assert_eq!(
+                b.time_to_min_connections, None,
+                "a node that never reached min_connections must report no latency, \
              while still being present in the snapshot"
-        );
+            );
+        });
     }
 
     /// The ordinary case still counts: gateways unconnected and not in backoff
     /// means a real CONNECT round is issued to them.
-    #[tokio::test]
-    async fn startup_rounds_counted_when_gateways_are_unconnected() {
-        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        crate::node::network_status::init(0, HashSet::new(), "test".to_string());
+    #[test]
+    fn startup_rounds_counted_when_gateways_are_unconnected() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("bootstrap-4787-unconnected", "127.0.0.1:14789").await;
+            let gateways = vec![bootstrap_gateway(24790), bootstrap_gateway(24791)];
+            assert_eq!(
+                op_manager.ring.is_not_connected(gateways.iter()).count(),
+                gateways.len(),
+                "test setup: both gateways must look unconnected"
+            );
 
-        let op_manager =
-            bootstrap_test_op_manager("bootstrap-4787-unconnected", "127.0.0.1:14789").await;
-        let gateways = vec![bootstrap_gateway(24790), bootstrap_gateway(24791)];
-        assert_eq!(
-            op_manager.ring.is_not_connected(gateways.iter()).count(),
-            gateways.len(),
-            "test setup: both gateways must look unconnected"
-        );
+            let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                .await
+                .expect("spawn join procedure");
+            let (issued, backoff, no_target) =
+                wait_for_startup_round(Duration::from_secs(10)).await;
+            handle.abort();
 
-        let handle = initial_join_procedure(op_manager.clone(), &gateways)
-            .await
-            .expect("spawn join procedure");
-        let (issued, backoff, no_target) = wait_for_startup_round(Duration::from_secs(10)).await;
-        handle.abort();
-
-        assert!(
-            issued > 0,
-            "a round that issues CONNECTs to unconnected gateways must count as \
+            assert!(
+                issued > 0,
+                "a round that issues CONNECTs to unconnected gateways must count as \
              connect_issued; got connect_issued={issued} backoff_blocked={backoff} \
              no_target={no_target}"
-        );
+            );
+        });
     }
 
     #[test]
