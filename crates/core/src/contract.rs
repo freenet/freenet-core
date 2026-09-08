@@ -524,6 +524,54 @@ async fn fetch_related_off_loop(
     }
 }
 
+/// Reject a completed off-loop related fetch that retained more than the park
+/// reserved for it at admission.
+///
+/// The other half of [`delegate_park::MAX_UPSERT_FETCH_BYTES`]: the reserve is
+/// taken in `task_bytes` before the fetch starts, and this is what makes the
+/// reserve true rather than aspirational. Without it the fetched states went
+/// into the resume sink and then an unbounded channel with no accounting at
+/// all, so one park could retain ~2 GiB against a nominal 64 MiB cap.
+///
+/// Failing the whole upsert on excess matches what this path already does for
+/// a miss, a timeout or an infra error — `fetch_related_off_loop` is
+/// all-or-nothing by design, mirroring the inline validate path — so the
+/// delegate is TOLD the upsert failed rather than left waiting, through a
+/// branch it already handles.
+///
+/// Applied at the CALL SITE rather than inside `fetch_related_off_loop` so the
+/// test stub (`OFF_LOOP_FETCH_OVERRIDE`), which returns before that function's
+/// body runs, is bounded by it too. A budget a test fixture can walk past is
+/// not a budget.
+fn within_fetch_allowance(
+    fetched: Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>,
+    missing: &[ContractInstanceId],
+    allowance: usize,
+) -> Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError> {
+    let states = fetched?;
+    let bytes: usize = states
+        .iter()
+        .map(|(_, state)| state.as_ref().len())
+        .sum::<usize>();
+    if bytes > allowance {
+        let id = states
+            .first()
+            .map(|(id, _)| *id)
+            .or_else(|| missing.first().copied())
+            .unwrap_or_else(|| ContractInstanceId::new([0u8; 32]));
+        tracing::warn!(
+            fetched_bytes = bytes,
+            allowance,
+            contract = %id,
+            "Off-loop related fetch retained more than the park reserved for \
+             it; failing the upsert rather than holding unbounded bytes behind \
+             a park (#5554 follow-up)"
+        );
+        return Err(ExecutorError::missing_related(id));
+    }
+    Ok(states)
+}
+
 /// Whether a delegate run may deliver delegate-to-delegate messages.
 ///
 /// This exists because the callers of
@@ -1739,6 +1787,13 @@ where
                                             pending.missing.clone(),
                                         )
                                         .await;
+                                        // Bound what is RETAINED against what
+                                        // the park reserved before fetching.
+                                        let fetched = within_fetch_allowance(
+                                            fetched,
+                                            &pending.missing,
+                                            delegate_park::MAX_UPSERT_FETCH_BYTES,
+                                        );
                                         sink.lock().unwrap().push(delegate_park::ResolvedUpsert {
                                             pending,
                                             fetched,

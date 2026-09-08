@@ -131,7 +131,7 @@ use either::Either;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{
     ContractContainer, ContractInstanceId, ContractKey, DelegateContext, DelegateKey,
-    InboundDelegateMsg, OutboundDelegateMsg, Parameters, RelatedContracts, StateDelta,
+    InboundDelegateMsg, OutboundDelegateMsg, Parameters, RelatedContracts, StateDelta, UpdateData,
     WrappedState,
 };
 
@@ -215,6 +215,37 @@ pub(super) const MAX_DEFERRED_UPSERTS_PER_PARK: usize = 4;
 /// allows, while bounding the aggregate a flood of parked delegates can pin.
 pub(super) const MAX_PARKED_BYTES: usize = 64 * 1024 * 1024;
 
+/// Bytes ONE deferred upsert's off-loop related-contract fetch may RETAIN.
+///
+/// This closes the largest hole in the byte bound, and the hole was total: the
+/// off-loop fetch pushed every fetched `WrappedState` into the resume sink and
+/// then an unbounded channel with **no accounting of any kind** — no reserve,
+/// no check, no rejection path. `missing` is capped at
+/// `MAX_RELATED_CONTRACTS_PER_REQUEST` (10) and a state at `MAX_STATE_SIZE`
+/// (50 MiB), with `MAX_DEFERRED_UPSERTS_PER_PARK` (4) upserts per park, so one
+/// park could retain 4 x 10 x 50 MiB ~= 2 GiB against a nominal 64 MiB cap. On
+/// that path the cap did not bind at all.
+///
+/// WHY AN ALLOWANCE RATHER THAN A WORST-CASE RESERVE. Reserving what the fetch
+/// COULD retrieve means reserving 2 GiB against 64 MiB, so every deferred
+/// upsert naming a missing related contract would be refused and fall back to
+/// the inline path — undoing much of what #5544 bought. Any honest
+/// pre-reservation therefore implies a per-fetch ceiling below
+/// `MAX_STATE_SIZE`; the only question is what it is, so it is derived from the
+/// node cap rather than invented: at most 8 fetching parks may coexist at the
+/// cap, and the 9th degrades to the inline path — the same deliberate trade the
+/// park cap itself makes.
+///
+/// RESERVED AT ADMISSION (see [`task_bytes`]) and ENFORCED WHEN THE FETCH
+/// COMPLETES (see `contract::within_fetch_allowance`), so retained bytes can
+/// never exceed reserved bytes. Stated limitation: the fetch races its sub-op
+/// GETs concurrently by design, so a state is in memory transiently before the
+/// check. This bounds RETENTION — what enters the sink, the resume channel and
+/// the park's lifetime, which is what this budget is about. The transient peak
+/// stays bounded by the sub-op GET path, as it already was.
+pub(super) const MAX_UPSERT_FETCH_BYTES: usize =
+    MAX_PARKED_BYTES / (8 * MAX_DEFERRED_UPSERTS_PER_PARK);
+
 /// Approximate heap footprint of the payloads a continuation pins.
 ///
 /// Counts the large, contract-controlled parts — inbound states and payloads —
@@ -258,22 +289,33 @@ pub(super) fn task_bytes(
                 Either::Left(state) => state.as_ref().len(),
                 Either::Right(delta) => delta.as_ref().len(),
             };
-            let code = u
-                .code
-                .as_ref()
-                .map_or(0, |c| c.data().len() + c.params().as_ref().len());
+            let code = u.code.as_ref().map_or(0, contract_container_bytes);
             // BORROW, do not clone. `clone().into_owned()` here deep-copied
             // every related state MERELY TO MEASURE IT: with up to ten 50 MiB
             // states that is hundreds of MiB allocated synchronously on the
             // serial loop, BEFORE the 64 MiB cap could reject the park —
             // causing the stall and the memory blow-up the cap exists to
             // prevent. The measurement was the harm.
-            let related: usize = u
-                .related_contracts
-                .states()
-                .map(|(_, st)| st.as_ref().map_or(0, |s| s.as_ref().len()))
-                .sum();
-            update + code + related
+            let related = related_contracts_bytes(&u.related_contracts);
+            // The context is ECHOED BACK to the delegate, so it is retained for
+            // the life of the park exactly as the state is, and it runs to
+            // `DelegateContext::MAX_SIZE` (~400 KiB). Omitting it permitted
+            // another ~100 MiB past the cap across 4 upserts x 64 parks. Same
+            // omission as the two `get_context()` ones this file already
+            // documents, in the one lane that does not go through a message.
+            let context = ctx_len(&u.context);
+            // RESERVE BEFORE THE FETCH, not charge after it. Charging once the
+            // bytes are in hand leaves dropping what you already paid to
+            // retrieve as the only available response; reserving up front means
+            // a node that cannot afford the fetch refuses the park instead, and
+            // falls back to the inline path. See [`MAX_UPSERT_FETCH_BYTES`] for
+            // why the allowance is a fixed ceiling rather than the worst case.
+            let fetch_reserve = if u.missing.is_empty() {
+                0
+            } else {
+                MAX_UPSERT_FETCH_BYTES
+            };
+            update + code + related + context + fetch_reserve
         })
         .sum();
     prompt_bytes + upsert_bytes
@@ -292,14 +334,40 @@ pub(super) fn request_bytes(req: &DelegateRequest<'static>) -> usize {
             inbound, params, ..
         } => inbound.iter().map(inbound_bytes).sum::<usize>() + params.as_ref().len(),
         DelegateRequest::RegisterDelegate { delegate, .. } => delegate_container_bytes(delegate),
-        DelegateRequest::UnregisterDelegate(_) | _ => 0,
+        // A key and nothing else.
+        DelegateRequest::UnregisterDelegate(_) => 0,
+        // See `delegate_container_bytes`: unmeasurable is charged as maximal,
+        // not as free.
+        _ => MAX_PARKED_BYTES,
     }
 }
 
 fn delegate_container_bytes(delegate: &freenet_stdlib::prelude::DelegateContainer) -> usize {
-    // `DelegateContainer` exposes the code but not the parameters directly;
-    // the code is the large part (the WASM) and is what matters for the bound.
-    delegate.code().as_ref().len()
+    use freenet_stdlib::prelude::{DelegateContainer, DelegateWasmAPIVersion};
+    // THE PARAMETERS ARE NOT FREE, and the comment this replaced said they were
+    // ("the code is the large part... and is what matters for the bound"). A
+    // `DelegateContainer` owns its `Parameters` as well as its WASM, and they
+    // are delegate-supplied and bounded only by the ~100 MiB websocket message
+    // allowance — so eight large queued re-registrations bypassed the 64 MiB
+    // park budget while each was charged as a tiny module. `DelegateContainer`
+    // exposes no `params()` accessor, which is presumably how this was missed;
+    // the inner `Delegate` does.
+    match delegate {
+        DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(d)) => {
+            d.code().as_ref().len() + d.params().as_ref().len()
+        }
+        // UNMEASURABLE MEANS MAXIMAL HERE, NOT FREE. Both enums are
+        // `#[non_exhaustive]`, so this arm cannot be removed, and a variant
+        // this code cannot measure is exactly the silently-uncounted payload
+        // this whole budget exists to stop — charging it 0 is the same defect
+        // one variant over. Charging the whole budget makes such a request
+        // refuse the park (degrading to the inline path) and refuse the queue
+        // (answering the client with a rejection) rather than pass unbounded
+        // bytes through a cap that reads as if it bound them. Both are loud and
+        // recoverable; an uncounted bypass is neither. If you are adding a
+        // variant, measure it above.
+        _ => MAX_PARKED_BYTES,
+    }
 }
 
 fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
@@ -361,8 +429,22 @@ fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
             r.message.bytes().len() + r.responses.iter().map(|resp| resp.len()).sum::<usize>()
         }
         OutboundDelegateMsg::GetContractRequest(r) => ctx_len(&r.context),
-        OutboundDelegateMsg::PutContractRequest(r) => r.state.as_ref().len() + ctx_len(&r.context),
-        OutboundDelegateMsg::UpdateContractRequest(r) => ctx_len(&r.context),
+        // `contract` and `related_contracts` were UNCOUNTED: a delegate-supplied
+        // `ContractContainer` (WASM plus params) and a set of full related
+        // states, both accumulating across parks via `RunSeed.accumulated`, on
+        // a message whose only charged payload was `state`. Charging some of a
+        // variant's fields reads more convincingly than charging none, which is
+        // what let this sit under a budget that names itself a byte bound.
+        OutboundDelegateMsg::PutContractRequest(r) => {
+            r.state.as_ref().len()
+                + contract_container_bytes(&r.contract)
+                + related_contracts_bytes(&r.related_contracts)
+                + ctx_len(&r.context)
+        }
+        // `update` was uncounted entirely — see `update_data_bytes`.
+        OutboundDelegateMsg::UpdateContractRequest(r) => {
+            update_data_bytes(&r.update) + ctx_len(&r.context)
+        }
         OutboundDelegateMsg::SubscribeContractRequest(r) => ctx_len(&r.context),
         OutboundDelegateMsg::UnsubscribeContractRequest(r) => ctx_len(&r.context),
     }
@@ -372,6 +454,49 @@ fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
 /// (~400 KiB), which is why omitting it was worth two High findings.
 fn ctx_len(ctx: &DelegateContext) -> usize {
     ctx.as_ref().len()
+}
+
+/// Bytes a `ContractContainer` pins: the WASM AND its parameters.
+///
+/// Factored out because three call sites measure this same shape and two of
+/// them disagreed — `task_bytes` counted code + params while
+/// `delegate_container_bytes` counted code alone. One helper is how they stay
+/// in step.
+fn contract_container_bytes(contract: &ContractContainer) -> usize {
+    contract.data().len() + contract.params().as_ref().len()
+}
+
+/// Bytes the states carried inside a `RelatedContracts` pin.
+fn related_contracts_bytes(related: &RelatedContracts<'static>) -> usize {
+    related
+        .states()
+        .map(|(_, st)| st.as_ref().map_or(0, |s| s.as_ref().len()))
+        .sum()
+}
+
+/// Bytes an `UpdateData` pins — a full state, a delta, or both.
+///
+/// UNCOUNTED BEFORE THIS. `outbound_bytes` charged an
+/// `OutboundDelegateMsg::UpdateContractRequest` its context and nothing else,
+/// while `update` carries a state bounded only by `MAX_STATE_SIZE` (50 MiB) and
+/// accumulates across parks through `RunSeed.accumulated`. Same class as the
+/// two `get_context()` omissions this file already documents, and found the
+/// same way: by asking what each field of each variant actually retains rather
+/// than what the variant is called.
+fn update_data_bytes(update: &UpdateData<'static>) -> usize {
+    match update {
+        UpdateData::State(state) => state.as_ref().len(),
+        UpdateData::Delta(delta) => delta.as_ref().len(),
+        UpdateData::StateAndDelta { state, delta } => state.as_ref().len() + delta.as_ref().len(),
+        UpdateData::RelatedState { state, .. } => state.as_ref().len(),
+        UpdateData::RelatedDelta { delta, .. } => delta.as_ref().len(),
+        UpdateData::RelatedStateAndDelta { state, delta, .. } => {
+            state.as_ref().len() + delta.as_ref().len()
+        }
+        // See `delegate_container_bytes` for why an unmeasurable variant is
+        // charged the whole budget rather than nothing.
+        _ => MAX_PARKED_BYTES,
+    }
 }
 
 /// Backstop lifetime for a park.
@@ -1396,6 +1521,383 @@ fn resume_in_hand(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =====================================================================
+    // Byte accounting: EVERY term, individually falsifiable.
+    // =====================================================================
+    //
+    // A mutation campaign zeroed the `SendDelegateMessage` and
+    // `PutContractRequest` payload terms of `outbound_bytes` and the whole
+    // 5486-test suite stayed green. Seven of the nine byte-accounting variants
+    // were never exercised at all, and the two that were, survived.
+    //
+    // That is worse than the omissions codex found, because it is the reason
+    // they could exist: a corrected `task_bytes` that nothing can falsify is
+    // the same defect one layer up. So each of these gives every payload-
+    // bearing term a DISTINCT size and asserts the sum. Zero any single term
+    // and the total drops below it — no term can stand in for another, and no
+    // case passes because a sibling term happened to be large.
+    //
+    // The tests that existed did the opposite: they set the payload EMPTY and
+    // asserted only that the context was charged, which is exactly why the
+    // payload terms could be deleted without anything noticing.
+
+    const T_PAYLOAD: usize = 8 * 1024;
+    const T_CTX: usize = 4 * 1024;
+    const T_STATE: usize = 16 * 1024;
+    const T_CODE: usize = 2 * 1024;
+    const T_PARAMS: usize = 1024;
+    const T_RELATED: usize = 32 * 1024;
+    const T_DELTA: usize = 512;
+
+    fn t_ctx() -> DelegateContext {
+        DelegateContext::new(vec![0u8; T_CTX])
+    }
+
+    fn t_contract() -> ContractContainer {
+        use freenet_stdlib::prelude::{ContractCode, ContractWasmAPIVersion, WrappedContract};
+        ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            std::sync::Arc::new(ContractCode::from(vec![1u8; T_CODE])),
+            Parameters::from(vec![2u8; T_PARAMS]),
+        )))
+    }
+
+    fn t_related() -> RelatedContracts<'static> {
+        RelatedContracts::from(HashMap::from([(
+            ContractInstanceId::new([9u8; 32]),
+            Some(freenet_stdlib::prelude::State::from(vec![3u8; T_RELATED])),
+        )]))
+    }
+
+    fn t_prompt() -> freenet_stdlib::prelude::UserInputRequest<'static> {
+        let message = freenet_stdlib::prelude::NotificationMessage::try_from(
+            &serde_json::Value::String("m".repeat(T_PAYLOAD)),
+        )
+        .expect("notification message");
+        freenet_stdlib::prelude::UserInputRequest {
+            request_id: 1,
+            message,
+            responses: vec![freenet_stdlib::prelude::ClientResponse::new(vec![
+                4u8;
+                T_STATE
+            ])],
+        }
+    }
+
+    /// Every `OutboundDelegateMsg` variant charges every payload it retains.
+    ///
+    /// These accumulate across parks through `RunSeed.accumulated` for up to
+    /// `MAX_CONTRACT_REQUEST_ITERATIONS`, so an uncounted field here is
+    /// multiplied before it is ever noticed.
+    ///
+    /// FALSIFY by zeroing any single term in `outbound_bytes` — including the
+    /// two the mutation campaign zeroed with the suite staying green, and the
+    /// `PutContractRequest::contract` / `related_contracts` /
+    /// `UpdateContractRequest::update` terms that were never charged at all.
+    #[test]
+    fn every_outbound_variant_charges_every_payload_it_retains() {
+        let cases: Vec<(&str, OutboundDelegateMsg, usize)> = vec![
+            (
+                "ApplicationMessage",
+                OutboundDelegateMsg::ApplicationMessage(
+                    freenet_stdlib::prelude::ApplicationMessage::new(vec![0u8; T_PAYLOAD])
+                        .with_context(t_ctx()),
+                ),
+                T_PAYLOAD + T_CTX,
+            ),
+            (
+                "SendDelegateMessage",
+                OutboundDelegateMsg::SendDelegateMessage(
+                    freenet_stdlib::prelude::DelegateMessage {
+                        target: key(1),
+                        sender: key(2),
+                        payload: vec![0u8; T_PAYLOAD],
+                        context: t_ctx(),
+                        processed: false,
+                    },
+                ),
+                T_PAYLOAD + T_CTX,
+            ),
+            (
+                "ContextUpdated",
+                OutboundDelegateMsg::ContextUpdated(t_ctx()),
+                T_CTX,
+            ),
+            (
+                "RequestUserInput",
+                OutboundDelegateMsg::RequestUserInput(t_prompt()),
+                T_PAYLOAD + T_STATE,
+            ),
+            (
+                "GetContractRequest",
+                OutboundDelegateMsg::GetContractRequest(
+                    freenet_stdlib::prelude::GetContractRequest {
+                        contract_id: ContractInstanceId::new([5u8; 32]),
+                        context: t_ctx(),
+                        processed: false,
+                    },
+                ),
+                T_CTX,
+            ),
+            (
+                "PutContractRequest",
+                OutboundDelegateMsg::PutContractRequest(
+                    freenet_stdlib::prelude::PutContractRequest {
+                        contract: t_contract(),
+                        state: WrappedState::new(vec![0u8; T_STATE]),
+                        related_contracts: t_related(),
+                        context: t_ctx(),
+                        processed: false,
+                    },
+                ),
+                T_STATE + T_CODE + T_PARAMS + T_RELATED + T_CTX,
+            ),
+            (
+                "UpdateContractRequest",
+                OutboundDelegateMsg::UpdateContractRequest(
+                    freenet_stdlib::prelude::UpdateContractRequest {
+                        contract_id: ContractInstanceId::new([5u8; 32]),
+                        update: UpdateData::StateAndDelta {
+                            state: freenet_stdlib::prelude::State::from(vec![0u8; T_STATE]),
+                            delta: StateDelta::from(vec![0u8; T_DELTA]),
+                        },
+                        context: t_ctx(),
+                        processed: false,
+                    },
+                ),
+                T_STATE + T_DELTA + T_CTX,
+            ),
+            (
+                "SubscribeContractRequest",
+                OutboundDelegateMsg::SubscribeContractRequest(
+                    freenet_stdlib::prelude::SubscribeContractRequest {
+                        contract_id: ContractInstanceId::new([5u8; 32]),
+                        context: t_ctx(),
+                        processed: false,
+                    },
+                ),
+                T_CTX,
+            ),
+        ];
+        for (name, msg, expected) in cases {
+            let charged = outbound_bytes(&msg);
+            assert!(
+                charged >= expected,
+                "{name}: charged {charged}, but it retains at least {expected} \
+                 bytes. Every payload-bearing field of this variant must be \
+                 counted — an uncounted one is retained for the life of the \
+                 park under a cap that reads as if it bounded it"
+            );
+        }
+    }
+
+    /// The same, for every `InboundDelegateMsg` variant.
+    ///
+    /// FALSIFY by zeroing any single term in `inbound_bytes`.
+    #[test]
+    fn every_inbound_variant_charges_every_payload_it_retains() {
+        let cid = ContractInstanceId::new([5u8; 32]);
+        let cases: Vec<(&str, InboundDelegateMsg<'static>, usize)> = vec![
+            (
+                "ApplicationMessage",
+                InboundDelegateMsg::ApplicationMessage(
+                    freenet_stdlib::prelude::ApplicationMessage::new(vec![0u8; T_PAYLOAD])
+                        .with_context(t_ctx()),
+                ),
+                T_PAYLOAD + T_CTX,
+            ),
+            (
+                "GetContractResponse",
+                InboundDelegateMsg::GetContractResponse(
+                    freenet_stdlib::prelude::GetContractResponse {
+                        contract_id: cid,
+                        state: Some(WrappedState::new(vec![0u8; T_STATE])),
+                        context: t_ctx(),
+                    },
+                ),
+                T_STATE + T_CTX,
+            ),
+            (
+                "ContractNotification",
+                InboundDelegateMsg::ContractNotification(
+                    freenet_stdlib::prelude::ContractNotification {
+                        contract_id: cid,
+                        new_state: WrappedState::new(vec![0u8; T_STATE]),
+                        context: t_ctx(),
+                    },
+                ),
+                T_STATE + T_CTX,
+            ),
+            (
+                "UserResponse",
+                InboundDelegateMsg::UserResponse(freenet_stdlib::prelude::UserInputResponse {
+                    request_id: 1,
+                    response: freenet_stdlib::prelude::ClientResponse::new(vec![0u8; T_PAYLOAD]),
+                    context: t_ctx(),
+                }),
+                T_PAYLOAD + T_CTX,
+            ),
+            (
+                "DelegateMessage",
+                InboundDelegateMsg::DelegateMessage(freenet_stdlib::prelude::DelegateMessage {
+                    target: key(1),
+                    sender: key(2),
+                    payload: vec![0u8; T_PAYLOAD],
+                    context: t_ctx(),
+                    processed: false,
+                }),
+                T_PAYLOAD + T_CTX,
+            ),
+            (
+                "PutContractResponse",
+                InboundDelegateMsg::PutContractResponse(
+                    freenet_stdlib::prelude::PutContractResponse {
+                        contract_id: cid,
+                        result: Ok(()),
+                        context: t_ctx(),
+                    },
+                ),
+                T_CTX,
+            ),
+            (
+                "UpdateContractResponse",
+                InboundDelegateMsg::UpdateContractResponse(
+                    freenet_stdlib::prelude::UpdateContractResponse {
+                        contract_id: cid,
+                        result: Ok(()),
+                        context: t_ctx(),
+                    },
+                ),
+                T_CTX,
+            ),
+            (
+                "SubscribeContractResponse",
+                InboundDelegateMsg::SubscribeContractResponse(
+                    freenet_stdlib::prelude::SubscribeContractResponse {
+                        contract_id: cid,
+                        result: Ok(()),
+                        context: t_ctx(),
+                    },
+                ),
+                T_CTX,
+            ),
+        ];
+        for (name, msg, expected) in cases {
+            let charged = inbound_bytes(&msg);
+            assert!(
+                charged >= expected,
+                "{name}: charged {charged}, but it retains at least {expected} bytes"
+            );
+        }
+    }
+
+    /// P1b: a queued delegate re-registration is charged its PARAMETERS as well
+    /// as its WASM.
+    ///
+    /// `DelegateContainer` exposes `code()` but no `params()`, so the helper
+    /// counted the module and stopped. Parameters are delegate-supplied and
+    /// bounded only by the ~100 MiB websocket message allowance, so eight large
+    /// queued re-registrations bypassed the 64 MiB budget while each was
+    /// charged as a tiny module.
+    ///
+    /// FALSIFY by dropping the `params()` term from `delegate_container_bytes`:
+    /// the parameters here are 64x the code, so the assertion goes red on size
+    /// rather than on a technicality.
+    #[test]
+    fn a_queued_registration_charges_its_parameters_not_just_its_wasm() {
+        use freenet_stdlib::prelude::{
+            Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion,
+        };
+        let code = DelegateCode::from(vec![1u8; 1024]);
+        let params = Parameters::from(vec![2u8; 64 * 1024]);
+        let delegate =
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((&code, &params))));
+        let req = DelegateRequest::RegisterDelegate {
+            delegate,
+            cipher: [0u8; 32],
+            nonce: [0u8; 24],
+        };
+        assert!(
+            request_bytes(&req) >= 1024 + 64 * 1024,
+            "a registration must be charged its code AND its parameters; \
+             charged {}",
+            request_bytes(&req)
+        );
+    }
+
+    /// P2 + P1a: `task_bytes` charges the upsert's CONTEXT, and RESERVES the
+    /// off-loop fetch before it happens.
+    ///
+    /// The context is echoed back to the delegate, so it is retained exactly as
+    /// long as the state is and runs to ~400 KiB. The fetch reserve is the
+    /// larger of the two: fetched related states went into the sink and an
+    /// unbounded channel with no accounting of any kind, so one park could
+    /// retain ~2 GiB (4 upserts x 10 related x 50 MiB) against a nominal 64 MiB
+    /// cap.
+    ///
+    /// FALSIFY by dropping either the `context` term or the `fetch_reserve`
+    /// term from `task_bytes`.
+    #[test]
+    fn task_bytes_charges_the_upsert_context_and_reserves_its_fetch() {
+        fn upsert(context: DelegateContext, missing: Vec<ContractInstanceId>) -> PendingUpsert {
+            PendingUpsert {
+                key: ContractKey::from_params_and_code(
+                    &Parameters::from(vec![]),
+                    &freenet_stdlib::prelude::ContractCode::from(vec![0u8; 4]),
+                ),
+                update: Either::Right(StateDelta::from(vec![0u8; T_DELTA])),
+                related_contracts: RelatedContracts::default(),
+                code: None,
+                is_put: false,
+                context,
+                missing,
+            }
+        }
+
+        let baseline = task_bytes(&[], &[upsert(DelegateContext::default(), Vec::new())]);
+
+        let with_context = task_bytes(&[], &[upsert(t_ctx(), Vec::new())]);
+        assert!(
+            with_context >= baseline + T_CTX,
+            "the upsert's echoed context must be charged: it is retained for \
+             the life of the park exactly as the state is, and runs to ~400 \
+             KiB. Charged {with_context} against a {baseline} baseline"
+        );
+
+        let with_fetch = task_bytes(
+            &[],
+            &[upsert(
+                DelegateContext::default(),
+                vec![ContractInstanceId::new([1u8; 32])],
+            )],
+        );
+        assert!(
+            with_fetch >= baseline + MAX_UPSERT_FETCH_BYTES,
+            "an upsert naming missing related contracts must RESERVE its fetch \
+             allowance BEFORE the fetch happens. Charging afterwards leaves \
+             dropping what you already paid to retrieve as the only available \
+             response. Charged {with_fetch} against a {baseline} baseline"
+        );
+    }
+
+    /// The reserve is only real if something enforces it, so pin the allowance
+    /// against the node cap rather than against a hardcoded number: at most 8
+    /// fully-fetching parks may coexist at the budget.
+    ///
+    /// Asserts the BOUND, not the arithmetic — retuning `MAX_PARKED_BYTES` or
+    /// `MAX_DEFERRED_UPSERTS_PER_PARK` moves the allowance with it, and this
+    /// stays true. A test asserting a particular product of constants goes
+    /// stale the moment anyone tunes one of them.
+    #[test]
+    fn the_fetch_allowance_leaves_the_node_cap_binding() {
+        let worst_case_park = MAX_UPSERT_FETCH_BYTES * MAX_DEFERRED_UPSERTS_PER_PARK;
+        assert!(
+            worst_case_park > 0 && worst_case_park <= MAX_PARKED_BYTES / 8,
+            "one park's fetch reserve ({worst_case_park}) must leave room for \
+             others under MAX_PARKED_BYTES ({MAX_PARKED_BYTES}); a reserve that \
+             fills the cap turns every deferred upsert into an inline fallback"
+        );
+    }
 
     fn key(byte: u8) -> DelegateKey {
         DelegateKey::new(
