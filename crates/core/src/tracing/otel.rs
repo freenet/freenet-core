@@ -1540,10 +1540,20 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter, sources: RingSou
     //                            node within `gateways.len()` of the
     //                            threshold. Quiet, NOT the stall signature.
     //
-    // Alert on sustained `connect_issued_routed` growth while
-    // `freenet.bootstrap.completed` stays 0 — a healthy joiner with few
-    // gateways emits some of these too, and the gauge is what separates the
-    // two.
+    // `connect_issued_routed` climbing while `freenet.bootstrap.completed`
+    // stays 0 identifies a joiner that NEVER BOOTSTRAPPED. That is necessary
+    // for the #4787 stall but not sufficient — a network with fewer than
+    // `min_connections` reachable peers, or a node behind restrictive NAT,
+    // matches it permanently and identically, so an alert on the pair alone
+    // fires forever on a small network and gets muted.
+    //
+    // `freenet.bootstrap.churn` is the discriminator: a high
+    // `event=transient_expired` : `event=promoted_to_ring` ratio alongside it
+    // is acceptance churn (#4787); churn near zero means the CONNECTs are
+    // simply not finding acceptable peers. Rounds come ~every 3-5s, so a stuck
+    // joiner emits on the order of 900/hour without bound while a healthy one
+    // emits a few tens over the first minute or two and stops. Alert on more
+    // than a few minutes of continued growth.
     let _bootstrap_startup_rounds = meter
         .u64_observable_counter("freenet.bootstrap.startup_rounds")
         .with_description(

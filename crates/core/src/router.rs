@@ -909,11 +909,12 @@ pub(crate) struct RouterSnapshotInfo {
     /// time from process start to first reaching `min_connections`, recorded
     /// once per process; `bootstrap_completed` disambiguates the `None` there —
     /// `Some(false)` means this node has never bootstrapped, `None` means the
-    /// field wasn't reported at all. The three `bootstrap_startup_rounds_*`
+    /// field wasn't reported at all. The four `bootstrap_startup_rounds_*`
     /// fields partition below-threshold join-loop rounds by what each round
-    /// actually did (issued CONNECTs / blocked by gateway backoff / had no
-    /// target), which is what keeps a permanently-stuck joiner's count from
-    /// being an undifferentiated process-uptime proxy.
+    /// actually did (dialled unconnected gateways / routed CONNECTs through
+    /// already-connected ones / blocked by gateway backoff / had no target),
+    /// which is what keeps a permanently-stuck joiner's count from being an
+    /// undifferentiated process-uptime proxy.
     ///
     /// Populated by `Ring` from the network_status singleton on the snapshot
     /// cadence; `None` until the ring's snapshot task populates them.
@@ -923,8 +924,10 @@ pub(crate) struct RouterSnapshotInfo {
     pub bootstrap_time_to_min_connections_secs: Option<f64>,
     pub bootstrap_completed: Option<bool>,
     pub bootstrap_startup_rounds_connect_issued_gateway: Option<u64>,
-    /// Sustained growth here with `bootstrap_completed == Some(false)` is
-    /// the #4787 stall signature.
+    /// Sustained growth with `bootstrap_completed == Some(false)` means this
+    /// joiner never bootstrapped; the `bootstrap_transient_expired` :
+    /// `bootstrap_promoted_to_ring` ratio separates #4787 acceptance churn
+    /// from simply having too few acceptable peers.
     pub bootstrap_startup_rounds_connect_issued_routed: Option<u64>,
     pub bootstrap_startup_rounds_backoff_blocked: Option<u64>,
     pub bootstrap_startup_rounds_no_target: Option<u64>,

@@ -2069,8 +2069,20 @@ pub(crate) async fn initial_join_procedure(
                 // Route CONNECTs through connected gateways toward gap locations.
                 // #4787: count the gateways excluded specifically FOR backoff,
                 // separately from those excluded for having no resolved socket
-                // address. An empty `eligible` means very different things in
-                // those two cases and the round must be classified by which.
+                // address, so the empty-`eligible` case below is classified by
+                // the actual reason.
+                //
+                // In THIS branch the no-address case is currently unreachable,
+                // and a reader should not waste time trying to construct it:
+                // `gateways` is non-empty (the join task returns early
+                // otherwise), and `is_not_connected` counts an address-less
+                // peer as UNCONNECTED (`ring.rs`), so any such gateway would
+                // have made `unconnected_count > 0` and taken the branch above
+                // instead. The count is kept anyway rather than assuming
+                // `eligible.is_empty()` means backoff: that identity holds only
+                // via an invariant enforced two modules away, and a counter
+                // that silently mislabels a round if it ever changes is the
+                // failure mode this whole PR is about.
                 let (eligible, blocked_by_backoff) = {
                     let backoff = op_manager.gateway_backoff.lock();
                     let mut blocked = 0usize;
@@ -2531,6 +2543,88 @@ mod tests {
             assert_eq!(
                 t.routed, 0,
                 "nothing was routed — no gateway was eligible; got {t:?}"
+            );
+        });
+    }
+
+    /// The one arm with no positive pin, and the one whose documented meaning
+    /// this change altered most: `NoTarget` is now specifically "all gateways
+    /// connected AND the node is within `gateways.len()` of the threshold", so
+    /// `use_connected_as_routers` is false and the round deliberately issues
+    /// nothing. Every other shape must land in one of the three siblings.
+    ///
+    /// Without this, `NoTarget` was only ever asserted to be ZERO (by the two
+    /// tests above), which a counter that can never fire would also satisfy.
+    #[test]
+    fn startup_rounds_report_no_target_when_close_to_threshold() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("bootstrap-4787-no-target", "127.0.0.1:14795").await;
+            let cm = &op_manager.ring.connection_manager;
+            let gateways = vec![bootstrap_gateway(24796), bootstrap_gateway(24797)];
+            let min_conns = cm.min_connections;
+            assert!(
+                min_conns > gateways.len() + 1,
+                "test setup: this shape needs room for non-gateway peers below \
+             the threshold; min_connections={min_conns}"
+            );
+
+            // Fill the ring to exactly `min_connections - 1`, gateways included,
+            // so the remaining gap is 1 — which is <= gateways.len(), the
+            // condition that makes `use_connected_as_routers` false.
+            let mut addrs: Vec<SocketAddr> = gateways
+                .iter()
+                .map(|gw| gw.socket_addr().expect("gateway has an address"))
+                .collect();
+            for port in 30000..(30000 + (min_conns - 1 - gateways.len()) as u16) {
+                addrs.push(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                    port,
+                ));
+            }
+            for addr in &addrs {
+                let pub_key = TransportKeypair::new().public().clone();
+                assert!(
+                    cm.add_connection(Location::from_address(addr), *addr, pub_key, false),
+                    "test setup: ring must accept {addr}"
+                );
+            }
+
+            let open = op_manager.ring.open_connections();
+            assert_eq!(
+                open,
+                min_conns - 1,
+                "test setup: node must sit exactly one connection below the threshold"
+            );
+            assert!(
+                min_conns - open <= gateways.len(),
+                "test setup: the gap must be within gateways.len(), or the loop \
+             routes CONNECTs instead of idling"
+            );
+            assert_eq!(
+                op_manager.ring.is_not_connected(gateways.iter()).count(),
+                0,
+                "test setup: no gateway may look unconnected"
+            );
+
+            let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                .await
+                .expect("spawn join procedure");
+            let t = wait_for_startup_round(Duration::from_secs(10)).await;
+            handle.abort();
+
+            assert!(
+                t.no_target > 0,
+                "a below-threshold round that deliberately issues nothing must \
+             count as no_target; got {t:?}"
+            );
+            assert_eq!(
+                t.routed, 0,
+                "the gap is within gateways.len(), so nothing may be routed; got {t:?}"
+            );
+            assert_eq!(
+                t.gateway, 0,
+                "every gateway is connected, so nothing may be dialled; got {t:?}"
             );
         });
     }

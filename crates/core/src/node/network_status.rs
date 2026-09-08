@@ -432,18 +432,43 @@ pub struct NetworkStatus {
 /// - `no_target` — issued nothing for any other reason. Principally: all
 ///   gateways connected AND the node is within `gateways.len()` of the
 ///   threshold, so the routed-CONNECT branch above does not apply and the
-///   round deliberately waits. This is a comparatively quiet outcome, NOT the
-///   stall signature — an earlier revision of this instrumentation documented
-///   it as such, which would have had an operator watching a series that
-///   reads flat zero for the entire stall.
+///   round deliberately waits. This is NOT the #4787 acceptance-churn
+///   signature — an earlier revision of this instrumentation documented it as
+///   such, which would have had an operator watching a series that reads flat
+///   zero for the entire stall. But do not read it as merely quiet either: a
+///   node parked at, say, 24 of 25 connections matches this condition on
+///   every round forever, so sustained growth here is its own kind of stall —
+///   a joiner that has stopped issuing anything a few connections short of
+///   the threshold.
 ///
-/// The stall signature is therefore sustained `connect_issued_routed` growth
-/// while `time_to_min_connections` stays `None` (exported as
-/// `freenet.bootstrap.completed = 0`). The `completed` gauge is load-bearing
-/// here: a HEALTHY joiner with few gateways also emits some
-/// `connect_issued_routed` while it fills out its ring, and what distinguishes
-/// the stall is that the counter keeps climbing without the gauge ever
-/// flipping to 1.
+/// ## Reading the routed counter
+///
+/// Sustained `connect_issued_routed` growth while `time_to_min_connections`
+/// stays `None` (exported as `freenet.bootstrap.completed = 0`) identifies **a
+/// joiner that never bootstrapped**. That is NECESSARY for the #4787 stall but
+/// not SUFFICIENT, and the difference matters operationally: a network with
+/// fewer than `min_connections` reachable peers, a node behind restrictive
+/// NAT, and a node whose peers keep refusing for capacity all match the pair
+/// permanently and identically. An alert built on it alone fires forever on
+/// every node of a small network, gets muted, and then the real stall is
+/// invisible — the same defect this instrumentation exists to fix, one level
+/// up.
+///
+/// **The discriminator is `transient_registered` / `transient_expired` /
+/// `promoted_to_ring`**, documented above. A high `transient_expired` :
+/// `promoted_to_ring` ratio alongside climbing `connect_issued_routed` is
+/// acceptance churn — connections are being made and lost, which is #4787.
+/// Churn near zero with `connect_issued_routed` climbing means the CONNECTs
+/// are simply not finding acceptable peers: too few peers, or unreachable
+/// ones. Same routed counter, different fix.
+///
+/// Quantifying "sustained", so the guidance is implementable without
+/// re-deriving it from this loop: a round takes `BASE_WAIT_SECS * 3` plus 0–2s
+/// of jitter once the node holds any connection, so a joiner stuck in this
+/// branch emits on the order of 900 routed rounds per hour, without bound. A
+/// healthy joiner emits a few tens of them over the first minute or two and
+/// then stops, because reaching `min_connections` ends the counting. More than
+/// a few minutes of continued growth is the threshold worth alerting on.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootstrapChurnStats {
     /// Counts transient tracking entries actually inserted, not call-site
@@ -463,8 +488,10 @@ pub struct BootstrapChurnStats {
     pub startup_rounds_connect_issued_gateway: u64,
     /// Below-threshold join-loop rounds that routed CONNECTs through
     /// already-connected gateways because every gateway transport was already
-    /// up. Sustained growth here with `time_to_min_connections == None` is the
-    /// #4787 stall signature.
+    /// up. Sustained growth with `time_to_min_connections == None` means this
+    /// joiner never bootstrapped; the `transient_*` / `promoted_to_ring` ratio
+    /// is what separates #4787 acceptance churn from simply having too few
+    /// acceptable peers. See [`BootstrapChurnStats`].
     pub startup_rounds_connect_issued_routed: u64,
     /// Below-threshold join-loop rounds that issued nothing because every
     /// candidate gateway was in exponential backoff.
@@ -473,8 +500,10 @@ pub struct BootstrapChurnStats {
     /// reason — principally: every gateway is connected AND the node is within
     /// `gateways.len()` of the threshold, so the routed-CONNECT branch does
     /// not apply and the round deliberately waits for handshakes or pending
-    /// reservations. NOT the #4787 stall signature; see
-    /// `startup_rounds_connect_issued_routed`.
+    /// reservations. Not the #4787 acceptance-churn signature (see
+    /// `startup_rounds_connect_issued_routed`), but not benign either:
+    /// sustained growth means a joiner parked a few connections short of the
+    /// threshold and no longer issuing anything.
     pub startup_rounds_no_target: u64,
 }
 
