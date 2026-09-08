@@ -2746,7 +2746,32 @@ mod tests {
         // be the epoch trap.
         engine.epoch_deadline_ticks = 100;
 
-        const ID: i64 = 4242;
+        // R2 (#5480 review): NOT a low hard-coded constant, and NOT shared
+        // between the two entry points.
+        //
+        // `create_instance` draws ids from `next_instance_id()`, a monotonic
+        // counter starting at 0, and one test in this binary calls it 10,001
+        // times. Since #5480 the id here is registered in the PROCESS-GLOBAL
+        // `LIVE_DELEGATE_GUESTS`, and the assertion at the end of this function
+        // is precisely that it is STILL registered when the call returns —
+        // because the abandoned guest holds it for the rest of its ~10s epoch
+        // budget, after this test has finished. A low id would therefore sit in
+        // that set waiting to collide with an allocator-issued one.
+        //
+        // The collision is the one case that would make a retained id a false
+        // positive rather than a harmless leak: ids are never recycled, so a
+        // retained id can otherwise only refuse re-entry to the instance whose
+        // guest is genuinely wedged, which is the correct answer.
+        //
+        // And it would be near-invisible. `cargo nextest` runs a process per
+        // test and never sees it; plain `cargo test` shares one process and
+        // does. CI uses nextest, so CI would stay green while the contributor
+        // following AGENTS.md hits it.
+        let id: i64 = if async_imports {
+            i64::MAX - 54803
+        } else {
+            i64::MAX - 54804
+        };
         // Instantiate directly into the engine's own store so the entry point
         // finds the instance, without needing the `__frnt_set_id` / memory
         // exports that `create_instance` requires of a real contract.
@@ -2755,9 +2780,9 @@ mod tests {
         let module = Module::new(&eng, INFINITE_LOOP_WAT.as_bytes()).expect("WAT must compile");
         let instance = block_on_async(Linker::new(&eng).instantiate_async(&mut *store, &module))
             .expect("instantiation must succeed");
-        engine.instances.insert(ID, instance);
+        engine.instances.insert(id, instance);
 
-        let handle = InstanceHandle { id: ID };
+        let handle = InstanceHandle { id };
         let entry = if async_imports {
             "call_3i64_async_imports"
         } else {
@@ -2782,6 +2807,36 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "`{entry}` took {elapsed:?}: the 0.5s wall-clock backstop did not fire, and the \
              epoch budget (~10s) is too far out to have returned this (#5480)"
+        );
+
+        // R1 (#5480 review): the registration must OUTLIVE this call.
+        //
+        // The guest is still running on an abandoned blocking thread right now,
+        // and that is the entire basis of the re-entry guard in
+        // `exec_inbound_with_env`: if the registration cleared when this call
+        // returned, the guard would read false in exactly the scenario it exists
+        // for, which is the F1 defect this PR fixed.
+        //
+        // This pins the one link nothing else covered. Both source pins and both
+        // re-entry tests pass with `let _live_guest = live_guest;` DELETED from
+        // `call_typed_blocking`, because those tests populate the set by hand and
+        // so never exercise the registration path at all. Under Rust 2021
+        // disjoint capture an unmentioned capture is not moved into the closure,
+        // so deleting that binding drops the guard on the CALLING thread and
+        // restores F1 exactly — silently, and with no `unsafe` at the edit site.
+        //
+        // KNOWN GAP, not covered here: registering INSIDE the closure instead of
+        // moving the guard in leaves the `QueuedTimeout` window described at
+        // `native_api::LIVE_DELEGATE_GUESTS`, and this assertion still passes
+        // under that variant. Catching it deterministically needs control over
+        // blocking-pool scheduling, which the test harness does not offer.
+        assert!(
+            native_api::LIVE_DELEGATE_GUESTS.contains(&id),
+            "`{entry}`: the abandoned guest is still running, so its \
+             LIVE_DELEGATE_GUESTS registration must still be present after the \
+             wall-clock backstop returns. If this fails, the registration guard \
+             is being dropped on the calling thread instead of being moved into \
+             the guest closure (#5480 review R1)"
         );
     }
 
@@ -2825,7 +2880,11 @@ mod tests {
         };
         let mut engine = WasmtimeEngine::new(&config, false).expect("engine must build");
 
-        const ID: i64 = 4343;
+        // Same convention as the backstop tests above (R2): keep test ids far
+        // above anything `next_instance_id()` allocates. This one is cleared on
+        // the panic-unwind path rather than retained, but the collision risk
+        // while the test runs is identical.
+        const ID: i64 = i64::MAX - 54805;
         let store = engine.store.as_mut().expect("engine store present");
         let eng = store.engine().clone();
         let module = Module::new(&eng, HOST_PANIC_WAT.as_bytes()).expect("WAT must compile");

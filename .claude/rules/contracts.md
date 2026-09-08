@@ -74,9 +74,18 @@ Two consequences for anything touching the delegate path:
   `JoinHandle::abort()` cannot stop a `spawn_blocking` closure that has started.
   Ask "is a guest still running", not "is its env still registered" — those are
   different facts (`native_api::LIVE_DELEGATE_GUESTS`).
-- **Delegate host functions run on a blocking-pool thread**, so they find their
-  env through a thread-local installed on THAT thread by `GuestDelegateInstance`,
-  not on the caller's.
+- **During `process()`, delegate host functions run on a blocking-pool thread**,
+  so they find their env through a thread-local installed on THAT thread by
+  `GuestDelegateInstance`, not on the caller's.
+
+  Scope that to `process()` and no further. Buffer setup and instantiation —
+  `initiate_buffer`, `call_void`, `instantiate_and_init` — still enter the guest
+  with `block_on_async(func.call_async(...))` INLINE on the calling thread, with
+  no `execute_wasm_blocking` and no `GuestDelegateInstance`. That is why
+  `exec_inbound_with_env` still sets `CURRENT_DELEGATE_INSTANCE` on the calling
+  thread at all, as `DelegateEnvGuard`'s rustdoc explains. "Nothing
+  delegate-related runs on the calling thread" is false and would produce a wrong
+  call about exactly those paths.
 
 The pins `every_guest_entry_is_preceded_by_arm_epoch_deadline` and
 `blocking_paths_arm_epoch_inside_the_closure` enforce the single-body structure.

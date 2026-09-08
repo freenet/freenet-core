@@ -576,6 +576,42 @@ impl Runtime {
 
 #[cfg(test)]
 mod pins {
+    /// Bound `exec_inbound_with_env`'s body, failing closed if the window is
+    /// truncated.
+    ///
+    /// Shared by the pins below so they cannot drift apart, and so a truncated
+    /// window fails ONE place loudly rather than making each pin vacuous
+    /// independently. A "must be present" lookup over a shortened window misses
+    /// and reports the property violated; a "must be absent" one passes over
+    /// nothing. Both are wrong, and balanced braces is the cheap structural
+    /// check that catches either.
+    fn scrape_exec_inbound_with_env(src: &str) -> &str {
+        let start = src
+            .find("fn exec_inbound_with_env(")
+            .expect("`exec_inbound_with_env` not found — this pin has drifted");
+        // Bound at the next method so a later occurrence cannot satisfy an
+        // assertion about this one.
+        let rest = &src[start..];
+        let end = ["\n    pub(super) fn ", "\n    fn ", "\n}"]
+            .iter()
+            .filter_map(|needle| rest.find(needle))
+            .min()
+            .map(|off| start + off)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+
+        let opens = body.matches('{').count();
+        let closes = body.matches('}').count();
+        assert_eq!(
+            opens, closes,
+            "`exec_inbound_with_env`: scraped window is truncated ({opens} `{{` vs \
+             {closes} `}}`), so any pin over it is unreliable. Widen the end \
+             delimiters; do NOT delete the check."
+        );
+
+        body
+    }
+
     /// Source-scrape pin (#5480): in `exec_inbound_with_env`, the `?` that
     /// propagates the call's result MUST come BEFORE the `context` read-back.
     ///
@@ -593,32 +629,63 @@ mod pins {
     /// Below the `?` the read is reached only on success, which means
     /// `execute_wasm_blocking` joined the guest closure and the guest is
     /// provably finished.
+    /// Source-scrape pin (#5480 review): `DelegateEnvGuard` must be constructed
+    /// as a LOCAL of `exec_inbound_with_env`.
+    ///
+    /// This is the fact that makes the merged #5554 safe, and until this pin
+    /// nothing checked it. #5554 parks delegates off the serial
+    /// `contract_handling` loop, so a delegate's round trip can span two loop
+    /// iterations; its own comment notes the serial loop was the ONLY thing
+    /// guaranteeing one `process()` per delegate. What keeps that sound is that
+    /// the guard drops HERE, inside this function, so `DELEGATE_ENV` is cleared
+    /// before the `Err` reaches `inbound_app_message`, before
+    /// `DelegateRunOutcome::Failed`, and therefore before a park can release a
+    /// queued run for the same delegate.
+    ///
+    /// The realistic regression is not deletion but HOISTING: moving the guard
+    /// up into `inbound_app_message` so one guard spans the whole batch reads
+    /// like an efficiency win — one insert/remove per batch instead of per
+    /// message — and would put an abandoned guest's writes back within reach of
+    /// a queued run.
+    ///
+    /// `LIVE_DELEGATE_GUESTS` does NOT cover this. It is keyed by instance id,
+    /// and a fresh run for the same delegate gets a fresh `RunningInstance` with
+    /// a fresh id, so the set never observes the overlap. The scope of one local
+    /// variable is the whole protection.
+    #[test]
+    fn the_env_guard_is_constructed_inside_exec_inbound_with_env() {
+        let src = include_str!("execution.rs");
+        let body = scrape_exec_inbound_with_env(src);
+
+        assert!(
+            body.contains("let _guard = DelegateEnvGuard::new(instance_id);"),
+            "`exec_inbound_with_env` must construct its `DelegateEnvGuard` \
+             itself. If this guard has been hoisted into `inbound_app_message` \
+             so one covers a whole batch, the env now outlives the call that \
+             created it and #5554's park can release a queued run for the same \
+             delegate while an abandoned guest is still writing (#5480, #5554)"
+        );
+
+        // The construction must also precede the guest call it protects —
+        // present but below `exec_inbound` would clean up an env that was never
+        // guarded during execution.
+        let guard = body
+            .find("let _guard = DelegateEnvGuard::new(instance_id);")
+            .expect("checked above");
+        let call = body
+            .find("self.exec_inbound(")
+            .expect("`exec_inbound_with_env` must call `exec_inbound`");
+        assert!(
+            guard < call,
+            "the `DelegateEnvGuard` must be constructed BEFORE `exec_inbound`, \
+             so it covers the guest call rather than trailing it"
+        );
+    }
+
     #[test]
     fn context_readback_happens_after_the_result_is_propagated() {
         let src = include_str!("execution.rs");
-        let start = src
-            .find("fn exec_inbound_with_env(")
-            .expect("`exec_inbound_with_env` not found — this pin has drifted");
-        // Bound at the next method so a later `?` cannot satisfy the assertion.
-        let rest = &src[start..];
-        let end = ["\n    pub(super) fn ", "\n    fn ", "\n}"]
-            .iter()
-            .filter_map(|needle| rest.find(needle))
-            .min()
-            .map(|off| start + off)
-            .unwrap_or(src.len());
-        let body = &src[start..end];
-
-        // Fail closed if the window was truncated: a shortened window would let
-        // the "read-back is present" lookup miss and turn this pin vacuous.
-        let opens = body.matches('{').count();
-        let closes = body.matches('}').count();
-        assert_eq!(
-            opens, closes,
-            "`exec_inbound_with_env`: scraped window is truncated ({opens} `{{` vs \
-             {closes} `}}`), so this pin would pass vacuously. Widen the end \
-             delimiters; do NOT delete the check."
-        );
+        let body = scrape_exec_inbound_with_env(src);
 
         let propagate = body
             .find("let outbound = result?;")

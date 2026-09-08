@@ -3414,6 +3414,79 @@ mod secret_read_memo_tests {
     /// `context_write`, the exact path the pin's own doc named. Enumerating
     /// rebinding forms is an open set. This asserts the single closed fact the
     /// whole property now rests on: no mutable borrow of the env is taken.
+    /// COMPILE-TIME guard (#5480 review F2): every field of `DelegateCallEnv`
+    /// must be named here, so ADDING ONE IS A COMPILE ERROR.
+    ///
+    /// This closes the half of F2 that moving the `unsafe impl` to
+    /// `DelegateEnvSlot` does NOT close, and the distinction is worth being
+    /// precise about because it is easy to over-claim:
+    ///
+    ///  - The slot narrows the impl's REACH. `DelegateCallEnv` is itself
+    ///    `!Send`/`!Sync`, so code that tries to share or move one anywhere
+    ///    other than into `DELEGATE_ENV` is rejected by the compiler.
+    ///  - The slot does NOT narrow what the impl BLESSES. It wraps the whole
+    ///    struct, so a field added tomorrow with different thread-safety is
+    ///    still covered by `unsafe impl Sync for DelegateEnvSlot` exactly as it
+    ///    would have been by an impl on `DelegateCallEnv`. A comment cannot
+    ///    object to that; only the compiler can.
+    ///
+    /// Hence the rest pattern is DELIBERATELY ABSENT. Do not "fix" this by
+    /// adding `..` — that silently restores the hazard and is the one edit this
+    /// test exists to prevent. When it stops compiling, the right response is to
+    /// add the new field here AND revisit the numbered SAFETY argument above
+    /// `DelegateEnvSlot`, deciding which of its four points the field affects.
+    ///
+    /// The current fields divide as follows, which is the review this forces:
+    ///  - `!Sync` and load-bearing for the argument: `secret_store`,
+    ///    `delegate_store` (`UnsafeCell<*mut _>`), `contract_store`
+    ///    (`*const _`), `context` and `secret_read_memo` (`RefCell`),
+    ///    `creations_this_call` (`Cell`). Six, not three — an earlier draft of
+    ///    the SAFETY block miscounted, which is exactly the kind of slip that
+    ///    makes a reader stop trusting a soundness argument.
+    ///  - Plain owned data, safe by construction: everything else.
+    #[test]
+    fn every_call_env_field_is_named_in_the_safety_argument() {
+        #[allow(dead_code)]
+        fn exhaustive(env: &DelegateCallEnv) {
+            // NO `..` REST PATTERN. See this test's rustdoc.
+            let DelegateCallEnv {
+                context,
+                secret_store,
+                delegate_key,
+                user_context,
+                contract_store,
+                state_store_db,
+                state_write_callback,
+                state_admit_callback,
+                delegate_store,
+                creation_depth,
+                creations_this_call,
+                origin_contracts,
+                created_delegates_count,
+                inherited_origins,
+                secret_read_memo,
+            } = env;
+
+            let _ = (
+                context,
+                secret_store,
+                delegate_key,
+                user_context,
+                contract_store,
+                state_store_db,
+                state_write_callback,
+                state_admit_callback,
+                delegate_store,
+                creation_depth,
+                creations_this_call,
+                origin_contracts,
+                created_delegates_count,
+                inherited_origins,
+                secret_read_memo,
+            );
+        }
+    }
+
     #[test]
     fn no_mutable_borrow_of_the_call_env_exists() {
         let src = include_str!("native_api.rs");
