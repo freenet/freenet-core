@@ -558,6 +558,30 @@ fn update_data_bytes(update: &UpdateData<'static>) -> usize {
 /// Set above BOTH inner budgets so the real timeout always wins and this never
 /// fires first on a merely-slow operation; a park cut short at its own TTL
 /// would report a spurious failure for work that was about to succeed.
+///
+/// NOT ON THE SIMULATED CLOCK, and this is why the backstop's own coverage is
+/// thin. `parked_at` is a `tokio::time::Instant` and the loop waits on
+/// `tokio::time::sleep_until`, while a simulated node runs on
+/// `crate::simulation::VirtualTime` — a separate clock that does not advance
+/// either. So advancing simulation time past this TTL does NOT expire a park,
+/// and whether the backstop fires there depends on real scheduler time.
+/// Direct time access in `crates/core` is disallowed by
+/// `.claude/rules/testing.md` for exactly this reason.
+///
+/// **The TTL backstop is therefore untestable in simulation today.** Stated
+/// rather than left for the next person to rediscover, because it explains an
+/// absence: the sweep's tests all drive `DelegateParkCtx` directly with a
+/// caller-supplied `now`, and none drives it through a simulated node.
+///
+/// Closing it means threading the node's `TimeSource` through the registry and
+/// the deadline wait, and it is not a local change: no `TimeSource` exists
+/// anywhere in the contract layer or at any of `contract_handling`'s call
+/// sites. It also cannot stop at this constant — `PARK_WORK_BUDGET`'s
+/// `tokio::time::timeout` and `DEFERRED_RELATED_FETCH_TIMEOUT` would remain on
+/// the tokio clock, leaving the park on two clocks and the
+/// `PARK_WORK_BUDGET < PARK_TTL` ordering below comparing unlike things. That
+/// ordering is load-bearing (see [`PARK_WORK_BUDGET`]), so a partial conversion
+/// would be worse than none.
 pub(super) const PARK_TTL: Duration = Duration::from_secs(90);
 
 /// Cap on the off-loop task's own runtime, kept BELOW [`PARK_TTL`].
