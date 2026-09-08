@@ -236,6 +236,37 @@ permanently-registered dispatchers to defeat the `live <= 1` fast path,
 regression test must run in a child process, is in
 [testing.md](testing.md#cross-test-interference-is-invisible-to-ci--only-plain-cargo-test-can-see-it).
 
+### The mirror image: a failure that is the HARNESS, not the code
+
+The section above is about a real bug the runner hides. This is the same
+confusion in the other direction — **a green-code failure produced by how the
+suite was run** — and it costs time in a nastier way, because the instinct on a
+red test is to look at the diff.
+
+**A test that re-execs `std::env::current_exe()` is broken by any concurrent
+`cargo` invocation against the same target dir.** Cargo replaces the test binary
+while the test is holding a path to it, and the child fails to spawn with
+`NotFound` — nothing to do with the code under test. In `crates/core` this is
+`wasm_runtime::engine::wasmtime_engine::tests::{test_instance_virtual_memory_reservation_bounded_3986,
+test_store_refresh_reduces_vm_maps}`, which re-run themselves as subprocesses to
+measure VM maps in isolation.
+
+The symptom to recognise, so nobody bisects it:
+
+```
+panicked at .../wasmtime_engine.rs:NNNN:
+Failed to spawn subprocess: Os { code: 2, kind: NotFound, ... }
+```
+
+Not reachable in CI, which does not run concurrent cargo against one target dir.
+It is routine on a workstation running several agents, where a second `cargo
+clippy`, `cargo build` or `cargo test` in another shell is enough. **Before
+investigating a failure in these two, check whether anything else was
+building**, and re-run them with the target dir to yourself; they pass in an
+isolated run. Same species as the row above — a property of how the suite is
+run, misread as a property of what it tests.
+
+
 ## Self-satisfying `include_str!` source-scrape pins
 
 A source-scrape pin — a test that `include_str!`s its own crate's source
