@@ -2992,8 +2992,50 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// captured when the cycle began, so a peer cannot end our cycle on demand
     /// by shrinking what it advertises;
     /// `a_peer_that_shrinks_the_shared_set_cannot_pin_the_window` asserts it.
-    /// A positional (geometric) notion of completion would additionally make a
-    /// staleness bound stateable under churn: #5313.
+    ///
+    /// ## The redraw at completion is load-bearing, not decoration
+    ///
+    /// The frame guard in [`Self::record_summary_cursor`] cannot be the whole
+    /// defence, and no record-level check can be. A record is validated by its
+    /// circular advance within `sorted` — and `sorted` is the PEER's set, so a
+    /// well-formed advance of `k` positions inside a set the peer composed is
+    /// an arbitrary jump across the ground the cycle is sweeping. The record is
+    /// not even dishonest: the peer really did receive those entries. The
+    /// steering happens HERE, when an id is resolved against a set the peer
+    /// chose, not there.
+    ///
+    /// What bounds it is that a completed cycle draws a fresh random origin,
+    /// which periodically destroys any position the peer has arranged. Removing
+    /// that in favour of a contiguous boundary — to deliver a tighter revisit
+    /// bound — reopens the steering: a peer alternating two sets of the SAME
+    /// size (so no frame-based guard can fire at all) pinned every round of one
+    /// set to the same window, starving a genuinely shared contract, with zero
+    /// rejections logged.
+    /// `probe_same_size_recomposition_pins_the_window` is that attack.
+    ///
+    /// Measured over the four candidate boundary rules, coverage of the
+    /// attacked set under that probe was: contiguous 15/16, contiguous with a
+    /// reset to the cycle origin 15/16, a position cursor advanced by each
+    /// round's fair share of id space 9/16 (which also loses coverage against
+    /// an HONEST peer, because `cycle_len` says how many entries there are and
+    /// not how they are spread, and the peer picks the spread), and the random
+    /// redraw 16/16. Contiguity and anti-steering are in direct tension and the
+    /// redraw is what currently pays for the second.
+    ///
+    /// The cost is the revisit bound. Because each cycle starts somewhere new,
+    /// a contract covered early in one cycle and late in the next waits up to
+    /// `2 * ceil(len / limit) - 1` rounds, not `ceil(len / limit)`; measured at
+    /// `len = 200`, `limit = 64` (so `ceil` is 4), six 12-cycle runs gave
+    /// worst-case gaps of 6, 7, 7, 7, 6 and 7.
+    /// `the_revisit_gap_spans_at_most_two_cycles` pins the honest figure. Do
+    /// not quote the single-cycle `ceil(len / limit)` as a revisit bound: that
+    /// is the WITHIN-cycle coverage bound, and the two are different claims.
+    ///
+    /// Delivering `ceil(len / limit)` needs a cursor whose position is not
+    /// resolved through the peer's set at all — a positional (geometric) notion
+    /// of completion, which would additionally make a staleness bound stateable
+    /// under churn: #5313. That is the right fix and it is a design change, not
+    /// a guard.
     pub(crate) fn begin_summary_window(&self, peer: &PeerKey, sorted: &[ContractKey]) -> usize {
         if sorted.is_empty() {
             return 0;
@@ -3097,7 +3139,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         let new_pos = first_index_after(sorted, &last_sent) % len;
         let mut cursors = self.summary_window_cursor.lock();
         let updated = match cursors.peek(peer) {
-            Some(prev) if len < prev.cycle_len => {
+            Some(prev)
+                if len < prev.cycle_len
+                    && (entries_sent >= len || len.saturating_mul(2) < prev.cycle_len) =>
+            {
                 // A round built against a SMALLER set than the cycle's own
                 // frame. Its last id is not a position in this cycle's ground,
                 // and applying it would drag `last_sent` to wherever the
@@ -3110,12 +3155,54 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 // rotation short of the set. Charging the rejection means the
                 // escape below still fires, so a set that has genuinely shrunk
                 // redraws within a bounded number of rounds instead of wedging.
+                //
+                // # Why not `len < cycle_len` alone
+                //
+                // Both sides of the intersection churn — interest entries
+                // expire on a 20-minute TTL and are swept every minute — so a
+                // set one or two elements below the frame is ORDINARY, not
+                // adversarial, and rejecting it costs real bandwidth for no
+                // coverage. A rejected round parks the cursor, so the NEXT
+                // round re-sends a byte-identical window: measured on a
+                // 200-contract set losing one element on alternate rounds, the
+                // bare form took 6 rounds and 3 rejections to cover the set
+                // where this one takes 4 and none. Anti-entropy bandwidth is
+                // the scarce resource here (#5153), so a 50% surcharge on
+                // ordinary churn is not a cheap safety margin.
+                // `an_ordinary_shrink_is_not_rejected` pins the churn case.
+                //
+                // The two clauses are the cases the ADVANCE check below cannot
+                // police, and neither implies the other:
+                //
+                // - `entries_sent >= len` — the round covered the WHOLE set, so
+                //   it wrapped to where it started: its circular advance is `0`
+                //   and `entries_sent % len` is `0` too, and ANY last id the
+                //   peer arranges passes. That is the vacuous case, and it is
+                //   reachable at any size (a 150-of-200 set sent whole).
+                // - `len * 2 < prev.cycle_len` — a MATERIAL shrink. Below that
+                //   the advance check is not vacuous, but it is still measured
+                //   in the peer's own index space, and a well-formed advance of
+                //   `k` positions inside a set the peer composed is an
+                //   arbitrary jump across the ground the cycle is sweeping. The
+                //   check proves the round is internally consistent; it says
+                //   nothing about where the cursor LANDS.
+                //   `probe_peer_pins_window_with_a_set_larger_than_the_limit`
+                //   and `probe_budget_cut_round_bypasses_the_frame_guard` are
+                //   that attack at two different sizes.
+                //
+                // Neither clause is a general defence against a peer-composed
+                // set — nothing checked here can be, because `sorted` is the
+                // coordinate system the record is expressed in. What bounds the
+                // residue is the RANDOM REDRAW at cycle completion in
+                // [`Self::begin_summary_window`], which periodically destroys
+                // any position the peer has arranged. See its rustdoc.
                 self.summary_cursor_rejections
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let rejections = prev.consecutive_rejections.saturating_add(1);
                 tracing::debug!(
                     ?peer,
                     set_len = len,
+                    entries_sent,
                     cycle_len = prev.cycle_len,
                     consecutive = rejections,
                     "ignored a summary-rotation record from a smaller set than the cycle frame"
@@ -8666,6 +8753,296 @@ mod tests {
         );
     }
 
+    /// An ORDINARY shrink — the shared set losing an element to churn — must
+    /// pass the frame guard.
+    ///
+    /// `sorted` is our interest index intersected with the hashes the peer
+    /// advertised, and both sides churn: interest entries carry a 20-minute TTL
+    /// and are swept every minute. A set one element below the cycle frame is
+    /// therefore routine, and the guard's earlier `len < cycle_len` form
+    /// rejected it outright.
+    ///
+    /// The cost of that was bandwidth, which is the scarce resource this whole
+    /// rotation exists to ration (#5153): a rejected round leaves the cursor
+    /// parked, so the NEXT round re-sends a byte-identical window. Measured
+    /// here, the un-narrowed guard needs 6 rounds and 3 rejections where the
+    /// narrowed one needs 4 and none — a 50% surcharge on ordinary churn, for
+    /// no coverage gain.
+    ///
+    /// Deliberately NOT an alternation between a full set and a tiny one: that
+    /// shape is `a_peer_that_shrinks_the_shared_set_cannot_pin_the_window` and
+    /// `probe_peer_pins_window_with_a_set_larger_than_the_limit`. The existing
+    /// churn test only ever GROWS the set (20 -> 40), which is why this bug had
+    /// no coverage.
+    #[test]
+    fn an_ordinary_shrink_is_not_rejected() {
+        const LEN: usize = 200;
+        const LIMIT: usize = 64;
+        const DROPPED: usize = 100;
+
+        let full = sorted_keys(0..LEN as u32);
+        // One contract drops out of the intersection on alternate rounds.
+        let dipped: Vec<ContractKey> = full
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != DROPPED)
+            .map(|(_, k)| *k)
+            .collect();
+        let always_present: HashSet<ContractInstanceId> = dipped.iter().map(|k| *k.id()).collect();
+
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(1);
+        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+
+        let mut covered: HashSet<ContractInstanceId> = HashSet::new();
+        let mut rounds = 0usize;
+        while !always_present.is_subset(&covered) && rounds < 20 {
+            let set: &[ContractKey] = if rounds % 2 == 1 { &dipped } else { &full };
+            let start = mgr.begin_summary_window(&peer, set);
+            let window = rotation_window_indices(set.len(), start, LIMIT);
+            assert!(!window.is_empty(), "empty window on round {rounds}");
+            for &i in &window {
+                covered.insert(*set[i].id());
+            }
+            let last = *set[*window.last().expect("non-empty")].id();
+            mgr.record_summary_cursor(&peer, last, window.len(), set);
+            rounds += 1;
+        }
+
+        assert_eq!(
+            rounds,
+            LEN.div_ceil(LIMIT),
+            "a set dipping by one element must still cover its {} stable \
+             contracts in ceil({LEN}/{LIMIT}) rounds; took {rounds}",
+            always_present.len(),
+        );
+        assert_eq!(
+            mgr.summary_cursor_rejections(),
+            0,
+            "ordinary churn must not be rejected: a rejected round parks the \
+             cursor and the next round re-sends a byte-identical window"
+        );
+    }
+
+    /// The peer must not be able to drive the rotation through the REJECTION
+    /// ESCAPE HATCH.
+    ///
+    /// The hatch exists for a caller-side defect that makes every record
+    /// ill-formed; after `MAX_CONSECUTIVE_CURSOR_REJECTIONS` it abandons the
+    /// cursor and draws a fresh random origin. A peer that can force rejections
+    /// on demand can therefore force a boundary on demand, and the boundary is
+    /// framed against whatever it is advertising AT THAT MOMENT — a one-hash
+    /// `Interests` gives a cycle of length one, which completes on its very
+    /// next round.
+    ///
+    /// That is survivable only because the boundary draws a RANDOM origin: the
+    /// peer gets to choose WHEN we re-originate, but not WHERE. If the boundary
+    /// ever becomes deterministic, this is a second door to the steering that
+    /// `a_peer_that_shrinks_the_shared_set_cannot_pin_the_window` closes, and
+    /// this test is what notices.
+    ///
+    /// The alternation is deliberately LONGER than that test's: one full round
+    /// per `MAX_CONSECUTIVE_CURSOR_REJECTIONS + 1` one-hash rounds, so the
+    /// hatch has room to fire between full rounds. The existing test alternates
+    /// one for one, so a full round always resets the count first and the hatch
+    /// is never reached.
+    #[test]
+    fn a_peer_cannot_drive_the_rotation_through_the_rejection_escape_hatch() {
+        const LIMIT: usize = 8;
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(1);
+        let full = sorted_keys(0..64);
+        let pinned = vec![full[63]];
+
+        let mut full_round_starts = HashSet::new();
+        let mut covered = HashSet::new();
+        for _ in 0..20 {
+            // Enough one-hash rounds to reach the hatch.
+            for _ in 0..=MAX_CONSECUTIVE_CURSOR_REJECTIONS {
+                let s = mgr.begin_summary_window(&peer, &pinned);
+                let w = rotation_window_indices(pinned.len(), s, LIMIT);
+                mgr.record_summary_cursor(
+                    &peer,
+                    *pinned[*w.last().expect("non-empty")].id(),
+                    w.len(),
+                    &pinned,
+                );
+            }
+
+            let s = mgr.begin_summary_window(&peer, &full);
+            full_round_starts.insert(s);
+            let w = rotation_window_indices(full.len(), s, LIMIT);
+            for &i in &w {
+                covered.insert(i);
+            }
+            mgr.record_summary_cursor(
+                &peer,
+                *full[*w.last().expect("non-empty")].id(),
+                w.len(),
+                &full,
+            );
+        }
+
+        assert!(
+            full_round_starts.len() > 1,
+            "a peer that spends {} one-hash rounds between full ones must not \
+             pin the full-round start: 20 full rounds all began at {:?}",
+            MAX_CONSECUTIVE_CURSOR_REJECTIONS as usize + 1,
+            full_round_starts
+        );
+    }
+
+    /// A round covering the WHOLE of a set that is NOT a material shrink must
+    /// not move the cursor.
+    ///
+    /// The two clauses of the frame guard cover different cases and neither
+    /// implies the other; this pins the one the material-shrink clause misses.
+    /// A set at 136 of a 200 frame is well over half, so
+    /// `len * 2 < cycle_len` does not fire — but if the round sends the WHOLE
+    /// of it, the advance check below is VACUOUS: a full-set round wraps to
+    /// where it began, so its circular advance is `0` and `entries_sent % len`
+    /// is `0` too, and any last id the peer arranges passes. The window ends on
+    /// the entry cyclically BEFORE its start — the greatest advertised id at or
+    /// below the cursor — so by advertising exactly one low id the peer names
+    /// where `last_sent` lands.
+    ///
+    /// # What this test deliberately does NOT claim
+    ///
+    /// It asserts the record is not APPLIED, not that the peer is thereby
+    /// unable to pin the rotation. Measured: with this clause removed the
+    /// attack still fails to pin, because the accepted 136-entry round drives
+    /// the cycle to completion and the redraw scatters the origin (starts over
+    /// 20 rounds: 19 distinct values, coverage 200/200). The general defence is
+    /// the redraw — see [`InterestManager::begin_summary_window`]. What this
+    /// clause buys is narrower and still worth having: we do not apply a record
+    /// whose only check cannot fail. An end-to-end pin assertion here would be
+    /// claiming more than the mechanism delivers, and would pass for the wrong
+    /// reason.
+    #[test]
+    fn a_whole_set_round_is_rejected_even_when_the_shrink_is_not_material() {
+        const FRAME: usize = 200;
+        let full = sorted_keys(0..FRAME as u32);
+
+        // One id below the cursor, everything else above it: 136 of 200, so
+        // `len * 2 < cycle_len` is false (272 >= 200) and only the whole-set
+        // clause can catch this.
+        let attack: Vec<ContractKey> = std::iter::once(full[0])
+            .chain(full[65..].iter().copied())
+            .collect();
+        assert_eq!(attack.len(), 136);
+        assert!(
+            attack.len() * 2 >= FRAME,
+            "the point of this test is a shrink the material clause ignores"
+        );
+
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(1);
+        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+
+        // One honest round, so there is a real cursor to drag.
+        let s = mgr.begin_summary_window(&peer, &full);
+        let w = rotation_window_indices(full.len(), s, 64);
+        mgr.record_summary_cursor(
+            &peer,
+            *full[*w.last().expect("non-empty")].id(),
+            w.len(),
+            &full,
+        );
+        let before = mgr.peek_summary_cursor(&peer).expect("cursor");
+
+        // The whole advertised set in one round.
+        let sa = mgr.begin_summary_window(&peer, &attack);
+        let wa = rotation_window_indices(attack.len(), sa, FRAME);
+        assert_eq!(wa.len(), attack.len(), "the round must cover the whole set");
+        let last = *attack[*wa.last().expect("non-empty")].id();
+        assert_ne!(
+            last, before,
+            "the attack is only meaningful if the whole-set round ends on a \
+             DIFFERENT id than the cursor already holds"
+        );
+        mgr.record_summary_cursor(&peer, last, wa.len(), &attack);
+
+        assert_eq!(
+            mgr.peek_summary_cursor(&peer).expect("cursor"),
+            before,
+            "a round covering the whole of a smaller set must not move the \
+             cursor: its circular advance is 0 whatever last id it names, so \
+             the advance check cannot reject it"
+        );
+        assert!(
+            mgr.summary_cursor_rejections() > 0,
+            "the whole-set round must be counted as a rejection"
+        );
+    }
+
+    /// The HONEST revisit bound is two cycles, not one.
+    ///
+    /// This is the figure the rotation may be sold on, and it is weaker than
+    /// the within-cycle coverage bound it is easy to confuse it with. A cycle
+    /// covers a stable set in `ceil(len / limit)` rounds — that is
+    /// `rotation_covers_every_contract_within_ceil_n_over_limit_rounds`. But
+    /// each completed cycle draws a FRESH random origin (see
+    /// [`InterestManager::begin_summary_window`] for why that redraw is
+    /// load-bearing against steering), so a contract covered early in one cycle
+    /// and late in the next waits up to `2 * ceil(len / limit) - 1` rounds.
+    ///
+    /// Pinning the honest figure is the point. An earlier revision of this test
+    /// asserted the single-cycle bound and passed only because it ran exactly
+    /// ONE cycle; `the_real_api_covers_every_contract_from_every_origin` has
+    /// the same blind spot by construction. Tightening this to
+    /// `ceil(len / limit)` requires a cursor that is not resolved through the
+    /// peer's set at all (#5313) — until then, a test asserting the tighter
+    /// bound is asserting something the code does not do.
+    #[test]
+    fn the_revisit_gap_spans_at_most_two_cycles() {
+        for (len, limit) in [(200usize, 64usize), (40, 8), (33, 8), (17, 4)] {
+            let sorted = sorted_keys(0..len as u32);
+            let cycle = len.div_ceil(limit);
+            let bound = 2 * cycle - 1;
+            let rounds = cycle * 12;
+
+            for origin in [0usize, 1, len / 3, len / 2, len - 1] {
+                let (mgr, _clock) = make_manager();
+                let peer = make_unique_peer_key(9900 + origin as u32);
+                mgr.seed_summary_cursor_at_origin(&peer, &sorted, origin);
+
+                let mut last_seen: Vec<Option<usize>> = vec![None; len];
+                let mut worst = 0usize;
+                let mut worst_at = (0usize, 0usize);
+                for r in 0..rounds {
+                    let start = mgr.begin_summary_window(&peer, &sorted);
+                    let window = rotation_window_indices(len, start, limit);
+                    assert!(!window.is_empty(), "empty window");
+                    for &i in &window {
+                        if let Some(prev) = last_seen[i] {
+                            if r - prev > worst {
+                                worst = r - prev;
+                                worst_at = (i, r);
+                            }
+                        }
+                        last_seen[i] = Some(r);
+                    }
+                    let last = *sorted[*window.last().expect("non-empty")].id();
+                    mgr.record_summary_cursor(&peer, last, window.len(), &sorted);
+                }
+
+                assert!(
+                    last_seen.iter().all(Option::is_some),
+                    "len={len} limit={limit} origin={origin}: some contract was \
+                     never advertised in {rounds} rounds"
+                );
+                assert!(
+                    worst <= bound,
+                    "len={len} limit={limit} origin={origin}: contract {} went \
+                     {worst} rounds without being advertised (bound {bound}), \
+                     last at round {}",
+                    worst_at.0,
+                    worst_at.1
+                );
+            }
+        }
+    }
+
     /// A cycle COMPLETES and then re-randomises, so the anti-starvation redraw
     /// keeps firing.
     ///
@@ -8813,6 +9190,319 @@ mod tests {
              fixed restart starves the tail of the set for any peer that keeps \
              returning to a boundary, and a non-GlobalRng source breaks \
              simulation determinism"
+        );
+    }
+
+    /// REVIEW PROBE: a peer that advertises a set LARGER than the window but
+    /// SMALLER than the cycle frame can drag `last_sent` wherever it likes,
+    /// because the frame guard now only fires when the round covered the WHOLE
+    /// shared set.
+    #[test]
+    fn probe_peer_pins_window_with_a_set_larger_than_the_limit() {
+        const LIMIT: usize = 8;
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(1);
+        let full = sorted_keys(0..64);
+        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+
+        // 9 elements: one below the window we want to re-send, then the seven
+        // just after it, then the highest id. |S| = 9 > LIMIT = 8, so the
+        // narrowed frame guard does NOT fire.
+        let attack: Vec<ContractKey> = {
+            let mut v = vec![full[0]];
+            v.extend_from_slice(&full[8..15]);
+            v.push(full[63]);
+            v
+        };
+        assert_eq!(attack.len(), 9);
+
+        let mut full_round_starts = HashSet::new();
+        let mut covered = HashSet::new();
+        for _ in 0..20 {
+            let s = mgr.begin_summary_window(&peer, &full);
+            full_round_starts.insert(s);
+            let w = rotation_window_indices(full.len(), s, LIMIT);
+            for &i in &w {
+                covered.insert(i);
+            }
+            mgr.record_summary_cursor(&peer, *full[*w.last().expect("ne")].id(), w.len(), &full);
+
+            let sa = mgr.begin_summary_window(&peer, &attack);
+            let wa = rotation_window_indices(attack.len(), sa, LIMIT);
+            mgr.record_summary_cursor(
+                &peer,
+                *attack[*wa.last().expect("ne")].id(),
+                wa.len(),
+                &attack,
+            );
+        }
+
+        eprintln!(
+            "PROBE: full_round_starts={:?} covered={} rejections={}",
+            full_round_starts,
+            covered.len(),
+            mgr.summary_cursor_rejections()
+        );
+        assert!(
+            full_round_starts.len() > 1,
+            "PINNED: 20 full rounds all began at {full_round_starts:?}"
+        );
+        assert_eq!(
+            covered.len(),
+            full.len(),
+            "STARVED: covered {} of 64",
+            covered.len()
+        );
+    }
+
+    /// REVIEW PROBE: same lever, but the peer shrinks to a set that is smaller
+    /// than the window and yet still not fully covered because the reply was
+    /// cut short by the byte/summarize budget (`entries_sent < len`).
+    #[test]
+    fn probe_budget_cut_round_bypasses_the_frame_guard() {
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(2);
+        let full = sorted_keys(0..64);
+        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+
+        // Round one, full set, window of 8.
+        let s = mgr.begin_summary_window(&peer, &full);
+        let w = rotation_window_indices(full.len(), s, 8);
+        mgr.record_summary_cursor(&peer, *full[*w.last().expect("ne")].id(), w.len(), &full);
+        let before = mgr.peek_summary_cursor(&peer).expect("cursor");
+
+        // Peer advertises a 3-element set; the reply is cut after 2 entries by
+        // the budget, so entries_sent (2) < len (3): guard does not fire.
+        let small = vec![full[0], full[9], full[10]];
+        let sa = mgr.begin_summary_window(&peer, &small);
+        let wa = rotation_window_indices(small.len(), sa, 8);
+        // Simulate a budget cut: send only the first 2 of the window.
+        let sent = &wa[..2];
+        mgr.record_summary_cursor(
+            &peer,
+            *small[*sent.last().expect("ne")].id(),
+            sent.len(),
+            &small,
+        );
+        let after = mgr.peek_summary_cursor(&peer).expect("cursor");
+        eprintln!(
+            "PROBE budget-cut: start_in_small={sa} window={wa:?} moved={} rejections={}",
+            before != after,
+            mgr.summary_cursor_rejections()
+        );
+        assert_eq!(
+            before, after,
+            "a budget-cut short round against a smaller set moved the cursor"
+        );
+    }
+
+    /// REVIEW PROBE 3: same-SIZE re-composition. The peer never shrinks the
+    /// set below the frame, so the frame guard cannot fire at all; it simply
+    /// advertises a DIFFERENT set of the same size on alternate rounds.
+    #[test]
+    fn probe_same_size_recomposition_pins_the_window() {
+        const LIMIT: usize = 8;
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(3);
+        let full = sorted_keys(0..64);
+
+        let set_a: Vec<ContractKey> = full[0..16].to_vec();
+        let set_b: Vec<ContractKey> = {
+            let mut v = full[0..8].to_vec();
+            v.extend_from_slice(&full[8..15]);
+            v.push(full[63]);
+            v
+        };
+        assert_eq!(set_a.len(), set_b.len());
+
+        mgr.seed_summary_cursor_at_origin(&peer, &set_a, 0);
+        let mut a_starts = HashSet::new();
+        let mut covered = HashSet::new();
+        for _ in 0..20 {
+            let s = mgr.begin_summary_window(&peer, &set_a);
+            a_starts.insert(s);
+            let w = rotation_window_indices(set_a.len(), s, LIMIT);
+            for &i in &w {
+                covered.insert(*set_a[i].id());
+            }
+            mgr.record_summary_cursor(&peer, *set_a[*w.last().expect("ne")].id(), w.len(), &set_a);
+
+            let sb = mgr.begin_summary_window(&peer, &set_b);
+            let wb = rotation_window_indices(set_b.len(), sb, LIMIT);
+            mgr.record_summary_cursor(
+                &peer,
+                *set_b[*wb.last().expect("ne")].id(),
+                wb.len(),
+                &set_b,
+            );
+        }
+        eprintln!(
+            "PROBE3: a_starts={:?} covered_of_set_a={} rejections={}",
+            a_starts,
+            covered.len(),
+            mgr.summary_cursor_rejections()
+        );
+        assert!(
+            a_starts.len() > 1,
+            "PROBE3 PINNED: all set_a rounds began at {a_starts:?}"
+        );
+    }
+
+    /// REVIEW PROBE 4: a shared set that shrinks PERMANENTLY below the frame.
+    /// `cycle_len` never re-frames downward. Is that benign?
+    #[test]
+    fn probe_permanent_shrink_leaves_a_stale_cycle_len() {
+        // Production shape: MAX_SUMMARY_ENTRIES_PER_MESSAGE = 128.
+        const LIMIT: usize = 128;
+        let full = sorted_keys(0..200);
+        let small: Vec<ContractKey> = full[0..40].to_vec();
+        let small_ids: HashSet<ContractInstanceId> = small.iter().map(|k| *k.id()).collect();
+
+        let (mgr, _c) = make_manager();
+        let peer = make_peer_key(4);
+        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+        // Two rounds of 128 over 200: the cycle genuinely completes at 200.
+        for _ in 0..2 {
+            let s = mgr.begin_summary_window(&peer, &full);
+            let w = rotation_window_indices(full.len(), s, LIMIT);
+            mgr.record_summary_cursor(&peer, *full[*w.last().expect("ne")].id(), w.len(), &full);
+        }
+        let before = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+
+        // CONTROL: an identically-driven cursor that starts life framed at 40.
+        let (ctl, _c2) = make_manager();
+        let cpeer = make_peer_key(5);
+        ctl.seed_summary_cursor_at_origin(&cpeer, &small, 0);
+
+        // The set drops to 40 and stays there.
+        let mut stale_entries = Vec::new();
+        let mut ctl_entries = Vec::new();
+        let mut stale_cov: Vec<usize> = Vec::new();
+        for _ in 0..50 {
+            let s = mgr.begin_summary_window(&peer, &small);
+            let w = rotation_window_indices(small.len(), s, LIMIT);
+            let cov: HashSet<ContractInstanceId> = w.iter().map(|&i| *small[i].id()).collect();
+            stale_cov.push(cov.len());
+            stale_entries.push(w.len());
+            mgr.record_summary_cursor(&peer, *small[*w.last().expect("ne")].id(), w.len(), &small);
+
+            let cs = ctl.begin_summary_window(&cpeer, &small);
+            let cw = rotation_window_indices(small.len(), cs, LIMIT);
+            ctl_entries.push(cw.len());
+            ctl.record_summary_cursor(
+                &cpeer,
+                *small[*cw.last().expect("ne")].id(),
+                cw.len(),
+                &small,
+            );
+        }
+        let after = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+        eprintln!(
+            "RESIDUAL-A stale: cycle_len {}->{} advertised {}->{} last_sent_moved={} \
+             rejections={} entries/round={:?} coverage/round(min,max)=({},{})",
+            before.cycle_len,
+            after.cycle_len,
+            before.advertised_in_cycle,
+            after.advertised_in_cycle,
+            before.last_sent != after.last_sent,
+            mgr.summary_cursor_rejections(),
+            &stale_entries[..3],
+            stale_cov.iter().min().expect("ne"),
+            stale_cov.iter().max().expect("ne"),
+        );
+        let cc = ctl.peek_summary_cursor_state(&cpeer).expect("cursor");
+        eprintln!(
+            "RESIDUAL-A control: cycle_len={} advertised={} rejections={} entries/round={:?}",
+            cc.cycle_len,
+            cc.advertised_in_cycle,
+            ctl.summary_cursor_rejections(),
+            &ctl_entries[..3],
+        );
+
+        assert!(small_ids.len() == 40);
+        assert_eq!(
+            stale_cov.iter().copied().min().expect("ne"),
+            40,
+            "BENIGN-CLAIM-A: every round must still cover the whole shrunken set"
+        );
+        assert_eq!(
+            stale_entries, ctl_entries,
+            "BENIGN-CLAIM-B: a stale cycle_len must not cost extra entries vs a correctly-framed cursor"
+        );
+
+        // Recovery: the set grows back to 200.
+        let mut regrown = HashSet::new();
+        for _ in 0..2 {
+            let s = mgr.begin_summary_window(&peer, &full);
+            let w = rotation_window_indices(full.len(), s, LIMIT);
+            for &i in &w {
+                regrown.insert(i);
+            }
+            mgr.record_summary_cursor(&peer, *full[*w.last().expect("ne")].id(), w.len(), &full);
+        }
+        eprintln!(
+            "RESIDUAL-A recovery: covered {}/200 in 2 rounds",
+            regrown.len()
+        );
+        assert_eq!(
+            regrown.len(),
+            200,
+            "BENIGN-CLAIM-C: the rotation must resume on regrowth"
+        );
+    }
+
+    /// REVIEW PROBE 5: the same permanent shrink, but the reply is CUT by the
+    /// byte budget so `entries_sent < len` and the frame guard never fires.
+    #[test]
+    fn probe_permanent_shrink_with_a_budget_cut_latches_completion() {
+        let full = sorted_keys(0..200);
+        let small: Vec<ContractKey> = full[0..40].to_vec();
+        const CUT: usize = 20;
+
+        let (mgr, _c) = make_manager();
+        let peer = make_peer_key(6);
+        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+        for _ in 0..2 {
+            let s = mgr.begin_summary_window(&peer, &full);
+            let w = rotation_window_indices(full.len(), s, 128);
+            mgr.record_summary_cursor(&peer, *full[*w.last().expect("ne")].id(), w.len(), &full);
+        }
+
+        let mut completions = 0usize;
+        let mut prev_adv = mgr
+            .peek_summary_cursor_state(&peer)
+            .expect("c")
+            .advertised_in_cycle;
+        let mut covered = HashSet::new();
+        for _ in 0..60 {
+            let s = mgr.begin_summary_window(&peer, &small);
+            let now = mgr.peek_summary_cursor_state(&peer).expect("c");
+            if now.advertised_in_cycle < prev_adv {
+                completions += 1;
+            }
+            let w = rotation_window_indices(small.len(), s, CUT);
+            for &i in &w {
+                covered.insert(i);
+            }
+            mgr.record_summary_cursor(&peer, *small[*w.last().expect("ne")].id(), w.len(), &small);
+            prev_adv = mgr
+                .peek_summary_cursor_state(&peer)
+                .expect("c")
+                .advertised_in_cycle;
+        }
+        let c = mgr.peek_summary_cursor_state(&peer).expect("c");
+        eprintln!(
+            "RESIDUAL-B: cycle_len={} advertised={} (never reset; 60 rounds x {CUT}) \
+             count_resets={completions} covered={}/40 rejections={}",
+            c.cycle_len,
+            c.advertised_in_cycle,
+            covered.len(),
+            mgr.summary_cursor_rejections()
+        );
+        assert_eq!(covered.len(), 40, "coverage must still be complete");
+        assert!(
+            completions > 0,
+            "OBSERVATION: the cycle count never resets again"
         );
     }
 }
