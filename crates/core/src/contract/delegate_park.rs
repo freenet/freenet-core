@@ -606,10 +606,10 @@ fn update_data_bytes(update: &UpdateData<'static>) -> usize {
 /// Direct time access in `crates/core` is disallowed by
 /// `.claude/rules/testing.md` for exactly this reason.
 ///
-/// **The TTL backstop is therefore untestable in simulation today.** Stated
-/// rather than left for the next person to rediscover, because it explains an
-/// absence: the sweep's tests all drive `DelegateParkCtx` directly with a
-/// caller-supplied `now`, and none drives it through a simulated node.
+/// **The TTL backstop is therefore untestable in simulation today** (#5605).
+/// Stated rather than left for the next person to rediscover, because it
+/// explains an absence: the sweep's tests all drive `DelegateParkCtx` directly
+/// with a caller-supplied `now`, and none drives it through a simulated node.
 ///
 /// Closing it means threading the node's `TimeSource` through the registry and
 /// the deadline wait, and it is not a local change: no `TimeSource` exists
