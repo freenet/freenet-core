@@ -269,6 +269,16 @@ pub(super) fn parked_budget_for(total_ram: usize) -> usize {
 /// cap, and the 9th degrades to the inline path — the same deliberate trade the
 /// park cap itself makes.
 ///
+/// 2 MiB IS WELL UNDER `MAX_STATE_SIZE` (50 MiB), SO A LEGITIMATELY LARGE
+/// RELATED CONTRACT WILL ALWAYS DEGRADE — read those two numbers together and
+/// it looks like a bug, so: it is deliberate. What the upsert degrades TO is
+/// the pre-#5544 inline path, which is slower and holds the loop but loses
+/// nothing, not a new failure mode. The alternative is a cap that does not cap:
+/// admitting one 50 MiB related state would blow a 64 MiB node-wide budget on a
+/// single park. The refusal is logged (see `contract::within_fetch_allowance`)
+/// precisely so a latency complaint can be traced back to it rather than
+/// guessed at.
+///
 /// RESERVED AT ADMISSION (see [`task_bytes`]) and ENFORCED WHEN THE FETCH
 /// COMPLETES (see `contract::within_fetch_allowance`), so retained bytes can
 /// never exceed reserved bytes. Stated limitation: the fetch races its sub-op
@@ -369,9 +379,8 @@ pub(super) fn request_bytes(req: &DelegateRequest<'static>) -> usize {
         DelegateRequest::RegisterDelegate { delegate, .. } => delegate_container_bytes(delegate),
         // A key and nothing else.
         DelegateRequest::UnregisterDelegate(_) => 0,
-        // See `delegate_container_bytes`: unmeasurable is charged as maximal,
-        // not as free.
-        _ => MAX_PARKED_BYTES,
+        // See `unmeasurable`: charged as maximal, not as free, and announced.
+        other => unmeasurable("DelegateRequest", &format!("{other:?}")),
     }
 }
 
@@ -404,8 +413,37 @@ fn delegate_container_bytes(delegate: &freenet_stdlib::prelude::DelegateContaine
         // bytes through a cap that reads as if it bound them. Both are loud and
         // recoverable; an uncounted bypass is neither. If you are adding a
         // variant, measure it above.
-        _ => MAX_PARKED_BYTES,
+        other => unmeasurable("DelegateContainer", &format!("{other:?}")),
     }
+}
+
+/// Charge for a payload this build cannot measure: the whole budget, and a
+/// `warn!` saying why.
+///
+/// THE CHARGE ALONE WOULD BE A SILENT BEHAVIOUR CHANGE. Charging maximal makes
+/// an unknown variant refuse the park (degrading to the inline path) or reject
+/// the queue (answering the client) instead of passing unbounded bytes through
+/// a cap that reads as if it bounded them — but the first symptom of that is
+/// unexplained latency, and nothing would connect it to a stdlib upgrade. So it
+/// is announced, with the variant that was not recognised.
+///
+/// NOT A RARE PATH UNDER STDLIB-FIRST DEVELOPMENT. stdlib ships variants before
+/// core learns them, so every such release makes delegates using the new
+/// variant degrade until core catches up. That is the deliberate trade — a loud,
+/// recoverable degradation beats a silent bypass of a memory bound — but it is a
+/// known consequence rather than a surprise, and this is where a reader finds it.
+fn unmeasurable(kind: &str, variant: &str) -> usize {
+    tracing::warn!(
+        kind,
+        variant,
+        charged_bytes = MAX_PARKED_BYTES,
+        "Unrecognised {kind} variant in park byte accounting; charging the whole \
+         park budget so it cannot bypass the bound. This delegate will fall back \
+         to the inline path (or have its request rejected) until this build \
+         learns to measure the variant — expect it after a freenet-stdlib \
+         upgrade that adds one"
+    );
+    MAX_PARKED_BYTES
 }
 
 fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
@@ -538,9 +576,9 @@ fn update_data_bytes(update: &UpdateData<'static>) -> usize {
         UpdateData::RelatedStateAndDelta { state, delta, .. } => {
             state.as_ref().len() + delta.as_ref().len()
         }
-        // See `delegate_container_bytes` for why an unmeasurable variant is
-        // charged the whole budget rather than nothing.
-        _ => MAX_PARKED_BYTES,
+        // See `unmeasurable` for why this is the whole budget rather than
+        // nothing, and why it is announced.
+        other => unmeasurable("UpdateData", &format!("{other:?}")),
     }
 }
 
@@ -1128,6 +1166,9 @@ pub(super) struct DelegateParkCtx {
     parked_bytes: usize,
     /// What `parked_bytes` is measured against, from [`parked_budget_for`].
     budget: usize,
+    /// The host RAM `budget` was scaled from, carried only so a refusal can say
+    /// where its limit came from.
+    host_ram: usize,
     /// Source of park identities; see [`DelegateResume::epoch`].
     next_epoch: u64,
     /// Refusal counters, per cause (L9). A refusal that is only logged is a
@@ -1156,13 +1197,14 @@ impl DelegateParkCtx {
         // Read once, at construction: the budget is a property of the host, and
         // re-reading it per admission would make the cap wobble under memory
         // pressure exactly when it most needs to be stable.
-        let budget = parked_budget_for(
-            crate::wasm_runtime::read_total_ram_bytes().unwrap_or(FALLBACK_TOTAL_RAM_BYTES),
-        );
+        let host_ram =
+            crate::wasm_runtime::read_total_ram_bytes().unwrap_or(FALLBACK_TOTAL_RAM_BYTES);
+        let budget = parked_budget_for(host_ram);
         Self {
             parked: HashMap::new(),
             parked_bytes: 0,
             budget,
+            host_ram,
             next_epoch: 0,
             refused: RefusalCounts::default(),
             resume_tx,
@@ -1234,7 +1276,15 @@ impl DelegateParkCtx {
                 limit = MAX_PARKED_DELEGATES,
                 parked_bytes = self.parked_bytes,
                 adding_bytes = bytes,
+                // The BUDGET and the RAM it was scaled from, together. On a
+                // small host `parked_budget_for` gives less than the 64 MiB
+                // ceiling, so parks are refused sooner and fall back inline
+                // more often — #5544's original problem returning at small
+                // sizes. That is the deliberate trade for an aggregate that
+                // actually holds, and an operator seeing more inline fallback
+                // on a small VPS has to be able to find out why from one line.
                 byte_limit = self.budget,
+                host_ram = self.host_ram,
                 over_bytes,
                 already_parked = self.parked.contains_key(&key),
                 total_refused_parks = self.refused.parks.saturating_add(1),

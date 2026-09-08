@@ -632,6 +632,66 @@ grep -rnE "max_tracked|MAX_TRACKED" crates/core/src/
 ```
 
 
+## A count cap reads like a memory bound; a FLAT memory cap reads like it scales
+
+**The second half of the pattern above, and it bites the fix for the first
+half.** Replacing a count cap with a byte cap is the right move — but a byte cap
+written as a bare `const` is sized for exactly one host, and every reader after
+you will assume it tracks the machine, because every budget beside it does.
+
+#5544 introduced `MAX_PARKED_BYTES: usize = 64 * 1024 * 1024` precisely because
+`MAX_PARKED_DELEGATES` bounded the NUMBER of parks and not their footprint. The
+new cap was flat. Its siblings in `contract::executor::declared_cache_ceiling`
+(`summary_budget_for`, `delta_budget_for`, `store_arena_budget_for`,
+`budget_for_ram`, ...) are all RAM-derived, so a reader comparing them sees one
+term that does not move and has no reason to think it should.
+
+**How it surfaced, which is the useful part.** The flat cap was ALSO missing from
+`declared_cache_ceiling` — and `ring::hosting::cache::resident_overhead_budget_for`
+derives the hosting budget as a *residual* from that sum, so hosting had been
+treating 64 MiB already committed to parks as free. Adding the term turned
+`cache_byte_budgets_are_aggregate_safe` red immediately: a 1 GiB VPS with 4
+workers declared **566,231,032 bytes against a 536,870,912 half-limit**. The
+over-commit was real from the day the cap shipped and unobservable until the
+aggregate could see the term. Fixed by making it
+`clamp(total_ram / 32, 8 MiB, 64 MiB)` like its siblings.
+
+Audit questions for any new byte budget:
+
+- **Does it scale with the host?** If it is a bare `const`, name the smallest
+  supported host and check the aggregate still fits there.
+- **Is it in the aggregate?** A budget outside `declared_cache_ceiling` is
+  memory some other consumer believes is free.
+- **Can the guard on that aggregate FAIL for a budget nobody added to it?** If it
+  validates a hardcoded list, it catches removal and not addition — see below.
+
+```bash
+# Flat byte budgets, which should be rare:
+grep -rnE "^(pub(\([a-z]+\))? )?const [A-Z0-9_]+_BYTES: usize = [0-9]" crates/core/src/
+# ...against the RAM-derived shape they should usually have:
+grep -rn "fn .*_budget_for" crates/core/src/
+```
+
+### And a guard that ENUMERATES cannot fail for something new
+
+`declared_cache_ceiling_names_every_budget` was defended against every vacuity
+mode its author anticipated — anchor uniqueness, a required closing brace, a
+region-escape check — and then validated a **hardcoded list of eight names**. Its
+own doc said "a new one is added here at the same time it is added there", which
+is an honour-system requirement written as though it were a check. It catches a
+summed budget being REMOVED and cannot catch one being ADDED, which is the case
+that matters for a new budget.
+
+The companion `declared_cache_ceiling_discovers_every_budget` DISCOVERS instead:
+it walks the crate for budget-shaped declarations and requires each to be summed
+or listed in a `NOT_SUMMED` table **with a written reason**, so an exclusion is a
+visible decision rather than an omission — and asserts every `NOT_SUMMED` entry
+is still discoverable, so the table cannot rot into names that no longer exist.
+Both tests are kept, and each says in its rustdoc what the other covers: they
+catch opposite things, and deleting one because the other "looks equivalent" is
+the mistake this file exists to prevent.
+
+
 ## A refusal that is not counted renders as a clean zero
 
 **Any code path that DISCARDS an input must count the discard.** Three bare

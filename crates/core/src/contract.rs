@@ -543,6 +543,24 @@ async fn fetch_related_off_loop(
 /// test stub (`OFF_LOOP_FETCH_OVERRIDE`), which returns before that function's
 /// body runs, is bounded by it too. A budget a test fixture can walk past is
 /// not a budget.
+/// Fetches refused for exceeding their park's reserve, since process start.
+///
+/// A COUNTER AS WELL AS THE `warn!`, per this repo's own rule that "a refusal
+/// that is not counted renders as a clean zero" — the same reasoning behind
+/// `delegate_park::RefusalCounts`. The degradation here is legitimate (the
+/// upsert fails and the delegate is told, exactly as it is for a miss or a
+/// timeout on this path), which is precisely why it needs to be visible: a
+/// legitimate behaviour change that nothing counts is indistinguishable from
+/// nothing happening, and the symptom an operator sees is latency somewhere
+/// else entirely.
+static REFUSED_OVERSIZED_FETCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn refused_oversized_fetches() -> usize {
+    REFUSED_OVERSIZED_FETCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn within_fetch_allowance(
     fetched: Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>,
     missing: &[ContractInstanceId],
@@ -559,10 +577,14 @@ fn within_fetch_allowance(
             .map(|(id, _)| *id)
             .or_else(|| missing.first().copied())
             .unwrap_or_else(|| ContractInstanceId::new([0u8; 32]));
+        let total = REFUSED_OVERSIZED_FETCHES
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
         tracing::warn!(
             fetched_bytes = bytes,
             allowance,
             contract = %id,
+            total_refused = total,
             "Off-loop related fetch retained more than the park reserved for \
              it; failing the upsert rather than holding unbounded bytes behind \
              a park (#5554 follow-up)"
@@ -8411,6 +8433,66 @@ mod hol_4391_tests {
         }
     }
 
+    /// The fetch allowance REFUSES, and the refusal is visible.
+    ///
+    /// Two halves, and the second is the one that gets skipped. A bound that
+    /// silently pushes a delegate back onto the serial loop is a behaviour
+    /// change nobody can trace: the symptom is latency somewhere else, six
+    /// months later, and nothing connects it to a related contract that grew
+    /// past 2 MiB. This repo's own rule says a refusal that is not counted
+    /// renders as a clean zero, so it is counted as well as logged.
+    ///
+    /// Note the allowance is well under `MAX_STATE_SIZE` (50 MiB) by design —
+    /// see `MAX_UPSERT_FETCH_BYTES`. A legitimately large related contract
+    /// degrades to the pre-#5544 inline path, which is slower but loses
+    /// nothing.
+    ///
+    /// FALSIFY by removing the size check from `within_fetch_allowance`: the
+    /// oversized fetch is then accepted and both assertions go red.
+    #[test]
+    fn an_oversized_related_fetch_is_refused_and_counted() {
+        let id = ContractInstanceId::new([1u8; 32]);
+        let allowance = 1024usize;
+
+        let before = refused_oversized_fetches();
+        let within = within_fetch_allowance(
+            Ok(vec![(id, WrappedState::new(vec![0u8; allowance]))]),
+            &[id],
+            allowance,
+        );
+        assert!(
+            within.is_ok(),
+            "a fetch inside its reserve must be accepted, or this test would \
+             pass for the wrong reason"
+        );
+        assert_eq!(
+            refused_oversized_fetches(),
+            before,
+            "an accepted fetch must not be counted as a refusal"
+        );
+
+        let over = within_fetch_allowance(
+            Ok(vec![(id, WrappedState::new(vec![0u8; allowance + 1]))]),
+            &[id],
+            allowance,
+        );
+        assert!(
+            over.is_err(),
+            "a fetch beyond its reserve must be refused: it is what the park \
+             reserved against, and accepting it makes the reservation a \
+             decoration"
+        );
+        assert_eq!(
+            refused_oversized_fetches(),
+            before + 1,
+            "the refusal must be COUNTED. It is a legitimate degradation — the \
+             delegate is told, exactly as for a miss or a timeout on this path \
+             — which is precisely why an operator needs to be able to see that \
+             it happened"
+        );
+    }
+
+    /// M3, the SIBLING SITE: a QUEUED notification that parks on its own run
     /// M3, the SIBLING SITE: a QUEUED notification that parks on its own run
     /// must also fan its residual output out to apps.
     ///
