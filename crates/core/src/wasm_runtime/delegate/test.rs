@@ -4919,3 +4919,247 @@ mod hosted_user_secrets {
         Ok(())
     }
 }
+
+/// REGRESSION (#5480): re-entering an instance id whose `DelegateCallEnv` is
+/// still live must FAIL CLOSED, in release builds too.
+///
+/// This is the release-visible half of the change that promoted a
+/// `debug_assert!` to a hard `Err`. The assert compiled out in release, so
+/// before #5480 the only thing preventing re-entry was the batch loop in
+/// `interface.rs` aborting on the first error — control flow, not a guarantee.
+///
+/// It became memory safety when the guest moved off the calling thread. One
+/// `RunningInstance` id is shared by every message in a batch, and on the
+/// wall-clock-timeout path the previous message's guest is still running on an
+/// abandoned `spawn_blocking` thread (`abort()` cannot stop one). Inserting a
+/// new env under that id would make the abandoned guest's
+/// `DELEGATE_ENV.get(&id)` resolve to the NEW env and dereference its raw store
+/// pointers while this thread holds `&mut` to the very same stores — aliasing
+/// UB across two threads, with no `unsafe` at the edit site that caused it.
+///
+/// Unreachable today. That is exactly why it needs a test: an edit making the
+/// batch loop error-tolerant ("collect errors and continue", "retry the
+/// message") would reintroduce it silently, and nothing else would object.
+#[tokio::test]
+async fn reentering_a_live_instance_id_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+    use super::super::engine::InstanceHandle;
+    use super::super::native_api::{DELEGATE_ENV, DelegateCallEnv, DelegateEnvSlot};
+
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+
+    // Far above anything `next_instance_id` will hand out: it is a monotonic
+    // counter starting at 0, incremented once per instance.
+    const LIVE_ID: i64 = i64::MAX - 5480;
+
+    let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::ReadContext)?;
+    let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload));
+    let handle = InstanceHandle { id: LIVE_ID };
+    let params: Parameters = vec![].into();
+
+    // CONTROL: with LIVE_ID unoccupied the guard must not fire. This call fails
+    // for an unrelated reason (no engine instance under that handle), which is
+    // the point — it proves the assertion below distinguishes the re-entry
+    // guard from "this call failed somehow", rather than passing on any error.
+    let control = runtime.exec_inbound_with_env(
+        delegate.key(),
+        &params,
+        None,
+        None,
+        &msg,
+        Vec::new(),
+        &handle,
+        LIVE_ID,
+        DelegateApiVersion::V2,
+    );
+    let control_msg = format!("{:?}", control.err());
+    assert!(
+        !control_msg.contains("already active"),
+        "control call must not trip the re-entry guard, got: {control_msg}"
+    );
+
+    // Occupy LIVE_ID exactly as an abandoned guest's env would.
+    // SAFETY: the env is removed below before `runtime` (which owns the stores
+    // these pointers address) is dropped, and no guest ever runs against it.
+    let env = unsafe {
+        DelegateCallEnv::new(
+            Vec::new(),
+            &mut runtime.secret_store,
+            &runtime.contract_store,
+            runtime.state_store_db.clone(),
+            runtime.state_write_callback.clone(),
+            runtime.state_admit_callback.clone(),
+            delegate.key().clone(),
+            &mut runtime.delegate_store,
+            0,
+            Vec::new(),
+            None,
+            runtime.created_delegates_count.clone(),
+            runtime.inherited_origins.clone(),
+        )
+    };
+    DELEGATE_ENV.insert(LIVE_ID, DelegateEnvSlot::new(env));
+
+    let result = runtime.exec_inbound_with_env(
+        delegate.key(),
+        &params,
+        None,
+        None,
+        &msg,
+        Vec::new(),
+        &handle,
+        LIVE_ID,
+        DelegateApiVersion::V2,
+    );
+
+    // Remove before asserting: a panicking assert would otherwise leave a stale
+    // env in the process-global map for every later test in this binary.
+    DELEGATE_ENV.remove(&LIVE_ID);
+
+    let err = result.expect_err(
+        "re-entering an instance id with a live env must fail closed, not proceed (#5480)",
+    );
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("already active"),
+        "expected the re-entry guard's error, got: {rendered}"
+    );
+
+    Ok(())
+}
+
+/// REGRESSION (#5480 review, F1): re-entry must be refused while a guest is
+/// still running, EVEN THOUGH its `DELEGATE_ENV` entry has already been removed.
+///
+/// This is the case the first version of the guard could not see.
+/// `DelegateEnvGuard::drop` removes the env on every exit path of
+/// `exec_inbound_with_env`, including the wall-clock-timeout `Err` — and on that
+/// path the guest is still running on an abandoned `spawn_blocking` thread,
+/// since `abort()` cannot stop a closure that has started. So by the time the
+/// batch loop sees the error, `DELEGATE_ENV.contains_key(id)` is already false
+/// while the dangerous condition — a live guest holding raw pointers to this
+/// runtime's stores — is still true.
+///
+/// A check on `DELEGATE_ENV` alone therefore reads false in exactly the
+/// scenario the guard exists for. `LIVE_DELEGATE_GUESTS` tracks the guest's own
+/// lifetime instead, which is the fact that matters.
+///
+/// Simulated by registering the id directly: reproducing it through a real
+/// abandoned guest would need an error-tolerant batch loop, which is precisely
+/// the future edit this guard is here to catch and which does not exist yet.
+#[tokio::test]
+async fn reentering_an_id_with_a_live_guest_fails_closed_even_with_no_env()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::super::engine::InstanceHandle;
+    use super::super::native_api::{DELEGATE_ENV, LIVE_DELEGATE_GUESTS};
+
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+
+    const LIVE_ID: i64 = i64::MAX - 54801;
+
+    let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::ReadContext)?;
+    let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload));
+    let handle = InstanceHandle { id: LIVE_ID };
+    let params: Parameters = vec![].into();
+
+    // The env is absent, exactly as `DelegateEnvGuard::drop` leaves it after a
+    // wall-clock timeout. Only the guest registration remains.
+    assert!(
+        !DELEGATE_ENV.contains_key(&LIVE_ID),
+        "precondition: no env under LIVE_ID, so a DELEGATE_ENV-only check would pass"
+    );
+    LIVE_DELEGATE_GUESTS.insert(LIVE_ID);
+
+    let result = runtime.exec_inbound_with_env(
+        delegate.key(),
+        &params,
+        None,
+        None,
+        &msg,
+        Vec::new(),
+        &handle,
+        LIVE_ID,
+        DelegateApiVersion::V2,
+    );
+
+    // Clear before asserting so a failure cannot strand a live-guest marker in
+    // the process-global set for every later test in this binary.
+    LIVE_DELEGATE_GUESTS.remove(&LIVE_ID);
+
+    let err = result.expect_err(
+        "re-entry must be refused while a guest is still live, even with the env already \
+         removed (#5480 review F1)",
+    );
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("already active"),
+        "expected the re-entry guard's error, got: {rendered}"
+    );
+
+    Ok(())
+}
+
+/// REGRESSION (#5480 review): `exec_inbound_with_env` must have finished its
+/// cleanup by the time it RETURNS — on the error path as much as the success
+/// path — not merely "eventually".
+///
+/// This pins the fact that makes the #5554 interaction safe, and which nothing
+/// else states. #5554 parks delegates off the serial `contract_handling` loop,
+/// so a delegate's round trip can now span two loop iterations; its own comment
+/// notes that the serial loop was the ONLY thing guaranteeing one `process()`
+/// per delegate. What keeps that sound is ordering: `_guard` is a local of
+/// `exec_inbound_with_env`, so `DELEGATE_ENV` is cleared strictly before the
+/// `Err` reaches `inbound_app_message`, before `DelegateRunOutcome::Failed`, and
+/// therefore before a park can release a queued run for the same delegate.
+///
+/// That is the placement of one local variable, load-bearing across two merged
+/// changes, and until this test nothing checked it. A `std::mem::forget(_guard)`
+/// — or hoisting the guard into the caller to "clean up once per batch" — would
+/// leave the entry live past the return with no other alarm.
+#[tokio::test]
+async fn env_cleanup_completes_before_the_call_returns() -> Result<(), Box<dyn std::error::Error>> {
+    use super::super::engine::InstanceHandle;
+    use super::super::native_api::{DELEGATE_ENV, LIVE_DELEGATE_GUESTS};
+
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+
+    const ID: i64 = i64::MAX - 54802;
+
+    let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::ReadContext)?;
+    let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload));
+    let handle = InstanceHandle { id: ID };
+    let params: Parameters = vec![].into();
+
+    // Fails inside `exec_inbound` (no engine instance under this handle), which
+    // is the path that matters: the guard must still have run.
+    let result = runtime.exec_inbound_with_env(
+        delegate.key(),
+        &params,
+        None,
+        None,
+        &msg,
+        Vec::new(),
+        &handle,
+        ID,
+        DelegateApiVersion::V2,
+    );
+    assert!(
+        result.is_err(),
+        "fixture precondition: this call is expected to fail, so the assertions \
+         below are about the ERROR path"
+    );
+
+    assert!(
+        !DELEGATE_ENV.contains_key(&ID),
+        "`exec_inbound_with_env` returned with its DELEGATE_ENV entry still \
+         present. `_guard` must drop inside this function, before the error \
+         reaches `inbound_app_message` and before #5554's park can release a \
+         queued run for the same delegate"
+    );
+    assert!(
+        !LIVE_DELEGATE_GUESTS.contains(&ID),
+        "no guest ever started for this call, so nothing may be left registered \
+         as live — a stale entry here would refuse every later call on this id"
+    );
+
+    Ok(())
+}
