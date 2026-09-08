@@ -211,9 +211,42 @@ pub(super) const MAX_DEFERRED_UPSERTS_PER_PARK: usize = 4;
 /// pattern found on this change alone (see #5551), and `code-style.md` rule 4
 /// requires the cap be on the quantity actually consumed.
 ///
-/// 64 MiB: generous beside the 50 MB single-state ceiling the runtime already
-/// allows, while bounding the aggregate a flood of parked delegates can pin.
+/// 64 MiB on a host with the RAM for it — generous beside the 50 MB
+/// single-state ceiling the runtime already allows, while bounding the
+/// aggregate a flood of parked delegates can pin. See [`parked_budget_for`]:
+/// this is the CLAMP CEILING, not the budget a given node gets.
 pub(super) const MAX_PARKED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Floor, so a very small host still admits some parks rather than falling back
+/// inline for everything.
+const MIN_PARKED_BYTES: usize = 8 * 1024 * 1024;
+
+/// RAM assumed when the host's real figure cannot be read — the same
+/// conservative 1 GiB every sibling budget falls back to.
+const FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Fraction of node memory the park registry may pin. Matches the shape of
+/// every sibling budget (`budget_for_ram`, `summary_budget_for`, ...), which is
+/// the point — see [`parked_budget_for`].
+const PARKED_RAM_DIVISOR: usize = 32;
+
+/// The park budget a node with `total_ram` bytes actually gets.
+///
+/// A FLAT CONSTANT IS NOT A MEMORY BUDGET ON A SMALL HOST, and this only became
+/// visible once `MAX_PARKED_BYTES` was added to
+/// `contract::executor::declared_cache_ceiling` (#5554 follow-up). It had never
+/// been in that sum, so nothing compared it against the host: with it included,
+/// `cache_byte_budgets_are_aggregate_safe` immediately went red — a 1 GiB VPS
+/// declared 566 MB of ceilings against a 537 MB half-limit. The over-commit was
+/// real all along; the aggregate simply could not see it.
+///
+/// This is the same family of mistake as the one `MAX_PARKED_BYTES` itself was
+/// introduced to fix, one level up: a count cap reads like a memory bound, and
+/// a FLAT memory cap reads like it scales. Every other term in that sum is
+/// RAM-derived, so this one is too.
+pub(super) fn parked_budget_for(total_ram: usize) -> usize {
+    (total_ram / PARKED_RAM_DIVISOR).clamp(MIN_PARKED_BYTES, MAX_PARKED_BYTES)
+}
 
 /// Bytes ONE deferred upsert's off-loop related-contract fetch may RETAIN.
 ///
@@ -244,7 +277,7 @@ pub(super) const MAX_PARKED_BYTES: usize = 64 * 1024 * 1024;
 /// the park's lifetime, which is what this budget is about. The transient peak
 /// stays bounded by the sub-op GET path, as it already was.
 pub(super) const MAX_UPSERT_FETCH_BYTES: usize =
-    MAX_PARKED_BYTES / (8 * MAX_DEFERRED_UPSERTS_PER_PARK);
+    MIN_PARKED_BYTES / (8 * MAX_DEFERRED_UPSERTS_PER_PARK);
 
 /// Approximate heap footprint of the payloads a continuation pins.
 ///
@@ -342,6 +375,11 @@ pub(super) fn request_bytes(req: &DelegateRequest<'static>) -> usize {
     }
 }
 
+// `#[allow]` on the FUNCTION: clippy emits `wildcard_enum_match_arm` at the
+// match expression, so an arm-level attribute does not suppress it. Both
+// `DelegateContainer` and `DelegateWasmAPIVersion` are `#[non_exhaustive]`, so
+// the wildcard cannot be removed; every variant that exists is listed.
+#[allow(clippy::wildcard_enum_match_arm)]
 fn delegate_container_bytes(delegate: &freenet_stdlib::prelude::DelegateContainer) -> usize {
     use freenet_stdlib::prelude::{DelegateContainer, DelegateWasmAPIVersion};
     // THE PARAMETERS ARE NOT FREE, and the comment this replaced said they were
@@ -483,6 +521,13 @@ fn related_contracts_bytes(related: &RelatedContracts<'static>) -> usize {
 /// two `get_context()` omissions this file already documents, and found the
 /// same way: by asking what each field of each variant actually retains rather
 /// than what the variant is called.
+//
+// The `#[allow]` sits on the FUNCTION, not on the arm: clippy emits
+// `wildcard_enum_match_arm` at the match EXPRESSION, so an arm-level attribute
+// does not suppress it — the same trap #5554 hit, where a local `cargo test`
+// was green while CI's `-D warnings` went red. The wildcard is required because
+// `UpdateData` is `#[non_exhaustive]`; every variant that exists IS listed.
+#[allow(clippy::wildcard_enum_match_arm)]
 fn update_data_bytes(update: &UpdateData<'static>) -> usize {
     match update {
         UpdateData::State(state) => state.as_ref().len(),
@@ -754,6 +799,53 @@ pub(super) struct PendingUpsert {
     pub missing: Vec<ContractInstanceId>,
 }
 
+/// One upsert a park owes a response for, carried so a SYNTHESIZED failure can
+/// echo what the delegate sent.
+///
+/// Was `(ContractInstanceId, bool)`. The context was dropped on the floor and
+/// `handle_delegate_resume` rebuilt the failure with `DelegateContext::default()`
+/// — its comment said "the `PendingUpsert` that carried it is gone by then",
+/// which was true and was the bug rather than the reason. Delegates use the
+/// echoed context to correlate a response with the request that produced it, so
+/// a defaulted one can be applied to the WRONG logical request, and is simply
+/// unusable when two requests target the same contract. Reachable on every
+/// abnormal exit: panic, cancellation, or the off-loop budget expiring.
+///
+/// The identity half is still `(contract, is_put)` — the reconciliation below
+/// is a MULTISET match on exactly those two, and the context is payload carried
+/// alongside, not part of the key.
+pub(super) struct OwedUpsert {
+    pub contract: ContractInstanceId,
+    pub is_put: bool,
+    pub context: DelegateContext,
+}
+
+/// What a park OWES, derived from the upserts its off-loop task is carrying.
+///
+/// A FUNCTION rather than an inline `map` at the call site, and the reason is
+/// the defect it fixes. The context was dropped where this list was built, in
+/// `handle_delegate_with_contract_requests`, and the guard-level test that
+/// exercised the synthesized failure could not see it: that test builds a
+/// `ParkGuard` directly, so it pinned that the guard PRESERVES what it is
+/// given, never that the caller gives it the right thing. Falsifying the fix
+/// against the old inline construction proved that — defaulting the context at
+/// the call site left the whole suite green.
+///
+/// With the construction here there is no context expression at the call site
+/// to get wrong, and `owed_upserts_carry_the_delegate_s_context` covers the one
+/// place it can be.
+pub(super) fn owed_upserts(upserts: &[PendingUpsert]) -> Vec<OwedUpsert> {
+    upserts
+        .iter()
+        .map(|u| OwedUpsert {
+            contract: *u.key.id(),
+            is_put: u.is_put,
+            // ECHOED BACK on a synthesized failure. See `OwedUpsert::context`.
+            context: u.context.clone(),
+        })
+        .collect()
+}
+
 /// A [`PendingUpsert`] whose off-loop fetch has finished, one way or the other.
 pub(super) struct ResolvedUpsert {
     pub pending: PendingUpsert,
@@ -785,7 +877,7 @@ pub(super) struct DelegateResume {
     /// Upserts the off-loop task never resolved — it panicked, was cancelled,
     /// or ran out of budget. `(contract, is_put)`, turned into failure
     /// responses by the resume handler so the delegate is told.
-    pub unresolved_upserts: Vec<(ContractInstanceId, bool)>,
+    pub unresolved_upserts: Vec<OwedUpsert>,
 }
 
 /// RAII guard guaranteeing an off-loop task delivers EXACTLY ONE
@@ -813,11 +905,11 @@ struct ParkGuardPayload {
     /// Prompt request ids this park owes a `UserResponse` for. A MULTISET:
     /// `request_id` is chosen by delegate WASM, so `[7, 7]` is reachable.
     owed_prompts: Vec<u32>,
-    /// Upserts this park owes a response for, as `(contract, is_put)`. Also a
-    /// MULTISET: `deferred_upserts` is built by two independent loops (PUTs and
-    /// UPDATEs) with no de-duplication, so `[(X,true),(X,false)]` and
-    /// `[(X,true),(X,true)]` are both reachable.
-    owed_upserts: Vec<(ContractInstanceId, bool)>,
+    /// Upserts this park owes a response for. Also a MULTISET: `deferred_upserts`
+    /// is built by two independent loops (PUTs and UPDATEs) with no
+    /// de-duplication, so `[(X,true),(X,false)]` and `[(X,true),(X,true)]` are
+    /// both reachable.
+    owed_upserts: Vec<OwedUpsert>,
     /// Where the off-loop task deposits results AS THEY COMPLETE. Shared with
     /// the task rather than created inside it, so `Drop` can see work that
     /// finished before a panic or cancellation (#5544 F2).
@@ -832,7 +924,7 @@ impl ParkGuard {
         delegate_key: DelegateKey,
         epoch: u64,
         owed_prompts: Vec<u32>,
-        owed_upserts: Vec<(ContractInstanceId, bool)>,
+        owed_upserts: Vec<OwedUpsert>,
         answers: std::sync::Arc<std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>>,
         fetches: std::sync::Arc<std::sync::Mutex<Vec<ResolvedUpsert>>>,
     ) -> Self {
@@ -936,10 +1028,10 @@ impl ParkGuard {
                 .or_default() += 1;
         }
         let mut unresolved_upserts = Vec::new();
-        for (id, is_put) in owed_upserts {
-            match resolved.get_mut(&(id, is_put)) {
+        for owed in owed_upserts {
+            match resolved.get_mut(&(owed.contract, owed.is_put)) {
                 Some(n) if *n > 0 => *n -= 1,
-                _ => unresolved_upserts.push((id, is_put)),
+                _ => unresolved_upserts.push(owed),
             }
         }
         if !unresolved_upserts.is_empty() {
@@ -1010,6 +1102,8 @@ pub(super) struct DelegateParkCtx {
     /// Running total of every retained payload across live parks (#5544 S4):
     /// continuations, off-loop task work, and queued pending runs.
     parked_bytes: usize,
+    /// What `parked_bytes` is measured against, from [`parked_budget_for`].
+    budget: usize,
     /// Source of park identities; see [`DelegateResume::epoch`].
     next_epoch: u64,
     /// Refusal counters, per cause (L9). A refusal that is only logged is a
@@ -1035,13 +1129,28 @@ pub(super) struct RefusalCounts {
 
 impl DelegateParkCtx {
     pub(super) fn new(resume_tx: tokio::sync::mpsc::UnboundedSender<DelegateResume>) -> Self {
+        // Read once, at construction: the budget is a property of the host, and
+        // re-reading it per admission would make the cap wobble under memory
+        // pressure exactly when it most needs to be stable.
+        let budget = parked_budget_for(
+            crate::wasm_runtime::read_total_ram_bytes().unwrap_or(FALLBACK_TOTAL_RAM_BYTES),
+        );
         Self {
             parked: HashMap::new(),
             parked_bytes: 0,
+            budget,
             next_epoch: 0,
             refused: RefusalCounts::default(),
             resume_tx,
         }
+    }
+
+    /// The byte budget this registry is enforcing. Tests assert against THIS
+    /// rather than against `MAX_PARKED_BYTES`, so they stay true on a host
+    /// whose scaled budget is smaller than the clamp ceiling.
+    #[cfg(test)]
+    pub(super) fn budget(&self) -> usize {
+        self.budget
     }
 
     pub(super) fn resume_tx(&self) -> &tokio::sync::mpsc::UnboundedSender<DelegateResume> {
@@ -1092,7 +1201,7 @@ impl DelegateParkCtx {
         task_bytes: usize,
     ) -> ParkAdmission {
         let bytes = continuation_bytes(&continuation).saturating_add(task_bytes);
-        let over_bytes = self.parked_bytes.saturating_add(bytes) > MAX_PARKED_BYTES;
+        let over_bytes = self.parked_bytes.saturating_add(bytes) > self.budget;
         if self.parked.len() >= MAX_PARKED_DELEGATES || self.parked.contains_key(&key) || over_bytes
         {
             tracing::warn!(
@@ -1101,7 +1210,7 @@ impl DelegateParkCtx {
                 limit = MAX_PARKED_DELEGATES,
                 parked_bytes = self.parked_bytes,
                 adding_bytes = bytes,
-                byte_limit = MAX_PARKED_BYTES,
+                byte_limit = self.budget,
                 over_bytes,
                 already_parked = self.parked.contains_key(&key),
                 total_refused_parks = self.refused.parks.saturating_add(1),
@@ -1136,6 +1245,7 @@ impl DelegateParkCtx {
     /// the request is still answered.
     pub(super) fn queue_pending(&mut self, key: &DelegateKey, req: PendingRun) -> QueueOutcome {
         let parked_bytes = self.parked_bytes;
+        let budget = self.budget;
         let Some(entry) = self.parked.get_mut(key) else {
             return QueueOutcome::Rejected(Box::new(req));
         };
@@ -1177,13 +1287,13 @@ impl DelegateParkCtx {
                 let projected = parked_bytes
                     .saturating_add(bytes)
                     .saturating_sub(superseded);
-                if projected > MAX_PARKED_BYTES {
+                if projected > budget {
                     tracing::info!(
                         delegate = %key,
                         contract = %contract_id,
                         parked_bytes,
                         adding_bytes = bytes,
-                        byte_limit = MAX_PARKED_BYTES,
+                        byte_limit = budget,
                         total_dropped = self.refused.notifications.saturating_add(1),
                         "Dropped a notification: queueing it would exceed the parked \
                          byte budget"
@@ -1236,12 +1346,12 @@ impl DelegateParkCtx {
                 // local app pushing large ApplicationMessages behind a single
                 // park could disable parking for the whole node — reinstating
                 // the exact stall this change removes.
-                if parked_bytes.saturating_add(bytes) > MAX_PARKED_BYTES {
+                if parked_bytes.saturating_add(bytes) > budget {
                     tracing::warn!(
                         delegate = %key,
                         parked_bytes,
                         adding_bytes = bytes,
-                        byte_limit = MAX_PARKED_BYTES,
+                        byte_limit = budget,
                         total_refused = self.refused.client_requests.saturating_add(1),
                         "Refusing to queue a delegate request: it would exceed the \
                          parked byte budget"
@@ -1842,8 +1952,8 @@ mod tests {
         fn upsert(context: DelegateContext, missing: Vec<ContractInstanceId>) -> PendingUpsert {
             PendingUpsert {
                 key: ContractKey::from_params_and_code(
-                    &Parameters::from(vec![]),
-                    &freenet_stdlib::prelude::ContractCode::from(vec![0u8; 4]),
+                    Parameters::from(vec![]),
+                    freenet_stdlib::prelude::ContractCode::from(vec![0u8; 4]),
                 ),
                 update: Either::Right(StateDelta::from(vec![0u8; T_DELTA])),
                 related_contracts: RelatedContracts::default(),
@@ -1892,10 +2002,12 @@ mod tests {
     fn the_fetch_allowance_leaves_the_node_cap_binding() {
         let worst_case_park = MAX_UPSERT_FETCH_BYTES * MAX_DEFERRED_UPSERTS_PER_PARK;
         assert!(
-            worst_case_park > 0 && worst_case_park <= MAX_PARKED_BYTES / 8,
+            worst_case_park > 0 && worst_case_park <= MIN_PARKED_BYTES / 8,
             "one park's fetch reserve ({worst_case_park}) must leave room for \
-             others under MAX_PARKED_BYTES ({MAX_PARKED_BYTES}); a reserve that \
-             fills the cap turns every deferred upsert into an inline fallback"
+             others under the SMALLEST budget a node can get \
+             ({MIN_PARKED_BYTES}) — not merely under the clamp ceiling; a \
+             reserve sized to the ceiling fills a small host's whole budget and \
+             turns every deferred upsert into an inline fallback"
         );
     }
 
@@ -2724,7 +2836,7 @@ mod tests {
 
         // Fill the budget with parks that each carry a large task payload, and
         // confirm admission is refused rather than the total silently growing.
-        let per_park = MAX_PARKED_BYTES / 4;
+        let per_park = ctx.budget() / 4;
         let mut admitted = 0usize;
         for i in 0..MAX_PARKED_DELEGATES {
             match ctx.park(key(i as u8), continuation(), per_park) {
@@ -2736,7 +2848,8 @@ mod tests {
             admitted <= 4,
             "the byte cap must refuse once the RETAINED total is reached; \
              admitted {admitted} parks of {per_park} bytes each against a \
-             {MAX_PARKED_BYTES} byte budget"
+             {} byte budget",
+            ctx.budget()
         );
     }
 
@@ -2802,7 +2915,11 @@ mod tests {
             key(1),
             0,
             vec![1, 2],
-            vec![(ContractInstanceId::new([3; 32]), true)],
+            vec![OwedUpsert {
+                contract: ContractInstanceId::new([3; 32]),
+                is_put: true,
+                context: DelegateContext::new(b"correlation-token".to_vec()),
+            }],
             answers,
             fetches,
         ));
@@ -2814,10 +2931,126 @@ mod tests {
             "every owed prompt must get a synthesized response, or the delegate \
              waits forever for one nothing remains to produce"
         );
+        assert_eq!(resume.unresolved_upserts.len(), 1);
+        let owed = &resume.unresolved_upserts[0];
+        assert_eq!(owed.contract, ContractInstanceId::new([3; 32]));
+        assert!(owed.is_put);
         assert_eq!(
-            resume.unresolved_upserts,
-            vec![(ContractInstanceId::new([3; 32]), true)],
-            "every owed upsert must be reported unresolved"
+            owed.context.as_ref(),
+            b"correlation-token",
+            "the synthesized failure must echo the context the DELEGATE sent. \
+             It is how a delegate correlates a response with the request that \
+             produced it, so a defaulted one can be applied to the wrong \
+             logical request, and is unusable outright when two requests target \
+             the same contract"
+        );
+    }
+
+    /// The owed list must carry the context the DELEGATE sent.
+    ///
+    /// This is the assertion that was missing. The guard-level tests build a
+    /// `ParkGuard` directly, so they pin that the guard preserves what it is
+    /// GIVEN — and the bug was in what the caller gave it. Defaulting the
+    /// context where this list used to be built inline left every one of them
+    /// green.
+    ///
+    /// FALSIFY by defaulting `context` in `owed_upserts`.
+    #[test]
+    fn owed_upserts_carry_the_delegate_s_context() {
+        let key = ContractKey::from_params_and_code(
+            Parameters::from(vec![]),
+            freenet_stdlib::prelude::ContractCode::from(vec![0u8; 4]),
+        );
+        let owed = owed_upserts(&[PendingUpsert {
+            key,
+            update: Either::Right(StateDelta::from(vec![])),
+            related_contracts: RelatedContracts::default(),
+            code: None,
+            is_put: true,
+            context: DelegateContext::new(b"correlation-token".to_vec()),
+            missing: Vec::new(),
+        }]);
+        assert_eq!(owed.len(), 1);
+        assert_eq!(owed[0].contract, *key.id());
+        assert!(owed[0].is_put);
+        assert_eq!(
+            owed[0].context.as_ref(),
+            b"correlation-token",
+            "the owed record must carry the delegate's own context: it is what \
+             a synthesized failure echoes, and it is how the delegate tells \
+             WHICH request failed when two target the same contract"
+        );
+    }
+
+    /// The context survives RECONCILIATION, not just construction.
+    /// The context survives RECONCILIATION, not just construction.
+    ///
+    /// The owed list is matched against completions as a MULTISET on
+    /// `(contract, is_put)`, so two upserts naming one contract are
+    /// indistinguishable by key — which is exactly the case where a defaulted
+    /// context is unusable rather than merely unhelpful. Here one of the two
+    /// completes and the other does not; the survivor must carry ITS OWN
+    /// context through.
+    ///
+    /// FALSIFY by defaulting the context anywhere on that path.
+    #[tokio::test]
+    async fn a_partially_resolved_upsert_pair_keeps_the_unresolved_one_s_context() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (answers, fetches) = sinks();
+        // Derive the id FROM the key the resolved upsert will carry, so the
+        // reconciliation really does match it. Building the two independently
+        // makes the completion match nothing and the test pass for the wrong
+        // reason.
+        let resolved_key = ContractKey::from_params_and_code(
+            Parameters::from(vec![]),
+            freenet_stdlib::prelude::ContractCode::from(vec![0u8; 4]),
+        );
+        let contract = *resolved_key.id();
+        let guard = ParkGuard::new(
+            tx,
+            key(1),
+            0,
+            Vec::new(),
+            vec![
+                OwedUpsert {
+                    contract,
+                    is_put: true,
+                    context: DelegateContext::new(b"first".to_vec()),
+                },
+                OwedUpsert {
+                    contract,
+                    is_put: true,
+                    context: DelegateContext::new(b"second".to_vec()),
+                },
+            ],
+            answers,
+            fetches.clone(),
+        );
+        // Exactly ONE of the pair resolves.
+        fetches.lock().unwrap().push(ResolvedUpsert {
+            pending: PendingUpsert {
+                key: resolved_key,
+                update: Either::Right(StateDelta::from(vec![])),
+                related_contracts: RelatedContracts::default(),
+                code: None,
+                is_put: true,
+                context: DelegateContext::new(b"first".to_vec()),
+                missing: Vec::new(),
+            },
+            fetched: Ok(Vec::new()),
+        });
+        drop(guard);
+
+        let resume = rx.recv().await.expect("drop must still resume the park");
+        assert_eq!(
+            resume.unresolved_upserts.len(),
+            1,
+            "one of the pair resolved, so exactly one obligation must remain"
+        );
+        assert!(
+            !resume.unresolved_upserts[0].context.as_ref().is_empty(),
+            "the surviving obligation must still carry a context; a defaulted \
+             one cannot be told from the resolved sibling's"
         );
     }
 
@@ -2879,7 +3112,18 @@ mod tests {
             key(1),
             0,
             vec![7, 7],
-            vec![(contract, true), (contract, true)],
+            vec![
+                OwedUpsert {
+                    contract,
+                    is_put: true,
+                    context: DelegateContext::default(),
+                },
+                OwedUpsert {
+                    contract,
+                    is_put: true,
+                    context: DelegateContext::default(),
+                },
+            ],
             answers,
             fetches,
         ));

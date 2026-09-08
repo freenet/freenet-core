@@ -1392,6 +1392,16 @@ pub(crate) fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> u
     let page_cache = crate::contract::storages::redb::page_cache_size_for(memory_limit);
     #[cfg(not(feature = "redb"))]
     let page_cache = 0;
+    // The delegate park registry's node-wide retention cap (#5544 S4). One per
+    // node, so NOT multiplied by the pool.
+    //
+    // Missing from this sum until the #5554 follow-up, which matters because
+    // `ring::hosting::cache::resident_overhead_budget_for` derives the hosting
+    // budget as a RESIDUAL from this figure: hosting was treating 64 MiB
+    // already committed to parked delegates as available to it. That is
+    // #5268's defect 3 in a new term — the reason this function was promoted
+    // out of the test module in the first place.
+    let parked = crate::contract::delegate_park::parked_budget_for(memory_limit);
 
     pool_size * (summary + delta + arena)
         + contract_modules
@@ -1399,6 +1409,7 @@ pub(crate) fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> u
         + source_code
         + interest_delta
         + page_cache
+        + parked
 }
 
 /// Fallback total-RAM estimate (1 GiB) when the OS query fails — mirrors the
@@ -1839,6 +1850,7 @@ mod tests {
             "SOURCE_CODE_CACHE_MAX_BYTES",
             "interest_delta_budget_for",
             "page_cache_size_for",
+            "parked_budget_for",
         ] {
             assert!(
                 body.contains(required),
@@ -1852,6 +1864,246 @@ mod tests {
             "the per-executor terms must be multiplied by the pool size — that \
              product IS defect 3"
         );
+    }
+
+    /// The other half of `declared_cache_ceiling_names_every_budget`, and the
+    /// half that was missing: that one catches a summed budget being REMOVED;
+    /// this one catches a new one being ADDED and not summed.
+    ///
+    /// WHY THE SIBLING COULD NOT DO IT. That test is scrupulously defended
+    /// against every vacuity mode its author anticipated — it asserts its
+    /// scrape anchor occurs exactly once so it cannot match its own text,
+    /// requires a closing `\n}` rather than widening to EOF, and asserts the
+    /// scoped region did not escape into a sibling item. All of that is well
+    /// built. Then it validates a HARDCODED LIST of eight names. Its doc says
+    /// "every budget that consumes node memory has to appear in the sum, and a
+    /// new one is added here at the same time it is added there" — which is an
+    /// honour-system requirement written as though it were a check. A ninth
+    /// budget (`MAX_PARKED_BYTES`, #5544) was added, was not summed, and the
+    /// guard had no way to fail: `resident_overhead_budget_for` derives the
+    /// hosting budget as a residual from this figure, so hosting was treating
+    /// 64 MiB already committed to parked delegates as free.
+    ///
+    /// So this DISCOVERS budgets instead of listing them. Anything it finds is
+    /// either in the sum, or in `NOT_SUMMED` with a reason — an exclusion
+    /// becomes a visible decision rather than an omission. And every
+    /// `NOT_SUMMED` entry must still be discoverable, so the table cannot rot
+    /// into a list of names that no longer exist.
+    ///
+    /// DISCOVERY RULE, and its stated limits. Module-scope (column 0)
+    /// `const NAME: usize` where `NAME` ends in `_BYTES`, plus every
+    /// `fn *_budget_for(`. Column 0 is principled rather than convenient: a
+    /// budget this function could reference has to be at module scope, so a
+    /// function-local or test-local constant cannot be one. The rule does not
+    /// catch a budget expressed as a differently-named function
+    /// (`budget_for_ram`, `page_cache_size_for`) — those are held by the
+    /// sibling test's explicit list, which is why both tests exist.
+    ///
+    /// FALSIFY by adding a tenth module-scope `*_BYTES` constant anywhere under
+    /// `crates/core/src` without summing it or listing it below. Verified by
+    /// doing exactly that.
+    #[test]
+    fn declared_cache_ceiling_discovers_every_budget() {
+        /// Budgets deliberately NOT in the aggregate, each with the reason.
+        /// Adding a name here is a decision someone has to write down.
+        const NOT_SUMMED: &[(&str, &str)] = &[
+            // Clamps and fallbacks consumed INSIDE a summed budget function.
+            // Summing them as well would double-count.
+            ("SUMMARY_CACHE_MIN_BYTES", "clamp inside summary_budget_for"),
+            ("SUMMARY_CACHE_MAX_BYTES", "clamp inside summary_budget_for"),
+            (
+                "SUMMARY_CACHE_FALLBACK_TOTAL_RAM_BYTES",
+                "RAM fallback for summary_budget_for",
+            ),
+            ("DELTA_CACHE_MIN_BYTES", "clamp inside delta_budget_for"),
+            ("DELTA_CACHE_MAX_BYTES", "clamp inside delta_budget_for"),
+            (
+                "CACHE_ABSOLUTE_FLOOR_BYTES",
+                "floor shared by the clamps above",
+            ),
+            (
+                "STORE_ARENA_MIN_BYTES",
+                "clamp inside store_arena_budget_for",
+            ),
+            (
+                "STORE_ARENA_MAX_BYTES",
+                "clamp inside store_arena_budget_for",
+            ),
+            (
+                "STORE_ARENA_FALLBACK_TOTAL_RAM_BYTES",
+                "RAM fallback for store_arena_budget_for",
+            ),
+            ("PAGE_CACHE_MIN_BYTES", "clamp inside page_cache_size_for"),
+            ("PAGE_CACHE_MAX_BYTES", "clamp inside page_cache_size_for"),
+            (
+                "PAGE_CACHE_FALLBACK_TOTAL_RAM_BYTES",
+                "RAM fallback for page_cache_size_for",
+            ),
+            (
+                "INTEREST_DELTA_CACHE_MIN_BYTES",
+                "clamp inside interest_delta_budget_for",
+            ),
+            (
+                "INTEREST_DELTA_CACHE_MAX_BYTES",
+                "clamp inside interest_delta_budget_for",
+            ),
+            (
+                "INTEREST_DELTA_CACHE_FALLBACK_TOTAL_RAM_BYTES",
+                "RAM fallback for interest_delta_budget_for",
+            ),
+            (
+                "MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES",
+                "clamp inside budget_for_ram",
+            ),
+            (
+                "MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES",
+                "clamp inside budget_for_ram",
+            ),
+            (
+                "FALLBACK_TOTAL_RAM_BYTES",
+                "RAM fallback for budget_for_ram",
+            ),
+            (
+                "CGROUP_UNLIMITED_THRESHOLD_BYTES",
+                "sentinel for reading the cgroup limit, not a budget",
+            ),
+            ("MAX_PARKED_BYTES", "clamp inside parked_budget_for"),
+            ("MIN_PARKED_BYTES", "clamp inside parked_budget_for"),
+            (
+                "MAX_UPSERT_FETCH_BYTES",
+                "sub-allowance carved OUT OF MAX_PARKED_BYTES, which is summed",
+            ),
+            // Per-request / per-message limits. Bounded and released within one
+            // operation, so they are not memory the node holds resident.
+            ("MAX_EVIDENCE_INPUT_BYTES", "per-request input limit"),
+            ("MAX_IMPORT_BUNDLE_BYTES", "per-request import limit"),
+            ("MAX_PULL_IMPORT_REQUEST_BYTES", "per-request limit"),
+            ("MAX_PULL_STORE_BYTES", "per-user on-DISK quota, not RAM"),
+            (
+                "MAX_EXPORT_TOTAL_PLAINTEXT_BYTES",
+                "per-export plaintext limit, streamed not retained",
+            ),
+            (
+                "DEFAULT_PER_USER_SECRET_QUOTA_BYTES",
+                "per-user on-DISK secret quota, not RAM",
+            ),
+            (
+                "PUT_TERMINAL_CAUSE_MAX_BYTES",
+                "truncation limit for a log field",
+            ),
+            ("MIN_FULL_STATE_SAVING_BYTES", "threshold, not a budget"),
+            (
+                "MIN_BUCKET_CAPACITY_BYTES",
+                "token-bucket floor, not a cache",
+            ),
+            ("BLOOM_BYTES", "fixed size of one bloom filter"),
+            (
+                "CACHE_ENTRY_OVERHEAD_BYTES",
+                "per-entry overhead CHARGED AGAINST the budgets above, not a budget",
+            ),
+            (
+                "MAX_QUEUED_BYTES",
+                "conformance-capture harness, not a node budget",
+            ),
+            // Functions.
+            ("disk_budget_for", "DISK, not resident memory"),
+            (
+                "resident_overhead_budget_for",
+                "the CONSUMER of this aggregate; summing it would be circular",
+            ),
+        ];
+
+        // The scoped body of `declared_cache_ceiling`, by the same anchoring the
+        // sibling test uses and for the same reasons.
+        const FULL: &str = include_str!("executor.rs");
+        let anchor = format!(
+            "fn declared_cache_ceiling(memory_limit: usize, {}",
+            "pool_size: usize) -> usize {"
+        );
+        let after = FULL.split(&anchor).nth(1).expect("anchor must exist");
+        let body = after
+            .split_once("\n}")
+            .expect("could not locate the end of declared_cache_ceiling")
+            .0;
+
+        // Walk the crate's sources.
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("readable source directory") {
+                let path = entry.expect("readable entry").path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+        assert!(
+            files.len() > 50,
+            "the scrape found only {} source files — it is measuring nothing",
+            files.len()
+        );
+
+        let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("readable source file");
+            for line in text.lines() {
+                // Module scope only: an indented declaration is inside a
+                // function or a test module and cannot be a node-wide budget.
+                if let Some(rest) = line
+                    .strip_prefix("const ")
+                    .or_else(|| line.strip_prefix("pub const "))
+                    .or_else(|| line.strip_prefix("pub(crate) const "))
+                    .or_else(|| line.strip_prefix("pub(super) const "))
+                    && let Some((name, tail)) = rest.split_once(':')
+                    && tail.trim_start().starts_with("usize")
+                    && name.ends_with("_BYTES")
+                {
+                    found.insert(name.to_string());
+                }
+                if let Some(idx) = line.find("fn ")
+                    && line[..idx]
+                        .trim()
+                        .chars()
+                        .all(|c| c.is_alphabetic() || "()".contains(c))
+                    && let Some(name) = line[idx + 3..].split('(').next()
+                    && name.ends_with("_budget_for")
+                {
+                    found.insert(name.to_string());
+                }
+            }
+        }
+        assert!(
+            found.contains("MAX_PARKED_BYTES") && found.contains("summary_budget_for"),
+            "the discovery did not find budgets it is known to contain, so it \
+             is measuring nothing; found {found:?}"
+        );
+
+        for name in &found {
+            if body.contains(name.as_str()) {
+                continue;
+            }
+            assert!(
+                NOT_SUMMED.iter().any(|(n, _)| n == name),
+                "`{name}` looks like a node memory budget and is neither summed \
+                 by `declared_cache_ceiling` nor listed in NOT_SUMMED. \
+                 `resident_overhead_budget_for` derives the hosting budget as a \
+                 RESIDUAL from that sum, so a budget missing from it is memory \
+                 hosting believes is free. Add it to the sum, or add it to \
+                 NOT_SUMMED with the reason it does not belong."
+            );
+        }
+
+        for (name, reason) in NOT_SUMMED {
+            assert!(
+                found.contains(*name),
+                "NOT_SUMMED lists `{name}` ({reason}) but nothing by that name \
+                 exists any more. A stale exclusion is how this table stops \
+                 describing the code it is meant to constrain — remove it."
+            );
+        }
     }
 
     /// Below roughly a 1 GiB limit the aggregate is dominated by floors this PR

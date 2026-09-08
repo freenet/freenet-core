@@ -111,6 +111,17 @@ pub(crate) struct MockWasmRuntime {
     /// an interleaving bug: a resumed run must observe the context ITS OWN
     /// pre-park run wrote, not one a foreign run left behind.
     pub(crate) delegate_observations: DelegateObservations,
+    /// Force `execute_delegate_request` to answer with a `HostResponse` variant
+    /// that is NOT a delegate response.
+    ///
+    /// Exists so the "unexpected response" arm of
+    /// `handle_delegate_with_contract_requests` is reachable BEHAVIOURALLY.
+    /// Nothing else can drive it — every other mock path returns
+    /// `DelegateResponse` or `Err` — which is exactly why that prohibition was
+    /// pinned from source, and why the source pin turned out to be defeatable
+    /// by a helper-call indirection. A prohibition worth pinning is worth being
+    /// able to execute.
+    pub(crate) delegate_wrong_variant: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One scripted delegate invocation.
@@ -494,6 +505,22 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         // stays the "not supported" error it has always been, so no existing
         // test changes behaviour.
         let key = req.key().clone();
+        if self
+            .runtime
+            .delegate_wrong_variant
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // An internal invariant violation: the executor answering a
+            // delegate request with something that is not a delegate response.
+            // Any non-delegate variant does; `StreamChunk` is simply the
+            // cheapest to construct.
+            return Ok(freenet_stdlib::client_api::HostResponse::StreamChunk {
+                stream_id: 0,
+                index: 0,
+                total: 1,
+                data: Default::default(),
+            });
+        }
 
         // Model the real `DelegateContextCache` read-modify-write around every
         // invocation (#5544 S7): read on entry, record what was seen, write on
@@ -598,6 +625,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_calls: DelegateCallLog::default(),
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
+            delegate_wrong_variant: std::sync::Arc::default(),
         };
 
         Executor::new(
@@ -632,6 +660,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_calls: DelegateCallLog::default(),
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
+            delegate_wrong_variant: std::sync::Arc::default(),
         };
 
         Executor::new(state_store, || Ok(()), OperationMode::Local, runtime, None).await
@@ -658,6 +687,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_calls: DelegateCallLog::default(),
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
+            delegate_wrong_variant: std::sync::Arc::default(),
         };
 
         Executor::new(

@@ -1722,10 +1722,13 @@ where
                         // and never run the task's own cleanup (#5544 P2).
                         let owed: Vec<u32> =
                             user_input_requests.iter().map(|r| r.request_id).collect();
-                        let owed_upserts: Vec<(ContractInstanceId, bool)> = deferred_upserts
-                            .iter()
-                            .map(|u| (*u.key.id(), u.is_put))
-                            .collect();
+                        // Built by `delegate_park::owed_upserts` rather than
+                        // inline: the CONTEXT has to ride along or a
+                        // synthesized failure cannot be matched to the request
+                        // that produced it, and an inline `map` here is exactly
+                        // where that was got wrong and where no test could see
+                        // it. See that function.
+                        let owed_upserts = delegate_park::owed_upserts(&deferred_upserts);
                         // SINKS CREATED BEFORE THE GUARD, AND SHARED WITH IT
                         // (#5544 F2). They used to be created inside the
                         // spawned future, so `ParkGuard::drop` could not see
@@ -3642,13 +3645,19 @@ where
     }
     // Upserts the off-loop task never resolved (panic, cancellation, budget).
     // The delegate is TOLD they failed rather than left waiting for a response
-    // nothing remains to produce (#5544 P2). `DelegateContext` is defaulted
-    // because the `PendingUpsert` that carried it is gone by then.
-    for (contract_id, is_put) in unresolved_upserts {
+    // nothing remains to produce (#5544 P2).
+    //
+    // WITH THE CONTEXT THE DELEGATE SENT. This defaulted it, on the reasoning
+    // that "the `PendingUpsert` that carried it is gone by then" — true, and
+    // the bug rather than the reason: the context is how a delegate correlates
+    // a response with the request that produced it, so a defaulted one can be
+    // applied to the wrong logical request and is unusable outright when two
+    // requests target the same contract. `OwedUpsert` now carries it.
+    for owed in unresolved_upserts {
         all_inbound.push(upsert_response_msg(
-            is_put,
-            contract_id,
-            DelegateContext::default(),
+            owed.is_put,
+            owed.contract,
+            owed.context,
             Err(ExecutorError::other(anyhow::anyhow!(
                 "delegate upsert did not complete: its off-loop work ended early"
             ))),
@@ -5248,26 +5257,40 @@ mod tests {
     /// That the prohibition survives without quoting the old code is the signal
     /// this pin was guarding behaviour rather than shape.
     ///
-    /// Pinned from source rather than behaviourally because both mock
-    /// executors return `Err` unconditionally, so no fixture can drive the
-    /// executor to hand back a wrong-variant `Ok`.
+    /// KNOWN LIMIT, and the reason this is no longer the only guard. It is a
+    /// TEXT scrape, so it constrains what the arm says, not what it does:
+    /// `return unexpected_response_outcome();` behind a new helper satisfies
+    /// both assertions while the arm reports the violation to the client as an
+    /// empty success. A mutation campaign confirmed exactly that defeat. Comment
+    /// stripping (added here) closes the commented-out variant; nothing a text
+    /// scrape can do closes the indirection.
+    ///
+    /// So the PROHIBITION is now held behaviourally by
+    /// `hol_4391_tests::an_unexpected_executor_response_reaches_the_client_as_an_error`,
+    /// and this pin is kept for what a scrape is good at: catching the arm
+    /// being deleted or inverted in place. The claim that no fixture could
+    /// drive it was true when written — every mock path returned
+    /// `DelegateResponse` or `Err` — and stopped being true when the mock grew
+    /// `delegate_wrong_variant`, which exists for this test. A prohibition
+    /// worth pinning is worth being able to execute.
     #[test]
     fn unexpected_response_variant_does_not_become_a_fake_success() {
-        let full = include_str!("contract.rs");
-        let cutoff = full
-            .find("\nmod tests {")
-            .expect("contract.rs must have a top-level `mod tests`");
-        let src = &full[..cutoff];
-
-        let start = src
-            .find("async fn handle_delegate_with_contract_requests")
-            .expect("handle_delegate_with_contract_requests must exist");
-        let body = &src[start..];
-        let end = body[1..]
-            .find("\nasync fn ")
-            .map(|i| i + 1)
-            .unwrap_or(body.len());
-        let body = &body[..end];
+        // `production_code()`, NOT raw `include_str!`. #5554's commit message
+        // said both widened pins "strip line comments before scraping"; that
+        // was true of the TTL-sweep pin and FALSE of this one, which scraped
+        // raw. The asymmetry is what made the mutation campaign's defeat work:
+        // replacing the arm with a helper call and leaving a stale
+        // `// was DelegateRunOutcome::Failed(...)` comment kept this green
+        // while the arm reported an internal invariant violation to the client
+        // as an EMPTY SUCCESS. A commit message describing a property the code
+        // does not have is its own instance of the pattern this workstream
+        // keeps finding.
+        //
+        // `fn_region` bounds by brace matching rather than by "the next
+        // `\nasync fn `" — the same widening hazard `fn_region`'s own rustdoc
+        // describes, which this pin's hand-rolled bound had.
+        let src = production_code();
+        let body = fn_region(&src, "async fn handle_delegate_with_contract_requests");
 
         let arm = body
             .find("phase = \"unexpected_response\"")
@@ -5307,6 +5330,18 @@ mod tests {
     /// sweep precedes EVERY exit, by sitting before the first of them. That
     /// forbids everything the original forbade — its failure return is one of
     /// the exits — plus the two parking introduced.
+    ///
+    /// KNOWN LIMIT, and it is exactly the one this pin's own assertion message
+    /// oversells. It pins POSITION. The message says the sweep "must not become
+    /// conditional on the delegate doing anything in particular", and position
+    /// cannot express conditionality: wrapping the sweep in
+    /// `if std::hint::black_box(false) { .. }` WITHOUT MOVING IT leaves this
+    /// green while the sweep never runs. A mutation campaign confirmed that.
+    /// Same lesson as the drain-before-sweep pin this file already records —
+    /// position is the right tool for order and the wrong tool for everything
+    /// else — and the same remedy: the property is now held behaviourally by
+    /// `hol_4391_tests::the_notification_path_actually_runs_the_registry_sweep`,
+    /// and this keeps only the ordering claim a scrape can really make.
     ///
     /// The source is truncated at the test module BEFORE scraping: the needles
     /// also occur in this function's own text, which `include_str!` pulls in
@@ -8274,6 +8309,365 @@ mod hol_4391_tests {
             "a deferred victim must be re-listed and swept, not skipped — the \
              backstop still has to un-wedge every wedged delegate"
         );
+    }
+
+    /// M3: a notification-driven run that PARKS must, on resume, fan its
+    /// residual messages out to the registered apps — not to a client
+    /// responder that does not exist.
+    ///
+    /// `Delivery::Apps` -> `Delivery::Client` at the notification park site
+    /// survives the whole suite: with no client behind a notification, the
+    /// `Client` arm finds `carried_responder == None` and the delegate's reply
+    /// is silently dropped. Nothing observed the difference, because every
+    /// existing test of this path either never parks or never looks at where
+    /// the residual output went.
+    ///
+    /// So this parks through the notification path and then resumes, and the
+    /// observation is the registered app receiving the message. The
+    /// counterfactual is built in: the run must actually park first (asserted),
+    /// or the resume path is never exercised and the delivery target is never
+    /// chosen.
+    ///
+    /// FALSIFY by changing `delivery` at that site to `Delivery::Client`.
+    #[tokio::test]
+    async fn a_parked_notification_run_delivers_its_residual_output_to_apps() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        // First entry parks (it asks for user input); the resumed entry emits
+        // the reply the app must receive.
+        script.lock().unwrap().push_back(prompt_outbound().into());
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: vec![OutboundDelegateMsg::ApplicationMessage(
+                freenet_stdlib::prelude::ApplicationMessage::new(b"for-the-app".to_vec()),
+            )],
+            writes_context: None,
+        });
+
+        let key = DelegateKey::new(
+            [0x33; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x33; 32]),
+        );
+        let (app_tx, mut app_rx) = tokio::sync::mpsc::channel(4);
+        assert!(
+            delegate_app_registry::register_app(
+                &key,
+                crate::client_events::ClientId::next(),
+                delegate_app_registry::AppIdentity::Local,
+                app_tx,
+            ),
+            "the app registration must be accepted, or this measures nothing"
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx);
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+
+        handle_delegate_notification(
+            &mut handler,
+            executor::DelegateNotification {
+                delegate_key: key.clone(),
+                contract_id: ContractInstanceId::new([0x33; 32]),
+                new_state: Arc::new(WrappedState::new(b"changed".to_vec())),
+            },
+            &prompter,
+            Some(&mut park),
+        )
+        .await;
+        assert!(
+            park.is_parked(&key),
+            "the notification-driven run must PARK, or the resume path this \
+             test is about is never reached"
+        );
+
+        // The off-loop task answers the prompt and delivers its resume.
+        let resume = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the off-loop task must deliver a resume")
+            .expect("resume channel open");
+        handle_delegate_resume(&mut handler, &mut park, &prompter, resume).await;
+
+        let delivered = tokio::time::timeout(Duration::from_secs(5), app_rx.recv())
+            .await
+            .expect(
+                "a resumed notification run must fan its residual messages out \
+                 to registered apps; with Delivery::Client there is no \
+                 responder behind a notification and the reply is dropped",
+            )
+            .expect("app channel open");
+        match delivered {
+            Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key: k, values }) => {
+                assert_eq!(k, key);
+                assert!(
+                    values.iter().any(|v| matches!(
+                        v,
+                        OutboundDelegateMsg::ApplicationMessage(m)
+                            if m.payload == b"for-the-app"
+                    )),
+                    "the app must receive the delegate's actual reply, got {values:?}"
+                );
+            }
+            other => panic!("expected a DelegateResponse to the app, got {other:?}"),
+        }
+    }
+
+    /// M3, the SIBLING SITE: a QUEUED notification that parks on its own run
+    /// must also fan its residual output out to apps.
+    ///
+    /// `run_queued_notification` builds its own `ParkingCtx` with its own
+    /// `delivery`, and the test above cannot reach it: that one parks on the
+    /// first notification, this one parks on a notification that was QUEUED
+    /// behind an existing park and drained later. Flipping this site to
+    /// `Delivery::Client` left the suite green with the other test in place —
+    /// checked, not assumed. Every defect this workstream has found has had a
+    /// sibling, and a test that covers one of two identical sites is how the
+    /// second one survives.
+    ///
+    /// FALSIFY by changing `delivery` in `run_queued_notification`.
+    #[tokio::test]
+    async fn a_queued_notification_that_parks_also_delivers_to_apps() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        // 1: the resumed original run, which says nothing.
+        // 2: the drained queued notification, which parks.
+        // 3: that park's resume, whose reply the app must receive.
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: Vec::new(),
+            writes_context: None,
+        });
+        script.lock().unwrap().push_back(prompt_outbound().into());
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: vec![OutboundDelegateMsg::ApplicationMessage(
+                freenet_stdlib::prelude::ApplicationMessage::new(b"from-the-queue".to_vec()),
+            )],
+            writes_context: None,
+        });
+
+        let key = DelegateKey::new(
+            [0x34; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x34; 32]),
+        );
+        let (app_tx, mut app_rx) = tokio::sync::mpsc::channel(4);
+        assert!(delegate_app_registry::register_app(
+            &key,
+            crate::client_events::ClientId::next(),
+            delegate_app_registry::AppIdentity::Local,
+            app_tx,
+        ));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx.clone());
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+
+        // A park already in flight, so the notification below is QUEUED rather
+        // than run — which is what routes it through `run_queued_notification`.
+        let delegate_park::ParkAdmission::Admitted { epoch } =
+            park.park(key.clone(), park_continuation(), 0)
+        else {
+            panic!("the initial park must be admitted");
+        };
+
+        handle_delegate_notification(
+            &mut handler,
+            executor::DelegateNotification {
+                delegate_key: key.clone(),
+                contract_id: ContractInstanceId::new([0x34; 32]),
+                new_state: Arc::new(WrappedState::new(b"changed".to_vec())),
+            },
+            &prompter,
+            Some(&mut park),
+        )
+        .await;
+
+        // Resume the original park: it completes, then DRAINS the queued
+        // notification, whose run parks again — at the site under test.
+        handle_delegate_resume(
+            &mut handler,
+            &mut park,
+            &prompter,
+            delegate_park::DelegateResume {
+                delegate_key: key.clone(),
+                epoch,
+                cause: delegate_park::ResumeCause::Completed,
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                    freenet_stdlib::prelude::ApplicationMessage::new(b"go".to_vec()),
+                )],
+                upserts: Vec::new(),
+                unresolved_upserts: Vec::new(),
+            },
+        )
+        .await;
+        assert!(
+            park.is_parked(&key),
+            "the drained notification's run must PARK, or the site this test is \
+             about is never reached"
+        );
+
+        let resume = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the off-loop task must deliver a resume")
+            .expect("resume channel open");
+        handle_delegate_resume(&mut handler, &mut park, &prompter, resume).await;
+
+        let delivered = tokio::time::timeout(Duration::from_secs(5), app_rx.recv())
+            .await
+            .expect(
+                "a QUEUED notification whose run parked must still fan its \
+                 residual messages out to apps on resume; with Delivery::Client \
+                 there is no responder and the reply is dropped",
+            )
+            .expect("app channel open");
+        match delivered {
+            Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { values, .. }) => {
+                assert!(
+                    values.iter().any(|v| matches!(
+                        v,
+                        OutboundDelegateMsg::ApplicationMessage(m)
+                            if m.payload == b"from-the-queue"
+                    )),
+                    "the app must receive the queued run's reply, got {values:?}"
+                );
+            }
+            other => panic!("expected a DelegateResponse to the app, got {other:?}"),
+        }
+    }
+
+    /// P4b: the notification path must actually RUN the delegate->apps TTL
+    /// P4b: the notification path must actually RUN the delegate->apps TTL
+    /// sweep, not merely contain it.
+    ///
+    /// `sweep_expired` is that registry's ONLY garbage collection — the
+    /// AGENTS.md GC-exemption bound rests on it — and the sibling source pin
+    /// checks where the call SITS. Wrapping it in `if black_box(false) { .. }`
+    /// with its position unchanged leaves that pin green while nothing is ever
+    /// reaped, which a mutation campaign demonstrated. Position cannot express
+    /// conditionality.
+    ///
+    /// So this drives the path and observes the consequence: a registration
+    /// older than `REGISTRATION_TTL` is gone afterwards. `route_to_apps`
+    /// returning 0 is the observation, and the assertion BEFORE the sweep is
+    /// what stops it passing vacuously — the registration must be live first,
+    /// or "nothing was delivered" proves nothing.
+    ///
+    /// FALSIFY by making the sweep conditional, or deleting it.
+    #[tokio::test(start_paused = true)]
+    async fn the_notification_path_actually_runs_the_registry_sweep() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+
+        // A delegate key of its own, so a parallel test's registrations in this
+        // process-global registry cannot be confused for this one's.
+        let key = DelegateKey::new(
+            [0x5b; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x5b; 32]),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        assert!(
+            delegate_app_registry::register_app(
+                &key,
+                crate::client_events::ClientId::next(),
+                delegate_app_registry::AppIdentity::Local,
+                tx,
+            ),
+            "the registration must be accepted, or this test measures nothing"
+        );
+        assert_eq!(
+            delegate_app_registry::route_to_apps(
+                &key,
+                Ok(freenet_stdlib::client_api::HostResponse::Ok)
+            ),
+            1,
+            "COUNTERFACTUAL: the registration must be live before the sweep, or \
+             a later zero would prove nothing"
+        );
+
+        // Past the TTL, so the sweep has something to reap.
+        tokio::time::advance(delegate_app_registry::REGISTRATION_TTL + Duration::from_secs(1))
+            .await;
+
+        // Any notification drives the path; this one is for an unrelated
+        // delegate, which is the point — the sweep is the registry's GC and
+        // must not be conditional on what the notified delegate does.
+        handle_delegate_notification(
+            &mut handler,
+            executor::DelegateNotification {
+                delegate_key: test_delegate_key(),
+                contract_id: ContractInstanceId::new([0x5b; 32]),
+                new_state: Arc::new(WrappedState::new(b"changed".to_vec())),
+            },
+            &Arc::new(crate::contract::user_input::AutoApprovePrompter),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            delegate_app_registry::route_to_apps(
+                &key,
+                Ok(freenet_stdlib::client_api::HostResponse::Ok)
+            ),
+            0,
+            "the notification path must RUN the TTL sweep, not merely contain \
+             it: this registration is past REGISTRATION_TTL and nothing else \
+             reaps the delegate->apps registry"
+        );
+    }
+
+    /// P5b: the executor answering a delegate request with a variant that is
+    /// NOT a delegate response must reach the client as an ERROR.
+    ///
+    /// This is the prohibition #5263 established and #5544 re-expressed in the
+    /// outcome enum, and until now it was held only by a source scrape — which
+    /// a mutation campaign defeated with a helper-call indirection, leaving the
+    /// arm reporting an internal invariant violation to the client as an empty
+    /// success while the pin stayed green.
+    ///
+    /// Executing it needs a mock that can produce a wrong variant, which is
+    /// what `delegate_wrong_variant` is for. Nothing else can: every other mock
+    /// path returns `DelegateResponse` or `Err`, and "no fixture can drive it"
+    /// is what justified pinning from source in the first place. That was a
+    /// reason to extend the fixture, not a reason to accept a weaker guard.
+    ///
+    /// FALSIFY by changing the arm to yield `Completed`, or by routing it
+    /// through a helper that does — the case the source pin cannot see.
+    #[tokio::test]
+    async fn an_unexpected_executor_response_reaches_the_client_as_an_error() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        handler
+            .runtime_mut()
+            .delegate_wrong_variant
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let send = Arc::new(send);
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            crate::contract::user_input::AutoApprovePrompter,
+        ));
+
+        let key = test_delegate_key();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send_to_handler(delegate_event(&key)),
+        )
+        .await
+        .expect("the delegate request must be answered, not dropped")
+        .expect("delegate request must respond");
+
+        match response {
+            ContractHandlerEvent::DelegateResponse(result) => {
+                assert!(
+                    result.is_err(),
+                    "the executor answered with a non-delegate variant — an \
+                     internal invariant violation. The client must be able to \
+                     tell that from `the delegate said nothing`, so it has to \
+                     arrive as Err, not as an empty success (#5263)"
+                );
+            }
+            other => panic!("expected DelegateResponse, got {other}"),
+        }
+
+        handle.abort();
     }
 
     /// B1: a contract notification arriving for a delegate that is currently
