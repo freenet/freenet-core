@@ -2022,6 +2022,19 @@ pub(crate) async fn initial_join_procedure(
                 // remaining duration, in which case the CONNECT fan-out below
                 // is empty and no CONNECT is issued. Classify by what actually
                 // happens, not by which branch we are in.
+                //
+                // No live-loop test drives THIS `BackoffBlocked` specifically,
+                // and that is a property of the branch rather than an omission:
+                // `is_in_backoff` and `remaining_backoff` evaluate the same
+                // predicate (`Instant::now() < retry_after`, `util/backoff.rs`)
+                // from separate clock reads, so reaching here needs the clock to
+                // cross `retry_after` between two calls a few instructions
+                // apart. The reachable all-in-backoff dial round takes the
+                // `min_backoff` wait path above and IS pinned, by
+                // `startup_rounds_report_backoff_when_all_unconnected_gateways_are_backed_off`.
+                // The arm stays because the alternative — assuming
+                // `eligible_count == 0` here means CONNECTs were issued — would
+                // silently mislabel the round if that race ever widened.
                 record_round(if eligible_count > 0 {
                     StartupRoundOutcome::ConnectIssuedGateway
                 } else {
@@ -2465,6 +2478,68 @@ mod tests {
             assert_eq!(
                 t.routed, 0,
                 "dialling unconnected gateways is not a routed CONNECT round; got {t:?}"
+            );
+        });
+    }
+
+    /// Branch A's backoff case: gateways are UNCONNECTED (so the dial branch
+    /// is taken, not the routed one) and every one of them is in exponential
+    /// backoff, so the round issues nothing and waits. That is `BackoffBlocked`.
+    ///
+    /// The sibling classification in branch B is pinned by
+    /// `startup_rounds_report_backoff_when_routing_through_connected_gateways`;
+    /// this is the same outcome reached by the other path, which had no live
+    /// test.
+    #[test]
+    fn startup_rounds_report_backoff_when_all_unconnected_gateways_are_backed_off() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("bootstrap-4787-dial-backoff", "127.0.0.1:14798").await;
+            let gateways = vec![bootstrap_gateway(24799), bootstrap_gateway(24800)];
+
+            // Unconnected, unlike the routed-branch test: this is what selects
+            // `open_conns < threshold && unconnected_count > 0`.
+            assert_eq!(
+                op_manager.ring.is_not_connected(gateways.iter()).count(),
+                gateways.len(),
+                "test setup: both gateways must look unconnected"
+            );
+
+            {
+                let mut backoff = op_manager.gateway_backoff.lock();
+                for gw in &gateways {
+                    let addr = gw.socket_addr().expect("gateway has an address");
+                    backoff.record_failure(addr);
+                    assert!(
+                        backoff.is_in_backoff(addr),
+                        "test setup: gateway must actually be in backoff"
+                    );
+                    assert!(
+                        backoff.remaining_backoff(addr).is_some(),
+                        "test setup: backoff must report a remaining duration, or \
+                     the loop takes the race fallback instead of the wait path"
+                    );
+                }
+            }
+
+            let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                .await
+                .expect("spawn join procedure");
+            let t = wait_for_startup_round(Duration::from_secs(10)).await;
+            handle.abort();
+
+            assert!(
+                t.backoff > 0,
+                "a dial round with every unconnected gateway in backoff must count \
+             as backoff_blocked; got {t:?}"
+            );
+            assert_eq!(
+                t.gateway, 0,
+                "nothing was dialled — every gateway was filtered for backoff; got {t:?}"
+            );
+            assert_eq!(
+                t.no_target, 0,
+                "the round had a target and a specific reason for skipping it; got {t:?}"
             );
         });
     }
