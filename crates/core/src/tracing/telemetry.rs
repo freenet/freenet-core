@@ -3187,8 +3187,12 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         snapshot.bootstrap_promoted_to_ring,
                     ),
                     (
-                        "bootstrap_startup_rounds_connect_issued",
-                        snapshot.bootstrap_startup_rounds_connect_issued,
+                        "bootstrap_startup_rounds_connect_issued_gateway",
+                        snapshot.bootstrap_startup_rounds_connect_issued_gateway,
+                    ),
+                    (
+                        "bootstrap_startup_rounds_connect_issued_routed",
+                        snapshot.bootstrap_startup_rounds_connect_issued_routed,
                     ),
                     (
                         "bootstrap_startup_rounds_backoff_blocked",
@@ -4149,7 +4153,8 @@ mod tests {
         info.bootstrap_promoted_to_ring = Some(1);
         info.bootstrap_time_to_min_connections_secs = Some(12.5);
         info.bootstrap_completed = Some(true);
-        info.bootstrap_startup_rounds_connect_issued = Some(4);
+        info.bootstrap_startup_rounds_connect_issued_gateway = Some(4);
+        info.bootstrap_startup_rounds_connect_issued_routed = Some(5);
         info.bootstrap_startup_rounds_backoff_blocked = Some(3);
         info.bootstrap_startup_rounds_no_target = Some(2);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
@@ -4158,7 +4163,8 @@ mod tests {
         assert_eq!(json["bootstrap_promoted_to_ring"], 1);
         assert_eq!(json["bootstrap_time_to_min_connections_secs"], 12.5);
         assert_eq!(json["bootstrap_completed"], true);
-        assert_eq!(json["bootstrap_startup_rounds_connect_issued"], 4);
+        assert_eq!(json["bootstrap_startup_rounds_connect_issued_gateway"], 4);
+        assert_eq!(json["bootstrap_startup_rounds_connect_issued_routed"], 5);
         assert_eq!(json["bootstrap_startup_rounds_backoff_blocked"], 3);
         assert_eq!(json["bootstrap_startup_rounds_no_target"], 2);
     }

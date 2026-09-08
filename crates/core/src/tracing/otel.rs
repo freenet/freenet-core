@@ -1525,11 +1525,25 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter, sources: RingSou
     // Below-threshold join-loop rounds, split by what each round actually did
     // (#4787). A node stuck below `min_connections` increments one of these
     // every ~4s forever, so an unsplit total degrades into a process-uptime
-    // proxy; the split is the measurement. `connect_issued` = actively
-    // retrying and being refused, `backoff_blocked` = every gateway in
-    // exponential backoff, `no_target` = gateway transports look
-    // connected/pending while no real peers are acquired (the #4787 stall
-    // signature). Read alongside `freenet.bootstrap.completed`.
+    // proxy; the split is the measurement.
+    //
+    //   connect_issued_gateway — dialled gateways not yet connected to
+    //                            (ordinary bootstrap).
+    //   connect_issued_routed  — every gateway transport already up and the
+    //                            node still far below the threshold, so
+    //                            CONNECTs were routed THROUGH the connected
+    //                            gateways. THIS is the series that moves
+    //                            during the #4787 stall.
+    //   backoff_blocked        — every candidate gateway in exponential
+    //                            backoff.
+    //   no_target              — nothing to do: gateways all connected and the
+    //                            node within `gateways.len()` of the
+    //                            threshold. Quiet, NOT the stall signature.
+    //
+    // Alert on sustained `connect_issued_routed` growth while
+    // `freenet.bootstrap.completed` stays 0 — a healthy joiner with few
+    // gateways emits some of these too, and the gauge is what separates the
+    // two.
     let _bootstrap_startup_rounds = meter
         .u64_observable_counter("freenet.bootstrap.startup_rounds")
         .with_description(
@@ -1539,8 +1553,12 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter, sources: RingSou
         .with_callback(move |observer| {
             if let Some(status) = (sources.status_scalars)() {
                 observer.observe(
-                    status.bootstrap_startup_rounds_connect_issued,
-                    &[KeyValue::new("outcome", "connect_issued")],
+                    status.bootstrap_startup_rounds_connect_issued_gateway,
+                    &[KeyValue::new("outcome", "connect_issued_gateway")],
+                );
+                observer.observe(
+                    status.bootstrap_startup_rounds_connect_issued_routed,
+                    &[KeyValue::new("outcome", "connect_issued_routed")],
                 );
                 observer.observe(
                     status.bootstrap_startup_rounds_backoff_blocked,
@@ -1944,7 +1962,8 @@ mod tests {
                 bootstrap_transient_registered: 10,
                 bootstrap_transient_expired: 9,
                 bootstrap_promoted_to_ring: 1,
-                bootstrap_startup_rounds_connect_issued: 4,
+                bootstrap_startup_rounds_connect_issued_gateway: 4,
+                bootstrap_startup_rounds_connect_issued_routed: 5,
                 bootstrap_startup_rounds_backoff_blocked: 3,
                 bootstrap_startup_rounds_no_target: 2,
                 ..Default::default()
@@ -3031,7 +3050,14 @@ mod tests {
             ("freenet.bootstrap.churn", "event=transient_registered"),
             ("freenet.bootstrap.churn", "event=transient_expired"),
             ("freenet.bootstrap.churn", "event=promoted_to_ring"),
-            ("freenet.bootstrap.startup_rounds", "outcome=connect_issued"),
+            (
+                "freenet.bootstrap.startup_rounds",
+                "outcome=connect_issued_gateway",
+            ),
+            (
+                "freenet.bootstrap.startup_rounds",
+                "outcome=connect_issued_routed",
+            ),
             (
                 "freenet.bootstrap.startup_rounds",
                 "outcome=backoff_blocked",

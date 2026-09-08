@@ -150,7 +150,8 @@ pub(crate) struct OtelStatusScalars {
     pub bootstrap_transient_expired: u64,
     pub bootstrap_promoted_to_ring: u64,
     pub bootstrap_time_to_min_connections: Option<Duration>,
-    pub bootstrap_startup_rounds_connect_issued: u64,
+    pub bootstrap_startup_rounds_connect_issued_gateway: u64,
+    pub bootstrap_startup_rounds_connect_issued_routed: u64,
     pub bootstrap_startup_rounds_backoff_blocked: u64,
     pub bootstrap_startup_rounds_no_target: u64,
 }
@@ -187,7 +188,8 @@ pub(crate) fn otel_status_scalars() -> Option<OtelStatusScalars> {
         bootstrap_transient_expired: b.transient_expired,
         bootstrap_promoted_to_ring: b.promoted_to_ring,
         bootstrap_time_to_min_connections: b.time_to_min_connections,
-        bootstrap_startup_rounds_connect_issued: b.startup_rounds_connect_issued,
+        bootstrap_startup_rounds_connect_issued_gateway: b.startup_rounds_connect_issued_gateway,
+        bootstrap_startup_rounds_connect_issued_routed: b.startup_rounds_connect_issued_routed,
         bootstrap_startup_rounds_backoff_blocked: b.startup_rounds_backoff_blocked,
         bootstrap_startup_rounds_no_target: b.startup_rounds_no_target,
     })
@@ -408,17 +410,40 @@ pub struct NetworkStatus {
 /// the exporter publishes `freenet.bootstrap.completed` as a 0/1 gauge so a
 /// permanently-stuck joiner is visible rather than absent.
 ///
-/// The three `startup_rounds_*` counters partition every below-threshold
+/// The four `startup_rounds_*` counters partition every below-threshold
 /// iteration of the join loop by what that iteration actually DID, and stop
 /// at the process's first real bootstrap (a later transient dip below
 /// `min_connections` is ordinary post-startup churn, not startup). Splitting
 /// them is what keeps them from degrading into a process-uptime proxy: a node
 /// stuck below `min_connections` forever increments SOMETHING every ~4s no
-/// matter how the counter is shaped, so the informative quantity is which one
-/// — `connect_issued` means it is actively retrying and being refused,
-/// `backoff_blocked` means every gateway is in exponential backoff, and
-/// `no_target` means the gateway transports look connected/pending while no
-/// real peers are being acquired, which is the #4787 stall signature.
+/// matter how the counter is shaped, so the informative quantity is which one:
+///
+/// - `connect_issued_gateway` — dialled gateways this node was not yet
+///   connected to. Ordinary bootstrap; a healthy joiner's first rounds.
+/// - `connect_issued_routed` — every gateway transport was already up and the
+///   node was still more than `gateways.len()` connections short, so CONNECTs
+///   were routed THROUGH the connected gateways toward gap locations.
+///   **This is the series that moves during the #4787 stall.** With
+///   `min_connections = 25` and the 1–3 gateways a real deployment has, a
+///   joiner whose gateway transports are up but which acquires no real peers
+///   takes this branch on every round, for the whole multi-minute stall.
+/// - `backoff_blocked` — issued nothing because every candidate gateway was
+///   in exponential backoff.
+/// - `no_target` — issued nothing for any other reason. Principally: all
+///   gateways connected AND the node is within `gateways.len()` of the
+///   threshold, so the routed-CONNECT branch above does not apply and the
+///   round deliberately waits. This is a comparatively quiet outcome, NOT the
+///   stall signature — an earlier revision of this instrumentation documented
+///   it as such, which would have had an operator watching a series that
+///   reads flat zero for the entire stall.
+///
+/// The stall signature is therefore sustained `connect_issued_routed` growth
+/// while `time_to_min_connections` stays `None` (exported as
+/// `freenet.bootstrap.completed = 0`). The `completed` gauge is load-bearing
+/// here: a HEALTHY joiner with few gateways also emits some
+/// `connect_issued_routed` while it fills out its ring, and what distinguishes
+/// the stall is that the counter keeps climbing without the gauge ever
+/// flipping to 1.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootstrapChurnStats {
     /// Counts transient tracking entries actually inserted, not call-site
@@ -433,15 +458,23 @@ pub struct BootstrapChurnStats {
     /// cap-rejected promotion attempt is not counted as a promotion.
     pub promoted_to_ring: u64,
     pub time_to_min_connections: Option<Duration>,
-    /// Below-threshold join-loop rounds that issued a CONNECT round (to
-    /// unconnected gateways, or routed through already-connected gateways).
-    pub startup_rounds_connect_issued: u64,
+    /// Below-threshold join-loop rounds that dialled gateways this node was
+    /// not yet connected to.
+    pub startup_rounds_connect_issued_gateway: u64,
+    /// Below-threshold join-loop rounds that routed CONNECTs through
+    /// already-connected gateways because every gateway transport was already
+    /// up. Sustained growth here with `time_to_min_connections == None` is the
+    /// #4787 stall signature.
+    pub startup_rounds_connect_issued_routed: u64,
     /// Below-threshold join-loop rounds that issued nothing because every
     /// candidate gateway was in exponential backoff.
     pub startup_rounds_backoff_blocked: u64,
     /// Below-threshold join-loop rounds that issued nothing for any other
-    /// reason — principally "all gateways appear connected/pending" while the
-    /// node still has no real peers. The #4787 stall signature.
+    /// reason — principally: every gateway is connected AND the node is within
+    /// `gateways.len()` of the threshold, so the routed-CONNECT branch does
+    /// not apply and the round deliberately waits for handshakes or pending
+    /// reservations. NOT the #4787 stall signature; see
+    /// `startup_rounds_connect_issued_routed`.
     pub startup_rounds_no_target: u64,
 }
 
@@ -449,8 +482,12 @@ pub struct BootstrapChurnStats {
 /// did not issue CONNECTs (#4787). See [`BootstrapChurnStats`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupRoundOutcome {
-    /// A CONNECT round was actually issued this iteration.
-    ConnectIssued,
+    /// CONNECTs were issued to gateways this node is not yet connected to.
+    ConnectIssuedGateway,
+    /// CONNECTs were routed through already-connected gateways toward gap
+    /// locations, because every gateway transport is already up. The #4787
+    /// stall signature — see [`BootstrapChurnStats`].
+    ConnectIssuedRouted,
     /// Nothing issued: every candidate gateway was in exponential backoff.
     BackoffBlocked,
     /// Nothing issued for any other reason.
@@ -1480,7 +1517,12 @@ pub fn record_bootstrap_startup_round(outcome: StartupRoundOutcome) {
         if let Ok(mut s) = status.write() {
             let b = &mut s.bootstrap_churn_stats;
             let slot = match outcome {
-                StartupRoundOutcome::ConnectIssued => &mut b.startup_rounds_connect_issued,
+                StartupRoundOutcome::ConnectIssuedGateway => {
+                    &mut b.startup_rounds_connect_issued_gateway
+                }
+                StartupRoundOutcome::ConnectIssuedRouted => {
+                    &mut b.startup_rounds_connect_issued_routed
+                }
                 StartupRoundOutcome::BackoffBlocked => &mut b.startup_rounds_backoff_blocked,
                 StartupRoundOutcome::NoTarget => &mut b.startup_rounds_no_target,
             };
@@ -2540,10 +2582,15 @@ mod tests {
         record_bootstrap_transient_expired();
         record_bootstrap_transient_expired();
         record_bootstrap_promoted_to_ring();
-        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssued);
-        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssued);
-        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssued);
-        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssued);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedGateway);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedGateway);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedGateway);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedGateway);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedRouted);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedRouted);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedRouted);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedRouted);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedRouted);
         record_bootstrap_startup_round(StartupRoundOutcome::BackoffBlocked);
         record_bootstrap_startup_round(StartupRoundOutcome::BackoffBlocked);
         record_bootstrap_startup_round(StartupRoundOutcome::NoTarget);
@@ -2572,7 +2619,8 @@ mod tests {
                 transient_expired: 2,
                 promoted_to_ring: 1,
                 time_to_min_connections: Some(first),
-                startup_rounds_connect_issued: 4,
+                startup_rounds_connect_issued_gateway: 4,
+                startup_rounds_connect_issued_routed: 5,
                 startup_rounds_backoff_blocked: 2,
                 startup_rounds_no_target: 1,
             }),

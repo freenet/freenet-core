@@ -1885,9 +1885,11 @@ pub(crate) async fn initial_join_procedure(
             // decides what the round does records its own outcome BEFORE
             // awaiting anything, so a CONNECT fan-out that hangs still leaves a
             // counted round; whatever reaches the bottom unrecorded is a round
-            // that issued nothing, which is the "all gateways appear
-            // connected/pending" stall the issue was filed about and which the
-            // first version of this instrumentation could not see at all.
+            // that issued nothing AND had no more specific reason, which is a
+            // quiet "nothing to do" and NOT the stall the issue was filed
+            // about. The stall — gateway transports up, no real peers acquired
+            // — routes CONNECTs through the connected gateways and is counted
+            // as `ConnectIssuedRouted`.
             let mut round_recorded = false;
             let mut record_round = |outcome: StartupRoundOutcome| {
                 if !round_recorded && !min_connections_reached {
@@ -2021,7 +2023,7 @@ pub(crate) async fn initial_join_procedure(
                 // is empty and no CONNECT is issued. Classify by what actually
                 // happens, not by which branch we are in.
                 record_round(if eligible_count > 0 {
-                    StartupRoundOutcome::ConnectIssued
+                    StartupRoundOutcome::ConnectIssuedGateway
                 } else {
                     StartupRoundOutcome::BackoffBlocked
                 });
@@ -2065,25 +2067,37 @@ pub(crate) async fn initial_join_procedure(
             } else if use_connected_as_routers {
                 // All gateways connected but still need many more peers.
                 // Route CONNECTs through connected gateways toward gap locations.
-                let eligible: Vec<_> = {
+                // #4787: count the gateways excluded specifically FOR backoff,
+                // separately from those excluded for having no resolved socket
+                // address. An empty `eligible` means very different things in
+                // those two cases and the round must be classified by which.
+                let (eligible, blocked_by_backoff) = {
                     let backoff = op_manager.gateway_backoff.lock();
-                    gateways
+                    let mut blocked = 0usize;
+                    let eligible: Vec<_> = gateways
                         .iter()
-                        .filter(|gw| {
-                            gw.socket_addr()
-                                .map(|addr| !backoff.is_in_backoff(addr))
-                                .unwrap_or(false)
+                        .filter(|gw| match gw.socket_addr() {
+                            Some(addr) if backoff.is_in_backoff(addr) => {
+                                blocked += 1;
+                                false
+                            }
+                            Some(_) => true,
+                            None => false,
                         })
-                        .collect()
+                        .collect();
+                    (eligible, blocked)
                 };
 
                 if !eligible.is_empty() {
-                    // #4787: these are CONNECT rounds too. They were uncounted
-                    // in the first version of this instrumentation, and they
-                    // are the rounds a stalled joiner actually issues — its
-                    // gateway transports are up, so the branch above (which
-                    // needs an UNCONNECTED gateway) never runs.
-                    record_round(StartupRoundOutcome::ConnectIssued);
+                    // #4787: these are CONNECT rounds too, and they are THE
+                    // rounds a stalled joiner issues — its gateway transports
+                    // are up, so the branch above (which needs an UNCONNECTED
+                    // gateway) never runs. They are counted separately from the
+                    // dial-a-gateway case above precisely because this is the
+                    // series that moves during the stall the issue describes;
+                    // an operator told to watch `no_target` instead would watch
+                    // a flat zero for the whole outage.
+                    record_round(StartupRoundOutcome::ConnectIssuedRouted);
                     tracing::info!(
                         eligible = eligible.len(),
                         total_gateways = gateways.len(),
@@ -2122,6 +2136,22 @@ pub(crate) async fn initial_join_procedure(
                             }
                         })
                         .await;
+                } else if blocked_by_backoff > 0 {
+                    // #4787: nothing was issued because every gateway this
+                    // round could route through is in exponential backoff —
+                    // which is `BackoffBlocked`, not `NoTarget`. Without this
+                    // the round fell through to the default at the bottom of
+                    // the loop and was misreported. Reachable from the
+                    // fully-isolated path (`open_conns == 0` with every gateway
+                    // transport apparently up and every gateway backed off),
+                    // i.e. exactly when the classification matters most.
+                    record_round(StartupRoundOutcome::BackoffBlocked);
+                    tracing::info!(
+                        blocked_by_backoff,
+                        total_gateways = gateways.len(),
+                        open_connections = open_conns,
+                        "All connected gateways in backoff, cannot route CONNECTs this round"
+                    );
                 }
             } else if open_conns >= bootstrap_threshold {
                 tracing::trace!(
@@ -2131,12 +2161,19 @@ pub(crate) async fn initial_join_procedure(
                 );
             }
 
-            // Nothing was issued this round (#4787). `record_round` is gated on
-            // `!min_connections_reached` so these stay startup-only counters: a
-            // later transient dip below `bootstrap_threshold` is ordinary
-            // post-bootstrap churn, not bootstrap. `min_connections_reached` is
-            // set at the top of this iteration, so reaching here with it false
-            // means `open_conns < bootstrap_threshold`.
+            // Nothing was issued this round and no branch above claimed a more
+            // specific reason (#4787). Principally: every gateway is connected
+            // AND the node is within `gateways.len()` of the threshold, so
+            // `use_connected_as_routers` is false and the round deliberately
+            // waits for handshakes or pending reservations to resolve. This is
+            // NOT the stall signature — see `startup_rounds_connect_issued_routed`.
+            //
+            // `record_round` is gated on `!min_connections_reached` so these
+            // stay startup-only counters: a later transient dip below
+            // `bootstrap_threshold` is ordinary post-bootstrap churn, not
+            // bootstrap. `min_connections_reached` is set at the top of this
+            // iteration, so reaching here with it false means
+            // `open_conns < bootstrap_threshold`.
             record_round(StartupRoundOutcome::NoTarget);
 
             // Add random jitter to prevent thundering herd after gateway restart.
@@ -2257,22 +2294,40 @@ mod tests {
     }
 
     /// Total below-threshold rounds recorded so far, by category.
-    fn startup_round_totals() -> (u64, u64, u64) {
-        let b = crate::node::network_status::bootstrap_churn_counts()
-            .expect("network_status singleton initialized by the test");
-        (
-            b.startup_rounds_connect_issued,
-            b.startup_rounds_backoff_blocked,
-            b.startup_rounds_no_target,
-        )
+    #[derive(Debug, Clone, Copy)]
+    struct RoundTotals {
+        /// Dialled gateways this node was not yet connected to.
+        gateway: u64,
+        /// Routed CONNECTs through already-connected gateways — the #4787
+        /// stall signature.
+        routed: u64,
+        backoff: u64,
+        no_target: u64,
+    }
+
+    impl RoundTotals {
+        fn read() -> Self {
+            let b = crate::node::network_status::bootstrap_churn_counts()
+                .expect("network_status singleton initialized by the test");
+            Self {
+                gateway: b.startup_rounds_connect_issued_gateway,
+                routed: b.startup_rounds_connect_issued_routed,
+                backoff: b.startup_rounds_backoff_blocked,
+                no_target: b.startup_rounds_no_target,
+            }
+        }
+
+        fn total(&self) -> u64 {
+            self.gateway + self.routed + self.backoff + self.no_target
+        }
     }
 
     /// Poll until the join loop has classified at least one round, or give up.
-    async fn wait_for_startup_round(deadline: Duration) -> (u64, u64, u64) {
+    async fn wait_for_startup_round(deadline: Duration) -> RoundTotals {
         let start = std::time::Instant::now();
         loop {
-            let totals = startup_round_totals();
-            if totals.0 + totals.1 + totals.2 > 0 || start.elapsed() >= deadline {
+            let totals = RoundTotals::read();
+            if totals.total() > 0 || start.elapsed() >= deadline {
                 return totals;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -2284,7 +2339,16 @@ mod tests {
     /// `min_connections`. The first version of this instrumentation put its
     /// only increment inside `open_conns < threshold && unconnected_count > 0`,
     /// so it recorded ZERO for the entire multi-minute stall it was added to
-    /// measure. The loop must classify this round.
+    /// measure.
+    ///
+    /// This pins WHICH series moves, not merely that something does. With
+    /// `min_connections = 25` and 1-3 gateways the stall takes the
+    /// `use_connected_as_routers` branch, so the moving series is
+    /// `connect_issued_routed` — and NOT `no_target`, which four doc sites
+    /// previously named as "the #4787 stall signature". An operator following
+    /// that guidance would have watched a series that reads flat zero for the
+    /// whole outage, which is the same defect (a counter that reads healthy
+    /// during the failure it observes) this PR exists to fix.
     #[test]
     fn startup_rounds_counted_while_all_gateways_appear_connected() {
         with_network_status_lock(async {
@@ -2320,23 +2384,33 @@ mod tests {
             let handle = initial_join_procedure(op_manager.clone(), &gateways)
                 .await
                 .expect("spawn join procedure");
-            let (issued, backoff, no_target) =
-                wait_for_startup_round(Duration::from_secs(10)).await;
+            let t = wait_for_startup_round(Duration::from_secs(10)).await;
             handle.abort();
 
             assert!(
-                issued + backoff + no_target > 0,
-                "the join loop must count a below-threshold round during the stall; \
-             got connect_issued={issued} backoff_blocked={backoff} no_target={no_target}"
+                t.total() > 0,
+                "the join loop must count a below-threshold round during the stall; got {t:?}"
             );
             // With 25 - 2 > 2 the loop routes CONNECTs through the connected
             // gateways (`use_connected_as_routers`), a path the first version of
-            // this instrumentation also left uncounted.
+            // this instrumentation left uncounted entirely.
             assert!(
-                issued > 0,
-                "rounds routed through connected gateways must count as \
-             connect_issued; got connect_issued={issued} backoff_blocked={backoff} \
-             no_target={no_target}"
+                t.routed > 0,
+                "the stall must move `connect_issued_routed` — the series the \
+             docs now name as its signature; got {t:?}"
+            );
+            // The discrimination that makes the split worth having: the stall
+            // must NOT show up in the ordinary dial-a-gateway series, and must
+            // NOT show up as `no_target`, which the docs used to name.
+            assert_eq!(
+                t.gateway, 0,
+                "no gateway is unconnected here, so the dial-a-gateway series \
+             must stay at zero; got {t:?}"
+            );
+            assert_eq!(
+                t.no_target, 0,
+                "`no_target` must stay flat through the stall — documenting it \
+             as the stall signature is precisely the bug this pins; got {t:?}"
             );
 
             // And the joiner must be visibly un-bootstrapped rather than absent.
@@ -2366,15 +2440,97 @@ mod tests {
             let handle = initial_join_procedure(op_manager.clone(), &gateways)
                 .await
                 .expect("spawn join procedure");
-            let (issued, backoff, no_target) =
-                wait_for_startup_round(Duration::from_secs(10)).await;
+            let t = wait_for_startup_round(Duration::from_secs(10)).await;
             handle.abort();
 
             assert!(
-                issued > 0,
-                "a round that issues CONNECTs to unconnected gateways must count as \
-             connect_issued; got connect_issued={issued} backoff_blocked={backoff} \
-             no_target={no_target}"
+                t.gateway > 0,
+                "a round that dials unconnected gateways must count as \
+             connect_issued_gateway; got {t:?}"
+            );
+            // The other half of the split: ordinary bootstrap must not be
+            // mistaken for the stall signature.
+            assert_eq!(
+                t.routed, 0,
+                "dialling unconnected gateways is not a routed CONNECT round; got {t:?}"
+            );
+        });
+    }
+
+    /// Finding 2: `use_connected_as_routers` with every gateway in backoff
+    /// issues nothing, and that is `BackoffBlocked` — not `NoTarget`. Before
+    /// the fix this branch had no `else`, so the round fell through to the
+    /// `NoTarget` default at the bottom of the loop and was misreported as
+    /// "gateways all connected, nothing to do" while the real reason was
+    /// exponential backoff.
+    ///
+    /// The same branch is reached from the fully-isolated path
+    /// (`open_conns == 0` with every gateway transport apparently up); the
+    /// setup here uses real ring connections because that is deterministic to
+    /// construct, and the classification under test is identical.
+    #[test]
+    fn startup_rounds_report_backoff_when_routing_through_connected_gateways() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("bootstrap-4787-routed-backoff", "127.0.0.1:14792").await;
+            let cm = &op_manager.ring.connection_manager;
+            let gateways = vec![bootstrap_gateway(24793), bootstrap_gateway(24794)];
+
+            for gw in &gateways {
+                let addr = gw.socket_addr().expect("gateway has an address");
+                assert!(
+                    cm.add_connection(
+                        Location::from_address(&addr),
+                        addr,
+                        gw.pub_key().clone(),
+                        false
+                    ),
+                    "test setup: gateway must be accepted into the ring"
+                );
+            }
+            assert_eq!(
+                op_manager.ring.is_not_connected(gateways.iter()).count(),
+                0,
+                "test setup: no gateway may look unconnected"
+            );
+            assert!(
+                op_manager.ring.open_connections() < cm.min_connections,
+                "test setup: node must be below the bootstrap threshold"
+            );
+
+            // Every gateway in backoff, so the routed-CONNECT branch has no
+            // eligible gateway to route through.
+            {
+                let mut backoff = op_manager.gateway_backoff.lock();
+                for gw in &gateways {
+                    let addr = gw.socket_addr().expect("gateway has an address");
+                    backoff.record_failure(addr);
+                    assert!(
+                        backoff.is_in_backoff(addr),
+                        "test setup: gateway must actually be in backoff"
+                    );
+                }
+            }
+
+            let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                .await
+                .expect("spawn join procedure");
+            let t = wait_for_startup_round(Duration::from_secs(10)).await;
+            handle.abort();
+
+            assert!(
+                t.backoff > 0,
+                "a routed-CONNECT round blocked entirely by gateway backoff must \
+             count as backoff_blocked; got {t:?}"
+            );
+            assert_eq!(
+                t.no_target, 0,
+                "misclassifying a backoff-blocked round as `no_target` is the bug \
+             this pins; got {t:?}"
+            );
+            assert_eq!(
+                t.routed, 0,
+                "nothing was routed — no gateway was eligible; got {t:?}"
             );
         });
     }

@@ -922,7 +922,10 @@ pub(crate) struct RouterSnapshotInfo {
     pub bootstrap_promoted_to_ring: Option<u64>,
     pub bootstrap_time_to_min_connections_secs: Option<f64>,
     pub bootstrap_completed: Option<bool>,
-    pub bootstrap_startup_rounds_connect_issued: Option<u64>,
+    pub bootstrap_startup_rounds_connect_issued_gateway: Option<u64>,
+    /// Sustained growth here with `bootstrap_completed == Some(false)` is
+    /// the #4787 stall signature.
+    pub bootstrap_startup_rounds_connect_issued_routed: Option<u64>,
     pub bootstrap_startup_rounds_backoff_blocked: Option<u64>,
     pub bootstrap_startup_rounds_no_target: Option<u64>,
     /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
@@ -1890,7 +1893,8 @@ impl Router {
             bootstrap_promoted_to_ring: None,
             bootstrap_time_to_min_connections_secs: None,
             bootstrap_completed: None,
-            bootstrap_startup_rounds_connect_issued: None,
+            bootstrap_startup_rounds_connect_issued_gateway: None,
+            bootstrap_startup_rounds_connect_issued_routed: None,
             bootstrap_startup_rounds_backoff_blocked: None,
             bootstrap_startup_rounds_no_target: None,
             // Renegade predictor diagnostics

@@ -2024,8 +2024,10 @@ impl Ring {
                 // `None` (this build/collector doesn't report it) — see #4787
                 // finding 3.
                 snapshot.bootstrap_completed = Some(b.time_to_min_connections.is_some());
-                snapshot.bootstrap_startup_rounds_connect_issued =
-                    Some(b.startup_rounds_connect_issued);
+                snapshot.bootstrap_startup_rounds_connect_issued_gateway =
+                    Some(b.startup_rounds_connect_issued_gateway);
+                snapshot.bootstrap_startup_rounds_connect_issued_routed =
+                    Some(b.startup_rounds_connect_issued_routed);
                 snapshot.bootstrap_startup_rounds_backoff_blocked =
                     Some(b.startup_rounds_backoff_blocked);
                 snapshot.bootstrap_startup_rounds_no_target = Some(b.startup_rounds_no_target);

@@ -68,6 +68,14 @@ Registered in `tracing/otel.rs::register_metrics`.
 | `freenet.bootstrap.completed` | gauge | — | `NetworkStatus::bootstrap_churn_stats` (#4787) |
 | `freenet.bootstrap.startup_rounds` | counter | `outcome` | `NetworkStatus::bootstrap_churn_stats` (#4787) |
 
+`freenet.bootstrap.startup_rounds`'s `outcome` label takes
+`connect_issued_gateway`, `connect_issued_routed`, `backoff_blocked` and
+`no_target`. The #4787 bootstrap stall shows up as sustained
+`connect_issued_routed` growth while `freenet.bootstrap.completed` stays 0 —
+that branch is the one a joiner takes when its gateway transports are all up
+but it is still far below `min_connections`. `no_target` is the quiet
+"nothing to do this round" case and stays near flat during that stall.
+
 Everything but the two histograms is an observable callback over state that
 already existed for the local dashboard.
 
