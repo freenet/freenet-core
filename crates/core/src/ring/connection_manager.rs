@@ -2261,6 +2261,36 @@ impl ConnectionManager {
         Some(loc)
     }
 
+    /// Test-only: push a raw [`Connection`] straight into
+    /// `connections_by_location`, bypassing [`Self::add_connection`]'s
+    /// addr-keyed bookkeeping.
+    ///
+    /// This is the ONLY way to stage an ADDRESSLESS ([`PeerAddr::Unknown`])
+    /// connection, and that is precisely because production cannot: every
+    /// other write to `connections_by_location` stores a known addr
+    /// (`add_connection` and `update_peer_identity` both take a
+    /// `SocketAddr`; `prune_connection` only removes), and the getter hands
+    /// back a clone so no caller can mutate a stored entry back to
+    /// `Unknown`. `Ring::k_closest_potentially_hosting` nonetheless carries
+    /// an addressless-candidate branch, and the GET retry driver a matching
+    /// `GetExhaustionReason::AddresslessCandidate`, as defence-in-depth. This
+    /// helper exists so those can be tested against real behaviour rather
+    /// than source text — it manufactures a state the rest of the system is
+    /// supposed to make impossible, so DO NOT read its existence as evidence
+    /// that the state occurs.
+    ///
+    /// Deliberately skips the capacity cap, `location_for_peer`, readiness
+    /// and reservation bookkeeping — it is a fixture, not a substitute for
+    /// `add_connection`.
+    #[cfg(test)]
+    pub(crate) fn insert_raw_connection_for_test(&self, loc: Location, peer: PeerKeyLocation) {
+        self.connections_by_location
+            .write()
+            .entry(loc)
+            .or_default()
+            .push(Connection::new(peer));
+    }
+
     pub(crate) fn connection_count(&self) -> usize {
         // Count only established connections tracked by location buckets.
         self.connections_by_location
