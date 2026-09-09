@@ -1696,6 +1696,14 @@ async fn process_open_request(
                                         "ContractNotification"
                                     }
                                     InboundDelegateMsg::DelegateMessage(_) => "DelegateMessage",
+                                    // Appended in stdlib 0.10.0. Core does not
+                                    // yet produce either (#5600 unsubscribe,
+                                    // #5565 wakeup), but an app may send one,
+                                    // and it should not read as "Unknown".
+                                    InboundDelegateMsg::UnsubscribeContractResponse(_) => {
+                                        "UnsubscribeContractResponse"
+                                    }
+                                    InboundDelegateMsg::WakeupFired { .. } => "WakeupFired",
                                     _ => "Unknown",
                                 })
                                 .collect();

@@ -254,6 +254,7 @@ async fn test_get_contract_request_response() -> Result<(), Box<dyn std::error::
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected GetContractRequest, got {:?}", other)
         }
@@ -280,6 +281,7 @@ async fn test_get_contract_request_response() -> Result<(), Box<dyn std::error::
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -337,6 +339,7 @@ async fn test_get_contract_not_found() -> Result<(), Box<dyn std::error::Error>>
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected GetContractRequest, got {:?}", other)
         }
@@ -359,6 +362,7 @@ async fn test_get_contract_not_found() -> Result<(), Box<dyn std::error::Error>>
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -418,6 +422,7 @@ async fn test_multiple_contract_requests() -> Result<(), Box<dyn std::error::Err
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected GetContractRequest, got {:?}", other)
         }
@@ -442,6 +447,7 @@ async fn test_multiple_contract_requests() -> Result<(), Box<dyn std::error::Err
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected GetContractRequest for contract2, got {:?}", other)
         }
@@ -466,6 +472,7 @@ async fn test_multiple_contract_requests() -> Result<(), Box<dyn std::error::Err
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected GetContractRequest for contract3, got {:?}", other)
         }
@@ -490,6 +497,7 @@ async fn test_multiple_contract_requests() -> Result<(), Box<dyn std::error::Err
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -559,6 +567,7 @@ async fn test_message_accumulation() -> Result<(), Box<dyn std::error::Error>> {
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | OutboundDelegateMsg::SendDelegateMessage(_) => None,
         })
         .expect("Expected a GetContractRequest");
@@ -574,6 +583,7 @@ async fn test_message_accumulation() -> Result<(), Box<dyn std::error::Error>> {
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | OutboundDelegateMsg::SendDelegateMessage(_) => None,
         })
         .expect("Expected an ApplicationMessage (Echo)");
@@ -618,6 +628,7 @@ async fn test_message_accumulation() -> Result<(), Box<dyn std::error::Error>> {
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -725,6 +736,7 @@ async fn test_context_persistence_within_call() -> Result<(), Box<dyn std::error
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -739,6 +751,7 @@ async fn test_context_persistence_within_call() -> Result<(), Box<dyn std::error
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -809,6 +822,7 @@ async fn test_context_persists_between_calls() -> Result<(), Box<dyn std::error:
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -836,6 +850,7 @@ async fn test_context_persists_between_calls() -> Result<(), Box<dyn std::error:
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1400,6 +1415,7 @@ async fn test_has_secret_host_function() -> Result<(), Box<dyn std::error::Error
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1437,6 +1453,7 @@ async fn test_has_secret_host_function() -> Result<(), Box<dyn std::error::Error
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1477,6 +1494,7 @@ async fn test_get_nonexistent_secret() -> Result<(), Box<dyn std::error::Error>>
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1522,6 +1540,7 @@ async fn test_store_and_retrieve_secret() -> Result<(), Box<dyn std::error::Erro
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1546,6 +1565,7 @@ async fn test_store_and_retrieve_secret() -> Result<(), Box<dyn std::error::Erro
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1612,6 +1632,7 @@ async fn test_set_secret_failure_returns_secret_store_failed()
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1657,6 +1678,7 @@ async fn test_read_empty_context() -> Result<(), Box<dyn std::error::Error>> {
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1725,6 +1747,7 @@ async fn test_context_clear() -> Result<(), Box<dyn std::error::Error>> {
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1749,6 +1772,7 @@ async fn test_context_clear() -> Result<(), Box<dyn std::error::Error>> {
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1809,6 +1833,7 @@ async fn test_context_shared_across_batch() -> Result<(), Box<dyn std::error::Er
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
@@ -1882,6 +1907,7 @@ async fn test_remove_secret_host_function() -> Result<(), Box<dyn std::error::Er
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1905,6 +1931,7 @@ async fn test_remove_secret_host_function() -> Result<(), Box<dyn std::error::Er
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1928,6 +1955,7 @@ async fn test_remove_secret_host_function() -> Result<(), Box<dyn std::error::Er
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1974,6 +2002,7 @@ async fn test_large_context_data() -> Result<(), Box<dyn std::error::Error>> {
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -2015,6 +2044,7 @@ async fn test_large_context_data() -> Result<(), Box<dyn std::error::Error>> {
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -2085,6 +2115,7 @@ async fn test_large_context_within_batch() -> Result<(), Box<dyn std::error::Err
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -2174,6 +2205,7 @@ async fn a_write_invalidates_the_secret_memo_within_one_process_call()
             | other @ OutboundDelegateMsg::PutContractRequest(_)
             | other @ OutboundDelegateMsg::UpdateContractRequest(_)
             | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage, got {other:?}")
             }
@@ -2266,6 +2298,7 @@ async fn test_large_secret_data() -> Result<(), Box<dyn std::error::Error>> {
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -2307,6 +2340,7 @@ async fn test_large_secret_data() -> Result<(), Box<dyn std::error::Error>> {
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -2414,6 +2448,7 @@ async fn test_concurrent_delegate_execution() -> Result<(), Box<dyn std::error::
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
@@ -2494,6 +2529,7 @@ async fn test_concurrent_delegate_execution() -> Result<(), Box<dyn std::error::
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
@@ -2743,6 +2779,7 @@ async fn test_v2_delegate_reads_contract_state() -> Result<(), Box<dyn std::erro
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -2833,6 +2870,7 @@ async fn test_v2_delegate_contract_not_found() -> Result<(), Box<dyn std::error:
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -2947,6 +2985,7 @@ fn send_v2_message(
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -3156,6 +3195,7 @@ async fn test_put_contract_request_response() -> Result<(), Box<dyn std::error::
         | other @ OutboundDelegateMsg::GetContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected PutContractRequest, got {:?}", other)
         }
@@ -3185,6 +3225,7 @@ async fn test_put_contract_request_response() -> Result<(), Box<dyn std::error::
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -3245,6 +3286,7 @@ async fn test_update_contract_request_response() -> Result<(), Box<dyn std::erro
         | other @ OutboundDelegateMsg::GetContractRequest(_)
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected UpdateContractRequest, got {:?}", other)
         }
@@ -3274,6 +3316,7 @@ async fn test_update_contract_request_response() -> Result<(), Box<dyn std::erro
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -3336,6 +3379,7 @@ async fn test_subscribe_contract_request_response() -> Result<(), Box<dyn std::e
         | other @ OutboundDelegateMsg::GetContractRequest(_)
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected SubscribeContractRequest, got {:?}", other)
         }
@@ -3365,6 +3409,7 @@ async fn test_subscribe_contract_request_response() -> Result<(), Box<dyn std::e
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -3429,6 +3474,7 @@ async fn test_contract_notification_delivered() -> Result<(), Box<dyn std::error
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -3542,6 +3588,7 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
         | other @ OutboundDelegateMsg::GetContractRequest(_)
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected SubscribeContractRequest, got {:?}", other)
         }
@@ -3608,6 +3655,7 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -3657,6 +3705,7 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -4076,7 +4125,8 @@ async fn test_delegate_emits_send_delegate_message() -> Result<(), Box<dyn std::
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_) => None,
         })
         .expect("Expected SendDelegateMessage in outbound");
 
@@ -4132,6 +4182,7 @@ async fn test_delegate_receives_delegate_message() -> Result<(), Box<dyn std::er
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", &outbound[0])
         }
@@ -4265,7 +4316,8 @@ async fn test_delegate_to_delegate_roundtrip() -> Result<(), Box<dyn std::error:
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_) => None,
         })
         .expect("Expected SendDelegateMessage from delegate A");
 
@@ -4291,6 +4343,7 @@ async fn test_delegate_to_delegate_roundtrip() -> Result<(), Box<dyn std::error:
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!(
                 "Expected ApplicationMessage from B, got {:?}",
@@ -4379,7 +4432,8 @@ async fn test_multiple_send_delegate_messages_all_attested()
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_) => None,
         })
         .collect();
 
@@ -4475,7 +4529,8 @@ async fn test_drain_behind_application_message_reattests_sender()
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_) => None,
         })
         .expect("SendDelegateMessage should be drained into results");
 
@@ -4536,7 +4591,8 @@ async fn test_drain_behind_get_contract_request_reattests_sender()
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_) => None,
         })
         .expect("SendDelegateMessage should be drained into results");
 

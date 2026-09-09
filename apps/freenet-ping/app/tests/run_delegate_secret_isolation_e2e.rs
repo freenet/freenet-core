@@ -100,43 +100,40 @@ async fn delegate_app_msg(
     }
 }
 
-/// E2E test for `RegisterDelegateWithPredecessors`'s secret copy-forward,
-/// exercised end-to-end over token-less raw WebSocket connections.
+/// E2E test that a newly-registered delegate starts with an EMPTY secret
+/// namespace, exercised end-to-end over token-less raw WebSocket connections.
 ///
-/// A delegate's on-disk key is BLAKE3(code_hash || params), so any WASM
-/// rebuild (or, as here, a param change simulating one) mints a new key and
-/// a new, empty secret namespace. `DelegateRequest::RegisterDelegateWithPredecessors`
-/// was designed to carry Local-scope secrets forward from a list of
-/// predecessor keys into the newly-registered successor's namespace, gated by
-/// an H1 same-origin check in `SecretsStore::migrate_secrets` — but as of
-/// freenet/freenet-core#5198, the copy-forward call is UNCONDITIONALLY
-/// DISABLED at the handler level (`crates/core/src/contract/executor/runtime/delegates.rs`):
-/// `origin_contract` is forgeable by any HTTP client, so the H1 gate cannot
-/// actually authorize anything, and re-enabling the copy needs that fixed
-/// first. This test's raw WS connection carries no origin attestation at all
-/// (`origin_contract = None`), which was already unprivileged even before
-/// #5198 — so this test exercises the same observable outcome (copy refused)
-/// both before and after the fix, but for a different reason now (disabled
-/// entirely, not merely None-unprivileged).
+/// A delegate's on-disk key is BLAKE3(code_hash || params), so any WASM rebuild
+/// (or, as here, a param change simulating one) mints a new key and a new,
+/// empty secret namespace. `DelegateRequest::RegisterDelegateWithPredecessors`
+/// once carried Local-scope secrets forward from named predecessor keys into
+/// the newly-registered successor's namespace, gated by an H1 same-origin check
+/// in `SecretsStore::migrate_secrets`. freenet/freenet-core#5198 disabled that
+/// copy unconditionally — `origin_contract` is forgeable by any HTTP client, so
+/// the H1 gate could not authorize anything — and freenet-stdlib 0.9.0
+/// (freenet/freenet-stdlib#91) then removed the request variant from the wire
+/// altogether, so there is no longer any message that could ask for a copy.
 ///
-/// This test registers a "predecessor" delegate (test-delegate-2), stores a
-/// Local-scope secret in it via `set_secret` (exercised through the
-/// `StoreSecret` app message), then registers a "successor" delegate — same
-/// WASM, different params, so a DIFFERENT `DelegateKey` — via
-/// `RegisterDelegateWithPredecessors` naming the predecessor. It asserts that
-/// registration itself still succeeds (disabling the copy never fails
-/// registration), that the successor genuinely has NO migrated secret, and
-/// that the predecessor's own copy is untouched (no-delete invariant). The
-/// handler-level `register_delegate_with_predecessors_never_copies_secrets`
-/// test in `crates/core/src` covers the stronger claim directly (copy refused
-/// even when `origin_contract` DOES match the predecessor's recorded origin);
-/// this raw-WS harness has no way to attach any origin to a connection, so it
-/// only ever exercises the `None` case.
+/// This test asserted that the copy did not happen when it was asked for; it
+/// now asserts the property that outlived the request: registering a fresh
+/// delegate gives it NOTHING of another delegate's, and leaves that other
+/// delegate's secrets intact. That is the invariant a re-wired, properly-attested
+/// copy-forward path would have to opt out of deliberately, so it is worth
+/// keeping a live end-to-end check on it.
+///
+/// It registers one delegate (test-delegate-2), stores a Local-scope secret in
+/// it via `set_secret` (exercised through the `StoreSecret` app message), then
+/// registers a second delegate — same WASM, different params, so a DIFFERENT
+/// `DelegateKey`. It asserts that the second registration succeeds, that the
+/// second delegate resolves NO secret under the first delegate's `SecretsId`,
+/// and that the first delegate's own copy is untouched.
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn test_delegate_secret_copy_forward_e2e_refuses_token_less_origin() -> anyhow::Result<()> {
+async fn test_registering_a_delegate_does_not_inherit_another_delegates_secrets()
+-> anyhow::Result<()> {
     // Same WASM, different params => different DelegateKeys
     // (DelegateKey = BLAKE3(code_hash || params)), simulating a WASM rebuild
-    // that mints a new successor key while keeping the same delegate logic.
+    // that mints a new key while keeping the same delegate logic. `pred`/`succ`
+    // name the two generations that such a rebuild produces.
     let pred_params = Parameters::from(vec![1u8]);
     let pred_delegate = freenet::test_utils::load_delegate("test-delegate-2", pred_params.clone())?;
     let pred_key = pred_delegate.key().clone();
@@ -150,8 +147,8 @@ async fn test_delegate_secret_copy_forward_e2e_refuses_token_less_origin() -> an
         "predecessor and successor must have different DelegateKeys"
     );
 
-    const SECRET_KEY: &[u8] = b"delegate-secret-copy-forward-e2e";
-    const SECRET_VALUE: &[u8] = b"secret-value-carried-across-rebuild";
+    const SECRET_KEY: &[u8] = b"delegate-secret-isolation-e2e";
+    const SECRET_VALUE: &[u8] = b"secret-value-that-must-not-cross-delegates";
 
     // Allocate unique IP for this test's gateway
     let base_node_idx = allocate_test_node_block(1);
@@ -224,8 +221,8 @@ async fn test_delegate_secret_copy_forward_e2e_refuses_token_less_origin() -> an
 
         // Step 2: Store a Local-scope secret in the predecessor (no user
         // token on this connection, so `set_secret` lands in `SecretScope::Local`
-        // — the only scope the node-side copy-forward can re-encrypt, since
-        // its DEK is derivable at rest from the delegate key + node KEK).
+        // — the scope whose DEK is derivable at rest from the delegate key +
+        // node KEK, i.e. the one a node-side copy could ever have re-encrypted).
         match delegate_app_msg(
             &mut client,
             &pred_key,
@@ -243,8 +240,8 @@ async fn test_delegate_secret_copy_forward_e2e_refuses_token_less_origin() -> an
             other => return Err(anyhow!("Expected SecretStored, got: {other:?}")),
         }
 
-        // Step 3: Read the secret back from the predecessor to confirm it's
-        // actually stored before we exercise the migration.
+        // Step 3: Read the secret back from the predecessor to confirm it is
+        // actually stored, so Step 5's negative result cannot pass vacuously.
         match delegate_app_msg(
             &mut client,
             &pred_key,
@@ -263,16 +260,16 @@ async fn test_delegate_secret_copy_forward_e2e_refuses_token_less_origin() -> an
             other => return Err(anyhow!("Expected SecretResult(Some(..)), got: {other:?}")),
         }
 
-        // Step 4: Register the successor delegate (different DelegateKey),
-        // naming the predecessor so the node runs the one-shot secret
-        // copy-forward as part of registration.
+        // Step 4: Register the successor delegate (different DelegateKey).
+        // There is no longer any request that could ask the node to carry the
+        // predecessor's secrets over: `RegisterDelegateWithPredecessors` was
+        // removed from the wire in freenet-stdlib 0.9.0.
         client
             .send(ClientRequest::DelegateOp(
-                DelegateRequest::RegisterDelegateWithPredecessors {
+                DelegateRequest::RegisterDelegate {
                     delegate: succ_delegate.clone(),
                     cipher: TEST_DELEGATE_CIPHER,
                     nonce: TEST_DELEGATE_NONCE,
-                    predecessors: vec![pred_key.clone()],
                 },
             ))
             .await?;
@@ -280,7 +277,7 @@ async fn test_delegate_secret_copy_forward_e2e_refuses_token_less_origin() -> an
         match resp {
             HostResponse::DelegateResponse { key, .. } => {
                 assert_eq!(key, succ_key, "Key mismatch registering successor delegate");
-                tracing::info!("Registered successor delegate with predecessors: {key}");
+                tracing::info!("Registered successor delegate: {key}");
             }
             other => {
                 return Err(anyhow!(
@@ -289,13 +286,9 @@ async fn test_delegate_secret_copy_forward_e2e_refuses_token_less_origin() -> an
             }
         }
 
-        // Step 5: The successor must NOT resolve the migrated SecretsId.
-        // Copy-forward is unconditionally disabled (#5198), so this holds
-        // regardless of origin — this token-less connection additionally
-        // carries `origin_contract = None`, which was already unprivileged
-        // under the underlying H1 gate even before #5198. Registration
-        // itself still succeeded (Step 4): disabling the copy never fails
-        // registration.
+        // Step 5: The successor must NOT resolve the predecessor's SecretsId.
+        // Each delegate key owns its own secret namespace, and registration
+        // never populates a new one from an existing delegate's.
         match delegate_app_msg(
             &mut client,
             &succ_key,
@@ -306,22 +299,21 @@ async fn test_delegate_secret_copy_forward_e2e_refuses_token_less_origin() -> an
         {
             OutboundAppMessage::SecretResult(None) => {
                 tracing::info!(
-                    "Successor correctly has NO migrated secret — copy-forward is disabled (#5198)"
+                    "Successor correctly resolves NO secret under the predecessor's SecretsId"
                 );
             }
             OutboundAppMessage::SecretResult(Some(value)) => {
                 return Err(anyhow!(
-                    "successor unexpectedly read a migrated secret ({} bytes) — copy-forward \
-                     must be unconditionally disabled (#5198)",
+                    "successor unexpectedly read another delegate's secret ({} bytes) — a \
+                     freshly-registered delegate must start with an EMPTY secret namespace",
                     value.len()
                 ));
             }
             other => return Err(anyhow!("Expected SecretResult, got: {other:?}")),
         }
 
-        // Step 6: No-delete invariant — the predecessor's own copy must still
-        // be readable; copy-forward only ever reads the predecessor, never
-        // mutates or deletes it.
+        // Step 6: The predecessor's own copy must still be readable — the
+        // successor's registration must not have moved, mutated or deleted it.
         match delegate_app_msg(
             &mut client,
             &pred_key,
@@ -333,9 +325,9 @@ async fn test_delegate_secret_copy_forward_e2e_refuses_token_less_origin() -> an
             OutboundAppMessage::SecretResult(Some(value)) => {
                 assert_eq!(
                     value, SECRET_VALUE,
-                    "predecessor secret must remain intact after copy-forward (no-delete invariant)"
+                    "predecessor secret must remain intact after the successor registers"
                 );
-                tracing::info!("Predecessor secret confirmed intact after copy-forward");
+                tracing::info!("Predecessor secret confirmed intact after successor registration");
             }
             other => {
                 return Err(anyhow!(
@@ -345,8 +337,8 @@ async fn test_delegate_secret_copy_forward_e2e_refuses_token_less_origin() -> an
         }
 
         tracing::info!(
-            "Delegate secret copy-forward E2E checks passed: registration succeeded, \
-             and the copy-forward (disabled, #5198) correctly copied nothing"
+            "Delegate secret isolation E2E checks passed: the second registration \
+             succeeded, inherited nothing, and left the first delegate's secret intact"
         );
         Ok::<_, anyhow::Error>(())
     });

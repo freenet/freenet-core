@@ -171,6 +171,9 @@ fn inbound_kind(msg: &InboundDelegateMsg<'_>) -> &'static str {
         InboundDelegateMsg::SubscribeContractResponse(_) => "SubscribeContractResponse",
         InboundDelegateMsg::ContractNotification(_) => "ContractNotification",
         InboundDelegateMsg::DelegateMessage(_) => "DelegateMessage",
+        // Appended in stdlib 0.10.0.
+        InboundDelegateMsg::UnsubscribeContractResponse(_) => "UnsubscribeContractResponse",
+        InboundDelegateMsg::WakeupFired { .. } => "WakeupFired",
         _ => "Other",
     }
 }

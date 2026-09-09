@@ -304,6 +304,9 @@ impl Runtime {
             InboundDelegateMsg::SubscribeContractResponse(_) => "SubscribeContractResponse",
             InboundDelegateMsg::ContractNotification(_) => "ContractNotification",
             InboundDelegateMsg::DelegateMessage(_) => "DelegateMessage",
+            // Appended in stdlib 0.10.0.
+            InboundDelegateMsg::UnsubscribeContractResponse(_) => "UnsubscribeContractResponse",
+            InboundDelegateMsg::WakeupFired { .. } => "WakeupFired",
             // `InboundDelegateMsg` is `#[non_exhaustive]` (stdlib 0.6.0+).
             // Future variants land here for tracing only — they still flow
             // through the wasm boundary as raw bincode below; classifying
