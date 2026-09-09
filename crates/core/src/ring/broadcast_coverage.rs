@@ -325,6 +325,13 @@ fn peer_hash(tx: &Transaction, pub_key: &TransportPublicKey) -> PeerHash {
 ///   the state it re-drives is by definition one that reached NOBODY, so
 ///   suppressing its fan-out against someone else's claim withholds content
 ///   that has never propagated at all.
+/// * The V2 delegate write callback
+///   (`contract::executor::runtime::v2_delegate_state_write_callback`, #5479).
+///   A delegate writing state while a relayed update for the same contract is
+///   in flight takes that apply's claim. Rarer than the others — it needs a
+///   delegate write concurrent with a relay apply of the same contract — and
+///   healed the same way. Listed here rather than left out, because this
+///   block's own argument is that a partial list is worse than none.
 ///
 /// Each needs a same-contract emission concurrent with a relayed update inside
 /// one contract-handler round trip. All are bounded by [`COVERAGE_TTL`] and

@@ -34,17 +34,61 @@ V2: Async host functions — delegates call contract methods directly:
                                          subscription does NOT register demand, #4669)
     Backend implementation: func_wrap_async (wasmtime native async support)
     Selected when state_store_db is configured on Runtime
-    NOTE: V2 PUT/UPDATE are local-only, bypass contract validation, and skip
-    hosting metadata. Network propagation is separate.
+    NOTE (updated by #5479): V2 PUT/UPDATE now queue a network fan-out, so a
+    content-CHANGING write propagates to peers already interested in the
+    contract. The queued event (NodeEvent::V2DelegateStateChanged) carries the
+    contract id and NO state; the handler re-reads current state when it drains,
+    so the queue cost does not scale with state size and repeat writes to one
+    contract coalesce into a single fan-out carrying the newest value.
+    Bookkeeping (generation bump, meters, cache invalidation) runs on EVERY
+    committed write; only the fan-out is skipped when the bytes did not change.
+    Three caveats remain, and they matter:
+      - the write still bypasses the contract's own validate_state/update_state
+        merge on the writing node (receivers do merge it);
+      - it writes no hosting metadata, so `should_summarize_or_broadcast` drops
+        the broadcast for a contract this node holds ONLY because a delegate
+        wrote it (#4669 — a delegate subscription does not register demand);
+      - it does not reach this node's OWN WebSocket clients or other locally
+        subscribed delegates (#5486).
 ```
 
 ### WASM Call Modes
 
+All four guest entry points share ONE body, `call_typed_blocking` in
+`engine/wasmtime_engine.rs`. Delegates ran "sync, on the calling thread" until
+#5480; they no longer do, and nothing should reintroduce a per-entry-point copy.
+
 ```
-call_3i64()              — Sync, same thread (delegates V1)
-call_3i64_async_imports() — For modules with async host function imports (delegates V2)
-call_*_blocking()        — spawn_blocking + timeout (contracts)
+call_3i64()               — delegates V1
+call_3i64_async_imports() — delegates V2 (modules with async host-function imports)
+call_2i64_blocking()      — contracts
+call_3i64_blocking()      — contracts
+        ↓ all four
+call_typed_blocking()     — spawn_blocking + wall-clock backstop + panic capture
 ```
+
+Two consequences for anything touching the delegate path:
+
+- **A delegate guest can outlive its call.** On the wall-clock-timeout path
+  `exec_inbound_with_env` returns while the guest is still running, because
+  `JoinHandle::abort()` cannot stop a `spawn_blocking` closure that has started.
+  Ask "is a guest still running", not "is its env still registered" — those are
+  different facts (`native_api::LIVE_DELEGATE_GUESTS`).
+- **During `process()`, delegate host functions run on a blocking-pool thread**,
+  so they find their env through a thread-local installed on THAT thread by
+  `GuestDelegateInstance`, not on the caller's.
+
+  Scope that to `process()` and no further. Buffer setup and instantiation —
+  `initiate_buffer`, `call_void`, `instantiate_and_init` — still enter the guest
+  with `block_on_async(func.call_async(...))` INLINE on the calling thread, with
+  no `execute_wasm_blocking` and no `GuestDelegateInstance`. That is why
+  `exec_inbound_with_env` still sets `CURRENT_DELEGATE_INSTANCE` on the calling
+  thread at all, as `DelegateEnvGuard`'s rustdoc explains. "Nothing
+  delegate-related runs on the calling thread" is false and would produce a wrong
+  call about exactly those paths.
+
+The pins `every_guest_entry_is_preceded_by_arm_epoch_deadline` and
+`blocking_paths_arm_epoch_inside_the_closure` enforce the single-body structure.
 
 ## WASM Execution Rules
 
@@ -289,10 +333,23 @@ MUST:
 
 - Off-loop deferral (#4391): there are now TWO entry points into the
   bridged upsert.
-  * The NON-deferrable path (`upsert_contract_state`, used by
-    delegate-driven PUTs and direct callers) keeps the INLINE
+  * The NON-deferrable path (`upsert_contract_state`) keeps the INLINE
     `start_sub_op_get` escalation described above — it awaits the
     network GET in place, bounded by RELATED_FETCH_TIMEOUT.
+    Used by direct callers, and as a FALLBACK only: the delegate path
+    reaches it when there is no parking context (direct unit-test calls)
+    or when a park was refused at the node-wide cap. Falling back means
+    accepting the loop stall the deferral exists to remove, which is the
+    deliberate trade at that cap — losing a user's prompt or a delegate's
+    write would be worse.
+  * DELEGATE-DRIVEN PUTs AND UPDATEs USE THE DEFERRABLE PATH (#5544).
+    They used to be listed above as non-deferrable, and were: the delegate
+    arms called `upsert_contract_state` directly, so a related-contract
+    miss awaited a network GET on the serial loop for up to
+    RELATED_FETCH_TIMEOUT. That was one of the two stalls #5544 removes.
+    Past `MAX_DEFERRED_UPSERTS_PER_PARK` the excess REFUSES with
+    `MissingRelated` rather than falling back inline, because nothing caps
+    how many upserts one `process()` may emit.
   * The DEFERRABLE path (`upsert_contract_state_deferrable`, used by the
     serial `contract_handling` loop) resolves related contracts
     LOCAL-ONLY first. On a local miss it does NOT await the network GET

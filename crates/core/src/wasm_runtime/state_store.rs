@@ -202,7 +202,7 @@ pub struct StateStore<S: StateStorage> {
     ///     `Storage`, BYPASSING `StateStore`, so they invalidate this entry (and
     ///     the moka state-bytes cache) via a [`StateCacheInvalidator`] handle
     ///     wired into the runtime's `state_write_callback` (see
-    ///     `Runtime::set_state_write_callback` and the callback installers in
+    ///     `Runtime::set_state_write_callback` and the single callback installer in
     ///     `executor/runtime.rs`). Without this a V2 write would leave a stale
     ///     detector hash → stale summary/delta → divergence (caught by Codex
     ///     review).

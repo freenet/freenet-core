@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use super::contract_store::ContractStore;
 use super::delegate_store::DelegateStore;
 use super::runtime::InstanceInfo;
-use super::secrets_store::{SecretScope, SecretsStore, UserSecretContext};
+use super::secrets_store::{SecretScope, SecretStoreError, SecretsStore, UserSecretContext};
 use crate::contract::storages::Storage;
 
 /// This is a map of starting addresses of the instance memory space.
@@ -23,14 +23,58 @@ use crate::contract::storages::Storage;
 pub(super) static MEM_ADDR: LazyLock<DashMap<InstanceId, InstanceInfo>> =
     LazyLock::new(DashMap::default);
 
+/// One memoised secret read: the secret's 32-byte hash (the value that names
+/// its on-disk file) paired with the plaintext that hash decrypted to. See
+/// [`DelegateCallEnv::secret_read_memo`].
+type SecretReadMemo = Option<([u8; 32], zeroize::Zeroizing<Vec<u8>>)>;
+
 /// Per-instance delegate call environment.
 ///
 /// The runtime populates this before calling the delegate's `process` function.
 /// Host functions for context and secret access read/write through this.
 /// After `process` returns, the runtime reads back the (possibly mutated) context
 /// and removes the entry.
-pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateCallEnv>> =
+pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateEnvSlot>> =
     LazyLock::new(DashMap::default);
+
+/// Instance ids whose delegate guest MAY STILL BE EXECUTING.
+///
+/// This exists because `DELEGATE_ENV` cannot answer the question that actually
+/// matters. `DelegateEnvGuard::drop` removes the env on EVERY exit path of
+/// `exec_inbound_with_env`, including the wall-clock-timeout `Err` — and on that
+/// path the guest is still running on an abandoned `spawn_blocking` thread,
+/// because `JoinHandle::abort()` cannot stop a closure that has started. So
+/// `DELEGATE_ENV.contains_key(id)` tests "is an env still registered", while the
+/// dangerous fact is "is a guest still running". Those were the same thing only
+/// while the guest could not outlive the call, which stopped being true in
+/// #5480.
+///
+/// One `RunningInstance` id is shared by every message in a batch
+/// (`delegate/interface.rs`), so without this an error-tolerant batch loop could
+/// insert a second env under an id whose first guest is still live, and the two
+/// threads would alias the same `SecretsStore`, `context` and
+/// `secret_read_memo`. The last of those holds decrypted secret plaintext, so
+/// the consequence is cross-value disclosure, not merely a panic.
+///
+/// LIFETIME. An entry is added on the CALLING thread before the guest closure is
+/// enqueued, and removed by a guard MOVED INTO that closure. That placement is
+/// deliberate and both halves matter:
+///
+///  - Adding it inside the closure would leave a gap. `execute_wasm_blocking`
+///    reports `QueuedTimeout` when its `started` flag is false, then aborts; if
+///    that abort loses the race the closure runs anyway, so a registration made
+///    inside it could land AFTER the caller had already returned and the next
+///    message had passed its check.
+///  - Removing it by dropping a captured guard covers both outcomes without a
+///    leak: if the closure runs, the guard drops when the guest finishes
+///    (including on panic-unwind); if `abort()` wins and the closure is dropped
+///    UNRUN, its captures drop with it and the id clears — correctly, since no
+///    guest ever ran.
+///
+/// The registration must therefore stay captured by the closure. Moving it out,
+/// or dropping it before the guest returns, silently reintroduces the hazard.
+pub(super) static LIVE_DELEGATE_GUESTS: LazyLock<dashmap::DashSet<InstanceId>> =
+    LazyLock::new(dashmap::DashSet::default);
 
 /// Global registry of delegate subscriptions to contracts.
 ///
@@ -58,13 +102,33 @@ pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
 /// entry and stores the (possibly-mutated) `Vec` back on exit. Cleared on
 /// `UnregisterDelegate` so an unregistered delegate can't accumulate state.
 ///
-/// Concurrency: the runtime serializes calls into a given delegate instance
-/// (one WASM `process()` at a time), so two prompt round-trips on the same
-/// delegate cannot interleave context writes. Wrapped in `Arc` so a
-/// `RuntimePool` of `Runtime`s shares one cache: a delegate's first call
-/// might run on executor A and its `UserResponse` follow-up on executor B,
-/// so per-`Runtime` storage would have the same locality bug as the
-/// per-call `Vec`.
+/// Concurrency — READ THIS BEFORE RELYING ON IT. Because the map is keyed by
+/// `DelegateKey` alone and is last-write-wins, it is only safe while at most
+/// ONE `process()` per delegate is in flight. That property holds today, but
+/// **the runtime does not provide it**: `prepare_delegate_call` takes no
+/// per-delegate lock (its mutex guards the module cache, keyed by code hash),
+/// `RuntimePool::execute_delegate_request` pops an arbitrary pooled executor
+/// with no per-delegate affinity, and there is no per-delegate mutex anywhere
+/// in `wasm_runtime::delegate`.
+///
+/// It is supplied entirely by the SERIAL `contract::contract_handling` loop:
+/// both call sites of `execute_delegate_request` sit inside
+/// `handle_delegate_with_contract_requests`, which runs on that one loop, so a
+/// second call for the same delegate cannot begin until the first returns.
+///
+/// The consequence, spelled out because an earlier version of this comment
+/// credited the runtime and would have let someone remove the real protection
+/// believing it was redundant: anything that lets a delegate's round-trip span
+/// two loop iterations — parking it mid-prompt, deferring a contract op —
+/// breaks this invariant and must bring its own per-delegate exclusion. A
+/// second run would otherwise overwrite the parked continuation's context, and
+/// the delegate would resume reading someone else's bytes. Silent state
+/// corruption, not a crash.
+///
+/// Wrapped in `Arc` so a `RuntimePool` of `Runtime`s shares one cache: a
+/// delegate's first call might run on executor A and its `UserResponse`
+/// follow-up on executor B, so per-`Runtime` storage would have the same
+/// locality bug as the per-call `Vec`.
 ///
 /// TTL: each entry stores the `Instant` it was last written. On every
 /// `inbound_app_message` call the loader prunes entries older than
@@ -466,13 +530,49 @@ pub mod error_codes {
 /// Host functions access this through the global `DELEGATE_ENV` map.
 pub(super) struct DelegateCallEnv {
     /// Mutable context bytes. The delegate reads/writes this via host functions.
-    pub context: Vec<u8>,
+    ///
+    /// Behind a `RefCell` so that writing it needs only a SHARED reference to
+    /// the env. That is not a style choice: it is what makes the identity
+    /// fields below immutable at the TYPE level rather than by convention.
+    ///
+    /// `context_write` was the sole reason a `&mut DelegateCallEnv` ever
+    /// existed (via `DELEGATE_ENV.get_mut`), and from a `&mut` to the struct
+    /// every field is reachable for rebinding. A source pin forbidding
+    /// `.delegate_key = ` caught assignment and nothing else — `mem::swap`,
+    /// `clone_from` and `let k = &mut env.delegate_key; *k = ..` all sailed
+    /// past it, which mutation review demonstrated. Enumerating rebinding
+    /// forms is an open set, the same mistake as enumerating item kinds.
+    ///
+    /// With this cell there is no `&mut DelegateCallEnv` anywhere in the
+    /// crate, so NO rebinding of any field compiles at all. See
+    /// `no_mutable_borrow_of_the_call_env_exists`.
+    pub(super) context: std::cell::RefCell<Vec<u8>>,
     /// Interior-mutable pointer to the runtime's SecretsStore. Valid only during
     /// the synchronous `process()` call. Uses `UnsafeCell` to make the interior
     /// mutability explicit rather than hiding it behind `#[allow(clippy::mut_from_ref)]`.
     secret_store: std::cell::UnsafeCell<*mut SecretsStore>,
     /// The delegate key, needed to scope secret access.
-    pub delegate_key: DelegateKey,
+    ///
+    /// PRIVATE, AND MUST STAY THAT WAY, and must never be reassigned after
+    /// [`DelegateCallEnv::new`]. The storage read binds this identity TWICE:
+    /// once in the file path (`secrets_store::store::scope_dir`) and once in
+    /// the DEK the blob is authenticated under (HKDF salted with
+    /// `delegate.encode()`). A [`secret_read_memo`](Self::secret_read_memo)
+    /// HIT binds it ZERO times — it is a 32-byte hash comparison and a return.
+    ///
+    /// So before the memo existed, reassigning this mid-call self-corrected:
+    /// you got the wrong path, or a Poly1305 tag that would not verify. The
+    /// AEAD was the backstop. With the memo, the same edit silently returns the
+    /// PREVIOUS identity's plaintext — in hosted mode, cross-tenant
+    /// disclosure.
+    ///
+    /// What holds it is the TYPE SYSTEM, not a convention: `context` is behind
+    /// a `RefCell`, so nothing needs a `&mut DelegateCallEnv`, so no field is
+    /// rebindable by any means — not assignment, not `mem::swap`, not
+    /// `clone_from`, not a `&mut` reborrow. Reintroducing a mutable borrow is
+    /// what would reopen this, and `no_mutable_borrow_of_the_call_env_exists`
+    /// is the pin over that one remaining route.
+    delegate_key: DelegateKey,
     /// Optional per-user secret namespace for this call, derived ONCE at the
     /// WS connection boundary from the connection's user token (hosted mode,
     /// P2 of #4381). When `Some`, the secret host functions
@@ -485,6 +585,13 @@ pub(super) struct DelegateCallEnv {
     /// the runtime from the connection context and is NEVER settable from
     /// inside the WASM sandbox, a delegate message, or any request body — that
     /// is the unforgeability invariant of the per-user namespace.
+    ///
+    /// Like [`delegate_key`](Self::delegate_key), this must never be reassigned
+    /// after construction: [`secret_read_memo`](Self::secret_read_memo) is keyed
+    /// on the secret hash ALONE, which is only sound because the scope this
+    /// field selects is fixed for the whole call. Held by the same mechanism:
+    /// no `&mut DelegateCallEnv` exists, so nothing can rebind this either.
+    /// See `no_mutable_borrow_of_the_call_env_exists`.
     user_context: Option<UserSecretContext>,
     /// Read-only pointer to the ContractStore for index lookups
     /// (ContractInstanceId → CodeHash). Valid only during synchronous process().
@@ -493,14 +600,17 @@ pub(super) struct DelegateCallEnv {
     /// contract state synchronously via host functions. ReDb is Arc<Database>
     /// internally, so cloning is cheap.
     state_store_db: Option<Storage>,
-    /// Optional callback invoked AFTER a successful V2 delegate state write
-    /// (`put_contract_state_sync` / `update_contract_state_sync`). Closes the
-    /// EvictContract re-host race for the V2 delegate write path by bumping
-    /// the per-contract generation token and refreshing the hosting-cache
-    /// snapshot — the V2 path bypasses the executor `state_store.{store,update}`
-    /// chokepoints where the four executor-side bump+refresh sites live, so
-    /// without this hook the V2 path leaves the race open. See
-    /// `super::runtime::StateWriteCallback`.
+    /// Optional callback invoked AFTER a successful, content-CHANGING V2
+    /// delegate state write (`put_contract_state_sync` /
+    /// `update_contract_state_sync`). The V2 path bypasses the executor's
+    /// `state_store.{store,update}` chokepoints, so this hook re-applies what
+    /// they do: it invalidates `StateStore`'s caches, bumps the per-contract
+    /// generation and refreshes the hosting-cache snapshot (closing the
+    /// EvictContract re-host race), reports StateBytesWritten, records the
+    /// contract-update timestamp, and — for a write that CHANGED the stored
+    /// bytes — queues the key-only `NodeEvent::V2DelegateStateChanged` that
+    /// propagates it (#5479). See `super::runtime::StateWriteCallback` and
+    /// `after_state_write`.
     state_write_callback: Option<super::runtime::StateWriteCallback>,
     /// Pre-write disk-budget admission gate for V2 delegate writes (#4683,
     /// PR 3). Runs BEFORE the raw `Storage` write in
@@ -523,17 +633,235 @@ pub(super) struct DelegateCallEnv {
     /// creation extends when the parent has origins. See
     /// [`SharedInheritedOrigins`].
     inherited_origins: SharedInheritedOrigins,
+    /// Memo of the most recently read secret for THIS call: `(hash, plaintext)`.
+    ///
+    /// `DelegateContext::get_secret` in freenet-stdlib is a TWO-call protocol —
+    /// `get_secret_len` to size the guest buffer, then `get_secret` to fill it —
+    /// and each host call independently re-read the file and re-ran the whole
+    /// XChaCha20-Poly1305 decrypt. Every delegate secret read therefore cost two
+    /// file reads and two full AEAD passes over the plaintext to deliver one
+    /// value, which for a large secret is the dominant cost of the call.
+    ///
+    /// The memo is per-`DelegateCallEnv`, and a `DelegateCallEnv` is built
+    /// immediately before one synchronous `process()` call and dropped
+    /// immediately after (see the SAFETY note below), so a plaintext never
+    /// outlives the call that read it. `Zeroizing` wipes it on drop, exactly as
+    /// the un-memoized `get_secret` result was wiped.
+    ///
+    /// Every host function that can CHANGE what a read returns clears this (see
+    /// [`DelegateCallEnv::invalidate_secret_memo`]), so a stale plaintext is
+    /// never served.
+    ///
+    /// # Residency: `has_secret` now retains a plaintext, deliberately
+    ///
+    /// `has_secret` answers one bit but decrypts in full (it always did). It
+    /// now KEEPS that plaintext for the rest of the call, where before it was
+    /// dropped and zeroized on return. This is a change in how long secret
+    /// material is resident, not only in how often it is decrypted, and it is a
+    /// stated tradeoff rather than an oversight:
+    ///
+    /// * **The delegate gains nothing.** It could call `get_secret` instead and
+    ///   get the real bytes into its own linear memory — larger, longer-lived,
+    ///   and not wiped by us. No privilege is added.
+    /// * **The exposure that moves is the HOST's.** A one-bit existence query
+    ///   now makes a full plaintext resident in node memory, which matters to a
+    ///   core dump, a swapped page, or a memory-disclosure bug elsewhere in the
+    ///   process.
+    /// * **It cannot be avoided for free.** stdlib's `get_secret` is
+    ///   `get_secret_len` -> `vec![0u8; len]` -> `get_secret` and never calls
+    ///   `has_secret`, so the three-decrypt case only arises when an author
+    ///   hand-writes `if ctx.has_secret(k) { ctx.get_secret(k) }` — and there
+    ///   `has_secret` IS the miss that populates the memo. Not populating on a
+    ///   miss would destroy exactly that 3 -> 1 saving, leaving 2 -> 1.
+    ///
+    /// The window is one `process()` call. That is NOMINALLY bounded by
+    /// `max_execution_seconds` (5 s), but not hard-bounded: the epoch trap
+    /// cannot fire inside a host call, so host time is not preemptible — see
+    /// freenet-core#5594, which documents exactly that.
+    ///
+    /// # What is and is not wiped
+    ///
+    /// The PLAINTEXT half is wiped: `Zeroizing<Vec<u8>>`'s drop covers the
+    /// initialized elements and `spare_capacity_mut()`, so even a truncated
+    /// AEAD tag tail in the spare capacity is cleared, and the value is MOVED
+    /// into the memo (no clone, no re-wrap), so exactly one copy exists at any
+    /// time.
+    ///
+    /// The `[u8; 32]` hash half is NOT wiped — it has no `Drop` and stays in
+    /// freed memory. That is correct rather than an omission: it is the
+    /// secret's identifier, already on disk in the clear as the bs58 filename
+    /// and enumerable through `list_secrets`. Do not describe the tuple as
+    /// "zeroized"; the plaintext is.
+    ///
+    /// The wipe-on-drop guarantee assumes panics UNWIND. `DelegateEnvGuard`
+    /// (and this field's own drop) run on the unwind path; with
+    /// `panic = "abort"` — commented out in the workspace `Cargo.toml`, but one
+    /// uncomment away — a panic would leave the plaintext unwiped in a dying
+    /// process. Noted because it is true today and would become silently false
+    /// after an unrelated release-profile change.
+    ///
+    secret_read_memo: std::cell::RefCell<SecretReadMemo>,
 }
 
-// SAFETY: DelegateCallEnv is only inserted into DELEGATE_ENV immediately before
-// a synchronous WASM process() call and removed immediately after. The raw pointer
-// to SecretsStore is valid for the entire duration because the Runtime (which owns
-// SecretsStore) is alive and on the same call stack. Wasmer's Singlepass compiler
-// executes WASM synchronously on the calling thread.
-unsafe impl Send for DelegateCallEnv {}
-// SAFETY: Same rationale as Send above -- single-threaded synchronous WASM execution
-// means DelegateCallEnv is never accessed from multiple threads concurrently.
-unsafe impl Sync for DelegateCallEnv {}
+// SAFETY: `DELEGATE_ENV` is a `static`, so its `DashMap` must be `Sync`, which
+// requires `DelegateCallEnv: Send + Sync`. This type holds raw pointers into the
+// `Runtime` that created it (`secret_store`, `contract_store`, `delegate_store`),
+// so these two impls are the whole basis for that soundness.
+//
+// The justification is NOT "WASM executes synchronously on the calling thread".
+// That was true when these impls were written and is FALSE since #5480: the
+// guest now runs on a `spawn_blocking` worker, and on the wall-clock timeout
+// path it KEEPS RUNNING after the creating thread has returned, because
+// `JoinHandle::abort()` cannot stop a `spawn_blocking` closure. The argument
+// below is stated for that abandoned-guest path, since it is the hard one.
+//
+//  1. VALIDITY IS BOUNDED BY THE GUARD, NOT BY THE CALL. The pointers address
+//     fields of a `Runtime` owned by an `Executor` that the pool MOVES back into
+//     its slot once the call returns (`contract/executor/runtime/pool.rs`), and
+//     may drop and replace. A move alone invalidates all three. So they are
+//     valid only until `DelegateEnvGuard::drop` returns; after that they may
+//     dangle at any moment. Do not read this as "the `Runtime` stays put while a
+//     guest can reach it" -- it does not. What makes the path safe is 2 and 4.
+//
+//  2. ONLY THE GUEST THREAD DEREFERENCES THEM, AND ONLY UNDER A MAP GUARD.
+//     Every dereference is inside one of the four private accessors below, each
+//     reached through a `Ref`/`RefMut` from `DELEGATE_ENV`. `DashMap::remove`
+//     takes the shard WRITE lock, so `DelegateEnvGuard::drop` waits for any
+//     in-flight host call's guard to release; every dereference therefore
+//     happens-before that removal returns, which happens-before the pool moves
+//     the `Runtime`.
+//
+//     TWO THINGS THAT WRITE LOCK DOES NOT BUY.
+//
+//     It does not bound EFFECTS, only pointer validity. Between the wall clock
+//     firing and the removal completing, an abandoned guest can still finish a
+//     host call it had already entered — a `set_secret`, a
+//     `put_contract_state_sync`. Those writes land after the caller has been
+//     told the call timed out. That is not unsoundness, but do not read
+//     "removal bounds the dereferences" as "removal bounds what the guest did".
+//
+//     It is also a DEADLOCK EDGE. dashmap is writer-preferring, so once
+//     `remove` is waiting for the shard write lock, a new READ of that shard
+//     blocks behind it. A host function that took a second `DELEGATE_ENV.get`
+//     while already holding a `Ref` would therefore hang rather than merely
+//     contend. All 15 current call sites take exactly one guard and drop it
+//     before returning, which is the only reason this is safe today; a single
+//     nested `get` is the whole distance to a hung node. Keep every host
+//     function to one guard at a time.
+//
+//     THE CREATING THREAD MUST NOT TOUCH THE ENV WHILE A GUEST MAY STILL BE
+//     RUNNING. On the wall-clock-timeout path it returns with the guest still
+//     live on an abandoned blocking thread, so any access it makes there is a
+//     genuinely concurrent one. It makes exactly one access: the `context`
+//     read-back in `delegate/execution.rs`, and that sits AFTER the `?` so it
+//     runs only on the success path -- i.e. only once `execute_wasm_blocking`
+//     has JOINED the guest closure and the guest is provably finished.
+//
+//     DO NOT MOVE IT BACK ABOVE THE `?`, and do not add a read of any other
+//     field beside it. That is not a style preference: since #5593 `context` is
+//     a `RefCell<Vec<u8>>` whose mutator (`context_write`) takes `DELEGATE_ENV
+//     .get` -- a SHARED shard lock -- and then `borrow_mut()`. Above the `?`,
+//     the read-back's `get` + `borrow()` would run concurrently with that on
+//     the timeout path: a race on `RefCell`'s non-atomic borrow flag, which its
+//     own runtime check cannot detect, and a use-after-free of the `Vec` buffer
+//     when `to_vec()` reallocates under `clone()`.
+//
+//     Note how little would warn you. `RefCell<Vec<u8>>` is `!Sync`, so the
+//     compiler WOULD reject this type -- except that the `Sync` impl below
+//     overrides exactly that check, and neither edit site needs `unsafe`. The
+//     ordering of these two lines is load-bearing and nothing but this comment
+//     says so.
+//
+//  3. NO REFERENCE ESCAPES ITS GUARD. The four accessors are private and each is
+//     `&self -> &T`, so lifetime elision ties the result to the `Ref` that
+//     produced it, and nothing copies a raw pointer out. Be precise about what
+//     that buys: the compiler enforces the EXTENT of the borrow, NOT its
+//     exclusivity. `secret_store_mut(&self) -> &mut SecretsStore` manufactures a
+//     `&mut` from a `&`, so two simultaneously-live `&mut SecretsStore` from one
+//     env would compile today with no `unsafe` at the call site. Every current
+//     caller holds one at a time in a statement-scoped temporary; THAT half is a
+//     convention these accessors do not check.
+//
+//  4. NO ENV IS INSERTED UNDER AN ID WHOSE GUEST MAY STILL BE RUNNING. This is
+//     what stands between the design and an aliased `&mut SecretsStore` across
+//     two threads, and it needs BOTH halves:
+//      - Ids are not recycled. `NEXT_INSTANCE_ID` (this module, allocated by
+//        `next_instance_id`) is a monotonic `AtomicI64`, so an abandoned
+//        thread's `get(&old_id)` misses
+//        rather than resolving to a LATER call's env. (`fetch_add` does wrap in
+//        principle. At one increment per instance that is not reachable in a
+//        process lifetime, but it is an assumption, not a proof.)
+//      - One id IS reused WITHIN a batch. `delegate/interface.rs` creates a
+//        single `RunningInstance` and passes its id to `exec_inbound_with_env`
+//        for every message, so the insert runs again under the same id per
+//        message. The fail-closed check there is what makes that safe. Without
+//        it, an error-tolerant batch loop would re-insert under an id whose
+//        previous guest is still abandoned and running, and the two threads
+//        would alias the same stores.
+//
+//        That check must consult `LIVE_DELEGATE_GUESTS`, not `DELEGATE_ENV`
+//        alone. `DelegateEnvGuard::drop` removes the env on EVERY exit path of
+//        `exec_inbound_with_env`, the wall-clock-timeout `Err` included, so
+//        `DELEGATE_ENV.contains_key` is already false at the moment the caller
+//        learns the call timed out — while the guest runs on. Presence of an env
+//        and liveness of a guest are different facts, and only the second one is
+//        dangerous.
+//
+// Keying instances by anything recycled (a pool slot, a code hash) breaks the
+// first half of 4 and makes these impls unsound.
+//
+// WHY THIS LIVES ON A WRAPPER AND NOT ON `DelegateCallEnv` ITSELF. The bound
+// that forces an `unsafe impl` here is narrow and purely structural:
+// `DELEGATE_ENV` is a `static`, statics must be `Sync`, and `DashMap<K, V>` is
+// `Sync` only when `V: Send + Sync`. Nothing in this crate ever wants to SHARE a
+// `&DelegateCallEnv` between threads — every access is single-threaded under a
+// map guard, per 2 above. So the impl satisfies a container's bound; it does not
+// assert that the environment is safe to use concurrently, and putting it on
+// `DelegateCallEnv` said the second thing while meaning the first.
+//
+// Confining it to `DelegateEnvSlot` leaves `DelegateCallEnv` itself `!Send` and
+// `!Sync`, so any FUTURE code that tries to share or move one for some other
+// reason is rejected by the compiler instead of being silently absorbed by an
+// impl written for `DashMap`. Only the one storage location opts out, and it is
+// the location whose safety argument is written above.
+//
+// This is a narrowing, not the fix. The fix is to stop holding the environment
+// in a process-global map at all — move it into wasmtime's `HostState`, which
+// the `Store` already owns and hands to host functions through `Caller`, which
+// would delete this impl, `DELEGATE_ENV`, `CURRENT_DELEGATE_INSTANCE`,
+// `LIVE_DELEGATE_GUESTS` and the whole abandoned-guest hazard class together.
+// Tracked as #5604; out of scope for #5480.
+//
+// One correction worth recording, because the opposite is easy to assume: the
+// `RefCell<Vec<u8>>` that #5593 gave `context` is NOT why this type is `!Sync`,
+// and it is not what made these impls necessary. `UnsafeCell<*mut SecretsStore>`,
+// `UnsafeCell<*mut DelegateStore>` and `*const ContractStore` are each `!Sync`
+// on their own and all predate that PR. The `RefCell` was a fourth reason, not
+// the first. This impl has been suppressing the check for far longer than the
+// #5593/#5480 pair.
+pub(super) struct DelegateEnvSlot(DelegateCallEnv);
+
+impl DelegateEnvSlot {
+    pub(super) fn new(env: DelegateCallEnv) -> Self {
+        Self(env)
+    }
+}
+
+// SAFETY: the argument in points 1-4 above, which is what makes it sound to
+// reach a `DelegateCallEnv` through `DELEGATE_ENV` at all. These impls exist
+// solely to meet `DashMap`'s `V: Send + Sync` bound for that `static`; they are
+// NOT a claim that a `&DelegateCallEnv` may be shared across threads.
+unsafe impl Send for DelegateEnvSlot {}
+// SAFETY: as for `Send` directly above -- the two are one argument.
+unsafe impl Sync for DelegateEnvSlot {}
+
+impl std::ops::Deref for DelegateEnvSlot {
+    type Target = DelegateCallEnv;
+
+    fn deref(&self) -> &DelegateCallEnv {
+        &self.0
+    }
+}
 
 /// Typed errors from `DelegateCallEnv` contract operations.
 ///
@@ -552,6 +880,9 @@ pub(super) enum DelegateEnvError {
     StorageError(String),
     /// Pre-write disk-budget admission gate rejected the V2 write (#4683).
     DiskBudgetExceeded(String),
+    /// The state exceeds `MAX_STATE_SIZE`. Enforced here because the V2 path
+    /// bypasses `StateStore::{store,update}`, where the ceiling normally lives.
+    StateTooLarge { size: usize, limit: usize },
 }
 
 /// Errors that can occur during delegate creation via `create_delegate_sync`.
@@ -594,7 +925,7 @@ impl DelegateCallEnv {
         inherited_origins: SharedInheritedOrigins,
     ) -> Self {
         Self {
-            context,
+            context: std::cell::RefCell::new(context),
             secret_store: std::cell::UnsafeCell::new(secret_store as *mut SecretsStore),
             delegate_key,
             user_context,
@@ -608,6 +939,7 @@ impl DelegateCallEnv {
             origin_contracts,
             created_delegates_count,
             inherited_origins,
+            secret_read_memo: std::cell::RefCell::new(None),
         }
     }
 
@@ -643,6 +975,67 @@ impl DelegateCallEnv {
         // SAFETY: guaranteed by the caller of `new()` and the synchronous WASM execution model.
         // The Runtime holds &mut self when calling process(), ensuring exclusive access.
         unsafe { &mut **self.secret_store.get() }
+    }
+
+    /// Read `secret_id` under this call's scope and hand the plaintext to `f`,
+    /// serving a repeat read of the SAME secret from [`Self::secret_read_memo`]
+    /// instead of re-reading and re-decrypting it.
+    ///
+    /// This exists for the stdlib's `get_secret_len`-then-`get_secret` pair: the
+    /// first call populates the memo, the second is served from it, so one
+    /// logical read costs one file read and one AEAD pass rather than two. The
+    /// decrypt is still performed exactly once per distinct secret per call, so
+    /// nothing unauthenticated is ever handed to the guest — the memo holds only
+    /// plaintext that already passed the Poly1305 tag check.
+    ///
+    /// The memo is keyed on the secret's 32-byte hash, which is what names the
+    /// on-disk file, so two different keys can never share an entry. Neither
+    /// the delegate identity nor the scope is part of the key, and that is only
+    /// sound because BOTH are fixed for the lifetime of the
+    /// `DelegateCallEnv` — see the invariant on
+    /// [`delegate_key`](Self::delegate_key). A hit therefore performs no
+    /// identity check at all, where the storage read it replaces performs two
+    /// (path and DEK). That is the property this memo removes, and the
+    /// immutability of those two fields is what puts it back.
+    fn with_secret<R>(
+        &self,
+        secret_id: &SecretsId,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, SecretStoreError> {
+        {
+            // The read borrow is held across `f` on THIS path but not on the
+            // miss path below, where `f` runs with no borrow outstanding. That
+            // asymmetry is the hazard: an `f` that touched the memo would
+            // succeed on the first (miss) call and panic on the second (hit),
+            // which is nastier to diagnose than a uniform panic. `f` is always
+            // a local closure that copies bytes out and never re-enters, and a
+            // borrow panic here would unwind out of a wasmtime host call —
+            // worse than the borrow it protects. Keep `f` non-re-entrant.
+            let memo = self.secret_read_memo.borrow();
+            if let Some((hash, plaintext)) = memo.as_ref()
+                && hash == secret_id.hash()
+            {
+                return Ok(f(plaintext));
+            }
+        }
+        let plaintext =
+            self.secret_store()
+                .get_secret(&self.delegate_key, secret_id, self.secret_scope())?;
+        let out = f(&plaintext);
+        *self.secret_read_memo.borrow_mut() = Some((*secret_id.hash(), plaintext));
+        Ok(out)
+    }
+
+    /// Drop the read memo.
+    ///
+    /// Called by every host function that can change what a read of ANY secret
+    /// returns — a write, a removal — rather than only the matching key, so a
+    /// future mutation that affects more than one key cannot silently leave a
+    /// stale entry behind. Clearing is unconditional (even on a failed store):
+    /// after a failed write the on-disk state is not something we want to
+    /// re-assert from a cached copy.
+    fn invalidate_secret_memo(&self) {
+        self.secret_read_memo.borrow_mut().take();
     }
 
     /// Access the contract store for index lookups.
@@ -835,6 +1228,169 @@ impl DelegateCallEnv {
         }
     }
 
+    /// Reject a V2 delegate write whose state exceeds `MAX_STATE_SIZE`.
+    ///
+    /// `StateStore::{store,update}` enforce this ceiling, and the V1 commit
+    /// path enforces it again before broadcasting. The V2 bypass writes
+    /// through the raw `Storage`, which does not — so before #5479 an
+    /// oversized V2 write was a local-disk problem, and after it the same
+    /// uncapped `WrappedState` would reach the fan-out and go on the wire,
+    /// where every recipient rejects it at its own guard AFTER paying for the
+    /// transfer. Enforcing it here, next to the disk-budget gate, keeps the
+    /// ceiling where the write is. (The queued event itself carries no state,
+    /// but the drain reads this value back and broadcasts it, so the ceiling is
+    /// still what keeps an oversized state off the wire.)
+    fn check_state_size(state_size: usize) -> Result<(), DelegateEnvError> {
+        if state_size > crate::wasm_runtime::MAX_STATE_SIZE {
+            return Err(DelegateEnvError::StateTooLarge {
+                size: state_size,
+                limit: crate::wasm_runtime::MAX_STATE_SIZE,
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether `new_state` differs from what is already stored for `key`.
+    ///
+    /// The V1 path never reaches commit-or-broadcast for a byte-identical
+    /// apply — `bridged_upsert_contract_state_inner` short-circuits to
+    /// `UpsertResult::NoChange`, and that filter is load-bearing rather than
+    /// incidental (`ring::broadcast_coverage` records that no-change applies
+    /// are ~97% of received contract bytes). Without the same filter here, the
+    /// ordinary delegate shape "on each message, recompute my state and store
+    /// it" — idempotent, writing identical bytes most of the time — would go
+    /// from zero network fan-out to one full fan-out per message. That is a
+    /// self-inflicted storm needing no attacker, so it is checked, at the cost
+    /// of one ReDb read per V2 write (the V1 path reads the current state
+    /// too).
+    ///
+    /// A read error is reported as CHANGED: failing towards an extra
+    /// broadcast is recoverable, failing towards a silent drop is the bug
+    /// #5479 is about.
+    ///
+    /// # This read and the write that follows it are NOT atomic
+    ///
+    /// The comparison happens here; the write happens further down
+    /// `put_contract_state_sync` / `update_contract_state_sync`. Nothing holds
+    /// a lock across the two, and this code owns nothing that makes the pair
+    /// safe. **Correctness depends on delegate `process()` being GLOBALLY
+    /// serialized by the contract-handling loop** — `execute_delegate_request`
+    /// is reached only from `handle_delegate_with_contract_requests`, whose
+    /// call sites all `await` it inline on that single-task loop with no
+    /// spawn, so two V2 delegate writes cannot run concurrently on a node.
+    ///
+    /// Were that to change, this gate could suppress a REAL change. The
+    /// interleaving is not the symmetric one it looks like: writer A whose own
+    /// bytes happen to equal what it reads decides "no change" and will
+    /// suppress; writer B then commits and broadcasts different bytes; A then
+    /// writes its own bytes and stays silent. Local state ends at A's value
+    /// while the network last heard B's, and nothing re-announces it until the
+    /// next write or the anti-entropy heartbeat. That is precisely the
+    /// idempotent-rewrite workload this gate exists to catch, so the racy case
+    /// would be the common case rather than an exotic one.
+    ///
+    /// # Per-delegate exclusion would NOT be enough
+    ///
+    /// Read this before concluding some newer delegate-concurrency mechanism
+    /// already covers this gate. **The racing pair is two DIFFERENT delegates
+    /// writing the same contract**, so an exclusion that serializes each
+    /// delegate against itself leaves the race fully intact. Only GLOBAL
+    /// serialization of delegate execution — or an atomic compare-and-write
+    /// here — closes it.
+    ///
+    /// #5544 (implemented by #5554) removes a node-wide stall by moving work
+    /// off this loop, and **preserves the global serialization above**: the
+    /// off-loop task captures neither a `ContractHandler` nor an executor, so
+    /// it structurally cannot invoke a delegate — its jobs (awaiting a human,
+    /// driving a sub-op GET) need neither, and a resumed `process()` always
+    /// runs back on the loop. Parking therefore opens a window in which a
+    /// different delegate may START, not one in which two may RUN. The gate
+    /// stays safe across that change.
+    ///
+    /// # The durable fix
+    ///
+    /// The guarantee above is an unenforced property of the contract-handling
+    /// loop, not an invariant this code holds. Nothing here fails if a future
+    /// change breaks it. The durable fix is to make the compare-and-write
+    /// atomic — fold the comparison into the same ReDb write transaction as
+    /// the store, the way `update_state_sync` already does its check-and-write
+    /// — so this gate stops depending on a caller-side property at all.
+    fn state_content_changed(
+        &self,
+        contract_key: &ContractKey,
+        new_state: &freenet_stdlib::prelude::WrappedState,
+    ) -> bool {
+        let Some(ref db) = self.state_store_db else {
+            return true;
+        };
+        match db.get_state_sync(contract_key) {
+            Ok(Some(existing)) => existing.as_ref() != new_state.as_ref(),
+            Ok(None) => true,
+            Err(e) => {
+                tracing::debug!(
+                    contract = %contract_key,
+                    error = %e,
+                    "could not read the stored state to test for a no-op V2 write; \
+                     treating it as changed"
+                );
+                true
+            }
+        }
+    }
+
+    /// The post-write sequence every V2 delegate state write owes, in one
+    /// place.
+    ///
+    /// A V2 write goes straight through the raw `Storage`, bypassing the
+    /// executor's `state_store.{store,update}` chokepoints — so every side
+    /// effect those chokepoints perform has to be re-applied here, and the
+    /// one that gets forgotten is silent. That has already happened twice:
+    /// the disk-budget admission gate (#4683) and network propagation
+    /// (#5479, where a V2 write returned success and the network never
+    /// learned of it). Hence one helper called from both write paths rather
+    /// than the sequence hand-inlined at each — the "manually-inlined
+    /// originator side effects" row in
+    /// `.claude/rules/bug-prevention-patterns.md`.
+    ///
+    /// Everything here is best-effort: the write has already committed, and
+    /// nothing below is worth rolling it back for. The installed callback
+    /// (see `super::runtime::StateWriteCallback` and
+    /// `contract::executor::runtime::v2_delegate_state_write_callback`)
+    /// invalidates the `StateStore` caches, runs `Ring::commit_state_write`,
+    /// and — only when `content_changed` — queues the fan-out that propagates
+    /// the write.
+    fn after_state_write(
+        &self,
+        contract_key: &ContractKey,
+        new_state: &freenet_stdlib::prelude::WrappedState,
+        content_changed: bool,
+    ) {
+        if !content_changed {
+            tracing::debug!(
+                contract = %contract_key,
+                event = "v2_delegate_write_no_content_change",
+                "V2 delegate rewrote identical state; no fan-out"
+            );
+        }
+        // ALWAYS invoked, including for a byte-identical rewrite — the hook
+        // decides for itself what the unchanged case skips.
+        //
+        // The V1 `UpsertResult::NoChange` short-circuit is NOT a precedent for
+        // returning early here, and the difference is the whole point: V1
+        // short-circuits BEFORE writing, so nothing committed and there is
+        // nothing to record. The V2 path has already written to the raw
+        // `Storage` by the time this runs, so the bookkeeping the hook performs
+        // — in particular `Ring::commit_state_write`, whose generation bump is
+        // what tells a scheduled `EvictContract` that the contract was written
+        // after it was queued (`pool.rs::remove_contract` guard 3) — is owed
+        // whether or not the CONTENT changed. Skipping it left a committed
+        // write invisible to that guard, so an in-flight eviction could reclaim
+        // a contract that had just been written.
+        if let Some(cb) = &self.state_write_callback {
+            cb(contract_key, new_state, content_changed);
+        }
+    }
+
     /// Store (PUT) contract state by instance ID.
     ///
     /// The contract's code hash must already be registered in the ContractStore
@@ -852,13 +1408,17 @@ impl DelegateCallEnv {
         };
 
         let contract_key = self.resolve_contract_key(instance_id)?;
-        // Capture the byte count BEFORE the move into store_state_sync —
-        // the callback needs it for governance attribution. The
-        // bug-prevention-patterns rule about "Manually-inlined originator
-        // side effects after a task-per-tx migration" applies here too:
-        // a future refactor that drops state_size from the callback path
-        // would silently undercount StateBytesWritten for V2 delegate PUT.
-        let state_size = state.len();
+        // Wrap BEFORE the admission gate so exactly one value is admitted,
+        // written, and handed to the post-write hook — `WrappedState` is
+        // `Arc<Vec<u8>>`, so the clone into `store_state_sync` below is a
+        // refcount bump, not a state copy. The "manually-inlined originator
+        // side effects" row in `.claude/rules/bug-prevention-patterns.md`
+        // applies here: a refactor that reconstructs the state for the hook
+        // instead of passing the written one is how these paths drift.
+        let new_state = freenet_stdlib::prelude::WrappedState::new(state);
+        let state_size = new_state.as_ref().len();
+        Self::check_state_size(state_size)?;
+        let content_changed = self.state_content_changed(&contract_key, &new_state);
 
         // Disk-budget admission gate (#4683): the V2 path bypasses the executor
         // `state_store` chokepoint where the gate normally runs, so apply it here
@@ -872,21 +1432,10 @@ impl DelegateCallEnv {
             }
         }
 
-        db.store_state_sync(
-            &contract_key,
-            freenet_stdlib::prelude::WrappedState::new(state),
-        )
-        .map_err(|e| DelegateEnvError::StorageError(e.to_string()))?;
+        db.store_state_sync(&contract_key, new_state.clone())
+            .map_err(|e| DelegateEnvError::StorageError(e.to_string()))?;
 
-        // V2 delegate write chokepoint: this path bypasses the executor's
-        // `state_store.store` call site where the bump+refresh+report
-        // happen. The callback (when wired) mirrors those side effects
-        // via `Ring::commit_state_write`. Failure here is best-effort —
-        // the write has already committed and we don't want to roll it
-        // back over a counter bump.
-        if let Some(cb) = &self.state_write_callback {
-            cb(&contract_key, state_size);
-        }
+        self.after_state_write(&contract_key, &new_state, content_changed);
 
         Ok(())
     }
@@ -905,9 +1454,11 @@ impl DelegateCallEnv {
         };
 
         let contract_key = self.resolve_contract_key(instance_id)?;
-        // Capture byte count BEFORE the move — same reason as
-        // put_contract_state_sync above.
-        let state_size = state.len();
+        // Wrap before the admission gate — see `put_contract_state_sync`.
+        let new_state = freenet_stdlib::prelude::WrappedState::new(state);
+        let state_size = new_state.as_ref().len();
+        Self::check_state_size(state_size)?;
+        let content_changed = self.state_content_changed(&contract_key, &new_state);
 
         // Disk-budget admission gate (#4683): apply the executor-chokepoint gate
         // that the V2 path bypasses, BEFORE the raw write. This is a V2 UPDATE —
@@ -923,18 +1474,9 @@ impl DelegateCallEnv {
         }
 
         // Atomic check-and-write in a single ReDb write transaction.
-        match db.update_state_sync(
-            &contract_key,
-            freenet_stdlib::prelude::WrappedState::new(state),
-        ) {
+        match db.update_state_sync(&contract_key, new_state.clone()) {
             Ok(true) => {
-                // V2 delegate write chokepoint: mirror the executor's
-                // `state_store.update` bump+refresh+report side effects
-                // via `Ring::commit_state_write`. See
-                // `put_contract_state_sync` for the rationale.
-                if let Some(cb) = &self.state_write_callback {
-                    cb(&contract_key, state_size);
-                }
+                self.after_state_write(&contract_key, &new_state, content_changed);
                 Ok(())
             }
             Ok(false) => Err(DelegateEnvError::NoExistingState),
@@ -1353,7 +1895,7 @@ pub(super) mod delegate_context {
             tracing::warn!("delegate call env not set for instance {id}");
             return error_codes::ERR_NOT_IN_PROCESS;
         };
-        let len = env.context.len();
+        let len = env.context.borrow().len();
         if len > i32::MAX as usize {
             return error_codes::ERR_CONTEXT_TOO_LARGE;
         }
@@ -1384,7 +1926,8 @@ pub(super) mod delegate_context {
             tracing::warn!("delegate call env not set for instance {id}");
             return error_codes::ERR_NOT_IN_PROCESS;
         };
-        let to_copy = env.context.len().min(len as usize);
+        let context = env.context.borrow();
+        let to_copy = context.len().min(len as usize);
         if to_copy == 0 {
             return 0;
         }
@@ -1397,7 +1940,7 @@ pub(super) mod delegate_context {
         // linear memory bounds, and `env.context` is a valid `Vec<u8>` with at least
         // `to_copy` bytes.
         unsafe {
-            std::ptr::copy_nonoverlapping(env.context.as_ptr(), dst, to_copy);
+            std::ptr::copy_nonoverlapping(context.as_ptr(), dst, to_copy);
         }
         to_copy as i32
     }
@@ -1423,12 +1966,15 @@ pub(super) mod delegate_context {
             tracing::warn!("instance mem space not recorded for {id}");
             return error_codes::ERR_NOT_IN_PROCESS;
         };
-        let Some(mut env) = DELEGATE_ENV.get_mut(&id) else {
+        // `get`, NOT `get_mut`: see the `context` field's rustdoc. A `&mut`
+        // here would put every other field — including the identity fields the
+        // secret memo's soundness rests on — back within reach of rebinding.
+        let Some(env) = DELEGATE_ENV.get(&id) else {
             tracing::warn!("delegate call env not set for instance {id}");
             return error_codes::ERR_NOT_IN_PROCESS;
         };
         if len == 0 {
-            env.context.clear();
+            env.context.borrow_mut().clear();
             return error_codes::SUCCESS;
         }
         let Some(src) =
@@ -1440,7 +1986,7 @@ pub(super) mod delegate_context {
         // SAFETY: `src` was validated by `validate_and_compute_ptr` to point to `len`
         // bytes within the WASM linear memory.
         let bytes = unsafe { std::slice::from_raw_parts(src, len as usize) };
-        env.context = bytes.to_vec();
+        *env.context.borrow_mut() = bytes.to_vec();
         error_codes::SUCCESS
     }
 }
@@ -1508,12 +2054,12 @@ pub(super) mod delegate_secrets {
         // `User` when this call runs under a hosted-mode user token (P2 of
         // #4381). The scope comes solely from the connection-derived
         // `user_context`, never from anything the delegate can influence.
-        match env
-            .secret_store()
-            .get_secret(&env.delegate_key, &secret_id, env.secret_scope())
-        {
-            Ok(plaintext) => {
-                let len = plaintext.len();
+        //
+        // Goes through `with_secret` so the `get_secret` that the stdlib issues
+        // straight after this one is served from the memo rather than repeating
+        // the read and the decrypt.
+        match env.with_secret(&secret_id, |plaintext| plaintext.len()) {
+            Ok(len) => {
                 if len > i32::MAX as usize {
                     // Secret is larger than i32::MAX, return max representable
                     i32::MAX
@@ -1579,54 +2125,49 @@ pub(super) mod delegate_secrets {
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
         // Look up the secret (scope per the connection's user_context; see
-        // get_secret_len).
-        match env
-            .secret_store()
-            .get_secret(&env.delegate_key, &secret_id, env.secret_scope())
-        {
-            Ok(plaintext) => {
-                let secret_len = plaintext.len();
-                let out_len_usize = out_len as usize;
+        // get_secret_len). Normally a memo hit: the stdlib's `get_secret_len`
+        // ran moments ago on this same key.
+        match env.with_secret(&secret_id, |plaintext| {
+            let secret_len = plaintext.len();
+            let out_len_usize = out_len as usize;
 
-                // Check if buffer is large enough
-                if secret_len > out_len_usize {
-                    tracing::debug!(
-                        "delegate get_secret buffer too small: need {secret_len}, have {out_len_usize}"
-                    );
-                    return error_codes::ERR_BUFFER_TOO_SMALL;
-                }
-
-                if secret_len == 0 {
-                    return 0;
-                }
-
-                let Some(dst) = validate_and_compute_ptr::<u8>(
-                    out_ptr,
-                    info.start_ptr,
-                    secret_len,
-                    info.mem_size,
-                ) else {
-                    tracing::error!("Memory bounds violation in delegate get_secret (output)");
-                    return error_codes::ERR_MEMORY_BOUNDS;
-                };
-                // SAFETY: `dst` was validated by `validate_and_compute_ptr` to point to
-                // `secret_len` bytes within WASM linear memory, and `plaintext` is a
-                // valid byte slice of that length.
-                //
-                // Memory hygiene boundary: the host-side `plaintext` is
-                // `Zeroizing<Vec<u8>>` so its allocation is wiped when
-                // this function returns. The copy destination — WASM
-                // linear memory inside the delegate instance — is NOT
-                // wiped by us; the delegate is responsible for zeroing
-                // its own buffer when done. The corresponding stdlib-
-                // side `Zeroize` derive is tracked under #4137 and will
-                // ship in a follow-up once a freenet-stdlib release is
-                // cut for it (stdlib-first release policy).
-                unsafe {
-                    std::ptr::copy_nonoverlapping(plaintext.as_ptr(), dst, secret_len);
-                }
-                secret_len as i32
+            // Check if buffer is large enough
+            if secret_len > out_len_usize {
+                tracing::debug!(
+                    "delegate get_secret buffer too small: need {secret_len}, have {out_len_usize}"
+                );
+                return error_codes::ERR_BUFFER_TOO_SMALL;
             }
+
+            if secret_len == 0 {
+                return 0;
+            }
+
+            let Some(dst) =
+                validate_and_compute_ptr::<u8>(out_ptr, info.start_ptr, secret_len, info.mem_size)
+            else {
+                tracing::error!("Memory bounds violation in delegate get_secret (output)");
+                return error_codes::ERR_MEMORY_BOUNDS;
+            };
+            // SAFETY: `dst` was validated by `validate_and_compute_ptr` to point to
+            // `secret_len` bytes within WASM linear memory, and `plaintext` is a
+            // valid byte slice of that length.
+            //
+            // Memory hygiene boundary: the host-side `plaintext` is
+            // `Zeroizing<Vec<u8>>` so its allocation is wiped when
+            // this function returns. The copy destination — WASM
+            // linear memory inside the delegate instance — is NOT
+            // wiped by us; the delegate is responsible for zeroing
+            // its own buffer when done. The corresponding stdlib-
+            // side `Zeroize` derive is tracked under #4137 and will
+            // ship in a follow-up once a freenet-stdlib release is
+            // cut for it (stdlib-first release policy).
+            unsafe {
+                std::ptr::copy_nonoverlapping(plaintext.as_ptr(), dst, secret_len);
+            }
+            secret_len as i32
+        }) {
+            Ok(code) => code,
             Err(e) => {
                 tracing::debug!(
                     delegate = %env.delegate_key,
@@ -1699,6 +2240,9 @@ pub(super) mod delegate_secrets {
         );
 
         let scope = env.secret_scope();
+        // A write changes what a read returns, so the read memo must go before
+        // the store is touched at all.
+        env.invalidate_secret_memo();
         match env
             .secret_store_mut()
             .store_secret(&env.delegate_key, &secret_id, scope, value)
@@ -1751,11 +2295,8 @@ pub(super) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
-        match env
-            .secret_store()
-            .get_secret(&env.delegate_key, &secret_id, env.secret_scope())
-        {
-            Ok(_) => 1,
+        match env.with_secret(&secret_id, |_| ()) {
+            Ok(()) => 1,
             Err(e) => {
                 tracing::debug!(
                     delegate = %env.delegate_key,
@@ -1810,6 +2351,8 @@ pub(super) mod delegate_secrets {
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
         let scope = env.secret_scope();
+        // A removal changes what a read returns; drop the memo first.
+        env.invalidate_secret_memo();
         match env
             .secret_store_mut()
             .remove_secret(&env.delegate_key, &secret_id, scope)
@@ -2064,6 +2607,20 @@ pub(super) mod delegate_contracts {
             // A disk-budget rejection is a store-capacity failure from the
             // delegate's perspective — map to the generic store-error code.
             DelegateEnvError::DiskBudgetExceeded(_) => contract_error_codes::ERR_STORE_ERROR as i64,
+            // The delegate handed us a state larger than the protocol allows.
+            // That is a caller error, not a store failure, so it maps to
+            // ERR_INVALID_PARAM rather than ERR_STORE_ERROR — and to an
+            // EXISTING code rather than a new one, because a new negative
+            // return value is a wire-visible change to the V2 delegate API
+            // that a delegate branching on codes would not expect.
+            DelegateEnvError::StateTooLarge { size, limit } => {
+                tracing::warn!(
+                    state_size = size,
+                    limit,
+                    "V2 delegate write rejected: state exceeds MAX_STATE_SIZE"
+                );
+                contract_error_codes::ERR_INVALID_PARAM as i64
+            }
         }
     }
 
@@ -2638,5 +3195,335 @@ mod list_secrets_abi_tests {
                 "negative prefix_len via list_secrets must be ERR_INVALID_PARAM"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod secret_read_memo_tests {
+    //! `DelegateContext::get_secret` in freenet-stdlib is a TWO-call protocol —
+    //! `get_secret_len` to size the guest buffer, then `get_secret` to fill it.
+    //! Each of those host calls used to re-read the file and re-run the whole
+    //! XChaCha20-Poly1305 decrypt, so one logical read of an N-byte secret cost
+    //! two file reads and 2N bytes of AEAD. `DelegateCallEnv::secret_read_memo`
+    //! removes the second pass; these tests pin that it works, and — the part
+    //! that can actually go wrong — that it is invalidated.
+
+    use super::*;
+    use crate::contract::storages::Storage;
+    use crate::util::tests::get_temp_dir;
+    use freenet_stdlib::prelude::CodeHash;
+    use zeroize::Zeroizing;
+
+    /// Real stores on a temp dir, mirroring `delegate_api::tests::TestEnv`.
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        contract_store: ContractStore,
+        delegate_store: DelegateStore,
+        secret_store: SecretsStore,
+    }
+
+    async fn fixture() -> Fixture {
+        let temp = get_temp_dir();
+        let db = Storage::new(temp.path()).await.unwrap();
+        let contract_store =
+            ContractStore::new(temp.path().join("contracts"), 10_000_000, db.clone()).unwrap();
+        let delegate_store =
+            DelegateStore::new(temp.path().join("delegates"), 10_000, db.clone()).unwrap();
+        let secret_store =
+            SecretsStore::new(temp.path().join("secrets"), Default::default(), db).unwrap();
+        Fixture {
+            _temp: temp,
+            contract_store,
+            delegate_store,
+            secret_store,
+        }
+    }
+
+    fn delegate_key() -> DelegateKey {
+        DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]))
+    }
+
+    /// # Safety
+    /// The returned env points at `f` through raw pointers, so it must be
+    /// dropped before `f` is.
+    unsafe fn env_of(f: &mut Fixture) -> DelegateCallEnv {
+        // SAFETY: forwarded to the caller's obligation above.
+        unsafe {
+            DelegateCallEnv::new(
+                vec![],
+                &mut f.secret_store,
+                &f.contract_store,
+                None,
+                None,
+                None,
+                delegate_key(),
+                &mut f.delegate_store,
+                0,
+                vec![],
+                None,
+                new_delegate_counter(),
+                new_inherited_origins(),
+            )
+        }
+    }
+
+    fn read(env: &DelegateCallEnv, id: &SecretsId) -> Vec<u8> {
+        env.with_secret(id, |plaintext| plaintext.to_vec())
+            .expect("secret must be readable")
+    }
+
+    /// Both halves of the memo: a repeat read is served from it, and
+    /// invalidation drops it. The middle assertion is the load-bearing one — it
+    /// is what makes the `invalidate_secret_memo()` calls in `set_secret` /
+    /// `remove_secret` necessary rather than decorative.
+    #[tokio::test]
+    async fn memo_serves_a_repeat_read_and_invalidation_drops_it() {
+        let mut f = fixture().await;
+        let id = SecretsId::new(b"memo-key".to_vec());
+        // SAFETY: `env` is dropped at the end of this test, before `f`.
+        let env = unsafe { env_of(&mut f) };
+
+        env.secret_store_mut()
+            .store_secret(
+                &delegate_key(),
+                &id,
+                SecretScope::Local,
+                Zeroizing::new(b"v1".to_vec()),
+            )
+            .unwrap();
+        assert_eq!(read(&env, &id), b"v1".to_vec());
+
+        // Change the value underneath the memo, bypassing invalidation.
+        env.secret_store_mut()
+            .store_secret(
+                &delegate_key(),
+                &id,
+                SecretScope::Local,
+                Zeroizing::new(b"v2".to_vec()),
+            )
+            .unwrap();
+        assert_eq!(
+            read(&env, &id),
+            b"v1".to_vec(),
+            "the memo must actually serve the repeat read — if this already \
+             reads v2 the memo is doing nothing and the whole change is a no-op"
+        );
+
+        env.invalidate_secret_memo();
+        assert_eq!(
+            read(&env, &id),
+            b"v2".to_vec(),
+            "invalidation must drop the memo, or a write followed by a read \
+             inside one process() call would serve the pre-write plaintext"
+        );
+    }
+
+    /// The memo is keyed on the secret's hash. Without that check a read of a
+    /// different key would be served the previous secret's bytes — a
+    /// cross-secret leak inside a single `process()` call.
+    #[tokio::test]
+    async fn memo_is_keyed_on_the_secret_hash() {
+        let mut f = fixture().await;
+        let first = SecretsId::new(b"first".to_vec());
+        let second = SecretsId::new(b"second".to_vec());
+        // SAFETY: `env` is dropped at the end of this test, before `f`.
+        let env = unsafe { env_of(&mut f) };
+
+        for (id, body) in [(&first, &b"aaa"[..]), (&second, &b"bbbb"[..])] {
+            env.secret_store_mut()
+                .store_secret(
+                    &delegate_key(),
+                    id,
+                    SecretScope::Local,
+                    Zeroizing::new(body.to_vec()),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(read(&env, &first), b"aaa".to_vec());
+        assert_eq!(
+            read(&env, &second),
+            b"bbbb".to_vec(),
+            "a read of a different key must not be served from the previous \
+             key's memo entry"
+        );
+    }
+
+    /// Source pin for the two call sites a behavioural test cannot reach: both
+    /// mutating host functions need a live WASM instance plus the `MEM_ADDR` /
+    /// `DELEGATE_ENV` globals to drive. Dropping either `invalidate_secret_memo()`
+    /// call would leave a `set_secret` followed by a `get_secret` inside ONE
+    /// `process()` serving the pre-write plaintext, silently, with every other
+    /// test still green.
+    /// A read that FAILS must not populate the memo.
+    ///
+    /// `with_secret` propagates the store error with `?` before the memo
+    /// write, so a plaintext that never passed its Poly1305 check is never
+    /// cached. Nothing held that: the stdlib short-circuits after
+    /// `get_secret_len?`, so no existing test probes a failing key twice, and
+    /// the mutation review confirmed that moving the cache above the `?`
+    /// survives the whole suite. If it were cached, a second `has_secret` on a
+    /// corrupted or wrong-DEK secret would answer 1 for a secret that cannot
+    /// be decrypted.
+    #[tokio::test]
+    async fn a_failed_read_does_not_populate_the_memo() {
+        let mut f = fixture().await;
+        let missing = SecretsId::new(b"never-stored".to_vec());
+        // SAFETY: `env` is dropped at the end of this test, before `f`.
+        let env = unsafe { env_of(&mut f) };
+
+        assert!(
+            env.with_secret(&missing, |_| ()).is_err(),
+            "reading a secret that was never stored must fail"
+        );
+        assert!(
+            env.secret_read_memo.borrow().is_none(),
+            "a failed read must leave the memo EMPTY; caching the error path \
+             would let a later probe answer from a plaintext that never passed \
+             its AEAD tag check"
+        );
+
+        // And the memo still works afterwards, so the assertion above is not
+        // passing merely because the memo is broken.
+        env.secret_store_mut()
+            .store_secret(
+                &delegate_key(),
+                &missing,
+                SecretScope::Local,
+                Zeroizing::new(b"now-present".to_vec()),
+            )
+            .unwrap();
+        assert_eq!(read(&env, &missing), b"now-present".to_vec());
+        assert!(
+            env.secret_read_memo.borrow().is_some(),
+            "a successful read must populate the memo"
+        );
+    }
+
+    /// M1: the memo's key omits the delegate identity and the scope, which is
+    /// sound ONLY because both are fixed after construction.
+    ///
+    /// The storage read this memo replaces binds the delegate identity twice —
+    /// in the file path and in the DEK the blob is authenticated under. A memo
+    /// hit binds it zero times. So rebinding `delegate_key` mid-call, which
+    /// before this memo self-corrected via a failed AEAD tag, would now
+    /// silently return the previous identity's plaintext.
+    ///
+    /// The field being private stops any other module. This stops
+    /// `native_api` itself, and it does so at the TYPE level rather than by
+    /// scraping: with `context` behind a `RefCell`, nothing needs a
+    /// `&mut DelegateCallEnv`, so no field can be rebound by ANY means.
+    ///
+    /// An earlier version of this pin asserted `.delegate_key = ` did not
+    /// appear. Mutation review defeated it with `mem::swap`, and `clone_from`
+    /// and `let k = &mut env.delegate_key; *k = ..` would have too — inside
+    /// `context_write`, the exact path the pin's own doc named. Enumerating
+    /// rebinding forms is an open set. This asserts the single closed fact the
+    /// whole property now rests on: no mutable borrow of the env is taken.
+    /// COMPILE-TIME guard (#5480 review F2): every field of `DelegateCallEnv`
+    /// must be named here, so ADDING ONE IS A COMPILE ERROR.
+    ///
+    /// This closes the half of F2 that moving the `unsafe impl` to
+    /// `DelegateEnvSlot` does NOT close, and the distinction is worth being
+    /// precise about because it is easy to over-claim:
+    ///
+    ///  - The slot narrows the impl's REACH. `DelegateCallEnv` is itself
+    ///    `!Send`/`!Sync`, so code that tries to share or move one anywhere
+    ///    other than into `DELEGATE_ENV` is rejected by the compiler.
+    ///  - The slot does NOT narrow what the impl BLESSES. It wraps the whole
+    ///    struct, so a field added tomorrow with different thread-safety is
+    ///    still covered by `unsafe impl Sync for DelegateEnvSlot` exactly as it
+    ///    would have been by an impl on `DelegateCallEnv`. A comment cannot
+    ///    object to that; only the compiler can.
+    ///
+    /// Hence the rest pattern is DELIBERATELY ABSENT. Do not "fix" this by
+    /// adding `..` — that silently restores the hazard and is the one edit this
+    /// test exists to prevent. When it stops compiling, the right response is to
+    /// add the new field here AND revisit the numbered SAFETY argument above
+    /// `DelegateEnvSlot`, deciding which of its four points the field affects.
+    ///
+    /// The current fields divide as follows, which is the review this forces:
+    ///  - `!Sync` and load-bearing for the argument: `secret_store`,
+    ///    `delegate_store` (`UnsafeCell<*mut _>`), `contract_store`
+    ///    (`*const _`), `context` and `secret_read_memo` (`RefCell`),
+    ///    `creations_this_call` (`Cell`). Six, not three — an earlier draft of
+    ///    the SAFETY block miscounted, which is exactly the kind of slip that
+    ///    makes a reader stop trusting a soundness argument.
+    ///  - Plain owned data, safe by construction: everything else.
+    #[test]
+    fn every_call_env_field_is_named_in_the_safety_argument() {
+        #[allow(dead_code)]
+        fn exhaustive(env: &DelegateCallEnv) {
+            // NO `..` REST PATTERN. See this test's rustdoc.
+            let DelegateCallEnv {
+                context,
+                secret_store,
+                delegate_key,
+                user_context,
+                contract_store,
+                state_store_db,
+                state_write_callback,
+                state_admit_callback,
+                delegate_store,
+                creation_depth,
+                creations_this_call,
+                origin_contracts,
+                created_delegates_count,
+                inherited_origins,
+                secret_read_memo,
+            } = env;
+
+            let _ = (
+                context,
+                secret_store,
+                delegate_key,
+                user_context,
+                contract_store,
+                state_store_db,
+                state_write_callback,
+                state_admit_callback,
+                delegate_store,
+                creation_depth,
+                creations_this_call,
+                origin_contracts,
+                created_delegates_count,
+                inherited_origins,
+                secret_read_memo,
+            );
+        }
+    }
+
+    #[test]
+    fn no_mutable_borrow_of_the_call_env_exists() {
+        let src = include_str!("native_api.rs");
+        // Only the PRODUCTION half. This test's own message names the needle,
+        // so an unbounded search would count itself and fail — the same
+        // self-reference that makes a bare `split_once(anchor)` match a pin's
+        // own assertion string. Bounding here is also the right semantics: the
+        // property is about production code.
+        let production = &src[..src
+            .find("\n#[cfg(test)]")
+            .expect("no #[cfg(test)] marker found; the production/test split is broken")];
+        let call_sites = production.matches("DELEGATE_ENV.get_mut(").count();
+        assert_eq!(
+            call_sites, 0,
+            "`DELEGATE_ENV.get_mut(` gives a `&mut DelegateCallEnv`, and from \
+             one every field is reachable for rebinding — by assignment, \
+             `mem::swap`, `clone_from` or a `&mut` reborrow. `delegate_key` and \
+             `user_context` fix the delegate identity and the secret scope for \
+             the whole call, and `secret_read_memo` is keyed on the secret hash \
+             ALONE on that basis, so rebinding either leaves a memo entry \
+             belonging to the previous identity (cross-tenant disclosure in \
+             hosted mode). If you need to mutate a field, put THAT field behind \
+             a cell as `context` is — do not reintroduce the mutable borrow"
+        );
+
+        // Non-vacuous: the shared form must be present, or this test would
+        // pass just as well against a file that had no DELEGATE_ENV at all.
+        assert!(
+            production.contains("DELEGATE_ENV.get(&id)"),
+            "the shared-borrow form must appear; if it does not, the search is \
+             wrong and the assertion above proves nothing"
+        );
     }
 }

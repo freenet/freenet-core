@@ -37,6 +37,7 @@ mod delegate2_messages {
         RemoveSecret(Vec<u8>),
         WriteLargeContext(usize),
         StoreLargeSecret { key: Vec<u8>, size: usize },
+        ReadWriteRead { key: Vec<u8>, value: Vec<u8> },
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -57,6 +58,57 @@ mod delegate2_messages {
     }
 }
 
+/// Execution budget for the delegate test fixtures.
+///
+/// `RuntimeConfig::max_execution_seconds` defaults to 5.0, which is a
+/// PRODUCTION policy — how long a delegate may occupy an executor — and it is
+/// enforced as WALL CLOCK: `epoch_deadline_ticks` turns it into 51 ticks of a
+/// 100 ms process-global epoch ticker. That clock keeps running while the guest
+/// is blocked inside a HOST call, and the epoch trap cannot fire until control
+/// returns to the guest, so the budget is spent on the node's own file I/O and
+/// XChaCha20-Poly1305 as much as on delegate code.
+///
+/// These fixtures assert functional behaviour, not that policy, and one of them
+/// sits on the boundary by construction: `test_large_secret_data` drives ~2 MiB
+/// of AEAD through host calls for a single 1 MiB secret, in a build where that
+/// crypto is monomorphised into `crates/core` at opt-level 0 — the
+/// `[profile.dev.package."*"] opt-level = 3` override in the workspace manifest
+/// covers dependency PACKAGES, not generic code instantiated in the local
+/// crate. On a loaded machine, or a CI runner running the suite in parallel
+/// under nextest, that legitimately exceeds 5 s of wall clock and the guest is
+/// epoch-trapped as `WasmError::Timeout` — a failure that says nothing about
+/// the code under test. Measured on a 16-core box: 0 failures in 28 runs below
+/// load average 50, and failures on BOTH `main` and a feature branch above it.
+///
+/// So `setup_runtime` sets the budget explicitly instead of inheriting the
+/// production one. NOT a completed sweep: `setup_v2_runtime_with_contract`,
+/// `setup_runtime_with_params`, `bare_runtime` and the tests that build a
+/// `Runtime` inline still inherit the production 5.0 s. They are not known to
+/// flake on it, and widening this to every delegate fixture is a larger change
+/// than the one flake in hand justified, so it was left deliberately rather
+/// than overlooked. Point them here if the same timeout shows up in them.
+///
+/// 60 s is generous but still bounded, so a delegate test that genuinely wedges
+/// fails rather than hanging forever.
+///
+/// Nothing here weakens timeout coverage. The real epoch-trap coverage — a
+/// guest actually being interrupted — lives in `engine::wasmtime_engine`'s own
+/// tests, which drive WASM directly and set their own budgets.
+/// `wasm_runtime::tests::execution_handling` also asserts timeout behaviour,
+/// but it simulates a polling loop and never runs WASM, so it is untouched by
+/// this constant for a different reason than I first wrote here.
+///
+/// This does not make the wall-clock accounting correct — a real delegate
+/// storing a large secret on a busy node can still be charged for the host's
+/// crypto and I/O. That is tracked separately; this constant only stops a unit
+/// test from being gated on it.
+fn delegate_fixture_config() -> super::super::runtime::RuntimeConfig {
+    super::super::runtime::RuntimeConfig {
+        max_execution_seconds: 60.0,
+        ..Default::default()
+    }
+}
+
 async fn setup_runtime(
     name: &str,
 ) -> Result<(DelegateContainer, Runtime, tempfile::TempDir), Box<dyn std::error::Error>> {
@@ -71,7 +123,14 @@ async fn setup_runtime(
     let delegate_store = DelegateStore::new(delegates_dir, 10_000, db.clone())?;
     let secret_store = SecretsStore::new(secrets_dir, Default::default(), db)?;
 
-    let mut runtime = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+    let mut runtime = Runtime::build_with_config(
+        contract_store,
+        delegate_store,
+        secret_store,
+        false,
+        delegate_fixture_config(),
+    )
+    .unwrap();
 
     let delegate = {
         let bytes = super::super::tests::get_test_module(name)?;
@@ -2064,6 +2123,115 @@ async fn test_large_context_within_batch() -> Result<(), Box<dyn std::error::Err
 /// `refresh_mem_addr_from_caller`, the subsequent read uses a stale pointer
 /// and returns garbage data. Under full parallel test suite runs (~1600 tests)
 /// the relocation is more likely due to memory pressure.
+/// A write must invalidate the host's per-`process()` secret memo, observed
+/// through a real WASM guest rather than asserted about the source.
+///
+/// `get_secret_len` + `get_secret` both decrypt, so the host memoises the
+/// plaintext for the duration of one `process()` call. `set_secret` and
+/// `remove_secret` therefore have to clear it, or a read after a write in the
+/// same call is served the PRE-WRITE bytes.
+///
+/// This replaces a source-scrape pin that asserted both host functions
+/// contained `invalidate_secret_memo()`. That pin was defeatable by prose: the
+/// mutation review deleted both real calls, left the string in a trailing `//`
+/// comment, and the whole suite stayed green — the comment filter only
+/// stripped lines that BEGIN with `//`, not comment tails. Worse, deleting
+/// both calls killed exactly one test, the pin itself, so a string in a
+/// comment was the entire protection for the invariant.
+///
+/// Nothing reached these call sites behaviourally before, and the reason is
+/// narrow enough to be worth recording: `exec_inbound_with_env` builds one
+/// `DelegateCallEnv` per inbound message, so batching two messages gives two
+/// memos and cannot observe a stale one. The read, the write and the re-read
+/// all have to happen inside a single `process()`, which needs a guest
+/// handler — hence `ReadWriteRead` in `tests/test-delegate-2`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_invalidates_the_secret_memo_within_one_process_call()
+-> Result<(), Box<dyn std::error::Error>> {
+    use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+    let key = b"memo-invalidation".to_vec();
+
+    let send = |runtime: &mut Runtime,
+                msg: &InboundAppMessage|
+     -> Result<OutboundAppMessage, Box<dyn std::error::Error>> {
+        let payload = bincode::serialize(msg)?;
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        )?;
+        match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => Ok(bincode::deserialize(&m.payload)?),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
+                panic!("Expected ApplicationMessage, got {other:?}")
+            }
+        }
+    };
+
+    // Seed the key in an EARLIER call, so the read-write-read call below finds
+    // something to memoise on its first read.
+    let stored = send(
+        &mut runtime,
+        &InboundAppMessage::StoreSecret {
+            key: key.clone(),
+            value: b"before".to_vec(),
+        },
+    )?;
+    assert!(
+        matches!(stored, OutboundAppMessage::SecretStored),
+        "seeding the secret must succeed, got {stored:?}"
+    );
+
+    // One process() call: read (populates the memo), write, read again.
+    let observed = send(
+        &mut runtime,
+        &InboundAppMessage::ReadWriteRead {
+            key: key.clone(),
+            value: b"after".to_vec(),
+        },
+    )?;
+
+    match observed {
+        OutboundAppMessage::SecretResult(Some(bytes)) => assert_eq!(
+            bytes,
+            b"after".to_vec(),
+            "the read AFTER the write must see the written bytes. Reading \
+             `before` means set_secret did not invalidate the per-process() \
+             secret memo, so the guest was served the pre-write plaintext"
+        ),
+        other @ OutboundAppMessage::SecretResult(None)
+        | other @ OutboundAppMessage::CreateInboxResponse(_)
+        | other @ OutboundAppMessage::MessageSigned(_)
+        | other @ OutboundAppMessage::ContextData(_)
+        | other @ OutboundAppMessage::CounterValue(_)
+        | other @ OutboundAppMessage::SecretExists(_)
+        | other @ OutboundAppMessage::ContextWritten
+        | other @ OutboundAppMessage::ContextCleared
+        | other @ OutboundAppMessage::SecretStored
+        | other @ OutboundAppMessage::SecretRemoved
+        | other @ OutboundAppMessage::LargeContextWritten(_)
+        | other @ OutboundAppMessage::LargeSecretStored(_)
+        | other @ OutboundAppMessage::SecretStoreFailed => panic!(
+            "expected SecretResult(Some(..)) from the post-write read, got {other:?}. \
+             SecretResult(None) means the write or the re-read failed outright"
+        ),
+    }
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_large_secret_data() -> Result<(), Box<dyn std::error::Error>> {
     use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
@@ -4750,4 +4918,248 @@ mod hosted_user_secrets {
         std::mem::drop(temp_dir);
         Ok(())
     }
+}
+
+/// REGRESSION (#5480): re-entering an instance id whose `DelegateCallEnv` is
+/// still live must FAIL CLOSED, in release builds too.
+///
+/// This is the release-visible half of the change that promoted a
+/// `debug_assert!` to a hard `Err`. The assert compiled out in release, so
+/// before #5480 the only thing preventing re-entry was the batch loop in
+/// `interface.rs` aborting on the first error — control flow, not a guarantee.
+///
+/// It became memory safety when the guest moved off the calling thread. One
+/// `RunningInstance` id is shared by every message in a batch, and on the
+/// wall-clock-timeout path the previous message's guest is still running on an
+/// abandoned `spawn_blocking` thread (`abort()` cannot stop one). Inserting a
+/// new env under that id would make the abandoned guest's
+/// `DELEGATE_ENV.get(&id)` resolve to the NEW env and dereference its raw store
+/// pointers while this thread holds `&mut` to the very same stores — aliasing
+/// UB across two threads, with no `unsafe` at the edit site that caused it.
+///
+/// Unreachable today. That is exactly why it needs a test: an edit making the
+/// batch loop error-tolerant ("collect errors and continue", "retry the
+/// message") would reintroduce it silently, and nothing else would object.
+#[tokio::test]
+async fn reentering_a_live_instance_id_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+    use super::super::engine::InstanceHandle;
+    use super::super::native_api::{DELEGATE_ENV, DelegateCallEnv, DelegateEnvSlot};
+
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+
+    // Far above anything `next_instance_id` will hand out: it is a monotonic
+    // counter starting at 0, incremented once per instance.
+    const LIVE_ID: i64 = i64::MAX - 5480;
+
+    let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::ReadContext)?;
+    let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload));
+    let handle = InstanceHandle { id: LIVE_ID };
+    let params: Parameters = vec![].into();
+
+    // CONTROL: with LIVE_ID unoccupied the guard must not fire. This call fails
+    // for an unrelated reason (no engine instance under that handle), which is
+    // the point — it proves the assertion below distinguishes the re-entry
+    // guard from "this call failed somehow", rather than passing on any error.
+    let control = runtime.exec_inbound_with_env(
+        delegate.key(),
+        &params,
+        None,
+        None,
+        &msg,
+        Vec::new(),
+        &handle,
+        LIVE_ID,
+        DelegateApiVersion::V2,
+    );
+    let control_msg = format!("{:?}", control.err());
+    assert!(
+        !control_msg.contains("already active"),
+        "control call must not trip the re-entry guard, got: {control_msg}"
+    );
+
+    // Occupy LIVE_ID exactly as an abandoned guest's env would.
+    // SAFETY: the env is removed below before `runtime` (which owns the stores
+    // these pointers address) is dropped, and no guest ever runs against it.
+    let env = unsafe {
+        DelegateCallEnv::new(
+            Vec::new(),
+            &mut runtime.secret_store,
+            &runtime.contract_store,
+            runtime.state_store_db.clone(),
+            runtime.state_write_callback.clone(),
+            runtime.state_admit_callback.clone(),
+            delegate.key().clone(),
+            &mut runtime.delegate_store,
+            0,
+            Vec::new(),
+            None,
+            runtime.created_delegates_count.clone(),
+            runtime.inherited_origins.clone(),
+        )
+    };
+    DELEGATE_ENV.insert(LIVE_ID, DelegateEnvSlot::new(env));
+
+    let result = runtime.exec_inbound_with_env(
+        delegate.key(),
+        &params,
+        None,
+        None,
+        &msg,
+        Vec::new(),
+        &handle,
+        LIVE_ID,
+        DelegateApiVersion::V2,
+    );
+
+    // Remove before asserting: a panicking assert would otherwise leave a stale
+    // env in the process-global map for every later test in this binary.
+    DELEGATE_ENV.remove(&LIVE_ID);
+
+    let err = result.expect_err(
+        "re-entering an instance id with a live env must fail closed, not proceed (#5480)",
+    );
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("already active"),
+        "expected the re-entry guard's error, got: {rendered}"
+    );
+
+    Ok(())
+}
+
+/// REGRESSION (#5480 review, F1): re-entry must be refused while a guest is
+/// still running, EVEN THOUGH its `DELEGATE_ENV` entry has already been removed.
+///
+/// This is the case the first version of the guard could not see.
+/// `DelegateEnvGuard::drop` removes the env on every exit path of
+/// `exec_inbound_with_env`, including the wall-clock-timeout `Err` — and on that
+/// path the guest is still running on an abandoned `spawn_blocking` thread,
+/// since `abort()` cannot stop a closure that has started. So by the time the
+/// batch loop sees the error, `DELEGATE_ENV.contains_key(id)` is already false
+/// while the dangerous condition — a live guest holding raw pointers to this
+/// runtime's stores — is still true.
+///
+/// A check on `DELEGATE_ENV` alone therefore reads false in exactly the
+/// scenario the guard exists for. `LIVE_DELEGATE_GUESTS` tracks the guest's own
+/// lifetime instead, which is the fact that matters.
+///
+/// Simulated by registering the id directly: reproducing it through a real
+/// abandoned guest would need an error-tolerant batch loop, which is precisely
+/// the future edit this guard is here to catch and which does not exist yet.
+#[tokio::test]
+async fn reentering_an_id_with_a_live_guest_fails_closed_even_with_no_env()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::super::engine::InstanceHandle;
+    use super::super::native_api::{DELEGATE_ENV, LIVE_DELEGATE_GUESTS};
+
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+
+    const LIVE_ID: i64 = i64::MAX - 54801;
+
+    let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::ReadContext)?;
+    let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload));
+    let handle = InstanceHandle { id: LIVE_ID };
+    let params: Parameters = vec![].into();
+
+    // The env is absent, exactly as `DelegateEnvGuard::drop` leaves it after a
+    // wall-clock timeout. Only the guest registration remains.
+    assert!(
+        !DELEGATE_ENV.contains_key(&LIVE_ID),
+        "precondition: no env under LIVE_ID, so a DELEGATE_ENV-only check would pass"
+    );
+    LIVE_DELEGATE_GUESTS.insert(LIVE_ID);
+
+    let result = runtime.exec_inbound_with_env(
+        delegate.key(),
+        &params,
+        None,
+        None,
+        &msg,
+        Vec::new(),
+        &handle,
+        LIVE_ID,
+        DelegateApiVersion::V2,
+    );
+
+    // Clear before asserting so a failure cannot strand a live-guest marker in
+    // the process-global set for every later test in this binary.
+    LIVE_DELEGATE_GUESTS.remove(&LIVE_ID);
+
+    let err = result.expect_err(
+        "re-entry must be refused while a guest is still live, even with the env already \
+         removed (#5480 review F1)",
+    );
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("already active"),
+        "expected the re-entry guard's error, got: {rendered}"
+    );
+
+    Ok(())
+}
+
+/// REGRESSION (#5480 review): `exec_inbound_with_env` must have finished its
+/// cleanup by the time it RETURNS — on the error path as much as the success
+/// path — not merely "eventually".
+///
+/// This pins the fact that makes the #5554 interaction safe, and which nothing
+/// else states. #5554 parks delegates off the serial `contract_handling` loop,
+/// so a delegate's round trip can now span two loop iterations; its own comment
+/// notes that the serial loop was the ONLY thing guaranteeing one `process()`
+/// per delegate. What keeps that sound is ordering: `_guard` is a local of
+/// `exec_inbound_with_env`, so `DELEGATE_ENV` is cleared strictly before the
+/// `Err` reaches `inbound_app_message`, before `DelegateRunOutcome::Failed`, and
+/// therefore before a park can release a queued run for the same delegate.
+///
+/// That is the placement of one local variable, load-bearing across two merged
+/// changes, and until this test nothing checked it. A `std::mem::forget(_guard)`
+/// — or hoisting the guard into the caller to "clean up once per batch" — would
+/// leave the entry live past the return with no other alarm.
+#[tokio::test]
+async fn env_cleanup_completes_before_the_call_returns() -> Result<(), Box<dyn std::error::Error>> {
+    use super::super::engine::InstanceHandle;
+    use super::super::native_api::{DELEGATE_ENV, LIVE_DELEGATE_GUESTS};
+
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+
+    const ID: i64 = i64::MAX - 54802;
+
+    let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::ReadContext)?;
+    let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload));
+    let handle = InstanceHandle { id: ID };
+    let params: Parameters = vec![].into();
+
+    // Fails inside `exec_inbound` (no engine instance under this handle), which
+    // is the path that matters: the guard must still have run.
+    let result = runtime.exec_inbound_with_env(
+        delegate.key(),
+        &params,
+        None,
+        None,
+        &msg,
+        Vec::new(),
+        &handle,
+        ID,
+        DelegateApiVersion::V2,
+    );
+    assert!(
+        result.is_err(),
+        "fixture precondition: this call is expected to fail, so the assertions \
+         below are about the ERROR path"
+    );
+
+    assert!(
+        !DELEGATE_ENV.contains_key(&ID),
+        "`exec_inbound_with_env` returned with its DELEGATE_ENV entry still \
+         present. `_guard` must drop inside this function, before the error \
+         reaches `inbound_app_message` and before #5554's park can release a \
+         queued run for the same delegate"
+    );
+    assert!(
+        !LIVE_DELEGATE_GUESTS.contains(&ID),
+        "no guest ever started for this call, so nothing may be left registered \
+         as live — a stale entry here would refuse every later call on this id"
+    );
+
+    Ok(())
 }

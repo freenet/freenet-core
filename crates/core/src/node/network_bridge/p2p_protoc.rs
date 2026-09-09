@@ -53,6 +53,7 @@ mod broadcast;
 mod connection_lifecycle;
 mod dispatch;
 mod migration;
+mod v2_drain;
 
 /// Represents the different ways the event loop can exit.
 ///
@@ -88,6 +89,94 @@ impl std::error::Error for EventLoopExitReason {}
 /// poll. A diagnostics query is best-effort, so cap the wait and serve an empty
 /// result on timeout rather than freezing (or, previously, killing) the listener.
 const QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound on the state read the V2 delegate broadcast drain performs.
+///
+/// Same hazard and same remedy as [`QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT`]: the
+/// read runs INLINE on the network event loop, and the handler's own timeout is
+/// `CH_EV_RESPONSE_TIME_OUT` (300 s), so an unbounded await here is the #4549
+/// wedge — a saturated contract handler stalls, then kills, the listener.
+///
+/// TIGHT ON PURPOSE, and it was briefly widened to `BROADCAST_CH_TIMEOUT`
+/// (10 s) on reasoning that does not hold. Recorded because the reasoning was
+/// plausible and will be re-invented otherwise.
+///
+/// The widening argued that `handle_broadcast_state_change`, called three lines
+/// later on this same arm, already spends `BROADCAST_CH_TIMEOUT` per target, so
+/// a tighter cap here protected nothing. **That is false in a production
+/// build.** In production the handler resolves targets in memory and hands off
+/// to `BroadcastQueue::enqueue`, a mutex-guarded push; every
+/// `BROADCAST_CH_TIMEOUT` round trip lives in `broadcast_to_single_peer`, which
+/// runs inside the spawned `drain_lane` workers, OFF this loop. The function
+/// that does await per target inline, `broadcast_state_to_peers`, is
+/// `#[cfg(feature = "simulation_tests")]`. So the comparison was against a path
+/// the shipped binary does not take.
+///
+/// The second argument was that a stall here produces no slow-iteration warning
+/// — `SLOW_EVENT_THRESHOLD` is measured around `process_select_result`, and the
+/// `NodeAction` dispatch containing this arm runs after that elapsed time is
+/// taken. That part is TRUE, and it argues the opposite way: an unobserved
+/// stall needs a tighter bound, not a looser one, because nothing will tell an
+/// operator it happened.
+///
+/// What the bound trades. Expiry drops one broadcast, which is recoverable —
+/// the next write to the contract re-announces it, and anti-entropy repairs it
+/// otherwise. Overrunning starves the network event loop, which processes no
+/// UDP and no connection events while it waits, and that is not recoverable.
+/// The asymmetry matters more than it looks because the coalescing marker is
+/// PER CONTRACT: a delegate writing across N contracts queues N distinct
+/// drains, so the worst case is N times this bound of dead loop, not one.
+pub(crate) const V2_BROADCAST_DRAIN_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Count of V2 delegate broadcasts dropped because the drain could not read
+/// local state.
+///
+/// A counter, not only a log line: `crates/core/Cargo.toml` enables tracing's
+/// `release_max_level_info`, so anything logged below INFO does not exist in a
+/// release binary. The accompanying message is therefore WARN, and this counter
+/// gives the same fact a form an operator can poll and graph rather than grep.
+/// `.claude/rules/code-style.md` requires exactly this of a drop that is
+/// invisible on the happy path — a refusal that is not counted renders as a
+/// clean zero.
+static V2_BROADCAST_DRAINS_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Count a dropped V2 broadcast drain, and WARN at power-of-two milestones.
+///
+/// RATE-LIMITED on purpose, and the reason is a production incident rather than
+/// taste. `try_notify_node_event_on` logs its `Full` arm at `debug!` with the
+/// note that a per-occurrence WARN there flooded production gateways after the
+/// HN spike (#4238) at 8-14 MB/hour. This path is reached under exactly that
+/// condition — a saturated node — and once per V2 write, so an unconditional
+/// WARN here would re-create the same flood by a different door.
+///
+/// `release_max_level_info` still rules out `debug!` (the drop would leave no
+/// evidence in a release build, the #4981 shape), so the answer is neither
+/// every occurrence nor none: count all, warn at 1, 2, 4, 8, ... exactly as
+/// `tracing::register::note_dropped_event_log` does for the same trade.
+fn note_v2_broadcast_drain_dropped(key: &freenet_stdlib::prelude::ContractKey) {
+    let dropped =
+        V2_BROADCAST_DRAINS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if dropped.is_power_of_two() {
+        tracing::warn!(
+            contract = %key,
+            dropped_total = dropped,
+            timeout_secs = V2_BROADCAST_DRAIN_READ_TIMEOUT.as_secs(),
+            "V2 delegate broadcast dropped: could not read local state to announce, and \
+             the bounded retry did not recover it. The usual cause is the contract-handling \
+             loop being held by the delegate that made this write — a delegate awaiting user \
+             input holds it for a human-scale time and will not be recovered by retries \
+             (#5544/#5554 remove that precondition). The write is committed locally; a peer \
+             hosting or using this contract re-learns it EVENTUALLY via anti-entropy, \
+             or sooner on the delegate's next write. Eventually is the honest word: \
+             INTEREST_HEARTBEAT_INTERVAL (300s) is the heartbeat PERIOD, not a recovery \
+             bound — each exchange carries at most MAX_SUMMARY_ENTRIES_PER_MESSAGE \
+             entries, chosen by RANDOM ROTATION when a peer shares more contracts than \
+             that, so a busy node needs several rounds and the count is probabilistic. \
+             Logged at power-of-two milestones (#4238)."
+        );
+    }
+}
 
 /// Best-effort, bounded query to the contract handler for application-level
 /// subscriptions, used by the diagnostics arms of the network event loop (#4549).
@@ -751,6 +840,15 @@ pub(in crate::node) struct P2pConnManager {
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// Per-contract retry count for broadcasts that found no targets yet.
     broadcast_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
+    /// Per-contract retry count for a V2 delegate broadcast drain whose state
+    /// read came back `Unavailable`.
+    ///
+    /// Separate from `broadcast_retries`, which counts a different failure (a
+    /// fan-out that resolved no targets). This one counts "we could not read
+    /// what to send". Bounded by [`Self::MAX_V2_DRAIN_RETRIES`]; the entry is
+    /// removed on success, on a definitive `NotHeld`, and on exhaustion, so it
+    /// cannot accumulate per contract.
+    v2_drain_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
     /// Tracks how many consecutive broadcast cycles found zero targets per contract.
     /// Used to suppress repetitive WARN logs after the first few failures.
     /// Bounded to MAX_BROADCAST_STREAK_ENTRIES to prevent unbounded growth from
@@ -1322,6 +1420,7 @@ impl P2pConnManager {
             congestion_config: config.config.network_api.build_congestion_config(),
             blocked_addresses: config.blocked_addresses.clone(),
             broadcast_retries: HashMap::new(),
+            v2_drain_retries: HashMap::new(),
             broadcast_no_target_streak: HashMap::new(),
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue: super::broadcast_queue::BroadcastQueue::new(),
@@ -1390,6 +1489,7 @@ impl P2pConnManager {
             ack_version_floor_override,
             blocked_addresses,
             broadcast_retries,
+            v2_drain_retries,
             broadcast_no_target_streak,
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue,
@@ -1485,6 +1585,7 @@ impl P2pConnManager {
             ack_version_floor_override,
             blocked_addresses,
             broadcast_retries,
+            v2_drain_retries,
             broadcast_no_target_streak,
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue: broadcast_queue.clone(),
@@ -2932,6 +3033,30 @@ impl P2pConnManager {
                                     new_state,
                                     is_retry,
                                     is_reemit,
+                                )
+                                .await;
+                            }
+                            NodeEvent::V2DelegateStateChanged { key } => {
+                                // Extracted so it is reachable from a test —
+                                // see `v2_drain`, and the mutation results that
+                                // motivated it. Inline in this `select!` arm,
+                                // deleting the fan-out left the whole suite
+                                // green.
+                                //
+                                // Linear backoff with +/-20% jitter so a burst
+                                // of contracts failing together does not retry
+                                // in lockstep against the one serial loop that
+                                // was already too busy to answer
+                                // (`code-style.md`). Drawn here, not inside, so
+                                // the retry arithmetic is deterministic under
+                                // test.
+                                let jitter_pct: u64 =
+                                    crate::config::GlobalRng::random_range(80u64..=120u64);
+                                v2_drain::handle_v2_delegate_state_changed(
+                                    &mut ctx,
+                                    &op_manager,
+                                    key,
+                                    jitter_pct,
                                 )
                                 .await;
                             }
@@ -5304,6 +5429,65 @@ pub(crate) mod tests {
              over-suppression. Every queue test passes an empty fanout, so no \
              behavioural test distinguishes the two."
         );
+    }
+
+    /// The V2 drain retry POLICY, which the source-order pins cannot reach.
+    ///
+    /// The pins assert the shape of the dispatch arm; they cannot tell you that
+    /// retries stop at the cap or that the jitter stays inside its documented
+    /// band. Both matter here for a specific reason: the drops are CORRELATED —
+    /// the read fails because it is queued behind a delegate notification
+    /// batch, so one busy batch drops many contracts at once. Un-jittered
+    /// backoff would then re-queue all of them in lockstep against the same
+    /// serial loop that was already too busy, making the retry amplify the
+    /// congestion it exists to recover from.
+    #[test]
+    fn v2_drain_retry_policy_is_bounded_and_jittered() {
+        use super::P2pConnManager;
+
+        // Stops exactly at the cap, and the cap is what gives up.
+        for attempts in 0..P2pConnManager::MAX_V2_DRAIN_RETRIES {
+            assert!(
+                P2pConnManager::plan_v2_drain_retry(attempts, 100).is_some(),
+                "attempt {attempts} is below MAX_V2_DRAIN_RETRIES and must still retry"
+            );
+        }
+        assert!(
+            P2pConnManager::plan_v2_drain_retry(P2pConnManager::MAX_V2_DRAIN_RETRIES, 100)
+                .is_none(),
+            "at MAX_V2_DRAIN_RETRIES the drain must give up rather than retry forever — an \
+             unbounded retry here is a loop against the contract handler that is already \
+             saturated"
+        );
+        assert!(
+            P2pConnManager::plan_v2_drain_retry(u8::MAX, 100).is_none(),
+            "any count past the cap must also give up"
+        );
+
+        // Linear growth at the neutral factor.
+        let base = P2pConnManager::V2_DRAIN_RETRY_BASE_DELAY;
+        assert_eq!(P2pConnManager::plan_v2_drain_retry(0, 100), Some(base));
+        assert_eq!(P2pConnManager::plan_v2_drain_retry(1, 100), Some(base * 2));
+        assert_eq!(P2pConnManager::plan_v2_drain_retry(2, 100), Some(base * 3));
+
+        // Jitter band: +/-20% of the linear delay at each attempt, and the
+        // extremes must actually MOVE the delay — a jitter that silently
+        // collapsed to 1.0 would pass a bounds-only check.
+        for attempts in 0..P2pConnManager::MAX_V2_DRAIN_RETRIES {
+            let linear = base * u32::from(attempts + 1);
+            let low = P2pConnManager::plan_v2_drain_retry(attempts, 80).unwrap();
+            let high = P2pConnManager::plan_v2_drain_retry(attempts, 120).unwrap();
+            assert!(
+                low < linear && high > linear,
+                "jitter must actually spread attempt {attempts}: got low={low:?}, \
+                 linear={linear:?}, high={high:?}. If low == high == linear the jitter \
+                 factor is being ignored and correlated drops will retry in lockstep"
+            );
+            assert!(
+                low >= linear.mul_f64(0.8) && high <= linear.mul_f64(1.2),
+                "jitter must stay within the documented +/-20% band at attempt {attempts}"
+            );
+        }
     }
 
     /// Phase 7 egress self-block pin (#4300). `handle_broadcast_state_change`
