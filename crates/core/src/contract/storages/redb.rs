@@ -2036,9 +2036,32 @@ impl ReDb {
     /// keep the in-memory registry in step, so the two representations agree at
     /// the cap instead of diverging there.
     ///
+    /// # A REPEAT SUBSCRIBE MUST NOT OPEN A WRITE TRANSACTION
+    ///
+    /// This runs synchronously on the WASM call stack for the V2
+    /// `subscribe_contract()` host function, on the serial contract-handling
+    /// loop, and nothing bounds how many `SubscribeContractRequest`s one
+    /// `process()` may emit (#5567). A write transaction takes redb's single
+    /// writer lock and commits, so paying one per repeat would let a delegate
+    /// re-subscribing on a timer serialise every other writer on the node
+    /// behind it — for a row that already exists.
+    ///
+    /// So the present case is answered from a READ transaction and returns
+    /// before any write. `register_subscription` has the same shape and the
+    /// same reason (its cheapest-check-first fast path), and the two have to
+    /// agree: it short-circuits a repeat, so this must too, or the repeat is
+    /// cheap in the ring and expensive on disk.
+    ///
+    /// The read-then-write is not atomic. It does not need to be: the only
+    /// racing writer for this row is another registration of the SAME
+    /// `(contract, delegate)`, whose insert is idempotent, and the cap is a
+    /// backstop rather than a ration — an overshoot of the number of in-flight
+    /// registrations cannot compound, because every later one is refused. The
+    /// same argument `register_subscription` makes for its three caps.
+    ///
     /// # Errors
-    /// Returns `Err` if the redb write transaction, table open, range count or
-    /// commit fails.
+    /// Returns `Err` if the redb read or write transaction, table open, range
+    /// count or commit fails.
     pub fn add_delegate_subscription(
         &self,
         contract: &ContractInstanceId,
@@ -2046,6 +2069,19 @@ impl ReDb {
     ) -> Result<bool, redb::Error> {
         let row_key = Self::delegate_subscription_row_key(contract, delegate);
         let (lo, hi) = Self::delegate_subscription_range(contract);
+
+        // Cheap path: already recorded. A missing table is the same answer as
+        // an absent row, and costs no write either.
+        let already_present =
+            self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
+                Ok(tbl) => Ok(tbl.get(row_key.as_slice())?.is_some()),
+                Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+                Err(e) => Err(e.into()),
+            })?;
+        if already_present {
+            return Ok(true);
+        }
+
         let txn = self.begin_write()?;
         let admitted;
         {
@@ -3211,6 +3247,52 @@ mod tests {
             db.record_delegate_origin_first_writer(&d2, Some([0x22u8; 32]))
                 .is_err(),
             "a durable-write failure must surface as Err, never a silent Ok"
+        );
+    }
+
+    /// A repeat delegate subscribe must be answered from a READ transaction.
+    ///
+    /// `add_delegate_subscription` runs synchronously on the WASM call stack
+    /// for the V2 `subscribe_contract()` host function, on the serial
+    /// contract-handling loop, and nothing bounds how many subscribe requests
+    /// one delegate `process()` may emit (#5567). A write transaction takes
+    /// redb's single writer lock, so a delegate re-subscribing on a timer would
+    /// serialise every other writer on the node behind it — for a row that
+    /// already exists.
+    ///
+    /// A behavioural test cannot see this: the row count is identical either
+    /// way (`recording_the_same_subscription_twice_writes_one_row` covers
+    /// that), and the difference is which lock was taken. So this pins the
+    /// structure: the early return must come before `begin_write`.
+    #[test]
+    fn a_repeat_delegate_subscription_returns_before_opening_a_write_transaction() {
+        const SOURCE: &str = include_str!("redb.rs");
+        let start = SOURCE
+            .find("pub fn add_delegate_subscription(")
+            .expect("add_delegate_subscription must still exist");
+        let rel_end = SOURCE[start..]
+            .find("\n    }\n")
+            .expect("add_delegate_subscription must still be a closed fn body");
+        let body = &SOURCE[start..start + rel_end];
+
+        // Window guard, separate from the assertion that uses it: a window
+        // truncated to a PREFIX that stopped before `begin_write` would make
+        // the ordering check below pass vacuously.
+        let write = body
+            .find("self.begin_write()")
+            .expect("the scraped window no longer reaches the write transaction. Widen it; do NOT delete this check.");
+        let read = body.find("self.read_guarded(").expect(
+            "`add_delegate_subscription` must answer the already-recorded case from a READ \
+                 transaction. Without it every repeat subscribe takes redb's writer lock on the \
+                 serial contract-handling loop, for a row that already exists.",
+        );
+        let early_return = body
+            .find("return Ok(true);")
+            .expect("the already-present fast path must still return before the write");
+        assert!(
+            read < early_return && early_return < write,
+            "the order must be read, then early return, then write. Got read at {read}, \
+             return at {early_return}, write at {write}."
         );
     }
 
