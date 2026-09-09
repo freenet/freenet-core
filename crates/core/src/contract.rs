@@ -7899,6 +7899,196 @@ mod hol_4391_tests {
         handle.abort();
     }
 
+    /// #5542. The mapping from a resolved network operation to the message the
+    /// delegate actually receives, covering every outcome including the ones
+    /// that cannot happen by construction.
+    ///
+    /// Pure and exhaustive on purpose: the off-loop task, the resume handler
+    /// and the `ParkGuard`'s panic path all funnel through this one function,
+    /// and the failure this pins is a failure arm quietly producing a SUCCESS
+    /// shape — telling a delegate its subscription is live when the node cannot
+    /// say that.
+    #[test]
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn contract_op_response_msg_maps_every_outcome() {
+        use delegate_park::{ContractOpKind, ContractOpOutcome};
+        let id = ContractInstanceId::new([4u8; 32]);
+        let ctx = DelegateContext::new(b"cont".to_vec());
+
+        let found = contract_op_response_msg(
+            ContractOpKind::Get,
+            id,
+            ctx.clone(),
+            ContractOpOutcome::Fetched(Some(WrappedState::new(b"hello".to_vec()))),
+        );
+        match found {
+            InboundDelegateMsg::GetContractResponse(r) => {
+                assert_eq!(r.state.as_deref(), Some(&b"hello"[..]));
+                assert_eq!(r.context.as_ref(), ctx.as_ref(), "context must round-trip");
+            }
+            other => panic!("a resolved GET must answer with GetContractResponse, got {other:?}"),
+        }
+
+        let get_failed = contract_op_response_msg(
+            ContractOpKind::Get,
+            id,
+            ctx.clone(),
+            ContractOpOutcome::Failed("boom".to_string()),
+        );
+        match get_failed {
+            InboundDelegateMsg::GetContractResponse(r) => assert!(
+                r.state.is_none(),
+                "a failed GET must not fabricate a state"
+            ),
+            other => panic!("a failed GET must still answer the delegate, got {other:?}"),
+        }
+
+        let subscribed = contract_op_response_msg(
+            ContractOpKind::Subscribe,
+            id,
+            ctx.clone(),
+            ContractOpOutcome::Subscribed,
+        );
+        match subscribed {
+            InboundDelegateMsg::SubscribeContractResponse(r) => {
+                assert!(r.result.is_ok(), "a completed subscribe must report Ok")
+            }
+            other => panic!("expected SubscribeContractResponse, got {other:?}"),
+        }
+
+        let sub_failed = contract_op_response_msg(
+            ContractOpKind::Subscribe,
+            id,
+            ctx,
+            ContractOpOutcome::Failed("no hosting peers".to_string()),
+        );
+        match sub_failed {
+            InboundDelegateMsg::SubscribeContractResponse(r) => {
+                let err = r
+                    .result
+                    .expect_err("a failed subscribe MUST NOT be reported as success");
+                assert!(
+                    err.contains("no hosting peers"),
+                    "the delegate must be told WHY, got {err:?}"
+                );
+            }
+            other => panic!("expected SubscribeContractResponse, got {other:?}"),
+        }
+    }
+
+    /// #5542. The `DELEGATE_SUBSCRIPTIONS` hook is installed ONLY when the
+    /// network subscription actually succeeded.
+    ///
+    /// This is the concrete form of the warning on the issue: that map is a
+    /// local notification hook and nothing in `ring/` reads it, so a hook
+    /// installed for a subscription that never got established gives a delegate
+    /// that believes it is subscribed and then never hears anything — the
+    /// silent-on-both-sides failure, one layer up.
+    #[test]
+    fn the_notification_hook_is_installed_only_on_a_successful_subscribe() {
+        use delegate_park::{
+            ContractOpKind, ContractOpOutcome, PendingContractOp, ResolvedContractOp,
+        };
+        let dkey = DelegateKey::new([21u8; 32], freenet_stdlib::prelude::CodeHash::new([21u8; 32]));
+        let ok_id = ContractInstanceId::new([22u8; 32]);
+        let bad_id = ContractInstanceId::new([23u8; 32]);
+        // Global registry: use ids unique to this test so it does not race the
+        // rest of the suite.
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&ok_id);
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&bad_id);
+
+        let _ = apply_resolved_contract_op(
+            ResolvedContractOp {
+                pending: PendingContractOp {
+                    contract_id: ok_id,
+                    kind: ContractOpKind::Subscribe,
+                    context: DelegateContext::default(),
+                },
+                outcome: ContractOpOutcome::Subscribed,
+            },
+            &dkey,
+        );
+        let _ = apply_resolved_contract_op(
+            ResolvedContractOp {
+                pending: PendingContractOp {
+                    contract_id: bad_id,
+                    kind: ContractOpKind::Subscribe,
+                    context: DelegateContext::default(),
+                },
+                outcome: ContractOpOutcome::Failed("network exhausted".to_string()),
+            },
+            &dkey,
+        );
+
+        assert!(
+            already_subscribed(&ok_id, &dkey),
+            "a successful subscribe must install the notification hook"
+        );
+        assert!(
+            !already_subscribed(&bad_id, &dkey),
+            "a FAILED subscribe must not install a hook: it would advertise a \
+             delivery path that was never established"
+        );
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&ok_id);
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&bad_id);
+    }
+
+    /// #5542. A delegate SUBSCRIBE that cannot reach the network must still get
+    /// a TERMINAL response, and the round-trip must complete.
+    ///
+    /// The executor here has no `OpManager` (`build_handler` passes `None`), so
+    /// the request is refused rather than parked. Refusing is the correct
+    /// behaviour — #5544's park-cap fallback to an inline wait is explicitly not
+    /// inheritable by an operation that reaches the network — but a refusal that
+    /// is DROPPED rather than answered leaves the delegate waiting forever for a
+    /// `SubscribeContractResponse` nobody will send. That is what this pins.
+    #[tokio::test]
+    async fn a_delegate_subscribe_that_cannot_reach_the_network_is_still_answered() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        let observations = handler.runtime_mut().delegate_observations.clone();
+        let unseen = ContractInstanceId::new([42u8; 32]);
+        script.lock().unwrap().push_back(
+            vec![OutboundDelegateMsg::SubscribeContractRequest(
+                freenet_stdlib::prelude::SubscribeContractRequest::new(unseen),
+            )]
+            .into(),
+        );
+
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            },
+        ));
+        let key = test_delegate_key();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send_to_handler(delegate_event(&key)),
+        )
+        .await
+        .expect("the round-trip must terminate, not hang on an unanswered subscribe")
+        .expect("handler responds");
+        assert!(
+            matches!(resp, ContractHandlerEvent::DelegateResponse(_)),
+            "expected a DelegateResponse, got {resp}"
+        );
+
+        let saw_response = observations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|o| o.inbound_kinds.iter().any(|k| *k == "SubscribeContractResponse"));
+        assert!(
+            saw_response,
+            "the delegate must be fed a SubscribeContractResponse even when the \
+             subscribe is refused; dropping it leaves the delegate waiting for a \
+             response nobody will send"
+        );
+        handle.abort();
+    }
+
     /// A delegate that prompts TWICE parks, resumes, and parks again. Its
     /// client must still be answered exactly once, at the end.
     ///
