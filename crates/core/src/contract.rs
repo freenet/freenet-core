@@ -768,6 +768,74 @@ fn contract_op_response_msg(
     }
 }
 
+/// Give back the local interest that resolved-but-dropped SUBSCRIBEs took
+/// (#5542 finding B3).
+///
+/// Called from the one path that discards a `DelegateResume` without running
+/// `apply_resolved_contract_op`: a resume whose park is gone, because the
+/// `PARK_TTL` backstop ended it without consuming the guard. That is reachable
+/// by NODE LOAD alone — no delegate behaviour is required — and each occurrence
+/// would otherwise cost one permanently unreleasable refcount.
+///
+/// Releases only for `(Subscribe, Subscribed)`, the same evidence
+/// `delegate_interest::record` gates on, so it can never decrement interest a
+/// different subscriber holds. Installs no `DELEGATE_SUBSCRIPTIONS` hook: the
+/// delegate is not told it is subscribed, and nothing advertises a delivery
+/// path that will not be served.
+///
+/// Logged at `warn!`, not `debug!`. The dropped resume is ordinary; a refcount
+/// leaving with it is not, and an operator seeing this repeatedly is seeing
+/// parks lose the race to the backstop.
+fn release_stranded_subscribe_interest<CH>(
+    contract_handler: &mut CH,
+    delegate_key: &DelegateKey,
+    contract_ops: &[delegate_park::ResolvedContractOp],
+) where
+    CH: ContractHandler + Send + 'static,
+{
+    let stranded: Vec<freenet_stdlib::prelude::ContractInstanceId> = contract_ops
+        .iter()
+        .filter(|resolved| {
+            matches!(
+                (resolved.pending.kind, &resolved.outcome),
+                (
+                    delegate_park::ContractOpKind::Subscribe,
+                    delegate_park::ContractOpOutcome::Subscribed
+                )
+            )
+        })
+        .map(|resolved| resolved.pending.contract_id)
+        .collect();
+    if stranded.is_empty() {
+        return;
+    }
+    let Some(op_manager) = contract_handler.executor().op_manager_handle() else {
+        tracing::warn!(
+            delegate = %delegate_key,
+            count = stranded.len(),
+            "Dropped resume carried resolved delegate subscribes but this \
+             executor has no OpManager, so their local interest cannot be \
+             released (#5542)"
+        );
+        return;
+    };
+    for contract_id in stranded {
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            contract_id,
+            freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+        );
+        let lost_interest = op_manager.interest_manager.remove_local_client(&key);
+        tracing::warn!(
+            contract = %contract_id,
+            delegate = %delegate_key,
+            lost_interest,
+            "Released the local interest of a delegate SUBSCRIBE whose resume \
+             was dropped on epoch mismatch; without this the refcount could \
+             never be discharged (#5542 finding B3)"
+        );
+    }
+}
+
 /// Finish a resolved delegate network operation ON the loop (#5542).
 ///
 /// The network work happened off-loop; what is left is the part that must be
@@ -4130,6 +4198,32 @@ where
             "Resume for a park that no longer exists (force-resumed by the TTL \
              backstop, or already ended) — dropping"
         );
+        // DISCHARGE WHAT THE DROPPED OPS ALREADY TOOK (#5542 finding B3).
+        //
+        // Dropping the resume drops `contract_ops` with it, so
+        // `apply_resolved_contract_op` never runs and
+        // `delegate_interest::record` never runs. But a `Subscribed` outcome
+        // means `run_executor_subscribe` ALREADY called `add_local_client` —
+        // on the network path via `finalize_originator_subscribe`, or directly
+        // on the local-hit path. With no hold recorded, `release_delegate` and
+        // `release_contract` have nothing to discharge, so that refcount is
+        // stranded permanently: exactly the leak `wasm_runtime::delegate_interest`
+        // exists to close, arriving through a door this PR opened.
+        //
+        // Give it back directly rather than recording a hold and installing the
+        // notification hook. Absorbing would keep a live network subscription,
+        // which is tempting, but per-delegate exclusion queues an
+        // `UnregisterDelegate` BEHIND the park, so by the time a late resume
+        // arrives the delegate may already be gone — and installing its hook
+        // then resurrects a subscription for a delegate that no longer exists.
+        //
+        // This cannot over-release. It fires only on `Subscribed`, which is the
+        // same evidence `record` itself uses, and it releases through the
+        // instance-only key for the reason given at
+        // `delegate_subscribe_interest_handle`: `ContractKey`'s `Hash`/`Eq` are
+        // instance-only, so it resolves exactly the entry `add_local_client`
+        // created.
+        release_stranded_subscribe_interest(contract_handler, &delegate_key, &contract_ops);
         return 0;
     };
     // The resumed run itself, plus one per pending request drained below.
@@ -8341,6 +8435,100 @@ mod hol_4391_tests {
             task_monitor,
         ));
         (op_manager, guards)
+    }
+
+    /// #5542 finding B3/F2. A resolved SUBSCRIBE whose resume is dropped on
+    /// epoch mismatch must give back the interest it already took.
+    ///
+    /// `run_executor_subscribe` calls `add_local_client` before it returns, so
+    /// by the time the resume is built the refcount exists. If the park is gone
+    /// — the `PARK_TTL` backstop ended it without consuming the off-loop task's
+    /// guard, so that guard's resume still arrives —
+    /// `handle_delegate_resume` returns early and `apply_resolved_contract_op`
+    /// never runs, so `delegate_interest::record` never runs either. Nothing
+    /// could then discharge it: both release functions work from the hold map,
+    /// which has no entry for that pair.
+    ///
+    /// Reachable by NODE LOAD alone. No delegate behaviour is required, and the
+    /// delegate is the victim rather than the cause. The code at the early
+    /// return already documents that the path is reachable, having retracted an
+    /// earlier comment that claimed otherwise.
+    #[tokio::test]
+    async fn a_dropped_resume_gives_back_the_interest_its_subscribe_took() {
+        use delegate_park::{
+            ContractOpKind, ContractOpOutcome, PendingContractOp, ResolvedContractOp,
+        };
+        use freenet_stdlib::prelude::CodeHash;
+
+        let _guard = TEST_GUARD.lock().await;
+        let (op_manager, _guards) = build_op_manager("d5542-stale-resume").await;
+        let (_send, rcv_halve, _wait) = handler::contract_handler_channel();
+        let mut handler = MockWasmContractHandler::new_test(
+            rcv_halve,
+            Some(op_manager.clone()),
+            "d5542_stale_resume",
+        )
+        .await;
+
+        let dkey = DelegateKey::new([51u8; 32], CodeHash::new([51u8; 32]));
+        let id = ContractInstanceId::new([52u8; 32]);
+        let full_key = ContractKey::from_id_and_code(id, CodeHash::new([53u8; 32]));
+
+        // What `run_executor_subscribe` did before the resume was built.
+        assert!(
+            op_manager.interest_manager.add_local_client(&full_key),
+            "the refcount this test is about must actually have been taken"
+        );
+
+        // A park context with NOTHING parked, so `take_matching` rejects the
+        // resume exactly as it does after the TTL backstop has ended the park.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx);
+
+        let runs = handle_delegate_resume(
+            &mut handler,
+            &mut park,
+            &Arc::new(GatedPrompter {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            }),
+            delegate_park::DelegateResume {
+                delegate_key: dkey.clone(),
+                epoch: 7,
+                cause: delegate_park::ResumeCause::Completed,
+                inbound: Vec::new(),
+                upserts: Vec::new(),
+                unresolved_upserts: Vec::new(),
+                contract_ops: vec![ResolvedContractOp {
+                    pending: PendingContractOp {
+                        contract_id: id,
+                        kind: ContractOpKind::Subscribe,
+                        context: DelegateContext::default(),
+                    },
+                    outcome: ContractOpOutcome::Subscribed,
+                }],
+                unresolved_contract_ops: Vec::new(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            runs, 0,
+            "this test is only meaningful while the resume is actually DROPPED; \
+             a non-zero run count means it was absorbed and the early return \
+             never ran"
+        );
+        assert!(
+            !op_manager.interest_manager.has_local_interest(&full_key),
+            "a dropped resume must give back the local interest its resolved \
+             SUBSCRIBE already took; nothing else can ever discharge it, because \
+             no hold was recorded (#5542 finding B3)"
+        );
+        assert!(
+            !already_subscribed(&id, &dkey),
+            "and it must NOT install a notification hook: the delegate may be \
+             gone by now, and advertising a delivery path nothing will serve is \
+             the failure this PR exists to prevent"
+        );
     }
 
     /// #5542 finding B1/F1. The delegate network fan-out budget must span the
