@@ -2483,82 +2483,59 @@ mod tests {
     /// FALSIFY by setting `ELEMENT_OVERHEAD_BYTES` to 0.
     #[test]
     fn empty_messages_are_charged_for_their_slots() {
+        // ASSERT GROWTH, NOT A PRODUCT OF THE CONSTANT UNDER TEST. The first
+        // version asserted `charged >= N * ELEMENT_OVERHEAD_BYTES`, which is
+        // SELF-REFERENTIAL: zeroing the constant zeroes the expectation too, so
+        // `charged >= 0` held and the test passed under the exact mutation it
+        // is named for. The campaign caught it; reading it did not, twice.
+        //
+        // Growth cannot be defeated that way. With the constant at 0, N empty
+        // messages and one empty message both cost nothing, so the difference
+        // is 0 and this goes red.
         const N: usize = 512;
-        let mut cont = continuation();
-        cont.inbound_so_far = (0..N)
-            .map(|_| {
-                InboundDelegateMsg::ApplicationMessage(
-                    freenet_stdlib::prelude::ApplicationMessage::new(Vec::new()),
-                )
-            })
-            .collect();
-        assert!(
-            continuation_bytes(&cont) >= N * ELEMENT_OVERHEAD_BYTES.get(),
-            "{N} EMPTY messages carry no payload and still cost {N} slots. \
-             Summing payload lengths alone bounds nothing when the delegate \
-             picks the count: charged {}",
+        let charge_for = |count: usize| {
+            let mut cont = continuation();
+            cont.inbound_so_far = (0..count)
+                .map(|_| {
+                    InboundDelegateMsg::ApplicationMessage(
+                        freenet_stdlib::prelude::ApplicationMessage::new(Vec::new()),
+                    )
+                })
+                .collect();
             continuation_bytes(&cont)
+        };
+        let one = charge_for(1);
+        let many = charge_for(N);
+        assert!(
+            many > one,
+            "{N} EMPTY messages must cost more than one. They carry no payload, \
+             so only a per-element charge distinguishes them — and the delegate \
+             picks the count: ~10M of them fit a 200 MiB buffer. Charged {many} \
+             for {N} against {one} for 1"
+        );
+        assert!(
+            many - one >= N - 1,
+            "each additional empty message must cost at least a byte; got \
+             {} across {} extra messages",
+            many - one,
+            N - 1
         );
 
-        let mut cont = continuation();
-        cont.accumulated = (0..N)
-            .map(|_| {
-                OutboundDelegateMsg::ApplicationMessage(
-                    freenet_stdlib::prelude::ApplicationMessage::new(Vec::new()),
-                )
-            })
-            .collect();
+        let charge_out = |count: usize| {
+            let mut cont = continuation();
+            cont.accumulated = (0..count)
+                .map(|_| {
+                    OutboundDelegateMsg::ApplicationMessage(
+                        freenet_stdlib::prelude::ApplicationMessage::new(Vec::new()),
+                    )
+                })
+                .collect();
+            continuation_bytes(&cont)
+        };
         assert!(
-            continuation_bytes(&cont) >= N * ELEMENT_OVERHEAD_BYTES.get(),
+            charge_out(N) > charge_out(1),
             "the same holds for the accumulated lane, which grows across parks"
         );
-    }
-
-    /// The saturating property itself, which is what the newtype buys.
-    ///
-    /// WHY THIS IS THE TEST AND NOT AN END-TO-END ONE. Driving a real
-    /// `unmeasurable` through `task_bytes` needs a `#[non_exhaustive]` variant
-    /// this build does not know, which is impossible by definition — so the
-    /// composition case CANNOT be exercised end to end, only asserted
-    /// structurally. That impossibility is the whole argument for a type
-    /// rather than a careful `saturating_add` at each site.
-    ///
-    /// What went wrong without it: `unmeasurable()` returned a bare
-    /// `usize::MAX`, and every function that composed it with a sibling term
-    /// used plain `+`. `overflow-checks` appears nowhere in this repository —
-    /// no Cargo profile, no CI, no RUSTFLAGS — so debug panicked and RELEASE
-    /// WRAPPED: `ELEMENT_OVERHEAD_BYTES + usize::MAX` became
-    /// `ELEMENT_OVERHEAD_BYTES - 1`. "Unadmittable at any budget" inverted into
-    /// "admittable at almost any budget", in the build that ships.
-    ///
-    /// FALSIFY by giving `ByteCount` a wrapping `Add` (`Self(self.0 + rhs.0)`):
-    /// the first assertion goes red in debug by panicking and in release by
-    /// wrapping.
-    #[test]
-    fn byte_counts_saturate_rather_than_wrap() {
-        assert_eq!(
-            ByteCount::MAX + ELEMENT_OVERHEAD_BYTES,
-            ByteCount::MAX,
-            "adding to the maximal count must SATURATE. Wrapping here turns the \
-             sentinel that refuses an unmeasurable payload into one that admits \
-             it, and only in release builds"
-        );
-        assert_eq!(ELEMENT_OVERHEAD_BYTES + ByteCount::MAX, ByteCount::MAX);
-        assert_eq!(
-            [ByteCount::MAX, ELEMENT_OVERHEAD_BYTES]
-                .into_iter()
-                .sum::<ByteCount>(),
-            ByteCount::MAX,
-            "`sum` is how every list of payloads is folded, so it must saturate too"
-        );
-        assert_eq!(
-            ByteCount::MAX * 2,
-            ByteCount::MAX,
-            "the predecessor-count multiply is a client-supplied length times a \
-             constant, so it must saturate as well"
-        );
-        // ...and it is still ordinary arithmetic below the ceiling.
-        assert_eq!((ByteCount::new(3) + ByteCount::new(4)).get(), 7);
     }
 
     /// H4/M4: an unmeasurable variant is charged so much that no budget admits

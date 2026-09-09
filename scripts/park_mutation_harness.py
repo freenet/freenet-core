@@ -16,6 +16,34 @@ contents in memory, writes mutants, and restores from memory in a `finally`
 plus signal handlers, so SIGINT and SIGTERM take the same path as a clean exit.
 It also verifies the restore byte-for-byte and says so, because "I restored it"
 is a claim and this workstream has learned to distrust those.
+
+WHY THE LOCK IS NOT OPTIONAL, and why the usual check does not protect you.
+
+`~/.claude/rules/never-trust-cwd-with-parallel-agents.md` exists because two
+agents sharing a repository silently write into each other's work, and its
+protection is check 3: read the diff before committing, and treat a file you do
+not recognise as the signal. That check cannot fire here. Two harnesses in one
+worktree each restore correctly FROM THEIR OWN SNAPSHOT, so the tree ends
+clean, `git status` is empty, and there is no unfamiliar file to notice. Both
+result sets are still garbage: each row is green or red for reasons unrelated
+to the mutation the harness believes it applied.
+
+So the failure leaves no trace in the files, only in the conclusions — which is
+the one place nobody re-derives. Mutual exclusion is the only protection, which
+is why the lock is acquired in `__init__` rather than offered as an option.
+
+That is not hypothetical and it did not take long to demonstrate. The lock was
+added after I ran a proof-of-restore against the worktree a live campaign was
+using and had to discard the campaign. On its very first run afterwards it
+refused a second acquisition — and the offender was `campaign.py` itself,
+which constructed two `Tree` objects, the second over files the first had
+already mutated. It would have snapshotted mutated content as "pristine" and
+restored the tree to it, then produced a full-length, clean-looking table that
+was wrong throughout. That was the script about to produce the final evidence
+for the pull request.
+
+A GUARD THAT CATCHES SOMETHING ON ITS FIRST RUN IS TELLING YOU THE CLASS IS
+MORE COMMON THAN YOU THOUGHT, not that you got unlucky once.
 """
 import atexit
 import os
@@ -24,7 +52,22 @@ import subprocess
 import sys
 from pathlib import Path
 
-WORKTREE = Path("/home/ian/code/freenet/freenet-core/fix-5554-followup")
+def _worktree() -> Path:
+    """Where to mutate: `$PARK_HARNESS_WORKTREE`, else the repo this file is in.
+
+    Hardcoding one contributor's absolute path made this unrunnable for anyone
+    else and in CI — the same defect as leaving it in a job's scratch directory,
+    one step along: committed so others can fix it, and still not runnable by
+    them.
+    """
+    env = os.environ.get("PARK_HARNESS_WORKTREE")
+    if env:
+        return Path(env).resolve()
+    # scripts/park_mutation_harness.py -> repo root
+    return Path(__file__).resolve().parent.parent
+
+
+WORKTREE = _worktree()
 
 class Tree:
     """Holds pristine contents and guarantees they go back."""

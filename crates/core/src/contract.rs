@@ -2158,8 +2158,30 @@ where
         // Its budget is its OWN, not what the resume batch above has left. A
         // node with a steady stream of resumes would otherwise never sweep, and
         // the backstop exists precisely for the case where something is wedged.
-        // Worst case per iteration is therefore 2 x MAX_RESUME_DRAIN_BATCH
-        // delegate runs, both bounded constants.
+        //
+        // WORST CASE PER ITERATION IS 80 DELEGATE RUNS, NOT 32. An earlier
+        // version of this comment said "2 x MAX_RESUME_DRAIN_BATCH", which
+        // understates it by two and a half times — an over-strong bound claim
+        // in the change whose subject is over-strong bound claims, written a
+        // few hundred lines from the `PARK_WORK_BUDGET` "the guard always wins"
+        // correction, by someone reading the file for exactly this.
+        //
+        // The arithmetic, because a bound worth stating is worth deriving.
+        // BOTH loops test the budget BEFORE consuming a victim's cost — the
+        // batch as `while resume_budget > 0`, the sweep as
+        // `if spent >= budget { break }`. So fifteen one-run victims take a
+        // 16-unit budget down to its last unit, and the sixteenth is STILL
+        // admitted, at up to `1 + MAX_PENDING_PER_DELEGATE +
+        // MAX_PENDING_NOTIFICATION_CONTRACTS` = 25 runs (see
+        // `handle_delegate_resume`). Each loop is therefore
+        // `(MAX_RESUME_DRAIN_BATCH - 1) + 25` = 40, and the two together are 80.
+        //
+        // Still a bound, and still bounded by constants — which is what the
+        // budget is for. It is simply 80 rather than 32, and stating the real
+        // number is the whole point of the exercise this comment sits inside.
+        // `the_sweep_budget_admits_one_maximal_victim_past_the_limit` pins the
+        // boundary, which the original test could not see because its victims
+        // cost exactly one run each.
         sweep_expired_parks(
             &mut contract_handler,
             &mut park_ctx,
@@ -8291,6 +8313,130 @@ mod hol_4391_tests {
         }
     }
 
+    /// THE BOUNDARY the sibling test cannot reach: a maximal-cost victim
+    /// admitted on the budget's LAST unit.
+    ///
+    /// Both budgeted loops test the budget BEFORE a victim's cost is known —
+    /// `while resume_budget > 0` and `if spent >= budget { break }` — so
+    /// `MAX_RESUME_DRAIN_BATCH - 1` one-run victims walk the budget down to its
+    /// final unit and the next victim is STILL admitted, at up to
+    /// `1 + MAX_PENDING_PER_DELEGATE + MAX_PENDING_NOTIFICATION_CONTRACTS` = 25
+    /// runs. The real per-loop bound is therefore `(budget - 1) + 25` = 40, and
+    /// 80 across both loops — not the `2 x MAX_RESUME_DRAIN_BATCH` = 32 the
+    /// loop comment claimed until this test was written.
+    ///
+    /// The sibling test could not see it because every victim there costs
+    /// exactly one run, so the budget is spent in units of one and never
+    /// straddles the limit. This one gives the LAST victim a full pending queue
+    /// and asserts the overshoot both ways: it must exceed the budget (or the
+    /// cost is being checked before it is spent, and the documented bound is
+    /// wrong in the other direction) and it must not exceed the derived
+    /// ceiling.
+    ///
+    /// FALSIFY by moving the budget check after the cost is spent: the first
+    /// assertion then goes red.
+    #[tokio::test]
+    async fn the_sweep_budget_admits_one_maximal_victim_past_the_limit() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park_ctx = delegate_park::DelegateParkCtx::new(tx);
+        let mut buffered = std::collections::VecDeque::new();
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+
+        // EXACTLY MAX_RESUME_DRAIN_BATCH victims, with the LAST one carrying a
+        // queue so its force-resume costs more than a single run.
+        //
+        // The count is the whole fixture. `expired` returns victims in epoch
+        // order and epochs are assigned in park order, so victim N is swept
+        // Nth. With `budget + 1` victims the budget breaks at the 17th and the
+        // costly one is never reached — the first version of this test did
+        // exactly that and reported `spent == 16`, i.e. no overshoot, which
+        // looks like the bound holding. The costly victim has to sit ON the
+        // boundary: fifteen one-run victims take `spent` to 15, and the
+        // sixteenth is admitted because `15 >= 16` is false.
+        let victims = MAX_RESUME_DRAIN_BATCH;
+        let mut keys = Vec::new();
+        for i in 0..victims {
+            let byte = u8::try_from(i).expect("fits");
+            let key = DelegateKey::new(
+                [byte; 32],
+                freenet_stdlib::prelude::CodeHash::new([byte; 32]),
+            );
+            assert!(matches!(
+                park_ctx.park(
+                    key.clone(),
+                    park_continuation(),
+                    delegate_park::ByteCount::default()
+                ),
+                delegate_park::ParkAdmission::Admitted { .. }
+            ));
+            keys.push(key);
+        }
+        let costly = keys.last().expect("a last victim").clone();
+        for i in 0..delegate_park::MAX_PENDING_PER_DELEGATE {
+            let outcome = park_ctx.queue_pending(
+                &costly,
+                delegate_park::PendingRun::Client {
+                    id: handler::EventId { id: i as u64 },
+                    req: DelegateRequest::ApplicationMessages {
+                        key: costly.clone(),
+                        params: Parameters::from(Vec::new()),
+                        inbound: Vec::new(),
+                    },
+                    origin_contract: None,
+                    connection_scope: crate::client_events::ConnectionScope::Local,
+                    user_context: None,
+                },
+            );
+            assert!(
+                matches!(outcome, delegate_park::QueueOutcome::Queued),
+                "the queue behind the costly victim must actually fill, or this \
+                 test measures a one-run victim like every other"
+            );
+        }
+
+        let past_due =
+            tokio::time::Instant::now() + delegate_park::PARK_TTL + Duration::from_secs(1);
+        let spent = sweep_expired_parks(
+            &mut handler,
+            &mut park_ctx,
+            &prompter,
+            &mut rx,
+            &mut buffered,
+            past_due,
+            MAX_RESUME_DRAIN_BATCH,
+        )
+        .await;
+
+        // THE POINT: the budget is tested BEFORE a victim's cost is known, so
+        // the last admitted victim can carry the whole queue past the limit.
+        // The bound is real but it is `(budget - 1) + max_victim_cost`, not
+        // `budget` — and the comment in `contract_handling` said the latter
+        // until this test was written.
+        assert!(
+            spent > MAX_RESUME_DRAIN_BATCH,
+            "a maximal victim admitted on the budget's last unit must be able to \
+             overshoot it — if this holds at exactly the budget, the loop is \
+             checking the cost BEFORE spending it and the documented bound is \
+             wrong in the other direction. Spent {spent}"
+        );
+        let ceiling = (MAX_RESUME_DRAIN_BATCH - 1)
+            + 1
+            + delegate_park::MAX_PENDING_PER_DELEGATE
+            + delegate_park::MAX_PENDING_NOTIFICATION_CONTRACTS;
+        assert!(
+            spent <= ceiling,
+            "...but it must not exceed `(budget - 1) + 1 + \
+             MAX_PENDING_PER_DELEGATE + MAX_PENDING_NOTIFICATION_CONTRACTS` = \
+             {ceiling}, which is the real per-loop bound the loop comment now \
+             states. Spent {spent}"
+        );
+    }
+
+    /// The ORIGINAL sweep-budget test, which cannot see the boundary above:
+    /// its victims cost exactly one run each, so the budget is consumed in
+    /// units of one and never straddles the limit.
     /// M2: the TTL backstop must not perform an unbounded number of delegate
     /// runs in a single pass.
     ///
@@ -8311,6 +8457,12 @@ mod hol_4391_tests {
     /// The third and fourth assertions are what stop that from being fixable by
     /// simply sweeping FEWER parks — the deferred victims must still be swept,
     /// and `expired` recomputing every pass is what makes deferring free.
+    ///
+    /// LIMIT, and it is why the boundary test below exists: every victim here
+    /// costs exactly ONE run, so the budget is consumed in units of one and
+    /// never straddles its limit. That is what let the loop comment claim a
+    /// per-iteration bound of `2 x MAX_RESUME_DRAIN_BATCH` for as long as it
+    /// did — the case that disproves it cannot arise in this fixture.
     #[tokio::test]
     async fn the_ttl_sweep_is_bounded_and_leaves_the_rest_for_the_next_pass() {
         let _guard = TEST_GUARD.lock().await;
