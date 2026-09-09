@@ -189,6 +189,55 @@ pub(crate) fn load_persisted<S: DelegateSubscriptionPersistence + ?Sized>(
     db.load_delegate_subscriptions()
 }
 
+/// Put a subscription back in the in-memory registry from a durable row that
+/// has just been read, WITHOUT re-affirming that row.
+///
+/// The counterpart to [`register`], and the difference is the reason it exists.
+/// `register` writes the durable row and stamps it as affirmed now; that is
+/// right for a delegate calling subscribe and wrong for the node replaying its
+/// own disk at boot. A stamp that boot restore refreshed would be re-affirmed
+/// by restarts alone, so the row could never age out and the cleanup exemption
+/// would be permanently refreshable, which `AGENTS.md` forbids.
+///
+/// Returns whether the subscription is registered after this call. `false` only
+/// when the durable row has gone since it was read, which is not reachable at
+/// boot; the caller warns rather than registering demand for a subscription the
+/// store no longer holds (the same ordering rule `register` enforces at the
+/// cap: no pin without a subscription record).
+pub(crate) fn restore_registration<S: DelegateSubscriptionPersistence + ?Sized>(
+    db: Option<&S>,
+    contract: &ContractInstanceId,
+    delegate: &DelegateKey,
+) -> bool {
+    let recorded = match db {
+        Some(db) => db.delegate_subscription_is_recorded(contract, delegate),
+        // No store means no durable row to contradict; the in-memory registry
+        // is the whole record for this run.
+        None => true,
+    };
+    if !recorded {
+        return false;
+    }
+    REGISTRY
+        .entry(*contract)
+        .or_default()
+        .insert(delegate.clone());
+    true
+}
+
+/// Drop durable rows no genuine subscribe has affirmed within the backend's
+/// idle horizon, returning `(expired, restamped)`.
+///
+/// Call at boot BEFORE [`load_persisted`], so an expired row is gone before
+/// restore can put its notification hook and its pin back. It touches only the
+/// durable set: at boot the in-memory registry is empty, so there is no second
+/// representation to keep in step.
+pub(crate) fn expire_stale<S: DelegateSubscriptionPersistence + ?Sized>(
+    db: &S,
+) -> (usize, usize) {
+    db.expire_stale_delegate_subscriptions()
+}
+
 // ---------------------------------------------------------------------------
 // Durable half.
 // ---------------------------------------------------------------------------
@@ -236,6 +285,28 @@ pub trait DelegateSubscriptionPersistence: Send + Sync {
         &self,
     ) -> Result<Vec<(ContractInstanceId, DelegateKey)>, String> {
         Ok(Vec::new())
+    }
+
+    /// Whether `(contract, delegate)` is recorded, WITHOUT affirming it.
+    ///
+    /// Boot restore uses this instead of [`Self::persist_delegate_subscription`]
+    /// so replaying the durable set does not refresh the rows' last-affirmed
+    /// stamps. See [`restore_registration`].
+    fn delegate_subscription_is_recorded(
+        &self,
+        _contract: &ContractInstanceId,
+        _delegate: &DelegateKey,
+    ) -> bool {
+        true
+    }
+
+    /// Drop rows not affirmed within the backend's idle horizon, returning
+    /// `(expired, restamped)`. Boot only; see [`expire_stale`].
+    ///
+    /// The default is `(0, 0)` because only the redb backend persists anything
+    /// at all, so for every other backend there is nothing that could go stale.
+    fn expire_stale_delegate_subscriptions(&self) -> (usize, usize) {
+        (0, 0)
     }
 }
 

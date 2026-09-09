@@ -289,7 +289,30 @@ pub(crate) const RESERVED_MARKER_HASHES_TABLE: TableDefinition<&[u8], &[u8]> =
 /// only full scan is the one at boot.
 ///
 /// Key: ContractInstanceId (32 bytes) || DelegateKey (64 bytes) = 96 bytes
-/// Value: single presence byte
+/// Value: last-affirmed stamp, 8 bytes big-endian milliseconds since the UNIX
+/// epoch.
+///
+/// The stamp exists so the row can be AGED OUT. Without it a row whose contract
+/// still exists but is no longer hosted is kept forever: it is deliberately not
+/// dropped by boot reconciliation (the delegate still wants notifications, and
+/// the pin returns if the node re-hosts the contract), and nothing else would
+/// ever look at it again. `AGENTS.md` requires a cleanup exemption to be
+/// time-bounded, and a row that can silently re-pin a contract at some
+/// arbitrary future boot is one.
+///
+/// Only a GENUINE delegate subscribe refreshes the stamp. Boot restore
+/// explicitly does not, which is the whole point: a stamp that restore
+/// refreshed would be re-affirmed by the node's own restarts, making the
+/// exemption permanently refreshable, which is the trap
+/// `.claude/rules/code-style.md` names and `AGENTS.md` forbids. What the stamp
+/// therefore measures is "when was this app last used", because a delegate only
+/// runs when something invokes it.
+///
+/// A value shorter than 8 bytes is read as UNSTAMPED and restamped at the next
+/// expiry pass rather than treated as infinitely old, so no row is ever deleted
+/// merely for predating the stamp. Nothing in the field carries such a row
+/// today (the table is introduced unreleased, by #4669 part 2); the branch is
+/// there so a future value-encoding change fails safe rather than destructive.
 pub(crate) const DELEGATE_SUBSCRIPTIONS_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("delegate_contract_subscriptions");
 
@@ -2024,6 +2047,62 @@ impl ReDb {
     /// enforce by refusing to register demand when this returns `false`.
     pub(crate) const MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT: usize = 256;
 
+    /// How long a durable delegate-subscription row survives without a GENUINE
+    /// re-subscribe before the boot expiry pass drops it.
+    ///
+    /// # THE VALUE IS AN OPEN DECISION, THE MECHANISM IS NOT
+    ///
+    /// The mechanism is required: `AGENTS.md` forbids an unbounded cleanup
+    /// exemption, and a row that is deliberately kept while its contract is
+    /// unhosted (see [`restore_persisted_subscriptions`]) can otherwise re-pin
+    /// that contract at an arbitrary future boot with nothing that would ever
+    /// remove it. The NUMBER is not derivable here and is set generously on
+    /// purpose. It is #5467 open question 1 ("how long should a dormant app
+    /// keep its user's contracts alive") narrowed to unhosted rows, and it is
+    /// one line to change.
+    ///
+    /// Why there is no anchor to derive it from: the in-repo precedent for this
+    /// shape, `PHANTOM_ABSOLUTE_MAX_AGE`, is a multiple of
+    /// `SUBSCRIPTION_LEASE_DURATION`, so several renewal cycles must fail
+    /// first. Nothing equivalent exists here, because the thing that
+    /// re-affirms a row is THE APP BEING USED, which the node does not bound.
+    /// River re-subscribes per session, so in practice this is "the user has
+    /// not opened the app in 180 days".
+    ///
+    /// What expiry costs when it is wrong: the user's own node stops pinning
+    /// the user's own contract. It does not delete the contract, and the next
+    /// time the app runs its delegate re-subscribes and re-pins. That is why a
+    /// generous value is the safe direction to be wrong in, and why the
+    /// mechanism is worth having at a value nobody has ratified yet.
+    pub(crate) const DELEGATE_SUBSCRIPTION_MAX_IDLE_MS: u64 = 180 * 24 * 60 * 60 * 1000;
+
+    /// Only rewrite a row's stamp when the stored one is older than this.
+    ///
+    /// The stamp exists to age rows out over months, so resolving it to the
+    /// hour loses nothing. What that buys is the perf property
+    /// `add_delegate_subscription` is documented to hold: a delegate
+    /// re-subscribing on a timer must not take redb's single writer lock per
+    /// call. Without the granularity every repeat subscribe would become a
+    /// write, which is exactly what the read-transaction fast path exists to
+    /// avoid.
+    pub(crate) const DELEGATE_SUBSCRIPTION_STAMP_GRANULARITY_MS: u64 = 60 * 60 * 1000;
+
+    /// Milliseconds since the UNIX epoch, saturating at 0 before it.
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Decode a delegate-subscription row value. `None` means UNSTAMPED (any
+    /// length but 8), which is restamped rather than treated as expired, so a
+    /// value-encoding change can never delete a row. See
+    /// [`DELEGATE_SUBSCRIPTIONS_TABLE`].
+    fn decode_delegate_subscription_stamp(value: &[u8]) -> Option<u64> {
+        <[u8; 8]>::try_from(value).ok().map(u64::from_be_bytes)
+    }
+
     /// 96-byte row key `contract_instance_id(32) || delegate_key64(64)`.
     fn delegate_subscription_row_key(
         contract: &ContractInstanceId,
@@ -2084,18 +2163,42 @@ impl ReDb {
         contract: &ContractInstanceId,
         delegate: &DelegateKey,
     ) -> Result<bool, redb::Error> {
+        self.add_delegate_subscription_at(contract, delegate, Self::now_ms())
+    }
+
+    /// [`Self::add_delegate_subscription`] with the clock supplied, so a test
+    /// can place a row at a chosen age instead of waiting for one.
+    pub(crate) fn add_delegate_subscription_at(
+        &self,
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+        now_ms: u64,
+    ) -> Result<bool, redb::Error> {
         let row_key = Self::delegate_subscription_row_key(contract, delegate);
         let (lo, hi) = Self::delegate_subscription_range(contract);
+        let stamp = now_ms.to_be_bytes();
 
-        // Cheap path: already recorded. A missing table is the same answer as
-        // an absent row, and costs no write either.
-        let already_present =
+        // Cheap path: already recorded, and affirmed recently enough that
+        // rewriting the stamp would buy nothing. A missing table is the same
+        // answer as an absent row, and costs no write either.
+        //
+        // An UNSTAMPED row does not take this path: it falls through to the
+        // write so the stamp is established. That is bounded at one write per
+        // row, because the row is stamped from then on.
+        let fresh_enough =
             self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
-                Ok(tbl) => Ok(tbl.get(row_key.as_slice())?.is_some()),
+                Ok(tbl) => Ok(match tbl.get(row_key.as_slice())? {
+                    Some(v) => Self::decode_delegate_subscription_stamp(v.value())
+                        .is_some_and(|affirmed| {
+                            now_ms.saturating_sub(affirmed)
+                                < Self::DELEGATE_SUBSCRIPTION_STAMP_GRANULARITY_MS
+                        }),
+                    None => false,
+                }),
                 Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
                 Err(e) => Err(e.into()),
             })?;
-        if already_present {
+        if fresh_enough {
             return Ok(true);
         }
 
@@ -2103,12 +2206,19 @@ impl ReDb {
         let admitted;
         {
             let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
-            if tbl.get(row_key.as_slice())?.is_some() {
+            // Bind the presence answer so the read guard is released before the
+            // insert below borrows the table mutably.
+            let present = tbl.get(row_key.as_slice())?.is_some();
+            if present {
+                // Re-affirm in place. NO cap check: this row is already one of
+                // the rows the cap counts, so re-checking it could refuse a
+                // delegate that is merely renewing something it already holds.
+                tbl.insert(row_key.as_slice(), stamp.as_slice())?;
                 admitted = true;
             } else {
                 let count = tbl.range(lo.as_slice()..=hi.as_slice())?.count();
                 if count < Self::MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT {
-                    tbl.insert(row_key.as_slice(), [1u8].as_slice())?;
+                    tbl.insert(row_key.as_slice(), stamp.as_slice())?;
                     admitted = true;
                 } else {
                     tracing::warn!(
@@ -2124,6 +2234,96 @@ impl ReDb {
         }
         Self::commit_guarded(txn)?;
         Ok(admitted)
+    }
+
+    /// Whether `(contract, delegate)` has a durable row, WITHOUT affirming it.
+    ///
+    /// This is the boot-restore path, and the difference from
+    /// [`Self::add_delegate_subscription`] is the entire point. Restore replays
+    /// rows that are already on disk; if it went through the writer it would
+    /// refresh their stamps, and a stamp refreshed by the node's own restarts
+    /// is a permanently-refreshable exemption, which is the trap
+    /// `.claude/rules/code-style.md` names and `AGENTS.md` forbids. A node
+    /// restarting nightly would then hold every row it ever accepted forever,
+    /// which is the state the stamp exists to end.
+    ///
+    /// # Errors
+    /// Returns `Err` if the redb read transaction, table open or lookup fails.
+    pub fn delegate_subscription_is_recorded(
+        &self,
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+    ) -> Result<bool, redb::Error> {
+        let row_key = Self::delegate_subscription_row_key(contract, delegate);
+        self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
+            Ok(tbl) => Ok(tbl.get(row_key.as_slice())?.is_some()),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+            Err(e) => Err(e.into()),
+        })
+    }
+
+    /// Drop delegate-subscription rows not affirmed within `max_idle_ms`, and
+    /// stamp any unstamped row so a later pass can age it.
+    ///
+    /// **Boot only, before the event loop starts.** The scan and the write are
+    /// separate transactions, so a subscribe landing between them could have
+    /// its just-written row deleted. At boot there is no such writer: nothing
+    /// can invoke a delegate until the loop is running. Calling this from a
+    /// periodic sweep would need the two folded into one write transaction.
+    ///
+    /// Returns `(expired, restamped)`.
+    ///
+    /// # Errors
+    /// Returns `Err` if any redb transaction, table open, scan, write or commit
+    /// fails. The caller must not treat `Err` as "nothing to expire" in a way
+    /// that also drops rows: a failed expiry is a no-op, not an empty set.
+    pub(crate) fn expire_stale_delegate_subscriptions_at(
+        &self,
+        now_ms: u64,
+        max_idle_ms: u64,
+    ) -> Result<(usize, usize), redb::Error> {
+        let (expired, unstamped) =
+            self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
+                Ok(tbl) => {
+                    let mut expired: Vec<Vec<u8>> = Vec::new();
+                    let mut unstamped: Vec<Vec<u8>> = Vec::new();
+                    for entry in tbl.iter()? {
+                        let (k, v) = entry?;
+                        match Self::decode_delegate_subscription_stamp(v.value()) {
+                            Some(affirmed) => {
+                                if now_ms.saturating_sub(affirmed) >= max_idle_ms {
+                                    expired.push(k.value().to_vec());
+                                }
+                            }
+                            None => unstamped.push(k.value().to_vec()),
+                        }
+                    }
+                    Ok((expired, unstamped))
+                }
+                // Never recorded a subscription, so never created the table.
+                Err(redb::TableError::TableDoesNotExist(_)) => Ok((Vec::new(), Vec::new())),
+                Err(e) => Err(e.into()),
+            })?;
+
+        // Do not open a write transaction, and so do not CREATE the table, on
+        // the overwhelmingly common boot where there is nothing to do.
+        if expired.is_empty() && unstamped.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let stamp = now_ms.to_be_bytes();
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            for key in &expired {
+                tbl.remove(key.as_slice())?;
+            }
+            for key in &unstamped {
+                tbl.insert(key.as_slice(), stamp.as_slice())?;
+            }
+        }
+        Self::commit_guarded(txn)?;
+        Ok((expired.len(), unstamped.len()))
     }
 
     /// Forget that `delegate` is subscribed to `contract`. Idempotent.
@@ -2351,6 +2551,51 @@ impl crate::wasm_runtime::delegate_subscriptions::DelegateSubscriptionPersistenc
     ) -> Result<Vec<(ContractInstanceId, DelegateKey)>, String> {
         self.load_all_delegate_subscriptions()
             .map_err(|e| e.to_string())
+    }
+
+    fn delegate_subscription_is_recorded(
+        &self,
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+    ) -> bool {
+        match self.delegate_subscription_is_recorded(contract, delegate) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                // Answer "recorded" on a read failure. The row was on disk when
+                // boot restore read it moments ago, and refusing here would
+                // drop the delegate's notification hook for the whole run over
+                // a transient error, which is the failure #4669 part 2 exists
+                // to prevent.
+                tracing::warn!(
+                    %error,
+                    %contract,
+                    delegate = %delegate,
+                    "could not confirm a persisted delegate subscription on restore; \
+                     restoring it anyway rather than dropping the delegate's hook"
+                );
+                true
+            }
+        }
+    }
+
+    fn expire_stale_delegate_subscriptions(&self) -> (usize, usize) {
+        match self.expire_stale_delegate_subscriptions_at(
+            Self::now_ms(),
+            Self::DELEGATE_SUBSCRIPTION_MAX_IDLE_MS,
+        ) {
+            Ok(counts) => counts,
+            Err(error) => {
+                // A failed expiry pass is a no-op, deliberately. The rows stay,
+                // the next boot tries again, and nothing is dropped on the
+                // strength of a read that did not complete.
+                tracing::warn!(
+                    %error,
+                    "could not expire stale delegate subscriptions; the durable set is \
+                     unchanged and the next boot will retry"
+                );
+                (0, 0)
+            }
+        }
     }
 }
 
@@ -3284,12 +3529,14 @@ mod tests {
     #[test]
     fn a_repeat_delegate_subscription_returns_before_opening_a_write_transaction() {
         const SOURCE: &str = include_str!("redb.rs");
+        // The clock-injected inner function is where the work is;
+        // `add_delegate_subscription` is a one-line wrapper over it.
         let start = SOURCE
-            .find("pub fn add_delegate_subscription(")
-            .expect("add_delegate_subscription must still exist");
+            .find("pub(crate) fn add_delegate_subscription_at(")
+            .expect("add_delegate_subscription_at must still exist");
         let rel_end = SOURCE[start..]
             .find("\n    }\n")
-            .expect("add_delegate_subscription must still be a closed fn body");
+            .expect("add_delegate_subscription_at must still be a closed fn body");
         let body = &SOURCE[start..start + rel_end];
 
         // Window guard, separate from the assertion that uses it: a window
@@ -3358,6 +3605,215 @@ mod tests {
     /// and `load_all_user_secrets_index`. Pins that the composite
     /// `(DelegateKey, UserId)` key round-trips and that two users under the
     /// same delegate are independent.
+    // ---- delegate-subscription idle expiry (#4669 part 2) -----------------
+    //
+    // The row that makes this necessary is the KEPT-BUT-UNHOSTED one: boot
+    // reconciliation deliberately keeps a row whose contract exists but is no
+    // longer hosted, and before these tests nothing ever aged it out. See
+    // `DELEGATE_SUBSCRIPTIONS_TABLE`.
+
+    fn expiry_test_delegate(seed: u8) -> DelegateKey {
+        DelegateKey::new([seed; 32], CodeHash::from_code(&[seed]))
+    }
+
+    /// Read a row's stored stamp, or `None` if the row is absent. Goes to the
+    /// table directly: the assertion is about the VALUE, and no accessor
+    /// exposes it.
+    fn stored_stamp(store: &ReDb, contract: &ContractInstanceId, delegate: &DelegateKey) -> Option<u64> {
+        let row_key = ReDb::delegate_subscription_row_key(contract, delegate);
+        store
+            .read_guarded(|txn| {
+                let tbl = match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
+                    Ok(tbl) => tbl,
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                    Err(e) => return Err(e.into()),
+                };
+                Ok(tbl
+                    .get(row_key.as_slice())?
+                    .and_then(|v| ReDb::decode_delegate_subscription_stamp(v.value())))
+            })
+            .expect("read stamp")
+    }
+
+    /// A row no genuine subscribe has affirmed within the horizon is dropped;
+    /// one inside the horizon is not.
+    ///
+    /// The negative half is not decoration. An expiry pass that dropped
+    /// everything would satisfy the positive assertion on its own, and the
+    /// failure it would cause in the field (every delegate loses its pin at the
+    /// next boot) is worse than the leak this closes.
+    #[tokio::test]
+    async fn a_delegate_subscription_expires_once_nothing_affirms_it() {
+        let dir = TempDir::new().unwrap();
+        let store = ReDb::new(dir.path()).await.unwrap();
+
+        let contract = ContractInstanceId::new([3; 32]);
+        let stale = expiry_test_delegate(1);
+        let recent = expiry_test_delegate(2);
+
+        let horizon = ReDb::DELEGATE_SUBSCRIPTION_MAX_IDLE_MS;
+        let now = 10 * horizon;
+
+        // One row affirmed exactly at the horizon, one a millisecond inside it.
+        assert!(store
+            .add_delegate_subscription_at(&contract, &stale, now - horizon)
+            .unwrap());
+        assert!(store
+            .add_delegate_subscription_at(&contract, &recent, now - horizon + 1)
+            .unwrap());
+
+        let (expired, restamped) = store
+            .expire_stale_delegate_subscriptions_at(now, horizon)
+            .unwrap();
+        assert_eq!(expired, 1, "exactly the row at the horizon must go");
+        assert_eq!(restamped, 0, "both rows were stamped, so none needs one");
+
+        let survivors: Vec<DelegateKey> = store
+            .load_all_delegate_subscriptions()
+            .unwrap()
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(
+            survivors,
+            vec![recent],
+            "the row inside the horizon must survive — an expiry pass that drops \
+             everything would satisfy the count assertion above and take every \
+             delegate's pin with it at the next boot"
+        );
+    }
+
+    /// An unstamped row is STAMPED, never deleted.
+    ///
+    /// Nothing in the field carries one today (this table is unreleased), so
+    /// this pins the direction of the fail-safe rather than a migration that
+    /// has to happen: a future value-encoding change must not be able to delete
+    /// every delegate subscription on the node by making the old values
+    /// unreadable.
+    #[tokio::test]
+    async fn an_unstamped_delegate_subscription_row_is_stamped_not_dropped() {
+        let dir = TempDir::new().unwrap();
+        let store = ReDb::new(dir.path()).await.unwrap();
+
+        let contract = ContractInstanceId::new([4; 32]);
+        let delegate = expiry_test_delegate(9);
+        let row_key = ReDb::delegate_subscription_row_key(&contract, &delegate);
+
+        // A row in the pre-stamp encoding: a single presence byte.
+        let txn = store.begin_write().unwrap();
+        {
+            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE).unwrap();
+            tbl.insert(row_key.as_slice(), [1u8].as_slice()).unwrap();
+        }
+        ReDb::commit_guarded(txn).unwrap();
+        assert_eq!(
+            stored_stamp(&store, &contract, &delegate),
+            None,
+            "precondition: the row must be UNSTAMPED, or this test is asserting \
+             about an ordinary row"
+        );
+
+        let now = 12_345_678_000;
+        let (expired, restamped) = store
+            .expire_stale_delegate_subscriptions_at(now, ReDb::DELEGATE_SUBSCRIPTION_MAX_IDLE_MS)
+            .unwrap();
+        assert_eq!(
+            expired, 0,
+            "an unreadable value must never be read as infinitely old"
+        );
+        assert_eq!(restamped, 1);
+        assert_eq!(
+            stored_stamp(&store, &contract, &delegate),
+            Some(now),
+            "the row must now carry a stamp, so the NEXT pass can age it"
+        );
+    }
+
+    /// A genuine subscribe past the granularity re-affirms the row, which is
+    /// the only thing that keeps it alive.
+    #[tokio::test]
+    async fn a_genuine_subscribe_reaffirms_the_row() {
+        let dir = TempDir::new().unwrap();
+        let store = ReDb::new(dir.path()).await.unwrap();
+
+        let contract = ContractInstanceId::new([5; 32]);
+        let delegate = expiry_test_delegate(3);
+        let granularity = ReDb::DELEGATE_SUBSCRIPTION_STAMP_GRANULARITY_MS;
+        let first = 1_000_000_000;
+
+        assert!(store
+            .add_delegate_subscription_at(&contract, &delegate, first)
+            .unwrap());
+        assert_eq!(stored_stamp(&store, &contract, &delegate), Some(first));
+
+        // Inside the granularity: answered from the read transaction, so the
+        // stamp does NOT move. This is the perf property
+        // `a_repeat_delegate_subscription_returns_before_opening_a_write_transaction`
+        // pins in the source, asserted here as behaviour.
+        assert!(store
+            .add_delegate_subscription_at(&contract, &delegate, first + granularity - 1)
+            .unwrap());
+        assert_eq!(
+            stored_stamp(&store, &contract, &delegate),
+            Some(first),
+            "a repeat inside the granularity must not write"
+        );
+
+        // Past it: the row is re-affirmed.
+        let later = first + granularity;
+        assert!(store
+            .add_delegate_subscription_at(&contract, &delegate, later)
+            .unwrap());
+        assert_eq!(
+            stored_stamp(&store, &contract, &delegate),
+            Some(later),
+            "a subscribe past the granularity must re-affirm the row, or nothing \
+             a live delegate does can keep it from expiring"
+        );
+    }
+
+    /// Re-affirming a row must not be refused when the contract is at the cap.
+    ///
+    /// The re-affirm path skips the cap check on purpose: the row it is
+    /// rewriting is already one of the rows the cap counts, so counting it
+    /// again would refuse a delegate for renewing something it already holds,
+    /// and the row would then expire under it.
+    #[tokio::test]
+    async fn reaffirming_an_existing_row_is_not_refused_at_the_cap() {
+        let dir = TempDir::new().unwrap();
+        let store = ReDb::new(dir.path()).await.unwrap();
+
+        let contract = ContractInstanceId::new([6; 32]);
+        let cap = ReDb::MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT;
+        let nth = |n: u16| {
+            let b = n.to_le_bytes();
+            DelegateKey::new([b[0]; 32], CodeHash::from_code(&[b[0], b[1]]))
+        };
+
+        let first = 1_000_000_000;
+        for n in 0..cap {
+            assert!(store
+                .add_delegate_subscription_at(&contract, &nth(n as u16), first)
+                .unwrap());
+        }
+
+        let later = first + ReDb::DELEGATE_SUBSCRIPTION_STAMP_GRANULARITY_MS;
+        assert!(
+            store
+                .add_delegate_subscription_at(&contract, &nth(0), later)
+                .unwrap(),
+            "an incumbent must be able to re-affirm at the cap"
+        );
+        assert_eq!(stored_stamp(&store, &contract, &nth(0)), Some(later));
+        assert!(
+            !store
+                .add_delegate_subscription_at(&contract, &nth(cap as u16), later)
+                .unwrap(),
+            "a NEW row at the cap must still be refused, or the re-affirm path \
+             has removed the bound"
+        );
+    }
+
     #[tokio::test]
     async fn user_secrets_index_store_get_remove_load_round_trip() {
         let temp_dir = TempDir::new().unwrap();

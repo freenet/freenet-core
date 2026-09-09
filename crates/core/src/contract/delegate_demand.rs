@@ -1146,6 +1146,13 @@ pub(crate) struct RestoreOutcome {
     pub(crate) dropped_delegate_gone: usize,
     /// Rows dropped because the contract is no longer in the contract store.
     pub(crate) dropped_contract_gone: usize,
+    /// Rows dropped by the expiry pass because no genuine subscribe affirmed
+    /// them within `DELEGATE_SUBSCRIPTION_MAX_IDLE_MS`. Counted before the
+    /// restore loop, so these never appear in `restored` or `pinned`.
+    pub(crate) expired_stale: usize,
+    /// Rows the expiry pass stamped because they carried no stamp. One write
+    /// per row, ever.
+    pub(crate) restamped: usize,
 }
 
 /// Put persisted delegate subscriptions back, dropping the stale ones
@@ -1179,6 +1186,22 @@ pub(crate) struct RestoreOutcome {
 /// the contract again. It is the same no-pin outcome a fresh subscribe gets in
 /// that state, counted by the same `not_hosted` counter.
 ///
+/// # Expiry
+///
+/// That kept-but-unhosted row is why this function opens with an expiry pass.
+/// Keeping it is right, but keeping it FOREVER is a cleanup exemption with no
+/// time bound, which `AGENTS.md` forbids: nothing else would ever look at the
+/// row again, and it can silently re-pin its contract at an arbitrary future
+/// boot. So a row no genuine subscribe has affirmed within
+/// `DELEGATE_SUBSCRIPTION_MAX_IDLE_MS` is dropped here, before the restore loop
+/// can put its hook and its pin back.
+///
+/// The restore loop itself goes through
+/// [`restore_registration`](crate::wasm_runtime::delegate_subscriptions::restore_registration)
+/// rather than `register` for the same reason: `register` would stamp every row
+/// it replayed as affirmed now, so the exemption would be refreshed by the
+/// node's own restarts and could never expire.
+///
 /// # On a read failure
 ///
 /// Returns without touching anything. A read failure must NOT be read as "no
@@ -1194,6 +1217,11 @@ pub(crate) fn restore_persisted_subscriptions<S>(
 where
     S: crate::wasm_runtime::delegate_subscriptions::DelegateSubscriptionPersistence + ?Sized,
 {
+    // Expire first, so a row past the idle horizon is gone before the loop
+    // below could put its notification hook and its pin back. See the Expiry
+    // section above for why the kept-but-unhosted row needs this at all.
+    let (expired_stale, restamped) = crate::wasm_runtime::delegate_subscriptions::expire_stale(db);
+
     let persisted = match crate::wasm_runtime::delegate_subscriptions::load_persisted(db) {
         Ok(rows) => rows,
         Err(error) => {
@@ -1204,11 +1232,19 @@ where
                  relying on some other route to keep its contracts hosted, which \
                  is the failure #4669 part 2 exists to close."
             );
-            return RestoreOutcome::default();
+            return RestoreOutcome {
+                expired_stale,
+                restamped,
+                ..RestoreOutcome::default()
+            };
         }
     };
     if persisted.is_empty() {
-        return RestoreOutcome::default();
+        return RestoreOutcome {
+            expired_stale,
+            restamped,
+            ..RestoreOutcome::default()
+        };
     }
 
     // Per-reason refusal counters, sampled around the loop.
@@ -1232,7 +1268,11 @@ where
     // the log then simply omits the breakdown rather than the whole line.
     let refusals_before = crate::node::network_status::delegate_pin_refusal_counts();
 
-    let mut outcome = RestoreOutcome::default();
+    let mut outcome = RestoreOutcome {
+        expired_stale,
+        restamped,
+        ..RestoreOutcome::default()
+    };
     for (instance_id, delegate) in persisted {
         if !delegate_is_registered(&delegate) {
             crate::wasm_runtime::delegate_subscriptions::forget_one(
@@ -1253,26 +1293,35 @@ where
             continue;
         };
 
-        // Re-registering through the one writer is deliberate even though the
-        // durable row already exists: it is idempotent there, and it is what
-        // keeps the in-memory registry from being seeded by a second path that
-        // could drift from the first.
+        // Seeding the in-memory registry through the same module that owns the
+        // durable copy is deliberate: it keeps the registry from being written
+        // by a second path that could drift from the first.
+        //
+        // But NOT through `register`, which is the live-subscribe writer and
+        // stamps the row as affirmed now. Replaying the durable set is not a
+        // delegate affirming anything, and a stamp the node's own restarts
+        // refreshed could never age out — the permanently-refreshable exemption
+        // `AGENTS.md` forbids. `restore_registration` reads presence and writes
+        // nothing to disk.
         //
         // The return value is honoured here for the same reason it is at the two
         // live subscribe paths: a pin must never exist without the subscription
         // record that a teardown walks to find it. This should not be reachable
-        // at boot — the row we are restoring is itself one of the rows the cap
-        // counts, so it re-admits — but "should not be reachable" is not a
-        // reason to register demand for a subscription the writer just refused.
-        if !crate::wasm_runtime::delegate_subscriptions::register(Some(db), &instance_id, &delegate)
-        {
+        // at boot — the row was on disk a moment ago, in this same function —
+        // but "should not be reachable" is not a reason to register demand for a
+        // subscription the store says it does not hold.
+        if !crate::wasm_runtime::delegate_subscriptions::restore_registration(
+            Some(db),
+            &instance_id,
+            &delegate,
+        ) {
             tracing::warn!(
                 %instance_id,
                 delegate = %delegate,
-                "a persisted delegate subscription was refused on restore; not \
-                 registering its pin. This should be unreachable — the row is \
-                 one the per-contract cap counts — so treat it as a sign the \
-                 durable set and the cap disagree."
+                "a persisted delegate subscription was not confirmed on restore; not \
+                 registering its pin. This should be unreachable — the row was read \
+                 from disk moments earlier — so treat it as a sign the durable set \
+                 changed underneath boot restore."
             );
             continue;
         }
@@ -1333,6 +1382,8 @@ where
         pinned = outcome.pinned,
         dropped_delegate_gone = outcome.dropped_delegate_gone,
         dropped_contract_gone = outcome.dropped_contract_gone,
+        expired_stale = outcome.expired_stale,
+        restamped = outcome.restamped,
         "restored persisted delegate subscriptions (#4669 part 2)"
     );
     outcome
@@ -1803,6 +1854,8 @@ mod tests {
                 pinned: 1,
                 dropped_delegate_gone: 0,
                 dropped_contract_gone: 0,
+                expired_stale: 0,
+                restamped: 0,
             }
         );
         assert!(
@@ -1927,6 +1980,8 @@ mod tests {
                 pinned: 0,
                 dropped_delegate_gone: 1,
                 dropped_contract_gone: 0,
+                expired_stale: 0,
+                restamped: 0,
             }
         );
         assert!(!op_manager.ring.contract_in_use(&key));
@@ -1981,6 +2036,8 @@ mod tests {
                 pinned: 0,
                 dropped_delegate_gone: 0,
                 dropped_contract_gone: 1,
+                expired_stale: 0,
+                restamped: 0,
             }
         );
         assert!(
@@ -2035,6 +2092,8 @@ mod tests {
                 pinned: 0,
                 dropped_delegate_gone: 0,
                 dropped_contract_gone: 0,
+                expired_stale: 0,
+                restamped: 0,
             }
         );
         assert!(!op_manager.ring.contract_in_use(&key));
