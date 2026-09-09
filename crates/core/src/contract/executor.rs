@@ -1062,6 +1062,35 @@ pub(crate) trait ContractExecutor: Send + 'static {
         }
     }
 
+    /// The durable half of the delegate wakeup schedule (freenet-core#3972), or
+    /// `None` on an executor with no state store.
+    ///
+    /// The serial `contract_handling` loop needs this to release a lease's row
+    /// when the lease fires, and it reaches its executor generically — hence a
+    /// trait object rather than a concrete backend.
+    ///
+    /// The default `None` is the honest answer for mock and local-only
+    /// executors: they degrade to the in-memory schedule, so a wakeup survives
+    /// the process and not a restart. Only the production `RuntimePool`
+    /// overrides it.
+    fn delegate_wakeup_store(
+        &self,
+    ) -> Option<&dyn crate::wasm_runtime::delegate_wakeups::DelegateWakeupPersistence> {
+        None
+    }
+
+    /// The parameters `key` was registered with, or `None` when this executor
+    /// keeps no delegate registry.
+    ///
+    /// A node-internal invocation has no client to supply params, and
+    /// `DelegateKey` identity covers `BLAKE3(code_hash ‖ params)` — so passing
+    /// empty params runs a parameterized delegate under a configuration it
+    /// never had. It does not fail; it misbehaves quietly, which is why the
+    /// wakeup path (freenet-core#3972) resolves them rather than defaulting.
+    fn registered_delegate_params(&self, _key: &DelegateKey) -> Option<Parameters<'static>> {
+        None
+    }
+
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;
 
     /// Remove all subscriptions for a disconnected client.

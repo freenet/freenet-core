@@ -193,6 +193,102 @@ pub mod delegate_mgmt_error_codes {
     pub const ERR_STORE_FAILED: i32 = -24;
 }
 
+/// Host codes returned by `__frnt__delegate__schedule_wakeup`
+/// (freenet-core#3972).
+///
+/// # Why every refusal has its own code
+///
+/// `DelegateCtx::schedule_wakeup` returns `Result<(), i64>`, not `bool`.
+/// `subscribe_contract` returns `bool` and collapses every host outcome into
+/// `result == 0`, which is why a delegate today cannot tell a real subscription
+/// from a silently-refused one (#5565). This primitive is not in that trap and
+/// must not walk into it: "you are asking too often" and "the node is full"
+/// call for OPPOSITE responses from the delegate — back off versus retry
+/// unchanged — and a delegate that cannot tell them apart cannot respond
+/// correctly to either.
+///
+/// The numbers sit in a fresh range. freenet-stdlib's published
+/// `delegate_host::error_codes` occupies -1..-10 and -20..-24; starting at -40
+/// leaves room for both to grow without a silent collision, which would be the
+/// worst possible failure here — a delegate reading one refusal as another.
+///
+/// # Two deliberate divergences from the stdlib wrapper
+///
+/// `DelegateCtx::schedule_wakeup` refuses an oversized tag itself with
+/// `ERR_INVALID_PARAM` (-4) WITHOUT calling the host, and CLAMPS a short delay
+/// up to `MIN_WAKEUP_DELAY` before calling. So [`ERR_WAKEUP_TAG_TOO_LONG`] and
+/// [`ERR_WAKEUP_DELAY_TOO_SHORT`] are reachable only by a delegate that
+/// declares the import itself and bypasses that wrapper — which is exactly the
+/// caller the host bound exists for, since a guest-side check on a
+/// guest-declared import can never be a bound.
+///
+/// The host REFUSES a short delay where the stdlib clamps, on purpose: clamping
+/// silently grants something other than what was asked, which is the
+/// silent-refusal shape this whole code table exists to avoid.
+///
+/// # One thing that cannot be signalled, stated rather than hidden
+///
+/// A node built without redb (`--features sqlite`, and the mock runtime) has no
+/// durable store, so a wakeup there survives the process but not a restart. The
+/// natural signal would be a distinct NON-negative code — "scheduled, but not
+/// durable" — but `DelegateCtx::schedule_wakeup` maps every code `>= 0` to
+/// `Ok(())` and discards it, so that channel does not exist. Refusing outright
+/// would make the primitive unavailable under sqlite and in every mock test, so
+/// such a node accepts, logs at `info!`, and this paragraph is the disclosure.
+/// Widening the guest-side return is a stdlib follow-up.
+pub mod wakeup_error_codes {
+    /// The wakeup was scheduled.
+    pub const SUCCESS: i64 = 0;
+    /// Called outside of a `process()` context.
+    pub const ERR_NOT_IN_PROCESS: i64 = -1;
+    /// Memory bounds violation reading the tag.
+    pub const ERR_MEMORY_BOUNDS: i64 = -9;
+    /// `tag` exceeded `MAX_WAKEUP_TAG_BYTES` (128).
+    ///
+    /// Programming error, deterministic: shorten the tag. A tag names a job; it
+    /// is not a place to carry state, which is what secrets are for.
+    pub const ERR_WAKEUP_TAG_TOO_LONG: i64 = -40;
+    /// The delay was below `MIN_WAKEUP_DELAY` (1 s).
+    ///
+    /// Programming error, deterministic: ask for at least a second. Without
+    /// this floor a delegate re-arming inside its own handler is an unbounded
+    /// re-entry loop.
+    pub const ERR_WAKEUP_DELAY_TOO_SHORT: i64 = -41;
+    /// The delay exceeded `MAX_WAKEUP_DELAY` (30 days).
+    ///
+    /// Programming error, deterministic: a lease has a horizon, so that it is
+    /// time-bounded rather than held forever.
+    pub const ERR_WAKEUP_DELAY_TOO_LONG: i64 = -42;
+    /// This delegate already holds `MAX_WAKEUPS_PER_DELEGATE` (16) leases.
+    ///
+    /// YOUR state: let one fire, or reuse a tag you already hold — re-arming a
+    /// tag replaces its lease rather than taking another.
+    pub const ERR_WAKEUP_DELEGATE_FULL: i64 = -43;
+    /// The node already holds `MAX_WAKEUPS_PER_NODE` (1024) leases.
+    ///
+    /// NOT your state: another delegate is using the node's allowance. Retrying
+    /// later unchanged is the correct response; changing your own behaviour is
+    /// not.
+    pub const ERR_WAKEUP_NODE_FULL: i64 = -44;
+    /// This delegate's unprompted-execution budget is spent.
+    ///
+    /// YOUR state, and the one refusal that says your own behaviour is the
+    /// problem: your wakeup handlers have consumed more than this delegate's
+    /// share of the serial loop (1%). Back off — longer periods, or cheaper
+    /// handlers. Credit refills with wall clock.
+    pub const ERR_WAKEUP_DELEGATE_BUDGET: i64 = -45;
+    /// The node's unprompted-execution budget is spent.
+    ///
+    /// NOT your state: the node as a whole is over its 10% share. Retry later.
+    pub const ERR_WAKEUP_NODE_BUDGET: i64 = -46;
+    /// The durable row could not be written; the wakeup is NOT scheduled.
+    ///
+    /// Distinct from every cap above because it is neither a policy refusal nor
+    /// a programming error — it is the node failing, and the honest answer is
+    /// that nothing was scheduled in either representation.
+    pub const ERR_WAKEUP_STORAGE: i64 = -47;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

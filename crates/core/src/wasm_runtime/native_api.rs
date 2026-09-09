@@ -1505,6 +1505,37 @@ impl DelegateCallEnv {
 
         Ok(())
     }
+
+    /// Ask the wakeup broker for a lease on future loop occupancy
+    /// (freenet-core#3972).
+    ///
+    /// Every bound is applied inside
+    /// [`delegate_wakeups::schedule`](crate::wasm_runtime::delegate_wakeups::schedule),
+    /// including the tag size and delay floor freenet-stdlib also checks: the
+    /// import is guest-declared, so a delegate can bypass
+    /// `DelegateCtx::schedule_wakeup` and the guest-side checks bound only
+    /// well-behaved callers.
+    ///
+    /// The delegate identity comes from `self.delegate_key`, never from an
+    /// argument, so a delegate cannot schedule work charged to another.
+    ///
+    /// A node with no state store (sqlite, mock) still gets a lease; it simply
+    /// does not survive a restart. See `wakeup_error_codes` for why that cannot
+    /// be signalled to the guest.
+    pub(super) fn schedule_wakeup_sync(
+        &self,
+        tag: &[u8],
+        after: std::time::Duration,
+    ) -> Result<(), crate::wasm_runtime::delegate_wakeups::WakeupRefusal> {
+        crate::wasm_runtime::delegate_wakeups::schedule(
+            self.state_store_db.as_ref(),
+            &self.delegate_key,
+            tag,
+            after,
+            std::time::SystemTime::now(),
+            tokio::time::Instant::now(),
+        )
+    }
 }
 
 /// Helper to get the current instance ID from the thread-local.
@@ -2951,6 +2982,86 @@ pub(super) mod delegate_contracts {
 pub(super) mod delegate_management {
     use super::*;
     use crate::wasm_runtime::delegate_api::delegate_mgmt_error_codes;
+    use crate::wasm_runtime::delegate_api::wakeup_error_codes;
+
+    /// Implementation of `__frnt__delegate__schedule_wakeup` (freenet-core#3972).
+    ///
+    /// Reads `tag` out of WASM memory and asks the wakeup broker for a lease on
+    /// future occupancy of the serial `contract_handling` loop.
+    ///
+    /// # Returns
+    ///
+    /// `0` on success, or a DISTINCT negative code per refusal — see
+    /// [`wakeup_error_codes`], which documents each one and what a delegate
+    /// should do about it. Collapsing them would reproduce #5565, where a
+    /// `bool` return leaves a delegate unable to tell a real subscription from
+    /// a silently-refused one.
+    ///
+    /// `after_millis` is `i64` because that is the guest ABI (the stdlib
+    /// saturates its `Duration` into it). A negative value is not a valid
+    /// duration and is refused as too short rather than reinterpreted.
+    pub(crate) fn schedule_wakeup_impl(after_millis: i64, tag_ptr: i64, tag_len: i32) -> i64 {
+        let id = current_instance_id();
+        if id == -1 {
+            tracing::warn!("delegate schedule_wakeup called outside process()");
+            return wakeup_error_codes::ERR_NOT_IN_PROCESS;
+        }
+
+        // A negative delay is refused, not clamped. The guest ABI cannot
+        // express it through `DelegateCtx::schedule_wakeup` (which saturates a
+        // `Duration`), so reaching here means the import was declared by hand —
+        // exactly the caller these bounds exist for.
+        if after_millis < 0 {
+            return wakeup_error_codes::ERR_WAKEUP_DELAY_TOO_SHORT;
+        }
+        if tag_len < 0 {
+            return wakeup_error_codes::ERR_WAKEUP_TAG_TOO_LONG;
+        }
+        let tag_len_usize = tag_len as usize;
+
+        // Refuse an oversized tag BEFORE reading it out of guest memory. A
+        // length cap that is enforced after the copy is not a memory bound at
+        // all: the copy is the cost.
+        if tag_len_usize > crate::wasm_runtime::delegate_wakeups::MAX_WAKEUP_TAG_BYTES {
+            return wakeup_error_codes::ERR_WAKEUP_TAG_TOO_LONG;
+        }
+
+        let tag: Vec<u8> = if tag_len_usize == 0 {
+            Vec::new()
+        } else {
+            let Some(info) = MEM_ADDR.get(&id) else {
+                tracing::warn!("instance mem space not recorded for {id}");
+                return wakeup_error_codes::ERR_NOT_IN_PROCESS;
+            };
+            let start_ptr = info.start_ptr;
+            let mem_size = info.mem_size;
+            drop(info);
+
+            let Some(src) =
+                validate_and_compute_ptr::<u8>(tag_ptr, start_ptr, tag_len_usize, mem_size)
+            else {
+                tracing::error!("Memory bounds violation reading tag in schedule_wakeup");
+                return wakeup_error_codes::ERR_MEMORY_BOUNDS;
+            };
+            // SAFETY: `src` was validated by `validate_and_compute_ptr` to point
+            // to `tag_len_usize` bytes within the WASM linear memory.
+            unsafe { std::slice::from_raw_parts(src, tag_len_usize) }.to_vec()
+        };
+
+        let Some(env) = DELEGATE_ENV.get(&id) else {
+            tracing::warn!("delegate call env not set for instance {id}");
+            return wakeup_error_codes::ERR_NOT_IN_PROCESS;
+        };
+
+        match env.schedule_wakeup_sync(&tag, std::time::Duration::from_millis(after_millis as u64))
+        {
+            Ok(()) => wakeup_error_codes::SUCCESS,
+            Err(refusal) => {
+                tracing::debug!(?refusal, "delegate schedule_wakeup refused");
+                refusal.code()
+            }
+        }
+    }
 
     /// Implementation of create_delegate host function.
     ///

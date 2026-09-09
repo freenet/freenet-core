@@ -128,6 +128,21 @@ const MAX_INFLIGHT_DEFERRALS: usize = 256;
 /// bounded-batch rationale.
 const MAX_RESUME_DRAIN_BATCH: usize = 16;
 
+/// Maximum delegate wakeups fired per loop iteration (freenet-core#3972).
+///
+/// Each one is a full delegate `process()` on the serial loop, so the same
+/// bounded-batch reasoning as `MAX_RESUME_DRAIN_BATCH` applies — but SMALLER,
+/// because these are the only runs on this loop that nothing outside the node
+/// asked for. Externally-triggered work (a client GET, a notification, a park
+/// resume) must not queue behind a burst of self-scheduled work, and a node
+/// coming back from downtime has a whole backlog of it.
+///
+/// This bounds a burst; `delegate_wakeups`' duty budget is what bounds the
+/// sustained rate. Neither subsumes the other: this cap alone would still allow
+/// 4 wakeups per iteration forever, and the budget alone would still allow a
+/// whole boot backlog in one iteration.
+const MAX_WAKEUP_FIRE_BATCH: usize = 4;
+
 /// A PUT/UPDATE that deferred its related-contract fetch off the serial loop,
 /// carrying everything needed to re-run the upsert once the fetch resolves.
 ///
@@ -2100,6 +2115,35 @@ where
             );
         }
 
+        // Fire delegate wakeups whose deadline has passed (#3972), AFTER the
+        // resume drains and BEFORE the fair queue's event. Ordering matters and
+        // is deliberate: a wakeup is the only work on this loop that nothing
+        // outside the node asked for, so it must never run ahead of a client
+        // that is waiting or a park that is holding a responder — but it must
+        // not be starved either, since an idle node with a backlog of periodic
+        // jobs is precisely the case this feature exists for.
+        //
+        // Bounded per iteration by `MAX_WAKEUP_FIRE_BATCH` (a burst bound) and
+        // over time by the duty budget inside `delegate_wakeups` (a rate
+        // bound). Neither subsumes the other.
+        {
+            let store = contract_handler.executor().delegate_wakeup_store();
+            let due = crate::wasm_runtime::delegate_wakeups::take_due(
+                store,
+                std::time::SystemTime::now(),
+                MAX_WAKEUP_FIRE_BATCH,
+            );
+            for wakeup in due {
+                handle_delegate_wakeup(
+                    &mut contract_handler,
+                    wakeup,
+                    &prompter,
+                    Some(&mut park_ctx),
+                )
+                .await;
+            }
+        }
+
         // Drain completed off-loop EXPORTS (#4531 / #4381 P5): return/replace the
         // executor and answer the parked client. Bounded by MAX_CONCURRENT_EXPORTS
         // (the export semaphore), so this batch is tiny; each iteration is a pool
@@ -2232,6 +2276,52 @@ where
         // `pending()` when nothing is parked, so an idle node with no parks
         // still blocks indefinitely rather than spinning on a timer.
         let park_deadline = park_ctx.next_sweep_deadline();
+        // The delegate-wakeup deadline, for exactly the reason `park_deadline`
+        // exists (#5544 B6): without an arm of its own, a due wakeup would only
+        // fire when some UNRELATED event happened to wake this select. A quiet
+        // node is the normal state for a background peer, and a quiet node is
+        // precisely what a scheduled wakeup is FOR — a timer that only fires
+        // when someone else generates traffic is not a timer.
+        //
+        // `None` when nothing is scheduled, so an idle node with no wakeups
+        // still blocks indefinitely rather than spinning on a timer.
+        //
+        // WHY A PAST DEADLINE DOES NOT SPIN. It can be in the past: more than
+        // `MAX_WAKEUP_FIRE_BATCH` wakeups can come due at once, and
+        // `sleep_until` on a past deadline returns immediately. That is a
+        // drain, not a spin — every such pass fires a full batch of real
+        // delegate runs at the top of the next iteration, against a backlog
+        // bounded by `MAX_WAKEUPS_PER_NODE` and refilled only as fast as
+        // admission grants new leases. The loop is making progress on work it
+        // holds, which is the same argument the `delegate_resumes` `continue`
+        // above rests on.
+        //
+        // A WAKEUP DOES NOT FIRE ON ITS DEADLINE UNDER `tokio::time::pause()`,
+        // WHICH THE SIMULATION RUNNER USES (`start_paused(true)`). Deadlines are
+        // absolute wall-clock milliseconds, because they are persisted and must
+        // survive a restart, so `next_due_in` measures the remaining time with
+        // `SystemTime`. That remaining time is then turned into a deadline on
+        // tokio's clock. With time paused those two clocks move independently:
+        // tokio advances to the deadline, the real clock does not, so
+        // `take_due(SystemTime::now())` at the top of the next iteration still
+        // finds nothing due, and the loop computes an almost unchanged remaining
+        // and sleeps again. The wakeup fires when the real clock catches up, or
+        // on the next loop event from other traffic, not on its deadline.
+        //
+        // This is only the DEADLINE axis. The budget clocks (refill, debt
+        // repayment, admission) are `tokio::time::Instant` and a paused test
+        // does control those.
+        //
+        // Inert today because no simulation schedules a wakeup, so nothing
+        // exercises it. Recorded here rather than only in the pull request
+        // because the person it will bite is whoever writes the FIRST simulation
+        // test for this, and that person reads the code. Closing it means
+        // routing `SystemTime::now()` through `TimeSource::system_time_now()`,
+        // which exists on the trait for exactly this, but no `TimeSource` is
+        // threaded into this loop yet.
+        let wakeup_deadline =
+            crate::wasm_runtime::delegate_wakeups::next_due_in(std::time::SystemTime::now())
+                .map(|remaining| tokio::time::Instant::now() + remaining);
         tokio::select! {
             result = contract_handler.channel().recv_from_sender() => {
                 let (id, event, priority) = result?;
@@ -2258,6 +2348,15 @@ where
             } => {
                 // Wake only; the sweep itself runs at the top of the next
                 // iteration, so there is exactly one sweep implementation.
+            }
+            () = async {
+                match wakeup_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Wake only; firing runs at the top of the next iteration, so
+                // there is exactly one place wakeups are delivered from.
             }
             Some(delegate_resume) = delegate_resume_rx.recv() => {
                 let _ = handle_delegate_resume(
@@ -2934,6 +3033,196 @@ async fn send_queue_full_response(
             error = %error,
             "Failed to send queue-full response (client may have disconnected)"
         );
+    }
+}
+
+/// Fire one due delegate wakeup on the serial loop (freenet-core#3972).
+///
+/// A wakeup is a FOURTH way into a delegate, alongside the client request, the
+/// inter-delegate hop and the contract notification — and the first one nothing
+/// outside the node triggers. Everything about the dispatch below therefore
+/// mirrors `handle_delegate_notification`, which is the closest existing
+/// node-internal invocation: `ConnectionScope::Local`, the inter-delegate hop
+/// SUPPRESSED, no user context, residual messages fanned out to the registered
+/// apps.
+///
+/// The one thing this does that no other entry point does is CHARGE. The run's
+/// measured duration is debited from the delegate's and the node's
+/// loop-occupancy budgets, which is what turns "a delegate may schedule its own
+/// execution" from an unbounded work generator into a metered one.
+async fn handle_delegate_wakeup<CH, P>(
+    contract_handler: &mut CH,
+    due: crate::wasm_runtime::delegate_wakeups::DueWakeup,
+    prompter: &std::sync::Arc<P>,
+    mut park: Option<&mut delegate_park::DelegateParkCtx>,
+) where
+    CH: ContractHandler + Send + 'static,
+    P: UserInputPrompter + 'static,
+{
+    let delegate_key = due.delegate.clone();
+
+    // PER-DELEGATE EXCLUSION (#5544 B1). A parked delegate's continuation lives
+    // in the last-write-wins `DelegateContextCache`; re-entering it here would
+    // clobber that continuation just as thoroughly as a notification would.
+    //
+    // DEFERRED rather than queued behind the park. A wakeup carries no payload
+    // and nothing about it goes stale, and the stdlib's guarantee is only ever
+    // "not before" — so the primitive's own deadline is a better queue than a
+    // third `PendingRun` variant with its own cap and byte accounting would be.
+    // See `delegate_wakeups::defer`, which bounds the deferrals independently of
+    // `PARK_TTL`.
+    if let Some(park) = park.as_deref_mut()
+        && park.is_parked(&delegate_key)
+    {
+        let store = contract_handler.executor().delegate_wakeup_store();
+        if crate::wasm_runtime::delegate_wakeups::defer(
+            store,
+            &due,
+            crate::wasm_runtime::delegate_wakeups::WAKEUP_PARK_RETRY,
+            std::time::SystemTime::now(),
+        ) {
+            tracing::debug!(
+                delegate = %delegate_key,
+                "Delegate is parked; deferred its wakeup rather than clobbering \
+                 the parked continuation (#3972)"
+            );
+        }
+        return;
+    }
+
+    // AFFORDABILITY, checked here and not only at admission.
+    //
+    // `schedule` asks "were you solvent when you asked"; it cannot ask "can you
+    // afford what you are about to do", because a run's cost is unknown until
+    // it has happened. Without this second check a delegate holding 16 leases
+    // that all come due together gets 16 runs on one solvency check — 80 s of
+    // loop time against a 1% share that takes over two hours to earn. Deferring
+    // an unaffordable lease makes the overshoot ONE run instead of one per
+    // lease, which is what turns the duty budget into a bound on occupancy
+    // rather than only on the rate of asking.
+    //
+    // Deferred, never dropped: the delegate is not at fault for the node being
+    // busy, and it has no way to learn that a lease it was granted was thrown
+    // away. The wait is the computed repayment time, so it converges rather
+    // than ticking.
+    if let Err(wait) = crate::wasm_runtime::delegate_wakeups::affordability(
+        &delegate_key,
+        tokio::time::Instant::now(),
+    ) {
+        let store = contract_handler.executor().delegate_wakeup_store();
+        if crate::wasm_runtime::delegate_wakeups::defer(
+            store,
+            &due,
+            wait,
+            std::time::SystemTime::now(),
+        ) {
+            tracing::debug!(
+                delegate = %delegate_key,
+                wait_ms = wait.as_millis(),
+                "Deferred a due delegate wakeup: its unprompted-execution budget is \
+                 in debt, so it waits for the debt to clear rather than running now \
+                 (#3972)"
+            );
+        }
+        return;
+    }
+
+    let inbound = vec![InboundDelegateMsg::WakeupFired { tag: due.tag }];
+
+    // THE REGISTERED PARAMS, not empty ones.
+    //
+    // `DelegateKey` identity covers `BLAKE3(code_hash ‖ params)`, and
+    // `DelegateStore::fetch_delegate` resolves the CODE through the index by key
+    // while attaching whatever params the caller supplies — so an empty
+    // `Parameters` here runs a parameterized delegate (the per-user / per-room
+    // shape #5268 re-keyed the module cache for) under a configuration it never
+    // had. It does not fail; it misbehaves quietly, and a wakeup is unprompted,
+    // so there is no client waiting on a wrong answer to notice.
+    //
+    // `handle_delegate_notification` still passes empty params — a known v1
+    // limitation named in `delegate_park::Continuation::params`. Fixing it there
+    // is a behaviour change to #5544's path and belongs in its own change, not
+    // smuggled into this one.
+    let params = contract_handler
+        .executor()
+        .registered_delegate_params(&delegate_key)
+        .unwrap_or_else(|| {
+            // Reachable on executors with no registry (mock, local-only), where
+            // empty is what every other path uses too.
+            tracing::debug!(
+                delegate = %delegate_key,
+                "No registered params for a waking delegate; using empty (#3972)"
+            );
+            Parameters::from(vec![])
+        });
+
+    let req = DelegateRequest::ApplicationMessages {
+        key: delegate_key.clone(),
+        params,
+        inbound,
+    };
+
+    // A wakeup-driven run has no client responder to carry; the slot exists
+    // only to satisfy the shared `ParkingCtx` shape.
+    let mut no_responder = None;
+    // THE REAL CLOCK, DELIBERATELY, and the one place in this feature where it
+    // is correct. `started.elapsed()` below is what the duty budget is charged,
+    // so it must measure the wall-clock time this run actually occupied the
+    // serial loop. `tokio::time::Instant` does not advance across a synchronous
+    // CPU-bound call while time is paused, so under `tokio::time::pause()` this
+    // would measure approximately zero, every run would be charged nothing, and
+    // the budget would stop bounding anything in exactly the simulation the
+    // rule exists to protect. The refill clocks around it are the tokio one;
+    // only the measurement of real occupancy is not.
+    // rule-lint: ok
+    let started = std::time::Instant::now();
+    let outcome = handle_delegate_with_contract_requests(
+        contract_handler,
+        req,
+        None,
+        // Node-internal invocation: this descends from a timer this delegate
+        // set, not from any client connection, so there is NO scope to classify
+        // and this hardcodes `Local` exactly as the notification path does.
+        crate::client_events::ConnectionScope::Local,
+        // And for exactly the same reason the notification path suppresses it:
+        // a hardcoded `Local` scope plus an inter-delegate hop would hand back
+        // an attestation the caller was refused. A wakeup is if anything more
+        // exposed, since a remote caller can drive a delegate once and have it
+        // arm a timer that runs long after the connection is gone.
+        InterDelegateDispatch::Suppressed,
+        // No client connection, so no user token and no per-user secret
+        // namespace. Secrets stay `SecretScope::Local` — which is also why a
+        // delegate needing state across a wakeup reads it from its secrets:
+        // `WakeupFired` deliberately carries no `DelegateContext`.
+        None,
+        &delegate_key,
+        prompter,
+        park.map(|park| ParkingCtx {
+            park,
+            delivery: delegate_park::Delivery::Apps,
+            carried_responder: &mut no_responder,
+        }),
+        RunSeed::default(),
+    )
+    .await;
+
+    // CHARGED ON EVERY PATH, including a failed or parked run. A delegate that
+    // traps on every wakeup still spent the loop time, and a budget that only
+    // counts successful runs is one an expensive failure can evade. A run that
+    // PARKED is charged only for the part that has run so far; its resume is
+    // ordinary loop work like any other resume.
+    crate::wasm_runtime::delegate_wakeups::charge_run(
+        &delegate_key,
+        started.elapsed(),
+        tokio::time::Instant::now(),
+    );
+
+    match outcome {
+        DelegateRunOutcome::Parked => {}
+        DelegateRunOutcome::Failed(_) => {}
+        DelegateRunOutcome::Completed(outbound) => {
+            route_notification_outbound(&delegate_key, outbound);
+        }
     }
 }
 
@@ -4775,6 +5064,15 @@ mod tests {
             "dispatch_delegate_request",
             "handle_delegate_resume",
             "run_queued_notification",
+            // #3972. Awaited from `contract_handling`'s top-of-loop fire block,
+            // which is on the one loop task per node — the same position as
+            // `handle_delegate_notification`, and the reason a wakeup is
+            // delivered from the loop rather than from the timer that armed it.
+            // A wakeup is the FOURTH route into a delegate and the first that
+            // nothing outside the node triggers, so it is also the one most
+            // likely to be moved off-loop by a later "the timer can just run it
+            // itself" change; that change is what this pin exists to catch.
+            "handle_delegate_wakeup",
         ];
         let mut callers: Vec<&str> = code
             .match_indices(&format!("{chokepoint}("))
@@ -7643,6 +7941,141 @@ mod hol_4391_tests {
     /// TTL — a park with a guard that has already fired, which is exactly the
     /// case the old sentence said could not exist. See
     /// `delegate_park::tests::the_backstop_leaves_a_park_whose_answer_is_already_in_hand`.
+    /// The relation that makes `MAX_WAKEUP_DEFERRALS` a backstop rather than a
+    /// delivery policy (#3972).
+    ///
+    /// A wakeup for a parked delegate is deferred rather than run, and a park
+    /// always terminates at [`delegate_park::PARK_TTL`] — so a park deferral
+    /// never reaches the drop. That is only true while the deferral window
+    /// outlasts the TTL, and "bounded by another module's timeout" is exactly
+    /// the cross-module assumption that rots silently the first time that
+    /// timeout is tuned. This turns the comment into a check: raise `PARK_TTL`
+    /// past the window and CI fails until someone raises the deferral bound
+    /// deliberately.
+    ///
+    /// It lives HERE rather than beside the constants it compares because this
+    /// is the one module that can see both — widening `PARK_TTL`'s visibility
+    /// for a test would be a change to #5544's surface for no other reason.
+    ///
+    /// FALSIFY: set `PARK_TTL` to 200 s, or `MAX_WAKEUP_DEFERRALS` to 8.
+    #[test]
+    fn a_parked_delegates_wakeup_is_never_dropped_before_the_park_is_swept() {
+        use crate::wasm_runtime::delegate_wakeups::{MAX_WAKEUP_DEFERRALS, WAKEUP_PARK_RETRY};
+        let window = WAKEUP_PARK_RETRY * MAX_WAKEUP_DEFERRALS;
+        let ttl = delegate_park::PARK_TTL;
+        assert!(
+            window > ttl,
+            "a wakeup would be DROPPED before its delegate's park is force-resumed: \
+             {MAX_WAKEUP_DEFERRALS} deferrals x {WAKEUP_PARK_RETRY:?} = {window:?}, \
+             but PARK_TTL is {ttl:?}. A dropped wakeup is a delegate that was told \
+             Ok(()), spent a lease, will never run, and cannot find out — raise \
+             MAX_WAKEUP_DEFERRALS rather than letting this ship."
+        );
+    }
+
+    /// The wakeup deadline gets its own `select!` arm, for the same reason
+    /// `park_deadline` does (#5544 B6 / #3972): a timer that only fires when
+    /// unrelated traffic happens to wake the loop is not a timer, and a quiet
+    /// node is both the normal state for a background peer AND precisely what a
+    /// scheduled wakeup exists for.
+    ///
+    /// A POSITION claim, which is all a source scrape can honestly make; that
+    /// the wakeup actually fires on an idle node is carried by
+    /// `tests/delegate_wakeup.rs`, which waits on a real node with no other
+    /// traffic.
+    ///
+    /// FALSIFY: delete either arm, or compute the deadline without awaiting it.
+    #[test]
+    fn the_wakeup_deadline_is_armed_and_the_loop_waits_on_it() {
+        let src = contract_handling_body();
+        let body = src.as_str();
+        assert!(
+            body.contains("delegate_wakeups::next_due_in("),
+            "contract_handling must compute the next wakeup deadline"
+        );
+        assert_eq!(
+            body.matches("tokio::time::sleep_until(deadline)").count(),
+            2,
+            "the idle select! must wait on BOTH the park sweep deadline and the \
+             wakeup deadline; one of them has been removed"
+        );
+    }
+
+    /// The run-duration measurement MUST keep the real clock (#3972).
+    ///
+    /// `started.elapsed()` is what `charge_run` debits, so it has to measure
+    /// the time the run actually occupied the serial loop. Under
+    /// `tokio::time::pause()` the tokio clock does not advance across a
+    /// synchronous CPU-bound call, so converting that one binding would charge
+    /// every wakeup run approximately zero: the duty budget would still exist,
+    /// still compile, and still pass every other test in this file, while
+    /// bounding nothing. That is worse than not having the budget, because the
+    /// mechanism still looks present.
+    ///
+    /// The site therefore carries a `// rule-lint: ok` exemption, and a comment
+    /// is the weakest thing protecting it: the next reader to meet a lint
+    /// exemption is tempted to remove it, and the removal compiles. This pin is
+    /// the tripwire. `a_paused_clock_cannot_measure_a_synchronous_run` shows the
+    /// same fact as behaviour rather than as position.
+    ///
+    /// The second half matters as much as the first: the refill and solvency
+    /// clocks in this function must stay on TOKIO's clock, or Rule Lint #1 has
+    /// been satisfied by converting the wrong one.
+    ///
+    /// FALSIFY: swap either clock for the other.
+    #[test]
+    fn the_wakeup_run_measures_real_time_and_refills_on_the_paused_clock() {
+        let code = super::tests::production_code();
+        let body = super::tests::fn_region(&code, "async fn handle_delegate_wakeup");
+        assert!(
+            body.contains("let started = std::time::Instant::now();"),
+            "the duty charge must measure REAL elapsed time: a tokio Instant \
+             reads about zero across a synchronous call while time is paused, \
+             which would make the budget vacuous in exactly the simulation \
+             Rule Lint #1 exists to protect"
+        );
+        assert!(
+            !body.contains("let started = tokio::time::Instant::now()"),
+            "the run-duration measurement has been converted to the paused \
+             clock; see this test's docs before removing the rule-lint \
+             exemption"
+        );
+        assert!(
+            body.contains("tokio::time::Instant::now()"),
+            "the refill and solvency clocks must stay on tokio's clock, so a \
+             paused test controls budget refill; converting everything to \
+             std::time would satisfy the lint by breaking determinism instead"
+        );
+    }
+
+    /// Why the exemption above exists, as behaviour rather than as a claim.
+    ///
+    /// A delegate's WASM runs synchronously on this loop and never awaits, so
+    /// nothing lets a paused runtime auto-advance during it.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_clock_cannot_measure_a_synchronous_run() {
+        let real = std::time::Instant::now();
+        let paused = tokio::time::Instant::now();
+
+        // Burn real CPU without awaiting, the way a WASM run does.
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        while std::time::Instant::now() < until {
+            std::hint::spin_loop();
+        }
+
+        assert!(
+            real.elapsed() >= std::time::Duration::from_millis(15),
+            "the real clock must see the work: {:?}",
+            real.elapsed()
+        );
+        assert!(
+            paused.elapsed() < std::time::Duration::from_millis(5),
+            "a paused tokio clock does not advance across a synchronous run, so \
+             charging the duty budget from it would charge nothing: {:?}",
+            paused.elapsed()
+        );
+    }
+
     #[test]
     fn park_sweep_deadline_is_armed_and_the_loop_waits_on_it() {
         // The loop must consult the deadline, not sweep only on other traffic.

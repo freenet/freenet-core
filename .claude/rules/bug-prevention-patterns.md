@@ -695,6 +695,67 @@ Question to ask of any one of them: *if this branch fires a thousand times, what
 a reader see?* If the answer is "an empty result", the count is missing.
 
 
+## Growth driven by the refusal or discard path
+
+**Ask of any bounded-looking structure what grows when it REFUSES, not when it
+succeeds.** The success path is where a reviewer looks for a bound and usually
+finds one. The growth that matters is often driven by the failure path, and that
+is where a hostile or misbehaving party has the most leverage, because refusing
+is the one outcome it can produce on demand. Each instance looks bounded because
+the quantity it COUNTS is bounded, while what actually accumulates is a side
+effect of declining the work.
+
+This is the parent of the two refusal patterns above. *"A count cap enforced by
+REFUSAL, over entries that ordinary use refreshes"* is about what the cap admits;
+*"a refusal that is not counted renders as a clean zero"* is about what the
+refusal records. This one is about what the refusal COSTS, which is the axis
+neither of them measures.
+
+### Four instances, three of them in #3972 alone
+
+| Instance | What the refusal path grew | How it hid |
+|---|---|---|
+| `delegate_wakeups::schedule` refusal logging (#3972, fixed here) | Log volume. All four cap and budget refusals logged at `info!`, which survives `release_max_level_info`, and a delegate can call the host import in a loop inside one `process()`, bounded only by `max_execution_seconds`. | The caps were real and enforced, so the code read as correct. The delegate driving the volume is the one already AT its cap, so the containment mechanism was the amplifier. |
+| The obvious FIX for the row above (#3972, avoided in review of my own change) | A `HashSet` of currently-refusing delegates, one entry per refused delegate. | It reads as bookkeeping for the fix. It trades a log amplifier for a memory one on the same path, in a module that already carried a comment forbidding the refusal path from creating a budget entry. |
+| `take_due`'s deferral bookkeeping (#3972, real gap, found by mutation) | One `deferrals` entry per deferred-then-fired lease, keyed by (delegate, tag), reachable by any delegate that gets parked. | The map's own comment says it holds only currently-deferred ids and needs no sweep. That is TRUE only because delivery moves the count out. A version that merely read it leaked forever, and the existing test covered the grant path's removal instead. |
+| Count-capped caches holding contract-controlled values (see the row below) | Bytes, behind an entry-count cap. | A count cap READS like a memory bound and is not. |
+
+The second row is the one worth dwelling on: it was found while actively fixing
+the first, by asking this question of the fix itself. A pattern that catches you
+mid-remedy is worth more than one that only catches strangers.
+
+### The rule
+
+1. **Put the accumulating state on something that ALREADY exists and is already
+   bounded and GC'd on the success path**, rather than creating a new structure
+   the failure path populates. In #3972 the refusing bit went on
+   `DutyBudget`, which every refusable delegate already has an entry in, and
+   which `gc_budgets` and `forget_delegate` already remove.
+2. **For logging, report the TRANSITION into and out of the refusing state at
+   `info!` and the steady state at `debug!`**, so volume tracks state changes
+   the refused party cannot drive without also succeeding in between
+   (`log_refusal!`, `DutyBudget::note_refused`). Sub-case question: *can the
+   party being refused choose how often this line is emitted?*
+3. **Assert on the returned transition, never on captured logs.** `tracing`
+   resolves a callsite's `Interest` once per PROCESS against whichever thread
+   reaches it first (#5314), so a log-capture guard passes or fails according to
+   what else ran beside it.
+4. **Mutation-test the bound, not the happy path.** The deferral leak survived a
+   mutation campaign's first pass because the mutation was paired with a test
+   that exercised a different removal site. Matching the code is not the same as
+   testing the property.
+
+### Audit
+
+```bash
+# Structures written from a refusal/discard branch:
+grep -rn -B4 "return Err(\|continue;" crates/core/src/ | grep -E "\.insert\(|\.push\(|tracing::(info|warn|error)!"
+```
+
+Question to ask of any one of them: *what grows when this refuses, and who chooses
+how often it refuses?*
+
+
 ## Manually-inlined originator side effects (a mandatory sequence, hand-inlined per branch)
 
 **When two code paths both owe the same sequence of side effects, extract one
