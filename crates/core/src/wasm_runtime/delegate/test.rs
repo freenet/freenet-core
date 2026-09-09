@@ -5219,3 +5219,79 @@ async fn env_cleanup_completes_before_the_call_returns() -> Result<(), Box<dyn s
 
     Ok(())
 }
+
+/// A delegate that emits `UnsubscribeContractRequest` must FAIL the run, not
+/// have the request silently dropped.
+///
+/// freenet-stdlib 0.10.0 added the variant (freenet/freenet-stdlib#98); core
+/// has no unsubscribe path behind it yet (#5600). The choice of an explicit
+/// error over a quiet drop is the load-bearing decision here, and the two are
+/// indistinguishable from the delegate's side unless something pins it:
+///
+/// - a DROP returns `Ok` with the request absent from `results`, so the
+///   delegate waits forever for an `UnsubscribeContractResponse` nobody will
+///   send, and every observer reads the unsubscribe as having succeeded while
+///   the subscription is still live;
+/// - the ERROR reaches the client as a delegate execution failure naming
+///   #5600.
+///
+/// Asserting `results` stayed empty as well as `Err` is what makes this a real
+/// pin: a regression that forwarded the request onward as if it were handled
+/// would produce a non-empty `results`, and one that dropped it would produce
+/// `Ok`. Both `processed` states are covered, because core cannot honour either
+/// — it never sets `processed` on this variant, since it errors first.
+#[tokio::test(flavor = "multi_thread")]
+async fn unsubscribe_contract_request_fails_the_run_rather_than_being_dropped()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::VecDeque;
+
+    for processed in [false, true] {
+        let (mut runtime, _temp_dir) = bare_runtime().await;
+
+        let delegate_key = DelegateKey::new([11u8; 32], CodeHash::new([12u8; 32]));
+        let contract_id = ContractInstanceId::new([13u8; 32]);
+
+        let mut req = UnsubscribeContractRequest::new(contract_id);
+        req.processed = processed;
+
+        let mut outbound: VecDeque<OutboundDelegateMsg> = VecDeque::new();
+        outbound.push_back(OutboundDelegateMsg::UnsubscribeContractRequest(req));
+
+        let handle = InstanceHandle { id: 0 };
+        let params: Parameters = vec![].into();
+        let mut context = Vec::new();
+        let mut results = Vec::new();
+        let outcome = runtime.process_outbound(
+            &delegate_key,
+            &handle,
+            0,
+            &params,
+            None,
+            &mut outbound,
+            &mut context,
+            &mut results,
+        );
+
+        let Err(err) = outcome else {
+            panic!(
+                "an unsubscribe core cannot serve must FAIL the run; returning Ok \
+                 strands the delegate on a response that will never arrive \
+                 (processed={processed})"
+            );
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("UnsubscribeContractRequest") && rendered.contains("5600"),
+            "the failure must name the request and its tracking issue so an operator \
+             can tell it from a delegate bug, got: {rendered}"
+        );
+        assert!(
+            results.is_empty(),
+            "a request core cannot serve must not be forwarded onward as though it \
+             had been handled, got {} result(s)",
+            results.len()
+        );
+    }
+
+    Ok(())
+}

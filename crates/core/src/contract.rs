@@ -7151,6 +7151,94 @@ mod hol_4391_tests {
         }
     }
 
+    /// The executor loop's half of the same guarantee as
+    /// `unsubscribe_contract_request_fails_the_run_rather_than_being_dropped`
+    /// in `wasm_runtime::delegate::test`: an `UnsubscribeContractRequest` a
+    /// delegate emits must reach the CLIENT as a failure.
+    ///
+    /// freenet-stdlib 0.10.0 added the variant (freenet/freenet-stdlib#98) and
+    /// core has no unsubscribe path behind it yet (#5600). Both dispatchers are
+    /// pinned separately because they fail through different machinery and a
+    /// regression in either one alone would be invisible: `process_outbound`
+    /// returns `Err(DelegateExecError)`, while this loop returns
+    /// `DelegateRunOutcome::Failed(ExecutorError)`. The mock runtime does not
+    /// go through `process_outbound` at all, so this is the only cover for the
+    /// loop's arm.
+    ///
+    /// The assertion is on the error TEXT, not merely `is_err()`. `#5263`'s
+    /// test shows why: a delegate request against this handler can fail for
+    /// unrelated reasons (an exhausted script yields a generic error), so
+    /// asserting only that something failed would pass just as happily if the
+    /// unsubscribe arm were deleted tomorrow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_unsubscribe_request_surfaces_not_implemented_to_the_client() {
+        let (send_halve, rcv_halve, _) = handler::contract_handler_channel();
+        let mut handler =
+            MockWasmContractHandler::new_test(rcv_halve, None, "del_unsub_5600").await;
+
+        // Script the delegate to emit exactly the request core cannot serve.
+        let contract_id = ContractInstanceId::new([21u8; 32]);
+        handler
+            .runtime_mut()
+            .delegate_script
+            .lock()
+            .unwrap()
+            .push_back(ScriptedRun::from(vec![
+                OutboundDelegateMsg::UnsubscribeContractRequest(
+                    freenet_stdlib::prelude::UnsubscribeContractRequest::new(contract_id),
+                ),
+            ]));
+
+        let delegate_key = DelegateKey::new([21u8; 32], CodeHash::new([22u8; 32]));
+        let event = ContractHandlerEvent::DelegateRequest {
+            req: DelegateRequest::ApplicationMessages {
+                key: delegate_key,
+                params: Parameters::from(vec![]),
+                inbound: vec![],
+            },
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+        };
+
+        let send_fut = send_halve.send_to_handler(event);
+        let recv_fut = async {
+            let (id, received, _priority) = handler
+                .channel()
+                .recv_from_sender()
+                .await
+                .expect("handler channel should be open");
+            handle_contract_event(
+                &mut handler,
+                id,
+                received,
+                &std::sync::Arc::new(user_input::AutoApprovePrompter),
+                None,
+                None,
+            )
+            .await
+            .expect("dispatch must not error");
+        };
+        let (send_res, ()) = tokio::join!(send_fut, recv_fut);
+
+        match send_res.expect("must receive a response") {
+            ContractHandlerEvent::DelegateResponse(result) => {
+                let err = result.expect_err(
+                    "an unsubscribe this node cannot serve must surface an ERROR to the \
+                     client; a success (even an empty one) reads as an unsubscribe that \
+                     happened, while the subscription is in fact still live",
+                );
+                let rendered = err.to_string();
+                assert!(
+                    rendered.contains("UnsubscribeContractRequest") && rendered.contains("5600"),
+                    "the client-visible failure must name the request and its tracking \
+                     issue, not a generic delegate error, got: {rendered}"
+                );
+            }
+            other => panic!("expected DelegateResponse, got {other}"),
+        }
+    }
+
     // ---- #5544: a parked delegate must not stall the loop, and must not be
     // ---- re-entered while parked.
 
