@@ -1882,6 +1882,8 @@ mod tests {
             Vec::new(),
             answers,
             fetches,
+            Vec::new(),
+            Default::default(),
         ));
 
         // The loop takes it off the channel but runs out of budget before
@@ -1988,6 +1990,8 @@ mod tests {
             Vec::new(),
             answers,
             fetches,
+            Vec::new(),
+            Default::default(),
         ));
 
         tokio::time::advance(PARK_TTL + Duration::from_secs(1)).await;
@@ -2050,6 +2054,8 @@ mod tests {
             Vec::new(),
             answers,
             fetches,
+            Vec::new(),
+            Default::default(),
         ));
 
         assert!(
@@ -2101,6 +2107,8 @@ mod tests {
             inbound: vec![answer(1)],
             upserts: Vec::new(),
             unresolved_upserts: Vec::new(),
+            contract_ops: Vec::new(),
+            unresolved_contract_ops: Vec::new(),
         });
 
         tokio::time::advance(PARK_TTL + Duration::from_secs(1)).await;
@@ -2389,11 +2397,172 @@ mod tests {
             .collect()
     }
 
+    fn net_op(contract: u8, kind: ContractOpKind) -> PendingContractOp {
+        PendingContractOp {
+            contract_id: ContractInstanceId::new([contract; 32]),
+            kind,
+            context: DelegateContext::default(),
+        }
+    }
+
+    fn resolved_net_op(contract: u8, kind: ContractOpKind) -> ResolvedContractOp {
+        ResolvedContractOp {
+            pending: net_op(contract, kind),
+            outcome: match kind {
+                ContractOpKind::Get => ContractOpOutcome::Fetched(None),
+                ContractOpKind::Subscribe => ContractOpOutcome::Subscribed,
+            },
+        }
+    }
+
+    /// #5542. Every delegate network operation a park owes must produce a
+    /// terminal outcome on EVERY exit, including the `Drop` path a panic or a
+    /// cancellation takes. Without this the delegate waits forever for a
+    /// `GetContractResponse` nothing remains to produce — the same failure
+    /// #5544 P2 had to fix for prompts and upserts, at a third level.
+    #[tokio::test]
+    async fn drop_reports_every_owed_network_op_as_unresolved() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (answers, fetches) = sinks();
+        drop(ParkGuard::new(
+            tx,
+            key(1),
+            0,
+            Vec::new(),
+            Vec::new(),
+            answers,
+            fetches,
+            vec![
+                (ContractInstanceId::new([9; 32]), ContractOpKind::Get),
+                (ContractInstanceId::new([8; 32]), ContractOpKind::Subscribe),
+            ],
+            Default::default(),
+        ));
+        let resume = rx.recv().await.expect("drop must still resume the park");
+        assert_eq!(resume.cause, ResumeCause::TimedOut);
+        assert_eq!(
+            resume.unresolved_contract_ops,
+            vec![
+                (ContractInstanceId::new([9; 32]), ContractOpKind::Get),
+                (ContractInstanceId::new([8; 32]), ContractOpKind::Subscribe),
+            ],
+            "every owed network operation must be reported unresolved"
+        );
+    }
+
+    /// #5542, inheriting #5544 F1/F3. `owed_contract_ops` is a MULTISET: one
+    /// `process()` return can emit two `GetContractRequest`s naming the same
+    /// contract. Reconciling by SET membership would let ONE completion
+    /// discharge BOTH obligations, and the delegate would wait forever for the
+    /// second response.
+    #[tokio::test]
+    async fn network_ops_are_reconciled_by_count_not_by_set() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (answers, fetches) = sinks();
+        let net_ops: std::sync::Arc<std::sync::Mutex<Vec<ResolvedContractOp>>> = Default::default();
+        net_ops
+            .lock()
+            .unwrap()
+            .push(resolved_net_op(9, ContractOpKind::Get));
+        drop(ParkGuard::new(
+            tx,
+            key(1),
+            0,
+            Vec::new(),
+            Vec::new(),
+            answers,
+            fetches,
+            vec![
+                (ContractInstanceId::new([9; 32]), ContractOpKind::Get),
+                (ContractInstanceId::new([9; 32]), ContractOpKind::Get),
+            ],
+            net_ops,
+        ));
+        let resume = rx.recv().await.expect("resume");
+        assert_eq!(
+            resume.contract_ops.len(),
+            1,
+            "the completed operation must survive the drop path"
+        );
+        assert_eq!(
+            resume.unresolved_contract_ops,
+            vec![(ContractInstanceId::new([9; 32]), ContractOpKind::Get)],
+            "one completion must discharge exactly ONE of two identical \
+             obligations, not both"
+        );
+    }
+
+    /// #5542. `kind` is part of the obligation's identity: a GET and a
+    /// SUBSCRIBE naming one contract are two different promises to the
+    /// delegate, and answering the GET must not silently discharge the
+    /// SUBSCRIBE.
+    #[tokio::test]
+    async fn a_get_and_a_subscribe_for_one_contract_are_two_obligations() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (answers, fetches) = sinks();
+        let net_ops: std::sync::Arc<std::sync::Mutex<Vec<ResolvedContractOp>>> = Default::default();
+        net_ops
+            .lock()
+            .unwrap()
+            .push(resolved_net_op(9, ContractOpKind::Get));
+        drop(ParkGuard::new(
+            tx,
+            key(1),
+            0,
+            Vec::new(),
+            Vec::new(),
+            answers,
+            fetches,
+            vec![
+                (ContractInstanceId::new([9; 32]), ContractOpKind::Get),
+                (ContractInstanceId::new([9; 32]), ContractOpKind::Subscribe),
+            ],
+            net_ops,
+        ));
+        let resume = rx.recv().await.expect("resume");
+        assert_eq!(
+            resume.unresolved_contract_ops,
+            vec![(
+                ContractInstanceId::new([9; 32]),
+                ContractOpKind::Subscribe
+            )],
+            "the SUBSCRIBE must still be owed after only the GET completed"
+        );
+    }
+
+    /// #5542. The park's byte cap must charge what a pending network operation
+    /// retains. A delegate chooses its own `DelegateContext`, so charging zero
+    /// for it makes `MAX_PARKED_BYTES` blind to 4 x 64 delegate-supplied
+    /// payloads — the same "count cap standing in for a byte cap" this file
+    /// already fixed twice.
+    #[tokio::test]
+    async fn pending_network_ops_are_charged_for_their_context() {
+        const N: usize = 32 * 1024;
+        let mut op = net_op(9, ContractOpKind::Get);
+        op.context = DelegateContext::new(vec![0u8; N]);
+        let charged = task_bytes(&[], &[], std::slice::from_ref(&op));
+        assert!(
+            charged >= N,
+            "a pending network op must be charged for the context it retains, \
+             got {charged} for a {N}-byte context"
+        );
+    }
+
     #[tokio::test]
     async fn guard_delivers_exactly_one_resume_on_success() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (answers, fetches) = sinks();
-        let guard = ParkGuard::new(tx, key(1), 0, Vec::new(), Vec::new(), answers, fetches);
+        let guard = ParkGuard::new(
+            tx,
+            key(1),
+            0,
+            Vec::new(),
+            Vec::new(),
+            answers,
+            fetches,
+            Vec::new(),
+            Default::default(),
+        );
         guard.send();
         let resume = rx.recv().await.expect("one resume");
         assert_eq!(resume.cause, ResumeCause::Completed);
@@ -2420,6 +2589,8 @@ mod tests {
             vec![(ContractInstanceId::new([3; 32]), true)],
             answers,
             fetches,
+            Vec::new(),
+            Default::default(),
         ));
         let resume = rx.recv().await.expect("drop must still resume the park");
         assert_eq!(resume.cause, ResumeCause::TimedOut);
@@ -2454,6 +2625,8 @@ mod tests {
             Vec::new(),
             answers,
             fetches,
+            Vec::new(),
+            Default::default(),
         ));
         let resume = rx.recv().await.expect("resume");
         let kept: Vec<&InboundDelegateMsg<'static>> = resume
@@ -2497,6 +2670,8 @@ mod tests {
             vec![(contract, true), (contract, true)],
             answers,
             fetches,
+            Vec::new(),
+            Default::default(),
         ));
         let resume = rx.recv().await.expect("resume");
         assert_eq!(

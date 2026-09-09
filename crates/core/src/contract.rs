@@ -746,11 +746,16 @@ fn contract_op_response_msg(
         (ContractOpKind::Subscribe, outcome) => {
             let err = match outcome {
                 ContractOpOutcome::Failed(err) => err,
-                // Unreachable by construction: only a GET produces `Fetched`.
-                // Reported rather than silently rewritten as a success, for the
-                // same reason the unexpected-response arm above is a failure.
-                other => {
-                    let _ = other;
+                // Unreachable by construction: only a GET produces `Fetched`,
+                // and `Subscribed` is taken by the arm above. Enumerated rather
+                // than wildcarded so a new outcome variant is a compile error
+                // here instead of silently landing in this string.
+                //
+                // Reported as a failure rather than silently rewritten as a
+                // success: telling a delegate its subscription is live when the
+                // node cannot say that is the class of lie #5263 removed from
+                // the delegate response path.
+                ContractOpOutcome::Fetched(_) | ContractOpOutcome::Subscribed => {
                     "delegate subscribe resolved with a non-subscribe outcome".to_string()
                 }
             };
