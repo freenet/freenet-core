@@ -1195,8 +1195,7 @@ impl Runtime {
     }
 
     /// One-shot, idempotent, Local-scope copy-forward of delegate secrets from
-    /// `predecessors` into `successor` (#4117), the node-side primitive behind
-    /// `DelegateRequest::RegisterDelegateWithPredecessors`. Another route to the
+    /// `predecessors` into `successor` (#4117). Another route to the
     /// `pub(super) secret_store` for a write from outside the `wasm_runtime`
     /// module (the executor lives in a different module tree and wraps secret
     /// access in `Runtime` methods, exactly as `register_delegate` /
@@ -1211,14 +1210,17 @@ impl Runtime {
     /// Runs ON the contract loop (serialized with delegate `store_secret`),
     /// mirroring the on-loop write discipline of `import_secret_bundle`.
     ///
-    /// UNREACHABLE as of GHSA-824h-7x5x-wfmf: the sole caller (the
-    /// `RegisterDelegateWithPredecessors` handler in
-    /// `crates/core/src/contract/executor/runtime/delegates.rs`) no longer
-    /// calls this, because the `origin_contract` this method's H1 gate relies
-    /// on is forgeable by any HTTP client — see GHSA-824h-7x5x-wfmf for the exploit chain.
+    /// HAS NO CALLER as of GHSA-824h-7x5x-wfmf. Its only one was the
+    /// `DelegateRequest::RegisterDelegateWithPredecessors` handler in
+    /// `crates/core/src/contract/executor/runtime/delegates.rs`: #5199 stopped
+    /// it calling this (the `origin_contract` the H1 gate relies on is forgeable
+    /// by any HTTP client — see GHSA-824h-7x5x-wfmf for the exploit chain), and
+    /// freenet-stdlib 0.9.0 then removed that request variant from the wire
+    /// altogether (freenet/freenet-stdlib#91), so the handler is gone too.
     /// Kept (not deleted) so the underlying `SecretsStore::migrate_secrets`
     /// mechanism, which is otherwise sound, is easy to re-wire once
-    /// `origin_contract` attestation is hardened.
+    /// `origin_contract` attestation is hardened. Re-wiring it needs a NEW,
+    /// properly-attested request path — do not restore the old variant.
     #[allow(dead_code)]
     pub(crate) fn migrate_delegate_secrets(
         &mut self,

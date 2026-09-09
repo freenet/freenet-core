@@ -292,11 +292,6 @@ pub(super) fn request_bytes(req: &DelegateRequest<'static>) -> usize {
             inbound, params, ..
         } => inbound.iter().map(inbound_bytes).sum::<usize>() + params.as_ref().len(),
         DelegateRequest::RegisterDelegate { delegate, .. } => delegate_container_bytes(delegate),
-        DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate,
-            predecessors,
-            ..
-        } => delegate_container_bytes(delegate) + predecessors.len() * 64,
         DelegateRequest::UnregisterDelegate(_) | _ => 0,
     }
 }
@@ -364,6 +359,7 @@ fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
         OutboundDelegateMsg::PutContractRequest(r) => r.state.as_ref().len() + ctx_len(&r.context),
         OutboundDelegateMsg::UpdateContractRequest(r) => ctx_len(&r.context),
         OutboundDelegateMsg::SubscribeContractRequest(r) => ctx_len(&r.context),
+        OutboundDelegateMsg::UnsubscribeContractRequest(r) => ctx_len(&r.context),
     }
 }
 

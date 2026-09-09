@@ -512,7 +512,6 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
             }
             DelegateRequest::RegisterDelegate { .. }
             | DelegateRequest::UnregisterDelegate(_)
-            | DelegateRequest::RegisterDelegateWithPredecessors { .. }
             | _ => Vec::new(),
         };
 

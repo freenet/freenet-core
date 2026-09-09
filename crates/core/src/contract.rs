@@ -820,11 +820,10 @@ where
     P: UserInputPrompter + 'static,
 {
     // Extract initial params from the request (only ApplicationMessages has params we need).
-    // The registration variants (including RegisterDelegateWithPredecessors,
-    // #4117) carry no params relevant here — registration's empty response exits
-    // the loop before params are read — but the new variant is listed EXPLICITLY
-    // for local consistency with this match's style; the wildcard remains only to
-    // satisfy `#[non_exhaustive]`.
+    // The registration variants carry no params relevant here — registration's
+    // empty response exits the loop before params are read — but they are listed
+    // EXPLICITLY for local consistency with this match's style; the wildcard
+    // remains only to satisfy `#[non_exhaustive]`.
     // GATE THE ORIGIN BEFORE ANY CONSUMER IN THIS FUNCTION
     // (GHSA-824h-7x5x-wfmf).
     //
@@ -847,10 +846,9 @@ where
 
     let initial_params = match &initial_req {
         DelegateRequest::ApplicationMessages { params, .. } => params.clone(),
-        DelegateRequest::RegisterDelegate { .. }
-        | DelegateRequest::RegisterDelegateWithPredecessors { .. }
-        | DelegateRequest::UnregisterDelegate(_)
-        | _ => Parameters::from(Vec::new()),
+        DelegateRequest::RegisterDelegate { .. } | DelegateRequest::UnregisterDelegate(_) | _ => {
+            Parameters::from(Vec::new())
+        }
     };
 
     let mut current_req = initial_req;
@@ -998,6 +996,25 @@ where
                 }
                 OutboundDelegateMsg::RequestUserInput(req) => {
                     user_input_requests.push(req);
+                }
+                // freenet-stdlib 0.10.0 added this variant (freenet/freenet-stdlib#98);
+                // core has no unsubscribe path behind it yet (tracked in #5600).
+                // `Runtime::process_outbound` already rejects it upstream, so on
+                // the real runtime this arm is unreachable; the mock runtime does
+                // not go through that path, so keep the same answer here. Fail
+                // rather than drop: a dropped request would leave the delegate
+                // waiting forever for an `UnsubscribeContractResponse` nobody
+                // sends, and would read as a successful unsubscribe while the
+                // subscription stays live.
+                OutboundDelegateMsg::UnsubscribeContractRequest(req) => {
+                    tracing::warn!(
+                        delegate_key = %delegate_key,
+                        contract_id = %req.contract_id,
+                        "Delegate requested UnsubscribeContractRequest, which this node does not implement yet (see #5600)"
+                    );
+                    return DelegateRunOutcome::Failed(ExecutorError::other(anyhow::anyhow!(
+                        "UnsubscribeContractRequest is not implemented by this node yet (#5600)"
+                    )));
                 }
                 other @ OutboundDelegateMsg::ApplicationMessage(_)
                 | other @ OutboundDelegateMsg::ContextUpdated(_) => {
@@ -3110,6 +3127,7 @@ fn route_notification_outbound(delegate_key: &DelegateKey, outbound: Vec<Outboun
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 tracing::warn!(
                     delegate = %delegate_key,
