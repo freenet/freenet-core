@@ -817,15 +817,40 @@ where
         // for a pair that never incremented would fall on interest a real
         // client holds, which is strictly worse than the leak.
         //
-        // The key is resolvable now precisely because the subscribe succeeded:
-        // `run_executor_subscribe` bootstrapped the body, so the contract is
-        // local. If it somehow is not, we cannot name the interest to release
-        // and must not guess.
-        match (
-            contract_handler.executor().lookup_key(&pending.contract_id),
-            contract_handler.executor().op_manager_handle(),
-        ) {
-            (Some(full_key), Some(op_manager)) => {
+        // The obligation is recorded whether or not the FULL key resolves, and
+        // that is load-bearing rather than defensive. `run_executor_subscribe`
+        // usually bootstraps the body, but `finalize_originator_subscribe` calls
+        // `add_local_client` OUTSIDE its `if have_body` guard
+        // (`operations/subscribe.rs`), so a subscribe whose
+        // `fetch_contract_if_missing` timed out inside its 2 s window takes the
+        // refcount and still returns `Ok(())` with no code blob stored. On that
+        // path `lookup_key` — which resolves through
+        // `ContractStore::code_hash_from_id` — is `None`. Recording only when
+        // it is `Some` therefore left the whole leak standing on the feature's
+        // PRIMARY path (a delegate subscribing to a contract this node has never
+        // seen), reported as a `warn!` and nothing else.
+        //
+        // Falling back to an instance-only key is exact, not a guess.
+        // `InterestManager::local_interests` is keyed by `ContractKey`, whose
+        // `Hash`/`Eq` are INSTANCE-ONLY (freenet-stdlib `contract_interface/
+        // key.rs`), and the hash index derives from `id().as_bytes()`
+        // (`ring::interest::contract_hash`), so `remove_local_client` and
+        // `cleanup_contract_if_no_interest` resolve exactly the entry
+        // `add_local_client` created with the full key. Same device as the
+        // `probe_key` in `node.rs`. The full key is still preferred where it is
+        // available, so logs and any future code-hash-sensitive consumer see the
+        // real one.
+        match contract_handler.executor().op_manager_handle() {
+            Some(op_manager) => {
+                let key = contract_handler
+                    .executor()
+                    .lookup_key(&pending.contract_id)
+                    .unwrap_or_else(|| {
+                        ContractKey::from_id_and_code(
+                            pending.contract_id,
+                            freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+                        )
+                    });
                 // WEAK, so an outstanding hold never keeps a shut-down node's
                 // `OpManager` alive. A hold that cannot upgrade has nothing
                 // left to release.
@@ -833,7 +858,7 @@ where
                 crate::wasm_runtime::delegate_interest::record(
                     pending.contract_id,
                     delegate_key.clone(),
-                    full_key,
+                    key,
                     std::sync::Arc::new(move |key: &ContractKey| {
                         if let Some(op_manager) = weak.upgrade() {
                             op_manager.interest_manager.remove_local_client(key);
@@ -841,13 +866,15 @@ where
                     }),
                 );
             }
-            _ => {
-                tracing::warn!(
+            None => {
+                // No `OpManager` means no `run_executor_subscribe` ran, so no
+                // refcount was taken and there is nothing to record. Reachable
+                // only from a test executor built without one.
+                tracing::debug!(
                     contract = %pending.contract_id,
                     delegate_key = %delegate_key,
-                    "Delegate subscribe succeeded but its local-interest hold could \
-                     not be recorded; that interest will not be released when the \
-                     subscription is dropped (#5542)"
+                    "Delegate subscribe resolved on an executor with no OpManager; \
+                     no local interest was taken, so none is recorded (#5542)"
                 );
             }
         }

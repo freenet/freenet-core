@@ -4027,6 +4027,49 @@ mod tests {
         (manager, time_source)
     }
 
+    /// A local-client refcount taken with a FULL `ContractKey` is released by an
+    /// instance-only key, and the hash index is cleaned up with it.
+    ///
+    /// This is the property `contract.rs`'s delegate-subscribe interest hold
+    /// relies on (#5542): a subscribe whose body fetch timed out has no code
+    /// blob, so the code hash is unavailable at release time and the release
+    /// runs against `ContractKey::from_id_and_code(id, CodeHash::new([0; 32]))`.
+    /// It holds because `ContractKey`'s `Hash`/`Eq` are instance-only
+    /// (freenet-stdlib `contract_interface/key.rs`) and `contract_hash` reads
+    /// `id().as_bytes()`.
+    ///
+    /// Pinned HERE rather than trusted, because it is a property of a
+    /// DEPENDENCY. If freenet-stdlib ever folds the code hash into
+    /// `ContractKey`'s equality, that release silently stops matching and the
+    /// leak returns with no other signal.
+    #[test]
+    fn an_instance_only_key_releases_interest_taken_with_the_full_key() {
+        let (manager, _time) = make_manager();
+        let full = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([9u8; 32]),
+        );
+        let instance_only =
+            ContractKey::from_id_and_code(*full.id(), CodeHash::new([0u8; 32]));
+
+        assert!(manager.add_local_client(&full));
+        assert!(manager.has_local_interest(&full));
+        assert!(
+            manager.lookup_by_hash(contract_hash(&full)).contains(&full),
+            "the acquisition must have indexed the contract"
+        );
+
+        assert!(
+            manager.remove_local_client(&instance_only),
+            "releasing with an instance-only key must drop the last interest"
+        );
+        assert!(!manager.has_local_interest(&full));
+        assert!(
+            manager.lookup_by_hash(contract_hash(&full)).is_empty(),
+            "cleanup_contract_if_no_interest must have unindexed it too"
+        );
+    }
+
     /// Wiring pin for the SHADOW-MODE futile-repair detector's attempt
     /// lifetime.
     ///
