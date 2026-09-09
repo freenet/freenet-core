@@ -653,15 +653,22 @@ fn outbound_bytes(msg: &OutboundDelegateMsg) -> ByteCount {
 /// `usize::MAX`. That is a coincidence, not an invariant, and
 /// [`unmeasurable`] introduced the first operand that is NOT a heap length.
 ///
+/// HISTORY, NOT CURRENT BEHAVIOUR — this paragraph describes what happened
+/// BEFORE this type existed, and is kept because it is the reason the type
+/// exists. Do not read it as a description of the code below and conclude the
+/// comment is stale; the arithmetic it describes is exactly what `ByteCount`
+/// now makes unrepresentable.
+///
 /// One non-heap-length operand was enough to break it, and it broke in the
 /// worst available direction. `overflow-checks` appears nowhere in this
 /// repository — no Cargo profile, no CI, no `RUSTFLAGS`, and there is no
-/// `arithmetic_side_effects` lint — so debug and test builds panic on the
-/// serial delegate loop while **release wraps**:
-/// `ELEMENT_OVERHEAD_BYTES + usize::MAX` becomes `ELEMENT_OVERHEAD_BYTES - 1`.
-/// The sentinel that exists to make a payload unadmittable at any budget would
-/// have made it admittable at almost any budget, silently, in the build that
-/// ships.
+/// `arithmetic_side_effects` lint — so debug and test builds panicked on the
+/// serial delegate loop while **release wrapped**: as bare `usize`,
+/// `ELEMENT_OVERHEAD_BYTES + usize::MAX` evaluated to
+/// `ELEMENT_OVERHEAD_BYTES - 1`. The sentinel that exists to make a payload
+/// unadmittable at any budget instead made it admittable at almost any budget,
+/// silently, in the build that ships. Both terms are `ByteCount` today, so that
+/// expression saturates and the inversion is unreachable.
 ///
 /// So the composition is fixed rather than the sentinel's route through it.
 /// `unmeasurable` is not the last non-heap-length operand this will see — the
