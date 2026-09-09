@@ -260,6 +260,24 @@ pub(crate) fn subscribe(contract: ContractInstanceId, delegate: &DelegateKey) ->
         // means "last notification delivered", and letting a delegate refresh it
         // by re-subscribing in a loop would let it pin an entry it never hears
         // from, defeating the eviction order.
+        //
+        // It DOES re-assert the forward-map half, which is not redundant. This
+        // function dedups on the reverse index while `is_subscribed` answers
+        // from the forward map, and while ONE map existed those were the same
+        // question by construction. They are no longer, so a state where the
+        // two disagree is now representable, and without this line it would be
+        // PERMANENT: the early return above happens before the forward-map
+        // insert below, so no later subscribe would ever repair it, and
+        // `remove_contract` early-returns on a missing forward entry so no
+        // removal would clean it either. The subscription would be dead —
+        // silently receiving nothing — while still holding a unit of cap budget
+        // that nothing ages out. A `HashSet` insert is idempotent and the
+        // reverse index is untouched here, so this cannot admit past the cap or
+        // double-count; it only makes every subscribe self-healing.
+        BY_CONTRACT
+            .entry(contract)
+            .or_default()
+            .insert(delegate.clone());
         return SubscribeOutcome::AlreadySubscribed;
     }
 
@@ -351,12 +369,31 @@ pub(crate) fn note_notified(contract: &ContractInstanceId, delegate: &DelegateKe
 
 /// Drop every subscription held by `delegate` (delegate unregistered).
 pub(crate) fn remove_delegate(delegate: &DelegateKey) {
-    let Some((_, owned)) = BY_DELEGATE.remove(delegate) else {
+    // Hold the reverse-index guard across the forward-map cleanup, rather than
+    // removing the entry and then walking a detached snapshot.
+    //
+    // Executors are a pool, so `UnregisterDelegate` does not run on the same
+    // thread as the V2 host call or `apply_resolved_contract_op`. A `subscribe`
+    // for this delegate completing inside a snapshot walk would recreate the
+    // reverse-index entry and insert into the forward map, and the walk would
+    // then strip the forward half back out — leaving exactly the disagreement
+    // the re-subscribe path above has to heal. Holding the guard makes such a
+    // `subscribe` wait instead, so the window does not exist in this direction
+    // at all. Same lock order as `subscribe` (reverse index, then forward), so
+    // it cannot deadlock against it.
+    let Some(mut owned) = BY_DELEGATE.get_mut(delegate) else {
         return;
     };
-    for contract in owned.keys() {
+    let contracts: Vec<ContractInstanceId> = owned.keys().copied().collect();
+    owned.clear();
+    for contract in &contracts {
         drop_from_contract_map(contract, delegate);
     }
+    drop(owned);
+    // Re-checked under the removal guard: a `subscribe` that was waiting on the
+    // guard above may have refilled the entry, and removing a non-empty one
+    // would silently unsubscribe it.
+    BY_DELEGATE.remove_if(delegate, |_, owned| owned.is_empty());
 }
 
 /// Drop every subscription to `contract` (contract removed, or its notification
@@ -648,6 +685,123 @@ mod tests {
         assert_eq!(subscription_count(&victim), 1);
         cleanup(&victim);
         cleanup(&hog);
+    }
+
+    /// The two indexes can disagree, and a re-subscribe must repair it rather
+    /// than dedup against the half that survived.
+    ///
+    /// `subscribe` dedups on the reverse index; `is_subscribed` answers from
+    /// the forward one. While there was a single map those were the same
+    /// question by construction — splitting the registry to enforce the cap
+    /// turned a structural property into one nothing enforces, so it is pinned
+    /// here instead.
+    ///
+    /// The disagreement is reachable: `remove_contract` snapshots the forward
+    /// entry and then walks it clearing reverse entries, and a `subscribe`
+    /// completing inside that walk is re-stripped from the forward map. The
+    /// consequence is what makes this worth a test rather than a comment —
+    /// without the repair, the early return happens BEFORE the forward-map
+    /// insert, so no later subscribe fixes it, `remove_contract` early-returns
+    /// on the missing forward entry so no removal cleans it, and the
+    /// subscription is permanently dead while still holding cap budget.
+    #[tokio::test]
+    async fn a_resubscribe_repairs_a_half_lost_registration() {
+        let d = dkey(12);
+        let c = cid(8500);
+        subscribe(c, &d);
+
+        // Exactly what a `subscribe` racing a removal walk leaves behind: the
+        // reverse index still claims the subscription, the forward index has
+        // lost it.
+        drop_from_contract_map(&c, &d);
+        assert!(
+            !is_subscribed(&c, &d),
+            "precondition: the forward half must be missing, or this test is \
+             not exercising the repair"
+        );
+        assert_eq!(subscription_count(&d), 1, "the reverse half must survive");
+
+        assert_eq!(
+            subscribe(c, &d),
+            SubscribeOutcome::AlreadySubscribed,
+            "the reverse index still holds it, so this is a re-subscribe"
+        );
+        assert!(
+            is_subscribed(&c, &d),
+            "a re-subscribe must re-assert the forward half; without it the \
+             subscription is permanently dead and permanently holds cap budget, \
+             because nothing else writes that entry and nothing ages it out"
+        );
+        assert_eq!(
+            subscription_count(&d),
+            1,
+            "repairing must not double-count against the cap"
+        );
+        cleanup(&d);
+    }
+
+    /// The mirror disagreement — forward half present, reverse half lost, which
+    /// is what a `subscribe` racing `remove_contract`'s walk leaves — must also
+    /// converge, and must not double-count.
+    #[tokio::test]
+    async fn a_resubscribe_repairs_a_lost_reverse_half() {
+        let d = dkey(13);
+        let c = cid(8600);
+        subscribe(c, &d);
+
+        if let Some(mut owned) = BY_DELEGATE.get_mut(&d) {
+            owned.remove(&c);
+        }
+        assert_eq!(subscription_count(&d), 0, "precondition: reverse half gone");
+        assert!(is_subscribed(&c, &d), "precondition: forward half survives");
+
+        assert_eq!(
+            subscribe(c, &d),
+            SubscribeOutcome::Registered,
+            "the reverse index lost it, so this registers rather than dedups"
+        );
+        assert!(is_subscribed(&c, &d));
+        assert_eq!(
+            subscription_count(&d),
+            1,
+            "the forward half was already present; re-registering must not \
+             leave the contract counted twice"
+        );
+        assert_eq!(
+            subscribers_of(&c),
+            vec![d.clone()],
+            "and must not duplicate the subscriber"
+        );
+        cleanup(&d);
+    }
+
+    /// Removing a delegate must leave the two indexes agreeing, including for a
+    /// delegate that still holds many subscriptions — the walk clears the
+    /// forward half for every one of them.
+    #[tokio::test]
+    async fn remove_delegate_leaves_both_indexes_agreeing() {
+        let d = dkey(14);
+        let others = dkey(15);
+        let shared = cid(8700);
+        subscribe(shared, &others);
+        for i in 0..8u16 {
+            subscribe(cid(8700 + i), &d);
+        }
+
+        remove_delegate(&d);
+
+        assert_eq!(subscription_count(&d), 0);
+        for i in 0..8u16 {
+            assert!(
+                !is_subscribed(&cid(8700 + i), &d),
+                "every forward entry must be cleared, not just the first"
+            );
+        }
+        assert!(
+            is_subscribed(&shared, &others),
+            "another delegate's subscription to the same contract must survive"
+        );
+        cleanup(&others);
     }
 
     /// Cap eviction drops ONE (contract, delegate) pair, and the local-interest
