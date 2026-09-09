@@ -1211,6 +1211,27 @@ where
         return RestoreOutcome::default();
     }
 
+    // Per-reason refusal counters, sampled around the loop.
+    //
+    // `register_subscription` returns a bare `bool`, so `pinned < restored`
+    // says a pin did not take but not WHY — and the two reasons want opposite
+    // responses. `not_hosted` is the ordinary case and self-heals the moment
+    // the node holds the contract again; `node_full` is a starvation with no
+    // recovery path, because nothing sheds a pin slot (see this module's
+    // resource enumeration). An operator has to be able to tell them apart at
+    // the one moment the whole durable set is being replayed.
+    //
+    // This is the counter #5467 Phase 0 added, read rather than only exported:
+    // it is the only channel that can carry the distinction, because the
+    // DELEGATE-facing one cannot — `subscribe_contract()` is `-> bool` in
+    // freenet-stdlib and `SubscribeContractResponse.result` is
+    // `Result<(), String>`, so neither can express "subscribed, not pinned"
+    // without a stdlib change (#5565).
+    //
+    // `None` before `network_status::init`, which is the case in most tests;
+    // the log then simply omits the breakdown rather than the whole line.
+    let refusals_before = crate::node::network_status::delegate_pin_refusal_counts();
+
     let mut outcome = RestoreOutcome::default();
     for (instance_id, delegate) in persisted {
         if !delegate_is_registered(&delegate) {
@@ -1244,6 +1265,49 @@ where
         if register_subscription(op_manager, &delegate, &contract) {
             outcome.pinned += 1;
         }
+    }
+
+    // A partial restore is a WARN, not a detail on the info line.
+    //
+    // `restored = 300, pinned = 100` reads as success at a glance, and it is
+    // the shape a saturated node produces: 200 delegate subscriptions came back
+    // with their notification hooks and without their demand, and every one of
+    // them is a delegate that believes its contracts are being kept alive and
+    // is wrong. That is the failure this whole PR exists to stop being silent,
+    // one layer up — and the delegate cannot be told, so the operator must be.
+    //
+    // Rate-limiting is deliberately absent: this runs exactly once per process,
+    // at boot, so there is nothing to flood.
+    let unpinned = outcome.restored.saturating_sub(outcome.pinned);
+    if unpinned > 0 {
+        let (not_hosted, node_full, contract_full, delegate_full) = match (
+            refusals_before,
+            crate::node::network_status::delegate_pin_refusal_counts(),
+        ) {
+            (Some(before), Some(after)) => (
+                after.not_hosted.saturating_sub(before.not_hosted),
+                after.node_full.saturating_sub(before.node_full),
+                after.contract_full.saturating_sub(before.contract_full),
+                after.delegate_full.saturating_sub(before.delegate_full),
+            ),
+            _ => (0, 0, 0, 0),
+        };
+        tracing::warn!(
+            restored = outcome.restored,
+            pinned = outcome.pinned,
+            unpinned,
+            not_hosted,
+            node_full,
+            contract_full,
+            delegate_full,
+            "restored delegate subscriptions whose hosting pin did NOT take. \
+             `not_hosted` is the ordinary case and self-heals when the node \
+             holds the contract again. `node_full` is not: nothing releases a \
+             delegate pin slot except the delegate itself or byte-pressure \
+             eviction, so those subscriptions stay unpinned across every \
+             subsequent boot as well. The delegates were told their subscribe \
+             succeeded and cannot see this (#5565)."
+        );
     }
 
     tracing::info!(
@@ -1971,6 +2035,97 @@ mod tests {
             1,
             "the row must SURVIVE: an unhosted contract is a state the node \
              recovers from, so this is not a stale entry"
+        );
+    }
+
+    /// A restore that could not re-pin everything WARNS, and says which reason.
+    ///
+    /// `restored = 300, pinned = 100` on an info line reads as success at a
+    /// glance, and it is exactly what a saturated node produces: 200 delegates
+    /// got their notification hooks back without their demand, each of them
+    /// believing its contracts are being kept alive. The delegate cannot be
+    /// told — `subscribe_contract()` is `-> bool` in freenet-stdlib and
+    /// `SubscribeContractResponse.result` is `Result<(), String>`, so neither
+    /// can express "subscribed, not pinned" (#5565) — so the operator has to
+    /// be, and has to be able to tell `not_hosted` (self-heals) from
+    /// `node_full` (does not).
+    ///
+    /// Asserts on the emitted WARN rather than on a counter, because the
+    /// counter is what the WARN reads: a test on the counter would pass with
+    /// the log deleted, and the log is the whole mechanism here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restore_that_cannot_repin_warns_with_the_reason() {
+        use crate::contract::storages::ReDb;
+
+        let _pin_outcomes = pin_outcome_guard().await;
+        crate::node::network_status::init(0, std::collections::HashSet::new(), "test".to_string());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: ReDb = ReDb::new(dir.path()).await.expect("open redb");
+
+        let key = contract_key(65);
+        let delegate = delegate_key(66);
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+
+        let fixture = seam_fixture("delegate-demand-4669-restore-warn").await;
+        let op_manager = fixture.op_manager.clone();
+        // Deliberately NOT hosted, so the restored row cannot get a pin.
+        assert!(!op_manager.ring.is_hosting_contract(&key), "precondition");
+        assert!(crate::wasm_runtime::delegate_subscriptions::register(
+            Some(&storage),
+            key.id(),
+            &delegate,
+        ));
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+
+        // Installed after every await, so the capture and the call it captures
+        // are on one thread.
+        let (messages, guard) = crate::util::test_log_capture::install();
+        let outcome = restore_persisted_subscriptions(
+            &op_manager,
+            &storage,
+            |id| (id == key.id()).then_some(key),
+            |_| true,
+        );
+        drop(guard);
+
+        assert_eq!(
+            (outcome.restored, outcome.pinned),
+            (1, 0),
+            "precondition: the restore must have produced an unpinned row, or \
+             there is nothing for the warning to be about"
+        );
+
+        let logs = messages.lock().unwrap();
+        let warnings: Vec<&String> = logs
+            .iter()
+            .filter(|line| line.starts_with("WARN") && line.contains("hosting pin did NOT take"))
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a restore that could not re-pin every subscription must WARN \
+             exactly once; captured:\n{logs:#?}"
+        );
+        // The counts are the point: an operator has to be able to tell the
+        // self-healing reason from the one with no recovery path.
+        assert!(
+            warnings[0].contains("unpinned=1"),
+            "the warning must say HOW MANY subscriptions came back unpinned:\n{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("not_hosted=1"),
+            "the warning must attribute the shortfall to a REASON — `not_hosted` \
+             self-heals and `node_full` does not, and they call for opposite \
+             responses:\n{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("node_full=0"),
+            "an unrelated reason must read zero, or the breakdown is not \
+             attributing anything:\n{}",
+            warnings[0]
         );
     }
 
