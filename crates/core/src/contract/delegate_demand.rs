@@ -1158,8 +1158,37 @@ pub(crate) struct RestoreOutcome {
     pub(crate) pinned: usize,
     /// Rows dropped because the delegate is no longer registered.
     pub(crate) dropped_delegate_gone: usize,
-    /// Rows dropped because the contract is no longer in the contract store.
-    pub(crate) dropped_contract_gone: usize,
+    /// Rows KEPT because the contract could not be resolved. Neither restored
+    /// nor pinned, and deliberately NOT deleted.
+    ///
+    /// # WHY THIS NO LONGER DELETES
+    ///
+    /// The lookup behind it is `ContractStore::code_hash_from_id`, which reads
+    /// the in-memory `key_to_code_part` index. That index is loaded at startup
+    /// from redb and **a load failure is swallowed**: `ContractStore::new_with_shared`
+    /// logs `warn!("Failed to load contract index from ReDb")` and constructs
+    /// the store with an EMPTY index.
+    ///
+    /// So one failed read makes every contract unresolvable, and a
+    /// delete-on-miss would then wipe **every delegate subscription on the
+    /// node** — silently, permanently, from a transient error. That is the
+    /// same shape as this function's existing read-failure guard, which
+    /// already refuses to read an unreadable subscription set as "no
+    /// subscriptions", and it deserves the same answer for the same reason: an
+    /// unreliable input must not be treated as authoritative when the
+    /// consequence is irreversible.
+    ///
+    /// Nothing is lost by keeping the row. Deleting here was always a REDUNDANT
+    /// second path: when a contract is genuinely removed,
+    /// `ContractStore::remove_contract` already calls
+    /// `delegate_subscriptions::forget_contract`, which clears its rows at the
+    /// moment the removal is known to be real. That path has correct
+    /// information; this one only ever had an absence.
+    ///
+    /// The residue is bounded. A row for a genuinely-vanished contract lingers
+    /// until its delegate unregisters, counted against both the per-contract
+    /// cap and `MAX_DELEGATE_SUBSCRIPTION_ROWS_PER_NODE`.
+    pub(crate) unresolved_contract: usize,
 }
 
 /// Put persisted delegate subscriptions back, dropping the stale ones
@@ -1289,13 +1318,12 @@ where
             outcome.dropped_delegate_gone += 1;
             continue;
         }
+        // A contract we cannot resolve is KEPT, not deleted. See
+        // `unresolved_contract` on [`RestoreOutcome`] for why — the short
+        // version is that the lookup can fail silently and a delete is
+        // permanent.
         let Some(contract) = resolve_contract(&instance_id) else {
-            crate::wasm_runtime::delegate_subscriptions::forget_one(
-                Some(db),
-                &instance_id,
-                &delegate,
-            );
-            outcome.dropped_contract_gone += 1;
+            outcome.unresolved_contract += 1;
             continue;
         };
 
@@ -1387,7 +1415,7 @@ where
         restored = outcome.restored,
         pinned = outcome.pinned,
         dropped_delegate_gone = outcome.dropped_delegate_gone,
-        dropped_contract_gone = outcome.dropped_contract_gone,
+        unresolved_contract = outcome.unresolved_contract,
         "restored persisted delegate subscriptions (#4669 part 2)"
     );
     outcome
@@ -1858,7 +1886,7 @@ mod tests {
                 restored: 1,
                 pinned: 1,
                 dropped_delegate_gone: 0,
-                dropped_contract_gone: 0,
+                unresolved_contract: 0,
             }
         );
         assert!(
@@ -1961,7 +1989,7 @@ mod tests {
                 restored: 1,
                 pinned: 1,
                 dropped_delegate_gone: 0,
-                dropped_contract_gone: 0,
+                unresolved_contract: 0,
             },
             "the row is inside the horizon, so restore must replay it in full and \
              the expiry pass must leave it alone"
@@ -2079,7 +2107,7 @@ mod tests {
                 restored: 0,
                 pinned: 0,
                 dropped_delegate_gone: 1,
-                dropped_contract_gone: 0,
+                unresolved_contract: 0,
             }
         );
         assert!(!op_manager.ring.contract_in_use(&key));
@@ -2098,7 +2126,7 @@ mod tests {
     /// Same reasoning as the delegate case: with no contract there is no
     /// eviction that could ever release the pin.
     #[tokio::test(flavor = "multi_thread")]
-    async fn boot_reconciliation_drops_a_subscription_whose_contract_is_gone() {
+    async fn boot_reconciliation_keeps_a_subscription_whose_contract_will_not_resolve() {
         let _pin_outcomes = pin_outcome_guard().await;
         use crate::contract::storages::ReDb;
 
@@ -2133,13 +2161,25 @@ mod tests {
                 restored: 0,
                 pinned: 0,
                 dropped_delegate_gone: 0,
-                dropped_contract_gone: 1,
+                unresolved_contract: 1,
             }
         );
-        assert!(
+        assert_eq!(
             crate::wasm_runtime::delegate_subscriptions::load_persisted(&storage)
                 .expect("read back")
-                .is_empty()
+                .len(),
+            1,
+            "the row must be KEPT. The resolve behind this is the contract index, \
+             whose load failure is SWALLOWED (`ContractStore::new_with_shared` \
+             warns and builds an empty index) — so one failed read makes every \
+             contract unresolvable, and deleting here would wipe every delegate \
+             subscription on the node from a transient error. Genuine removal is \
+             handled by `ContractStore::remove_contract`, which knows."
+        );
+        assert!(
+            !op_manager.ring.contract_in_use(&key),
+            "and it must NOT be pinned: keeping the row is not the same as \
+             registering demand for a contract we cannot resolve"
         );
     }
 
@@ -2187,7 +2227,7 @@ mod tests {
                 restored: 1,
                 pinned: 0,
                 dropped_delegate_gone: 0,
-                dropped_contract_gone: 0,
+                unresolved_contract: 0,
             }
         );
         assert!(!op_manager.ring.contract_in_use(&key));

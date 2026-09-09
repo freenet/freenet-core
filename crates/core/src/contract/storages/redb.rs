@@ -2041,6 +2041,15 @@ impl ReDb {
     /// reachable, and it is why the callers MUST honour this function's return
     /// value rather than reasoning that the two caps agree.
     ///
+    /// The CONVERSE is also reachable and is NOT a defect: a contract with many
+    /// WebSocket clients can reach `MAX_SUBSCRIBERS_PER_CONTRACT` while this cap
+    /// still admits, so a row can exist that the pin gate will never accept. A
+    /// record without a pin is a legitimate state — it is what a delegate had
+    /// before #4669, and what every `not_hosted` subscribe produces today: the
+    /// delegate still receives notifications, which is what the row is for.
+    /// What must never happen is the OTHER direction, a pin with no record,
+    /// because that is demand no teardown can find.
+    ///
     /// Do not "fix" the divergence by retuning either constant. They measure
     /// different things and both bounds are wanted; what has to hold is the
     /// ORDERING — no pin without a subscription record — which the call sites
@@ -2397,10 +2406,19 @@ impl ReDb {
         // byte-pressure sweep arrives in. On virtually every node today there
         // are zero delegate subscriptions, so that bought nothing at all.
         //
-        // The read-then-write is not atomic, and does not need to be: a
+        // The read-then-write is not atomic, and does not need to be. A
         // subscription landing between the two leaves a row for a contract
-        // being removed, which boot reconciliation drops as
-        // `dropped_contract_gone`. Self-healing, so not worth one transaction.
+        // being removed. That row is inert — nothing resolves the contract, so
+        // boot restore neither restores nor pins it — and it is bounded by the
+        // per-contract cap and MAX_DELEGATE_SUBSCRIPTION_ROWS_PER_NODE, and
+        // cleared whenever the delegate unregisters.
+        //
+        // Note boot reconciliation does NOT delete it, and deliberately so:
+        // the contract index it would consult swallows its own load failures,
+        // so a delete there could wipe the whole durable set from one failed
+        // read. See `RestoreOutcome::unresolved_contract`. So this residue is
+        // bounded rather than self-healing, which is still not worth folding
+        // the two transactions into one.
         let has_rows =
             self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
                 Ok(tbl) => Ok(tbl.range(lo.as_slice()..=hi.as_slice())?.next().is_some()),
