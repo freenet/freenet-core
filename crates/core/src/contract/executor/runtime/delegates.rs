@@ -425,8 +425,9 @@ impl Executor<Runtime> {
                 );
 
                 // Drop the matching DEMAND registrations (#4669 part 1). The
-                // retain above clears only the notification hook; the demand
-                // this delegate holds in the ring's client-subscription map is
+                // call above clears only the subscription record (hook and
+                // durable row); the demand this delegate holds in the ring's
+                // client-subscription map is
                 // a separate record, and leaving it behind would pin every
                 // contract the delegate ever subscribed to for the life of the
                 // process — a permanent, un-collapsible lease. Mirrors the
@@ -446,8 +447,8 @@ impl Executor<Runtime> {
                 // open hole gets its method written down, in a comment or in a
                 // commit message. See `no-public-disclosure-before-fix`.
                 //
-                // SCOPE MISMATCH, unfixed: the retain above walks the
-                // process-global `DELEGATE_SUBSCRIPTIONS`, so it clears this
+                // SCOPE MISMATCH, unfixed: the call above walks the
+                // process-global subscription registry, so it clears this
                 // delegate's hooks on EVERY node in the process, while the
                 // demand drop below reaches only THIS node's ring. In a
                 // shared-process multi-node test (every `#[freenet_test]`),
@@ -459,6 +460,14 @@ impl Executor<Runtime> {
                 // same mismatch exists in the channel-closed arm
                 // (`executor_impl.rs`). Both close when the hook and the demand
                 // become one record with one owner (#4669 part 3).
+                //
+                // #4669 part 2 adds a third scope to the same test-only shape,
+                // in the safe direction: the DURABLE rows are per-node, because
+                // each node has its own database. So node A clears node B's
+                // in-memory hooks but not B's durable rows, and B's next boot
+                // restores them. That is the failure mode one wants of the
+                // three — B recovers — and it is still only reachable in a
+                // shared-process test.
                 if let Some(op_manager) = &self.op_manager {
                     crate::contract::delegate_demand::drop_delegate_demand(op_manager, &key);
                 }
