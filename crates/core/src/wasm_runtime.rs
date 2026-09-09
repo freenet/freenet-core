@@ -2,6 +2,7 @@ mod contract;
 mod contract_store;
 mod delegate;
 pub(crate) mod delegate_api;
+pub(crate) mod delegate_wakeups;
 mod delegate_store;
 pub(crate) mod engine;
 mod error;
