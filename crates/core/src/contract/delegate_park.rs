@@ -202,6 +202,32 @@ pub(super) const MAX_PENDING_NOTIFICATION_CONTRACTS: usize = 16;
 /// to the old behaviour beats dropping a delegate's write.
 pub(super) const MAX_DEFERRED_UPSERTS_PER_PARK: usize = 4;
 
+/// Per-park cap on delegate contract operations that must reach the NETWORK
+/// (#5542): a GET or SUBSCRIBE for a contract this node has never seen.
+///
+/// CALLER-SIDE BY DESIGN, and it has to be. `start_sub_op_get` has no
+/// concurrency bound of any kind and must not grow one: each of its existing
+/// callers is bounded by ITSELF, not by the primitive - phantom repair by
+/// `MAX_PHANTOM_REPAIRS_PER_INTERVAL` per pass, the deferred related fetch by
+/// `MAX_DEFERRED_UPSERTS_PER_PARK` x `MAX_RELATED_CONTRACTS_PER_REQUEST`,
+/// subscribe by one per subscribe. A bound inside the primitive would silently
+/// reshape all three, including the phantom-repair path that restores a hosting
+/// invariant.
+///
+/// 4, matching `MAX_DEFERRED_UPSERTS_PER_PARK`. One `process()` return may name
+/// arbitrarily many contracts this node has never seen, and each one is a full
+/// network GET, so the fan-out has to be capped where it is created. Node-wide
+/// worst case is `MAX_PARKED_DELEGATES` (64) x 4 = 256 delegate-originated
+/// network operations in flight, which matches the client path's
+/// `MAX_INFLIGHT_DEFERRALS` (256) rather than exceeding it.
+///
+/// Over the cap the excess is REFUSED, never run inline. #5544's park-cap
+/// fallback to an inline wait is explicitly NOT inheritable here, and says so at
+/// its own call site: "inline" for a delegate GET means a sub-op GET on the
+/// serial `contract_handling` loop for up to 120 s, reachable by any delegate
+/// once the other 63 park slots are taken.
+pub(super) const MAX_NETWORK_CONTRACT_OPS_PER_PARK: usize = 4;
+
 /// Node-wide cap on the bytes a park may hold (#5544 S4).
 ///
 /// `MAX_PARKED_DELEGATES` bounds the NUMBER of parks, which is not the same as
@@ -246,6 +272,7 @@ pub(super) fn continuation_bytes(continuation: &Continuation) -> usize {
 pub(super) fn task_bytes(
     prompts: &[freenet_stdlib::prelude::UserInputRequest<'static>],
     upserts: &[PendingUpsert],
+    contract_ops: &[PendingContractOp],
 ) -> usize {
     let prompt_bytes: usize = prompts
         .iter()
@@ -276,7 +303,17 @@ pub(super) fn task_bytes(
             update + code + related
         })
         .sum();
-    prompt_bytes + upsert_bytes
+    // RESIDUAL, stated rather than papered over: this charges what a pending
+    // network op holds AT ADMISSION - its echoed `DelegateContext` - and cannot
+    // charge the state the network will return, because that size is unknown
+    // until the GET completes. Same shape and same magnitude as the residual
+    // already carried by `PendingUpsert.missing`, whose fetched related states
+    // are likewise uncharged. `MAX_NETWORK_CONTRACT_OPS_PER_PARK` bounds the
+    // COUNT (4 per park), which is a count cap standing in for a byte cap - the
+    // pattern #5551 tracks. Bounding the arriving state properly belongs there,
+    // where it can be fixed for both paths at once, not duplicated here.
+    let contract_op_bytes: usize = contract_ops.iter().map(|op| ctx_len(&op.context)).sum();
+    prompt_bytes + upsert_bytes + contract_op_bytes
 }
 
 /// Approximate bytes a queued delegate request pins.
@@ -618,6 +655,61 @@ pub(super) struct ResolvedUpsert {
     pub fetched: Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>,
 }
 
+/// Which delegate-originated network operation a [`PendingContractOp`] carries
+/// (#5542). Part of the identity a [`ParkGuard`] reconciles by, so a GET and a
+/// SUBSCRIBE naming the same contract are two distinct obligations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum ContractOpKind {
+    /// `GetContractRequest` for a contract this node has never seen.
+    Get,
+    /// `SubscribeContractRequest` for a contract this node has never seen.
+    Subscribe,
+}
+
+/// A delegate GET or SUBSCRIBE that the local store could not answer and which
+/// must therefore reach the network (#5542).
+///
+/// Off-loaded for the same reason as [`PendingUpsert`]: the work is a network
+/// operation, and awaiting one on the serial `contract_handling` loop freezes
+/// every contract operation on the node for its whole duration. Unlike an
+/// upsert, nothing has to be re-run on the loop afterwards - the response is
+/// pure data - but the SUBSCRIBE registry insert is still done there, so
+/// `DELEGATE_SUBSCRIPTIONS` is only ever written from one place.
+pub(super) struct PendingContractOp {
+    pub contract_id: ContractInstanceId,
+    pub kind: ContractOpKind,
+    /// Echoed back to the delegate so it can match the response to its request.
+    /// This is the continuation state that survives the park: the delegate's
+    /// own `DelegateContext` round-trips through the response.
+    pub context: DelegateContext,
+}
+
+/// What a [`PendingContractOp`]'s network work produced.
+pub(super) enum ContractOpOutcome {
+    /// A GET completed. `Some` is the state the network returned; `None` means
+    /// the network itself answered NotFound.
+    ///
+    /// NOTE the residual, which this type cannot fix: `GetContractResponse.state`
+    /// is a bare `Option<WrappedState>` in freenet-stdlib, so by the time this
+    /// reaches the delegate, "the network says this contract does not exist"
+    /// and "we could not reach the network" are both `None`. Distinguishing
+    /// them needs a stdlib wire change (#5542 scope item 4) and is deliberately
+    /// not faked here.
+    Fetched(Option<WrappedState>),
+    /// A SUBSCRIBE completed: the contract body was bootstrapped, a network
+    /// subscription was established and demand was registered.
+    Subscribed,
+    /// The operation failed - infrastructure error, exhausted retries, or no
+    /// `OpManager` on this executor.
+    Failed(String),
+}
+
+/// A [`PendingContractOp`] whose off-loop network work has finished.
+pub(super) struct ResolvedContractOp {
+    pub pending: PendingContractOp,
+    pub outcome: ContractOpOutcome,
+}
+
 /// Sent from an off-loop task back to the `contract_handling` loop.
 pub(super) struct DelegateResume {
     pub delegate_key: DelegateKey,
@@ -644,6 +736,13 @@ pub(super) struct DelegateResume {
     /// or ran out of budget. `(contract, is_put)`, turned into failure
     /// responses by the resume handler so the delegate is told.
     pub unresolved_upserts: Vec<(ContractInstanceId, bool)>,
+    /// Delegate GET/SUBSCRIBE operations whose network work finished off-loop
+    /// (#5542), turned into inbound responses on the loop.
+    pub contract_ops: Vec<ResolvedContractOp>,
+    /// Network operations the off-loop task never resolved, for the same three
+    /// reasons as `unresolved_upserts`. Turned into failure responses so the
+    /// delegate is told rather than left waiting for one that will never come.
+    pub unresolved_contract_ops: Vec<(ContractInstanceId, ContractOpKind)>,
 }
 
 /// RAII guard guaranteeing an off-loop task delivers EXACTLY ONE
@@ -681,6 +780,17 @@ struct ParkGuardPayload {
     /// finished before a panic or cancellation (#5544 F2).
     answers: std::sync::Arc<std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>>,
     fetches: std::sync::Arc<std::sync::Mutex<Vec<ResolvedUpsert>>>,
+    /// Network operations this park owes a response for, as
+    /// `(contract, kind)` (#5542). A MULTISET for the same reason as
+    /// `owed_upserts`: one `process()` return can emit two GETs naming the same
+    /// contract, and reconciling those by SET membership would let one
+    /// completion discharge both obligations, leaving the delegate waiting
+    /// forever for a response nothing remained to produce.
+    owed_contract_ops: Vec<(ContractInstanceId, ContractOpKind)>,
+    /// Where the off-loop task deposits finished network operations, shared with
+    /// the task for the same reason as `answers` and `fetches`: so `Drop` can
+    /// see work that completed before a panic or cancellation (#5544 F2).
+    contract_ops: std::sync::Arc<std::sync::Mutex<Vec<ResolvedContractOp>>>,
 }
 
 impl ParkGuard {
@@ -693,6 +803,8 @@ impl ParkGuard {
         owed_upserts: Vec<(ContractInstanceId, bool)>,
         answers: std::sync::Arc<std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>>,
         fetches: std::sync::Arc<std::sync::Mutex<Vec<ResolvedUpsert>>>,
+        owed_contract_ops: Vec<(ContractInstanceId, ContractOpKind)>,
+        contract_ops: std::sync::Arc<std::sync::Mutex<Vec<ResolvedContractOp>>>,
     ) -> Self {
         Self {
             payload: Some(ParkGuardPayload {
@@ -703,6 +815,8 @@ impl ParkGuard {
                 owed_upserts,
                 answers,
                 fetches,
+                owed_contract_ops,
+                contract_ops,
             }),
         }
     }
@@ -728,10 +842,13 @@ impl ParkGuard {
             owed_upserts,
             answers,
             fetches,
+            owed_contract_ops,
+            contract_ops,
         } = p;
 
         let mut inbound = std::mem::take(&mut *answers.lock().unwrap());
         let upserts = std::mem::take(&mut *fetches.lock().unwrap());
+        let contract_ops = std::mem::take(&mut *contract_ops.lock().unwrap());
 
         // TERMINAL RESULTS ARE PRODUCED HERE, not in the task body, so that
         // EVERY exit produces them — including a panic or a cancellation, which
@@ -800,6 +917,31 @@ impl ParkGuard {
             );
         }
 
+        // Same count-not-set reconciliation as the upserts above, for the same
+        // reason (#5544 F1/F3): `owed_contract_ops` is a multiset.
+        let mut resolved_ops: HashMap<(ContractInstanceId, ContractOpKind), usize> = HashMap::new();
+        for r in &contract_ops {
+            *resolved_ops
+                .entry((r.pending.contract_id, r.pending.kind))
+                .or_default() += 1;
+        }
+        let mut unresolved_contract_ops = Vec::new();
+        for (id, kind) in owed_contract_ops {
+            match resolved_ops.get_mut(&(id, kind)) {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => unresolved_contract_ops.push((id, kind)),
+            }
+        }
+        if !unresolved_contract_ops.is_empty() {
+            tracing::warn!(
+                delegate = %delegate_key,
+                count = unresolved_contract_ops.len(),
+                "Off-loop delegate work ended without resolving every network \
+                 contract operation; synthesizing failures so the delegate is \
+                 told rather than left waiting (#5542)"
+            );
+        }
+
         if resume_tx
             .send(DelegateResume {
                 delegate_key: delegate_key.clone(),
@@ -808,6 +950,8 @@ impl ParkGuard {
                 inbound,
                 upserts,
                 unresolved_upserts,
+                contract_ops,
+                unresolved_contract_ops,
             })
             .is_err()
         {

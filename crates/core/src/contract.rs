@@ -677,6 +677,193 @@ where
     upsert_response_msg(pending.is_put, contract_id, pending.context, result)
 }
 
+/// Whether `delegate_key` already holds a subscription to `contract_id`.
+///
+/// Extracted so the non-idempotency guard in the SUBSCRIBE arm has a name, and
+/// so it can be unit-tested without a running loop. See that call site for why
+/// the guard exists: `add_local_client` is a refcount, `DELEGATE_SUBSCRIPTIONS`
+/// is a set, and wiring the network path in without this makes a re-subscribe
+/// leak demand.
+fn already_subscribed(
+    contract_id: &freenet_stdlib::prelude::ContractInstanceId,
+    delegate_key: &DelegateKey,
+) -> bool {
+    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+        .get(contract_id)
+        .is_some_and(|subs| subs.contains(delegate_key))
+}
+
+/// Build the terminal inbound message for a delegate network operation (#5542).
+///
+/// Pure, and deliberately separate from the code that RUNS the operation: the
+/// off-loop task, the resume handler and the `ParkGuard`'s
+/// panic/cancellation/timeout path all have to produce the same shapes, and
+/// three inlined copies is how a failure arm silently diverges from a success
+/// arm.
+fn contract_op_response_msg(
+    kind: delegate_park::ContractOpKind,
+    contract_id: freenet_stdlib::prelude::ContractInstanceId,
+    context: DelegateContext,
+    outcome: delegate_park::ContractOpOutcome,
+) -> InboundDelegateMsg<'static> {
+    use delegate_park::{ContractOpKind, ContractOpOutcome};
+    match (kind, outcome) {
+        (ContractOpKind::Get, ContractOpOutcome::Fetched(state)) => {
+            InboundDelegateMsg::GetContractResponse(GetContractResponse {
+                contract_id,
+                state,
+                context,
+            })
+        }
+        (ContractOpKind::Subscribe, ContractOpOutcome::Subscribed) => {
+            InboundDelegateMsg::SubscribeContractResponse(SubscribeContractResponse {
+                contract_id,
+                result: Ok(()),
+                context,
+            })
+        }
+        (ContractOpKind::Get, outcome) => {
+            // A GET that failed. `GetContractResponse` has no error channel, so
+            // this collapses to `state: None` and the delegate cannot tell it
+            // from a genuine NotFound — #5542 scope item 4, which needs a
+            // freenet-stdlib wire change. Logged at warn so the operator can,
+            // even though the delegate cannot.
+            if let ContractOpOutcome::Failed(err) = &outcome {
+                tracing::warn!(
+                    contract = %contract_id,
+                    error = %err,
+                    "Delegate network GET failed; the delegate is told \
+                     `state: None`, which it cannot distinguish from a genuine \
+                     NotFound (#5542 scope item 4)"
+                );
+            }
+            InboundDelegateMsg::GetContractResponse(GetContractResponse {
+                contract_id,
+                state: None,
+                context,
+            })
+        }
+        (ContractOpKind::Subscribe, outcome) => {
+            let err = match outcome {
+                ContractOpOutcome::Failed(err) => err,
+                // Unreachable by construction: only a GET produces `Fetched`.
+                // Reported rather than silently rewritten as a success, for the
+                // same reason the unexpected-response arm above is a failure.
+                other => {
+                    let _ = other;
+                    "delegate subscribe resolved with a non-subscribe outcome".to_string()
+                }
+            };
+            InboundDelegateMsg::SubscribeContractResponse(SubscribeContractResponse {
+                contract_id,
+                result: Err(err),
+                context,
+            })
+        }
+    }
+}
+
+/// Finish a resolved delegate network operation ON the loop (#5542).
+///
+/// The network work happened off-loop; what is left is the part that must be
+/// serial. For a successful SUBSCRIBE that is the `DELEGATE_SUBSCRIPTIONS`
+/// insert — done HERE and only on success, so the registry never claims a
+/// delivery path that was not established, and so the registry has exactly one
+/// writer on this path.
+fn apply_resolved_contract_op(
+    resolved: delegate_park::ResolvedContractOp,
+    delegate_key: &DelegateKey,
+) -> InboundDelegateMsg<'static> {
+    let delegate_park::ResolvedContractOp { pending, outcome } = resolved;
+    if matches!(
+        (pending.kind, &outcome),
+        (
+            delegate_park::ContractOpKind::Subscribe,
+            delegate_park::ContractOpOutcome::Subscribed
+        )
+    ) {
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+            .entry(pending.contract_id)
+            .or_default()
+            .insert(delegate_key.clone());
+        tracing::debug!(
+            contract = %pending.contract_id,
+            delegate_key = %delegate_key,
+            "Delegate subscribed to a contract this node had not seen: body \
+             bootstrapped, network subscription established, demand registered \
+             and the notification hook installed (#5542)"
+        );
+    }
+    contract_op_response_msg(pending.kind, pending.contract_id, pending.context, outcome)
+}
+
+/// Run one delegate-originated network operation, OFF the serial loop (#5542).
+///
+/// Both entry points are the node-internal ones that already exist and already
+/// take a bare `ContractInstanceId`, which is all a delegate has:
+///
+/// * GET -> `start_sub_op_get(.., return_contract_code: true)`. The code is
+///   requested so the contract arrives complete and the full `ContractKey` can
+///   be formed locally, which is what makes the delegate's next operation on
+///   that contract an ordinary local hit.
+/// * SUBSCRIBE -> `run_executor_subscribe`, which bootstraps the body,
+///   registers demand and establishes the network subscription. NOT the client
+///   `Get { subscribe: true }` path: that one needs a subscription listener
+///   channel, a client id and a request id, none of which a delegate has.
+///
+/// No timeout of its own. The caller wraps the whole off-loop body in
+/// `PARK_WORK_BUDGET` (75 s, under `PARK_TTL`), so an operation that outruns
+/// the budget is reported as unresolved by the `ParkGuard` and the delegate is
+/// told. A sub-op GET whose receiver is dropped that way continues in the
+/// background until `OPERATION_TTL` and leaks nothing; the same is already true
+/// of `Executor::local_state_or_from_network`.
+async fn run_contract_op_off_loop(
+    op_manager: std::sync::Arc<crate::node::OpManager>,
+    pending: &delegate_park::PendingContractOp,
+) -> delegate_park::ContractOpOutcome {
+    use delegate_park::{ContractOpKind, ContractOpOutcome};
+    match pending.kind {
+        ContractOpKind::Get => {
+            let (_tx, rx) = crate::operations::get::op_ctx_task::start_sub_op_get(
+                &op_manager,
+                pending.contract_id,
+                /* return_contract_code */ true,
+            );
+            match rx.await {
+                Ok(crate::operations::get::op_ctx_task::SubOpGetOutcome::Found(result)) => {
+                    ContractOpOutcome::Fetched(Some(result.state))
+                }
+                Ok(crate::operations::get::op_ctx_task::SubOpGetOutcome::NotFound(reason)) => {
+                    tracing::debug!(
+                        contract = %pending.contract_id,
+                        %reason,
+                        "Delegate network GET: contract not found on the network"
+                    );
+                    ContractOpOutcome::Fetched(None)
+                }
+                Ok(crate::operations::get::op_ctx_task::SubOpGetOutcome::Infra(err)) => {
+                    ContractOpOutcome::Failed(err.to_string())
+                }
+                Err(_) => ContractOpOutcome::Failed("sub-op GET task dropped".to_string()),
+            }
+        }
+        ContractOpKind::Subscribe => {
+            let executor_tx =
+                crate::message::Transaction::new::<crate::operations::subscribe::SubscribeMsg>();
+            match crate::operations::subscribe::run_executor_subscribe(
+                op_manager,
+                pending.contract_id,
+                executor_tx,
+            )
+            .await
+            {
+                Ok(()) => ContractOpOutcome::Subscribed,
+                Err(err) => ContractOpOutcome::Failed(err.to_string()),
+            }
+        }
+    }
+}
+
 /// Drive the permission prompts for one delegate iteration and build the
 /// `UserResponse` messages to feed back.
 ///
@@ -1040,6 +1227,16 @@ where
         // node does not hold. Their network fetch is off-loaded with the rest of
         // this iteration's slow work rather than awaited here (#5544 stall 1).
         let mut deferred_upserts: Vec<delegate_park::PendingUpsert> = Vec::new();
+        // Delegate GET/SUBSCRIBE requests naming a contract this node has never
+        // seen. Off-loaded with the rest of this iteration's slow work for the
+        // same reason as `deferred_upserts` (#5542) — the work is a network
+        // operation and this is the serial loop.
+        let mut pending_contract_ops: Vec<delegate_park::PendingContractOp> = Vec::new();
+        // Whether this executor can reach the network at all. `None` on the
+        // mock/in-process executors used by unit tests and by
+        // `handle_delegate_notification`'s test seams; those keep the
+        // pre-#5542 local-only answers rather than pretending to have tried.
+        let can_reach_network = contract_handler.executor().op_manager_handle().is_some();
 
         // Process PUT requests (fire-and-forget: upsert state, send result back).
         // This calls upsert_contract_state which stores locally AND automatically
@@ -1181,9 +1378,58 @@ where
                         }
                     }
                     None => {
-                        tracing::debug!(
+                        // #5542. The contract is not in the local store, which
+                        // until now ended the request: the delegate got
+                        // `state: None` and no attempt was ever made to reach
+                        // the network. That is what made a delegate's whole
+                        // reason for existing conditional on a browser tab
+                        // being open to prime the store first.
+                        //
+                        // NOT awaited here. This runs on the serial
+                        // `contract_handling` loop, and a sub-op GET runs to
+                        // SUB_OP_FETCH_TIMEOUT (120 s) — awaiting it inline
+                        // would freeze every GET, PUT, UPDATE, subscribe
+                        // registration and notification delivery on the node
+                        // for that long. Park instead and answer on the
+                        // resumed run, carrying the delegate's own
+                        // `DelegateContext` across the gap.
+                        if parking.is_some()
+                            && can_reach_network
+                            && pending_contract_ops.len()
+                                < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
+                        {
+                            pending_contract_ops.push(delegate_park::PendingContractOp {
+                                contract_id,
+                                kind: delegate_park::ContractOpKind::Get,
+                                context,
+                            });
+                            continue;
+                        }
+                        // REFUSED, never run inline: see
+                        // `MAX_NETWORK_CONTRACT_OPS_PER_PARK` and #5544's note
+                        // at its own park-cap fallback, which says in terms
+                        // that the fallback is not inheritable by a delegate
+                        // operation that reaches the network.
+                        //
+                        // The refusal is INVISIBLE TO THE DELEGATE, and that is
+                        // a real limitation rather than an oversight:
+                        // `GetContractResponse` carries `Option<WrappedState>`
+                        // and no error channel, so a refusal, a network
+                        // NotFound and an unreachable network are all `None`.
+                        // Fixing that is #5542 scope item 4 and needs a
+                        // freenet-stdlib wire change; faking a distinction here
+                        // would be worse than naming the gap.
+                        tracing::warn!(
                             contract = %contract_id,
-                            "Contract not found locally for delegate GetContractRequest"
+                            delegate_key = %delegate_key,
+                            can_reach_network,
+                            parking = parking.is_some(),
+                            inflight = pending_contract_ops.len(),
+                            "Refusing a delegate GET for a contract this node has \
+                             not seen: no network reach, or past \
+                             MAX_NETWORK_CONTRACT_OPS_PER_PARK. Answering with \
+                             `state: None`, which the delegate cannot tell from \
+                             a genuine NotFound (#5542 scope item 4)"
                         );
                         None
                     }
@@ -1378,24 +1624,105 @@ where
                 let contract_id = req.contract_id;
                 let context = req.context;
 
-                // Validate contract existence before registering (matches V2 host function behavior)
                 let result = if contract_handler
                     .executor()
                     .lookup_key(&contract_id)
                     .is_some()
                 {
-                    // Register subscription in the global registry
+                    // Contract is local: unchanged pre-#5542 behaviour. Register
+                    // the notification hook and answer.
                     crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
                         .entry(contract_id)
                         .or_default()
                         .insert(delegate_key.clone());
                     Ok(())
+                } else if already_subscribed(&contract_id, delegate_key) {
+                    // ALREADY HELD, so re-asserting it must be a no-op.
+                    //
+                    // This gate is load-bearing and is not obvious from the
+                    // code it guards. `run_executor_subscribe` ends in
+                    // `InterestManager::add_local_client`, which is a REFCOUNT
+                    // and is explicitly NOT idempotent (see the
+                    // `!is_renewal` gate at `operations/subscribe.rs`). The
+                    // registry it feeds, `DELEGATE_SUBSCRIPTIONS`, is a
+                    // `HashSet` — so the pre-#5542 arm was idempotent for free
+                    // and a delegate re-subscribing in a loop cost nothing.
+                    // Wiring the network path in without this gate makes each
+                    // repeat take another interest refcount for one logical
+                    // subscriber: demand that is never released, growing
+                    // without bound, on the exact path #5467 exists to make
+                    // trustworthy.
+                    Ok(())
+                } else if parking.is_some()
+                    && can_reach_network
+                    && pending_contract_ops.len()
+                        < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
+                    && !pending_contract_ops.iter().any(|op| {
+                        op.contract_id == contract_id
+                            && op.kind == delegate_park::ContractOpKind::Subscribe
+                    })
+                {
+                    // #5542. Subscribing to a contract this node has never seen
+                    // is the PRIMARY use case, not an edge case: a delegate that
+                    // wants to learn about a per-address contract after the tab
+                    // is closed has no other way to name it.
+                    //
+                    // OPENING THIS GATE ALONE WOULD SHIP THE FEATURE SILENT.
+                    // The arm above does one thing — insert into
+                    // `DELEGATE_SUBSCRIPTIONS` — which is a local notification
+                    // hook that nothing in `ring/` reads. It establishes no
+                    // network subscription, so a delegate would subscribe
+                    // successfully to a contract it has never seen and then
+                    // never hear anything, which is #5467's silent-on-both-sides
+                    // failure reintroduced one layer up. Three things have to
+                    // happen together, and `run_executor_subscribe` is chosen
+                    // because it is the one entry point that does all three:
+                    //
+                    //   1. bootstrap the contract body
+                    //      (`finalize_originator_subscribe` ->
+                    //      `fetch_contract_if_missing` -> `start_sub_op_get`),
+                    //   2. register demand (`interest_manager.add_local_client`,
+                    //      so the contract is kept alive rather than evicted out
+                    //      from under the subscription),
+                    //   3. establish the real network subscription.
+                    //
+                    // The notification hook (the `DELEGATE_SUBSCRIPTIONS`
+                    // insert) is then done on the loop when the park resumes, and
+                    // ONLY on success — so a failed subscribe leaves no hook
+                    // claiming a delivery path that does not exist.
+                    //
+                    // The last conjunct de-duplicates WITHIN this round trip;
+                    // `already_subscribed` covers repeats ACROSS round trips.
+                    // Both are needed for the refcount argument above to hold.
+                    pending_contract_ops.push(delegate_park::PendingContractOp {
+                        contract_id,
+                        kind: delegate_park::ContractOpKind::Subscribe,
+                        context,
+                    });
+                    continue;
                 } else {
-                    tracing::debug!(
+                    // REFUSED, never inline — same rule as the GET arm above.
+                    // Unlike GET, `SubscribeContractResponse.result` is a
+                    // `Result<(), String>`, so this refusal IS visible to the
+                    // delegate and says which of the three reasons it was.
+                    let why = if !can_reach_network {
+                        "this node has no network handle"
+                    } else if parking.is_none() {
+                        "delegate parking is unavailable on this executor"
+                    } else {
+                        "too many delegate network operations already in flight \
+                         (MAX_NETWORK_CONTRACT_OPS_PER_PARK)"
+                    };
+                    tracing::warn!(
                         contract = %contract_id,
-                        "Contract not found locally for delegate SubscribeContractRequest"
+                        delegate_key = %delegate_key,
+                        why,
+                        "Refusing a delegate SUBSCRIBE for a contract this node \
+                         has not seen (#5542)"
                     );
-                    Err("Contract not found".to_string())
+                    Err(format!(
+                        "cannot subscribe to a contract this node has not seen: {why}"
+                    ))
                 };
 
                 inbound_responses.push(InboundDelegateMsg::SubscribeContractResponse(
@@ -1624,11 +1951,15 @@ where
         // `process_outbound` and the WASM `process()` call has returned — and
         // the deferrable upsert has already rolled back its partial work. All
         // that is needed is to re-enter the delegate when the results arrive.
-        if !user_input_requests.is_empty() || !deferred_upserts.is_empty() {
+        if !user_input_requests.is_empty()
+            || !deferred_upserts.is_empty()
+            || !pending_contract_ops.is_empty()
+        {
             tracing::debug!(
                 delegate_key = %delegate_key,
                 prompts = user_input_requests.len(),
                 deferred_upserts = deferred_upserts.len(),
+                network_contract_ops = pending_contract_ops.len(),
                 "Off-loading slow delegate work from the contract-handling loop"
             );
 
@@ -1662,7 +1993,11 @@ where
                 // continuation points at: the prompts and the deferred upserts
                 // live for exactly as long as the park, and a single upsert can
                 // own a full state plus related contracts plus code.
-                let task_bytes = delegate_park::task_bytes(&user_input_requests, &deferred_upserts);
+                let task_bytes = delegate_park::task_bytes(
+                    &user_input_requests,
+                    &deferred_upserts,
+                    &pending_contract_ops,
+                );
                 match ctx
                     .park
                     .park(delegate_key.clone(), continuation, task_bytes)
@@ -1678,6 +2013,18 @@ where
                             .iter()
                             .map(|u| (*u.key.id(), u.is_put))
                             .collect();
+                        // Third owed category (#5542). Same discipline as the
+                        // two above: what the park OWES is recorded here, so
+                        // the guard can synthesize a terminal response on
+                        // EVERY exit — including a panic or cancellation, which
+                        // reach `Drop` and never run the task's own cleanup.
+                        let owed_contract_ops: Vec<(
+                            ContractInstanceId,
+                            delegate_park::ContractOpKind,
+                        )> = pending_contract_ops
+                            .iter()
+                            .map(|op| (op.contract_id, op.kind))
+                            .collect();
                         // SINKS CREATED BEFORE THE GUARD, AND SHARED WITH IT
                         // (#5544 F2). They used to be created inside the
                         // spawned future, so `ParkGuard::drop` could not see
@@ -1692,6 +2039,9 @@ where
                         let fetch_sink: std::sync::Arc<
                             std::sync::Mutex<Vec<delegate_park::ResolvedUpsert>>,
                         > = Default::default();
+                        let net_op_sink: std::sync::Arc<
+                            std::sync::Mutex<Vec<delegate_park::ResolvedContractOp>>,
+                        > = Default::default();
                         let guard = delegate_park::ParkGuard::new(
                             ctx.park.resume_tx().clone(),
                             delegate_key.clone(),
@@ -1700,12 +2050,15 @@ where
                             owed_upserts,
                             answers_sink.clone(),
                             fetch_sink.clone(),
+                            owed_contract_ops,
+                            net_op_sink.clone(),
                         );
                         let prompter = std::sync::Arc::clone(prompter);
                         let key = delegate_key.clone();
                         let op_manager = contract_handler.executor().op_manager_handle();
                         let prompts = std::mem::take(&mut user_input_requests);
                         let upserts = std::mem::take(&mut deferred_upserts);
+                        let net_ops = std::mem::take(&mut pending_contract_ops);
                         // Fire-and-forget is safe precisely because of the
                         // guard: it delivers exactly one resume even if this
                         // task is dropped, panics or is cancelled, so the park
@@ -1747,6 +2100,54 @@ where
                                 }))
                                 .await;
                             };
+                            // Delegate GET/SUBSCRIBE that must reach the network
+                            // (#5542). Concurrent with the prompts and the
+                            // related fetches, and under the same
+                            // PARK_WORK_BUDGET: run sequentially they could sum
+                            // past PARK_TTL, at which point the loop's backstop
+                            // would force-resume while this task was still
+                            // running and discard its result.
+                            //
+                            // Results land in the SHARED sink as they complete,
+                            // not at the end, so a budget expiry or a panic
+                            // still delivers the ones that finished — the same
+                            // reason the two sinks above are shared with the
+                            // guard (#5544 F2).
+                            let network_ops = async {
+                                let op_manager = op_manager.clone();
+                                futures::future::join_all(net_ops.into_iter().map(|pending| {
+                                    let op_manager = op_manager.clone();
+                                    let sink = net_op_sink.clone();
+                                    async move {
+                                        let Some(op_manager) = op_manager else {
+                                            // Unreachable: the arms only enqueue
+                                            // when `can_reach_network`. Recorded
+                                            // as a failure rather than dropped,
+                                            // so the delegate is told either way.
+                                            sink.lock().unwrap().push(
+                                                delegate_park::ResolvedContractOp {
+                                                    outcome:
+                                                        delegate_park::ContractOpOutcome::Failed(
+                                                            "no op manager on this executor"
+                                                                .to_string(),
+                                                        ),
+                                                    pending,
+                                                },
+                                            );
+                                            return;
+                                        };
+                                        let outcome =
+                                            run_contract_op_off_loop(op_manager, &pending).await;
+                                        sink.lock()
+                                            .unwrap()
+                                            .push(delegate_park::ResolvedContractOp {
+                                                pending,
+                                                outcome,
+                                            });
+                                    }
+                                }))
+                                .await;
+                            };
                             let answers = async {
                                 if !prompts.is_empty() {
                                     run_user_input_prompts(
@@ -1762,7 +2163,7 @@ where
                             };
                             let done =
                                 tokio::time::timeout(delegate_park::PARK_WORK_BUDGET, async {
-                                    tokio::join!(answers, fetches)
+                                    tokio::join!(answers, fetches, network_ops)
                                 })
                                 .await;
                             // The guard reads the sinks itself, so this path
@@ -1807,6 +2208,32 @@ where
                 }
             }
 
+            // #5542 network operations are REFUSED here, never run inline —
+            // the one place this function's inline fallback does not apply, and
+            // the park-cap fallback below says why in its own comment: a
+            // delegate GET or SUBSCRIBE awaited on this loop is a network
+            // operation of up to 120 s, not a self-inflicted 10-60 s local
+            // wait. Refusing loudly is the whole point; dropping them would
+            // leave the delegate waiting for a response nobody would send.
+            for pending in std::mem::take(&mut pending_contract_ops) {
+                tracing::warn!(
+                    contract = %pending.contract_id,
+                    delegate_key = %delegate_key,
+                    "Delegate network contract operation refused: no park was \
+                     available (cap reached, or no parking context). Refused \
+                     rather than awaited on the serial loop (#5542)"
+                );
+                let msg = contract_op_response_msg(
+                    pending.kind,
+                    pending.contract_id,
+                    pending.context,
+                    delegate_park::ContractOpOutcome::Failed(
+                        "no delegate park available for a network contract operation"
+                            .to_string(),
+                    ),
+                );
+                inbound_responses.push(msg);
+            }
             // Inline fallback: no parking context (direct unit-test calls), or
             // the park cap was hit.
             for pending in std::mem::take(&mut deferred_upserts) {
@@ -2077,6 +2504,8 @@ where
                     // own guard still fires and is rejected on epoch, so
                     // nothing is answered twice.
                     unresolved_upserts: Vec::new(),
+                    contract_ops: Vec::new(),
+                    unresolved_contract_ops: Vec::new(),
                 },
             )
             .await;
@@ -3420,6 +3849,8 @@ where
         inbound,
         upserts,
         unresolved_upserts,
+        contract_ops,
+        unresolved_contract_ops,
     } = resume;
 
     let Some((continuation, pending)) = park.take_matching(&delegate_key, epoch) else {
@@ -3485,6 +3916,30 @@ where
             Err(ExecutorError::other(anyhow::anyhow!(
                 "delegate upsert did not complete: its off-loop work ended early"
             ))),
+        ));
+    }
+    // Delegate network GET/SUBSCRIBE results (#5542). Nothing has to be re-run
+    // on the loop for these — the network work is done — but a successful
+    // SUBSCRIBE installs its `DELEGATE_SUBSCRIPTIONS` hook here, on the loop and
+    // only on success, so the registry never advertises a delivery path that was
+    // never established.
+    for resolved in contract_ops {
+        all_inbound.push(apply_resolved_contract_op(resolved, &delegate_key));
+    }
+    // Network operations the off-loop task never resolved (panic, cancellation,
+    // budget). Same reasoning as the unresolved upserts above: the delegate is
+    // TOLD rather than left waiting. `DelegateContext` is defaulted because the
+    // `PendingContractOp` that carried it is gone by then.
+    for (contract_id, kind) in unresolved_contract_ops {
+        all_inbound.push(contract_op_response_msg(
+            kind,
+            contract_id,
+            DelegateContext::default(),
+            delegate_park::ContractOpOutcome::Failed(
+                "delegate network contract operation did not complete: its \
+                 off-loop work ended early"
+                    .to_string(),
+            ),
         ));
     }
     all_inbound.extend(inbound);
