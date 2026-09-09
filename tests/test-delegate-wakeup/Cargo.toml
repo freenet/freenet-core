@@ -1,0 +1,23 @@
+[package]
+name = "test-delegate-wakeup"
+version = "0.1.0"
+edition = "2024"
+description = "Test delegate for host-side scheduled wakeups (freenet-core#3972)"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+# 0.10.0 and not the 0.3.5 the older fixtures pin: `InboundDelegateMsg::WakeupFired`
+# and `DelegateCtx::schedule_wakeup` are both new in it, and a delegate built
+# against an older stdlib could not decode the inbound variant at all.
+[dependencies]
+freenet-stdlib = { version = "0.10.0", features = ["contract"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+[features]
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []
+trace = ["freenet-stdlib/trace"]
