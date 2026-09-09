@@ -2010,9 +2010,11 @@ mod tests {
         let stale_at = ReDb::now_ms()
             .saturating_sub(ReDb::DELEGATE_SUBSCRIPTION_MAX_IDLE_MS)
             .saturating_sub(24 * 60 * 60 * 1000);
-        assert!(storage
-            .add_delegate_subscription_at(key.id(), &delegate, stale_at)
-            .expect("record the row"));
+        assert!(
+            storage
+                .add_delegate_subscription_at(key.id(), &delegate, stale_at)
+                .expect("record the row")
+        );
 
         let outcome = restore_persisted_subscriptions(
             &op_manager,

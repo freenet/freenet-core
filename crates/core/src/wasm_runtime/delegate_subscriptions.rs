@@ -232,9 +232,7 @@ pub(crate) fn restore_registration<S: DelegateSubscriptionPersistence + ?Sized>(
 /// restore can put its notification hook and its pin back. It touches only the
 /// durable set: at boot the in-memory registry is empty, so there is no second
 /// representation to keep in step.
-pub(crate) fn expire_stale<S: DelegateSubscriptionPersistence + ?Sized>(
-    db: &S,
-) -> (usize, usize) {
+pub(crate) fn expire_stale<S: DelegateSubscriptionPersistence + ?Sized>(db: &S) -> (usize, usize) {
     db.expire_stale_delegate_subscriptions()
 }
 

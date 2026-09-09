@@ -2196,11 +2196,12 @@ impl ReDb {
         let fresh_enough =
             self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
                 Ok(tbl) => Ok(match tbl.get(row_key.as_slice())? {
-                    Some(v) => Self::decode_delegate_subscription_stamp(v.value())
-                        .is_some_and(|affirmed| {
+                    Some(v) => Self::decode_delegate_subscription_stamp(v.value()).is_some_and(
+                        |affirmed| {
                             now_ms.saturating_sub(affirmed)
                                 < Self::DELEGATE_SUBSCRIPTION_STAMP_GRANULARITY_MS
-                        }),
+                        },
+                    ),
                     None => false,
                 }),
                 Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
@@ -3678,12 +3679,16 @@ mod tests {
         let now = 10 * horizon;
 
         // One row affirmed exactly at the horizon, one a millisecond inside it.
-        assert!(store
-            .add_delegate_subscription_at(&contract, &stale, now - horizon)
-            .unwrap());
-        assert!(store
-            .add_delegate_subscription_at(&contract, &recent, now - horizon + 1)
-            .unwrap());
+        assert!(
+            store
+                .add_delegate_subscription_at(&contract, &stale, now - horizon)
+                .unwrap()
+        );
+        assert!(
+            store
+                .add_delegate_subscription_at(&contract, &recent, now - horizon + 1)
+                .unwrap()
+        );
 
         let (expired, restamped) = store
             .expire_stale_delegate_subscriptions_at(now, horizon)
@@ -3764,18 +3769,22 @@ mod tests {
         let granularity = ReDb::DELEGATE_SUBSCRIPTION_STAMP_GRANULARITY_MS;
         let first = 1_000_000_000;
 
-        assert!(store
-            .add_delegate_subscription_at(&contract, &delegate, first)
-            .unwrap());
+        assert!(
+            store
+                .add_delegate_subscription_at(&contract, &delegate, first)
+                .unwrap()
+        );
         assert_eq!(stored_stamp(&store, &contract, &delegate), Some(first));
 
         // Inside the granularity: answered from the read transaction, so the
         // stamp does NOT move. This is the perf property
         // `a_repeat_delegate_subscription_returns_before_opening_a_write_transaction`
         // pins in the source, asserted here as behaviour.
-        assert!(store
-            .add_delegate_subscription_at(&contract, &delegate, first + granularity - 1)
-            .unwrap());
+        assert!(
+            store
+                .add_delegate_subscription_at(&contract, &delegate, first + granularity - 1)
+                .unwrap()
+        );
         assert_eq!(
             stored_stamp(&store, &contract, &delegate),
             Some(first),
@@ -3784,9 +3793,11 @@ mod tests {
 
         // Past it: the row is re-affirmed.
         let later = first + granularity;
-        assert!(store
-            .add_delegate_subscription_at(&contract, &delegate, later)
-            .unwrap());
+        assert!(
+            store
+                .add_delegate_subscription_at(&contract, &delegate, later)
+                .unwrap()
+        );
         assert_eq!(
             stored_stamp(&store, &contract, &delegate),
             Some(later),
@@ -3815,9 +3826,11 @@ mod tests {
 
         let first = 1_000_000_000;
         for n in 0..cap {
-            assert!(store
-                .add_delegate_subscription_at(&contract, &nth(n as u16), first)
-                .unwrap());
+            assert!(
+                store
+                    .add_delegate_subscription_at(&contract, &nth(n as u16), first)
+                    .unwrap()
+            );
         }
 
         let later = first + ReDb::DELEGATE_SUBSCRIPTION_STAMP_GRANULARITY_MS;
