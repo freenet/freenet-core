@@ -18,6 +18,7 @@ It also verifies the restore byte-for-byte and says so, because "I restored it"
 is a claim and this workstream has learned to distrust those.
 """
 import atexit
+import os
 import signal
 import subprocess
 import sys
@@ -28,7 +29,28 @@ WORKTREE = Path("/home/ian/code/freenet/freenet-core/fix-5554-followup")
 class Tree:
     """Holds pristine contents and guarantees they go back."""
 
+    #: One harness per worktree. Two of them mutating the same files interleave
+    #: their edits, so each restores correctly from its own snapshot and BOTH
+    #: produce garbage verdicts -- rows green or red for reasons unrelated to
+    #: the mutation each thinks it applied. I did exactly this: ran a
+    #: proof-of-restore against the tree a live campaign was using, and had to
+    #: discard the campaign. The tree was fine afterwards; the RESULTS were
+    #: worthless, which is much harder to notice than a dirty file.
+    LOCK = WORKTREE / ".park-mutation-harness.lock"
+
     def __init__(self, paths):
+        try:
+            # O_EXCL: fails if another harness already holds this worktree.
+            fd = os.open(self.LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            raise SystemExit(
+                f"another mutation harness holds {WORKTREE} (lock: {self.LOCK}). "
+                f"Two harnesses on one worktree interleave their mutations and "
+                f"both produce meaningless verdicts. Wait for it, or remove the "
+                f"lock if you are certain no run is live."
+            ) from None
+        os.write(fd, f"pid={os.getpid()}\n".encode())
+        os.close(fd)
         self.paths = [WORKTREE / p for p in paths]
         self.pristine = {p: p.read_bytes() for p in self.paths}
         self._armed = True
@@ -53,6 +75,7 @@ class Tree:
             print(f"!! RESTORE FAILED for {bad} -- WORKING TREE IS DIRTY", flush=True)
             return
         self._armed = False
+        self.LOCK.unlink(missing_ok=True)
 
     def mutate(self, path, old, new):
         """Apply a unique textual mutation; returns False if it does not match."""
@@ -84,18 +107,46 @@ def run_tests(tests):
 
 
 def campaign(tree, cases, sha):
-    print(f"mutation campaign at {sha}\n")
+    """Run every mutation, and make a TRUNCATED run impossible to read as a result.
+
+    The first version printed one row per case and nothing else. Four rows and
+    fifteen rows therefore looked equally complete, and a run that died
+    mid-campaign -- which happened, for a cause I could not afterwards
+    establish -- produced output indistinguishable from a short campaign that
+    finished. That is the same defect as the lost backup file one layer over: it
+    fails quietly and the failure looks like data.
+
+    So the count is declared UP FRONT, every row is numbered against it, and the
+    run ends with an explicit marker naming how many of how many reported. A
+    reader checks one line. Absent that line, the table is not evidence.
+    """
+    total = len(cases)
+    print(f"mutation campaign at {sha}")
+    print(f"CAMPAIGN START: {total} cases\n", flush=True)
     results = []
-    for label, path, old, new, tests, expect in cases:
+    for n, (label, path, old, new, tests, expect) in enumerate(cases, start=1):
         tree.reset()
         if not tree.mutate(path, old, new):
             verdict = "SKIP (pattern not unique)"
         else:
             verdict = run_tests(tests)
         ok = "ok " if verdict == expect else "!! "
-        print(f"{ok}{verdict:14} (want {expect:5}) {label}", flush=True)
+        print(f"[{n:2}/{total}] {ok}{verdict:14} (want {expect:5}) {label}", flush=True)
         results.append((label, verdict, expect))
+
     tree.reset()
     baseline = run_tests([t for c in cases for t in c[4]])
     print(f"\n{'ok ' if baseline == 'GREEN' else '!! '}{baseline:14} (want GREEN) restored baseline")
+
+    unexpected = [r for r in results if r[1] != r[2]]
+    complete = len(results) == total and baseline == "GREEN"
+    print(
+        f"\nCAMPAIGN COMPLETE: {len(results)}/{total} reported, "
+        f"{len(unexpected)} unexpected, baseline {baseline}",
+        flush=True,
+    )
+    if not complete or unexpected:
+        # Non-zero so a wrapper cannot mistake a bad campaign for a good one
+        # either. A caller that only reads stdout still has the marker.
+        sys.exit(1)
     return results
