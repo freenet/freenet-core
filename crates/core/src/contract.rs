@@ -8079,7 +8079,7 @@ mod hol_4391_tests {
             .lock()
             .unwrap()
             .iter()
-            .any(|o| o.inbound_kinds.iter().any(|k| *k == "SubscribeContractResponse"));
+            .any(|o| o.inbound_kinds.contains(&"SubscribeContractResponse"));
         assert!(
             saw_response,
             "the delegate must be fed a SubscribeContractResponse even when the \
