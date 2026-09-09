@@ -181,14 +181,45 @@ mod tests {
     /// inside `UnregisterDelegate` / notification-dispatch paths that need a
     /// live executor and a live notification channel to reach. If you make
     /// those reachable in a unit test, replace these.
+    ///
+    /// TWO VACUITY TRAPS this pin walked into and now avoids, both of which
+    /// `contract.rs`'s pin helpers were written for after the same defects
+    /// shipped there (#5450 and the #5554-era pins):
+    ///
+    /// * **A commented-out call is still text.** Without stripping comments a
+    ///   scrape cannot tell `foo();` from `// foo();`, so it stays green over a
+    ///   call that no longer runs — and commenting a line out is exactly what
+    ///   someone does while debugging, which is precisely when the pin is the
+    ///   only thing still watching.
+    /// * **An unbounded search passes if the call merely MOVES.** Searching a
+    ///   whole file, or the entire suffix after a match arm's opener, is
+    ///   satisfied by the call existing anywhere later in the file — including
+    ///   in a function that never runs on this path. Each search is now bounded
+    ///   to the region that has to contain it.
     #[test]
     fn every_subscription_removal_site_releases_its_interest() {
+        /// Comment-stripped text between `start` and the next `end` after it.
+        /// Panics rather than returning empty if either anchor is missing, so a
+        /// rename fails the pin loudly instead of vacuously passing it.
+        fn region(src: &str, start: &str, end: &str) -> String {
+            let stripped = crate::contract::tests::strip_comments(src);
+            let from = stripped
+                .find(start)
+                .unwrap_or_else(|| panic!("anchor `{start}` must exist"));
+            let rest = &stripped[from + start.len()..];
+            let to = rest
+                .find(end)
+                .unwrap_or_else(|| panic!("closing anchor `{end}` must follow `{start}`"));
+            rest[..to].to_string()
+        }
+
         // `UnregisterDelegate` — an ORDINARY operation, not an edge case.
-        let delegates = include_str!("../contract/executor/runtime/delegates.rs");
-        let unregister = delegates
-            .split("DelegateRequest::UnregisterDelegate(key) => {")
-            .nth(1)
-            .expect("the UnregisterDelegate arm must exist");
+        // Bounded to that match arm: the next arm's opener ends it.
+        let unregister = region(
+            include_str!("../contract/executor/runtime/delegates.rs"),
+            "DelegateRequest::UnregisterDelegate(key) => {",
+            "DelegateRequest::ApplicationMessages {",
+        );
         assert!(
             unregister.contains("delegate_interest::release_delegate(&key)"),
             "UnregisterDelegate drops the delegate from every subscription entry, \
@@ -197,18 +228,42 @@ mod tests {
              `cleanup_contract_if_no_interest` never fires (#5542)"
         );
 
-        // Contract removal.
-        let store = include_str!("contract_store.rs");
+        // Contract removal, bounded to `ContractStore::remove_contract`.
+        let remove_contract = region(
+            include_str!("contract_store.rs"),
+            "pub fn remove_contract(&mut self, key: &ContractKey) -> RuntimeResult<()> {",
+            "\n    pub fn ",
+        );
         assert!(
-            store.contains("delegate_interest::release_contract(key.id())"),
+            remove_contract.contains("delegate_interest::release_contract(key.id())"),
             "removing a contract drops its delegate subscriptions, so it must \
              release the interest they took (#5542)"
         );
 
-        // Notification-channel-closed cleanup.
-        let executor = include_str!("../contract/executor/runtime/executor_impl.rs");
+        // The simulation/mock backend must agree with the production store, or
+        // a simulation models a node that behaves differently from the shipped
+        // one. It diverged from #3251 until #5542 found it.
+        let in_memory_remove = region(
+            include_str!("simulation_runtime.rs"),
+            "pub fn remove_contract(&self, key: &ContractKey) -> Result<(), anyhow::Error> {",
+            "\n    pub fn ",
+        );
         assert!(
-            executor.contains("delegate_interest::release_contract(&instance_id)"),
+            in_memory_remove.contains("delegate_interest::release_contract(key.id())"),
+            "`InMemoryContractStore::remove_contract` must release delegate \
+             interest exactly as the production `ContractStore` does; a backend \
+             that diverges here makes every simulation model a node that behaves \
+             differently from the one that ships (#5542)"
+        );
+
+        // Notification-channel-closed cleanup, bounded to its own function.
+        let notify = region(
+            include_str!("../contract/executor/runtime/executor_impl.rs"),
+            "fn send_delegate_contract_notifications(&self, key: &ContractKey, new_state: &WrappedState) {",
+            "async fn fetch_related_for_validation(",
+        );
+        assert!(
+            notify.contains("delegate_interest::release_contract(&instance_id)"),
             "channel-closed cleanup removes every subscription for the contract, \
              so it must release the interest they took (#5542)"
         );
@@ -219,12 +274,14 @@ mod tests {
     /// inert while looking present.
     #[test]
     fn the_subscribe_path_records_the_obligation_it_incurs() {
-        let contract = include_str!("../contract.rs");
+        let contract = crate::contract::tests::strip_comments(include_str!("../contract.rs"));
         let body = contract
             .split("fn apply_resolved_contract_op<CH>(")
             .nth(1)
             .expect("apply_resolved_contract_op must exist");
-        let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+        let body = &body[..body
+            .find("\nfn ")
+            .expect("apply_resolved_contract_op must be followed by another fn")];
         assert!(
             body.contains("delegate_interest::record("),
             "the site that installs the DELEGATE_SUBSCRIPTIONS hook after a \

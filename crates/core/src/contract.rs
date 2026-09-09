@@ -5265,7 +5265,7 @@ pub(crate) enum ContractError {
 
 #[cfg(test)]
 #[allow(clippy::wildcard_enum_match_arm)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::GlobalExecutor;
     use std::time::Duration;
@@ -5421,7 +5421,7 @@ mod tests {
     /// of that line is dropped; and Rust block comments nest, which this does
     /// not model. Either can only REMOVE text a pin looks for, turning a pin
     /// red rather than green — never the reverse.
-    pub(super) fn strip_comments(src: &str) -> String {
+    pub(crate) fn strip_comments(src: &str) -> String {
         enum S {
             Code,
             Line,
