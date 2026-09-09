@@ -1387,6 +1387,33 @@ mod tests {
 
     use crate::ring::cost_pressure_seam_tests::seam_fixture;
 
+    /// Serialises every test in this module that records a delegate pin
+    /// OUTCOME.
+    ///
+    /// `record_delegate_pin_outcome` writes to the process-global
+    /// `NETWORK_STATUS` singleton, and
+    /// `pin_outcomes_are_counted_separately_by_reason` asserts on EXACT deltas
+    /// across it — including that unrelated reasons did NOT move, which is the
+    /// assertion that gives the per-reason split its meaning. Under plain
+    /// `cargo test` this module's tests share one process and run
+    /// concurrently, so any other pin registration or refusal in flight moves
+    /// those counters underneath it.
+    ///
+    /// CI runs `cargo nextest`, which gives each test its own process and so
+    /// cannot see this at any repeat count — the exact blind spot
+    /// `.claude/rules/testing.md` describes. `AGENTS.md` tells contributors to
+    /// run `cargo test`, which can, so the lock is not optional decoration.
+    ///
+    /// Every test below that calls `register_subscription` or one of the drop
+    /// helpers takes it. `tokio::sync::Mutex` rather than `std`: it is held
+    /// across `.await`, and it does not poison, so one failing test does not
+    /// convert the rest into confusing lock-poisoning failures.
+    static PIN_OUTCOMES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn pin_outcome_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        PIN_OUTCOMES.lock().await
+    }
+
     fn contract_key(seed: u8) -> ContractKey {
         ContractKey::from_id_and_code(
             freenet_stdlib::prelude::ContractInstanceId::new([seed; 32]),
@@ -1396,6 +1423,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn delegate_subscription_registers_demand_in_the_local_tier() {
+        let _pin_outcomes = pin_outcome_guard().await;
         let fixture = seam_fixture("delegate-demand-4669-registers").await;
         let op_manager = fixture.op_manager.clone();
         let ring = &op_manager.ring;
@@ -1467,6 +1495,7 @@ mod tests {
     /// `.claude/rules/testing.md` warns about.
     #[tokio::test(flavor = "multi_thread")]
     async fn demand_is_not_registered_for_a_hosted_contract_with_no_state() {
+        let _pin_outcomes = pin_outcome_guard().await;
         use crate::contract::storages::{HostingMetadata, ReDb};
         use freenet_stdlib::prelude::WrappedState;
 
@@ -1538,8 +1567,541 @@ mod tests {
         assert!(ring.contract_in_use(&with_state));
     }
 
+    // =====================================================================
+    // Restart durability (#4669 part 2).
+    //
+    // A restart drops exactly two things these tests have to reproduce: the
+    // process-global notification registry, and the `Ring`'s in-memory demand.
+    // It does NOT drop the redb database. So a "restart" here is a FRESH
+    // fixture (new `OpManager`, new `Ring`, no demand) plus
+    // `clear_in_memory_for` on the registry, pointed at the SAME on-disk
+    // storage. Building a second real node would exercise process startup,
+    // which is not what is under test and cannot observe ring demand anyway
+    // (see the block comment above the falsifier tests).
+    //
+    // `an_in_memory_only_subscription_does_not_survive_a_restart` is the
+    // control that keeps this harness honest: it drives the same restart with
+    // the PRE-#4669-part-2 write (registry only, nothing on disk) and asserts
+    // the pin is gone. Without it, a restart harness that silently failed to
+    // clear anything would let the durability test pass for the wrong reason.
+    // =====================================================================
+
+    /// A contract this node hosts, with real state on disk, in a real redb.
+    ///
+    /// Wires REAL storage rather than the fixture's, for the same reason
+    /// `demand_is_not_registered_for_a_hosted_contract_with_no_state` does:
+    /// `contract_state_present` is conservative when the storage handle is
+    /// unset, so a test that skipped this would pass with the gate deleted.
+    async fn hosted_contract_on_real_storage(
+        ring: &crate::ring::Ring,
+        storage: &crate::contract::storages::ReDb,
+        key: ContractKey,
+    ) {
+        use crate::contract::storages::HostingMetadata;
+        use freenet_stdlib::prelude::WrappedState;
+
+        storage
+            .store_state_sync(&key, WrappedState::new(vec![7, 7, 7]))
+            .expect("store state");
+        storage
+            .store_hosting_metadata(&key, HostingMetadata::new(0, 0, 0, **key.code_hash(), true))
+            .expect("store hosting metadata");
+        ring.set_hosting_storage(storage.clone());
+        ring.load_hosting_cache(storage, |_id| None)
+            .expect("load_hosting_cache");
+        assert!(ring.is_hosting_contract(&key), "precondition");
+        assert!(ring.contract_state_present(&key), "precondition");
+    }
+
+    /// The headline guarantee: subscribe, restart, and the pin is still there
+    /// **without the app reconnecting** (#4669 part 2).
+    ///
+    /// Nothing in this test re-subscribes after the restart. That is the whole
+    /// point: a delegate only runs when something invokes it, and the thing
+    /// that would invoke it is a notification on the contract whose pin the
+    /// restart dropped. If the pin does not come back on its own, it does not
+    /// come back until the user reopens the app — which is precisely the case
+    /// the delegate exists to cover.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delegate_pin_survives_a_node_restart() {
+        let _pin_outcomes = pin_outcome_guard().await;
+        use crate::contract::storages::ReDb;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: ReDb = ReDb::new(dir.path()).await.expect("open redb");
+
+        let key = contract_key(41);
+        let delegate = delegate_key(42);
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+
+        // ---- session 1 -------------------------------------------------
+        let first = seam_fixture("delegate-demand-4669-restart-before").await;
+        let op_manager = first.op_manager.clone();
+        hosted_contract_on_real_storage(&op_manager.ring, &storage, key).await;
+
+        // Exactly what a subscribe does: one call, both representations.
+        assert!(crate::wasm_runtime::delegate_subscriptions::register(
+            Some(&storage),
+            key.id(),
+            &delegate,
+        ));
+        assert!(register_subscription(&op_manager, &delegate, &key));
+        assert!(
+            op_manager.ring.contract_in_use(&key),
+            "precondition: the pin exists before the restart"
+        );
+
+        // ---- restart ---------------------------------------------------
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+        drop(first);
+
+        let second = seam_fixture("delegate-demand-4669-restart-after").await;
+        let restarted = second.op_manager.clone();
+        hosted_contract_on_real_storage(&restarted.ring, &storage, key).await;
+        assert!(
+            !restarted.ring.contract_in_use(&key),
+            "precondition: a fresh ring holds no demand — if this fires the \
+             restart is not being reproduced and the assertion below is vacuous"
+        );
+
+        // ---- boot restore ----------------------------------------------
+        let outcome = restore_persisted_subscriptions(
+            &restarted,
+            &storage,
+            |id| (id == key.id()).then_some(key),
+            |_| true,
+        );
+
+        assert_eq!(
+            outcome,
+            RestoreOutcome {
+                restored: 1,
+                pinned: 1,
+                dropped_delegate_gone: 0,
+                dropped_contract_gone: 0,
+            }
+        );
+        assert!(
+            restarted.ring.contract_in_use(&key),
+            "#4669 part 2: a delegate's pin must survive a node restart, with \
+             no re-subscribe from the app"
+        );
+        assert!(
+            restarted.ring.contracts_needing_renewal().contains(&key),
+            "the restored pin must also put the contract back in the renewal \
+             set — a pin that is not renewed drops out of the update mesh"
+        );
+        assert!(
+            crate::wasm_runtime::delegate_subscriptions::test_support::is_registered(
+                key.id(),
+                &delegate
+            ),
+            "the notification hook must be restored too; a pin with no hook is \
+             the divergence #5487 describes"
+        );
+    }
+
+    /// The control for the test above: the PRE-#4669-part-2 write does NOT
+    /// survive.
+    ///
+    /// This exists so the restart harness cannot pass vacuously. If a future
+    /// change made `clear_in_memory_for` or the fresh fixture stop reproducing
+    /// a restart, this test goes green-for-the-wrong-reason first and fails,
+    /// rather than the durability test silently passing on stale state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_in_memory_only_subscription_does_not_survive_a_restart() {
+        let _pin_outcomes = pin_outcome_guard().await;
+        use crate::contract::storages::ReDb;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: ReDb = ReDb::new(dir.path()).await.expect("open redb");
+
+        let key = contract_key(43);
+        let delegate = delegate_key(44);
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+
+        let first = seam_fixture("delegate-demand-4669-restart-control-before").await;
+        let op_manager = first.op_manager.clone();
+        hosted_contract_on_real_storage(&op_manager.ring, &storage, key).await;
+
+        // The old behaviour: registry only, nothing on disk.
+        crate::wasm_runtime::delegate_subscriptions::test_support::register_in_memory_only(
+            key.id(),
+            &delegate,
+        );
+        assert!(register_subscription(&op_manager, &delegate, &key));
+        assert!(op_manager.ring.contract_in_use(&key), "precondition");
+
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+        drop(first);
+
+        let second = seam_fixture("delegate-demand-4669-restart-control-after").await;
+        let restarted = second.op_manager.clone();
+        hosted_contract_on_real_storage(&restarted.ring, &storage, key).await;
+
+        let outcome = restore_persisted_subscriptions(
+            &restarted,
+            &storage,
+            |id| (id == key.id()).then_some(key),
+            |_| true,
+        );
+
+        assert_eq!(
+            outcome,
+            RestoreOutcome::default(),
+            "an in-memory-only subscription leaves nothing on disk, so boot \
+             restore has nothing to find — this is the bug #4669 part 2 fixes"
+        );
+        assert!(
+            !restarted.ring.contract_in_use(&key),
+            "the pre-#4669-part-2 pin must be GONE after a restart. If this \
+             fires, the restart harness is not clearing what a restart clears, \
+             and `a_delegate_pin_survives_a_node_restart` proves nothing"
+        );
+    }
+
+    /// A row whose delegate was uninstalled while the node was down is DROPPED
+    /// from disk, not restored.
+    ///
+    /// Restoring it would create a pin nothing can ever release: the delegate
+    /// that would `UnregisterDelegate` it does not exist, so the pin would be
+    /// re-created at every subsequent boot, forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn boot_reconciliation_drops_a_subscription_whose_delegate_is_gone() {
+        let _pin_outcomes = pin_outcome_guard().await;
+        use crate::contract::storages::ReDb;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: ReDb = ReDb::new(dir.path()).await.expect("open redb");
+
+        let key = contract_key(45);
+        let delegate = delegate_key(46);
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+
+        let fixture = seam_fixture("delegate-demand-4669-reconcile-delegate").await;
+        let op_manager = fixture.op_manager.clone();
+        hosted_contract_on_real_storage(&op_manager.ring, &storage, key).await;
+        assert!(crate::wasm_runtime::delegate_subscriptions::register(
+            Some(&storage),
+            key.id(),
+            &delegate,
+        ));
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+
+        let outcome = restore_persisted_subscriptions(
+            &op_manager,
+            &storage,
+            |id| (id == key.id()).then_some(key),
+            // The delegate is gone: uninstalled while the node was down.
+            |_| false,
+        );
+
+        assert_eq!(
+            outcome,
+            RestoreOutcome {
+                restored: 0,
+                pinned: 0,
+                dropped_delegate_gone: 1,
+                dropped_contract_gone: 0,
+            }
+        );
+        assert!(!op_manager.ring.contract_in_use(&key));
+        assert!(
+            crate::wasm_runtime::delegate_subscriptions::load_persisted(&storage)
+                .expect("read back")
+                .is_empty(),
+            "the stale row must be gone from DISK, not merely skipped — a row \
+             that survives is restored again at the next boot and every boot \
+             after it"
+        );
+    }
+
+    /// A row whose contract has left the contract store is DROPPED from disk.
+    ///
+    /// Same reasoning as the delegate case: with no contract there is no
+    /// eviction that could ever release the pin.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn boot_reconciliation_drops_a_subscription_whose_contract_is_gone() {
+        let _pin_outcomes = pin_outcome_guard().await;
+        use crate::contract::storages::ReDb;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: ReDb = ReDb::new(dir.path()).await.expect("open redb");
+
+        let key = contract_key(47);
+        let delegate = delegate_key(48);
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+
+        let fixture = seam_fixture("delegate-demand-4669-reconcile-contract").await;
+        let op_manager = fixture.op_manager.clone();
+        hosted_contract_on_real_storage(&op_manager.ring, &storage, key).await;
+        assert!(crate::wasm_runtime::delegate_subscriptions::register(
+            Some(&storage),
+            key.id(),
+            &delegate,
+        ));
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+
+        let outcome = restore_persisted_subscriptions(
+            &op_manager,
+            &storage,
+            // The contract's code is no longer in the contract store.
+            |_| None,
+            |_| true,
+        );
+
+        assert_eq!(
+            outcome,
+            RestoreOutcome {
+                restored: 0,
+                pinned: 0,
+                dropped_delegate_gone: 0,
+                dropped_contract_gone: 1,
+            }
+        );
+        assert!(
+            crate::wasm_runtime::delegate_subscriptions::load_persisted(&storage)
+                .expect("read back")
+                .is_empty()
+        );
+    }
+
+    /// A subscription whose contract is no longer HOSTED is kept on disk and
+    /// restored WITHOUT a pin.
+    ///
+    /// This is the one reconciliation outcome that is not a drop, and the
+    /// distinction matters: "not hosted" is a state the node recovers from,
+    /// and something can still release the row (the delegate exists, the
+    /// contract exists). Dropping it would silently unsubscribe a delegate
+    /// because its contract happened to be evicted before a restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restored_subscription_for_an_unhosted_contract_keeps_its_row_but_gets_no_pin() {
+        let _pin_outcomes = pin_outcome_guard().await;
+        use crate::contract::storages::ReDb;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: ReDb = ReDb::new(dir.path()).await.expect("open redb");
+
+        let key = contract_key(49);
+        let delegate = delegate_key(50);
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+
+        let fixture = seam_fixture("delegate-demand-4669-restore-unhosted").await;
+        let op_manager = fixture.op_manager.clone();
+        // Deliberately NOT hosted: no hosting metadata, no state row.
+        assert!(!op_manager.ring.is_hosting_contract(&key), "precondition");
+        assert!(crate::wasm_runtime::delegate_subscriptions::register(
+            Some(&storage),
+            key.id(),
+            &delegate,
+        ));
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+
+        let outcome = restore_persisted_subscriptions(
+            &op_manager,
+            &storage,
+            |id| (id == key.id()).then_some(key),
+            |_| true,
+        );
+
+        assert_eq!(
+            outcome,
+            RestoreOutcome {
+                restored: 1,
+                pinned: 0,
+                dropped_delegate_gone: 0,
+                dropped_contract_gone: 0,
+            }
+        );
+        assert!(!op_manager.ring.contract_in_use(&key));
+        assert!(
+            crate::wasm_runtime::delegate_subscriptions::test_support::is_registered(
+                key.id(),
+                &delegate
+            ),
+            "the notification hook is restored even with no pin — the delegate \
+             still wants to be told about changes"
+        );
+        assert_eq!(
+            crate::wasm_runtime::delegate_subscriptions::load_persisted(&storage)
+                .expect("read back")
+                .len(),
+            1,
+            "the row must SURVIVE: an unhosted contract is a state the node \
+             recovers from, so this is not a stale entry"
+        );
+    }
+
+    /// `UnregisterDelegate`'s teardown reaches the durable copy.
+    ///
+    /// A cleanup path that clears only the in-memory registry leaves a row that
+    /// boot restore resurrects at every subsequent boot, pinning a contract for
+    /// a delegate that no longer exists. This asserts on DISK, which is the
+    /// half a registry-only teardown would leave behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_a_delegate_clears_its_durable_subscriptions() {
+        use crate::contract::storages::ReDb;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: ReDb = ReDb::new(dir.path()).await.expect("open redb");
+
+        let kept = contract_key(51);
+        let dropped_a = contract_key(52);
+        let dropped_b = contract_key(53);
+        let leaving = delegate_key(54);
+        let staying = delegate_key(55);
+
+        for c in [dropped_a, dropped_b] {
+            assert!(crate::wasm_runtime::delegate_subscriptions::register(
+                Some(&storage),
+                c.id(),
+                &leaving,
+            ));
+        }
+        assert!(crate::wasm_runtime::delegate_subscriptions::register(
+            Some(&storage),
+            kept.id(),
+            &staying,
+        ));
+
+        let affected =
+            crate::wasm_runtime::delegate_subscriptions::forget_delegate(Some(&storage), &leaving);
+        assert_eq!(affected.len(), 2);
+
+        let remaining = crate::wasm_runtime::delegate_subscriptions::load_persisted(&storage)
+            .expect("read back");
+        assert_eq!(
+            remaining,
+            vec![(*kept.id(), staying.clone())],
+            "only the departing delegate's rows may go, and they must go from \
+             disk — the other delegate's subscription is untouched"
+        );
+    }
+
+    /// Removing a contract clears its durable subscriptions.
+    ///
+    /// `ContractStore::remove_contract` is the one teardown site with no
+    /// `OpManager` to reach, which is why it was the site most likely to be
+    /// left writing only half the record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_a_contract_clears_its_durable_subscriptions() {
+        use crate::contract::storages::ReDb;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: ReDb = ReDb::new(dir.path()).await.expect("open redb");
+
+        let removed = contract_key(56);
+        let kept = contract_key(57);
+        let one = delegate_key(58);
+        let two = delegate_key(59);
+
+        for d in [&one, &two] {
+            assert!(crate::wasm_runtime::delegate_subscriptions::register(
+                Some(&storage),
+                removed.id(),
+                d,
+            ));
+        }
+        assert!(crate::wasm_runtime::delegate_subscriptions::register(
+            Some(&storage),
+            kept.id(),
+            &one,
+        ));
+
+        let gone = crate::wasm_runtime::delegate_subscriptions::forget_contract(
+            Some(&storage),
+            removed.id(),
+        );
+        assert_eq!(gone.len(), 2);
+
+        let remaining = crate::wasm_runtime::delegate_subscriptions::load_persisted(&storage)
+            .expect("read back");
+        assert_eq!(remaining, vec![(*kept.id(), one.clone())]);
+    }
+
+    /// Re-recording the same subscription is a no-op in both representations.
+    ///
+    /// Boot restore re-registers every surviving row through the same writer a
+    /// live subscribe uses, so a non-idempotent durable write would grow the
+    /// table by one row per boot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recording_the_same_subscription_twice_writes_one_row() {
+        use crate::contract::storages::ReDb;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: ReDb = ReDb::new(dir.path()).await.expect("open redb");
+
+        let key = contract_key(60);
+        let delegate = delegate_key(62);
+        for _ in 0..3 {
+            assert!(crate::wasm_runtime::delegate_subscriptions::register(
+                Some(&storage),
+                key.id(),
+                &delegate,
+            ));
+        }
+        assert_eq!(
+            crate::wasm_runtime::delegate_subscriptions::load_persisted(&storage)
+                .expect("read back")
+                .len(),
+            1
+        );
+    }
+
+    /// Dropping a delegate's demand records the abandonment stamp.
+    ///
+    /// `Ring::remove_client_subscription`'s reason to exist is that it stamps
+    /// abandonment, and nothing asserted it: two mutations of that line
+    /// survived the whole suite, because `maybe_record_abandonment`
+    /// short-circuits internally. The `abandoned_at_is_set` accessor was added
+    /// for this assertion and then never used; this is the assertion.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_delegates_demand_stamps_abandonment() {
+        let _pin_outcomes = pin_outcome_guard().await;
+        let fixture = seam_fixture("delegate-demand-4669-abandonment").await;
+        let op_manager = fixture.op_manager.clone();
+        let ring = &op_manager.ring;
+
+        let key = contract_key(63);
+        let delegate = delegate_key(64);
+        let _ = ring.host_contract(
+            key,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        assert!(
+            !ring.abandoned_at_is_set(&key),
+            "precondition: nothing has been abandoned yet"
+        );
+
+        assert!(register_subscription(&op_manager, &delegate, &key));
+        assert!(
+            !ring.abandoned_at_is_set(&key),
+            "precondition: holding a pin is not abandonment"
+        );
+
+        // The per-contract drop, because that is the path that goes through
+        // `Ring::remove_client_subscription` — the method whose reason to
+        // exist is the stamp. (`drop_delegate_demand` goes through
+        // `remove_client_from_all_subscriptions`, which stamps only for
+        // contracts that also have a live network subscription.)
+        drop_subscriptions_for_contract(&op_manager, [&delegate], &key);
+        assert!(
+            !ring.contract_in_use(&key),
+            "precondition: the demand really was dropped"
+        );
+        assert!(
+            ring.abandoned_at_is_set(&key),
+            "releasing the last demand on a contract must stamp abandonment — \
+             that stamp is the whole reason `remove_client_subscription` exists \
+             rather than a bare map removal"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn demand_is_not_registered_for_a_contract_the_node_does_not_host() {
+        let _pin_outcomes = pin_outcome_guard().await;
         let fixture = seam_fixture("delegate-demand-4669-unhosted").await;
         let op_manager = fixture.op_manager.clone();
         let ring = &op_manager.ring;
@@ -1578,6 +2140,7 @@ mod tests {
     /// making this test pass for the wrong reason.
     #[tokio::test(start_paused = true)]
     async fn a_contract_bounds_delegates_and_clients_against_one_subscriber_cap() {
+        let _pin_outcomes = pin_outcome_guard().await;
         let fixture = seam_fixture("delegate-demand-4669-contract-cap").await;
         let op_manager = fixture.op_manager.clone();
         let ring = &op_manager.ring;
@@ -1654,6 +2217,7 @@ mod tests {
     /// refused once the node is full.
     #[tokio::test(start_paused = true)]
     async fn the_node_wide_backstop_binds_across_delegates() {
+        let _pin_outcomes = pin_outcome_guard().await;
         let fixture = seam_fixture("delegate-demand-4669-node-cap").await;
         let op_manager = fixture.op_manager.clone();
         let ring = &op_manager.ring;
@@ -1715,6 +2279,7 @@ mod tests {
     /// outrank — never fires for it.
     #[tokio::test(start_paused = true)]
     async fn a_delegate_pin_does_not_veto_cost_pressure_eviction() {
+        let _pin_outcomes = pin_outcome_guard().await;
         let fixture = seam_fixture("delegate-demand-4669-cost").await;
         let op_manager = fixture.op_manager.clone();
         let ring = &op_manager.ring;
@@ -1767,6 +2332,7 @@ mod tests {
     /// whether it represents a rounding error or the whole workload.
     #[tokio::test(start_paused = true)]
     async fn pin_outcomes_are_counted_separately_by_reason() {
+        let _pin_outcomes = pin_outcome_guard().await;
         // The counters live on the `NETWORK_STATUS` singleton, which the seam
         // fixture does not initialise — `record_delegate_pin_outcome` is a
         // silent no-op until it is. Same idiom as
@@ -1861,6 +2427,7 @@ mod tests {
     /// collapse decision, for a contract this delegate never pinned.
     #[tokio::test(start_paused = true)]
     async fn dropping_demand_that_was_never_held_changes_nothing() {
+        let _pin_outcomes = pin_outcome_guard().await;
         let fixture = seam_fixture("delegate-demand-4669-noop-drop").await;
         let op_manager = fixture.op_manager.clone();
         let ring = &op_manager.ring;
@@ -1903,6 +2470,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn dropping_one_delegates_demand_leaves_another_delegates_intact() {
+        let _pin_outcomes = pin_outcome_guard().await;
         let fixture = seam_fixture("delegate-demand-4669-independent").await;
         let op_manager = fixture.op_manager.clone();
         let ring = &op_manager.ring;
@@ -1955,6 +2523,7 @@ mod tests {
     /// source-scrape pin below would have noticed it going wrong.
     #[tokio::test(start_paused = true)]
     async fn dropping_one_contract_leaves_the_delegates_other_pins_intact() {
+        let _pin_outcomes = pin_outcome_guard().await;
         let fixture = seam_fixture("delegate-demand-4669-drop-one-contract").await;
         let op_manager = fixture.op_manager.clone();
         let ring = &op_manager.ring;
@@ -2012,6 +2581,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn unregistering_a_delegate_drops_every_contract_it_pinned() {
+        let _pin_outcomes = pin_outcome_guard().await;
         let fixture = seam_fixture("delegate-demand-4669-unregister").await;
         let op_manager = fixture.op_manager.clone();
         let ring = &op_manager.ring;
@@ -2048,6 +2618,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn repeated_subscribe_by_the_same_delegate_is_idempotent() {
+        let _pin_outcomes = pin_outcome_guard().await;
         let fixture = seam_fixture("delegate-demand-4669-idempotent").await;
         let op_manager = fixture.op_manager.clone();
         let ring = &op_manager.ring;
@@ -2107,10 +2678,14 @@ mod tests {
             .expect("the V1 subscribe arm must still have its not-found branch");
         let body = &SOURCE[arm..arm + arm_end];
         assert!(
-            body.contains("DELEGATE_SUBSCRIPTIONS"),
+            body.contains("delegate_subscriptions::register("),
             "the V1 subscribe arm must still record the notification hook — \
              this change ADDS demand, it does not replace notification \
-             delivery, which River's private-room secret rotation depends on"
+             delivery, which River's private-room secret rotation depends on. \
+             It must go through `delegate_subscriptions::register`, the one \
+             writer of both the hook and its durable row (#4669 part 2); \
+             touching the registry directly would leave nothing on disk and \
+             the pin would not survive a restart."
         );
         assert!(
             body.contains("delegate_demand::register_subscription("),
@@ -2251,9 +2826,57 @@ mod tests {
         assert!(
             body.contains("delegate_demand::drop_delegate_demand("),
             "`UnregisterDelegate` cleanup must drop the delegate's demand as \
-             well as its notification hooks. There is no unsubscribe (#2830) \
-             and `DELEGATE_SUBSCRIPTIONS` is in-memory, so a demand record left \
-             behind here is a pin nothing can release for the life of the process."
+             well as its notification hooks. There is no unsubscribe (#2830), \
+             so a demand record left behind here is a pin nothing can release \
+             for the life of the process."
+        );
+        assert!(
+            body.contains("delegate_subscriptions::forget_delegate("),
+            "`UnregisterDelegate` cleanup must clear the DURABLE subscriptions \
+             too, which is what `delegate_subscriptions::forget_delegate` does \
+             and a bare registry `retain` does not (#4669 part 2). A row left \
+             on disk here is restored at every subsequent boot — pin included \
+             — for a delegate that no longer exists, so nothing can ever \
+             unregister it again."
+        );
+    }
+
+    /// Removing a contract must clear its DURABLE delegate subscriptions.
+    ///
+    /// `ContractStore::remove_contract` is the one teardown site with no
+    /// `OpManager` to reach — `wasm_runtime` is deliberately independent of
+    /// `ring` — so it was the site most likely to be left writing half the
+    /// record. It CAN reach the durable copy, because `ContractStore` owns a
+    /// `Storage` handle, and it must.
+    #[test]
+    fn removing_a_contract_clears_its_durable_delegate_subscriptions() {
+        const SOURCE: &str = include_str!("../wasm_runtime/contract_store.rs");
+        let start = SOURCE
+            .find("pub fn remove_contract(")
+            .expect("ContractStore::remove_contract must still exist");
+        let rel_end = SOURCE[start..]
+            .find("\n    }\n")
+            .expect("remove_contract must still be a closed fn body");
+        let body = code_only(&SOURCE[start..start + rel_end]);
+
+        // Window guard, separate from the assertion that uses it: a window
+        // truncated to a PREFIX would silently drop the region this pin is
+        // about while the `contains` below still searched a non-empty string.
+        // `remove_contract_index` is the first thing the fn does, so its
+        // presence proves the window starts where it should.
+        assert!(
+            body.contains("remove_contract_index("),
+            "the scraped `remove_contract` window no longer spans the start of \
+             the function. Widen it; do NOT delete this check."
+        );
+        assert!(
+            body.contains("delegate_subscriptions::forget_contract("),
+            "`ContractStore::remove_contract` must clear this contract's \
+             delegate subscriptions from DISK as well as from the in-memory \
+             registry (#4669 part 2). A row left behind is restored at every \
+             subsequent boot, pinning a contract that no longer exists — and \
+             nothing can evict a contract that is not there, so the pin is \
+             unreleasable."
         );
     }
 
@@ -2459,10 +3082,13 @@ mod tests {
         let arm = code_only(&body[closed..]);
 
         assert!(
-            arm.contains("DELEGATE_SUBSCRIPTIONS.remove("),
+            arm.contains("delegate_subscriptions::forget_contract("),
             "the channel-closed arm must still clear the notification hook — \
              dropping demand while leaving the hook installed pins a contract \
-             whose updates nothing can consume"
+             whose updates nothing can consume. It must go through \
+             `delegate_subscriptions::forget_contract`, which clears the \
+             durable row too (#4669 part 2): a row left on disk here is \
+             restored, pin and all, at every subsequent boot."
         );
         assert!(
             arm.contains("delegate_demand::drop_subscriptions_for_contract("),
