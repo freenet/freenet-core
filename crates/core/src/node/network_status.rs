@@ -366,13 +366,13 @@ pub struct NetworkStatus {
     /// replaced, per collapse site). `connection_drop` (re-root on an upstream loss)
     /// and `host_formation` (announce on first host) remain single-aspect EDGE
     /// shadow sites (focused comparison, record-only).
-    /// Delegate pin outcomes by reason (#4669 / #5467 Phase 0).
-    pub delegate_pin_refusals: DelegatePinRefusalStats,
     pub reconcile_shadow_collapse: ReconcileShadowStats,
     pub reconcile_shadow_renewal: ReconcileShadowStats,
     pub reconcile_shadow_inbound_unsubscribe: ReconcileShadowStats,
     pub reconcile_shadow_connection_drop: ReconcileShadowStats,
     pub reconcile_shadow_host_formation: ReconcileShadowStats,
+    /// Delegate pin outcomes by reason (#4669 / #5467 Phase 0).
+    pub delegate_pin_refusals: DelegatePinRefusalStats,
     /// Bootstrap-acceptance-churn counters (#4787). See [`BootstrapChurnStats`].
     pub bootstrap_churn_stats: BootstrapChurnStats,
 }

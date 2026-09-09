@@ -140,6 +140,11 @@ actors (clients, network peers) can influence.
      another route, re-apply the cap at the point that reads it, not only
      at the point that writes it.
 
+     Note also that BOTH branches of this rule can be live in one change.
+     #5493 added this entry AND enforces two reject-at-cap bounds over rows
+     that never age out, which is the starving branch above. A reader who
+     hits one wants the other; the residual is tracked in #5622.
+
      Three instances turned up in one night on the #5467 delegate work:
      the delegate pin cap, `MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT` on
      the durable subscription rows (#5493), and a transport stream cap
