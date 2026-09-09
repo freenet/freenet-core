@@ -3422,6 +3422,36 @@ mod tests {
         (op_manager, notifications_receiver, guard)
     }
 
+    /// #5542. The delegate self-heal fetch shares the CLIENT originator path's
+    /// cooldown, and reports honestly whether it actually started one.
+    ///
+    /// Both halves are load-bearing and neither is visible from the call site.
+    /// The shared map is what stops a delegate and a client fetching the same
+    /// contract twice. The return value is what the delegate's error message is
+    /// built from: told "a background fetch has been started" when none was, a
+    /// delegate retries into a five-minute silence with no way to know why.
+    #[tokio::test]
+    async fn delegate_self_heal_fetch_shares_the_originator_cooldown_and_reports_it() {
+        let (op_manager, _rx, _guard) = build_notification_test_node("selfheal_5542").await;
+        let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([77u8; 32]);
+
+        assert!(
+            op_manager.try_self_heal_fetch_for_local_originator(instance_id),
+            "the first attempt must start a fetch and say so"
+        );
+        assert!(
+            op_manager.pending_contract_fetches.contains_key(&instance_id),
+            "the attempt must be recorded in the SHARED cooldown map, or a client \
+             asking for the same contract fetches it a second time"
+        );
+        assert!(
+            !op_manager.try_self_heal_fetch_for_local_originator(instance_id),
+            "a second attempt inside CONTRACT_FETCH_COOLDOWN_MS must be refused, and \
+             must REPORT the refusal so the delegate is not promised a repair that \
+             is not running"
+        );
+    }
+
     /// Connect a peer and return `(pub_key, addr)`.
     fn connect_peer(
         op_manager: &OpManager,
