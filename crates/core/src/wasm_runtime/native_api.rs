@@ -1533,7 +1533,7 @@ impl DelegateCallEnv {
             tag,
             after,
             std::time::SystemTime::now(),
-            std::time::Instant::now(),
+            tokio::time::Instant::now(),
         )
     }
 }

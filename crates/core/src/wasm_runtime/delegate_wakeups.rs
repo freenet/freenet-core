@@ -143,7 +143,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+// The MONOTONIC clock is tokio's, not `std`'s, so a test that pauses time
+// controls budget refill and debt repayment. It is the same clock
+// `util::time_source::TimeSource::now` returns, so a site here can later
+// take an injected `DynTimeSource` without a type change. Deadlines are a
+// separate axis and stay on `SystemTime`: they are persisted as absolute
+// wall-clock milliseconds because they must survive a restart.
+use tokio::time::Instant;
 
 use freenet_stdlib::prelude::DelegateKey;
 
@@ -158,6 +165,37 @@ use freenet_stdlib::prelude::DelegateKey;
 /// stdlib constant documents what a well-behaved caller sends, this one is the
 /// bound. A delegate built against a newer stdlib with a larger constant is
 /// still held to this one, which is the entire point.
+/// Log a refusal at `info!` when it CHANGES the refusing state, and at
+/// `debug!` while that state persists.
+///
+/// A refusal path that logs unconditionally hands the REFUSED party a
+/// log-volume amplifier: it chooses the retry rate, and refusing is what logs.
+/// `crates/core/Cargo.toml` enables `release_max_level_info`, so an `info!`
+/// here survives into shipped binaries, and a delegate can call
+/// `__frnt__delegate__schedule_wakeup` in a loop inside one `process()`,
+/// bounded only by `max_execution_seconds`. The delegate that does so is
+/// precisely the one already at its cap, which would make the mechanism meant
+/// to CONTAIN a misbehaving delegate the thing that amplifies it.
+///
+/// Logging the transition keeps the operationally interesting event (this
+/// delegate STARTED being refused) at `info!`, while the steady state costs
+/// nothing in release. A delegate cannot manufacture transitions without
+/// succeeding in between, and succeeding is what the cap it is hitting
+/// prevents.
+///
+/// A macro and not a function so the structured fields and the `#3972` message
+/// survive unchanged; a helper taking `&str` would have to `format!` on a path
+/// a delegate can drive.
+macro_rules! log_refusal {
+    ($entering:expr, $($args:tt)*) => {
+        if $entering {
+            tracing::info!($($args)*);
+        } else {
+            tracing::debug!($($args)*);
+        }
+    };
+}
+
 pub(crate) const MAX_WAKEUP_TAG_BYTES: usize = 128;
 
 /// Shortest delay the host will accept.
@@ -329,6 +367,18 @@ struct DutyBudget {
     /// When `credit_micros` was last brought up to date. MONOTONIC on purpose:
     /// a wall-clock jump must not mint credit.
     last_refill: Instant,
+    /// Whether this delegate's LAST admission decision was a refusal.
+    ///
+    /// Here, and not in a set of its own, because a set keyed by delegate would
+    /// be grown BY THE REFUSAL PATH: a delegate driving refusals would add an
+    /// entry apiece, which is the memory version of the log problem this field
+    /// exists to fix, and `schedule` already refuses to create a budget entry
+    /// on that path for exactly that reason. Every delegate that can reach a
+    /// per-delegate refusal already has an entry in `delegate_budgets` (a
+    /// grant, a boot restore and a deferral each create one), and that map is
+    /// already bounded and GC'd, so this bit inherits both rather than needing
+    /// its own bounding.
+    refusing: bool,
 }
 
 impl DutyBudget {
@@ -336,6 +386,7 @@ impl DutyBudget {
         Self {
             credit_micros: burst as i64,
             last_refill: now,
+            refusing: false,
         }
     }
 
@@ -388,8 +439,30 @@ impl DutyBudget {
 
     /// Whether this budget is indistinguishable from a fresh one, and can
     /// therefore be dropped from the per-delegate map.
+    ///
+    /// `refusing` is deliberately NOT consulted here, and adding it would be a
+    /// bug rather than a tightening. An entry at full credit holding no leases
+    /// belongs to an IDLE delegate; dropping it discards the bit, so the next
+    /// refusal reports at `info!` again. That is correct: after an idle spell
+    /// it is a NEW episode of being refused, not a continuation of the old one,
+    /// and it is the transition an operator wants to see. Keeping the entry
+    /// alive to preserve the bit would instead make this map retainable by a
+    /// delegate that does nothing but get refused.
     fn is_full(&self, burst: u64) -> bool {
         self.credit_micros >= burst as i64
+    }
+
+    /// Record a refusal, returning whether it ENTERS the refusing state.
+    ///
+    /// See [`log_refusal`] for why the caller needs this rather than logging
+    /// every refusal.
+    fn note_refused(&mut self) -> bool {
+        !std::mem::replace(&mut self.refusing, true)
+    }
+
+    /// Record a grant, returning whether it ENDS a run of refusals.
+    fn note_granted(&mut self) -> bool {
+        std::mem::replace(&mut self.refusing, false)
     }
 }
 
@@ -423,6 +496,12 @@ struct Schedule {
     deferrals: HashMap<WakeupId, u32>,
     /// The node's loop-occupancy allowance.
     node_budget: DutyBudget,
+    /// Whether the NODE's last admission decision was a refusal.
+    ///
+    /// A node-wide condition belongs on the node rather than on whichever
+    /// delegate happened to ask while it held. One `bool`, so unlike a
+    /// per-delegate map there is nothing here a refused caller can grow.
+    node_refusing: bool,
     /// Per-delegate loop-occupancy allowances.
     ///
     /// TIME-BOUNDED, per the AGENTS.md rule against permanently-refreshable
@@ -445,6 +524,7 @@ impl Schedule {
             next_seq: 0,
             deferrals: HashMap::new(),
             node_budget: DutyBudget::new(NODE_DUTY_BURST_MICROS, now),
+            node_refusing: false,
             delegate_budgets: HashMap::new(),
         }
     }
@@ -462,6 +542,11 @@ impl Schedule {
             }
         }
         true
+    }
+
+    /// Record a node-wide refusal, returning whether it ENTERS that state.
+    fn note_node_refused(&mut self) -> bool {
+        !std::mem::replace(&mut self.node_refusing, true)
     }
 
     /// Drop budget entries that are indistinguishable from fresh ones.
@@ -570,7 +655,15 @@ pub(crate) fn schedule<S: DelegateWakeupPersistence + ?Sized>(
             None => true,
         };
         if !has_delegate_credit {
-            tracing::info!(
+            // The entry is known to exist: `has_delegate_credit` is only false
+            // when the match above found one. `is_none_or` states the fallback
+            // rather than unwrapping a shape that a later edit could change.
+            let entering = sched
+                .delegate_budgets
+                .get_mut(delegate)
+                .is_none_or(DutyBudget::note_refused);
+            log_refusal!(
+                entering,
                 delegate = %delegate.encode(),
                 "Refused a delegate wakeup: this delegate's unprompted-execution \
                  budget is spent (#3972)"
@@ -597,7 +690,9 @@ pub(crate) fn schedule<S: DelegateWakeupPersistence + ?Sized>(
             NODE_RENEWAL_RESERVE_MICROS as i64
         };
         if sched.node_budget.credit_micros <= node_floor {
-            tracing::info!(
+            let entering = sched.note_node_refused();
+            log_refusal!(
+                entering,
                 delegate = %delegate.encode(),
                 renewing,
                 "Refused a delegate wakeup: the node's unprompted-execution budget is spent (#3972)"
@@ -610,7 +705,14 @@ pub(crate) fn schedule<S: DelegateWakeupPersistence + ?Sized>(
         if !renewing {
             let held = sched.per_delegate.get(delegate).copied().unwrap_or(0);
             if held >= MAX_WAKEUPS_PER_DELEGATE {
-                tracing::info!(
+                // Holding leases implies a budget entry: every path that adds a
+                // lease (grant, boot restore, deferral) creates one.
+                let entering = sched
+                    .delegate_budgets
+                    .get_mut(delegate)
+                    .is_none_or(DutyBudget::note_refused);
+                log_refusal!(
+                    entering,
                     delegate = %delegate.encode(),
                     cap = MAX_WAKEUPS_PER_DELEGATE,
                     "Refused a delegate wakeup: this delegate is at its wakeup cap (#3972)"
@@ -618,7 +720,9 @@ pub(crate) fn schedule<S: DelegateWakeupPersistence + ?Sized>(
                 return Err(WakeupRefusal::DelegateFull);
             }
             if sched.index.len() >= MAX_WAKEUPS_PER_NODE {
-                tracing::info!(
+                let entering = sched.note_node_refused();
+                log_refusal!(
+                    entering,
                     delegate = %delegate.encode(),
                     cap = MAX_WAKEUPS_PER_NODE,
                     "Refused a delegate wakeup: the node is at its wakeup cap (#3972)"
@@ -659,11 +763,21 @@ pub(crate) fn schedule<S: DelegateWakeupPersistence + ?Sized>(
     sched.order.insert(deadline, id.clone());
     sched.index.insert(id, deadline);
     *sched.per_delegate.entry(delegate.clone()).or_insert(0) += 1;
-    sched
+    let recovered = sched
         .delegate_budgets
         .entry(delegate.clone())
-        .or_insert_with(|| DutyBudget::new(DELEGATE_DUTY_BURST_MICROS, mono));
+        .or_insert_with(|| DutyBudget::new(DELEGATE_DUTY_BURST_MICROS, mono))
+        .note_granted();
+    // A grant proves the node is no longer refusing, whichever delegate
+    // provoked the refusal that set it.
+    sched.node_refusing = false;
 
+    if recovered {
+        tracing::info!(
+            delegate = %delegate.encode(),
+            "Granting this delegate wakeups again after a run of refusals (#3972)"
+        );
+    }
     tracing::debug!(
         delegate = %delegate.encode(),
         due_ms = due,
@@ -1151,6 +1265,12 @@ pub(crate) mod test_support {
     /// How many delegates hold a budget entry. Used to pin the GC.
     pub(crate) fn budget_entries() -> usize {
         schedule_lock().delegate_budgets.len()
+    }
+
+    /// How many leases are currently recorded as deferred. Used to pin that
+    /// the map is emptied by delivery rather than only added to.
+    pub(crate) fn deferral_entries() -> usize {
+        schedule_lock().deferrals.len()
     }
 
     /// Set the node's credit directly, so a reserve or debt condition can be
@@ -1648,6 +1768,84 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Refusal reporting. A refusal path that logs unconditionally hands the
+    // refused party a log-volume amplifier, so what is reported is the
+    // TRANSITION, and these assert on the transition itself rather than on
+    // captured output: `tracing` resolves each callsite's `Interest` once per
+    // PROCESS against whichever thread reaches it first (#5314), so a
+    // log-capture assertion here would pass or fail depending on what else ran
+    // beside it.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_refusal_is_reported_once_and_a_repeat_is_not() {
+        let mut budget = DutyBudget::new(DELEGATE_DUTY_BURST_MICROS, Instant::now());
+        assert!(budget.note_refused(), "the first refusal is the transition");
+        assert!(
+            !budget.note_refused(),
+            "a delegate hammering the import must not be able to report again"
+        );
+        assert!(!budget.note_refused());
+        assert!(
+            budget.note_granted(),
+            "the grant ends the run of refusals and is worth reporting once"
+        );
+        assert!(
+            !budget.note_granted(),
+            "an ordinary grant reports nothing"
+        );
+        assert!(
+            budget.note_refused(),
+            "a refusal after a grant is a NEW episode, not a repeat"
+        );
+    }
+
+    #[test]
+    fn a_node_wide_refusal_transitions_on_the_node_not_on_a_delegate() {
+        // A local `Schedule`, so this says nothing about the global one and
+        // needs no serialisation.
+        let mut sched = Schedule::new(Instant::now());
+        assert!(sched.note_node_refused());
+        assert!(!sched.note_node_refused());
+        sched.node_refusing = false;
+        assert!(
+            sched.note_node_refused(),
+            "a grant clears the flag, so the next refusal reports again"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_refused_delegate_still_cannot_grow_the_budget_map() {
+        // The guard that reporting transitions could plausibly have broken. The
+        // obvious way to remember who is being refused is a set keyed by
+        // delegate, and a refused delegate would then add an entry to it — the
+        // memory version of the log amplifier, and the reason the bit lives on
+        // an entry that already exists rather than in a map of its own.
+        let (db, now, mono) = fresh();
+        test_support::drain_node_credit();
+        let newcomer = key(9);
+        for _ in 0..32 {
+            assert_eq!(
+                schedule(
+                    Some(&db),
+                    &newcomer,
+                    b"t",
+                    Duration::from_secs(60),
+                    now,
+                    mono
+                ),
+                Err(WakeupRefusal::NodeBudget)
+            );
+        }
+        assert_eq!(
+            test_support::budget_entries(),
+            0,
+            "32 refusals must leave no per-delegate state behind"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Firing.
     // -----------------------------------------------------------------------
 
@@ -1814,6 +2012,125 @@ mod tests {
     // -----------------------------------------------------------------------
     // Teardown and boot restore.
     // -----------------------------------------------------------------------
+
+    /// Delivery must EMPTY the deferral map, not merely read it.
+    ///
+    /// Found by mutation: `a_fresh_grant_resets_the_deferral_count` exercises
+    /// the GRANT path's `deferrals.remove`, so `take_due` reading instead of
+    /// removing left it green. The property that was unguarded is not the
+    /// reset, it is the map's BOUND: moving the count out with the lease is
+    /// what keeps `deferrals` holding only currently-deferred ids, which is
+    /// what the field's own comment claims and what lets it have no sweep. If
+    /// delivery only read the count, one entry would survive every
+    /// deferred-then-fired lease and the map would grow without bound, keyed by
+    /// (delegate, tag) and reachable by any delegate that gets parked.
+    ///
+    /// FALSIFY: make `take_due` use `deferrals.get` instead of `remove`.
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_deferred_lease_that_fires_leaves_no_deferral_entry_behind() {
+        let (db, now, mono) = fresh();
+        assert_eq!(
+            schedule(Some(&db), &key(1), b"t", Duration::from_secs(1), now, mono),
+            Ok(())
+        );
+        let clock = now + Duration::from_secs(2);
+        let due = take_due(Some(&db), clock, 10).remove(0);
+        assert!(defer(Some(&db), &due, WAKEUP_PARK_RETRY, clock));
+        assert_eq!(
+            test_support::deferral_entries(),
+            1,
+            "a deferred lease is recorded while it waits"
+        );
+
+        let again = take_due(
+            Some(&db),
+            clock + WAKEUP_PARK_RETRY + Duration::from_secs(1),
+            10,
+        )
+        .remove(0);
+        assert_eq!(again.attempts, 1, "the count rides out with the lease");
+        assert_eq!(
+            test_support::deferral_entries(),
+            0,
+            "and must be GONE from the map: an entry that survives delivery is \
+             one leaked per deferred-then-fired lease, forever"
+        );
+    }
+
+    /// A delegate at its row cap can still re-arm a tag it already holds.
+    ///
+    /// Found by mutation, indirectly: forcing `renewing` to false left
+    /// `rearming_a_tag_replaces_its_lease_instead_of_taking_another` green,
+    /// because replacement is done unconditionally by `remove_lease` and does
+    /// not depend on that flag at all. What the flag actually gates is this,
+    /// and nothing covered it.
+    ///
+    /// It matters because the caps are per-delegate: a delegate that fills its
+    /// cap with long-lived rotations could otherwise never refresh any of them,
+    /// so every one of its wakeups would expire at the moment it is busiest,
+    /// and the refusal it received would say it was full rather than that it
+    /// had asked for something forbidden.
+    ///
+    /// FALSIFY: check a renewal against the row caps.
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_delegate_at_its_cap_can_still_rearm_a_tag_it_already_holds() {
+        let (db, now, mono) = fresh();
+        for i in 0..MAX_WAKEUPS_PER_DELEGATE {
+            assert_eq!(
+                schedule(
+                    Some(&db),
+                    &key(1),
+                    format!("t{i}").as_bytes(),
+                    Duration::from_secs(600),
+                    now,
+                    mono
+                ),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            test_support::outstanding_for(&key(1)),
+            MAX_WAKEUPS_PER_DELEGATE
+        );
+
+        // The cap is real: a NEW tag is refused.
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(1),
+                b"new",
+                Duration::from_secs(600),
+                now,
+                mono
+            ),
+            Err(WakeupRefusal::DelegateFull)
+        );
+
+        // An EXISTING tag is not, and both representations move with it.
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(1),
+                b"t0",
+                Duration::from_secs(1200),
+                now,
+                mono
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            test_support::outstanding_for(&key(1)),
+            MAX_WAKEUPS_PER_DELEGATE,
+            "a renewal must not take a second row"
+        );
+        assert_eq!(
+            db.due_for(&key(1), b"t0"),
+            Some(to_millis(now) + 1_200_000),
+            "the durable deadline moves with the renewal"
+        );
+    }
 
     #[test]
     #[serial_test::serial(delegate_wakeups)]

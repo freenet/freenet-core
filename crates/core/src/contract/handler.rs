@@ -207,7 +207,7 @@ impl ContractHandler for NetworkContractHandler {
                 executor.registered_delegate_count(),
                 |key| executor.has_delegate(key),
                 std::time::SystemTime::now(),
-                std::time::Instant::now(),
+                tokio::time::Instant::now(),
             ) {
                 Ok(outcome) => {
                     if outcome.deferred > 0 {

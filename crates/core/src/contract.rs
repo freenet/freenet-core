@@ -2295,6 +2295,30 @@ where
         // admission grants new leases. The loop is making progress on work it
         // holds, which is the same argument the `delegate_resumes` `continue`
         // above rests on.
+        //
+        // A WAKEUP DOES NOT FIRE ON ITS DEADLINE UNDER `tokio::time::pause()`,
+        // WHICH THE SIMULATION RUNNER USES (`start_paused(true)`). Deadlines are
+        // absolute wall-clock milliseconds, because they are persisted and must
+        // survive a restart, so `next_due_in` measures the remaining time with
+        // `SystemTime`. That remaining time is then turned into a deadline on
+        // tokio's clock. With time paused those two clocks move independently:
+        // tokio advances to the deadline, the real clock does not, so
+        // `take_due(SystemTime::now())` at the top of the next iteration still
+        // finds nothing due, and the loop computes an almost unchanged remaining
+        // and sleeps again. The wakeup fires when the real clock catches up, or
+        // on the next loop event from other traffic, not on its deadline.
+        //
+        // This is only the DEADLINE axis. The budget clocks (refill, debt
+        // repayment, admission) are `tokio::time::Instant` and a paused test
+        // does control those.
+        //
+        // Inert today because no simulation schedules a wakeup, so nothing
+        // exercises it. Recorded here rather than only in the pull request
+        // because the person it will bite is whoever writes the FIRST simulation
+        // test for this, and that person reads the code. Closing it means
+        // routing `SystemTime::now()` through `TimeSource::system_time_now()`,
+        // which exists on the trait for exactly this, but no `TimeSource` is
+        // threaded into this loop yet.
         let wakeup_deadline =
             crate::wasm_runtime::delegate_wakeups::next_due_in(std::time::SystemTime::now())
                 .map(|remaining| tokio::time::Instant::now() + remaining);
@@ -3083,7 +3107,7 @@ async fn handle_delegate_wakeup<CH, P>(
     // than ticking.
     if let Err(wait) = crate::wasm_runtime::delegate_wakeups::affordability(
         &delegate_key,
-        std::time::Instant::now(),
+        tokio::time::Instant::now(),
     ) {
         let store = contract_handler.executor().delegate_wakeup_store();
         if crate::wasm_runtime::delegate_wakeups::defer(
@@ -3141,6 +3165,16 @@ async fn handle_delegate_wakeup<CH, P>(
     // A wakeup-driven run has no client responder to carry; the slot exists
     // only to satisfy the shared `ParkingCtx` shape.
     let mut no_responder = None;
+    // THE REAL CLOCK, DELIBERATELY, and the one place in this feature where it
+    // is correct. `started.elapsed()` below is what the duty budget is charged,
+    // so it must measure the wall-clock time this run actually occupied the
+    // serial loop. `tokio::time::Instant` does not advance across a synchronous
+    // CPU-bound call while time is paused, so under `tokio::time::pause()` this
+    // would measure approximately zero, every run would be charged nothing, and
+    // the budget would stop bounding anything in exactly the simulation the
+    // rule exists to protect. The refill clocks around it are the tokio one;
+    // only the measurement of real occupancy is not.
+    // rule-lint: ok
     let started = std::time::Instant::now();
     let outcome = handle_delegate_with_contract_requests(
         contract_handler,
@@ -3180,7 +3214,7 @@ async fn handle_delegate_wakeup<CH, P>(
     crate::wasm_runtime::delegate_wakeups::charge_run(
         &delegate_key,
         started.elapsed(),
-        std::time::Instant::now(),
+        tokio::time::Instant::now(),
     );
 
     match outcome {
@@ -7964,6 +7998,81 @@ mod hol_4391_tests {
             2,
             "the idle select! must wait on BOTH the park sweep deadline and the \
              wakeup deadline; one of them has been removed"
+        );
+    }
+
+    /// The run-duration measurement MUST keep the real clock (#3972).
+    ///
+    /// `started.elapsed()` is what `charge_run` debits, so it has to measure
+    /// the time the run actually occupied the serial loop. Under
+    /// `tokio::time::pause()` the tokio clock does not advance across a
+    /// synchronous CPU-bound call, so converting that one binding would charge
+    /// every wakeup run approximately zero: the duty budget would still exist,
+    /// still compile, and still pass every other test in this file, while
+    /// bounding nothing. That is worse than not having the budget, because the
+    /// mechanism still looks present.
+    ///
+    /// The site therefore carries a `// rule-lint: ok` exemption, and a comment
+    /// is the weakest thing protecting it: the next reader to meet a lint
+    /// exemption is tempted to remove it, and the removal compiles. This pin is
+    /// the tripwire. `a_paused_clock_cannot_measure_a_synchronous_run` shows the
+    /// same fact as behaviour rather than as position.
+    ///
+    /// The second half matters as much as the first: the refill and solvency
+    /// clocks in this function must stay on TOKIO's clock, or Rule Lint #1 has
+    /// been satisfied by converting the wrong one.
+    ///
+    /// FALSIFY: swap either clock for the other.
+    #[test]
+    fn the_wakeup_run_measures_real_time_and_refills_on_the_paused_clock() {
+        let code = super::tests::production_code();
+        let body = super::tests::fn_region(&code, "async fn handle_delegate_wakeup");
+        assert!(
+            body.contains("let started = std::time::Instant::now();"),
+            "the duty charge must measure REAL elapsed time: a tokio Instant \
+             reads about zero across a synchronous call while time is paused, \
+             which would make the budget vacuous in exactly the simulation \
+             Rule Lint #1 exists to protect"
+        );
+        assert!(
+            !body.contains("let started = tokio::time::Instant::now()"),
+            "the run-duration measurement has been converted to the paused \
+             clock; see this test's docs before removing the rule-lint \
+             exemption"
+        );
+        assert!(
+            body.contains("tokio::time::Instant::now()"),
+            "the refill and solvency clocks must stay on tokio's clock, so a \
+             paused test controls budget refill; converting everything to \
+             std::time would satisfy the lint by breaking determinism instead"
+        );
+    }
+
+    /// Why the exemption above exists, as behaviour rather than as a claim.
+    ///
+    /// A delegate's WASM runs synchronously on this loop and never awaits, so
+    /// nothing lets a paused runtime auto-advance during it.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_clock_cannot_measure_a_synchronous_run() {
+        let real = std::time::Instant::now();
+        let paused = tokio::time::Instant::now();
+
+        // Burn real CPU without awaiting, the way a WASM run does.
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        while std::time::Instant::now() < until {
+            std::hint::spin_loop();
+        }
+
+        assert!(
+            real.elapsed() >= std::time::Duration::from_millis(15),
+            "the real clock must see the work: {:?}",
+            real.elapsed()
+        );
+        assert!(
+            paused.elapsed() < std::time::Duration::from_millis(5),
+            "a paused tokio clock does not advance across a synchronous run, so \
+             charging the duty budget from it would charge nothing: {:?}",
+            paused.elapsed()
         );
     }
 
