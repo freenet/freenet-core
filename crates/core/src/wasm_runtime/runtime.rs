@@ -1136,6 +1136,19 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Whether `key` names a delegate registered in this runtime's store.
+    ///
+    /// An accessor rather than widening `delegate_store`, which is
+    /// `pub(super)` so that only `wasm_runtime` can mutate the store. Boot
+    /// reconciliation (`contract::delegate_demand`) needs the question
+    /// answered from outside this module, and only the question.
+    pub(crate) fn delegate_is_registered(
+        &self,
+        key: &freenet_stdlib::prelude::DelegateKey,
+    ) -> bool {
+        self.delegate_store.code_hash_from_key(key).is_some()
+    }
+
     /// Check if the runtime is in a healthy state and can execute WASM.
     pub fn is_healthy(&self) -> bool {
         self.engine.is_healthy()

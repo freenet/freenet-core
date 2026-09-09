@@ -279,11 +279,17 @@ fn persist_remove_contract<S: DelegateSubscriptionPersistence + ?Sized>(
 pub(crate) mod test_support {
     use super::*;
 
+    use dashmap::DashMap;
+
     /// The registry itself, for the pre-existing delegate tests that drive it
-    /// directly. Named as it used to be (`native_api::DELEGATE_SUBSCRIPTIONS`)
-    /// so those tests keep reading the same way; production code cannot reach
-    /// it, which is the property that matters.
-    pub(crate) use super::REGISTRY as DELEGATE_SUBSCRIPTIONS;
+    /// directly.
+    ///
+    /// A `#[cfg(test)]` FUNCTION rather than a wider visibility on the static:
+    /// the static stays private in every build, so production code cannot reach
+    /// it whatever it imports, which is the property this module exists for.
+    pub(crate) fn registry() -> &'static DashMap<ContractInstanceId, HashSet<DelegateKey>> {
+        &REGISTRY
+    }
 
     /// Register in the IN-MEMORY registry only, with no durable write.
     ///

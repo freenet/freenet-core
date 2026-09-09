@@ -50,7 +50,7 @@ use crate::contract::executor::{ContractExecutor, DelegateNotification, Executor
 use crate::node::OpManager;
 use crate::operations::get::GetResult;
 use crate::wasm_runtime::{
-    ContractStore, DELEGATE_SUBSCRIPTIONS, DelegateStore, Runtime, SecretsStore, StateStore,
+    ContractStore, DelegateStore, Runtime, SecretsStore, StateStore, delegate_subscription_registry,
 };
 
 /// The same mock-aligned fixture `wasm_conformance_tests` uses: its
@@ -93,7 +93,7 @@ struct SubscriptionGuard {
 
 impl SubscriptionGuard {
     fn register(instance_id: ContractInstanceId, delegate: DelegateKey) -> Self {
-        DELEGATE_SUBSCRIPTIONS
+        delegate_subscription_registry()
             .entry(instance_id)
             .or_default()
             .insert(delegate.clone());
@@ -106,7 +106,7 @@ impl SubscriptionGuard {
 
 impl Drop for SubscriptionGuard {
     fn drop(&mut self) {
-        DELEGATE_SUBSCRIPTIONS.retain(|id, subs| {
+        delegate_subscription_registry().retain(|id, subs| {
             if id == &self.instance_id {
                 subs.remove(&self.delegate);
             }

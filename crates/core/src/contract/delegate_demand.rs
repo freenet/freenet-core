@@ -1091,6 +1091,129 @@ pub(crate) fn drop_delegate_demand(op_manager: &std::sync::Arc<OpManager>, deleg
     }
 }
 
+/// What boot restore did, for the log line and for the tests.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RestoreOutcome {
+    /// Subscriptions put back in the notification registry.
+    pub(crate) restored: usize,
+    /// Of those, the ones that also got a pin. The difference is the
+    /// hosting/state gate refusing, which is the ordinary outcome for a
+    /// contract this node no longer holds.
+    pub(crate) pinned: usize,
+    /// Rows dropped because the delegate is no longer registered.
+    pub(crate) dropped_delegate_gone: usize,
+    /// Rows dropped because the contract is no longer in the contract store.
+    pub(crate) dropped_contract_gone: usize,
+}
+
+/// Put persisted delegate subscriptions back, dropping the stale ones
+/// (#4669 part 2).
+///
+/// Called once, from `NetworkContractHandler::build`, AFTER the hosting cache
+/// has been loaded (`Ring::load_hosting_cache`) and BEFORE the node event loop
+/// starts. Both halves of that ordering are load-bearing:
+///
+/// - After the hosting cache, because [`register_subscription`] gates on
+///   `is_hosting_contract && contract_state_present`. Restoring before it would
+///   refuse every pin and silently produce exactly the node this work exists to
+///   prevent.
+/// - Before the event loop, because nothing can invoke a delegate until the
+///   loop is running. A delegate therefore never observes a window in which its
+///   own subscription is missing.
+///
+/// # Reconciliation
+///
+/// The durable set can be stale: a delegate uninstalled while the node was
+/// down, a contract removed by a path that could not reach the durable copy
+/// (a crash between the two writes). An entry whose delegate or contract is
+/// gone is DROPPED rather than restored, because restoring it creates a pin
+/// that nothing can release — the delegate that would unregister it does not
+/// exist, and the contract that would evict it does not either.
+///
+/// A row whose contract still exists but is no longer HOSTED is kept and
+/// restored into the notification registry without a pin. That is not a stale
+/// entry: the delegate still wants the notifications, the row is still owned by
+/// something that can release it, and the pin returns the moment the node holds
+/// the contract again. It is the same no-pin outcome a fresh subscribe gets in
+/// that state, counted by the same `not_hosted` counter.
+///
+/// # On a read failure
+///
+/// Returns without touching anything. A read failure must NOT be read as "no
+/// subscriptions": clearing or ignoring the set on a transient error would drop
+/// every delegate's pin, which is the outcome the durable table exists to
+/// prevent.
+pub(crate) fn restore_persisted_subscriptions<S>(
+    op_manager: &OpManager,
+    db: &S,
+    resolve_contract: impl Fn(&freenet_stdlib::prelude::ContractInstanceId) -> Option<ContractKey>,
+    delegate_is_registered: impl Fn(&DelegateKey) -> bool,
+) -> RestoreOutcome
+where
+    S: crate::wasm_runtime::delegate_subscriptions::DelegateSubscriptionPersistence + ?Sized,
+{
+    let persisted = match crate::wasm_runtime::delegate_subscriptions::load_persisted(db) {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "could not read persisted delegate subscriptions; delegate pins are \
+                 NOT restored for this run. Every delegate on this node is now \
+                 relying on some other route to keep its contracts hosted, which \
+                 is the failure #4669 part 2 exists to close."
+            );
+            return RestoreOutcome::default();
+        }
+    };
+    if persisted.is_empty() {
+        return RestoreOutcome::default();
+    }
+
+    let mut outcome = RestoreOutcome::default();
+    for (instance_id, delegate) in persisted {
+        if !delegate_is_registered(&delegate) {
+            crate::wasm_runtime::delegate_subscriptions::forget_one(
+                Some(db),
+                &instance_id,
+                &delegate,
+            );
+            outcome.dropped_delegate_gone += 1;
+            continue;
+        }
+        let Some(contract) = resolve_contract(&instance_id) else {
+            crate::wasm_runtime::delegate_subscriptions::forget_one(
+                Some(db),
+                &instance_id,
+                &delegate,
+            );
+            outcome.dropped_contract_gone += 1;
+            continue;
+        };
+
+        // Re-registering through the one writer is deliberate even though the
+        // durable row already exists: it is idempotent there, and it is what
+        // keeps the in-memory registry from being seeded by a second path that
+        // could drift from the first.
+        crate::wasm_runtime::delegate_subscriptions::register(Some(db), &instance_id, &delegate);
+        outcome.restored += 1;
+
+        // Same gates, same counters as a live subscribe. A refusal here is not
+        // an error and does not drop the row — see the Reconciliation section.
+        if register_subscription(op_manager, &delegate, &contract) {
+            outcome.pinned += 1;
+        }
+    }
+
+    tracing::info!(
+        restored = outcome.restored,
+        pinned = outcome.pinned,
+        dropped_delegate_gone = outcome.dropped_delegate_gone,
+        dropped_contract_gone = outcome.dropped_contract_gone,
+        "restored persisted delegate subscriptions (#4669 part 2)"
+    );
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

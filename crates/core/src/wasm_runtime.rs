@@ -86,7 +86,7 @@ pub(crate) use native_api::{
 // module's functions; the pre-existing delegate tests that drive the map
 // directly keep the old name through this test-only re-export.
 #[cfg(test)]
-pub(crate) use delegate_subscriptions::test_support::DELEGATE_SUBSCRIPTIONS;
+pub(crate) use delegate_subscriptions::test_support::registry as delegate_subscription_registry;
 // Narrow re-export rather than making `native_api` crate-visible: only the
 // conformance test driver (outside the `wasm_runtime` subtree) needs the
 // clock-override primitive, and widening the whole module would also expose

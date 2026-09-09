@@ -33,7 +33,7 @@ use std::time::Duration;
 use crate::config::ConfigArgs;
 use crate::contract::executor::{ContractExecutor, Executor, OperationMode};
 use crate::node::OpManager;
-use crate::wasm_runtime::{DELEGATE_SUBSCRIPTIONS, MockStateStorage};
+use crate::wasm_runtime::{MockStateStorage, delegate_subscription_registry};
 
 use super::super::mock_runtime::test::create_test_contract as test_contract;
 
@@ -97,7 +97,7 @@ struct SubscriptionGuard {
 
 impl SubscriptionGuard {
     fn register(instance_id: ContractInstanceId, delegate: DelegateKey) -> Self {
-        DELEGATE_SUBSCRIPTIONS
+        delegate_subscription_registry()
             .entry(instance_id)
             .or_default()
             .insert(delegate.clone());
@@ -115,7 +115,7 @@ impl Drop for SubscriptionGuard {
         // test's subscription if the keys ever collided, which is the shape
         // `.claude/rules/testing.md` warns about for shared globals. Mirrors
         // how production cleans up in `runtime/delegates.rs`.
-        DELEGATE_SUBSCRIPTIONS.retain(|id, subs| {
+        delegate_subscription_registry().retain(|id, subs| {
             if id == &self.instance_id {
                 subs.remove(&self.delegate);
             }
