@@ -487,6 +487,82 @@ not known to work.
 grep -rn 'include_str!("' crates/core/src/bin/ | grep -v assets
 ```
 
+## Finishing the sentence and stopping there
+
+The author knows the rule. They have just written it down, in this file, in
+this edit. Then a few hundred lines away, or twenty lines below, or in the
+function immediately adjacent, the same edit does the thing the sentence
+forbids.
+
+This is not ignorance. Writing the sentence discharges the sense of having
+handled it, so the writer stops looking for the other places it applies. And
+the comment is evidence the concept was present, which is why it reads as
+covered to the next reviewer as well: a paragraph explaining a trap sits
+directly above code that walks into it, and nobody rereads the code because
+the paragraph appears to have answered for it already.
+
+The third row below is the dangerous form. A wrong comment misleads a reader
+and a weak test fails to catch a regression, but a wrong `FALSIFY` instruction
+recruits the next person into confirming something false. They run the mutation
+it names, see the result it predicts, and come away with more confidence than
+if nothing had been written.
+
+### Repeat offender history
+
+All three are from one PR,
+[#5606](https://github.com/freenet/freenet-core/pull/5606), and all three were
+authored in the same edit as the text they contradict rather than inherited
+from an earlier one.
+
+| Site | What the text said | What the same edit did |
+|------|--------------------|------------------------|
+| `contract.rs`, the sweep-budget comment vs `PARK_WORK_BUDGET` | corrected "the guard always wins that race" down to a 15 s margin, because the strong form was false | authored a fresh over-strong bound a few hundred lines away: `2 x MAX_RESUME_DRAIN_BATCH` (32), where the real per-iteration ceiling is `(MAX_RESUME_DRAIN_BATCH - 1) + 25` per loop and 80 across both |
+| `contract.rs`, `fn_region` vs `enclosing_fn` | `fn_region`'s rustdoc warns that anchoring on `"\nasync fn "` misses `pub async fn` | `enclosing_fn`, the next function in the file, was anchored on exactly that, so a chokepoint call in a new `pub async fn` was attributed to the allowed function declared above it |
+| `delegate_park.rs`, `a_partially_resolved_upsert_pair_keeps_the_unresolved_one_s_context` | a comment twenty lines above records that building the object by hand pins a true property of the wrong object, and that this is why the original bug survived | its `FALSIFY` line named a mutation that test structurally cannot see. A reviewer defaulted the context in `owed_upserts`, the only production site that builds the owed list, and the test stayed green |
+
+Two earlier instances of the same shape are recorded on that PR:
+[#5238](https://github.com/freenet/freenet-core/issues/5238) carried only one
+of two known dimensions across a bound it was otherwise correct about, and
+[#5493](https://github.com/freenet/freenet-core/pull/5493) named a bypass in a
+comment, closed it in one consumer, and left it open in a sibling consumer
+forty lines away in the same file.
+
+### The rule
+
+**A comment naming a trap, a bypass, a missing dimension, or a bound that does
+not hold is a search instruction, not a completed action.** Before the edit is
+finished:
+
+- **Grep for every other consumer** of the quantity, anchor, or invariant the
+  sentence names, and check each one. The sibling is usually in the same file,
+  which is what makes it easy to miss: it was on screen.
+- **Reread what you wrote in this edit against the sentence you wrote in this
+  edit.** Every row above is a self-inflicted instance, not an inherited one.
+  The correction and the fresh violation shipped together.
+- **Run every `FALSIFY` line you write.** An instruction that has never been
+  executed is a claim about the test rather than a property of it, which is the
+  same defect as the enumerated guards and self-satisfying pins elsewhere in
+  this file. If the named mutation leaves the test green, fix the instruction
+  or the test before merging, and say in the commit message which one was
+  wrong.
+
+### Audit
+
+There is no grep for "this was actually run", so the audit is to enumerate the
+instructions and account for each:
+
+```bash
+# Every FALSIFY line is a promise that a specific mutation was applied and the
+# test went red. List them and check them off against a campaign log.
+grep -rn "FALSIFY" crates/core/src/
+
+# Comments that name a limit are the search instructions above. For each hit,
+# grep the quantity it names and inspect every OTHER consumer of it.
+grep -rnE "(does not|doesn't|cannot|can't|fails to) (catch|cover|see|hold|fire)" crates/core/src/
+grep -rniE "same (trap|shape|omission|mistake)|one indirection away" crates/core/src/
+```
+
+
 ## SIGPIPE under `pipefail`: a present marker reads as absent
 
 In a script that sets `set -o pipefail`, piping a producer into a consumer that
