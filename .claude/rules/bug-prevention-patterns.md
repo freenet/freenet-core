@@ -527,6 +527,47 @@ of two known dimensions across a bound it was otherwise correct about, and
 comment, closed it in one consumer, and left it open in a sibling consumer
 forty lines away in the same file.
 
+### A membership check answers "is it named", never "does it contribute"
+
+The cleanest statement of this whole section came out of FIXING it, and it is
+worth more than the three instances above because it says what to expect next
+time.
+
+A guard asked whether a budget's name occurred in the text of the function that
+sums the budgets. That is a membership check over characters, so it was defeated
+by a comment: this file's own new prose named a budget in an explanatory
+paragraph, and that budget's exclusion row went unconsulted from the commit that
+added the paragraph.
+
+The fix was to stop scraping and sum a slice of `(label, value)` pairs, so the
+question became "is this name a label in the slice the function accumulated" --
+a fact about the accumulation rather than about the source text. **And the same
+defect reappears one level up, immediately.** A label with a zero value satisfies
+every membership check while contributing nothing to the total:
+
+```rust
+("parked_budget_for", 0),   // present, named, summed, and worth nothing
+```
+
+So the guard needs the second question too: each term must be non-zero on a
+representative host, with the legitimate zeros written down in a table that is
+itself checked for staleness. Otherwise the exclusion table is just a third
+place an entry can sit un-consulted.
+
+**Expect this whenever a check moves from text to structure.** The move is
+almost always right -- structure cannot be defeated by an adjacent comment --
+but it inherits the question one level up, and the new level is where nobody
+looks, because the fix feels finished. Ask of any guard: *does passing it
+require the thing to CONTRIBUTE, or only to be present?*
+
+Sibling shape, same source: **a guard's own failure mode is often disguised as
+the guard working.** The mutation harness took an exclusive lock before arming
+its restore path, so an exception in between left the lock held forever -- and a
+stranded lock presents as "the harness refuses to run", which is exactly what
+correct exclusivity looks like. A guard that fails silently into its own success
+message is worse than no guard, because the reader has been given a reason to
+stop looking.
+
 ### The commonest form is duller than the three above: prose that outlived its code
 
 The rows above are all a comment contradicted by code written in the SAME edit.
