@@ -2539,7 +2539,6 @@ mod tests {
     }
 
     /// H4/M4: an unmeasurable variant is charged so much that no budget admits
-    /// H4/M4: an unmeasurable variant is charged so much that no budget admits
     /// it — and the limit of what this can check, stated.
     ///
     /// WHAT CANNOT BE TESTED: that each `#[non_exhaustive]` wildcard actually
@@ -2599,7 +2598,6 @@ mod tests {
     }
 
     /// Every term of `request_bytes`, individually.
-    /// Every term of `request_bytes`, individually.
     ///
     /// The `ApplicationMessages` arm is the one every ordinary delegate call
     /// takes and it was entirely unpinned: both its inbound payloads and its
@@ -2650,25 +2648,30 @@ mod tests {
             DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((&code, &params))));
         assert!(
             request_bytes(&DelegateRequest::RegisterDelegate {
-                delegate: container.clone(),
+                delegate: container,
                 cipher: [0u8; 32],
                 nonce: [0u8; 24],
             }) >= T_CODE + T_PARAMS,
             "RegisterDelegate must charge the whole container"
         );
-        assert!(
-            request_bytes(&DelegateRequest::RegisterDelegateWithPredecessors {
-                delegate: container,
-                cipher: [0u8; 32],
-                nonce: [0u8; 24],
-                predecessors: vec![key],
-            }) >= T_CODE + T_PARAMS + 64,
-            "RegisterDelegateWithPredecessors must charge the container AND its \
-             predecessor list"
+        assert_eq!(
+            request_bytes(&DelegateRequest::UnregisterDelegate(key)),
+            0,
+            "UnregisterDelegate carries a key and nothing else"
         );
+
+        // THERE IS NO SECOND REGISTRATION VARIANT TO CHARGE. This test used to
+        // assert that `RegisterDelegateWithPredecessors` charged its container
+        // AND its predecessor list; that variant was removed from the wire in
+        // freenet-stdlib 0.9.0 (freenet/freenet-stdlib#91, GHSA-824h-7x5x-wfmf)
+        // and its node-side handler had already been disabled in #5199. Do not
+        // restore this assertion by reintroducing the variant. If a future
+        // registration variant does arrive, it lands on the `unmeasurable`
+        // wildcard (charged as maximal, not free) until an arm is written for
+        // it, which is what `an_unmeasurable_variant_cannot_be_admitted_at_any_budget`
+        // holds.
     }
 
-    /// P1b: a queued delegate re-registration is charged its PARAMETERS as well
     /// P1b: a queued delegate re-registration is charged its PARAMETERS as well
     /// as its WASM.
     ///
