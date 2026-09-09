@@ -4,6 +4,7 @@ mod delegate;
 pub(crate) mod delegate_api;
 pub(crate) mod delegate_interest;
 mod delegate_store;
+pub(crate) mod delegate_subscriptions;
 pub(crate) mod engine;
 mod error;
 pub(crate) mod mock_state_storage;
@@ -77,7 +78,7 @@ pub(crate) use module_cache::{
     MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES,
 };
 pub(crate) use native_api::{
-    DELEGATE_SUBSCRIPTIONS, DelegateContextCache, SharedDelegateCounter, SharedInheritedOrigins,
+    DelegateContextCache, SharedDelegateCounter, SharedInheritedOrigins,
     new_delegate_context_cache, new_delegate_counter, new_inherited_origins,
     release_created_delegate_slot,
 };

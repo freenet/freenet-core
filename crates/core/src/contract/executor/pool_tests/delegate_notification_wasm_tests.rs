@@ -49,9 +49,7 @@ use crate::config::ConfigArgs;
 use crate::contract::executor::{ContractExecutor, DelegateNotification, Executor, OperationMode};
 use crate::node::OpManager;
 use crate::operations::get::GetResult;
-use crate::wasm_runtime::{
-    ContractStore, DELEGATE_SUBSCRIPTIONS, DelegateStore, Runtime, SecretsStore, StateStore,
-};
+use crate::wasm_runtime::{ContractStore, DelegateStore, Runtime, SecretsStore, StateStore};
 
 /// The same mock-aligned fixture `wasm_conformance_tests` uses: its
 /// `validate_state` always returns `Valid`, so a PUT of arbitrary bytes lands
@@ -70,7 +68,7 @@ const DELTA_TRAP_CONTRACT: &str = "test-contract-delta-trap";
 
 /// Every test loads its contracts under DISTINCT parameters.
 ///
-/// `DELEGATE_SUBSCRIPTIONS` is process-global (#4824) and keyed by
+/// the subscription registry is process-global (#4824) and keyed by
 /// `ContractInstanceId`. CI runs `cargo nextest` (process per test) but
 /// contributors run plain `cargo test` (one process for all of them), and a
 /// contract's instance id is `hash(code, params)` — so two tests loading the
@@ -83,7 +81,7 @@ fn params(tag: u8) -> Parameters<'static> {
 }
 
 /// Registers one delegate against one contract and removes exactly that
-/// registration on drop — `DELEGATE_SUBSCRIPTIONS` is process-global (#4824),
+/// registration on drop — the subscription registry is process-global (#4824),
 /// so a blanket `remove` would delete a concurrent test's entry under plain
 /// `cargo test`. Mirrors the guard in the sibling module.
 struct SubscriptionGuard {
@@ -93,10 +91,7 @@ struct SubscriptionGuard {
 
 impl SubscriptionGuard {
     fn register(instance_id: ContractInstanceId, delegate: DelegateKey) -> Self {
-        DELEGATE_SUBSCRIPTIONS
-            .entry(instance_id)
-            .or_default()
-            .insert(delegate.clone());
+        crate::wasm_runtime::delegate_subscriptions::subscribe(instance_id, &delegate);
         Self {
             instance_id,
             delegate,
@@ -106,12 +101,7 @@ impl SubscriptionGuard {
 
 impl Drop for SubscriptionGuard {
     fn drop(&mut self) {
-        DELEGATE_SUBSCRIPTIONS.retain(|id, subs| {
-            if id == &self.instance_id {
-                subs.remove(&self.delegate);
-            }
-            !subs.is_empty()
-        });
+        crate::wasm_runtime::delegate_subscriptions::unsubscribe(&self.instance_id, &self.delegate);
     }
 }
 

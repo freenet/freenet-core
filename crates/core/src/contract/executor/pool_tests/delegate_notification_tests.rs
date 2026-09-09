@@ -33,7 +33,7 @@ use std::time::Duration;
 use crate::config::ConfigArgs;
 use crate::contract::executor::{ContractExecutor, Executor, OperationMode};
 use crate::node::OpManager;
-use crate::wasm_runtime::{DELEGATE_SUBSCRIPTIONS, MockStateStorage};
+use crate::wasm_runtime::MockStateStorage;
 
 use super::super::mock_runtime::test::create_test_contract as test_contract;
 
@@ -82,9 +82,9 @@ async fn build_op_manager(
 }
 
 /// Registers one delegate against one contract in the process-global
-/// `DELEGATE_SUBSCRIPTIONS` map and removes the entry on drop.
+/// subscription registry and removes the entry on drop.
 ///
-/// `DELEGATE_SUBSCRIPTIONS` is process-global (#4824), and CI runs
+/// the subscription registry is process-global (#4824), and CI runs
 /// `cargo nextest` (process per test) while contributors run plain
 /// `cargo test` (one process for all of them) — see
 /// `.claude/rules/testing.md`. So each test uses a contract key derived
@@ -97,10 +97,7 @@ struct SubscriptionGuard {
 
 impl SubscriptionGuard {
     fn register(instance_id: ContractInstanceId, delegate: DelegateKey) -> Self {
-        DELEGATE_SUBSCRIPTIONS
-            .entry(instance_id)
-            .or_default()
-            .insert(delegate.clone());
+        crate::wasm_runtime::delegate_subscriptions::subscribe(instance_id, &delegate);
         Self {
             instance_id,
             delegate,
@@ -115,12 +112,7 @@ impl Drop for SubscriptionGuard {
         // test's subscription if the keys ever collided, which is the shape
         // `.claude/rules/testing.md` warns about for shared globals. Mirrors
         // how production cleans up in `runtime/delegates.rs`.
-        DELEGATE_SUBSCRIPTIONS.retain(|id, subs| {
-            if id == &self.instance_id {
-                subs.remove(&self.delegate);
-            }
-            !subs.is_empty()
-        });
+        crate::wasm_runtime::delegate_subscriptions::unsubscribe(&self.instance_id, &self.delegate);
     }
 }
 

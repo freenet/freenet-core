@@ -5,7 +5,6 @@ use freenet_stdlib::prelude::{
     ContractInstanceId, ContractKey, DelegateKey, SecretsId, encode_secret_key_list,
 };
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -75,16 +74,6 @@ pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateEnvSlot>> =
 /// or dropping it before the guest returns, silently reintroduces the hazard.
 pub(super) static LIVE_DELEGATE_GUESTS: LazyLock<dashmap::DashSet<InstanceId>> =
     LazyLock::new(dashmap::DashSet::default);
-
-/// Global registry of delegate subscriptions to contracts.
-///
-/// When a V2 delegate calls `subscribe_contract()`, the (contract, delegate) pair is
-/// recorded here. When this node commits a new contract state,
-/// `Executor::finalize_state_commit` checks this registry and sends
-/// notifications to subscribed delegates.
-pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
-    DashMap<ContractInstanceId, HashSet<DelegateKey>>,
-> = LazyLock::new(DashMap::default);
 
 /// Shared, in-memory cache of `DelegateContext` bytes keyed by `DelegateKey`.
 ///
@@ -1486,10 +1475,17 @@ impl DelegateCallEnv {
 
     /// Register a subscription interest for a contract.
     ///
-    /// Validates the contract is known and records the (contract, delegate) pair in
-    /// the global subscription registry. When this node commits a new state for the
-    /// contract, `Executor::finalize_state_commit` sends a `ContractNotification`
-    /// to the delegate.
+    /// Validates the contract is known and records the (contract, delegate) pair
+    /// in the global subscription registry. When this node commits a new state
+    /// for the contract, `Executor::finalize_state_commit` sends a
+    /// `ContractNotification` to the delegate.
+    ///
+    /// Registration goes through `delegate_subscriptions::subscribe` rather than
+    /// touching the registry directly, so this path is bounded by
+    /// `MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE` exactly as the V1 path is. A
+    /// bound applied to only one of the two would be an opt-out: a delegate
+    /// selects V1 simply by not importing the async host functions
+    /// (`Runtime::prepare_delegate_call`).
     pub(super) fn subscribe_contract_sync(
         &self,
         instance_id: &ContractInstanceId,
@@ -1497,11 +1493,10 @@ impl DelegateCallEnv {
         // Validate the contract is known
         let _contract_key = self.resolve_contract_key(instance_id)?;
 
-        // Register in global subscription registry
-        DELEGATE_SUBSCRIPTIONS
-            .entry(*instance_id)
-            .or_default()
-            .insert(self.delegate_key.clone());
+        // Register in global subscription registry, under the per-delegate cap.
+        // The cap evicts rather than refuses, so this cannot fail and cannot
+        // starve a delegate that reaches it; see `delegate_subscriptions`.
+        crate::wasm_runtime::delegate_subscriptions::subscribe(*instance_id, &self.delegate_key);
 
         Ok(())
     }
@@ -2905,7 +2900,7 @@ pub(super) mod delegate_contracts {
     /// Implementation of subscribe_contract.
     ///
     /// Validates that the contract is known (code hash resolvable) and registers
-    /// subscription interest in the global `DELEGATE_SUBSCRIPTIONS` registry.
+    /// subscription interest in the global `delegate_subscriptions` registry.
     /// When the subscribed contract's state changes, `Executor::finalize_state_commit`
     /// delivers a `ContractNotification` to this delegate.
     ///
