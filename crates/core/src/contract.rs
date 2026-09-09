@@ -768,6 +768,44 @@ fn contract_op_response_msg(
     }
 }
 
+/// The egress ban gate, applied to delegate-originated network operations
+/// (#5542 finding B2).
+///
+/// `reject_if_contract_banned` is called at the top of every CLIENT originator
+/// entry point — `start_client_put` / `_get` / `_subscribe` / `_update` — so
+/// that a banned contract's request is refused before it consumes this node's
+/// outbound resources. The invariant that gate exists to hold is stated at
+/// `operations.rs`: a banned contract can neither receive new state via this
+/// node nor transmit new state via it.
+///
+/// The delegate paths call the INTERNAL drivers — `start_sub_op_get` and
+/// `run_executor_subscribe` — rather than those client entry points, so they
+/// sat underneath the gate entirely. A delegate could originate GET, SUBSCRIBE
+/// and the UPDATE self-heal fetch for a contract this node has banned, which
+/// defeats the egress half of the invariant on a path the ban list cannot see.
+///
+/// Applied at ADMISSION rather than inside the drivers: putting it in
+/// `start_sub_op_get` would reshape all of its callers, including the
+/// phantom-repair path that restores a hosting invariant, which this PR
+/// deliberately declines to do. Refusing at admission also means the delegate
+/// gets the ordinary refusal it already understands rather than a driver-level
+/// error it has no channel for.
+///
+/// `false` when there is no `OpManager`: no network operation can start without
+/// one, so there is nothing to gate.
+fn delegate_network_op_banned<CH>(
+    contract_handler: &mut CH,
+    contract_id: &freenet_stdlib::prelude::ContractInstanceId,
+) -> bool
+where
+    CH: ContractHandler + Send + 'static,
+{
+    let Some(op_manager) = contract_handler.executor().op_manager_handle() else {
+        return false;
+    };
+    crate::operations::reject_if_contract_banned(&op_manager, contract_id).is_err()
+}
+
 /// Give back the local interest that resolved-but-dropped SUBSCRIBEs took
 /// (#5542 finding B3).
 ///
@@ -1632,6 +1670,7 @@ where
                         // `DelegateContext` across the gap.
                         if parking.is_some()
                             && can_reach_network
+                            && !delegate_network_op_banned(contract_handler, &contract_id)
                             && pending_contract_ops.len() + self_heal_fetches_started
                                 < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
                         {
@@ -1983,6 +2022,7 @@ where
                     Ok(())
                 } else if parking.is_some()
                     && can_reach_network
+                    && !delegate_network_op_banned(contract_handler, &contract_id)
                     && pending_contract_ops.len() + self_heal_fetches_started
                         < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
                     && !pending_contract_ops.iter().any(|op| {
@@ -2037,6 +2077,8 @@ where
                         "this node has no network handle"
                     } else if parking.is_none() {
                         "delegate parking is unavailable on this executor"
+                    } else if delegate_network_op_banned(contract_handler, &contract_id) {
+                        "this node has banned this contract (#5542 finding B2)"
                     } else {
                         "too many delegate network operations already in flight \
                          (MAX_NETWORK_CONTRACT_OPS_PER_PARK)"
@@ -8435,6 +8477,80 @@ mod hol_4391_tests {
             task_monitor,
         ));
         (op_manager, guards)
+    }
+
+    /// #5542 finding B2. A delegate must not be able to originate a network
+    /// operation for a contract this node has BANNED.
+    ///
+    /// `reject_if_contract_banned` runs at the top of every CLIENT originator
+    /// entry point (`start_client_put` / `_get` / `_subscribe` / `_update`), so
+    /// the egress half of the ban invariant held for everything that crossed
+    /// one. The delegate GET and SUBSCRIBE arms call the internal drivers
+    /// `start_sub_op_get` and `run_executor_subscribe` directly, crossing none
+    /// of them, so they sat underneath the gate entirely.
+    ///
+    /// COVERAGE SHAPE, stated rather than implied: this proves the gate
+    /// function against a real `ContractBanList` on a real `OpManager`, and the
+    /// companion pin below proves both admission sites call it. Driving the two
+    /// arms end-to-end would need the refusal to be distinguishable from an
+    /// admitted-then-failed network op at the delegate boundary, and it is not:
+    /// `GetContractResponse` has no error channel at all, and both outcomes
+    /// reach the delegate as a `SubscribeContractResponse`. The UPDATE arm's
+    /// equivalent IS covered behaviourally, in
+    /// `operations::update::tests::a_banned_contract_gets_no_delegate_self_heal_fetch`,
+    /// because its refusal is observable in `pending_contract_fetches`.
+    #[tokio::test]
+    async fn a_banned_contract_refuses_delegate_originated_network_ops() {
+        let (op_manager, _guards) = build_op_manager("d5542-ban").await;
+        let (_send, rcv_halve, _wait) = handler::contract_handler_channel();
+        let mut handler =
+            MockWasmContractHandler::new_test(rcv_halve, Some(op_manager.clone()), "d5542_ban")
+                .await;
+
+        let banned = ContractInstanceId::new([61u8; 32]);
+        let allowed = ContractInstanceId::new([62u8; 32]);
+        op_manager.ring.contract_ban_list.ban(
+            banned,
+            tokio::time::Instant::now() + Duration::from_secs(3600),
+            crate::ring::contract_ban_list::BanReason::AutoMad,
+        );
+
+        assert!(
+            delegate_network_op_banned(&mut handler, &banned),
+            "a banned contract must be refused a delegate-originated network op"
+        );
+        assert!(
+            !delegate_network_op_banned(&mut handler, &allowed),
+            "an unbanned contract must still be admitted, or the gate is refusing \
+             everything and proves nothing"
+        );
+    }
+
+    /// #5542 finding B2, wiring half. Both delegate network-op admission sites
+    /// must consult the egress ban gate.
+    ///
+    /// The gate function being correct is worth nothing if an arm does not call
+    /// it, and that is the half that rots: a future arm is added, copies the
+    /// budget conjunct, and omits this one. Anchored on the call itself.
+    #[test]
+    fn both_delegate_network_admission_sites_consult_the_ban_gate() {
+        let code = super::tests::production_code();
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let gates = flat
+            .matches("< delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK")
+            .count();
+        let banned_checks = flat
+            .matches("!delegate_network_op_banned(contract_handler, &contract_id)")
+            .count();
+        assert_eq!(
+            banned_checks, 2,
+            "the GET and SUBSCRIBE admission gates must each refuse a banned \
+             contract before parking a network operation for it; found \
+             {banned_checks} of the 2 required (there are {gates} fan-out gates \
+             in total, the third being the UPDATE self-heal, which is gated \
+             inside `try_self_heal_fetch_for_local_originator` instead)"
+        );
     }
 
     /// #5542 finding B3/F2. A resolved SUBSCRIBE whose resume is dropped on

@@ -339,6 +339,22 @@ impl OpManager {
         use crate::config::GlobalSimulationTime;
         use dashmap::mapref::entry::Entry;
 
+        // EGRESS BAN GATE (#5542 finding B2). `try_auto_fetch_contract`'s
+        // client-originated sibling is reached only from paths that already
+        // passed `reject_if_contract_banned` at `start_client_update`; this one
+        // is reached from a delegate, which never crosses a client entry point.
+        // Without this check a delegate could make this node originate network
+        // traffic for a contract it has banned, defeating the egress half of the
+        // invariant documented at `operations.rs`.
+        if crate::operations::reject_if_contract_banned(self, &instance_id).is_err() {
+            tracing::debug!(
+                contract = %instance_id,
+                phase = "egress_banned_reject",
+                "Not starting a delegate-originated self-heal fetch: contract is banned"
+            );
+            return false;
+        }
+
         // A fetch that cannot possibly route must NOT burn the shared 5-minute
         // slot, and must not be reported to the delegate as started (#5542,
         // review finding 5B). `try_auto_fetch_contract` has the same discipline:
@@ -3480,6 +3496,54 @@ mod tests {
             "a second attempt inside CONTRACT_FETCH_COOLDOWN_MS must be refused, and \
              must REPORT the refusal so the delegate is not promised a repair that \
              is not running"
+        );
+    }
+
+    /// A delegate must not be able to make this node originate network traffic
+    /// for a contract it has BANNED (#5542 finding B2).
+    ///
+    /// `reject_if_contract_banned` runs at the top of every CLIENT originator
+    /// entry point, so the egress half of the ban invariant — a banned contract
+    /// can neither receive new state via this node nor transmit new state via it
+    /// — held for every path that crosses one. The delegate paths call the
+    /// internal drivers directly and crossed none of them, so this fetch was
+    /// reachable for a banned contract.
+    ///
+    /// The assertion on the cooldown map is the one that matters: refusing while
+    /// still taking the slot would be a second bug wearing the first one's fix.
+    #[tokio::test]
+    async fn a_banned_contract_gets_no_delegate_self_heal_fetch() {
+        let (op_manager, _rx, _guard) = build_notification_test_node("selfheal_5542_banned").await;
+        let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([79u8; 32]);
+        let _peer = connect_peer(&op_manager, 45_503, 0.5);
+
+        op_manager.ring.contract_ban_list.ban(
+            instance_id,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
+            crate::ring::contract_ban_list::BanReason::AutoMad,
+        );
+        assert!(
+            op_manager.ring.contract_ban_list.is_banned(&instance_id),
+            "the ban must be in force, or this test proves nothing"
+        );
+
+        assert!(
+            !op_manager.try_self_heal_fetch_for_local_originator(instance_id),
+            "a banned contract must not get a delegate-originated network fetch"
+        );
+        assert!(
+            !op_manager
+                .pending_contract_fetches
+                .contains_key(&instance_id),
+            "and the refusal must not burn the shared cooldown slot"
+        );
+
+        // An UNBANNED contract on the same node still proceeds, so the refusal
+        // above is the ban and not some unrelated precondition.
+        let allowed = freenet_stdlib::prelude::ContractInstanceId::new([80u8; 32]);
+        assert!(
+            op_manager.try_self_heal_fetch_for_local_originator(allowed),
+            "an unbanned contract must still be fetchable on this node"
         );
     }
 
