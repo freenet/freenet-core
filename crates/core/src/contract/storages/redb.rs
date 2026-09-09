@@ -286,7 +286,7 @@ pub(crate) const RESERVED_MARKER_HASHES_TABLE: TableDefinition<&[u8], &[u8]> =
 /// notification channel closing) is a prefix range scan; removing a delegate
 /// walks the in-memory registry for the contracts that delegate holds and
 /// issues point deletes, so neither teardown ever needs a full table scan. The
-/// only full scan is the one at boot.
+/// only full scans are at boot: the expiry pass and then the restore load.
 ///
 /// Key: ContractInstanceId (32 bytes) || DelegateKey (64 bytes) = 96 bytes
 /// Value: last-affirmed stamp, 8 bytes big-endian milliseconds since the UNIX
@@ -2074,6 +2074,14 @@ impl ReDb {
     /// time the app runs its delegate re-subscribes and re-pins. That is why a
     /// generous value is the safe direction to be wrong in, and why the
     /// mechanism is worth having at a value nobody has ratified yet.
+    ///
+    /// It is a wall-clock mechanism, and the clock error that actually happens
+    /// is the safe one: a node whose clock is BEHIND computes an age of zero
+    /// (the comparison saturates) and expires nothing, which is also what a
+    /// node booting with an unset RTC does. A clock that jumped more than this
+    /// horizon FORWARD would expire rows early, and nothing guards against
+    /// that; the restore log line reports `expired_stale` so it is at least
+    /// visible after the fact.
     pub(crate) const DELEGATE_SUBSCRIPTION_MAX_IDLE_MS: u64 = 180 * 24 * 60 * 60 * 1000;
 
     /// Only rewrite a row's stamp when the stored one is older than this.
