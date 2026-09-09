@@ -533,11 +533,15 @@ async fn fetch_related_off_loop(
 /// into the resume sink and then an unbounded channel with no accounting at
 /// all, so one park could retain ~2 GiB against a nominal 64 MiB cap.
 ///
-/// Failing the whole upsert on excess matches what this path already does for
-/// a miss, a timeout or an infra error — `fetch_related_off_loop` is
-/// all-or-nothing by design, mirroring the inline validate path — so the
-/// delegate is TOLD the upsert failed rather than left waiting, through a
-/// branch it already handles.
+/// AN OVER-ALLOWANCE FETCH IS NOT A FAILURE. It returns
+/// [`delegate_park::FetchDisposition::RetryInline`], and the resume path re-runs
+/// the upsert inline on the serial loop. An earlier version returned `Err`,
+/// which failed the write — and did so only when the park was ADMITTED, since a
+/// park REFUSED at admission falls back inline with no allowance applied at
+/// all. Whether a delegate's write succeeded therefore depended on how many
+/// other delegates happened to be parked, which is the opposite of what a
+/// pressure signal should do. A genuine fetch failure still passes through
+/// unchanged, through the branch the delegate already handles.
 ///
 /// Applied at the CALL SITE rather than inside `fetch_related_off_loop` so the
 /// test stub (`OFF_LOOP_FETCH_OVERRIDE`), which returns before that function's
@@ -565,8 +569,13 @@ fn within_fetch_allowance(
     fetched: Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>,
     missing: &[ContractInstanceId],
     allowance: usize,
-) -> Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError> {
-    let states = fetched?;
+) -> delegate_park::FetchDisposition {
+    let states = match fetched {
+        Ok(states) => states,
+        // A real fetch failure passes straight through: it is the caller's
+        // existing all-or-nothing outcome, not an allowance decision.
+        Err(err) => return delegate_park::FetchDisposition::Resolved(Err(err)),
+    };
     let bytes: usize = states
         .iter()
         .map(|(_, state)| state.as_ref().len())
@@ -589,9 +598,16 @@ fn within_fetch_allowance(
              it; failing the upsert rather than holding unbounded bytes behind \
              a park (#5554 follow-up)"
         );
-        return Err(ExecutorError::missing_related(id));
+        // RETRY INLINE, DO NOT FAIL. Returning `Err` here failed the write —
+        // and failed it precisely when the park was ADMITTED, so an identical
+        // request succeeded on a busier node that refused the park and went
+        // inline. The states are dropped at this statement (`states` is owned
+        // and goes out of scope), so nothing oversized is retained; the upsert
+        // is re-run on the loop at resume, which costs a second fetch and a
+        // stall and completes the write.
+        return delegate_park::FetchDisposition::RetryInline;
     }
-    Ok(states)
+    delegate_park::FetchDisposition::Resolved(Ok(states))
 }
 
 /// Whether a delegate run may deliver delegate-to-delegate messages.
@@ -692,6 +708,17 @@ where
     CH: ContractHandler + Send + 'static,
 {
     let delegate_park::ResolvedUpsert { pending, fetched } = resolved;
+    let delegate_park::FetchDisposition::Resolved(fetched) = fetched else {
+        // Unreachable: the caller routes `RetryInline` to
+        // `run_deferred_upsert_inline` before reaching here. Stated as an
+        // invariant rather than silently treated as a failure, because
+        // reporting an over-allowance as a failed write is exactly the defect
+        // the disposition enum exists to prevent.
+        unreachable!(
+            "RetryInline must be routed to run_deferred_upsert_inline by the \
+             caller, not resolved here"
+        )
+    };
     let contract_id = *pending.key.id();
     let mut related_contracts = pending.related_contracts;
     let result = match fetched {
@@ -1149,6 +1176,7 @@ where
                                 < delegate_park::MAX_DEFERRED_UPSERTS_PER_PARK =>
                     {
                         deferred_upserts.push(delegate_park::PendingUpsert {
+                            id: delegate_park::UpsertId::next(),
                             key: contract_key,
                             update,
                             related_contracts: req.related_contracts,
@@ -1350,6 +1378,7 @@ where
                                         < delegate_park::MAX_DEFERRED_UPSERTS_PER_PARK =>
                             {
                                 deferred_upserts.push(delegate_park::PendingUpsert {
+                                    id: delegate_park::UpsertId::next(),
                                     key: full_key,
                                     update: update_value,
                                     related_contracts: RelatedContracts::default(),
@@ -1732,7 +1761,13 @@ where
                 // continuation points at: the prompts and the deferred upserts
                 // live for exactly as long as the park, and a single upsert can
                 // own a full state plus related contracts plus code.
-                let task_bytes = delegate_park::task_bytes(&user_input_requests, &deferred_upserts);
+                // ONE SOURCE for the reserve and the later enforcement.
+                let fetch_allowance = ctx.park.upsert_fetch_allowance();
+                let task_bytes = delegate_park::task_bytes(
+                    &user_input_requests,
+                    &deferred_upserts,
+                    fetch_allowance,
+                );
                 match ctx
                     .park
                     .park(delegate_key.clone(), continuation, task_bytes)
@@ -1800,8 +1835,10 @@ where
                             // they could sum past PARK_TTL, at which point the
                             // loop's backstop sweep would force-resume while this
                             // task was still running and its result would be
-                            // discarded. Keeping the budget below the TTL means
-                            // the guard always wins the race.
+                            // discarded. Keeping the budget below the TTL gives
+                            // the guard a MARGIN in that race, not a guarantee
+                            // — see `PARK_WORK_BUDGET`, where the same sentence
+                            // was corrected and this copy was missed.
                             let fetches = async {
                                 futures::future::join_all(upserts.into_iter().map(|pending| {
                                     let op_manager = op_manager.clone();
@@ -1817,7 +1854,7 @@ where
                                         let fetched = within_fetch_allowance(
                                             fetched,
                                             &pending.missing,
-                                            delegate_park::MAX_UPSERT_FETCH_BYTES,
+                                            fetch_allowance,
                                         );
                                         sink.lock().unwrap().push(delegate_park::ResolvedUpsert {
                                             pending,
@@ -3573,13 +3610,20 @@ where
 /// requests drained behind the park, and is always at least 1. `None` means no
 /// park matched `(key, epoch)`, so nothing ran at all.
 ///
-/// EVERY caller spends the count against a budget (#5544 S5): each drained
-/// request is a full delegate run, so an unaccounted drain could do many of
-/// them before the fair queue got a single turn — exactly the head-of-line
-/// blocking the batch cap exists to prevent. That sentence was true of the
+/// The BATCHING callers spend the count against a budget (#5544 S5): each
+/// drained request is a full delegate run, so an unaccounted drain could do
+/// many of them before the fair queue got a single turn — exactly the
+/// head-of-line blocking the batch cap exists to prevent. That was true of the
 /// resume batch and false of the TTL sweep, which discarded the count with
 /// `let _ =` while performing up to 1600 runs in one pass; see
 /// `sweep_expired_parks`.
+///
+/// NOT "every caller", which an earlier version of this said. The idle
+/// `select!` arm in `contract_handling` still discards it, and that is
+/// deliberate: it runs at most ONE resume and then returns to the top of the
+/// loop, where the batch's own budget governs everything that follows. Saying
+/// "every" in the doc of a change whose subject is over-claiming doc comments
+/// was the wrong word, and the exception is cheaper to name than to defend.
 ///
 /// `None` is distinguished from `Some(0)` rather than folded into it because
 /// the sweep needs the difference: it must log "force-resuming" only for a park
@@ -3663,7 +3707,20 @@ where
     // Re-run any deferred upserts ON the loop (WASM stays serial; only the
     // fetch happened off it), then feed their responses back with the rest.
     for resolved in upserts {
-        all_inbound.push(apply_resolved_upsert(contract_handler, resolved).await);
+        // AN OVER-ALLOWANCE FETCH DEGRADES TO INLINE HERE, on the serial loop,
+        // which is where `run_deferred_upsert_inline` already belongs. This is
+        // what makes `upsert_fetch_allowance`'s "degrades to the inline path"
+        // true rather than aspirational: the write completes, at the cost of a
+        // second fetch and a stall for this one operation.
+        match resolved.fetched {
+            delegate_park::FetchDisposition::RetryInline => {
+                all_inbound
+                    .push(run_deferred_upsert_inline(contract_handler, resolved.pending).await);
+            }
+            delegate_park::FetchDisposition::Resolved(_) => {
+                all_inbound.push(apply_resolved_upsert(contract_handler, resolved).await);
+            }
+        }
     }
     // Upserts the off-loop task never resolved (panic, cancellation, budget).
     // The delegate is TOLD they failed rather than left waiting for a response
@@ -8461,9 +8518,12 @@ mod hol_4391_tests {
             allowance,
         );
         assert!(
-            within.is_ok(),
-            "a fetch inside its reserve must be accepted, or this test would \
-             pass for the wrong reason"
+            matches!(
+                within,
+                delegate_park::FetchDisposition::Resolved(Ok(ref v)) if v.len() == 1
+            ),
+            "a fetch inside its reserve must be RESOLVED with its states, or \
+             this test would pass for the wrong reason"
         );
         assert_eq!(
             refused_oversized_fetches(),
@@ -8477,10 +8537,11 @@ mod hol_4391_tests {
             allowance,
         );
         assert!(
-            over.is_err(),
-            "a fetch beyond its reserve must be refused: it is what the park \
-             reserved against, and accepting it makes the reservation a \
-             decoration"
+            matches!(over, delegate_park::FetchDisposition::RetryInline),
+            "a fetch beyond its reserve must be sent back to the INLINE path, \
+             not accepted and not failed. Accepting it makes the reservation a \
+             decoration; failing it fails a write that would have succeeded had \
+             the park been refused instead of admitted"
         );
         assert_eq!(
             refused_oversized_fetches(),
@@ -8492,7 +8553,6 @@ mod hol_4391_tests {
         );
     }
 
-    /// M3, the SIBLING SITE: a QUEUED notification that parks on its own run
     /// M3, the SIBLING SITE: a QUEUED notification that parks on its own run
     /// must also fan its residual output out to apps.
     ///
@@ -8615,7 +8675,6 @@ mod hol_4391_tests {
         }
     }
 
-    /// P4b: the notification path must actually RUN the delegate->apps TTL
     /// P4b: the notification path must actually RUN the delegate->apps TTL
     /// sweep, not merely contain it.
     ///
@@ -9008,6 +9067,7 @@ mod hol_4391_tests {
     ) -> delegate_park::ResolvedUpsert {
         delegate_park::ResolvedUpsert {
             pending: delegate_park::PendingUpsert {
+                id: delegate_park::UpsertId::next(),
                 key: contract.key(),
                 update: Either::Left(WrappedState::new(b"a_state".to_vec())),
                 related_contracts: RelatedContracts::default(),
@@ -9016,7 +9076,7 @@ mod hol_4391_tests {
                 context: DelegateContext::default(),
                 missing: vec![related],
             },
-            fetched,
+            fetched: delegate_park::FetchDisposition::Resolved(fetched),
         }
     }
 

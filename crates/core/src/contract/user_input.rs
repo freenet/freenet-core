@@ -735,6 +735,7 @@ mod tests {
     /// &self.nonce).is_some()`, the mutation that survived the whole 5465-test
     /// suite before this test existed. Both assertions go red.
     #[tokio::test]
+    #[serial_test::serial(prompt_events)]
     async fn a_prompt_cancelled_mid_await_removes_its_pending_entry() {
         let pending: PendingPrompts = Arc::new(DashMap::new());
         let prompter = noop_prompter(pending.clone());
@@ -766,14 +767,22 @@ mod tests {
         // The broadcast is process-global and shared with other tests, so match
         // on OUR nonce rather than on the next event to arrive.
         //
-        // `Lagged` is CONTINUED, not treated as end-of-stream. `PROMPT_EVENTS`
-        // is process-global with a capacity of `PROMPT_EVENT_CAPACITY`, shared
-        // with every other test in this binary running in parallel, so this
-        // receiver can fall behind through no fault of the code under test.
-        // `while let Ok(..)` broke on that arm, which made a lagged receiver
-        // report `removed == false` and fail with a message accusing
-        // `PromptEntryGuard` of never emitting `Removed` — a false accusation
-        // about a guard that had worked. Only `Empty`/`Closed` end the drain.
+        // TWO CHANGES, and the first is the one that actually closes it.
+        // `PROMPT_EVENTS` is process-global with a capacity of
+        // `PROMPT_EVENT_CAPACITY`, shared with every other test in this binary,
+        // so this receiver could fall behind through no fault of the code under
+        // test. The `#[serial(prompt_events)]` attribute on the three tests that
+        // touch that channel is what REMOVES that: they no longer run
+        // concurrently, so nothing else is publishing into the window between
+        // the subscribe above and this drain.
+        //
+        // Handling `Lagged` is then defence in depth rather than the fix, and
+        // saying so matters: `while let Ok(..)` BREAKS on that arm, so a lagged
+        // receiver reported `removed == false` and failed with a message
+        // accusing `PromptEntryGuard` of never emitting `Removed`. If the
+        // serialisation is ever removed, or a future emitter appears outside
+        // these three tests, the failure says which of the two it was instead
+        // of blaming the guard. Only `Empty`/`Closed` end the drain.
         let mut removed = false;
         let mut lagged = 0u64;
         loop {
@@ -1065,6 +1074,7 @@ mod tests {
     /// double-emit-avoidance path; the timeout-driven `Removed` path is
     /// covered by `test_prompt_timeout_emits_removed`.
     #[tokio::test]
+    #[serial_test::serial(prompt_events)]
     async fn test_prompt_added_emitted_and_external_remove_skips_cleanup_removed() {
         // Subscribe BEFORE spawning the prompter so we don't miss the
         // synchronous Added event.
@@ -1131,6 +1141,7 @@ mod tests {
     /// When the prompter's own timeout cleanup runs, it must emit Removed
     /// so subscribers on either transport dismiss the overlay.
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial(prompt_events)]
     async fn test_prompt_timeout_emits_removed() {
         let mut rx = prompt_events().subscribe();
 

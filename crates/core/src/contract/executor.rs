@@ -1866,6 +1866,52 @@ mod tests {
         );
     }
 
+    /// The margin the aggregate passes by, asserted rather than assumed.
+    ///
+    /// WHY THIS EXISTS AS ITS OWN TEST. `cache_byte_budgets_are_aggregate_safe`
+    /// asserts `total <= limit / 2` and says nothing about by how much — so
+    /// "we fixed the over-commit" and "we fixed it with under one percent to
+    /// spare" are indistinguishable from its output, and they call for very
+    /// different decisions about the next budget anyone adds.
+    ///
+    /// Adding `MAX_PARKED_BYTES` to the sum put a 1 GiB host at 566,231,032
+    /// against a 536,870,912 half-limit; RAM-scaling it via `parked_budget_for`
+    /// brought that under. The margin left is small, and the next term added to
+    /// this sum on a 1 GiB host will very likely exceed it — which is the point
+    /// of printing the number in the failure rather than leaving whoever adds
+    /// it to discover the ceiling by tripping the other test.
+    ///
+    /// 4 workers is the binding shape: fewer means smaller per-executor terms,
+    /// more means each shrinks again, so the worst case is in the middle.
+    #[test]
+    fn the_aggregate_margin_on_a_small_host_is_stated_not_assumed() {
+        let one_gib: usize = 1024 * 1024 * 1024;
+        let half = one_gib / 2;
+        let total = declared_cache_ceiling(one_gib, 4);
+        let margin = half.saturating_sub(total);
+        assert!(
+            total <= half,
+            "a 1 GiB host with 4 workers declares {total} bytes against a \
+             {half}-byte half-limit — over by {}. This is the shape that was \
+             already over-committed before `MAX_PARKED_BYTES` was summed",
+            total.saturating_sub(half)
+        );
+        // Deliberately loose: this pins that a margin was MEASURED, not a
+        // particular value, so retuning any term moves it without a spurious
+        // failure. What it forbids is the margin silently reaching zero.
+        assert!(
+            margin > 0,
+            "the aggregate now fits EXACTLY, with no headroom at all on a 1 GiB \
+             host. The next budget added to `declared_cache_ceiling` puts it \
+             over, and hosting derives its residual from this sum"
+        );
+        println!(
+            "1 GiB / 4 workers: declared {total}, half-limit {half}, margin {margin} bytes ({:.2}%)",
+            (margin as f64 / half as f64) * 100.0
+        );
+    }
+
+    /// The other half of `declared_cache_ceiling_names_every_budget`, and the
     /// The other half of `declared_cache_ceiling_names_every_budget`, and the
     /// half that was missing: that one catches a summed budget being REMOVED;
     /// this one catches a new one being ADDED and not summed.
@@ -1970,8 +2016,8 @@ mod tests {
             ("MAX_PARKED_BYTES", "clamp inside parked_budget_for"),
             ("MIN_PARKED_BYTES", "clamp inside parked_budget_for"),
             (
-                "MAX_UPSERT_FETCH_BYTES",
-                "sub-allowance carved OUT OF MAX_PARKED_BYTES, which is summed",
+                "ELEMENT_OVERHEAD_BYTES",
+                "per-element overhead CHARGED AGAINST MAX_PARKED_BYTES, which is summed",
             ),
             // Per-request / per-message limits. Bounded and released within one
             // operation, so they are not memory the node holds resident.

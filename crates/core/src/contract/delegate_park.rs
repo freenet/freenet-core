@@ -194,9 +194,16 @@ pub(super) const MAX_PENDING_NOTIFICATION_CONTRACTS: usize = 16;
 /// caps how many `PutContractRequest`s one `process()` may emit, each able to
 /// name up to `MAX_RELATED_CONTRACTS_PER_REQUEST` (10) missing contracts.
 ///
-/// 4 is chosen so the node-wide worst case matches the client path rather than
-/// exceeding it: MAX_PARKED_DELEGATES (64) x 4 x 10 = 2560 ids in flight,
-/// against the client path's 256 x 10 = 2560. Over the cap the excess upserts
+/// 4 is chosen so the node-wide worst case is of the same ORDER as the client
+/// path rather than a multiple of it: MAX_PARKED_DELEGATES (64) x 4 x 10 =
+/// 2560 ids in flight, against the client path's 256 x 10 = 2560.
+///
+/// Read as "matches", which it was, that is a stronger claim than the numbers
+/// support: the two are ADDITIVE, not alternatives — a node can be running the
+/// client path's 2560 and this path's 2560 at once — so the real effect of
+/// choosing 4 is to double a pre-existing ceiling rather than to stay under it.
+/// Still the right value, for the reason below; the parity was never the
+/// argument. Over the cap the excess upserts
 /// fall back to the inline fetch, which stalls the loop for those specific
 /// operations — the same deliberate trade as the park-cap fallback: degrading
 /// to the old behaviour beats dropping a delegate's write.
@@ -219,7 +226,13 @@ pub(super) const MAX_PARKED_BYTES: usize = 64 * 1024 * 1024;
 
 /// Floor, so a very small host still admits some parks rather than falling back
 /// inline for everything.
-const MIN_PARKED_BYTES: usize = 8 * 1024 * 1024;
+///
+/// An eighth of [`MAX_PARKED_BYTES`], and stated as such rather than left as a
+/// bare number: with `PARKED_RAM_DIVISOR` of 32 it binds below 256 MiB of RAM,
+/// and it is what [`upsert_fetch_allowance`] is smallest against — 512 KiB per
+/// deferred upsert at the floor. Changing either without the other silently
+/// moves where deferred upserts start degrading to the inline path.
+const MIN_PARKED_BYTES: usize = MAX_PARKED_BYTES / 8;
 
 /// RAM assumed when the host's real figure cannot be read — the same
 /// conservative 1 GiB every sibling budget falls back to.
@@ -264,30 +277,54 @@ pub(super) fn parked_budget_for(total_ram: usize) -> usize {
 /// upsert naming a missing related contract would be refused and fall back to
 /// the inline path — undoing much of what #5544 bought. Any honest
 /// pre-reservation therefore implies a per-fetch ceiling below
-/// `MAX_STATE_SIZE`; the only question is what it is, so it is derived from the
-/// node cap rather than invented: at most 8 fetching parks may coexist at the
-/// cap, and the 9th degrades to the inline path — the same deliberate trade the
-/// park cap itself makes.
+/// `MAX_STATE_SIZE`; the only question is what it is.
 ///
-/// 2 MiB IS WELL UNDER `MAX_STATE_SIZE` (50 MiB), SO A LEGITIMATELY LARGE
-/// RELATED CONTRACT WILL ALWAYS DEGRADE — read those two numbers together and
-/// it looks like a bug, so: it is deliberate. What the upsert degrades TO is
-/// the pre-#5544 inline path, which is slower and holds the loop but loses
-/// nothing, not a new failure mode. The alternative is a cap that does not cap:
-/// admitting one 50 MiB related state would blow a 64 MiB node-wide budget on a
-/// single park. The refusal is logged (see `contract::within_fetch_allowance`)
-/// precisely so a latency complaint can be traced back to it rather than
-/// guessed at.
+/// A FRACTION OF THE NODE'S BUDGET, NOT A CONSTANT. This was
+/// `MIN_PARKED_BYTES / (8 * MAX_DEFERRED_UPSERTS_PER_PARK)` — a `const`, so
+/// a node with the full 64 MiB budget got the same allowance as one at the
+/// 8 MiB floor. That is THE SAME DEFECT [`parked_budget_for`] exists to fix,
+/// one level down and introduced by the same commit: the cap was made to scale
+/// and its own sub-allowance was left flat, derived from the floor so it would
+/// be safe there, which made it eight times too small everywhere else. It also
+/// went unnoticed because the prose kept quoting the old value.
+///
+/// Now `budget / (4 * MAX_DEFERRED_UPSERTS_PER_PARK)`: **512 KiB at the 8 MiB
+/// floor, 4 MiB at the 64 MiB ceiling**, and at either size four fully-fetching
+/// parks fill the budget while the fifth degrades — the same deliberate trade
+/// the park cap itself makes.
+///
+/// THE ALLOWANCE IS SMALL BESIDE `MAX_STATE_SIZE` (50 MiB), SO A LARGE RELATED
+/// CONTRACT DEGRADES. Read those numbers together and it looks like a bug, so:
+/// it is deliberate, and the alternative is a cap that does not cap — one
+/// 50 MiB related state would blow the whole node-wide budget on a single park.
+/// What it degrades TO is the pre-#5544 inline path: the upsert is re-run on
+/// the serial loop at resume (see `contract::apply_resolved_upsert`'s caller),
+/// which stalls the loop for that operation and re-fetches, but **completes the
+/// write**. It is not a failure, and it must not become one — an over-allowance
+/// fetch used to return `Err`, which failed a write that would have succeeded
+/// had the park been REFUSED instead of admitted, so whether a delegate's write
+/// worked depended on how many other delegates were parked.
 ///
 /// RESERVED AT ADMISSION (see [`task_bytes`]) and ENFORCED WHEN THE FETCH
 /// COMPLETES (see `contract::within_fetch_allowance`), so retained bytes can
-/// never exceed reserved bytes. Stated limitation: the fetch races its sub-op
-/// GETs concurrently by design, so a state is in memory transiently before the
-/// check. This bounds RETENTION — what enters the sink, the resume channel and
-/// the park's lifetime, which is what this budget is about. The transient peak
-/// stays bounded by the sub-op GET path, as it already was.
-pub(super) const MAX_UPSERT_FETCH_BYTES: usize =
-    MIN_PARKED_BYTES / (8 * MAX_DEFERRED_UPSERTS_PER_PARK);
+/// never exceed reserved bytes.
+///
+/// RESIDUAL, AND IT IS NOT SMALL. This bounds RETENTION — what enters the sink,
+/// the resume channel and the park's lifetime, which is what this budget is
+/// about. It does NOT bound the transient peak: the fetch races its sub-op GETs
+/// concurrently by design, so every state is resident before the check sees the
+/// total. An earlier version of this comment claimed "the transient peak stays
+/// bounded by the sub-op GET path, as it already was" — **that was false and is
+/// worth stating plainly rather than quietly deleting.** `start_sub_op_get`
+/// takes no permit and consults no counter, there is no node-wide live-sub-op
+/// cap, and inbound reassembly is an unbounded map; only the fetch timeout
+/// bounds the window, which is a duration and a throughput rather than a memory
+/// bound. Worst case is ~2 GiB transient for one park against the shipped
+/// `MemoryMax=2G` while `parked_bytes` reads about a megabyte. Tracked in #5607;
+/// bounding it belongs with the sub-op GET path, not here.
+fn upsert_fetch_allowance(budget: usize) -> usize {
+    budget / (4 * MAX_DEFERRED_UPSERTS_PER_PARK)
+}
 
 /// Approximate heap footprint of the payloads a continuation pins.
 ///
@@ -295,15 +332,18 @@ pub(super) const MAX_UPSERT_FETCH_BYTES: usize =
 /// and ignores fixed-size bookkeeping. The point is to bound what an attacker
 /// can grow, not to be exact.
 pub(super) fn continuation_bytes(continuation: &Continuation) -> usize {
+    // Per ELEMENT as well as per payload — see [`ELEMENT_OVERHEAD_BYTES`]. The
+    // delegate controls both list lengths, so summing payloads alone bounds
+    // nothing when the payloads are empty.
     continuation
         .inbound_so_far
         .iter()
-        .map(inbound_bytes)
+        .map(|m| ELEMENT_OVERHEAD_BYTES + inbound_bytes(m))
         .sum::<usize>()
         + continuation
             .accumulated
             .iter()
-            .map(outbound_bytes)
+            .map(|m| ELEMENT_OVERHEAD_BYTES + outbound_bytes(m))
             .sum::<usize>()
         // `params` is delegate-supplied and retained for the life of the park.
         // Omitting it was one of three ways this "byte bound" failed to bound.
@@ -320,6 +360,11 @@ pub(super) fn continuation_bytes(continuation: &Continuation) -> usize {
 pub(super) fn task_bytes(
     prompts: &[freenet_stdlib::prelude::UserInputRequest<'static>],
     upserts: &[PendingUpsert],
+    // THE SAME NUMBER THE FETCH IS LATER CHECKED AGAINST, passed rather than
+    // read from a constant, so the reserve and the enforcement cannot drift
+    // apart. They already did once: the enforcement moved to a budget-derived
+    // value and three paragraphs of prose kept quoting the old one.
+    fetch_allowance: usize,
 ) -> usize {
     let prompt_bytes: usize = prompts
         .iter()
@@ -346,17 +391,25 @@ pub(super) fn task_bytes(
             // another ~100 MiB past the cap across 4 upserts x 64 parks. Same
             // omission as the two `get_context()` ones this file already
             // documents, in the one lane that does not go through a message.
-            let context = ctx_len(&u.context);
+            // TWICE. The task holds this `PendingUpsert` for the park's whole
+            // life, and `owed_upserts` CLONES the context into the guard's
+            // payload so a synthesized failure can echo it — both live until
+            // the park ends. Charging once left ~1.6 MiB per park uncharged at
+            // `DelegateContext::MAX_SIZE`, about 102 MiB across 64 parks
+            // against a 64 MiB budget: the same hole this term was added to
+            // close, reopened by the fix for a different finding in the same
+            // change.
+            let context = 2 * ctx_len(&u.context);
             // RESERVE BEFORE THE FETCH, not charge after it. Charging once the
             // bytes are in hand leaves dropping what you already paid to
             // retrieve as the only available response; reserving up front means
             // a node that cannot afford the fetch refuses the park instead, and
-            // falls back to the inline path. See [`MAX_UPSERT_FETCH_BYTES`] for
-            // why the allowance is a fixed ceiling rather than the worst case.
+            // falls back to the inline path. See [`upsert_fetch_allowance`]
+            // for why it is a fraction of the budget rather than the worst case.
             let fetch_reserve = if u.missing.is_empty() {
                 0
             } else {
-                MAX_UPSERT_FETCH_BYTES
+                fetch_allowance
             };
             update + code + related + context + fetch_reserve
         })
@@ -375,12 +428,18 @@ pub(super) fn request_bytes(req: &DelegateRequest<'static>) -> usize {
     match req {
         DelegateRequest::ApplicationMessages {
             inbound, params, ..
-        } => inbound.iter().map(inbound_bytes).sum::<usize>() + params.as_ref().len(),
+        } => {
+            inbound
+                .iter()
+                .map(|m| ELEMENT_OVERHEAD_BYTES + inbound_bytes(m))
+                .sum::<usize>()
+                + params.as_ref().len()
+        }
         DelegateRequest::RegisterDelegate { delegate, .. } => delegate_container_bytes(delegate),
         // A key and nothing else.
         DelegateRequest::UnregisterDelegate(_) => 0,
         // See `unmeasurable`: charged as maximal, not as free, and announced.
-        other => unmeasurable("DelegateRequest", &format!("{other:?}")),
+        other => unmeasurable("DelegateRequest", std::mem::discriminant(other)),
     }
 }
 
@@ -413,7 +472,7 @@ fn delegate_container_bytes(delegate: &freenet_stdlib::prelude::DelegateContaine
         // bytes through a cap that reads as if it bound them. Both are loud and
         // recoverable; an uncounted bypass is neither. If you are adding a
         // variant, measure it above.
-        other => unmeasurable("DelegateContainer", &format!("{other:?}")),
+        other => unmeasurable("DelegateContainer", std::mem::discriminant(other)),
     }
 }
 
@@ -432,18 +491,30 @@ fn delegate_container_bytes(delegate: &freenet_stdlib::prelude::DelegateContaine
 /// variant degrade until core catches up. That is the deliberate trade — a loud,
 /// recoverable degradation beats a silent bypass of a memory bound — but it is a
 /// known consequence rather than a surprise, and this is where a reader finds it.
-fn unmeasurable(kind: &str, variant: &str) -> usize {
+fn unmeasurable(kind: &str, variant: impl std::fmt::Debug) -> usize {
+    // THE DISCRIMINANT, NOT THE VALUE. This used to `format!("{value:?}")`,
+    // which Debug-formats the very payload the function exists because it
+    // cannot afford to hold — an unmeasurable variant could carry a 50 MiB
+    // state, and the log line would render all of it. The discriminant
+    // identifies the variant, which is all an operator needs to match it
+    // against a stdlib changelog.
     tracing::warn!(
         kind,
-        variant,
-        charged_bytes = MAX_PARKED_BYTES,
-        "Unrecognised {kind} variant in park byte accounting; charging the whole \
-         park budget so it cannot bypass the bound. This delegate will fall back \
-         to the inline path (or have its request rejected) until this build \
-         learns to measure the variant — expect it after a freenet-stdlib \
-         upgrade that adds one"
+        ?variant,
+        "Unrecognised {kind} variant in park byte accounting; charged as \
+         MAXIMAL so it cannot bypass the bound. This delegate falls back to \
+         the inline path (or has its request rejected) until this build learns \
+         to measure the variant — expect it after a freenet-stdlib upgrade \
+         that adds one"
     );
-    MAX_PARKED_BYTES
+    // MAXIMAL MEANS UNADMITTABLE AT ANY BUDGET, which `MAX_PARKED_BYTES` is
+    // not: admission tests `parked_bytes + bytes > budget`, so on a host whose
+    // budget IS `MAX_PARKED_BYTES` the first such item satisfies `MAX > MAX`
+    // as false and is admitted — the one item this charge exists to refuse.
+    // `usize::MAX` saturates every caller's `saturating_add` and so exceeds
+    // every budget, while leaving `>` meaning what it should for a legitimate
+    // exact fit.
+    usize::MAX
 }
 
 fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
@@ -483,10 +554,13 @@ fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
         // rather than assume: this arm exists precisely so nothing goes
         // uncounted. Carries no context by design.
         InboundDelegateMsg::WakeupFired { tag } => tag.len(),
-        // Required by `#[non_exhaustive]`. A new variant that carries bytes
-        // MUST be added above; this arm is the only thing between it and going
-        // uncounted, which is why the list is written out rather than delegated.
-        _ => 0,
+        // A FOURTH `#[non_exhaustive]` SITE, and the one that matters most:
+        // this is the lane `MAX_PARKED_BYTES` exists for, since
+        // `inbound_so_far` holds full `WrappedState`s. It charged 0 with a
+        // comment saying a new variant "MUST be added above" — an honour-system
+        // requirement written as a check, which is the exact criticism this
+        // change levels at the enumerated ceiling guard two files over.
+        other => unmeasurable("InboundDelegateMsg", std::mem::discriminant(other)),
     }
 }
 
@@ -526,6 +600,24 @@ fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
     }
 }
 
+/// Heap footprint of ONE element in a counted collection, beyond its payload.
+///
+/// FIXED TIMES UNBOUNDED IS NOT FIXED. Every function here summed payload
+/// LENGTHS and charged nothing for the slot holding them, justified as
+/// "fixed-size bookkeeping" — but the delegate controls the COUNT. An empty
+/// `ApplicationMessage` serialises to about 21 bytes and occupies roughly 200
+/// resident, and was charged zero: a 200 MiB return buffer is ~10M of them,
+/// ~2.0 GB held and 0 charged, per park. `related_contracts_bytes` had the same
+/// shape one level in, where a `None` entry costs a ~72-byte map slot and was
+/// charged nothing.
+///
+/// The idiom is already in this repo: `CACHE_ENTRY_OVERHEAD_BYTES`, which
+/// `declared_cache_ceiling`'s own `NOT_SUMMED` table describes as "per-entry
+/// overhead CHARGED AGAINST the budgets above". Same reasoning, same fix.
+/// Deliberately generous — the point is to bound what an attacker can grow, and
+/// under-charging the slot is the thing that failed.
+const ELEMENT_OVERHEAD_BYTES: usize = 256;
+
 /// Bytes a `DelegateContext` pins. Bounded by `DelegateContext::MAX_SIZE`
 /// (~400 KiB), which is why omitting it was worth two High findings.
 fn ctx_len(ctx: &DelegateContext) -> usize {
@@ -538,15 +630,35 @@ fn ctx_len(ctx: &DelegateContext) -> usize {
 /// them disagreed — `task_bytes` counted code + params while
 /// `delegate_container_bytes` counted code alone. One helper is how they stay
 /// in step.
+#[allow(clippy::wildcard_enum_match_arm)]
 fn contract_container_bytes(contract: &ContractContainer) -> usize {
-    contract.data().len() + contract.params().as_ref().len()
+    use freenet_stdlib::prelude::ContractWasmAPIVersion;
+    // BORROW, DO NOT CLONE — THE SAME DEFECT THIS FILE ALREADY DOCUMENTS 200
+    // LINES ABOVE, reintroduced by the helper that unified three call sites.
+    // `ContractContainer::params()` returns `Parameters<'static>` BY VALUE
+    // (a `.clone()` in stdlib's `versioning.rs`), so reading `.len()` through
+    // it deep-copies the whole parameter blob. `park()` computes this and then
+    // tests `over_bytes`, so a park about to be REFUSED for exceeding the
+    // budget paid the full cloning cost first — measuring the thing was the
+    // harm, which is exactly what `task_bytes`'s related-contract comment
+    // warns about. `WrappedContract::params()` borrows.
+    match contract {
+        ContractContainer::Wasm(ContractWasmAPIVersion::V1(c)) => {
+            c.code().data().len() + c.params().as_ref().len()
+        }
+        other => unmeasurable("ContractContainer", std::mem::discriminant(other)),
+    }
 }
 
 /// Bytes the states carried inside a `RelatedContracts` pin.
 fn related_contracts_bytes(related: &RelatedContracts<'static>) -> usize {
     related
         .states()
-        .map(|(_, st)| st.as_ref().map_or(0, |s| s.as_ref().len()))
+        .map(|(_, st)| {
+            // The map slot costs whether or not the state is present, and the
+            // delegate chooses how many entries there are.
+            ELEMENT_OVERHEAD_BYTES + st.as_ref().map_or(0, |s| s.as_ref().len())
+        })
         .sum()
 }
 
@@ -578,7 +690,7 @@ fn update_data_bytes(update: &UpdateData<'static>) -> usize {
         }
         // See `unmeasurable` for why this is the whole budget rather than
         // nothing, and why it is announced.
-        other => unmeasurable("UpdateData", &format!("{other:?}")),
+        other => unmeasurable("UpdateData", std::mem::discriminant(other)),
     }
 }
 
@@ -593,9 +705,16 @@ fn update_data_bytes(update: &UpdateData<'static>) -> usize {
 /// one could. On expiry the park is force-resumed — pending drained, responder
 /// answered — so a wedged delegate can never be wedged forever.
 ///
-/// Set above BOTH inner budgets so the real timeout always wins and this never
-/// fires first on a merely-slow operation; a park cut short at its own TTL
-/// would report a spurious failure for work that was about to succeed.
+/// Set above each inner budget INDIVIDUALLY so the real timeout normally wins
+/// and this rarely fires first on a merely-slow operation; a park cut short at
+/// its own TTL reports a spurious failure for work that was about to succeed.
+///
+/// NOT above their SUM, which an earlier version implied. `run_user_input_prompts`
+/// awaits prompts SEQUENTIALLY, so two prompts can sum to 120 s against a 90 s
+/// TTL — this fires first, and the delegate is resumed with whatever answers
+/// had arrived. `PARK_WORK_BUDGET` (75 s) caps the whole task body, which is
+/// what actually bounds the sequence; the ordering below is what keeps that cap
+/// the one that bites.
 ///
 /// NOT ON THE SIMULATED CLOCK, and this is why the backstop's own coverage is
 /// thin. `parked_at` is a `tokio::time::Instant` and the loop waits on
@@ -848,6 +967,17 @@ pub(super) enum ResumeCause {
 /// because it runs WASM and WASM stays serial. So the park carries everything
 /// needed to re-run it.
 pub(super) struct PendingUpsert {
+    /// Identity for THIS upsert, distinct even from another naming the same
+    /// contract with the same `is_put`.
+    ///
+    /// Reconciliation used to match on `(contract, is_put)` as a multiset,
+    /// which is exact for COUNTING but not for PAIRING: two deferred upserts
+    /// sharing that key whose fetches finish out of order let the later one
+    /// consume the earlier's obligation, so the delegate got a success and a
+    /// failure carrying the WRONG contexts and no response for one request.
+    /// A counter makes the pairing exact and the multiset bookkeeping
+    /// unnecessary.
+    pub id: UpsertId,
     pub key: ContractKey,
     pub update: Either<WrappedState, StateDelta<'static>>,
     pub related_contracts: RelatedContracts<'static>,
@@ -859,6 +989,18 @@ pub(super) struct PendingUpsert {
     pub context: DelegateContext,
     /// The related contracts to fetch off-loop.
     pub missing: Vec<ContractInstanceId>,
+}
+
+/// Identity of one deferred upsert. Monotonic per process; only equality
+/// matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct UpsertId(u64);
+
+impl UpsertId {
+    pub(super) fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 /// One upsert a park owes a response for, carried so a SYNTHESIZED failure can
@@ -877,6 +1019,8 @@ pub(super) struct PendingUpsert {
 /// is a MULTISET match on exactly those two, and the context is payload carried
 /// alongside, not part of the key.
 pub(super) struct OwedUpsert {
+    /// Matched against `ResolvedUpsert::pending.id` — see [`PendingUpsert::id`].
+    pub id: UpsertId,
     pub contract: ContractInstanceId,
     pub is_put: bool,
     pub context: DelegateContext,
@@ -900,6 +1044,7 @@ pub(super) fn owed_upserts(upserts: &[PendingUpsert]) -> Vec<OwedUpsert> {
     upserts
         .iter()
         .map(|u| OwedUpsert {
+            id: u.id,
             contract: *u.key.id(),
             is_put: u.is_put,
             // ECHOED BACK on a synthesized failure. See `OwedUpsert::context`.
@@ -908,10 +1053,29 @@ pub(super) fn owed_upserts(upserts: &[PendingUpsert]) -> Vec<OwedUpsert> {
         .collect()
 }
 
+/// What an off-loop related fetch produced, and what the loop must do with it.
+///
+/// THREE STATES, NOT A `Result` PLUS A FLAG. The third case — the fetch
+/// succeeded but retained more than the park reserved — is neither a success
+/// nor a failure, and encoding it as `Err` is what made an over-allowance fetch
+/// FAIL A WRITE that would have succeeded had the park been refused instead of
+/// admitted. A delegate's write then depended on how many OTHER delegates were
+/// parked, which inverts the signal a pressure indicator is supposed to give.
+pub(super) enum FetchDisposition {
+    /// Within the reserve. Use these states (or report this failure).
+    Resolved(Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>),
+    /// Over the reserve. The states have been DROPPED — nothing oversized ever
+    /// reaches the sink, the guard or the resume channel — and the upsert must
+    /// be re-run INLINE on the serial loop at resume, which is the degradation
+    /// [`upsert_fetch_allowance`] documents: slower, holds the loop, re-fetches,
+    /// and completes the write.
+    RetryInline,
+}
+
 /// A [`PendingUpsert`] whose off-loop fetch has finished, one way or the other.
 pub(super) struct ResolvedUpsert {
     pub pending: PendingUpsert,
-    pub fetched: Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>,
+    pub fetched: FetchDisposition,
 }
 
 /// Sent from an off-loop task back to the `contract_handling` loop.
@@ -1083,19 +1247,19 @@ impl ParkGuard {
             }
         }
 
-        let mut resolved: HashMap<(ContractInstanceId, bool), usize> = HashMap::new();
-        for r in &upserts {
-            *resolved
-                .entry((*r.pending.key.id(), r.pending.is_put))
-                .or_default() += 1;
-        }
-        let mut unresolved_upserts = Vec::new();
-        for owed in owed_upserts {
-            match resolved.get_mut(&(owed.contract, owed.is_put)) {
-                Some(n) if *n > 0 => *n -= 1,
-                _ => unresolved_upserts.push(owed),
-            }
-        }
+        // BY IDENTITY, not by (contract, is_put) multiset. The multiset was
+        // exact for counting and wrong for PAIRING: two upserts sharing a
+        // contract and direction, finishing out of order, let the later
+        // completion cancel the earlier's obligation — so the delegate received
+        // a success and a synthesized failure carrying each other's contexts,
+        // and one request got no response at all. `id` is unique per upsert, so
+        // an obligation can only be discharged by its own completion.
+        let resolved: std::collections::HashSet<UpsertId> =
+            upserts.iter().map(|r| r.pending.id).collect();
+        let unresolved_upserts: Vec<OwedUpsert> = owed_upserts
+            .into_iter()
+            .filter(|owed| !resolved.contains(&owed.id))
+            .collect();
         if !unresolved_upserts.is_empty() {
             tracing::warn!(
                 delegate = %delegate_key,
@@ -1217,6 +1381,12 @@ impl DelegateParkCtx {
     #[cfg(test)]
     pub(super) fn budget(&self) -> usize {
         self.budget
+    }
+
+    /// The bytes ONE deferred upsert's off-loop related fetch may retain on
+    /// this node. See [`upsert_fetch_allowance`].
+    pub(super) fn upsert_fetch_allowance(&self) -> usize {
+        upsert_fetch_allowance(self.budget)
     }
 
     pub(super) fn resume_tx(&self) -> &tokio::sync::mpsc::UnboundedSender<DelegateResume> {
@@ -1475,6 +1645,13 @@ impl DelegateParkCtx {
     /// off-loop task whose park was already ended by the TTL backstop and whose
     /// delegate has since re-parked. Matching on key alone would feed the old
     /// continuation's messages into the new park (#5544 H1).
+    /// ORDERING NOTE: `parked_bytes` is decremented here, while the memory is
+    /// freed when the CALLER drops the continuation it is handed. Between the
+    /// two, admission sees capacity that is not yet physically free. Deliberate
+    /// and in the safe direction for the thing this guards — a park is ending,
+    /// so the bytes are going away — but it does mean `parked_bytes` is a
+    /// bound on what is COMMITTED, not a reading of resident memory. See #5607
+    /// for the larger version of that distinction on the fetch path.
     pub(super) fn take_matching(
         &mut self,
         key: &DelegateKey,
@@ -1717,8 +1894,22 @@ mod tests {
     //
     // That is worse than the omissions codex found, because it is the reason
     // they could exist: a corrected `task_bytes` that nothing can falsify is
-    // the same defect one layer up. So each of these gives every payload-
-    // bearing term a DISTINCT size and asserts the sum. Zero any single term
+    // the same defect one layer up.
+    //
+    // AND THE FIRST VERSION OF THIS COMMENT OVER-CLAIMED IN EXACTLY THAT WAY.
+    // It said every term here was individually falsifiable while the tests
+    // below covered `outbound_bytes` and `inbound_bytes` only — so the two
+    // terms I had just ADDED to `task_bytes` were pinned and its five
+    // pre-existing ones were not, including a 50 MiB-capable state and the
+    // whole `ApplicationMessages` arm that every ordinary delegate call takes.
+    // Nine of twelve terms could be zeroed with the full suite green. I pinned
+    // what I fixed and wrote a sentence about the general case, which is the
+    // same shape as the context test that asserted a true property of the wrong
+    // object — both written in one change, by someone looking for exactly this.
+    //
+    // So each of these gives every payload-bearing term a DISTINCT size and
+    // asserts the sum, and `task_bytes` and `request_bytes` now have the same
+    // treatment as the two message functions. Zero any single term
     // and the total drops below it — no term can stand in for another, and no
     // case passes because a sibling term happened to be large.
     //
@@ -1733,6 +1924,9 @@ mod tests {
     const T_PARAMS: usize = 1024;
     const T_RELATED: usize = 32 * 1024;
     const T_DELTA: usize = 512;
+    /// A fetch allowance for `task_bytes` tests, distinct from every other size
+    /// here so it cannot be confused with a payload term.
+    const TEST_ALLOWANCE: usize = 64 * 1024;
 
     fn t_ctx() -> DelegateContext {
         DelegateContext::new(vec![0u8; T_CTX])
@@ -1975,6 +2169,308 @@ mod tests {
         }
     }
 
+    /// Every term of `task_bytes`, individually.
+    ///
+    /// The five pre-existing terms — prompt message, prompt responses, the
+    /// upsert's update, its contract code+params, its related states — were
+    /// unfalsifiable until now; only the two this change added were pinned.
+    /// Each gets a distinct size and is asserted as a DELTA against a baseline
+    /// that has it empty, so no term can be satisfied by a sibling.
+    ///
+    /// FALSIFY by zeroing any single term in `task_bytes`.
+    #[test]
+    fn every_task_bytes_term_is_charged() {
+        fn upsert(
+            update: Either<WrappedState, StateDelta<'static>>,
+            code: Option<ContractContainer>,
+            related: RelatedContracts<'static>,
+            context: DelegateContext,
+            missing: Vec<ContractInstanceId>,
+        ) -> PendingUpsert {
+            PendingUpsert {
+                id: UpsertId::next(),
+                key: ContractKey::from_params_and_code(
+                    Parameters::from(vec![]),
+                    freenet_stdlib::prelude::ContractCode::from(vec![0u8; 4]),
+                ),
+                update,
+                related_contracts: related,
+                code,
+                is_put: false,
+                context,
+                missing,
+            }
+        }
+        let empty = || {
+            upsert(
+                Either::Right(StateDelta::from(Vec::new())),
+                None,
+                RelatedContracts::default(),
+                DelegateContext::default(),
+                Vec::new(),
+            )
+        };
+        let base = task_bytes(&[], &[empty()], TEST_ALLOWANCE);
+
+        // The prompt lane: message and responses are separate terms.
+        let prompts = [t_prompt()];
+        assert!(
+            task_bytes(&prompts, &[empty()], TEST_ALLOWANCE) >= base + T_PAYLOAD + T_STATE,
+            "a prompt's message AND its responses must both be charged"
+        );
+
+        let cases: Vec<(&str, PendingUpsert, usize)> = vec![
+            (
+                "update state",
+                upsert(
+                    Either::Left(WrappedState::new(vec![0u8; T_STATE])),
+                    None,
+                    RelatedContracts::default(),
+                    DelegateContext::default(),
+                    Vec::new(),
+                ),
+                T_STATE,
+            ),
+            (
+                "update delta",
+                upsert(
+                    Either::Right(StateDelta::from(vec![0u8; T_DELTA])),
+                    None,
+                    RelatedContracts::default(),
+                    DelegateContext::default(),
+                    Vec::new(),
+                ),
+                T_DELTA,
+            ),
+            (
+                "contract code and params",
+                upsert(
+                    Either::Right(StateDelta::from(Vec::new())),
+                    Some(t_contract()),
+                    RelatedContracts::default(),
+                    DelegateContext::default(),
+                    Vec::new(),
+                ),
+                T_CODE + T_PARAMS,
+            ),
+            (
+                "related states",
+                upsert(
+                    Either::Right(StateDelta::from(Vec::new())),
+                    None,
+                    t_related(),
+                    DelegateContext::default(),
+                    Vec::new(),
+                ),
+                T_RELATED,
+            ),
+            (
+                // TWICE, and asserting only `T_CTX` did not catch charging it
+                // once — found by falsifying this test rather than by reading
+                // it. The task holds the `PendingUpsert` and `owed_upserts`
+                // clones the context into the guard, so both live for the
+                // park's life; a single charge leaves half of it uncounted.
+                "echoed context, charged for BOTH copies",
+                upsert(
+                    Either::Right(StateDelta::from(Vec::new())),
+                    None,
+                    RelatedContracts::default(),
+                    t_ctx(),
+                    Vec::new(),
+                ),
+                2 * T_CTX,
+            ),
+            (
+                "fetch reserve",
+                upsert(
+                    Either::Right(StateDelta::from(Vec::new())),
+                    None,
+                    RelatedContracts::default(),
+                    DelegateContext::default(),
+                    vec![ContractInstanceId::new([1u8; 32])],
+                ),
+                TEST_ALLOWANCE,
+            ),
+        ];
+        for (name, u, expected) in cases {
+            let charged = task_bytes(&[], &[u], TEST_ALLOWANCE);
+            assert!(
+                charged >= base + expected,
+                "task_bytes: the `{name}` term must be charged — {charged} \
+                 against a {base} baseline, expected at least {expected} more"
+            );
+        }
+    }
+
+    /// H6: the per-ELEMENT charge, which no payload assertion can see.
+    ///
+    /// Every other test here gives its payloads a size, so a missing
+    /// per-element term is invisible to all of them — zeroing
+    /// `ELEMENT_OVERHEAD_BYTES` left the whole suite green. The delegate
+    /// controls the COUNT, so empty messages are the attack: ~10M of them fit
+    /// in a 200 MiB return buffer at ~200 resident bytes each, and were charged
+    /// nothing.
+    ///
+    /// FALSIFY by setting `ELEMENT_OVERHEAD_BYTES` to 0.
+    #[test]
+    fn empty_messages_are_charged_for_their_slots() {
+        const N: usize = 512;
+        let mut cont = continuation();
+        cont.inbound_so_far = (0..N)
+            .map(|_| {
+                InboundDelegateMsg::ApplicationMessage(
+                    freenet_stdlib::prelude::ApplicationMessage::new(Vec::new()),
+                )
+            })
+            .collect();
+        assert!(
+            continuation_bytes(&cont) >= N * ELEMENT_OVERHEAD_BYTES,
+            "{N} EMPTY messages carry no payload and still cost {N} slots. \
+             Summing payload lengths alone bounds nothing when the delegate \
+             picks the count: charged {}",
+            continuation_bytes(&cont)
+        );
+
+        let mut cont = continuation();
+        cont.accumulated = (0..N)
+            .map(|_| {
+                OutboundDelegateMsg::ApplicationMessage(
+                    freenet_stdlib::prelude::ApplicationMessage::new(Vec::new()),
+                )
+            })
+            .collect();
+        assert!(
+            continuation_bytes(&cont) >= N * ELEMENT_OVERHEAD_BYTES,
+            "the same holds for the accumulated lane, which grows across parks"
+        );
+    }
+
+    /// H4/M4: an unmeasurable variant is charged so much that no budget admits
+    /// it — and the limit of what this can check, stated.
+    ///
+    /// WHAT CANNOT BE TESTED: that each `#[non_exhaustive]` wildcard actually
+    /// routes to `unmeasurable`. Constructing a variant this build does not
+    /// know is impossible by definition, so no fixture can drive those arms.
+    /// Changing one back to `_ => 0` is therefore invisible to every
+    /// behavioural test — verified, not assumed. The count assertion below is a
+    /// source scrape standing in for it, and is named as one.
+    ///
+    /// WHAT IS TESTED, because it is the half that decides the outcome: the
+    /// charge is `usize::MAX`, so it exceeds EVERY budget. `MAX_PARKED_BYTES`
+    /// would not: admission tests `parked_bytes + bytes > budget`, so on a host
+    /// whose budget IS that value the first such item satisfies `MAX > MAX` as
+    /// false and is admitted — the one item the charge exists to refuse.
+    #[test]
+    fn an_unmeasurable_variant_cannot_be_admitted_at_any_budget() {
+        assert_eq!(
+            unmeasurable("test", 0u8),
+            usize::MAX,
+            "an unmeasurable payload must be charged more than any budget, not \
+             merely a large number"
+        );
+
+        let (mut ctx, _rx) = ctx();
+        // The largest budget any host can have.
+        assert!(
+            matches!(
+                ctx.park(key(1), continuation(), unmeasurable("test", 0u8)),
+                ParkAdmission::Refused(_)
+            ),
+            "a park charged the unmeasurable rate must be REFUSED even on a \
+             host at the clamp ceiling"
+        );
+
+        // SOURCE SCRAPE, with its limit stated above: every `#[non_exhaustive]`
+        // enum this file measures must route its wildcard here. If you add or
+        // remove one, change this count deliberately.
+        let src = super::super::tests::strip_comments(include_str!("delegate_park.rs"));
+        let cutoff = src.find("\nmod tests {").unwrap_or(src.len());
+        let prod = &src[..cutoff];
+        // Minus the definition itself, which also contains the needle — the
+        // self-match trap this repo records twice.
+        let call_sites =
+            prod.matches("unmeasurable(").count() - prod.matches("fn unmeasurable(").count();
+        assert_eq!(
+            call_sites, 5,
+            "the five `#[non_exhaustive]` enums measured here — DelegateRequest, \
+             DelegateContainer, ContractContainer, InboundDelegateMsg, \
+             UpdateData — must each charge an unknown variant as unmeasurable. \
+             A wildcard that returns 0 instead is a silent bypass of this budget \
+             on someone else's stdlib release"
+        );
+    }
+
+    /// Every term of `request_bytes`, individually.
+    /// Every term of `request_bytes`, individually.
+    ///
+    /// The `ApplicationMessages` arm is the one every ordinary delegate call
+    /// takes and it was entirely unpinned: both its inbound payloads and its
+    /// params could be zeroed with the suite green.
+    ///
+    /// FALSIFY by zeroing any single term in `request_bytes`.
+    #[test]
+    fn every_request_bytes_term_is_charged() {
+        use freenet_stdlib::prelude::{
+            Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion,
+        };
+        let key = key(1);
+
+        let bare = DelegateRequest::ApplicationMessages {
+            key: key.clone(),
+            params: Parameters::from(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let base = request_bytes(&bare);
+
+        let with_inbound = DelegateRequest::ApplicationMessages {
+            key: key.clone(),
+            params: Parameters::from(Vec::new()),
+            inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                freenet_stdlib::prelude::ApplicationMessage::new(vec![0u8; T_PAYLOAD])
+                    .with_context(t_ctx()),
+            )],
+        };
+        assert!(
+            request_bytes(&with_inbound) >= base + T_PAYLOAD + T_CTX,
+            "ApplicationMessages must charge its inbound payloads and contexts"
+        );
+
+        let with_params = DelegateRequest::ApplicationMessages {
+            key: key.clone(),
+            params: Parameters::from(vec![0u8; T_PARAMS]),
+            inbound: Vec::new(),
+        };
+        assert!(
+            request_bytes(&with_params) >= base + T_PARAMS,
+            "ApplicationMessages must charge its params: they are \
+             delegate-supplied and retained behind the park"
+        );
+
+        let code = DelegateCode::from(vec![1u8; T_CODE]);
+        let params = Parameters::from(vec![2u8; T_PARAMS]);
+        let container =
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((&code, &params))));
+        assert!(
+            request_bytes(&DelegateRequest::RegisterDelegate {
+                delegate: container.clone(),
+                cipher: [0u8; 32],
+                nonce: [0u8; 24],
+            }) >= T_CODE + T_PARAMS,
+            "RegisterDelegate must charge the whole container"
+        );
+        assert!(
+            request_bytes(&DelegateRequest::RegisterDelegateWithPredecessors {
+                delegate: container,
+                cipher: [0u8; 32],
+                nonce: [0u8; 24],
+                predecessors: vec![key],
+            }) >= T_CODE + T_PARAMS + 64,
+            "RegisterDelegateWithPredecessors must charge the container AND its \
+             predecessor list"
+        );
+    }
+
+    /// P1b: a queued delegate re-registration is charged its PARAMETERS as well
     /// P1b: a queued delegate re-registration is charged its PARAMETERS as well
     /// as its WASM.
     ///
@@ -2025,6 +2521,7 @@ mod tests {
     fn task_bytes_charges_the_upsert_context_and_reserves_its_fetch() {
         fn upsert(context: DelegateContext, missing: Vec<ContractInstanceId>) -> PendingUpsert {
             PendingUpsert {
+                id: UpsertId::next(),
                 key: ContractKey::from_params_and_code(
                     Parameters::from(vec![]),
                     freenet_stdlib::prelude::ContractCode::from(vec![0u8; 4]),
@@ -2038,9 +2535,13 @@ mod tests {
             }
         }
 
-        let baseline = task_bytes(&[], &[upsert(DelegateContext::default(), Vec::new())]);
+        let baseline = task_bytes(
+            &[],
+            &[upsert(DelegateContext::default(), Vec::new())],
+            TEST_ALLOWANCE,
+        );
 
-        let with_context = task_bytes(&[], &[upsert(t_ctx(), Vec::new())]);
+        let with_context = task_bytes(&[], &[upsert(t_ctx(), Vec::new())], TEST_ALLOWANCE);
         assert!(
             with_context >= baseline + T_CTX,
             "the upsert's echoed context must be charged: it is retained for \
@@ -2054,9 +2555,10 @@ mod tests {
                 DelegateContext::default(),
                 vec![ContractInstanceId::new([1u8; 32])],
             )],
+            TEST_ALLOWANCE,
         );
         assert!(
-            with_fetch >= baseline + MAX_UPSERT_FETCH_BYTES,
+            with_fetch >= baseline + TEST_ALLOWANCE,
             "an upsert naming missing related contracts must RESERVE its fetch \
              allowance BEFORE the fetch happens. Charging afterwards leaves \
              dropping what you already paid to retrieve as the only available \
@@ -2064,24 +2566,40 @@ mod tests {
         );
     }
 
-    /// The reserve is only real if something enforces it, so pin the allowance
-    /// against the node cap rather than against a hardcoded number: at most 8
-    /// fully-fetching parks may coexist at the budget.
+    /// The allowance SCALES with the budget and still leaves the cap binding,
+    /// at both ends of the range.
     ///
-    /// Asserts the BOUND, not the arithmetic — retuning `MAX_PARKED_BYTES` or
-    /// `MAX_DEFERRED_UPSERTS_PER_PARK` moves the allowance with it, and this
-    /// stays true. A test asserting a particular product of constants goes
-    /// stale the moment anyone tunes one of them.
+    /// Asserts the BOUND, not the arithmetic, so retuning any of the three
+    /// constants keeps it true. And asserts it at BOTH the floor and the
+    /// ceiling, which the previous version did not: that one checked a single
+    /// `const` against `MIN_PARKED_BYTES`, and the defect it missed was
+    /// precisely that the allowance did not move with the budget at all — a
+    /// 64 MiB node got the 8 MiB floor's share. A test pinned to one point
+    /// cannot see a missing gradient.
     #[test]
-    fn the_fetch_allowance_leaves_the_node_cap_binding() {
-        let worst_case_park = MAX_UPSERT_FETCH_BYTES * MAX_DEFERRED_UPSERTS_PER_PARK;
+    fn the_fetch_allowance_scales_with_the_budget_and_leaves_it_binding() {
+        for budget in [MIN_PARKED_BYTES, MAX_PARKED_BYTES] {
+            let per_upsert = upsert_fetch_allowance(budget);
+            let worst_case_park = per_upsert * MAX_DEFERRED_UPSERTS_PER_PARK;
+            assert!(
+                per_upsert > 0,
+                "a budget of {budget} must still allow SOME off-loop fetch, or \
+                 every deferred upsert degrades to the inline path"
+            );
+            assert!(
+                worst_case_park <= budget / 4,
+                "one park's fetch reserve ({worst_case_park}) must leave room \
+                 for others within its own budget ({budget}); a reserve sized \
+                 to fill the budget turns every deferred upsert into an inline \
+                 fallback"
+            );
+        }
         assert!(
-            worst_case_park > 0 && worst_case_park <= MIN_PARKED_BYTES / 8,
-            "one park's fetch reserve ({worst_case_park}) must leave room for \
-             others under the SMALLEST budget a node can get \
-             ({MIN_PARKED_BYTES}) — not merely under the clamp ceiling; a \
-             reserve sized to the ceiling fills a small host's whole budget and \
-             turns every deferred upsert into an inline fallback"
+            upsert_fetch_allowance(MAX_PARKED_BYTES) > upsert_fetch_allowance(MIN_PARKED_BYTES),
+            "the allowance must SCALE with the node's budget. It did not: it \
+             was a `const` derived from the floor, so a host with eight times \
+             the budget got the same 256 KiB — the flat-cap defect \
+             `parked_budget_for` exists to fix, one level down"
         );
     }
 
@@ -2990,6 +3508,7 @@ mod tests {
             0,
             vec![1, 2],
             vec![OwedUpsert {
+                id: UpsertId::next(),
                 contract: ContractInstanceId::new([3; 32]),
                 is_put: true,
                 context: DelegateContext::new(b"correlation-token".to_vec()),
@@ -3036,6 +3555,7 @@ mod tests {
             freenet_stdlib::prelude::ContractCode::from(vec![0u8; 4]),
         );
         let owed = owed_upserts(&[PendingUpsert {
+            id: UpsertId::next(),
             key,
             update: Either::Right(StateDelta::from(vec![])),
             related_contracts: RelatedContracts::default(),
@@ -3056,7 +3576,6 @@ mod tests {
         );
     }
 
-    /// The context survives RECONCILIATION, not just construction.
     /// The context survives RECONCILIATION, not just construction.
     ///
     /// The owed list is matched against completions as a MULTISET on
@@ -3080,6 +3599,7 @@ mod tests {
             freenet_stdlib::prelude::ContractCode::from(vec![0u8; 4]),
         );
         let contract = *resolved_key.id();
+        let resolved_id = UpsertId::next();
         let guard = ParkGuard::new(
             tx,
             key(1),
@@ -3087,11 +3607,13 @@ mod tests {
             Vec::new(),
             vec![
                 OwedUpsert {
+                    id: resolved_id,
                     contract,
                     is_put: true,
                     context: DelegateContext::new(b"first".to_vec()),
                 },
                 OwedUpsert {
+                    id: UpsertId::next(),
                     contract,
                     is_put: true,
                     context: DelegateContext::new(b"second".to_vec()),
@@ -3103,6 +3625,7 @@ mod tests {
         // Exactly ONE of the pair resolves.
         fetches.lock().unwrap().push(ResolvedUpsert {
             pending: PendingUpsert {
+                id: resolved_id,
                 key: resolved_key,
                 update: Either::Right(StateDelta::from(vec![])),
                 related_contracts: RelatedContracts::default(),
@@ -3111,7 +3634,7 @@ mod tests {
                 context: DelegateContext::new(b"first".to_vec()),
                 missing: Vec::new(),
             },
-            fetched: Ok(Vec::new()),
+            fetched: FetchDisposition::Resolved(Ok(Vec::new())),
         });
         drop(guard);
 
@@ -3188,11 +3711,13 @@ mod tests {
             vec![7, 7],
             vec![
                 OwedUpsert {
+                    id: UpsertId::next(),
                     contract,
                     is_put: true,
                     context: DelegateContext::default(),
                 },
                 OwedUpsert {
+                    id: UpsertId::next(),
                     contract,
                     is_put: true,
                     context: DelegateContext::default(),
