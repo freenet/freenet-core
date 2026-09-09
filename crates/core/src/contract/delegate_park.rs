@@ -293,6 +293,15 @@ pub(super) fn parked_budget_for(total_ram: usize) -> usize {
 /// parks fill the budget while the fifth degrades — the same deliberate trade
 /// the park cap itself makes.
 ///
+/// THAT DIVISOR CARRIES A SECOND DECISION, named because a later reader takes
+/// an unexplained constant for arithmetic. The previous shape allowed EIGHT
+/// fetching parks per budget; this allows four. Four parks x four upserts is
+/// sixteen concurrent related fetches, which is ample, and halving the
+/// concurrency is part of how the per-upsert figure gets large enough to be
+/// useful. It is a choice about how many parks may fetch at once, riding inside
+/// a fix for how much each may retain — change it deliberately, not as a
+/// by-product of retuning the allowance.
+///
 /// THE ALLOWANCE IS SMALL BESIDE `MAX_STATE_SIZE` (50 MiB), SO A LARGE RELATED
 /// CONTRACT DEGRADES. Read those numbers together and it looks like a bug, so:
 /// it is deliberate, and the alternative is a cap that does not cap — one
@@ -300,7 +309,17 @@ pub(super) fn parked_budget_for(total_ram: usize) -> usize {
 /// What it degrades TO is the pre-#5544 inline path: the upsert is re-run on
 /// the serial loop at resume (see `contract::apply_resolved_upsert`'s caller),
 /// which stalls the loop for that operation and re-fetches, but **completes the
-/// write**. It is not a failure, and it must not become one — an over-allowance
+/// write**.
+///
+/// AND THE INLINE PATH APPLIES NO SIZE ALLOWANCE AT ALL
+/// (`contract::run_deferred_upsert_inline` -> `upsert_contract_state`), so state
+/// what this design is rather than implying inline is bounded: **the allowance
+/// bounds what a park RETAINS; exceeding it costs a stall and an unbounded
+/// transient on the loop.** A 50 MiB related contract goes through there
+/// unbounded. That is pre-existing — a park refused at admission already went
+/// that way — but this adds a SECOND route to it, so it is stated rather than
+/// discovered. Deferring to a bound that does not exist is the same defect as
+/// the transient-peak claim corrected above; #5607 covers both paths. It is not a failure, and it must not become one — an over-allowance
 /// fetch used to return `Err`, which failed a write that would have succeeded
 /// had the park been REFUSED instead of admitted, so whether a delegate's write
 /// worked depended on how many other delegates were parked.
@@ -3585,7 +3604,24 @@ mod tests {
     /// completes and the other does not; the survivor must carry ITS OWN
     /// context through.
     ///
-    /// FALSIFY by defaulting the context anywhere on that path.
+    /// FALSIFY by reconciling on `(contract, is_put)` again instead of on
+    /// `id`: the later completion then cancels the earlier's obligation and the
+    /// count goes to 0.
+    ///
+    /// **NOT by defaulting the context**, which is what this line used to say
+    /// and which is false of THIS test. It constructs `OwedUpsert` by hand, so
+    /// it never runs the production builder — the trap documented on
+    /// `owed_upserts` twenty lines up, written into the instruction for
+    /// checking the fix for it. Verified by doing exactly that: defaulting the
+    /// context in `owed_upserts` leaves this test GREEN, while
+    /// `owed_upserts_carry_the_delegate_s_context` goes red, and that is the
+    /// test which actually covers it.
+    ///
+    /// A WRONG `FALSIFY` LINE IS WORSE THAN A WEAK TEST. A weak test fails to
+    /// catch a regression; an instruction like this one recruits the next
+    /// person into confirming something false — they follow it, see the result
+    /// it predicts, and come away with more confidence than if nothing had been
+    /// written. It converts a gap into a positive belief.
     #[tokio::test]
     async fn a_partially_resolved_upsert_pair_keeps_the_unresolved_one_s_context() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

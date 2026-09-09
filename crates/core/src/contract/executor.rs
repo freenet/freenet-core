@@ -1936,14 +1936,36 @@ mod tests {
     /// `NOT_SUMMED` entry must still be discoverable, so the table cannot rot
     /// into a list of names that no longer exist.
     ///
-    /// DISCOVERY RULE, and its stated limits. Module-scope (column 0)
-    /// `const NAME: usize` where `NAME` ends in `_BYTES`, plus every
-    /// `fn *_budget_for(`. Column 0 is principled rather than convenient: a
-    /// budget this function could reference has to be at module scope, so a
-    /// function-local or test-local constant cannot be one. The rule does not
-    /// catch a budget expressed as a differently-named function
-    /// (`budget_for_ram`, `page_cache_size_for`) — those are held by the
-    /// sibling test's explicit list, which is why both tests exist.
+    /// DISCOVERY RULES, and the residual that remains after them.
+    ///
+    ///  1. Module-scope (column 0) `const NAME: usize` where `NAME` ends in
+    ///     `_BYTES`. Column 0 is principled rather than convenient: a budget
+    ///     this function could reference must be at module scope, so a
+    ///     function-local or test-local constant cannot be one.
+    ///  2. Every `fn *_budget_for(`.
+    ///  3. Every `fn` whose FIRST PARAMETER is `total_ram:` or
+    ///     `memory_limit:`, because a function that sizes something from node
+    ///     memory takes node memory as its input.
+    ///
+    /// RULE 3 EXISTS BECAUSE THIS RUSTDOC USED TO CLAIM SOMETHING FALSE. It
+    /// said differently-named budget functions "are held by the sibling test's
+    /// explicit list, which is why both tests exist" — that the two guards
+    /// caught opposite things. They did not. That list is hardcoded names, so
+    /// it holds the ones that exist and cannot hold a new one, and a
+    /// differently-named budget function passed BOTH tests. A doc asserting
+    /// coverage that was never executed, inside the test whose subject is docs
+    /// asserting coverage that was never executed.
+    ///
+    /// Broadening rule 2 to `fn *_for(` was MEASURED rather than assumed: 42
+    /// names, 6 of them budgets. Thirty-six exclusions is a table nobody reads,
+    /// so rule 3 was used instead — it found 10 and needed 3 new exclusions,
+    /// one of which (`wasmtime_cache_size_for_ram`) is a genuine RAM-derived
+    /// budget that simply lives on disk.
+    ///
+    /// RESIDUAL, stated rather than closed: a budget function taking node
+    /// memory under some OTHER parameter name (`ram`, `limit`, `bytes`) is
+    /// caught by none of the three. Narrower than what rule 3 closed, but real
+    /// — do not read the three rules as exhaustive.
     ///
     /// FALSIFY by adding a tenth module-scope `*_BYTES` constant anywhere under
     /// `crates/core/src` without summing it or listing it below. Verified by
@@ -2054,6 +2076,19 @@ mod tests {
             // Functions.
             ("disk_budget_for", "DISK, not resident memory"),
             (
+                "wasmtime_cache_size_for_ram",
+                "wasmtime's ON-DISK compile cache; RAM-derived only so it cannot exceed \
+                 the state budget, but not resident memory",
+            ),
+            (
+                "combine_wasmtime_cache_size",
+                "the RAM/disk combiner for that same on-disk cache",
+            ),
+            (
+                "declared_cache_ceiling",
+                "IS the sum; including it would be self-referential",
+            ),
+            (
                 "resident_overhead_budget_for",
                 "the CONSUMER of this aggregate; summing it would be circular",
             ),
@@ -2095,7 +2130,8 @@ mod tests {
         let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for file in &files {
             let text = std::fs::read_to_string(file).expect("readable source file");
-            for line in text.lines() {
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().copied().enumerate() {
                 // Module scope only: an indented declaration is inside a
                 // function or a test module and cannot be a node-wide budget.
                 if let Some(rest) = line
@@ -2118,6 +2154,32 @@ mod tests {
                     && name.ends_with("_budget_for")
                 {
                     found.insert(name.to_string());
+                }
+                // RULE 3, which closes the gap rule 2 left: a function that
+                // SIZES something from node memory takes node memory as its
+                // input. `budget_for_ram`, `page_cache_size_for` and
+                // `wasmtime_cache_size_for_ram` are all real budgets none of
+                // which is named `*_budget_for`. Broadening rule 2 to
+                // `fn *_for(` instead was MEASURED and rejected: 42 names, 6
+                // of them budgets, so 36 exclusions and a table nobody reads.
+                if let Some(idx) = line.find("fn ")
+                    && line[..idx]
+                        .trim()
+                        .chars()
+                        .all(|c| c.is_alphabetic() || "()".contains(c))
+                    && let Some(name) = line[idx + 3..].split('(').next()
+                {
+                    let rest = &line[idx + 3 + name.len()..];
+                    // Same line, or the first parameter of a wrapped signature.
+                    let params = if rest.trim() == "(" {
+                        lines.get(i + 1).copied().unwrap_or("")
+                    } else {
+                        rest
+                    };
+                    let params = params.trim().trim_start_matches('(').trim();
+                    if params.starts_with("total_ram:") || params.starts_with("memory_limit:") {
+                        found.insert(name.to_string());
+                    }
                 }
             }
         }

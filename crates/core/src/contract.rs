@@ -8504,9 +8504,21 @@ mod hol_4391_tests {
     /// degrades to the pre-#5544 inline path, which is slower but loses
     /// nothing.
     ///
+    /// AMBIENT STATE, HANDLED RATHER THAN IGNORED. `REFUSED_OVERSIZED_FETCHES`
+    /// is a process-global static and this binary runs its tests in one
+    /// process, so an exact `before + 1` would be a test that fails for a
+    /// reason other than the thing it names the moment a second caller lands —
+    /// the shared-process class recorded in
+    /// `.claude/rules/bug-prevention-patterns.md`. `#[serial]` keeps other
+    /// counter tests out of the window, and the increment is asserted with `>`
+    /// so a concurrent production caller cannot turn a real pass into a
+    /// spurious failure. The exact-equality half is kept where it is safe and
+    /// load-bearing: the ACCEPTED case must not increment at all.
+    ///
     /// FALSIFY by removing the size check from `within_fetch_allowance`: the
     /// oversized fetch is then accepted and both assertions go red.
     #[test]
+    #[serial_test::serial(oversized_fetch_counter)]
     fn an_oversized_related_fetch_is_refused_and_counted() {
         let id = ContractInstanceId::new([1u8; 32]);
         let allowance = 1024usize;
@@ -8543,13 +8555,11 @@ mod hol_4391_tests {
              decoration; failing it fails a write that would have succeeded had \
              the park been refused instead of admitted"
         );
-        assert_eq!(
-            refused_oversized_fetches(),
-            before + 1,
+        assert!(
+            refused_oversized_fetches() > before,
             "the refusal must be COUNTED. It is a legitimate degradation — the \
-             delegate is told, exactly as for a miss or a timeout on this path \
-             — which is precisely why an operator needs to be able to see that \
-             it happened"
+             delegate keeps its write, it just costs a stall — which is exactly \
+             why an operator needs to be able to see that it happened"
         );
     }
 
