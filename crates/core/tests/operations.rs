@@ -4194,6 +4194,50 @@ async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
 // #5542: a V1 delegate's GET and SUBSCRIBE must reach the network
 // ============================================================================
 
+/// Does this node have LOCAL PRESENCE of `key` — hosting it, or holding a
+/// subscription lease for it?
+///
+/// `collect_contract_states` documents absence from `contract_states` as
+/// meaning "not locally present" (it is the same signal the #3945 web
+/// subresource gate relies on), which is what makes it usable as a
+/// precondition here.
+///
+/// It is a PROXY, and the gap is worth naming: this reads the ring's hosting
+/// and subscription view, while the delegate arm under test gates on
+/// `Executor::lookup_key`, i.e. the contract store. A node can in principle
+/// disagree between the two. It is the only local-presence answer a client can
+/// get — `NodeQuery::NeighborHostingInfo`, which would answer more directly, is
+/// unimplemented (`client_events.rs`: "NeighborHostingInfo query not yet
+/// implemented").
+async fn node_has_contract_locally(client: &mut WebApi, key: ContractKey) -> anyhow::Result<bool> {
+    let config = freenet_stdlib::client_api::NodeDiagnosticsConfig {
+        include_node_info: false,
+        include_network_info: false,
+        include_subscriptions: false,
+        contract_keys: vec![key],
+        include_system_metrics: false,
+        include_detailed_peer_info: false,
+        include_subscriber_peer_ids: false,
+    };
+    client
+        .send(ClientRequest::NodeQueries(
+            freenet_stdlib::client_api::NodeQuery::NodeDiagnostics { config },
+        ))
+        .await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(5), client.recv()).await {
+            Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))) => {
+                return Ok(response.contract_states.contains_key(&key.to_string()));
+            }
+            Ok(Ok(other)) => tracing::debug!(?other, "ignoring while awaiting diagnostics"),
+            Ok(Err(e)) => bail!("websocket error awaiting diagnostics: {e}"),
+            Err(_) => {}
+        }
+    }
+    bail!("no NodeDiagnostics response within 30s")
+}
+
 /// Drive one `test-delegate-capabilities` command over `client` and return the
 /// `DelegateCommandResponse` the delegate produced.
 ///
@@ -4272,36 +4316,95 @@ async fn register_delegate(
     bail!("delegate registration was not acknowledged within 60s")
 }
 
+/// PUT `contract` from `client` and wait for the `PutResponse`.
+async fn put_and_await(
+    client: &mut WebApi,
+    contract: &ContractContainer,
+    state: WrappedState,
+) -> anyhow::Result<()> {
+    let contract_key = contract.key();
+    // `subscribe: false`. Subscribing the publisher pulls the contract onto more
+    // peers, and every extra peer holding it is one fewer candidate for
+    // `a_node_without_the_contract` — which is the resource this test is short
+    // of. Nothing here needs the publisher to be subscribed.
+    make_put(client, state, contract.clone(), false).await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(5), client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                ensure!(key == contract_key, "PUT response for the wrong contract");
+                return Ok(());
+            }
+            Ok(Ok(other)) => tracing::debug!(?other, "ignoring while awaiting PUT"),
+            Ok(Err(e)) => bail!("websocket error awaiting PUT: {e}"),
+            Err(_) => {}
+        }
+    }
+    bail!("no PutResponse within 60s")
+}
+
+/// Set up the shared world both #5542 tests need, and return a client on a node
+/// that PROVABLY does not hold the contract.
+///
+/// **Why the search, and why it can fail.** The whole point of #5542 is a node
+/// that has never seen the contract, and on a small test network a PUT can
+/// legitimately place the contract on every peer — in which case the delegate
+/// operation is answered from the local store and the test would pass without
+/// exercising the network path at all.
+///
+/// That is not hypothetical. The first version of these tests picked `node-b`
+/// unconditionally and PASSED against `main` WITHOUT the fix. They were
+/// measuring nothing. So local presence is now checked rather than assumed, a
+/// node without it is chosen, and a run where no such node exists FAILS LOUDLY
+/// instead of passing quietly — a vacuous pass is the outcome to design
+/// against, because it reports success while checking less.
+async fn a_node_without_the_contract<'a>(
+    ctx: &'a mut TestContext,
+    contract: &ContractContainer,
+    state: WrappedState,
+    candidates: &[&str],
+) -> anyhow::Result<WebApi> {
+    let contract_key = contract.key();
+
+    let publisher = ctx.node("node-a")?;
+    let (stream_a, _) = connect_async(&publisher.ws_url()).await?;
+    let mut client_a = WebApi::start(stream_a);
+    put_and_await(&mut client_a, contract, state).await?;
+
+    let mut placement = Vec::new();
+    for name in candidates {
+        let node = ctx.node(name)?;
+        let (stream, _) = connect_async(&node.ws_url()).await?;
+        let mut client = WebApi::start(stream);
+        let holds = node_has_contract_locally(&mut client, contract_key).await?;
+        tracing::info!(node = %name, holds, "#5542: local-presence probe");
+        if !holds {
+            return Ok(client);
+        }
+        placement.push(*name);
+    }
+    bail!(
+        "every candidate node {placement:?} already holds {contract_key} locally, so a          delegate operation on any of them is answered from the local store and this run          cannot observe #5542 at all. Failing rather than passing vacuously — the earlier          version of this test did the latter and was green against unfixed main."
+    )
+}
+
 /// Regression test for #5542: a delegate GET reaches the NETWORK for a contract
 /// this node has never seen.
 ///
 /// **This test cannot be single-node.** Both pre-existing delegate E2E tests
 /// (`test_delegate_contract_get`, `test_delegate_contract_put_and_update`) run
 /// `nodes = ["gateway"]`, and on one node every contract a delegate can name is
-/// necessarily already in the local store — which is precisely the case the bug
-/// handled correctly. The gap only exists on a node that has NOT seen the
-/// contract, so observing it needs a second node.
+/// necessarily already in the local store — the case the bug handled correctly.
+/// The gap exists only on a node that has NOT seen the contract.
 ///
-/// Shape:
-///   1. node-a PUTs the contract with a distinctive state.
-///   2. node-b registers the delegate. node-b issues no contract operation of
-///      its own for this contract, so nothing primes its local store — which is
-///      exactly the situation of a delegate running with the browser tab shut.
-///   3. node-b's delegate GETs the contract. Before this fix it received
-///      `state: None`, silently, and could not tell that from an empty
-///      contract. It must now receive the state node-a published.
-///
-/// **Stated residual.** Placement is not under the test's control: a PUT on a
-/// small network can legitimately place the contract on node-b as a host, in
-/// which case the delegate GET is answered from the local store and the run is
-/// vacuous — it passes without exercising the network path at all. There is no
-/// client-visible "is this in your store, locally, right now" query to gate on,
-/// so this is recorded rather than defended against. Non-vacuity was
-/// established the only way available: by running this test against `main`
-/// without the fix, where it fails with a `None` state.
+/// node-a publishes; a peer with no local presence of the contract registers
+/// the delegate and issues no contract operation of its own, which is the
+/// situation of a delegate running with the browser tab shut. Before this fix
+/// its GET returned `state: None`, silently, indistinguishable from an empty
+/// contract.
 #[freenet_test(
     health_check_readiness = true,
-    nodes = ["gateway", "node-a", "node-b"],
+    nodes = ["gateway", "node-a", "node-b", "node-c", "node-d"],
     timeout_secs = 600,
     startup_wait_secs = 40,
     tokio_flavor = "multi_thread",
@@ -4314,48 +4417,18 @@ async fn test_delegate_get_reaches_the_network_for_an_unseen_contract(
     const TEST_CONTRACT: &str = "test-contract-integration";
 
     let contract = load_contract(TEST_CONTRACT, Parameters::from(vec![]))?;
-    let contract_key = contract.key();
-    let contract_id = *contract_key.id();
+    let contract_id = *contract.key().id();
     let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
     let delegate_key = delegate.key().clone();
 
-    let node_a = ctx.node("node-a")?;
-    let node_b = ctx.node("node-b")?;
-    let (stream_a, _) = connect_async(&node_a.ws_url()).await?;
-    let mut client_a = WebApi::start(stream_a);
-    let (stream_b, _) = connect_async(&node_b.ws_url()).await?;
-    let mut client_b = WebApi::start(stream_b);
+    let state = WrappedState::from(test_utils::create_todo_list_with_item("Published by node-a"));
+    let mut client = a_node_without_the_contract(ctx, &contract, state, &["node-b", "node-c", "node-d"])
+        .await?;
 
-    // --- 1. node-a publishes the contract ---------------------------------
-    let initial_state = test_utils::create_todo_list_with_item("Published by node-a");
-    make_put(
-        &mut client_a,
-        WrappedState::from(initial_state.clone()),
-        contract.clone(),
-        true,
-    )
-    .await?;
-    let mut put_ok = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while !put_ok && std::time::Instant::now() < deadline {
-        match timeout(Duration::from_secs(5), client_a.recv()).await {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                ensure!(key == contract_key, "PUT response for the wrong contract");
-                put_ok = true;
-            }
-            Ok(Ok(other)) => tracing::debug!(?other, "node-a: ignoring while awaiting PUT"),
-            Ok(Err(e)) => bail!("node-a: websocket error awaiting PUT: {e}"),
-            Err(_) => {}
-        }
-    }
-    ensure!(put_ok, "node-a: no PutResponse within 60s");
+    register_delegate(&mut client, &delegate, &delegate_key).await?;
 
-    // --- 2. node-b registers the delegate, and nothing else ---------------
-    register_delegate(&mut client_b, &delegate, &delegate_key).await?;
-
-    // --- 3. the delegate GETs a contract node-b has never asked for -------
     let response = run_delegate_command(
-        &mut client_b,
+        &mut client,
         &delegate_key,
         &DelegateCommand::GetContractState { contract_id },
         Duration::from_secs(120),
@@ -4394,23 +4467,21 @@ async fn test_delegate_get_reaches_the_network_for_an_unseen_contract(
 /// waiting on a per-address contract to learn that a payment landed has no
 /// other way to name it.
 ///
-/// **What this test does and does not establish.** It establishes that the gate
-/// is open and that the subscribe is reported successful, which fails against
-/// `main`. It does NOT by itself establish that notifications subsequently flow:
-/// that needs an update on another peer to be observed arriving at this
-/// delegate, and the notification-driven delegate run routes its output through
-/// the app registry rather than back to this client, so it is not observable
-/// on this socket. That second half is what makes `run_executor_subscribe` the
-/// right entry point (it bootstraps the body, registers demand AND establishes
-/// the network subscription, where the old arm did none of the three), and it
-/// deserves its own test rather than an assertion this one cannot make. Stated
-/// rather than implied, because "subscribe returned Ok" reading as "the delegate
-/// will now hear about changes" is exactly the silent failure #5467 describes.
-///
-/// The same placement residual as the GET test above applies.
+/// **What this establishes, and what it does not.** It establishes that the
+/// gate is open and the subscribe is reported successful. It does NOT establish
+/// that notifications subsequently flow: that needs an update on another peer
+/// observed arriving at this delegate, and a notification-driven delegate run
+/// routes its output through the app registry rather than back to this client,
+/// so it is not observable on this socket. That second half is exactly why
+/// `run_executor_subscribe` is the right entry point — it bootstraps the body,
+/// registers demand AND establishes the network subscription, where the old arm
+/// did none of the three — and it deserves its own test rather than an
+/// assertion this one cannot make. Said plainly, because "subscribe returned
+/// Ok" reading as "the delegate will now hear about changes" is precisely the
+/// silent failure #5467 describes.
 #[freenet_test(
     health_check_readiness = true,
-    nodes = ["gateway", "node-a", "node-b"],
+    nodes = ["gateway", "node-a", "node-b", "node-c", "node-d"],
     timeout_secs = 600,
     startup_wait_secs = 40,
     tokio_flavor = "multi_thread",
@@ -4423,45 +4494,18 @@ async fn test_delegate_subscribe_reaches_the_network_for_an_unseen_contract(
     const TEST_CONTRACT: &str = "test-contract-integration";
 
     let contract = load_contract(TEST_CONTRACT, Parameters::from(vec![]))?;
-    let contract_key = contract.key();
-    let contract_id = *contract_key.id();
+    let contract_id = *contract.key().id();
     let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
     let delegate_key = delegate.key().clone();
 
-    let node_a = ctx.node("node-a")?;
-    let node_b = ctx.node("node-b")?;
-    let (stream_a, _) = connect_async(&node_a.ws_url()).await?;
-    let mut client_a = WebApi::start(stream_a);
-    let (stream_b, _) = connect_async(&node_b.ws_url()).await?;
-    let mut client_b = WebApi::start(stream_b);
+    let state = WrappedState::from(test_utils::create_todo_list_with_item("Published by node-a"));
+    let mut client = a_node_without_the_contract(ctx, &contract, state, &["node-b", "node-c", "node-d"])
+        .await?;
 
-    let initial_state = test_utils::create_todo_list_with_item("Published by node-a");
-    make_put(
-        &mut client_a,
-        WrappedState::from(initial_state),
-        contract.clone(),
-        true,
-    )
-    .await?;
-    let mut put_ok = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while !put_ok && std::time::Instant::now() < deadline {
-        match timeout(Duration::from_secs(5), client_a.recv()).await {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                ensure!(key == contract_key, "PUT response for the wrong contract");
-                put_ok = true;
-            }
-            Ok(Ok(other)) => tracing::debug!(?other, "node-a: ignoring while awaiting PUT"),
-            Ok(Err(e)) => bail!("node-a: websocket error awaiting PUT: {e}"),
-            Err(_) => {}
-        }
-    }
-    ensure!(put_ok, "node-a: no PutResponse within 60s");
-
-    register_delegate(&mut client_b, &delegate, &delegate_key).await?;
+    register_delegate(&mut client, &delegate, &delegate_key).await?;
 
     let response = run_delegate_command(
-        &mut client_b,
+        &mut client,
         &delegate_key,
         &DelegateCommand::SubscribeContract { contract_id },
         Duration::from_secs(180),

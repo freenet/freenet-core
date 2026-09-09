@@ -1382,10 +1382,27 @@ where
                 let contract_id = req.contract_id;
                 let context = req.context;
 
-                // Look up the full key from the instance id
-                let state = match contract_handler.executor().lookup_key(&contract_id) {
+                // LOCAL FIRST, and "local" means A STATE, not a known key.
+                //
+                // `lookup_key` answering `Some` says this node knows the
+                // contract's CODE; `fetch_contract` can still return
+                // `Ok((None, _))` for it, because the code and the state are
+                // separately present. That third shape is not a rare corner: it
+                // was observed on a live two-node run of
+                // `test_delegate_get_reaches_the_network_for_an_unseen_contract`,
+                // where the publishing peer's PUT had propagated the container
+                // to the delegate's node without its state, and it produced
+                // EXACTLY the #5542 symptom — a silent `state: None` the
+                // delegate cannot tell from an empty contract — while sailing
+                // past a fix that only handled the `lookup_key` miss.
+                //
+                // So all three local-miss shapes (no key, key but no state, key
+                // but a failing read) fall through to the same network path
+                // below. This mirrors `Executor::local_state_or_from_network`,
+                // which likewise treats a failed `state_store.get` as a miss
+                // rather than as an answer.
+                let local_state = match contract_handler.executor().lookup_key(&contract_id) {
                     Some(full_key) => {
-                        // Fetch the contract state
                         match contract_handler
                             .executor()
                             .fetch_contract(full_key, false)
@@ -1402,6 +1419,10 @@ where
                             }
                         }
                     }
+                    None => None,
+                };
+                let state = match local_state {
+                    Some(state) => Some(state),
                     None => {
                         // #5542. The contract is not in the local store, which
                         // until now ended the request: the delegate got
@@ -1590,14 +1611,78 @@ where
                         }
                     }
                     None => {
+                        // #5542 scope item 3, DECIDED rather than left to fall
+                        // out of the implementation.
+                        //
+                        // A delegate UPDATE for a contract this node does not
+                        // hold keeps FAILING -- and now ALSO self-heals in the
+                        // background, so the delegate's retry succeeds. That is
+                        // not a compromise between the two obvious options; it
+                        // is the contract a CLIENT UPDATE already has on this
+                        // node, and the reason to match it is that a delegate
+                        // should not be a second-class client.
+                        //
+                        // The client path (`operations/update.rs`, the
+                        // `phase = "auto_fetch_originator"` site) fails the
+                        // UPDATE and calls `try_auto_fetch_contract` with
+                        // `AutoFetchReason::Originator`, which is deliberately
+                        // NOT gated on `contract_in_use` -- "suppressing it
+                        // would strand the client's UPDATE behind a contract
+                        // that never gets fetched". A delegate is a local
+                        // originator with something waiting on the retry, which
+                        // is exactly the case that reason exists for.
+                        //
+                        // Why a SIBLING helper and not that function: it needs a
+                        // `sender_addr` to resolve a first-hop peer, and a
+                        // delegate UPDATE has no sender -- the delegate is the
+                        // originator, here. Handing it an address that resolves
+                        // to nothing makes it log, release its cooldown slot and
+                        // return, i.e. a silent no-op. It also takes a
+                        // `&ContractKey`, which a delegate cannot construct for
+                        // a contract it has never seen. See
+                        // `try_self_heal_fetch_for_local_originator`.
+                        //
+                        // NOT bootstrapped inline, and not parked like GET and
+                        // SUBSCRIBE. Bootstrapping would widen a delegate's
+                        // write reach in one step from "contracts this node
+                        // already holds" to "any contract in the keyspace,
+                        // named by instance id alone", on the same change that
+                        // first gives delegates network reach at all and before
+                        // #5543's containment ladder exists. PUT is not
+                        // comparable: it carries its own code, so a delegate can
+                        // only PUT contracts it can build.
+                        let healing = can_reach_network
+                            && contract_handler
+                                .executor()
+                                .op_manager_handle()
+                                .is_some_and(|op_manager| {
+                                    op_manager
+                                        .try_self_heal_fetch_for_local_originator(contract_id)
+                                });
                         tracing::debug!(
                             contract = %contract_id,
+                            healing,
                             "Contract not found locally for delegate UpdateContractRequest"
                         );
+                        // The message states the TIMESCALE, because the shared
+                        // cooldown is 5 minutes and a delegate that retries once
+                        // and gives up would otherwise be told to retry with no
+                        // idea that the answer may not be ready yet. When the
+                        // fetch was suppressed by that cooldown, say so rather
+                        // than promising a repair that is not running.
+                        let detail = if healing {
+                            "contract not known to this node; a background fetch has been \
+                             started, so retry shortly. GET or SUBSCRIBE it first to wait \
+                             for it deterministically (#5542)"
+                        } else {
+                            "contract not known to this node and no background fetch was \
+                             started (already attempted within the last 5 minutes, or this \
+                             node has no network handle). GET or SUBSCRIBE it first (#5542)"
+                        };
                         inbound_responses.push(InboundDelegateMsg::UpdateContractResponse(
                             UpdateContractResponse {
                                 contract_id,
-                                result: Err("Contract not found".to_string()),
+                                result: Err(detail.to_string()),
                                 context,
                             },
                         ));
@@ -1649,11 +1734,24 @@ where
                 let contract_id = req.contract_id;
                 let context = req.context;
 
-                let result = if contract_handler
-                    .executor()
-                    .lookup_key(&contract_id)
-                    .is_some()
-                {
+                // Same "local means A STATE, not a known key" test as the GET
+                // arm above, and for the same reason. Gating on `lookup_key`
+                // alone let a node that holds the contract's CODE but none of
+                // its state register the notification hook and answer `Ok`,
+                // taking no network subscription — so the delegate believed it
+                // was subscribed to a contract this node could not tell it
+                // anything about. That is the silent-on-both-sides failure
+                // #5467 describes, reachable without the local store being
+                // empty at all.
+                let has_local_state = match contract_handler.executor().lookup_key(&contract_id) {
+                    Some(full_key) => contract_handler
+                        .executor()
+                        .fetch_contract(full_key, false)
+                        .await
+                        .is_ok_and(|(state, _)| state.is_some()),
+                    None => false,
+                };
+                let result = if has_local_state {
                     // Contract is local: unchanged pre-#5542 behaviour. Register
                     // the notification hook and answer.
                     crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS

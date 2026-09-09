@@ -301,6 +301,78 @@ impl OpManager {
         let _tx = super::get::op_ctx_task::start_targeted_sub_op_get(self, instance_id, sender_pkl);
     }
 
+    /// Self-heal a contract a LOCAL ORIGINATOR asked to update but this node
+    /// does not hold, when there is no sender to fetch it from (#5542).
+    ///
+    /// This is [`try_auto_fetch_contract`](Self::try_auto_fetch_contract)'s
+    /// sibling for the delegate path, and it exists because that function
+    /// cannot serve it — for two independent reasons, both structural:
+    ///
+    /// * it needs a `sender_addr` to resolve a first-hop `PeerKeyLocation`, and
+    ///   a delegate UPDATE has no sender. The delegate IS the originator, on
+    ///   this node. Passing an address that resolves to nothing makes that
+    ///   function log "cannot auto-fetch", release its cooldown slot and return
+    ///   — a silent no-op, which is the worst of the three outcomes.
+    /// * it takes a `&ContractKey`, and for the case that matters here — a
+    ///   contract this node has never seen — a delegate holds only a
+    ///   `ContractInstanceId` and cannot construct one.
+    ///
+    /// So the fetch is an untargeted [`start_sub_op_get`], which routes on the
+    /// instance id alone, rather than a targeted one. Everything else is
+    /// deliberately identical to the originator path, including SHARING
+    /// `pending_contract_fetches` — one cooldown covers both, so a delegate and
+    /// a client asking for the same contract do not fetch it twice.
+    ///
+    /// Returns whether a fetch was started, so the caller can tell the delegate
+    /// honestly whether a retry has anything to wait for.
+    ///
+    /// Fire-and-forget: the caller does NOT await it. The point is the side
+    /// effect — the contract cached locally — so the delegate's next attempt
+    /// succeeds, matching the client contract of "fail now, self-heal in the
+    /// background, the retry succeeds".
+    pub(crate) fn try_self_heal_fetch_for_local_originator(
+        &self,
+        instance_id: freenet_stdlib::prelude::ContractInstanceId,
+    ) -> bool {
+        use crate::config::GlobalSimulationTime;
+        use dashmap::mapref::entry::Entry;
+
+        let now_ms = GlobalSimulationTime::read_time_ms();
+        // Same atomic entry-API rate limit as the originator path, against the
+        // same map, for the same reason: check-then-insert would race.
+        match self.pending_contract_fetches.entry(instance_id) {
+            Entry::Occupied(mut existing) => {
+                let elapsed_ms = now_ms.saturating_sub(*existing.get());
+                if elapsed_ms < CONTRACT_FETCH_COOLDOWN_MS {
+                    tracing::debug!(
+                        contract = %instance_id,
+                        "Delegate-originated self-heal fetch still in cooldown"
+                    );
+                    return false;
+                }
+                *existing.get_mut() = now_ms;
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(now_ms);
+            }
+        }
+
+        tracing::info!(
+            contract = %instance_id,
+            "Auto-fetching a contract a delegate tried to UPDATE but this node \
+             does not hold (#5542)"
+        );
+        // Receiver dropped: the caller wants the caching side effect, not the
+        // result. The driver logs its own outcome and self-terminates at
+        // OPERATION_TTL.
+        let (_tx, _rx) = super::get::op_ctx_task::start_sub_op_get(
+            self,
+            instance_id,
+            /* return_contract_code */ true,
+        );
+        true
+    }
+
     /// The advertised co-hosts of a contract: peers that announced, via the
     /// advertisement layer, that they host it.
     ///
