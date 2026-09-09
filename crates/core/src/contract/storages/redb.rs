@@ -2419,6 +2419,23 @@ impl ReDb {
 
     /// Forget that `delegate` is subscribed to `contract`. Idempotent.
     ///
+    /// # WHY THIS COMMITS UNCONDITIONALLY AND ITS SIBLING DOES NOT
+    ///
+    /// [`Self::remove_delegate_subscriptions_for_contract`] answers the empty
+    /// case from a read transaction, and this deliberately does not. The
+    /// asymmetry is about which case is COMMON, not an oversight, and it is
+    /// written down because the obvious "fix" is a regression.
+    ///
+    /// That one sits on `ContractStore::remove_contract`, which runs on every
+    /// eviction on nodes that almost always have ZERO delegate subscriptions,
+    /// so the read saves an fsync nearly every time. This one has a single
+    /// caller — boot restore's delegate-gone branch — and there the row is
+    /// known to exist, because it came out of `load_persisted` moments before.
+    /// Adding a read would pay for a lookup on every call to save an fsync on a
+    /// case no live caller reaches.
+    ///
+    /// If a caller ever appears that removes rows speculatively, revisit this.
+    ///
     /// # Errors
     /// Returns `Err` if the redb write transaction, table open, remove or
     /// commit fails.
@@ -3704,14 +3721,18 @@ mod tests {
         );
     }
 
-    // ---- delegate-subscription idle expiry (#4669 part 2) -----------------
+    // ---- delegate-subscription last-affirmed stamp (#4669 part 2) ---------
     //
-    // The row that makes this necessary is the KEPT-BUT-UNHOSTED one: boot
-    // reconciliation deliberately keeps a row whose contract exists but is no
-    // longer hosted, and before these tests nothing ever aged it out. See
-    // `DELEGATE_SUBSCRIPTIONS_TABLE`.
+    // NOTHING AGES A ROW OUT. These tests cover the stamp, not an expiry: the
+    // row that would need one is the KEPT-BUT-UNHOSTED case, which boot
+    // reconciliation deliberately keeps and nothing ever removes.
+    //
+    // What they pin is the property a horizon added later (#5622) depends on,
+    // and which is invisible while nothing expires: only a genuine subscribe
+    // moves the stamp, and an implausible stamp is rewritten rather than
+    // believed. See `DELEGATE_SUBSCRIPTIONS_TABLE`.
 
-    fn expiry_test_delegate(seed: u8) -> DelegateKey {
+    fn stamp_test_delegate(seed: u8) -> DelegateKey {
         DelegateKey::new([seed; 32], CodeHash::from_code(&[seed]))
     }
 
@@ -3784,7 +3805,7 @@ mod tests {
         let store = ReDb::new(dir.path()).await.unwrap();
 
         let contract = ContractInstanceId::new([21; 32]);
-        let delegate = expiry_test_delegate(21);
+        let delegate = stamp_test_delegate(21);
 
         // A clock that has not been set: well below the floor.
         let unset = 5_000u64;
@@ -3928,7 +3949,7 @@ mod tests {
         let store = ReDb::new(dir.path()).await.unwrap();
 
         let contract = ContractInstanceId::new([12; 32]);
-        let delegate = expiry_test_delegate(12);
+        let delegate = stamp_test_delegate(12);
         let now = 1_700_000_000_000u64;
 
         // Written during a forward clock excursion: a year ahead.
@@ -3969,7 +3990,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = ReDb::new(dir.path()).await.unwrap();
 
-        let delegate = expiry_test_delegate(11);
+        let delegate = stamp_test_delegate(11);
         let cap = ReDb::MAX_DELEGATE_SUBSCRIPTION_ROWS_PER_NODE;
         let now = 1_700_000_000_000u64;
 
@@ -4088,7 +4109,7 @@ mod tests {
         let store = ReDb::new(dir.path()).await.unwrap();
 
         let contract = ContractInstanceId::new([4; 32]);
-        let delegate = expiry_test_delegate(9);
+        let delegate = stamp_test_delegate(9);
         let row_key = ReDb::delegate_subscription_row_key(&contract, &delegate);
 
         // A row in the pre-stamp encoding: a single presence byte.
@@ -4135,7 +4156,7 @@ mod tests {
         let store = ReDb::new(dir.path()).await.unwrap();
 
         let contract = ContractInstanceId::new([5; 32]);
-        let delegate = expiry_test_delegate(3);
+        let delegate = stamp_test_delegate(3);
         let granularity = ReDb::DELEGATE_SUBSCRIPTION_STAMP_GRANULARITY_MS;
         let first = 1_700_000_000_000;
 
