@@ -524,10 +524,29 @@ async fn fetch_related_off_loop(
     }
 }
 
+/// Fetches refused for exceeding their park's reserve, since process start.
+///
+/// A COUNTER AS WELL AS THE `warn!`, per this repo's own rule that "a refusal
+/// that is not counted renders as a clean zero" — the same reasoning behind
+/// `delegate_park::RefusalCounts`. The degradation here is legitimate (the
+/// fetch is refused and the upsert re-runs inline on the serial loop, so the
+/// write still completes, more slowly), which is precisely why it needs to be
+/// visible: a
+/// legitimate behaviour change that nothing counts is indistinguishable from
+/// nothing happening, and the symptom an operator sees is latency somewhere
+/// else entirely.
+static REFUSED_OVERSIZED_FETCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn refused_oversized_fetches() -> usize {
+    REFUSED_OVERSIZED_FETCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Reject a completed off-loop related fetch that retained more than the park
 /// reserved for it at admission.
 ///
-/// The other half of [`delegate_park::MAX_UPSERT_FETCH_BYTES`]: the reserve is
+/// The other half of `delegate_park::upsert_fetch_allowance`: the reserve is
 /// taken in `task_bytes` before the fetch starts, and this is what makes the
 /// reserve true rather than aspirational. Without it the fetched states went
 /// into the resume sink and then an unbounded channel with no accounting at
@@ -547,24 +566,6 @@ async fn fetch_related_off_loop(
 /// test stub (`OFF_LOOP_FETCH_OVERRIDE`), which returns before that function's
 /// body runs, is bounded by it too. A budget a test fixture can walk past is
 /// not a budget.
-/// Fetches refused for exceeding their park's reserve, since process start.
-///
-/// A COUNTER AS WELL AS THE `warn!`, per this repo's own rule that "a refusal
-/// that is not counted renders as a clean zero" — the same reasoning behind
-/// `delegate_park::RefusalCounts`. The degradation here is legitimate (the
-/// upsert fails and the delegate is told, exactly as it is for a miss or a
-/// timeout on this path), which is precisely why it needs to be visible: a
-/// legitimate behaviour change that nothing counts is indistinguishable from
-/// nothing happening, and the symptom an operator sees is latency somewhere
-/// else entirely.
-static REFUSED_OVERSIZED_FETCHES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-fn refused_oversized_fetches() -> usize {
-    REFUSED_OVERSIZED_FETCHES.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 fn within_fetch_allowance(
     fetched: Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>,
     missing: &[ContractInstanceId],
@@ -596,9 +597,16 @@ fn within_fetch_allowance(
             allowance = %allowance,
             contract = %id,
             total_refused = total,
+            // SAYS WHAT THE CODE DOES. This read "failing the upsert", which
+            // stopped being true when the disposition became `RetryInline`:
+            // the write completes on the inline path. An operator-facing line
+            // that reports a failure where none occurred is worse than no line,
+            // because it is the signal for one of the three degradations this
+            // change promises are observable.
             "Off-loop related fetch retained more than the park reserved for \
-             it; failing the upsert rather than holding unbounded bytes behind \
-             a park (#5554 follow-up)"
+             it; re-running this upsert INLINE on the serial loop rather than \
+             holding unbounded bytes behind a park. The write still completes; \
+             the cost is a stall (#5554 follow-up)"
         );
         // RETRY INLINE, DO NOT FAIL. Returning `Err` here failed the write —
         // and failed it precisely when the park was ADMITTED, so an identical
@@ -5457,15 +5465,24 @@ mod tests {
             .expect("contract.rs must have a top-level `mod tests`");
         let src = &full[..cutoff];
 
-        let start = src
-            .find("async fn handle_delegate_notification")
-            .expect("handle_delegate_notification must exist");
-        let body = &src[start..];
-        let end = body[1..]
-            .find("\nasync fn ")
-            .map(|i| i + 1)
-            .unwrap_or(body.len());
-        let body = &body[..end];
+        // BRACE MATCHING, NOT THE NEXT `\nasync fn `. This bounded the region
+        // on that needle until a reviewer measured it: 242 lines scraped
+        // against a 163-line function, so it had already swallowed the
+        // following item and stopped at some later declaration. Benign today,
+        // because every needle it finds is inside the real function and the
+        // `min` over exits is unchanged. It fails OPEN, though: delete the
+        // sweep from the notification path while a neighbouring function
+        // inside the widened window has one, and `find` succeeds against the
+        // neighbour while the notification path no longer sweeps.
+        //
+        // `fn_region`'s own rustdoc warns about this needle, ten lines from
+        // where `fn_region` is used, and this change applied that lesson to
+        // `enclosing_fn` and to the P5b pin and left this one. That is the rule
+        // this change adds to `.claude/rules/bug-prevention-patterns.md`
+        // ("Finishing the sentence and stopping there") failing on its own
+        // author, which is the third instance and the reason the entry says to
+        // grep for every other consumer of the anchor.
+        let body = fn_region(src, "async fn handle_delegate_notification");
 
         // STRIP LINE COMMENTS FIRST. The needles below occur in this
         // function's own prose — the sweep's comment explains which exits used
@@ -8658,7 +8675,7 @@ mod hol_4391_tests {
     /// renders as a clean zero, so it is counted as well as logged.
     ///
     /// Note the allowance is well under `MAX_STATE_SIZE` (50 MiB) by design —
-    /// see `MAX_UPSERT_FETCH_BYTES`. A legitimately large related contract
+    /// see `upsert_fetch_allowance`. A legitimately large related contract
     /// degrades to the pre-#5544 inline path, which is slower but loses
     /// nothing.
     ///
@@ -8695,11 +8712,29 @@ mod hol_4391_tests {
             "a fetch inside its reserve must be RESOLVED with its states, or \
              this test would pass for the wrong reason"
         );
+        // EXACT EQUALITY HERE, AND WHAT ACTUALLY MAKES IT SAFE. The rustdoc
+        // above argues for `>` on the other half because
+        // `REFUSED_OVERSIZED_FETCHES` is process-global and this binary runs
+        // its tests in one process. That argument applies here too, and
+        // `#[serial_test::serial(oversized_fetch_counter)]` does NOT answer it:
+        // it excludes only tests in that one group, and the
+        // `OFF_LOOP_FETCH_OVERRIDE` tests are serialised among themselves by a
+        // different mechanism (their own `TEST_GUARD`), so they can run
+        // alongside this one.
+        //
+        // What makes the equality safe is that none of them can increment this
+        // counter: their stubs return small states and the floor allowance is
+        // 512 KiB at an 8 MiB budget, so they never take the refusal branch.
+        // That is a SIZE MARGIN, not serialisation, and saying so is the point
+        // -- a reader who believes the serial attribute is doing the work will
+        // add a test with a large stub and get an inexplicable flake here.
         assert_eq!(
             refused_oversized_fetches(),
             before,
             "an accepted fetch must not be counted as a refusal — without this \
-             half a counter that always increments would pass"
+             half a counter that always increments would pass. If this ever \
+             fails intermittently, look for a NEW test whose off-loop stub \
+             returns states over the fetch allowance, not for a bug here"
         );
 
         let over = within_fetch_allowance(

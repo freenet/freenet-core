@@ -95,12 +95,32 @@ class Tree:
             ) from None
         os.write(fd, f"pid={os.getpid()}\n".encode())
         os.close(fd)
-        self.paths = [WORKTREE / p for p in paths]
-        self.pristine = {p: p.read_bytes() for p in self.paths}
-        self._armed = True
-        atexit.register(self.restore)
-        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            signal.signal(sig, self._on_signal)
+        # EVERYTHING AFTER THE ACQUISITION IS INSIDE THE TRY, and the reason is
+        # that the window between the two is where this lock strands itself.
+        # `read_bytes()` on a missing file -- a wrong `$PARK_HARNESS_WORKTREE`,
+        # a renamed source file -- raised with the lock already on disk and no
+        # `atexit` hook or signal handler yet installed, so every later campaign
+        # on that worktree was refused until somebody deleted the file by hand.
+        #
+        # The failure is worse than what the lock guards against, and for the
+        # same reason as everything else in this file: it does not announce
+        # itself. A stranded lock presents as "the harness refuses to run",
+        # which reads exactly like the exclusivity working correctly. That is
+        # the third time in this workstream that a guard's own failure mode has
+        # been disguised as the guard doing its job.
+        try:
+            self.paths = [WORKTREE / p for p in paths]
+            self.pristine = {p: p.read_bytes() for p in self.paths}
+            self._armed = True
+            atexit.register(self.restore)
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                signal.signal(sig, self._on_signal)
+        except BaseException:
+            # Nothing has been mutated yet, so releasing is safe and is the
+            # only correct action: re-raise so the caller still sees the real
+            # error rather than a lock that outlives it.
+            self.LOCK.unlink(missing_ok=True)
+            raise
 
     def _on_signal(self, signum, _frame):
         self.restore()
@@ -146,7 +166,10 @@ class Tree:
 #: demonstrated rather than asserted" evidence -- because a rename there
 #: silently converts "watched to fail" back into "assumed", which is the exact
 #: thing this whole harness exists to stop.
-_RESULT = re.compile(r"test result: (\w+)\. (\d+) passed; (\d+) failed")
+#: Names of the tests cargo actually EXECUTED, which is the only evidence
+#: that a given filter matched something. The summary counts cannot answer
+#: that question when more than one filter is passed.
+_EXECUTED = re.compile(r"^test ([\w:]+) \.\.\. ", re.M)
 
 
 def run_tests(tests):
@@ -163,15 +186,20 @@ def run_tests(tests):
         cwd=WORKTREE, capture_output=True, text=True,
     )
     out = r.stdout + r.stderr
-    ran = sum(int(m[1]) + int(m[2]) for m in _RESULT.findall(out))
     if "test result: FAILED" in out:
         return "RED"
     if "error[" in out or "error: could not compile" in out:
         return "COMPILE ERROR"
     if "test result: ok" in out:
-        # A filter that matched nothing. Never GREEN: green here would mean
-        # "the property held" when what happened is "nobody asked".
-        return "GREEN" if ran else "NO TESTS RAN"
+        # PER FILTER, not "did anything run". Several filters are passed at
+        # once, so a total count above zero is satisfied by the OTHER filters
+        # while one of them matches nothing -- which is how a case reports the
+        # verdict it expected without ever exercising the test it names.
+        executed = _EXECUTED.findall(out)
+        unmatched = [t for t in tests if not any(t in name for name in executed)]
+        if unmatched:
+            return f"NO TESTS RAN ({', '.join(unmatched)})"
+        return "GREEN"
     # A non-unwinding panic (a null deref, say) ABORTS the process, so cargo
     # prints no `test result:` line at all. That is a kill, not a mystery.
     return "ABORTED (counts as RED)" if "error: test failed" in out else "UNKNOWN"

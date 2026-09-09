@@ -527,6 +527,41 @@ of two known dimensions across a bound it was otherwise correct about, and
 comment, closed it in one consumer, and left it open in a sibling consumer
 forty lines away in the same file.
 
+### The commonest form is duller than the three above: prose that outlived its code
+
+The rows above are all a comment contradicted by code written in the SAME edit.
+The high-frequency version is a comment contradicted by code written LATER, and
+it is worth naming separately because it is not a lapse of attention: the edit
+that invalidates the prose is usually in a different paragraph, a different
+item, or a different file, and nothing in the compiler or the test suite reads
+English.
+
+One review of [#5606](https://github.com/freenet/freenet-core/pull/5606)
+produced four in one change, and the shapes are worth recognising:
+
+- **A rustdoc attached to the wrong item.** `within_fetch_allowance`'s entire
+  doc block, including the paragraph explaining why its return type is a
+  disposition rather than a `Result`, was separated from the following
+  `/// ...` by no blank line, so all of it documented the `static` beneath it
+  and the function had no doc at all.
+- **A log line naming an outcome the code stopped producing.** The same
+  function's `warn!` said it was "failing the upsert" after the behaviour
+  changed to re-running inline, where the write completes. An operator-facing
+  line that reports a failure that did not happen is worse than no line.
+- **A doc describing the design a change replaced.** `OwedUpsert` still said
+  reconciliation was a multiset match on `(contract, is_put)` twelve lines above
+  the `HashSet<UpsertId>` that replaced it, and the field doc said it too.
+- **A justification table whose reasons drifted.** Two `NOT_SUMMED` rows
+  contradicted each other about which of `MAX_PARKED_BYTES` and
+  `parked_budget_for` was summed, in a table whose stated purpose is that an
+  exclusion is a decision someone wrote down.
+
+The rule is the same search instruction, pointed the other way: **when you
+change a behaviour, grep for the prose that describes it**: the doc on the
+item, the doc on its neighbours, the log lines it emits, and any table that
+gives a reason for it. And when a doc block sits above two items, check which
+one it is actually attached to; a missing blank line moves it silently.
+
 ### The rule
 
 **A comment naming a trap, a bypass, a missing dimension, or a bound that does

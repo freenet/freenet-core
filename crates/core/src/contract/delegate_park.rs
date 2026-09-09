@@ -236,7 +236,7 @@ const MIN_PARKED_BYTES: usize = MAX_PARKED_BYTES / 8;
 
 /// RAM assumed when the host's real figure cannot be read — the same
 /// conservative 1 GiB every sibling budget falls back to.
-const FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
+const PARKED_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Fraction of node memory the park registry may pin. Matches the shape of
 /// every sibling budget (`budget_for_ram`, `summary_budget_for`, ...), which is
@@ -1145,9 +1145,13 @@ impl UpsertId {
 /// unusable when two requests target the same contract. Reachable on every
 /// abnormal exit: panic, cancellation, or the off-loop budget expiring.
 ///
-/// The identity half is still `(contract, is_put)` — the reconciliation below
-/// is a MULTISET match on exactly those two, and the context is payload carried
-/// alongside, not part of the key.
+/// THE IDENTITY IS `id`, NOT `(contract, is_put)`. This paragraph said the
+/// opposite until a reviewer read it against the code twelve lines below:
+/// reconciliation is a `HashSet<UpsertId>` match, and `contract` and `is_put`
+/// are carried for the synthesized failure message rather than as the key.
+/// A multiset match on `(contract, is_put)` is precisely what `UpsertId`
+/// replaced, because a later completion cancelled an earlier obligation for
+/// the same contract. Leftover prose from the draft before that change.
 pub(super) struct OwedUpsert {
     /// Matched against `ResolvedUpsert::pending.id` — see [`PendingUpsert::id`].
     pub id: UpsertId,
@@ -1261,10 +1265,16 @@ struct ParkGuardPayload {
     /// Prompt request ids this park owes a `UserResponse` for. A MULTISET:
     /// `request_id` is chosen by delegate WASM, so `[7, 7]` is reachable.
     owed_prompts: Vec<u32>,
-    /// Upserts this park owes a response for. Also a MULTISET: `deferred_upserts`
-    /// is built by two independent loops (PUTs and UPDATEs) with no
-    /// de-duplication, so `[(X,true),(X,false)]` and `[(X,true),(X,true)]` are
-    /// both reachable.
+    /// Upserts this park owes a response for, keyed by [`UpsertId`].
+    ///
+    /// `deferred_upserts` is built by two independent loops (PUTs and UPDATEs)
+    /// with no de-duplication, so two entries for the same contract are
+    /// reachable and were originally reconciled as a MULTISET of
+    /// `(contract, is_put)`. That is what `UpsertId` replaced: under the
+    /// multiset match a later completion cancelled an EARLIER obligation for
+    /// the same contract, so one of the two was answered twice and the other
+    /// never. This doc described the multiset for one commit longer than the
+    /// code did.
     owed_upserts: Vec<OwedUpsert>,
     /// Where the off-loop task deposits results AS THEY COMPLETE. Shared with
     /// the task rather than created inside it, so `Drop` can see work that
@@ -1492,7 +1502,7 @@ impl DelegateParkCtx {
         // re-reading it per admission would make the cap wobble under memory
         // pressure exactly when it most needs to be stable.
         let host_ram =
-            crate::wasm_runtime::read_total_ram_bytes().unwrap_or(FALLBACK_TOTAL_RAM_BYTES);
+            crate::wasm_runtime::read_total_ram_bytes().unwrap_or(PARKED_FALLBACK_TOTAL_RAM_BYTES);
         let budget = parked_budget_for(host_ram);
         Self {
             parked: HashMap::new(),

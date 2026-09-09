@@ -2137,6 +2137,20 @@ mod tests {
                 "FALLBACK_TOTAL_RAM_BYTES",
                 "RAM fallback for budget_for_ram",
             ),
+            // A SEPARATE ROW BECAUSE IT IS A SEPARATE CONSTANT. Discovery
+            // collapses names into a `BTreeSet<String>`, so a second
+            // module-scope `FALLBACK_TOTAL_RAM_BYTES` was silently covered by
+            // the row above, which describes a different constant in a
+            // different module. Both really are RAM fallbacks, so it was
+            // benign, but one row standing for two things means the reason
+            // text is accurate for only one of them -- and this table's whole
+            // design is that an exclusion is a decision someone wrote down.
+            // The park constant is renamed to match every sibling's
+            // convention (`SUMMARY_CACHE_`, `PAGE_CACHE_`, `STORE_ARENA_`).
+            (
+                "PARKED_FALLBACK_TOTAL_RAM_BYTES",
+                "RAM fallback for parked_budget_for",
+            ),
             (
                 "CGROUP_UNLIMITED_THRESHOLD_BYTES",
                 "sentinel for reading the cgroup limit, not a budget",
