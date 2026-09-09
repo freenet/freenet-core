@@ -497,7 +497,44 @@ Is this a public API?
 Is this implementation logic?
   → Comment explains WHY, not WHAT
   → If code needs a WHAT comment, refactor for clarity instead
+
+INSERTING near a doc comment? Re-check what it is still attached to.
+  → An insertion anchored on an ATTRIBUTE or a SIGNATURE lands AFTER
+    the doc comment, not before it. `#[tokio::test]`, `pub fn`, a
+    match arm, a struct field. Anchoring on any of them puts the new
+    item between an existing doc block and the thing it documents.
+  → The result is silent: the doc now describes the wrong item, and
+    the item it was written for has none.
+  → NO TEST CATCHES THIS, because a comment has no test. It survives
+    review because a reviewer reads the diff, where the doc block is
+    unchanged context and the insertion looks correct in isolation.
 ```
+
+**Three instances in one PR (#5493), plus two more the same day:**
+
+- `native_api.rs`: `StateTooLarge`'s comment, explaining a mapping to
+  `ERR_INVALID_PARAM`, ended up above the `SubscriptionCapExceeded` arm,
+  which returns `ERR_STORE_ERROR`. A reader checking which code a
+  subscription-cap refusal returns read the wrong answer off the comment
+  directly above it. Reported as a "duplicated comment", which it was not.
+- `redb.rs`: a test block inserted at `#[tokio::test]` split a doc comment
+  from its test. Caught only because clippy's `empty_line_after_doc_comments`
+  fired, and only after an unrelated `-D dead-code` fix exposed it.
+- `network_status.rs`: a new field inserted between a long doc block about
+  reconcile-shadow sites and the fields it describes, so the block documented
+  the new field and every shadow field was left bare.
+
+Two things follow. **When you insert programmatically, anchor on the doc
+comment's START, not on the item's attribute or signature**, or insert after
+the previous item's closing brace. And **after any scripted insertion near
+rustdoc, read the surrounding twenty lines** rather than trusting that the
+diff looked right.
+
+The same shape applies to a fix that closes a surface: grep for every claim
+ABOUT that surface, in any wording, not just the file the fix touched. In
+#5493 a governance filter landed in `hosting.rs` while five of the six stale
+claims about it lived in two other files, and a review that searched for the
+reported phrase found four of six.
 
 ### BEFORE submitting code
 
