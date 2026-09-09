@@ -418,6 +418,45 @@ impl Executor<Runtime> {
                     !subscribers.is_empty()
                 });
 
+                // Drop the matching DEMAND registrations (#4669 part 1). The
+                // retain above clears only the notification hook; the demand
+                // this delegate holds in the ring's client-subscription map is
+                // a separate record, and leaving it behind would pin every
+                // contract the delegate ever subscribed to for the life of the
+                // process — a permanent, un-collapsible lease. Mirrors the
+                // WebSocket disconnect path in `client_events.rs`, including
+                // its upstream-collapse decision.
+                //
+                // AUTHORIZATION, PRE-EXISTING AND UNFIXED. There is an
+                // authorization gap on this teardown path, and this PR WIDENS
+                // WHAT IT COSTS: the same teardown now drops the delegate's
+                // ring demand as well as its notification hooks, so the reach
+                // is larger than it was before #4669.
+                //
+                // The mechanism is deliberately not stated here. It is tracked
+                // in a private advisory together with the related gap noted in
+                // `contract::delegate_demand`'s module header, and it stays
+                // there until there is a fix — a public repo is not where an
+                // open hole gets its method written down, in a comment or in a
+                // commit message. See `no-public-disclosure-before-fix`.
+                //
+                // SCOPE MISMATCH, unfixed: the retain above walks the
+                // process-global `DELEGATE_SUBSCRIPTIONS`, so it clears this
+                // delegate's hooks on EVERY node in the process, while the
+                // demand drop below reaches only THIS node's ring. In a
+                // shared-process multi-node test (every `#[freenet_test]`),
+                // unregistering on node A therefore strips node B's hooks and
+                // leaves B's demand — a pin with nothing able to consume its
+                // updates. Production runs one node per process, so the impact
+                // is test-only; it is not closed by scoping the demand drop,
+                // because the registry has no node dimension to scope BY. The
+                // same mismatch exists in the channel-closed arm
+                // (`executor_impl.rs`). Both close when the hook and the demand
+                // become one record with one owner (#4669 part 3).
+                if let Some(op_manager) = &self.op_manager {
+                    crate::contract::delegate_demand::drop_delegate_demand(op_manager, &key);
+                }
+
                 // Clean up delegate creation tracking to prevent unbounded growth
                 self.runtime.inherited_origins.remove(&key);
 
