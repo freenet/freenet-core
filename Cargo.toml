@@ -186,8 +186,33 @@ muda = "0.19"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
-# 0.8.4 adds `DelegateRequest::RegisterDelegateWithPredecessors` (stdlib PR #86),
-# consumed by the #4117 delegate secret copy-forward.
+# 0.10.0 adds three delegate wire variants, all APPENDED so existing tags are
+# unchanged (stdlib #98/#82). Core matches them explicitly rather than sweeping
+# them into a wildcard, but implements none of them yet:
+#   - `OutboundDelegateMsg::UnsubscribeContractRequest` — a delegate asking to
+#     drop a subscription. No core path behind it (#5600), so both dispatchers
+#     REJECT it with an explicit not-implemented error. A silent drop would
+#     strand the delegate on a response nobody sends and read as a successful
+#     unsubscribe while the subscription stayed live.
+#   - `InboundDelegateMsg::UnsubscribeContractResponse` — its answer, likewise
+#     never produced by core yet.
+#   - `InboundDelegateMsg::WakeupFired` — delivery of a wakeup scheduled via
+#     the new `__frnt__delegate__schedule_wakeup` host import (#5565). Core's
+#     wasmtime linker does not define that import and does not trap unknown
+#     imports, so a delegate that CALLS it fails at instantiation; one that
+#     merely links stdlib 0.10.0 without calling it is unaffected.
+#
+# 0.9.0 REMOVES `DelegateRequest::RegisterDelegateWithPredecessors` from the
+# wire (stdlib #91, GHSA-824h-7x5x-wfmf). Source-breaking, hence the minor bump.
+# Its node-side secret copy-forward was gated on an `origin_contract` any HTTP
+# client can forge, so the gate authorized nothing; #5199 had already disabled
+# the copy, leaving the variant registering exactly as `RegisterDelegate` does.
+# `SecretsStore::migrate_secrets` survives with its tests but now has NO caller.
+# Do NOT reintroduce a registration variant that copies secrets forward without
+# first making `origin_contract` attestable.
+#
+# 0.8.4 added that variant in the first place (stdlib PR #86), for the #4117
+# delegate secret copy-forward. Both are gone as of 0.9.0, above.
 #
 # 0.8.5 fixes the FlatBuffers client-request boundary (stdlib #85/#87/#88).
 # Behaviour changes for FBS clients, none for native ones:
@@ -205,7 +230,7 @@ zip = { version = "8", default-features = false, features = ["deflate", "time"] 
 # Exposure is FBS-only: `client_events/websocket.rs` falls back to
 # Flatbuffers when no encoding is specified, and every first-party client
 # (fdev, riverctl, River UI, the test harness) explicitly pins native.
-freenet-stdlib = "0.8.5"
+freenet-stdlib = "0.10.0"
 
 # Crypto (secrets-at-rest KEK + DEK derivation, see crates/core/src/config/kek.rs).
 # `sha2` is already declared above (workspace-wide); only `hkdf` and `keyring`

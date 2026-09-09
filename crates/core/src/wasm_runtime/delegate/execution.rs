@@ -88,6 +88,7 @@ fn drain_remaining_with_attestation(
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | OutboundDelegateMsg::SendDelegateMessage(_)) => results.push(msg),
         }
     }
@@ -303,6 +304,9 @@ impl Runtime {
             InboundDelegateMsg::SubscribeContractResponse(_) => "SubscribeContractResponse",
             InboundDelegateMsg::ContractNotification(_) => "ContractNotification",
             InboundDelegateMsg::DelegateMessage(_) => "DelegateMessage",
+            // Appended in stdlib 0.10.0.
+            InboundDelegateMsg::UnsubscribeContractResponse(_) => "UnsubscribeContractResponse",
+            InboundDelegateMsg::WakeupFired { .. } => "WakeupFired",
             // `InboundDelegateMsg` is `#[non_exhaustive]` (stdlib 0.6.0+).
             // Future variants land here for tracing only — they still flow
             // through the wasm boundary as raw bincode below; classifying
@@ -382,6 +386,9 @@ impl Runtime {
                     OutboundDelegateMsg::SubscribeContractRequest(req) => {
                         format!("SubscribeContractRequest(contract={})", req.contract_id)
                     }
+                    OutboundDelegateMsg::UnsubscribeContractRequest(req) => {
+                        format!("UnsubscribeContractRequest(contract={})", req.contract_id)
+                    }
                     OutboundDelegateMsg::SendDelegateMessage(msg) => {
                         format!(
                             "SendDelegateMessage(target={}, payload_len={})",
@@ -426,6 +433,7 @@ impl Runtime {
                         OutboundDelegateMsg::PutContractRequest(r) => format!("PutContractReq({})", r.contract.key()),
                         OutboundDelegateMsg::UpdateContractRequest(r) => format!("UpdateContractReq({})", r.contract_id),
                         OutboundDelegateMsg::SubscribeContractRequest(r) => format!("SubscribeContractReq({})", r.contract_id),
+                        OutboundDelegateMsg::UnsubscribeContractRequest(r) => format!("UnsubscribeContractReq({})", r.contract_id),
                         OutboundDelegateMsg::SendDelegateMessage(m) => format!("SendDelegateMsg(target={})", m.target),
                     }
                 }).collect::<Vec<_>>()
@@ -548,6 +556,26 @@ impl Runtime {
                     context.clear();
                     context.extend_from_slice(ctx.as_ref());
                 }
+                // freenet-stdlib 0.10.0 added this variant (freenet/freenet-stdlib#98);
+                // core has no unsubscribe path behind it yet (tracked in #5600).
+                // Fail LOUDLY rather than drop it: silently swallowing the
+                // request would leave the delegate blocked forever on an
+                // `UnsubscribeContractResponse` that no one is going to send,
+                // and would make "unsubscribed" look successful while the
+                // subscription is still live.
+                OutboundDelegateMsg::UnsubscribeContractRequest(req) => {
+                    tracing::warn!(
+                        delegate_key = %delegate_key,
+                        contract_id = %req.contract_id,
+                        "Delegate requested UnsubscribeContractRequest, which this node does not \
+                         implement yet (see #5600); failing the delegate execution"
+                    );
+                    return Err(DelegateExecError::UnexpectedMessage(
+                        "UnsubscribeContractRequest is not implemented by this node yet (#5600)",
+                    )
+                    .into());
+                }
+
                 OutboundDelegateMsg::SendDelegateMessage(mut msg) if !msg.processed => {
                     tracing::debug!(
                         target_delegate = %msg.target,

@@ -292,11 +292,6 @@ pub(super) fn request_bytes(req: &DelegateRequest<'static>) -> usize {
             inbound, params, ..
         } => inbound.iter().map(inbound_bytes).sum::<usize>() + params.as_ref().len(),
         DelegateRequest::RegisterDelegate { delegate, .. } => delegate_container_bytes(delegate),
-        DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate,
-            predecessors,
-            ..
-        } => delegate_container_bytes(delegate) + predecessors.len() * 64,
         DelegateRequest::UnregisterDelegate(_) | _ => 0,
     }
 }
@@ -339,6 +334,11 @@ fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
         InboundDelegateMsg::PutContractResponse(r) => ctx_len(&r.context),
         InboundDelegateMsg::UpdateContractResponse(r) => ctx_len(&r.context),
         InboundDelegateMsg::SubscribeContractResponse(r) => ctx_len(&r.context),
+        InboundDelegateMsg::UnsubscribeContractResponse(r) => ctx_len(&r.context),
+        // `tag` is bounded by stdlib's `MAX_WAKEUP_TAG_LEN`, but charge it
+        // rather than assume: this arm exists precisely so nothing goes
+        // uncounted. Carries no context by design.
+        InboundDelegateMsg::WakeupFired { tag } => tag.len(),
         // Required by `#[non_exhaustive]`. A new variant that carries bytes
         // MUST be added above; this arm is the only thing between it and going
         // uncounted, which is why the list is written out rather than delegated.
@@ -364,6 +364,7 @@ fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
         OutboundDelegateMsg::PutContractRequest(r) => r.state.as_ref().len() + ctx_len(&r.context),
         OutboundDelegateMsg::UpdateContractRequest(r) => ctx_len(&r.context),
         OutboundDelegateMsg::SubscribeContractRequest(r) => ctx_len(&r.context),
+        OutboundDelegateMsg::UnsubscribeContractRequest(r) => ctx_len(&r.context),
     }
 }
 

@@ -820,11 +820,10 @@ where
     P: UserInputPrompter + 'static,
 {
     // Extract initial params from the request (only ApplicationMessages has params we need).
-    // The registration variants (including RegisterDelegateWithPredecessors,
-    // #4117) carry no params relevant here — registration's empty response exits
-    // the loop before params are read — but the new variant is listed EXPLICITLY
-    // for local consistency with this match's style; the wildcard remains only to
-    // satisfy `#[non_exhaustive]`.
+    // The registration variants carry no params relevant here — registration's
+    // empty response exits the loop before params are read — but they are listed
+    // EXPLICITLY for local consistency with this match's style; the wildcard
+    // remains only to satisfy `#[non_exhaustive]`.
     // GATE THE ORIGIN BEFORE ANY CONSUMER IN THIS FUNCTION
     // (GHSA-824h-7x5x-wfmf).
     //
@@ -847,10 +846,9 @@ where
 
     let initial_params = match &initial_req {
         DelegateRequest::ApplicationMessages { params, .. } => params.clone(),
-        DelegateRequest::RegisterDelegate { .. }
-        | DelegateRequest::RegisterDelegateWithPredecessors { .. }
-        | DelegateRequest::UnregisterDelegate(_)
-        | _ => Parameters::from(Vec::new()),
+        DelegateRequest::RegisterDelegate { .. } | DelegateRequest::UnregisterDelegate(_) | _ => {
+            Parameters::from(Vec::new())
+        }
     };
 
     let mut current_req = initial_req;
@@ -998,6 +996,25 @@ where
                 }
                 OutboundDelegateMsg::RequestUserInput(req) => {
                     user_input_requests.push(req);
+                }
+                // freenet-stdlib 0.10.0 added this variant (freenet/freenet-stdlib#98);
+                // core has no unsubscribe path behind it yet (tracked in #5600).
+                // `Runtime::process_outbound` already rejects it upstream, so on
+                // the real runtime this arm is unreachable; the mock runtime does
+                // not go through that path, so keep the same answer here. Fail
+                // rather than drop: a dropped request would leave the delegate
+                // waiting forever for an `UnsubscribeContractResponse` nobody
+                // sends, and would read as a successful unsubscribe while the
+                // subscription stays live.
+                OutboundDelegateMsg::UnsubscribeContractRequest(req) => {
+                    tracing::warn!(
+                        delegate_key = %delegate_key,
+                        contract_id = %req.contract_id,
+                        "Delegate requested UnsubscribeContractRequest, which this node does not implement yet (see #5600)"
+                    );
+                    return DelegateRunOutcome::Failed(ExecutorError::other(anyhow::anyhow!(
+                        "UnsubscribeContractRequest is not implemented by this node yet (#5600)"
+                    )));
                 }
                 other @ OutboundDelegateMsg::ApplicationMessage(_)
                 | other @ OutboundDelegateMsg::ContextUpdated(_) => {
@@ -3110,6 +3127,7 @@ fn route_notification_outbound(delegate_key: &DelegateKey, outbound: Vec<Outboun
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 tracing::warn!(
                     delegate = %delegate_key,
@@ -7127,6 +7145,94 @@ mod hol_4391_tests {
                     result.is_err(),
                     "a delegate execution failure must surface an error to the \
                      client, not a fake empty success (#5263)"
+                );
+            }
+            other => panic!("expected DelegateResponse, got {other}"),
+        }
+    }
+
+    /// The executor loop's half of the same guarantee as
+    /// `unsubscribe_contract_request_fails_the_run_rather_than_being_dropped`
+    /// in `wasm_runtime::delegate::test`: an `UnsubscribeContractRequest` a
+    /// delegate emits must reach the CLIENT as a failure.
+    ///
+    /// freenet-stdlib 0.10.0 added the variant (freenet/freenet-stdlib#98) and
+    /// core has no unsubscribe path behind it yet (#5600). Both dispatchers are
+    /// pinned separately because they fail through different machinery and a
+    /// regression in either one alone would be invisible: `process_outbound`
+    /// returns `Err(DelegateExecError)`, while this loop returns
+    /// `DelegateRunOutcome::Failed(ExecutorError)`. The mock runtime does not
+    /// go through `process_outbound` at all, so this is the only cover for the
+    /// loop's arm.
+    ///
+    /// The assertion is on the error TEXT, not merely `is_err()`. `#5263`'s
+    /// test shows why: a delegate request against this handler can fail for
+    /// unrelated reasons (an exhausted script yields a generic error), so
+    /// asserting only that something failed would pass just as happily if the
+    /// unsubscribe arm were deleted tomorrow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_unsubscribe_request_surfaces_not_implemented_to_the_client() {
+        let (send_halve, rcv_halve, _) = handler::contract_handler_channel();
+        let mut handler =
+            MockWasmContractHandler::new_test(rcv_halve, None, "del_unsub_5600").await;
+
+        // Script the delegate to emit exactly the request core cannot serve.
+        let contract_id = ContractInstanceId::new([21u8; 32]);
+        handler
+            .runtime_mut()
+            .delegate_script
+            .lock()
+            .unwrap()
+            .push_back(ScriptedRun::from(vec![
+                OutboundDelegateMsg::UnsubscribeContractRequest(
+                    freenet_stdlib::prelude::UnsubscribeContractRequest::new(contract_id),
+                ),
+            ]));
+
+        let delegate_key = DelegateKey::new([21u8; 32], CodeHash::new([22u8; 32]));
+        let event = ContractHandlerEvent::DelegateRequest {
+            req: DelegateRequest::ApplicationMessages {
+                key: delegate_key,
+                params: Parameters::from(vec![]),
+                inbound: vec![],
+            },
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+        };
+
+        let send_fut = send_halve.send_to_handler(event);
+        let recv_fut = async {
+            let (id, received, _priority) = handler
+                .channel()
+                .recv_from_sender()
+                .await
+                .expect("handler channel should be open");
+            handle_contract_event(
+                &mut handler,
+                id,
+                received,
+                &std::sync::Arc::new(user_input::AutoApprovePrompter),
+                None,
+                None,
+            )
+            .await
+            .expect("dispatch must not error");
+        };
+        let (send_res, ()) = tokio::join!(send_fut, recv_fut);
+
+        match send_res.expect("must receive a response") {
+            ContractHandlerEvent::DelegateResponse(result) => {
+                let err = result.expect_err(
+                    "an unsubscribe this node cannot serve must surface an ERROR to the \
+                     client; a success (even an empty one) reads as an unsubscribe that \
+                     happened, while the subscription is in fact still live",
+                );
+                let rendered = err.to_string();
+                assert!(
+                    rendered.contains("UnsubscribeContractRequest") && rendered.contains("5600"),
+                    "the client-visible failure must name the request and its tracking \
+                     issue, not a generic delegate error, got: {rendered}"
                 );
             }
             other => panic!("expected DelegateResponse, got {other}"),
