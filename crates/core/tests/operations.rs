@@ -4384,7 +4384,16 @@ async fn a_node_without_the_contract(
         placement.push(*name);
     }
     bail!(
-        "every candidate node {placement:?} already holds {contract_key} locally, so a          delegate operation on any of them is answered from the local store and this run          cannot observe #5542 at all. Failing rather than passing vacuously — the earlier          version of this test did the latter and was green against unfixed main."
+        "every candidate node {placement:?} already holds {contract_key} locally, so a \
+         delegate operation on any of them is answered from the local store and this run \
+         cannot observe #5542 at all. Failing rather than passing vacuously — the earlier \
+         version of this test did the latter and was green against unfixed main. NOTE \
+         (#5542 finding F6): this precondition is not under the test's control. Under \
+         every-hop placement a PUT stores at every hop, so all candidates holding the \
+         contract is a routine placement outcome rather than an anomaly, and this failure \
+         may be luck rather than a regression. Re-run before investigating; the durable \
+         fix is to select the probe node by ring distance from the contract key, so the \
+         precondition becomes a property of the topology the test builds."
     )
 }
 
