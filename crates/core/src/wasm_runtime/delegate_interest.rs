@@ -92,18 +92,29 @@ struct Hold {
 pub(crate) type NodeIdentity = usize;
 
 /// Outstanding local-interest refcounts taken on behalf of delegate
-/// subscriptions, keyed by the `(contract, delegate, node)` triple that owns
-/// them.
+/// subscriptions, keyed by the `(contract, delegate)` pair, with one hold per
+/// NODE that took one.
 ///
-/// The NODE component is load-bearing and was missing. Keyed on the pair alone,
-/// `record`'s `or_insert` silently discarded a second node's obligation when two
-/// nodes in one process subscribed the same delegate to the same contract: both
-/// incremented, one hold existed, so release discharged one and leaked the
-/// other permanently. The module already argued that per-node behaviour matters
-/// here — it is why each hold carries its own release closure rather than a
-/// single global callback — but the key did not carry that intent.
+/// The per-node split is load-bearing and was missing. With a single `Hold` per
+/// pair, `record`'s `or_insert` silently discarded a second node's obligation
+/// when two nodes in one process subscribed the same delegate to the same
+/// contract: both incremented their own `InterestManager`, one hold existed, so
+/// release discharged one and leaked the other permanently. The module already
+/// argued that per-node behaviour matters here — it is why each hold carries its
+/// own release closure rather than a single global callback — but the storage
+/// did not carry that intent.
+///
+/// THE OUTER KEY STAYS THE PAIR, deliberately, and this is a compatibility
+/// constraint rather than a style choice. Every release path in the tree
+/// discharges by `(contract, delegate)` — including the per-delegate
+/// subscription cap's eviction path on #5623, which looks a pair up here
+/// directly. Moving the node into the KEY would make those lookups miss, and a
+/// miss here is a silent no-op by design, so the cap would leak again through
+/// exactly the door it closed. Putting the node in the VALUE keeps every
+/// pair-keyed lookup total: remove the pair and every node's hold for it is
+/// discharged.
 static DELEGATE_INTEREST_HOLDS: std::sync::LazyLock<
-    DashMap<(ContractInstanceId, DelegateKey, NodeIdentity), Hold>,
+    DashMap<(ContractInstanceId, DelegateKey), std::collections::HashMap<NodeIdentity, Hold>>,
 > = std::sync::LazyLock::new(DashMap::new);
 
 /// Record that one local-interest refcount was taken for
@@ -126,7 +137,9 @@ pub(crate) fn record(
     node: NodeIdentity,
 ) {
     DELEGATE_INTEREST_HOLDS
-        .entry((contract, delegate, node))
+        .entry((contract, delegate))
+        .or_default()
+        .entry(node)
         .or_insert(Hold { key, release });
 }
 
@@ -139,9 +152,9 @@ pub(crate) fn release_delegate(delegate: &DelegateKey) {
     // into `InterestManager`, which takes its own locks. Doing that under a
     // DashMap shard guard is how lock-order inversions get built.
     let mut discharged = Vec::new();
-    DELEGATE_INTEREST_HOLDS.retain(|(_, holder, _), hold| {
+    DELEGATE_INTEREST_HOLDS.retain(|(_, holder), holds| {
         if holder == delegate {
-            discharged.push((hold.key, hold.release.clone()));
+            discharged.extend(holds.values().map(|hold| (hold.key, hold.release.clone())));
             false
         } else {
             true
@@ -158,9 +171,9 @@ pub(crate) fn release_delegate(delegate: &DelegateKey) {
 /// both of which drop every delegate subscription for one contract.
 pub(crate) fn release_contract(contract: &ContractInstanceId) {
     let mut discharged = Vec::new();
-    DELEGATE_INTEREST_HOLDS.retain(|(id, _, _), hold| {
+    DELEGATE_INTEREST_HOLDS.retain(|(id, _), holds| {
         if id == contract {
-            discharged.push((hold.key, hold.release.clone()));
+            discharged.extend(holds.values().map(|hold| (hold.key, hold.release.clone())));
             false
         } else {
             true
@@ -199,6 +212,38 @@ mod tests {
     /// ever one; these stand for two `OpManager`s in one test process.
     const NODE_A: NodeIdentity = 0xA;
     const NODE_B: NodeIdentity = 0xB;
+
+    /// A pair-keyed lookup must find EVERY node's hold for that pair.
+    ///
+    /// This is the compatibility constraint the per-delegate subscription cap
+    /// (#5623) depends on: its eviction path discharges by `(contract,
+    /// delegate)`. If the node identity moved into the KEY, that lookup would
+    /// miss — and a miss here is a silent no-op by design, so the cap would leak
+    /// again through the door it just closed. Pinned so a future refactor that
+    /// re-keys this map fails here rather than in another PR's runtime.
+    #[test]
+    fn a_pair_keyed_lookup_discharges_every_node_holding_it() {
+        let (release_a, seen_a) = recorder();
+        let (release_b, seen_b) = recorder();
+        let d = delegate(250);
+        let k = key(251);
+        record(*k.id(), d.clone(), k, release_a, NODE_A);
+        record(*k.id(), d.clone(), k, release_b, NODE_B);
+
+        assert!(
+            DELEGATE_INTEREST_HOLDS.contains_key(&(*k.id(), d.clone())),
+            "the pair itself must be the key, so a pair-keyed release path finds it"
+        );
+
+        release_contract(k.id());
+
+        assert_eq!(seen_a.lock().unwrap().len(), 1);
+        assert_eq!(
+            seen_b.lock().unwrap().len(),
+            1,
+            "removing the pair must discharge every node's hold under it"
+        );
+    }
 
     /// Two NODES in one process, subscribing the same delegate to the same
     /// contract, each hold their own obligation (#5542 finding M3/F4).
@@ -415,7 +460,7 @@ mod tests {
             "every contract the delegate held interest in must be released"
         );
         assert!(
-            DELEGATE_INTEREST_HOLDS.contains_key(&(*key(201).id(), other, NODE_A)),
+            DELEGATE_INTEREST_HOLDS.contains_key(&(*key(201).id(), other)),
             "another delegate's hold on the same contract must NOT be discharged \
              — releasing interest a different subscriber holds is worse than the \
              leak this closes"
@@ -440,7 +485,7 @@ mod tests {
             "both delegates' holds on the removed contract must be released"
         );
         assert!(
-            DELEGATE_INTEREST_HOLDS.contains_key(&(*key(213).id(), delegate(211), NODE_A)),
+            DELEGATE_INTEREST_HOLDS.contains_key(&(*key(213).id(), delegate(211))),
             "a hold on a DIFFERENT contract must survive"
         );
     }
@@ -463,7 +508,7 @@ mod tests {
             "no hold matched, so nothing may be released"
         );
         assert!(
-            DELEGATE_INTEREST_HOLDS.contains_key(&(*key(220).id(), delegate(221), NODE_A)),
+            DELEGATE_INTEREST_HOLDS.contains_key(&(*key(220).id(), delegate(221))),
             "the unrelated hold must be untouched"
         );
     }
