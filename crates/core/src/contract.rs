@@ -822,6 +822,26 @@ fn apply_resolved_contract_op(
 /// told. A sub-op GET whose receiver is dropped that way continues in the
 /// background until `OPERATION_TTL` and leaks nothing; the same is already true
 /// of `Executor::local_state_or_from_network`.
+///
+/// RESIDUAL, on the SUBSCRIBE branch only, stated because it is invisible from
+/// either side of the call. `run_executor_subscribe` reaches
+/// `finalize_originator_subscribe`, whose last side effects are
+/// `interest_manager.add_local_client` (a REFCOUNT — see the caller's
+/// `already_subscribed` gate) and then `broadcast_change_interests`. Cancelling
+/// the future between those two takes the refcount and returns no `Ok`, so this
+/// reports `Failed`, the caller installs no `DELEGATE_SUBSCRIPTIONS` hook, and a
+/// later retry passes `already_subscribed` and takes a SECOND refcount for one
+/// logical subscriber.
+///
+/// Not compensated for here, deliberately. The only compensation available is
+/// `remove_local_client`, and this side of the call cannot tell whether
+/// `add_local_client` ran — so a decrement issued on the wrong branch would
+/// release an interest some OTHER subscriber holds, which is worse than the
+/// leak. Closing it properly means making the registration idempotent or
+/// transactional inside `subscribe`, which is a change to that operation rather
+/// than to this caller. The window is the tail of a 75 s budget and each
+/// occurrence costs one unreleased interest entry, so it is recorded rather
+/// than papered over.
 async fn run_contract_op_off_loop(
     op_manager: std::sync::Arc<crate::node::OpManager>,
     pending: &delegate_park::PendingContractOp,
