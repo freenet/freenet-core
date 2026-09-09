@@ -2841,6 +2841,63 @@ mod tests {
         );
     }
 
+    /// Boot MUST restore persisted delegate subscriptions.
+    ///
+    /// `restore_persisted_subscriptions` has behavioural tests above, but they
+    /// call it directly. Nothing else makes the node call it at startup, and if
+    /// it is not called the durable table is written faithfully and read by
+    /// nobody — every delegate pin silently lapses on restart, which is exactly
+    /// the defect #4669 part 2 closes. Sibling of the #4780 pin on the same
+    /// function (`node::op_state_manager::handler_build_rehydrates_local_
+    /// hosting_interest_on_restart`), for the same reason.
+    ///
+    /// Also pins the ORDER against `load_hosting_cache`. The pin gate is
+    /// `is_hosting_contract && contract_state_present`, so restoring before the
+    /// hosting cache is loaded refuses every pin — and refuses it silently,
+    /// producing a node that looks like it restored and holds nothing.
+    #[test]
+    fn handler_build_restores_persisted_delegate_subscriptions() {
+        const SOURCE: &str = include_str!("handler.rs");
+        let start = SOURCE
+            .find("async fn build(")
+            .expect("NetworkContractHandler::build must still exist");
+        let rel_end = SOURCE[start..]
+            .find("Ok(Self { executor, channel })")
+            .expect("build must still end by constructing Self");
+        let body = code_only(&SOURCE[start..start + rel_end]);
+
+        // Window guard, separate from the assertions that use it: a window
+        // truncated above the restore would make the `contains` below fail
+        // rather than pass, but one truncated to a PREFIX that still contained
+        // an earlier `load_hosting_cache` would let the ORDER check pass
+        // vacuously. `RuntimePool::new` is the first thing `build` does.
+        assert!(
+            body.contains("RuntimePool::new("),
+            "the scraped `build` window no longer starts at the top of the \
+             function. Widen it; do NOT delete this check."
+        );
+
+        let restore = body
+            .find("delegate_demand::restore_persisted_subscriptions(")
+            .expect(
+                "`NetworkContractHandler::build` must restore persisted delegate \
+                 subscriptions (#4669 part 2). Without this call the durable \
+                 table is written and never read, and every delegate's pin \
+                 lapses silently on restart — the defect this work closes.",
+            );
+        let load_cache = body
+            .find("load_hosting_cache(")
+            .expect("build must still load the hosting cache");
+        assert!(
+            load_cache < restore,
+            "the delegate-subscription restore must run AFTER \
+             `load_hosting_cache`. The pin gate is `is_hosting_contract && \
+             contract_state_present`, so restoring first refuses every pin — \
+             and refuses it silently, producing a node that looks restored and \
+             holds nothing."
+        );
+    }
+
     /// Removing a contract must clear its DURABLE delegate subscriptions.
     ///
     /// `ContractStore::remove_contract` is the one teardown site with no
