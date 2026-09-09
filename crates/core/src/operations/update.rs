@@ -324,7 +324,9 @@ impl OpManager {
     /// a client asking for the same contract do not fetch it twice.
     ///
     /// Returns whether a fetch was started, so the caller can tell the delegate
-    /// honestly whether a retry has anything to wait for.
+    /// honestly whether a retry has anything to wait for. `false` for a node
+    /// with no connections and for a contract still inside the shared cooldown;
+    /// neither takes or holds a cooldown slot it cannot use.
     ///
     /// Fire-and-forget: the caller does NOT await it. The point is the side
     /// effect — the contract cached locally — so the delegate's next attempt
@@ -336,6 +338,27 @@ impl OpManager {
     ) -> bool {
         use crate::config::GlobalSimulationTime;
         use dashmap::mapref::entry::Entry;
+
+        // A fetch that cannot possibly route must NOT burn the shared 5-minute
+        // slot, and must not be reported to the delegate as started (#5542,
+        // review finding 5B). `try_auto_fetch_contract` has the same discipline:
+        // it takes the slot, fails to resolve a first-hop peer, and RELEASES the
+        // slot before returning. This path routes untargeted, so it has no
+        // first-hop peer to resolve; the equivalent precondition is having any
+        // connection at all. Checked BEFORE the slot is taken rather than
+        // released after, because there is nothing to undo.
+        //
+        // Without this, a node with no connections told the delegate "a
+        // background fetch has been started, so retry shortly" and then refused
+        // every retry for five minutes — the opposite of the honesty this
+        // message exists to provide.
+        if self.ring.connection_manager.num_connections() == 0 {
+            tracing::debug!(
+                contract = %instance_id,
+                "Not starting a delegate-originated self-heal fetch: no connections"
+            );
+            return false;
+        }
 
         let now_ms = GlobalSimulationTime::read_time_ms();
         // Same atomic entry-API rate limit as the originator path, against the
@@ -3434,6 +3457,12 @@ mod tests {
     async fn delegate_self_heal_fetch_shares_the_originator_cooldown_and_reports_it() {
         let (op_manager, _rx, _guard) = build_notification_test_node("selfheal_5542").await;
         let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([77u8; 32]);
+        // A connection is now a PRECONDITION, not scenery: a node with none
+        // cannot route the fetch, so it refuses rather than burning the shared
+        // cooldown slot (finding 5B, and its own test below). This test is about
+        // the cooldown being SHARED and REPORTED, so give it the connectivity
+        // that case assumes.
+        let _peer = connect_peer(&op_manager, 45_501, 0.25);
 
         assert!(
             op_manager.try_self_heal_fetch_for_local_originator(instance_id),
@@ -3451,6 +3480,49 @@ mod tests {
             "a second attempt inside CONTRACT_FETCH_COOLDOWN_MS must be refused, and \
              must REPORT the refusal so the delegate is not promised a repair that \
              is not running"
+        );
+    }
+
+    /// A node with no connections must NOT burn the shared five-minute cooldown
+    /// slot, and must not tell the delegate a fetch started (#5542, finding 5B).
+    ///
+    /// `try_auto_fetch_contract` already has this discipline: it takes the slot,
+    /// fails to resolve a first-hop peer, and RELEASES it (`update.rs`, the
+    /// `get_peer_by_addr` miss). The self-heal path routes untargeted, so it has
+    /// no first-hop peer to resolve and had no equivalent check — it took the
+    /// slot unconditionally and returned `true`. The delegate was then told "a
+    /// background fetch has been started, so retry shortly" and every retry for
+    /// the next five minutes was refused by the slot the failed attempt had
+    /// taken, which is the exact opposite of the honesty this return value
+    /// exists to provide.
+    #[tokio::test]
+    async fn a_self_heal_fetch_with_no_connections_takes_no_cooldown_slot() {
+        let (op_manager, _rx, _guard) = build_notification_test_node("selfheal_5542_noconn").await;
+        let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([78u8; 32]);
+        assert_eq!(
+            op_manager.ring.connection_manager.num_connections(),
+            0,
+            "this test is only meaningful on a node that cannot route"
+        );
+
+        assert!(
+            !op_manager.try_self_heal_fetch_for_local_originator(instance_id),
+            "a fetch that cannot route must be reported as not started"
+        );
+        assert!(
+            !op_manager
+                .pending_contract_fetches
+                .contains_key(&instance_id),
+            "and it must not hold the shared cooldown slot, or the delegate's \
+             retries are refused for five minutes by an attempt that never ran"
+        );
+
+        // With a connection the same call proceeds, so the refusal above is the
+        // connectivity check and not some unrelated precondition.
+        let _peer = connect_peer(&op_manager, 45_502, 0.75);
+        assert!(
+            op_manager.try_self_heal_fetch_for_local_originator(instance_id),
+            "the same contract must be fetchable once the node can route"
         );
     }
 

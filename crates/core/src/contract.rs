@@ -1355,6 +1355,25 @@ where
         // same reason as `deferred_upserts` (#5542) — the work is a network
         // operation and this is the serial loop.
         let mut pending_contract_ops: Vec<delegate_park::PendingContractOp> = Vec::new();
+        // Delegate-originated network operations started in this round trip that
+        // are NOT in `pending_contract_ops`: the UPDATE arm's self-heal fetches,
+        // which are fire-and-forget rather than parked (#5542, review finding
+        // 5A). They are counted alongside the parked ops against the SAME
+        // `MAX_NETWORK_CONTRACT_OPS_PER_PARK` budget.
+        //
+        // Without this the PR's own fan-out argument does not hold. It declines
+        // to put a bound inside `start_sub_op_get` on the grounds that "each of
+        // its existing callers is bounded by itself", and bounds the delegate
+        // GET/SUBSCRIBE paths at 4 per park for a node-wide ceiling of
+        // MAX_PARKED_DELEGATES (64) x 4 = 256. The self-heal fetch is a new
+        // caller of `start_sub_op_get` that was NOT bounded by itself: one round
+        // trip emitting N `UpdateContractRequest`s for N DISTINCT unseen
+        // instance ids fired N background sub-op GETs, each running to
+        // OPERATION_TTL. The per-contract 5-minute cooldown does not bind across
+        // distinct ids, so nothing capped N. Sharing the budget restores the 256
+        // ceiling as a statement about all delegate-originated network work
+        // rather than only the parked half.
+        let mut self_heal_fetches_started = 0usize;
         // Whether this executor can reach the network at all. `None` on the
         // mock/in-process executors used by unit tests and by
         // `handle_delegate_notification`'s test seams; those keep the
@@ -1539,7 +1558,7 @@ where
                         // `DelegateContext` across the gap.
                         if parking.is_some()
                             && can_reach_network
-                            && pending_contract_ops.len()
+                            && pending_contract_ops.len() + self_heal_fetches_started
                                 < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
                         {
                             pending_contract_ops.push(delegate_park::PendingContractOp {
@@ -1749,12 +1768,26 @@ where
                         // #5543's containment ladder exists. PUT is not
                         // comparable: it carries its own code, so a delegate can
                         // only PUT contracts it can build.
+                        // Charged against the SAME per-round-trip budget as the
+                        // parked GET/SUBSCRIBE ops (finding 5A; see
+                        // `self_heal_fetches_started`). Past the budget the
+                        // UPDATE still fails with the message below, exactly as
+                        // it does when the cooldown suppresses the fetch — the
+                        // delegate is never told a repair is running when none
+                        // is.
+                        let within_fanout_budget = pending_contract_ops.len()
+                            + self_heal_fetches_started
+                            < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK;
                         let healing = can_reach_network
+                            && within_fanout_budget
                             && contract_handler.executor().op_manager_handle().is_some_and(
                                 |op_manager| {
                                     op_manager.try_self_heal_fetch_for_local_originator(contract_id)
                                 },
                             );
+                        if healing {
+                            self_heal_fetches_started += 1;
+                        }
                         tracing::debug!(
                             contract = %contract_id,
                             healing,
@@ -1772,8 +1805,10 @@ where
                              for it deterministically (#5542)"
                         } else {
                             "contract not known to this node and no background fetch was \
-                             started (already attempted within the last 5 minutes, or this \
-                             node has no network handle). GET or SUBSCRIBE it first (#5542)"
+                             started (already attempted within the last 5 minutes, too many \
+                             delegate network operations already in flight, this node has no \
+                             network handle, or it has no connections). GET or SUBSCRIBE it \
+                             first (#5542)"
                         };
                         inbound_responses.push(InboundDelegateMsg::UpdateContractResponse(
                             UpdateContractResponse {
@@ -1874,7 +1909,8 @@ where
                     Ok(())
                 } else if parking.is_some()
                     && can_reach_network
-                    && pending_contract_ops.len() < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
+                    && pending_contract_ops.len() + self_heal_fetches_started
+                        < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
                     && !pending_contract_ops.iter().any(|op| {
                         op.contract_id == contract_id
                             && op.kind == delegate_park::ContractOpKind::Subscribe
@@ -8294,6 +8330,61 @@ mod hol_4391_tests {
             task_monitor,
         ));
         (op_manager, guards)
+    }
+
+    /// #5542 finding 5A. EVERY delegate-originated network operation started in
+    /// one round trip is charged against `MAX_NETWORK_CONTRACT_OPS_PER_PARK` —
+    /// including the UPDATE arm's self-heal fetch, which is fire-and-forget
+    /// rather than parked and so does not appear in `pending_contract_ops`.
+    ///
+    /// This is what makes the PR's node-wide ceiling true. It declines to bound
+    /// `start_sub_op_get` internally on the grounds that "each of its existing
+    /// callers is bounded by itself"; the self-heal fetch was a new caller that
+    /// was not, so one round trip emitting N `UpdateContractRequest`s for N
+    /// distinct unseen instance ids fired N background GETs, each running to
+    /// OPERATION_TTL, with a per-contract cooldown that does not bind across
+    /// distinct ids.
+    ///
+    /// Source-scrape because the three gates sit inside one long `async fn` on
+    /// the serial loop and reaching the UPDATE arm's network branch needs a live
+    /// executor, a delegate script and a routable node. Anchored on the API
+    /// surface (the constant and the counter), not on surrounding prose, and it
+    /// asserts the counter is INCREMENTED as well as read — a budget whose
+    /// counter never rises is vacuous, which is the failure this shape invites.
+    #[test]
+    fn every_delegate_network_operation_is_charged_against_the_park_budget() {
+        let code = super::tests::production_code();
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let bounds = flat
+            .matches("< delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK")
+            .count();
+        assert_eq!(
+            bounds, 3,
+            "expected exactly three per-round-trip fan-out gates (GET, UPDATE \
+             self-heal, SUBSCRIBE); a fourth delegate-originated network \
+             operation must join this budget rather than open a new one"
+        );
+
+        let charged = flat
+            .matches(
+                "pending_contract_ops.len() + self_heal_fetches_started \
+                 < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK",
+            )
+            .count();
+        assert_eq!(
+            charged, bounds,
+            "every fan-out gate must count the fire-and-forget self-heal fetches \
+             as well as the parked ops; a gate reading `pending_contract_ops.len()` \
+             alone lets the UPDATE arm's fetches escape the ceiling"
+        );
+
+        assert!(
+            flat.contains("if healing { self_heal_fetches_started += 1; }"),
+            "the counter must be incremented when a self-heal fetch actually \
+             starts, or the term above is permanently zero and the budget is \
+             vacuous while looking present"
+        );
     }
 
     /// #5542. The release obligation must be recorded for EVERY subscribe that
