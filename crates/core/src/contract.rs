@@ -568,7 +568,7 @@ fn refused_oversized_fetches() -> usize {
 fn within_fetch_allowance(
     fetched: Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>,
     missing: &[ContractInstanceId],
-    allowance: usize,
+    allowance: delegate_park::ByteCount,
 ) -> delegate_park::FetchDisposition {
     let states = match fetched {
         Ok(states) => states,
@@ -576,10 +576,12 @@ fn within_fetch_allowance(
         // existing all-or-nothing outcome, not an allowance decision.
         Err(err) => return delegate_park::FetchDisposition::Resolved(Err(err)),
     };
-    let bytes: usize = states
+    // Composed in `ByteCount` for the same reason everything else is: these are
+    // contract-supplied lengths and `+` on them must not wrap.
+    let bytes: delegate_park::ByteCount = states
         .iter()
-        .map(|(_, state)| state.as_ref().len())
-        .sum::<usize>();
+        .map(|(_, state)| delegate_park::ByteCount::new(state.as_ref().len()))
+        .sum();
     if bytes > allowance {
         let id = states
             .first()
@@ -590,8 +592,8 @@ fn within_fetch_allowance(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .saturating_add(1);
         tracing::warn!(
-            fetched_bytes = bytes,
-            allowance,
+            fetched_bytes = %bytes,
+            allowance = %allowance,
             contract = %id,
             total_refused = total,
             "Off-loop related fetch retained more than the park reserved for \
@@ -8331,7 +8333,11 @@ mod hol_4391_tests {
             );
             assert!(
                 matches!(
-                    park_ctx.park(key, park_continuation(), 0),
+                    park_ctx.park(
+                        key,
+                        park_continuation(),
+                        delegate_park::ByteCount::default()
+                    ),
                     delegate_park::ParkAdmission::Admitted { .. }
                 ),
                 "every park must be admitted, or this test is measuring the cap"
@@ -8505,15 +8511,15 @@ mod hol_4391_tests {
     /// nothing.
     ///
     /// AMBIENT STATE, HANDLED RATHER THAN IGNORED. `REFUSED_OVERSIZED_FETCHES`
-    /// is a process-global static and this binary runs its tests in one
-    /// process, so an exact `before + 1` would be a test that fails for a
-    /// reason other than the thing it names the moment a second caller lands —
-    /// the shared-process class recorded in
-    /// `.claude/rules/bug-prevention-patterns.md`. `#[serial]` keeps other
-    /// counter tests out of the window, and the increment is asserted with `>`
-    /// so a concurrent production caller cannot turn a real pass into a
-    /// spurious failure. The exact-equality half is kept where it is safe and
-    /// load-bearing: the ACCEPTED case must not increment at all.
+    /// is a process-global static and this binary runs tests in one process,
+    /// so an exact `before + 1` would be a test that fails for a reason other
+    /// than the thing it names the moment a second caller lands — the shared-
+    /// process class recorded in `.claude/rules/bug-prevention-patterns.md`.
+    /// `#[serial]` keeps other counter tests out of the window, and the
+    /// increment is asserted as `>` rather than `== before + 1` so a concurrent
+    /// production caller cannot turn a real pass into a spurious failure. The
+    /// exact-equality half is kept where it is safe and load-bearing: the
+    /// ACCEPTED case must not increment at all.
     ///
     /// FALSIFY by removing the size check from `within_fetch_allowance`: the
     /// oversized fetch is then accepted and both assertions go red.
@@ -8527,7 +8533,7 @@ mod hol_4391_tests {
         let within = within_fetch_allowance(
             Ok(vec![(id, WrappedState::new(vec![0u8; allowance]))]),
             &[id],
-            allowance,
+            delegate_park::ByteCount::new(allowance),
         );
         assert!(
             matches!(
@@ -8540,13 +8546,14 @@ mod hol_4391_tests {
         assert_eq!(
             refused_oversized_fetches(),
             before,
-            "an accepted fetch must not be counted as a refusal"
+            "an accepted fetch must not be counted as a refusal — without this \
+             half a counter that always increments would pass"
         );
 
         let over = within_fetch_allowance(
             Ok(vec![(id, WrappedState::new(vec![0u8; allowance + 1]))]),
             &[id],
-            allowance,
+            delegate_park::ByteCount::new(allowance),
         );
         assert!(
             matches!(over, delegate_park::FetchDisposition::RetryInline),
@@ -8614,9 +8621,11 @@ mod hol_4391_tests {
 
         // A park already in flight, so the notification below is QUEUED rather
         // than run — which is what routes it through `run_queued_notification`.
-        let delegate_park::ParkAdmission::Admitted { epoch } =
-            park.park(key.clone(), park_continuation(), 0)
-        else {
+        let delegate_park::ParkAdmission::Admitted { epoch } = park.park(
+            key.clone(),
+            park_continuation(),
+            delegate_park::ByteCount::default(),
+        ) else {
             panic!("the initial park must be admitted");
         };
 
@@ -8865,7 +8874,11 @@ mod hol_4391_tests {
             .insert(key.clone(), b"parked-continuation".to_vec());
         assert!(
             matches!(
-                park.park(key.clone(), parked_continuation(), 0),
+                park.park(
+                    key.clone(),
+                    parked_continuation(),
+                    delegate_park::ByteCount::default()
+                ),
                 delegate_park::ParkAdmission::Admitted { .. }
             ),
             "the delegate must start out parked"

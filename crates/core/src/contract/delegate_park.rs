@@ -293,10 +293,10 @@ pub(super) fn parked_budget_for(total_ram: usize) -> usize {
 /// parks fill the budget while the fifth degrades — the same deliberate trade
 /// the park cap itself makes.
 ///
-/// THAT DIVISOR CARRIES A SECOND DECISION, named because a later reader takes
-/// an unexplained constant for arithmetic. The previous shape allowed EIGHT
-/// fetching parks per budget; this allows four. Four parks x four upserts is
-/// sixteen concurrent related fetches, which is ample, and halving the
+/// THAT DIVISOR CARRIES A SECOND DECISION, named here because a later reader
+/// takes an unexplained constant for arithmetic. The previous shape allowed
+/// EIGHT fetching parks per budget; this allows four. Four parks x four upserts
+/// is sixteen concurrent related fetches, which is ample, and halving the
 /// concurrency is part of how the per-upsert figure gets large enough to be
 /// useful. It is a choice about how many parks may fetch at once, riding inside
 /// a fix for how much each may retain — change it deliberately, not as a
@@ -312,14 +312,14 @@ pub(super) fn parked_budget_for(total_ram: usize) -> usize {
 /// write**.
 ///
 /// AND THE INLINE PATH APPLIES NO SIZE ALLOWANCE AT ALL
-/// (`contract::run_deferred_upsert_inline` -> `upsert_contract_state`), so state
-/// what this design is rather than implying inline is bounded: **the allowance
-/// bounds what a park RETAINS; exceeding it costs a stall and an unbounded
-/// transient on the loop.** A 50 MiB related contract goes through there
-/// unbounded. That is pre-existing — a park refused at admission already went
-/// that way — but this adds a SECOND route to it, so it is stated rather than
-/// discovered. Deferring to a bound that does not exist is the same defect as
-/// the transient-peak claim corrected above; #5607 covers both paths. It is not a failure, and it must not become one — an over-allowance
+/// (`contract::run_deferred_upsert_inline` -> `upsert_contract_state`), so say
+/// what this design actually is rather than implying inline is bounded: **the
+/// allowance bounds what a park RETAINS; exceeding it costs a stall and an
+/// unbounded transient on the loop.** A 50 MiB related contract goes through
+/// there unbounded. That is pre-existing — a park refused at admission already
+/// went that way — but this adds a second route to it, so it is stated rather
+/// than discovered. Deferring to a bound that does not exist is the same defect
+/// as the transient-peak claim corrected above, and #5607 covers both paths. It is not a failure, and it must not become one — an over-allowance
 /// fetch used to return `Err`, which failed a write that would have succeeded
 /// had the park been REFUSED instead of admitted, so whether a delegate's write
 /// worked depended on how many other delegates were parked.
@@ -341,8 +341,8 @@ pub(super) fn parked_budget_for(total_ram: usize) -> usize {
 /// bound. Worst case is ~2 GiB transient for one park against the shipped
 /// `MemoryMax=2G` while `parked_bytes` reads about a megabyte. Tracked in #5607;
 /// bounding it belongs with the sub-op GET path, not here.
-fn upsert_fetch_allowance(budget: usize) -> usize {
-    budget / (4 * MAX_DEFERRED_UPSERTS_PER_PARK)
+fn upsert_fetch_allowance(budget: usize) -> ByteCount {
+    ByteCount::new(budget / (4 * MAX_DEFERRED_UPSERTS_PER_PARK))
 }
 
 /// Approximate heap footprint of the payloads a continuation pins.
@@ -350,7 +350,7 @@ fn upsert_fetch_allowance(budget: usize) -> usize {
 /// Counts the large, contract-controlled parts — inbound states and payloads —
 /// and ignores fixed-size bookkeeping. The point is to bound what an attacker
 /// can grow, not to be exact.
-pub(super) fn continuation_bytes(continuation: &Continuation) -> usize {
+pub(super) fn continuation_bytes(continuation: &Continuation) -> ByteCount {
     // Per ELEMENT as well as per payload — see [`ELEMENT_OVERHEAD_BYTES`]. The
     // delegate controls both list lengths, so summing payloads alone bounds
     // nothing when the payloads are empty.
@@ -358,15 +358,15 @@ pub(super) fn continuation_bytes(continuation: &Continuation) -> usize {
         .inbound_so_far
         .iter()
         .map(|m| ELEMENT_OVERHEAD_BYTES + inbound_bytes(m))
-        .sum::<usize>()
+        .sum::<ByteCount>()
         + continuation
             .accumulated
             .iter()
             .map(|m| ELEMENT_OVERHEAD_BYTES + outbound_bytes(m))
-            .sum::<usize>()
+            .sum::<ByteCount>()
         // `params` is delegate-supplied and retained for the life of the park.
         // Omitting it was one of three ways this "byte bound" failed to bound.
-        + continuation.params.as_ref().len()
+        + ByteCount::new(continuation.params.as_ref().len())
 }
 
 /// Approximate bytes an off-loop task retains for one park: the prompts it is
@@ -383,20 +383,29 @@ pub(super) fn task_bytes(
     // read from a constant, so the reserve and the enforcement cannot drift
     // apart. They already did once: the enforcement moved to a budget-derived
     // value and three paragraphs of prose kept quoting the old one.
-    fetch_allowance: usize,
-) -> usize {
-    let prompt_bytes: usize = prompts
+    fetch_allowance: ByteCount,
+) -> ByteCount {
+    let prompt_bytes: ByteCount = prompts
         .iter()
-        .map(|r| r.message.bytes().len() + r.responses.iter().map(|resp| resp.len()).sum::<usize>())
+        .map(|r| {
+            ByteCount::new(r.message.bytes().len())
+                + r.responses
+                    .iter()
+                    .map(|resp| ByteCount::new(resp.len()))
+                    .sum::<ByteCount>()
+        })
         .sum();
-    let upsert_bytes: usize = upserts
+    let upsert_bytes: ByteCount = upserts
         .iter()
         .map(|u| {
             let update = match &u.update {
-                Either::Left(state) => state.as_ref().len(),
-                Either::Right(delta) => delta.as_ref().len(),
+                Either::Left(state) => ByteCount::new(state.as_ref().len()),
+                Either::Right(delta) => ByteCount::new(delta.as_ref().len()),
             };
-            let code = u.code.as_ref().map_or(0, contract_container_bytes);
+            let code = u
+                .code
+                .as_ref()
+                .map_or(ByteCount::default(), contract_container_bytes);
             // BORROW, do not clone. `clone().into_owned()` here deep-copied
             // every related state MERELY TO MEASURE IT: with up to ten 50 MiB
             // states that is hundreds of MiB allocated synchronously on the
@@ -418,7 +427,7 @@ pub(super) fn task_bytes(
             // against a 64 MiB budget: the same hole this term was added to
             // close, reopened by the fix for a different finding in the same
             // change.
-            let context = 2 * ctx_len(&u.context);
+            let context = ctx_len(&u.context) + ctx_len(&u.context);
             // RESERVE BEFORE THE FETCH, not charge after it. Charging once the
             // bytes are in hand leaves dropping what you already paid to
             // retrieve as the only available response; reserving up front means
@@ -426,7 +435,7 @@ pub(super) fn task_bytes(
             // falls back to the inline path. See [`upsert_fetch_allowance`]
             // for why it is a fraction of the budget rather than the worst case.
             let fetch_reserve = if u.missing.is_empty() {
-                0
+                ByteCount::default()
             } else {
                 fetch_allowance
             };
@@ -437,7 +446,7 @@ pub(super) fn task_bytes(
 }
 
 /// Approximate bytes a queued delegate request pins.
-pub(super) fn request_bytes(req: &DelegateRequest<'static>) -> usize {
+pub(super) fn request_bytes(req: &DelegateRequest<'static>) -> ByteCount {
     // The registration variants are NOT free: `RegisterDelegate` carries a whole
     // `DelegateContainer`, i.e. the delegate's WASM, and `DelegateRequest::key()`
     // returns that delegate's own key — so a re-registration really does queue
@@ -451,12 +460,12 @@ pub(super) fn request_bytes(req: &DelegateRequest<'static>) -> usize {
             inbound
                 .iter()
                 .map(|m| ELEMENT_OVERHEAD_BYTES + inbound_bytes(m))
-                .sum::<usize>()
-                + params.as_ref().len()
+                .sum::<ByteCount>()
+                + ByteCount::new(params.as_ref().len())
         }
         DelegateRequest::RegisterDelegate { delegate, .. } => delegate_container_bytes(delegate),
         // A key and nothing else.
-        DelegateRequest::UnregisterDelegate(_) => 0,
+        DelegateRequest::UnregisterDelegate(_) => ByteCount::default(),
         // See `unmeasurable`: charged as maximal, not as free, and announced.
         other => unmeasurable("DelegateRequest", std::mem::discriminant(other)),
     }
@@ -467,7 +476,7 @@ pub(super) fn request_bytes(req: &DelegateRequest<'static>) -> usize {
 // `DelegateContainer` and `DelegateWasmAPIVersion` are `#[non_exhaustive]`, so
 // the wildcard cannot be removed; every variant that exists is listed.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn delegate_container_bytes(delegate: &freenet_stdlib::prelude::DelegateContainer) -> usize {
+fn delegate_container_bytes(delegate: &freenet_stdlib::prelude::DelegateContainer) -> ByteCount {
     use freenet_stdlib::prelude::{DelegateContainer, DelegateWasmAPIVersion};
     // THE PARAMETERS ARE NOT FREE, and the comment this replaced said they were
     // ("the code is the large part... and is what matters for the bound"). A
@@ -479,7 +488,7 @@ fn delegate_container_bytes(delegate: &freenet_stdlib::prelude::DelegateContaine
     // the inner `Delegate` does.
     match delegate {
         DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(d)) => {
-            d.code().as_ref().len() + d.params().as_ref().len()
+            ByteCount::new(d.code().as_ref().len()) + ByteCount::new(d.params().as_ref().len())
         }
         // UNMEASURABLE MEANS MAXIMAL HERE, NOT FREE. Both enums are
         // `#[non_exhaustive]`, so this arm cannot be removed, and a variant
@@ -510,7 +519,7 @@ fn delegate_container_bytes(delegate: &freenet_stdlib::prelude::DelegateContaine
 /// variant degrade until core catches up. That is the deliberate trade — a loud,
 /// recoverable degradation beats a silent bypass of a memory bound — but it is a
 /// known consequence rather than a surprise, and this is where a reader finds it.
-fn unmeasurable(kind: &str, variant: impl std::fmt::Debug) -> usize {
+fn unmeasurable(kind: &str, variant: impl std::fmt::Debug) -> ByteCount {
     // THE DISCRIMINANT, NOT THE VALUE. This used to `format!("{value:?}")`,
     // which Debug-formats the very payload the function exists because it
     // cannot afford to hold — an unmeasurable variant could carry a 50 MiB
@@ -530,13 +539,15 @@ fn unmeasurable(kind: &str, variant: impl std::fmt::Debug) -> usize {
     // not: admission tests `parked_bytes + bytes > budget`, so on a host whose
     // budget IS `MAX_PARKED_BYTES` the first such item satisfies `MAX > MAX`
     // as false and is admitted — the one item this charge exists to refuse.
-    // `usize::MAX` saturates every caller's `saturating_add` and so exceeds
-    // every budget, while leaving `>` meaning what it should for a legitimate
-    // exact fit.
-    usize::MAX
+    //
+    // The type is what makes this safe to return. As a bare `usize::MAX` it
+    // WRAPPED at the first `+` in whichever function composed it with a
+    // sibling term, in release builds only, turning "unadmittable anywhere"
+    // into "admittable almost everywhere". See [`ByteCount`].
+    ByteCount::MAX
 }
 
-fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
+fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> ByteCount {
     // EXHAUSTIVE, PER VARIANT, IN THIS CRATE'S OWN MATCH.
     //
     // An earlier version routed the context charge through
@@ -553,17 +564,23 @@ fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
     // one indirection away. Only a match the compiler checks HERE, against the
     // variants this code actually retains, is one.
     match msg {
-        InboundDelegateMsg::ApplicationMessage(m) => m.payload.len() + ctx_len(&m.context),
+        InboundDelegateMsg::ApplicationMessage(m) => {
+            ByteCount::new(m.payload.len()) + ctx_len(&m.context)
+        }
         InboundDelegateMsg::GetContractResponse(r) => {
-            r.state.as_ref().map_or(0, |s| s.as_ref().len()) + ctx_len(&r.context)
+            ByteCount::new(r.state.as_ref().map_or(0, |s| s.as_ref().len())) + ctx_len(&r.context)
         }
         InboundDelegateMsg::ContractNotification(n) => {
-            n.new_state.as_ref().len() + ctx_len(&n.context)
+            ByteCount::new(n.new_state.as_ref().len()) + ctx_len(&n.context)
         }
         // `response` is the client's answer bytes; `context` is separate and
         // was charged zero until #5544 H2.
-        InboundDelegateMsg::UserResponse(r) => r.response.len() + ctx_len(&r.context),
-        InboundDelegateMsg::DelegateMessage(m) => m.payload.len() + ctx_len(&m.context),
+        InboundDelegateMsg::UserResponse(r) => {
+            ByteCount::new(r.response.len()) + ctx_len(&r.context)
+        }
+        InboundDelegateMsg::DelegateMessage(m) => {
+            ByteCount::new(m.payload.len()) + ctx_len(&m.context)
+        }
         // Small `Result` payloads, but their contexts are not small.
         InboundDelegateMsg::PutContractResponse(r) => ctx_len(&r.context),
         InboundDelegateMsg::UpdateContractResponse(r) => ctx_len(&r.context),
@@ -572,7 +589,7 @@ fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
         // `tag` is bounded by stdlib's `MAX_WAKEUP_TAG_LEN`, but charge it
         // rather than assume: this arm exists precisely so nothing goes
         // uncounted. Carries no context by design.
-        InboundDelegateMsg::WakeupFired { tag } => tag.len(),
+        InboundDelegateMsg::WakeupFired { tag } => ByteCount::new(tag.len()),
         // A FOURTH `#[non_exhaustive]` SITE, and the one that matters most:
         // this is the lane `MAX_PARKED_BYTES` exists for, since
         // `inbound_so_far` holds full `WrappedState`s. It charged 0 with a
@@ -583,7 +600,7 @@ fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
     }
 }
 
-fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
+fn outbound_bytes(msg: &OutboundDelegateMsg) -> ByteCount {
     // Exhaustive per variant, for the same reason as `inbound_bytes`:
     // `OutboundDelegateMsg::get_context()` also ends in `_ => None`, and the
     // wildcard swallows `ContextUpdated` — whose entire payload IS a context,
@@ -591,11 +608,19 @@ fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
     // parks via `RunSeed.accumulated` for up to MAX_CONTRACT_REQUEST_ITERATIONS
     // (#5544 H1).
     match msg {
-        OutboundDelegateMsg::ApplicationMessage(m) => m.payload.len() + ctx_len(&m.context),
-        OutboundDelegateMsg::SendDelegateMessage(m) => m.payload.len() + ctx_len(&m.context),
+        OutboundDelegateMsg::ApplicationMessage(m) => {
+            ByteCount::new(m.payload.len()) + ctx_len(&m.context)
+        }
+        OutboundDelegateMsg::SendDelegateMessage(m) => {
+            ByteCount::new(m.payload.len()) + ctx_len(&m.context)
+        }
         OutboundDelegateMsg::ContextUpdated(c) => ctx_len(c),
         OutboundDelegateMsg::RequestUserInput(r) => {
-            r.message.bytes().len() + r.responses.iter().map(|resp| resp.len()).sum::<usize>()
+            ByteCount::new(r.message.bytes().len())
+                + r.responses
+                    .iter()
+                    .map(|resp| ByteCount::new(resp.len()))
+                    .sum::<ByteCount>()
         }
         OutboundDelegateMsg::GetContractRequest(r) => ctx_len(&r.context),
         // `contract` and `related_contracts` were UNCOUNTED: a delegate-supplied
@@ -605,7 +630,7 @@ fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
         // variant's fields reads more convincingly than charging none, which is
         // what let this sit under a budget that names itself a byte bound.
         OutboundDelegateMsg::PutContractRequest(r) => {
-            r.state.as_ref().len()
+            ByteCount::new(r.state.as_ref().len())
                 + contract_container_bytes(&r.contract)
                 + related_contracts_bytes(&r.related_contracts)
                 + ctx_len(&r.context)
@@ -616,6 +641,81 @@ fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
         }
         OutboundDelegateMsg::SubscribeContractRequest(r) => ctx_len(&r.context),
         OutboundDelegateMsg::UnsubscribeContractRequest(r) => ctx_len(&r.context),
+    }
+}
+
+/// A byte quantity in the park accounting, which SATURATES rather than wraps.
+///
+/// WHY A TYPE AND NOT A CAREFUL `saturating_add` AT EACH SITE. Every function
+/// below composes contract- or client-supplied lengths with bare `+`, and that
+/// was sound only by accident: the operands all happened to be lengths of
+/// things actually allocated on the heap, so their sum could not approach
+/// `usize::MAX`. That is a coincidence, not an invariant, and
+/// [`unmeasurable`] introduced the first operand that is NOT a heap length.
+///
+/// One non-heap-length operand was enough to break it, and it broke in the
+/// worst available direction. `overflow-checks` appears nowhere in this
+/// repository — no Cargo profile, no CI, no `RUSTFLAGS`, and there is no
+/// `arithmetic_side_effects` lint — so debug and test builds panic on the
+/// serial delegate loop while **release wraps**:
+/// `ELEMENT_OVERHEAD_BYTES + usize::MAX` becomes `ELEMENT_OVERHEAD_BYTES - 1`.
+/// The sentinel that exists to make a payload unadmittable at any budget would
+/// have made it admittable at almost any budget, silently, in the build that
+/// ships.
+///
+/// So the composition is fixed rather than the sentinel's route through it.
+/// `unmeasurable` is not the last non-heap-length operand this will see — the
+/// whole reason it exists is that new `#[non_exhaustive]` variants are
+/// anticipated, and freenet-stdlib 0.10.0 shipped today.
+///
+/// AND THE END-TO-END CASE CANNOT BE TESTED, which is the argument that
+/// settles it. Driving a real `unmeasurable` through `task_bytes` requires
+/// constructing a variant this build does not know, which is impossible by
+/// definition. A test can only inject the sentinel PAST the composing
+/// function — as the first version of
+/// `an_unmeasurable_variant_cannot_be_admitted_at_any_budget` did, passing it
+/// straight to `park()` and so exercising `park()`'s own `saturating_add`
+/// while never touching `task_bytes`'s internal `+`. A property that cannot be
+/// tested end to end has to be structural, or it is not guaranteed at all.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub(super) struct ByteCount(usize);
+
+impl ByteCount {
+    /// Unadmittable at any budget. See [`unmeasurable`].
+    pub(super) const MAX: Self = Self(usize::MAX);
+
+    pub(super) const fn new(bytes: usize) -> Self {
+        Self(bytes)
+    }
+
+    pub(super) const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl std::ops::Add for ByteCount {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self(self.0.saturating_add(rhs.0))
+    }
+}
+
+impl std::ops::Mul<usize> for ByteCount {
+    type Output = Self;
+    fn mul(self, rhs: usize) -> Self {
+        Self(self.0.saturating_mul(rhs))
+    }
+}
+
+impl std::iter::Sum for ByteCount {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self(0), |acc, n| acc + n)
+    }
+}
+
+impl std::fmt::Display for ByteCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -635,12 +735,12 @@ fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
 /// overhead CHARGED AGAINST the budgets above". Same reasoning, same fix.
 /// Deliberately generous — the point is to bound what an attacker can grow, and
 /// under-charging the slot is the thing that failed.
-const ELEMENT_OVERHEAD_BYTES: usize = 256;
+const ELEMENT_OVERHEAD_BYTES: ByteCount = ByteCount::new(256);
 
 /// Bytes a `DelegateContext` pins. Bounded by `DelegateContext::MAX_SIZE`
 /// (~400 KiB), which is why omitting it was worth two High findings.
-fn ctx_len(ctx: &DelegateContext) -> usize {
-    ctx.as_ref().len()
+fn ctx_len(ctx: &DelegateContext) -> ByteCount {
+    ByteCount::new(ctx.as_ref().len())
 }
 
 /// Bytes a `ContractContainer` pins: the WASM AND its parameters.
@@ -650,7 +750,7 @@ fn ctx_len(ctx: &DelegateContext) -> usize {
 /// `delegate_container_bytes` counted code alone. One helper is how they stay
 /// in step.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn contract_container_bytes(contract: &ContractContainer) -> usize {
+fn contract_container_bytes(contract: &ContractContainer) -> ByteCount {
     use freenet_stdlib::prelude::ContractWasmAPIVersion;
     // BORROW, DO NOT CLONE — THE SAME DEFECT THIS FILE ALREADY DOCUMENTS 200
     // LINES ABOVE, reintroduced by the helper that unified three call sites.
@@ -663,20 +763,20 @@ fn contract_container_bytes(contract: &ContractContainer) -> usize {
     // warns about. `WrappedContract::params()` borrows.
     match contract {
         ContractContainer::Wasm(ContractWasmAPIVersion::V1(c)) => {
-            c.code().data().len() + c.params().as_ref().len()
+            ByteCount::new(c.code().data().len()) + ByteCount::new(c.params().as_ref().len())
         }
         other => unmeasurable("ContractContainer", std::mem::discriminant(other)),
     }
 }
 
 /// Bytes the states carried inside a `RelatedContracts` pin.
-fn related_contracts_bytes(related: &RelatedContracts<'static>) -> usize {
+fn related_contracts_bytes(related: &RelatedContracts<'static>) -> ByteCount {
     related
         .states()
         .map(|(_, st)| {
             // The map slot costs whether or not the state is present, and the
             // delegate chooses how many entries there are.
-            ELEMENT_OVERHEAD_BYTES + st.as_ref().map_or(0, |s| s.as_ref().len())
+            ELEMENT_OVERHEAD_BYTES + ByteCount::new(st.as_ref().map_or(0, |s| s.as_ref().len()))
         })
         .sum()
 }
@@ -697,15 +797,17 @@ fn related_contracts_bytes(related: &RelatedContracts<'static>) -> usize {
 // was green while CI's `-D warnings` went red. The wildcard is required because
 // `UpdateData` is `#[non_exhaustive]`; every variant that exists IS listed.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn update_data_bytes(update: &UpdateData<'static>) -> usize {
+fn update_data_bytes(update: &UpdateData<'static>) -> ByteCount {
     match update {
-        UpdateData::State(state) => state.as_ref().len(),
-        UpdateData::Delta(delta) => delta.as_ref().len(),
-        UpdateData::StateAndDelta { state, delta } => state.as_ref().len() + delta.as_ref().len(),
-        UpdateData::RelatedState { state, .. } => state.as_ref().len(),
-        UpdateData::RelatedDelta { delta, .. } => delta.as_ref().len(),
+        UpdateData::State(state) => ByteCount::new(state.as_ref().len()),
+        UpdateData::Delta(delta) => ByteCount::new(delta.as_ref().len()),
+        UpdateData::StateAndDelta { state, delta } => {
+            ByteCount::new(state.as_ref().len()) + ByteCount::new(delta.as_ref().len())
+        }
+        UpdateData::RelatedState { state, .. } => ByteCount::new(state.as_ref().len()),
+        UpdateData::RelatedDelta { delta, .. } => ByteCount::new(delta.as_ref().len()),
         UpdateData::RelatedStateAndDelta { state, delta, .. } => {
-            state.as_ref().len() + delta.as_ref().len()
+            ByteCount::new(state.as_ref().len()) + ByteCount::new(delta.as_ref().len())
         }
         // See `unmeasurable` for why this is the whole budget rather than
         // nothing, and why it is announced.
@@ -1404,7 +1506,7 @@ impl DelegateParkCtx {
 
     /// The bytes ONE deferred upsert's off-loop related fetch may retain on
     /// this node. See [`upsert_fetch_allowance`].
-    pub(super) fn upsert_fetch_allowance(&self) -> usize {
+    pub(super) fn upsert_fetch_allowance(&self) -> ByteCount {
         upsert_fetch_allowance(self.budget)
     }
 
@@ -1453,9 +1555,14 @@ impl DelegateParkCtx {
         key: DelegateKey,
         continuation: Continuation,
         // Bytes the off-loop task will retain for this park (see [`task_bytes`]).
-        task_bytes: usize,
+        task_bytes: ByteCount,
     ) -> ParkAdmission {
-        let bytes = continuation_bytes(&continuation).saturating_add(task_bytes);
+        // THE ONE CONVERSION, and it is the accumulator boundary. Everything
+        // upstream composes in [`ByteCount`], which saturates; `parked_bytes`
+        // is a plain `usize` running total whose own add already saturates.
+        // Keeping the newtype all the way to here is what makes a wrapping `+`
+        // on contract-supplied lengths impossible rather than merely absent.
+        let bytes = (continuation_bytes(&continuation) + task_bytes).get();
         let over_bytes = self.parked_bytes.saturating_add(bytes) > self.budget;
         if self.parked.len() >= MAX_PARKED_DELEGATES || self.parked.contains_key(&key) || over_bytes
         {
@@ -1490,7 +1597,7 @@ impl DelegateParkCtx {
             ParkEntry {
                 continuation,
                 epoch,
-                task_bytes,
+                task_bytes: task_bytes.get(),
                 parked_at: tokio::time::Instant::now(),
                 pending_clients: VecDeque::new(),
                 pending_notifications: HashMap::new(),
@@ -1519,11 +1626,12 @@ impl DelegateParkCtx {
             // rejecting is not — and rejecting would land on ghostkeys and
             // Harvest exactly when they are most active.
             PendingRun::Notification { contract_id, req } => {
-                let bytes = request_bytes(&req);
+                let bytes = request_bytes(&req).get();
                 let superseded = entry
                     .pending_notifications
                     .get(&contract_id)
-                    .map_or(0, request_bytes);
+                    .map_or(ByteCount::default(), request_bytes)
+                    .get();
                 // `contains_key` alone is the question. An earlier
                 // `superseded == 0 &&` conjunct was dead weight that also read
                 // as if a zero-byte entry were no entry (L11).
@@ -1573,7 +1681,7 @@ impl DelegateParkCtx {
                     entry.notification_order.push_back(contract_id);
                 }
                 if let Some(old) = entry.pending_notifications.insert(contract_id, req) {
-                    let freed = request_bytes(&old);
+                    let freed = request_bytes(&old).get();
                     entry.pending_bytes = entry.pending_bytes.saturating_sub(freed);
                     self.parked_bytes = self.parked_bytes.saturating_sub(freed);
                     tracing::debug!(
@@ -1599,7 +1707,7 @@ impl DelegateParkCtx {
                     return QueueOutcome::Rejected(Box::new(client));
                 }
                 let bytes = match &client {
-                    PendingRun::Client { req, .. } => request_bytes(req),
+                    PendingRun::Client { req, .. } => request_bytes(req).get(),
                     PendingRun::Notification { .. } => 0,
                 };
                 // Check the PROJECTED total BEFORE inserting. Adding first and
@@ -1695,7 +1803,7 @@ impl DelegateParkCtx {
         self.parked.remove(key).map(|entry| {
             self.parked_bytes = self
                 .parked_bytes
-                .saturating_sub(continuation_bytes(&entry.continuation))
+                .saturating_sub(continuation_bytes(&entry.continuation).get())
                 .saturating_sub(entry.task_bytes)
                 .saturating_sub(entry.pending_bytes);
             // Client requests first, then coalesced notifications. Clients have
@@ -1901,6 +2009,41 @@ fn resume_in_hand(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // `usize` shims for the byte functions, shadowing the `super::*` imports.
+    //
+    // Assertions compare against plain integers and do not ACCUMULATE, so the
+    // saturating discipline `ByteCount` exists to enforce buys nothing here and
+    // would cost a `ByteCount::new` around every literal. Production code has
+    // no such shim: `park()` is the single conversion point, and these are
+    // deliberately confined to `mod tests` so they cannot be reached from it.
+    // ---------------------------------------------------------------------
+    fn continuation_bytes(c: &Continuation) -> usize {
+        super::continuation_bytes(c).get()
+    }
+    fn task_bytes(
+        prompts: &[freenet_stdlib::prelude::UserInputRequest<'static>],
+        upserts: &[PendingUpsert],
+        fetch_allowance: usize,
+    ) -> usize {
+        super::task_bytes(prompts, upserts, ByteCount::new(fetch_allowance)).get()
+    }
+    fn request_bytes(req: &DelegateRequest<'static>) -> usize {
+        super::request_bytes(req).get()
+    }
+    fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
+        super::inbound_bytes(msg).get()
+    }
+    fn outbound_bytes(msg: &OutboundDelegateMsg) -> usize {
+        super::outbound_bytes(msg).get()
+    }
+    fn upsert_fetch_allowance(budget: usize) -> usize {
+        super::upsert_fetch_allowance(budget).get()
+    }
+    fn unmeasurable(kind: &str, variant: impl std::fmt::Debug) -> usize {
+        super::unmeasurable(kind, variant).get()
+    }
 
     // =====================================================================
     // Byte accounting: EVERY term, individually falsifiable.
@@ -2343,7 +2486,7 @@ mod tests {
             })
             .collect();
         assert!(
-            continuation_bytes(&cont) >= N * ELEMENT_OVERHEAD_BYTES,
+            continuation_bytes(&cont) >= N * ELEMENT_OVERHEAD_BYTES.get(),
             "{N} EMPTY messages carry no payload and still cost {N} slots. \
              Summing payload lengths alone bounds nothing when the delegate \
              picks the count: charged {}",
@@ -2359,11 +2502,59 @@ mod tests {
             })
             .collect();
         assert!(
-            continuation_bytes(&cont) >= N * ELEMENT_OVERHEAD_BYTES,
+            continuation_bytes(&cont) >= N * ELEMENT_OVERHEAD_BYTES.get(),
             "the same holds for the accumulated lane, which grows across parks"
         );
     }
 
+    /// The saturating property itself, which is what the newtype buys.
+    ///
+    /// WHY THIS IS THE TEST AND NOT AN END-TO-END ONE. Driving a real
+    /// `unmeasurable` through `task_bytes` needs a `#[non_exhaustive]` variant
+    /// this build does not know, which is impossible by definition — so the
+    /// composition case CANNOT be exercised end to end, only asserted
+    /// structurally. That impossibility is the whole argument for a type
+    /// rather than a careful `saturating_add` at each site.
+    ///
+    /// What went wrong without it: `unmeasurable()` returned a bare
+    /// `usize::MAX`, and every function that composed it with a sibling term
+    /// used plain `+`. `overflow-checks` appears nowhere in this repository —
+    /// no Cargo profile, no CI, no RUSTFLAGS — so debug panicked and RELEASE
+    /// WRAPPED: `ELEMENT_OVERHEAD_BYTES + usize::MAX` became
+    /// `ELEMENT_OVERHEAD_BYTES - 1`. "Unadmittable at any budget" inverted into
+    /// "admittable at almost any budget", in the build that ships.
+    ///
+    /// FALSIFY by giving `ByteCount` a wrapping `Add` (`Self(self.0 + rhs.0)`):
+    /// the first assertion goes red in debug by panicking and in release by
+    /// wrapping.
+    #[test]
+    fn byte_counts_saturate_rather_than_wrap() {
+        assert_eq!(
+            ByteCount::MAX + ELEMENT_OVERHEAD_BYTES,
+            ByteCount::MAX,
+            "adding to the maximal count must SATURATE. Wrapping here turns the \
+             sentinel that refuses an unmeasurable payload into one that admits \
+             it, and only in release builds"
+        );
+        assert_eq!(ELEMENT_OVERHEAD_BYTES + ByteCount::MAX, ByteCount::MAX);
+        assert_eq!(
+            [ByteCount::MAX, ELEMENT_OVERHEAD_BYTES]
+                .into_iter()
+                .sum::<ByteCount>(),
+            ByteCount::MAX,
+            "`sum` is how every list of payloads is folded, so it must saturate too"
+        );
+        assert_eq!(
+            ByteCount::MAX * 2,
+            ByteCount::MAX,
+            "the predecessor-count multiply is a client-supplied length times a \
+             constant, so it must saturate as well"
+        );
+        // ...and it is still ordinary arithmetic below the ceiling.
+        assert_eq!((ByteCount::new(3) + ByteCount::new(4)).get(), 7);
+    }
+
+    /// H4/M4: an unmeasurable variant is charged so much that no budget admits
     /// H4/M4: an unmeasurable variant is charged so much that no budget admits
     /// it — and the limit of what this can check, stated.
     ///
@@ -2392,7 +2583,11 @@ mod tests {
         // The largest budget any host can have.
         assert!(
             matches!(
-                ctx.park(key(1), continuation(), unmeasurable("test", 0u8)),
+                ctx.park(
+                    key(1),
+                    continuation(),
+                    ByteCount::new(unmeasurable("test", 0u8))
+                ),
                 ParkAdmission::Refused(_)
             ),
             "a park charged the unmeasurable rate must be REFUSED even on a \
@@ -2672,7 +2867,7 @@ mod tests {
         let k = key(1);
         assert!(!ctx.is_parked(&k));
         assert!(matches!(
-            ctx.park(k.clone(), continuation(), 0),
+            ctx.park(k.clone(), continuation(), ByteCount::default()),
             ParkAdmission::Admitted { .. }
         ));
         assert!(ctx.is_parked(&k));
@@ -2688,7 +2883,7 @@ mod tests {
         let (mut ctx, _rx) = ctx();
         for i in 0..MAX_PARKED_DELEGATES {
             assert!(matches!(
-                ctx.park(key(i as u8), continuation(), 0),
+                ctx.park(key(i as u8), continuation(), ByteCount::default()),
                 ParkAdmission::Admitted { .. }
             ));
         }
@@ -2696,7 +2891,7 @@ mod tests {
         // Over the cap: refused, and the continuation comes back so the caller
         // can fall back inline rather than losing the round-trip.
         assert!(matches!(
-            ctx.park(key(200), continuation(), 0),
+            ctx.park(key(200), continuation(), ByteCount::default()),
             ParkAdmission::Refused(_)
         ));
         assert!(!ctx.is_parked(&key(200)));
@@ -2707,13 +2902,13 @@ mod tests {
         let (mut ctx, _rx) = ctx();
         let k = key(1);
         assert!(matches!(
-            ctx.park(k.clone(), continuation(), 0),
+            ctx.park(k.clone(), continuation(), ByteCount::default()),
             ParkAdmission::Admitted { .. }
         ));
         // The live continuation must survive: clobbering it would strand the
         // first round-trip's client responder.
         assert!(matches!(
-            ctx.park(k.clone(), continuation(), 0),
+            ctx.park(k.clone(), continuation(), ByteCount::default()),
             ParkAdmission::Refused(_)
         ));
         assert!(
@@ -2726,7 +2921,7 @@ mod tests {
     async fn pending_queue_is_capped_and_overflow_is_returned_not_dropped() {
         let (mut ctx, _rx) = ctx();
         let k = key(1);
-        ctx.park(k.clone(), continuation(), 0);
+        ctx.park(k.clone(), continuation(), ByteCount::default());
         for i in 0..MAX_PENDING_PER_DELEGATE {
             assert!(matches!(
                 ctx.queue_pending(&k, pending(i as u8)),
@@ -2798,7 +2993,7 @@ mod tests {
     async fn notifications_coalesce_per_contract_rather_than_being_rejected() {
         let (mut ctx, _rx) = ctx();
         let k = key(1);
-        ctx.park(k.clone(), continuation(), 0);
+        ctx.park(k.clone(), continuation(), ByteCount::default());
 
         // Far more than MAX_PENDING_PER_DELEGATE, all for ONE contract.
         for i in 0..(MAX_PENDING_PER_DELEGATE as u8 + 12) {
@@ -2835,7 +3030,7 @@ mod tests {
     async fn a_full_client_queue_does_not_reject_notifications() {
         let (mut ctx, _rx) = ctx();
         let k = key(1);
-        ctx.park(k.clone(), continuation(), 0);
+        ctx.park(k.clone(), continuation(), ByteCount::default());
 
         for i in 0..MAX_PENDING_PER_DELEGATE {
             assert!(matches!(
@@ -2877,7 +3072,7 @@ mod tests {
     async fn refusals_are_counted_per_cause() {
         let (mut ctx, _rx) = ctx();
         let k = key(1);
-        ctx.park(k.clone(), continuation(), 0);
+        ctx.park(k.clone(), continuation(), ByteCount::default());
 
         for i in 0..MAX_PENDING_PER_DELEGATE {
             ctx.queue_pending(&k, pending(i as u8));
@@ -2901,7 +3096,7 @@ mod tests {
     async fn distinct_notification_contracts_are_capped() {
         let (mut ctx, _rx) = ctx();
         let k = key(1);
-        ctx.park(k.clone(), continuation(), 0);
+        ctx.park(k.clone(), continuation(), ByteCount::default());
 
         for i in 0..MAX_PENDING_NOTIFICATION_CONTRACTS {
             assert!(matches!(
@@ -2929,7 +3124,7 @@ mod tests {
         let (mut ctx, mut rx) = ctx();
         let mut buffered = VecDeque::new();
         let k = key(1);
-        ctx.park(k.clone(), continuation(), 0);
+        ctx.park(k.clone(), continuation(), ByteCount::default());
 
         tokio::time::advance(PARK_TTL - Duration::from_secs(1)).await;
         assert!(
@@ -2975,7 +3170,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ctx = DelegateParkCtx::new(tx.clone());
         let k = key(1);
-        let ParkAdmission::Admitted { epoch } = ctx.park(k.clone(), continuation(), 0) else {
+        let ParkAdmission::Admitted { epoch } =
+            ctx.park(k.clone(), continuation(), ByteCount::default())
+        else {
             panic!("park must be admitted");
         };
 
@@ -3070,7 +3267,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ctx = DelegateParkCtx::new(tx.clone());
         let k = key(1);
-        let ParkAdmission::Admitted { epoch } = ctx.park(k.clone(), continuation(), 0) else {
+        let ParkAdmission::Admitted { epoch } =
+            ctx.park(k.clone(), continuation(), ByteCount::default())
+        else {
             panic!("park must be admitted");
         };
 
@@ -3128,11 +3327,13 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ctx = DelegateParkCtx::new(tx.clone());
         let (first, second) = (key(1), key(2));
-        let ParkAdmission::Admitted { epoch: e1 } = ctx.park(first.clone(), continuation(), 0)
+        let ParkAdmission::Admitted { epoch: e1 } =
+            ctx.park(first.clone(), continuation(), ByteCount::default())
         else {
             panic!("park must be admitted");
         };
-        let ParkAdmission::Admitted { epoch: e2 } = ctx.park(second.clone(), continuation(), 0)
+        let ParkAdmission::Admitted { epoch: e2 } =
+            ctx.park(second.clone(), continuation(), ByteCount::default())
         else {
             panic!("park must be admitted");
         };
@@ -3189,13 +3390,15 @@ mod tests {
         let mut ctx = DelegateParkCtx::new(tx);
         let k = key(1);
 
-        let ParkAdmission::Admitted { epoch: first } = ctx.park(k.clone(), continuation(), 0)
+        let ParkAdmission::Admitted { epoch: first } =
+            ctx.park(k.clone(), continuation(), ByteCount::default())
         else {
             panic!("first park must be admitted");
         };
         // The backstop ended park #1; the delegate re-parked.
         assert!(ctx.take_matching(&k, first).is_some());
-        let ParkAdmission::Admitted { epoch: second } = ctx.park(k.clone(), continuation(), 0)
+        let ParkAdmission::Admitted { epoch: second } =
+            ctx.park(k.clone(), continuation(), ByteCount::default())
         else {
             panic!("second park must be admitted");
         };
@@ -3237,7 +3440,8 @@ mod tests {
         let (mut ctx, _rx) = ctx();
         let k = key(1);
 
-        let ParkAdmission::Admitted { epoch: first } = ctx.park(k.clone(), continuation(), 0)
+        let ParkAdmission::Admitted { epoch: first } =
+            ctx.park(k.clone(), continuation(), ByteCount::default())
         else {
             panic!("first park must be admitted");
         };
@@ -3249,7 +3453,8 @@ mod tests {
         );
 
         // The delegate re-parks: a new round-trip, a new continuation.
-        let ParkAdmission::Admitted { epoch: second } = ctx.park(k.clone(), continuation(), 0)
+        let ParkAdmission::Admitted { epoch: second } =
+            ctx.park(k.clone(), continuation(), ByteCount::default())
         else {
             panic!("second park must be admitted");
         };
@@ -3301,7 +3506,7 @@ mod tests {
     async fn coalesced_notifications_drain_in_arrival_order() {
         let (mut ctx, _rx) = ctx();
         let k = key(1);
-        ctx.park(k.clone(), continuation(), 0);
+        ctx.park(k.clone(), continuation(), ByteCount::default());
 
         // Insert in a fixed order; supersede one in the middle to confirm
         // coalescing keeps its ORIGINAL slot rather than moving it to the back.
@@ -3450,7 +3655,7 @@ mod tests {
         let per_park = ctx.budget() / 4;
         let mut admitted = 0usize;
         for i in 0..MAX_PARKED_DELEGATES {
-            match ctx.park(key(i as u8), continuation(), per_park) {
+            match ctx.park(key(i as u8), continuation(), ByteCount::new(per_park)) {
                 ParkAdmission::Admitted { .. } => admitted += 1,
                 ParkAdmission::Refused(_) => break,
             }
@@ -3614,13 +3819,13 @@ mod tests {
     /// `owed_upserts` twenty lines up, written into the instruction for
     /// checking the fix for it. Verified by doing exactly that: defaulting the
     /// context in `owed_upserts` leaves this test GREEN, while
-    /// `owed_upserts_carry_the_delegate_s_context` goes red, and that is the
-    /// test which actually covers it.
+    /// `owed_upserts_carry_the_delegate_s_context` goes red, which is the test
+    /// that actually covers it.
     ///
     /// A WRONG `FALSIFY` LINE IS WORSE THAN A WEAK TEST. A weak test fails to
     /// catch a regression; an instruction like this one recruits the next
     /// person into confirming something false — they follow it, see the result
-    /// it predicts, and come away with more confidence than if nothing had been
+    /// it predicts, and come away more confident than if nothing had been
     /// written. It converts a gap into a positive belief.
     #[tokio::test]
     async fn a_partially_resolved_upsert_pair_keeps_the_unresolved_one_s_context() {

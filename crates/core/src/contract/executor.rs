@@ -2140,7 +2140,17 @@ mod tests {
                     .or_else(|| line.strip_prefix("pub(crate) const "))
                     .or_else(|| line.strip_prefix("pub(super) const "))
                     && let Some((name, tail)) = rest.split_once(':')
-                    && tail.trim_start().starts_with("usize")
+                    // `ByteCount` as well as `usize`: a budget does not stop
+                    // being a budget because its type became safer. This guard
+                    // caught its own author changing `ELEMENT_OVERHEAD_BYTES`
+                    // to the saturating newtype, which under a `usize`-only
+                    // rule would have silently dropped it from discovery while
+                    // leaving a stale `NOT_SUMMED` entry behind — a guard
+                    // narrowing itself as a side effect of an unrelated fix.
+                    && {
+                        let ty = tail.trim_start();
+                        ty.starts_with("usize") || ty.starts_with("ByteCount")
+                    }
                     && name.ends_with("_BYTES")
                 {
                     found.insert(name.to_string());
