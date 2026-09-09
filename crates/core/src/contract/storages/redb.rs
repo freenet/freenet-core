@@ -1995,16 +1995,33 @@ impl ReDb {
 
     /// Per-CONTRACT cap on durably-recorded delegate subscriptions.
     ///
-    /// `client_subscriptions` — the map a pin lands in — is already bounded at
-    /// [`crate::contract::executor::MAX_SUBSCRIBERS_PER_CONTRACT`] (256), so a
-    /// 257th delegate on one contract could never have obtained a pin anyway.
-    /// The bound is repeated here because this table is written from a path
-    /// a delegate drives, and `.claude/rules/code-style.md` requires a per-key
+    /// The number matches [`crate::contract::executor::MAX_SUBSCRIBERS_PER_CONTRACT`]
+    /// (256), and the bound exists here because this table is written from a
+    /// path a delegate drives: `.claude/rules/code-style.md` requires a per-key
     /// collection to be bounded where it GROWS, not only where it is read.
     ///
-    /// It is deliberately the same number rather than a second, looser one: two
-    /// caps on the same fan-out that disagree is how you get a durable row with
-    /// no pin and no way to tell which bound refused.
+    /// **THE TWO CAPS COUNT DIFFERENT SETS, and an earlier version of this
+    /// comment said otherwise.** It justified the shared number by arguing that
+    /// "a 257th delegate could never have obtained a pin anyway", which assumes
+    /// one population where there are two:
+    ///
+    /// - `MAX_SUBSCRIBERS_PER_CONTRACT` bounds `client_subscriptions[id]` — the
+    ///   DEMAND set, WebSocket clients and delegate pins together.
+    /// - This cap bounds durable rows — the SUBSCRIPTION set, delegates only,
+    ///   pinned or not.
+    ///
+    /// The durable row is written BEFORE the pin gate runs, so every refused
+    /// pin (`not_hosted`, `node_full`, `delegate_full`) consumes a row and no
+    /// pin slot. 256 delegates subscribing to a contract this node does not host
+    /// therefore fill this cap while `client_subscriptions` stays empty — and
+    /// the 257th, refused here, would have been admitted by the pin cap. That is
+    /// reachable, and it is why the callers MUST honour this function's return
+    /// value rather than reasoning that the two caps agree.
+    ///
+    /// Do not "fix" the divergence by retuning either constant. They measure
+    /// different things and both bounds are wanted; what has to hold is the
+    /// ORDERING — no pin without a subscription record — which the call sites
+    /// enforce by refusing to register demand when this returns `false`.
     pub(crate) const MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT: usize = 256;
 
     /// 96-byte row key `contract_instance_id(32) || delegate_key64(64)`.

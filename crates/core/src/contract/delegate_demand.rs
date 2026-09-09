@@ -1257,7 +1257,25 @@ where
         // durable row already exists: it is idempotent there, and it is what
         // keeps the in-memory registry from being seeded by a second path that
         // could drift from the first.
-        crate::wasm_runtime::delegate_subscriptions::register(Some(db), &instance_id, &delegate);
+        //
+        // The return value is honoured here for the same reason it is at the two
+        // live subscribe paths: a pin must never exist without the subscription
+        // record that a teardown walks to find it. This should not be reachable
+        // at boot — the row we are restoring is itself one of the rows the cap
+        // counts, so it re-admits — but "should not be reachable" is not a
+        // reason to register demand for a subscription the writer just refused.
+        if !crate::wasm_runtime::delegate_subscriptions::register(Some(db), &instance_id, &delegate)
+        {
+            tracing::warn!(
+                %instance_id,
+                delegate = %delegate,
+                "a persisted delegate subscription was refused on restore; not \
+                 registering its pin. This should be unreachable — the row is \
+                 one the per-contract cap counts — so treat it as a sign the \
+                 durable set and the cap disagree."
+            );
+            continue;
+        }
         outcome.restored += 1;
 
         // Same gates, same counters as a live subscribe. A refusal here is not
@@ -2126,6 +2144,156 @@ mod tests {
             "an unrelated reason must read zero, or the breakdown is not \
              attributing anything:\n{}",
             warnings[0]
+        );
+    }
+
+    /// The two 256-caps count DIFFERENT sets, so the writer's refusal is the
+    /// only thing standing between a delegate and a pin with no subscription.
+    ///
+    /// `MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT` bounds durable ROWS (delegates
+    /// only, pinned or not). `MAX_SUBSCRIBERS_PER_CONTRACT` bounds
+    /// `client_subscriptions` (WebSocket clients and delegate pins together).
+    /// The row is written BEFORE the pin gate runs, so a refused pin consumes a
+    /// row and no pin slot — and a contract the node does not host refuses
+    /// every pin. Fill the row cap that way and the two counts are 256 and 0.
+    ///
+    /// The state this test exists to make unreachable: the next delegate is
+    /// refused by the row cap, gets no hook and nothing on disk, and would
+    /// still be admitted by the pin gate. That pin would raise the eviction
+    /// tier and the governance benefit for a delegate receiving nothing, and
+    /// `drop_subscriptions_for_contract` could never retire it, because it
+    /// iterates the registry the subscription is absent from —
+    /// `executor_impl.rs`'s own words for it are "demand without a hook is an
+    /// unconsumable pin".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_row_cap_and_the_pin_cap_count_different_sets() {
+        use crate::contract::storages::ReDb;
+
+        let _pin_outcomes = pin_outcome_guard().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: ReDb = ReDb::new(dir.path()).await.expect("open redb");
+
+        let key = contract_key(71);
+        let fixture = seam_fixture("delegate-demand-4669-cap-divergence").await;
+        let op_manager = fixture.op_manager.clone();
+
+        // A distinct delegate per row; `delegate_key` takes a u8 so it cannot
+        // reach 257 on its own.
+        let nth = |n: u16| {
+            let b = n.to_le_bytes();
+            DelegateKey::new(
+                [b[0]; 32],
+                freenet_stdlib::prelude::CodeHash::from_code(&[b[0], b[1]]),
+            )
+        };
+
+        let cap = ReDb::MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT;
+        for n in 0..cap {
+            let d = nth(n as u16);
+            crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&d);
+            assert!(
+                crate::wasm_runtime::delegate_subscriptions::register(Some(&storage), key.id(), &d),
+                "row {n} must be admitted while under the row cap"
+            );
+        }
+
+        // The divergence, stated as an assertion rather than an argument.
+        assert_eq!(
+            crate::wasm_runtime::delegate_subscriptions::load_persisted(&storage)
+                .expect("read back")
+                .len(),
+            cap,
+            "the ROW cap is full"
+        );
+        assert_eq!(
+            op_manager.ring.local_subscriber_count(key.id()),
+            0,
+            "and the PIN set is empty, because the contract is not hosted — \
+             this is what makes the two caps disagree, and it is reachable"
+        );
+
+        // Now the contract becomes hosted, so the pin gate would admit.
+        let _ = op_manager.ring.host_contract(
+            key,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+
+        let overflow = nth(cap as u16);
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&overflow);
+        assert!(
+            !crate::wasm_runtime::delegate_subscriptions::register(
+                Some(&storage),
+                key.id(),
+                &overflow
+            ),
+            "the row cap must refuse the 257th delegate outright"
+        );
+        assert!(
+            !crate::wasm_runtime::delegate_subscriptions::test_support::is_registered(
+                key.id(),
+                &overflow
+            ),
+            "a refused subscription must leave NO notification hook — if it did, \
+             the caller could not tell a refusal from a success"
+        );
+
+        // The counterfactual, and the whole reason the call sites must branch
+        // on the return value: the pin gate is nowhere near ITS cap.
+        assert!(
+            op_manager.ring.local_subscriber_count(key.id())
+                < crate::contract::executor::MAX_SUBSCRIBERS_PER_CONTRACT,
+            "the pin cap would admit this delegate. The row cap refusing it is \
+             the ONLY thing preventing a pin with no subscription record, which \
+             is why `register`'s return value is not advisory."
+        );
+    }
+
+    /// Both live subscribe paths must branch on the writer's refusal.
+    ///
+    /// The behavioural test above establishes that a refused subscription and
+    /// an admitted pin are simultaneously reachable. These pin that neither
+    /// call site invokes `register` as a bare statement — which is how the
+    /// first version of this change shipped, and it is silent: the delegate is
+    /// told `Ok`, the pin exists, and every other test still passes.
+    #[test]
+    fn both_subscribe_paths_honour_a_refused_subscription() {
+        const V1: &str = include_str!("../contract.rs");
+        let arm = V1
+            .find("for req in subscribe_requests")
+            .expect("the V1 SubscribeContractRequest loop must still exist");
+        let arm_end = V1[arm..]
+            .find(r#"Err("Contract not found""#)
+            .expect("the V1 subscribe arm must still have its not-found branch");
+        let v1_body = code_only(&V1[arm..arm + arm_end]);
+        assert!(
+            v1_body.contains("if !crate::wasm_runtime::delegate_subscriptions::register("),
+            "the V1 subscribe arm must BRANCH on `register`'s return value. \
+             Calling it as a bare statement registers demand for a subscription \
+             the writer refused, producing a pin with no hook and no durable row."
+        );
+
+        const V2: &str = include_str!("../wasm_runtime/native_api.rs");
+        let f = V2
+            .find("pub(super) fn subscribe_contract_sync(")
+            .expect("the V2 subscribe host function must still exist");
+        let rel_end = V2[f..]
+            .find("\n    }\n")
+            .expect("subscribe_contract_sync must still be a closed fn body");
+        let v2_body = code_only(&V2[f..f + rel_end]);
+        assert!(
+            v2_body.contains("if !crate::wasm_runtime::delegate_subscriptions::register("),
+            "the V2 `subscribe_contract()` host function must BRANCH on \
+             `register`'s return value, for the same reason as V1."
+        );
+        assert!(
+            v2_body.contains("SubscriptionCapExceeded"),
+            "and must report the refusal to the delegate. This is NOT the #5565 \
+             case: there the subscription succeeds and only the pin is refused, \
+             so reporting failure would be the worse lie. Here the SUBSCRIPTION \
+             was refused, so notification delivery stops — the delegate has to \
+             be told."
         );
     }
 

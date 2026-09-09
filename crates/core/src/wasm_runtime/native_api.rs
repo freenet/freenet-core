@@ -878,6 +878,14 @@ pub(super) enum DelegateEnvError {
     /// The state exceeds `MAX_STATE_SIZE`. Enforced here because the V2 path
     /// bypasses `StateStore::{store,update}`, where the ceiling normally lives.
     StateTooLarge { size: usize, limit: usize },
+    /// The contract is at `MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT`, so NO
+    /// subscription was recorded — no notification hook, no durable row.
+    ///
+    /// Distinct from a refused PIN, which is a different outcome and is still
+    /// reported as success (#5565): here the subscribe itself did not happen,
+    /// so notification delivery — a pre-existing feature the delegate is
+    /// relying on — silently stops unless this is surfaced.
+    SubscriptionCapExceeded,
 }
 
 /// Errors that can occur during delegate creation via `create_delegate_sync`.
@@ -1500,11 +1508,28 @@ impl DelegateCallEnv {
         // reach either, so the two cannot be written apart — see its module
         // docs. `state_store_db` is `None` on local-only and mock runtimes,
         // where the subscription is in-memory only, exactly as before #4669.
-        crate::wasm_runtime::delegate_subscriptions::register(
+        //
+        // THE RETURN VALUE IS LOAD-BEARING. `false` means the per-contract cap
+        // refused the subscription outright — neither representation recorded
+        // it. Registering demand anyway would create a pin with no notification
+        // hook and no durable row: `contract_in_use` demand that raises the
+        // eviction tier and the governance benefit while the delegate receives
+        // nothing, and that `drop_subscriptions_for_contract` cannot see,
+        // because it iterates the registry this subscription is absent from.
+        // `executor_impl.rs`'s channel-closed arm names that exact state —
+        // "demand without a hook is an unconsumable pin".
+        if !crate::wasm_runtime::delegate_subscriptions::register(
             self.state_store_db.as_ref(),
             instance_id,
             &self.delegate_key,
-        );
+        ) {
+            // Err, not Ok. This is NOT the #5565 case: there, the subscription
+            // succeeds and only the PIN is refused, so reporting failure would
+            // be the worse lie. Here the SUBSCRIPTION was refused, so
+            // notification delivery — which the delegate already had before
+            // #4669 — silently stops. `Err` is both available and true.
+            return Err(DelegateEnvError::SubscriptionCapExceeded);
+        }
 
         // Register the DEMAND half (#4669 part 1 / #5467 Phase 1). The registry
         // insert above is read only by the notification path — nothing in
@@ -2627,6 +2652,15 @@ pub(super) mod delegate_contracts {
             // EXISTING code rather than a new one, because a new negative
             // return value is a wire-visible change to the V2 delegate API
             // that a delegate branching on codes would not expect.
+            // A per-contract subscriber-cap refusal is a capacity failure
+            // from the delegate's perspective, so it maps to the same generic
+            // store-error code `DiskBudgetExceeded` uses — an EXISTING code
+            // rather than a new one, because a new negative return value is a
+            // wire-visible change to the V2 delegate API that a delegate
+            // branching on codes would not expect.
+            DelegateEnvError::SubscriptionCapExceeded => {
+                contract_error_codes::ERR_STORE_ERROR as i64
+            }
             DelegateEnvError::StateTooLarge { size, limit } => {
                 tracing::warn!(
                     state_size = size,

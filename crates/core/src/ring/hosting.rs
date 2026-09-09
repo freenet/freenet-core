@@ -2003,9 +2003,40 @@ impl HostingManager {
         let now = self.time_source.now();
         let mut benefits: HashMap<ContractInstanceId, f64> = HashMap::new();
 
-        // Pass 1: local-client beneficiaries.
+        // Pass 1: local-client beneficiaries, EXCLUDING delegate pins.
+        //
+        // Same exclusion, same reason, as the cost sweep gets from
+        // `non_delegate_local_and_downstream_counts` (see
+        // `sweep_expired_hosting_with_cost`). Governance is the other sweep
+        // built to catch resource abuse, and this is the other place a
+        // contract could exempt itself from it.
+        //
+        // `benefit_score` decides how likely a resource-usage ban is
+        // (`contract::governance`), and `LOCAL_DEMAND_WEIGHT` is 1.0 against
+        // `FORWARDED_DEMAND_WEIGHT` 0.1. Counting delegate pins here means one
+        // `subscribe_contract()` from an app's OWN delegate moves its own
+        // contract from benefit 0.0 to 1.0 — worth ten downstream subscribers
+        // — and the contracts this map is consulted for are exactly the ones
+        // already flagged as costing something. An input a contract can set for
+        // itself is not a defence.
+        //
+        // A WebSocket client is not the same case, even when it is the same
+        // app: it needs a live connection and the subscription dies with it.
+        // A delegate pin is created by the app's own code running on this node,
+        // has no TTL, and since #4669 part 2 survives restarts — so the
+        // self-granted signal is permanent.
+        //
+        // This is a NARROWING of the benefit signal, so it can only make a ban
+        // more likely, never less. A delegate's genuine demand still shows up
+        // everywhere it should — `contract_in_use`, the renewal set, the
+        // eviction ordering — it just stops voting on whether its own app
+        // should be sanctioned.
         for entry in self.client_subscriptions.iter() {
-            let count = entry.value().len();
+            let count = entry
+                .value()
+                .iter()
+                .filter(|id| !crate::contract::delegate_demand::is_delegate_client(**id))
+                .count();
             if count > 0 {
                 *benefits.entry(*entry.key()).or_insert(0.0) += local_weight * count as f64;
             }
@@ -2062,8 +2093,16 @@ impl HostingManager {
     /// `UnregisterDelegate`, the delegate-notification channel closing, or
     /// process exit, and there is no unsubscribe for a delegate to call
     /// (#2830). So this method's exemption is time-bounded for WebSocket
-    /// clients and downstream peers, and bounded only by process lifetime for
-    /// delegates.
+    /// clients and downstream peers, and NOT time-bounded at all for delegates.
+    ///
+    /// **"Bounded by process lifetime" was true when this was written and is
+    /// no longer true.** #4669 part 2 makes a delegate subscription durable and
+    /// restores its pin at boot, so a restart lapses the pin and immediately
+    /// reinstates it. The releases that remain — `UnregisterDelegate`, the
+    /// notification channel closing, and eviction — are the first two under
+    /// the delegate's own control, and the third only fires when the node is
+    /// over budget (`evict_over_budget` returns early otherwise). For a small
+    /// idle pinned contract on a node with headroom, nothing releases it.
     ///
     /// That gap is deliberate and disclosed rather than accidental — a delegate
     /// pin is real resident demand and a node cannot tell when an app has
@@ -2987,11 +3026,31 @@ impl HostingManager {
 
     /// Check if this node is actively receiving updates for a contract.
     ///
-    /// Returns true only if we have an active network subscription or local
-    /// client subscriptions — conditions that guarantee our cached state is
-    /// kept fresh. Unlike [`should_host()`](Self::should_host), this excludes
+    /// Returns true if we have an active network subscription or local client
+    /// subscriptions. Unlike [`should_host()`](Self::should_host), this excludes
     /// the hosting LRU cache, which can retain contracts after their
     /// subscriptions expire (leaving stale state).
+    ///
+    /// **The freshness GUARANTEE this doc used to claim is not established for
+    /// the local-client half, and #4669 widened the gap rather than opening
+    /// it.** `has_client_subscriptions` is true the instant a subscription is
+    /// registered, which is before any network subscription exists; the
+    /// renewal loop establishes that on a later tick
+    /// (`contracts_needing_renewal`). A delegate pin is registered the same
+    /// way, so it flips this true with no network subscription of its own —
+    /// and since #4669 part 2, boot restore registers pins before the node has
+    /// run a single renewal, so the window now starts at process start rather
+    /// than at a client's connect.
+    ///
+    /// The consumer to think about is the PUT relay probe
+    /// (`operations/put/op_ctx_task.rs`), which uses this as its FRESH-holder
+    /// signal and answers with a local state summary. Inside the window that
+    /// summary may describe stale state. That is self-correcting rather than
+    /// wrong — the originator computes a delta against whatever summary it is
+    /// given, which is exactly how a stale holder gets brought up to date —
+    /// and the pin is gated on `contract_state_present`, so there IS state to
+    /// summarize. What is not true is the unqualified "guarantees our cached
+    /// state is kept fresh", so it no longer says that.
     pub fn is_receiving_updates(&self, contract: &ContractKey) -> bool {
         self.is_subscribed(contract) || self.has_client_subscriptions(contract.id())
     }
@@ -5811,6 +5870,74 @@ mod tests {
             manager.local_client_count(&instance_id),
             2,
             "removing one client must decrement the live local-client count"
+        );
+    }
+
+    /// A delegate must not raise its OWN contract's governance benefit.
+    ///
+    /// `benefit_score` decides how likely a resource-usage ban is, and the
+    /// contracts this map is consulted for are exactly the ones governance has
+    /// already flagged as costing something. `LOCAL_DEMAND_WEIGHT` is 1.0
+    /// against `FORWARDED_DEMAND_WEIGHT` 0.1, so counting delegate pins here
+    /// would let one `subscribe_contract()` from an app's own delegate move its
+    /// own contract from 0.0 to 1.0 — worth ten downstream subscribers.
+    ///
+    /// Same bypass, same treatment, as the cost sweep gets from
+    /// `non_delegate_local_and_downstream_counts`: an input a contract can set
+    /// for itself is not a defence. A WebSocket client is not the same case
+    /// even when it is the same app — it needs a live connection and dies with
+    /// it, where a delegate pin has no TTL and survives restarts (#4669).
+    #[tokio::test(start_paused = true)]
+    async fn a_delegate_pin_does_not_raise_its_own_contracts_governance_benefit() {
+        use crate::client_events::ClientId;
+        const LOCAL: f64 = 1.0;
+        const FORWARDED: f64 = 0.1;
+
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+
+        // Pinned only by a delegate: the app subscribing to itself.
+        let self_pinned = ContractInstanceId::new([41; 32]);
+        let delegate = crate::contract::delegate_demand::client_id_for(
+            &freenet_stdlib::prelude::DelegateKey::new([7; 32], CodeHash::from_code(&[7])),
+        );
+        assert!(
+            crate::contract::delegate_demand::is_delegate_client(delegate),
+            "precondition: the synthetic id must be in the reserved range, or \
+             this test is asserting about an ordinary client"
+        );
+        manager.add_client_subscription(&self_pinned, delegate);
+
+        // The control: a real WebSocket client on another contract still counts.
+        let real_client = ContractInstanceId::new([42; 32]);
+        manager.add_client_subscription(&real_client, ClientId::next());
+
+        let benefits = manager.beneficiary_counts(LOCAL, FORWARDED);
+
+        assert_eq!(
+            benefits.get(&self_pinned).copied().unwrap_or(0.0),
+            0.0,
+            "a delegate pin must contribute NOTHING to governance benefit — \
+             otherwise an app improves its own standing against the sweep built \
+             to catch it, which is the bypass `evict_cost_pressure` already \
+             closes forty lines away"
+        );
+        assert_eq!(
+            benefits.get(&real_client).copied().unwrap_or(0.0),
+            LOCAL,
+            "a genuine WebSocket client must still count, or the filter has \
+             narrowed the benefit signal to nothing and the assertion above \
+             passes for the wrong reason"
+        );
+
+        // The pin is still real demand everywhere it should be. Narrowing the
+        // governance signal must not have touched retention or renewal.
+        assert!(
+            manager.contract_in_use(&ContractKey::from_id_and_code(
+                self_pinned,
+                CodeHash::new([99; 32])
+            )),
+            "the pin must still be demand for hosting purposes — this change \
+             removes its governance VOTE, not its demand"
         );
     }
 

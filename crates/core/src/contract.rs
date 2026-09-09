@@ -1374,11 +1374,45 @@ where
                         // (#4669 part 2). One choke point, so a future cleanup
                         // path cannot clear one and leave the other; see
                         // `wasm_runtime::delegate_subscriptions`.
-                        crate::wasm_runtime::delegate_subscriptions::register(
+                        //
+                        // THE RETURN VALUE IS LOAD-BEARING. `false` means the
+                        // per-contract cap refused the subscription outright —
+                        // neither representation recorded it. Registering demand
+                        // anyway would leave a pin with no notification hook and
+                        // no durable row: `contract_in_use` demand raising the
+                        // eviction tier while the delegate receives nothing, and
+                        // invisible to `drop_subscriptions_for_contract`, which
+                        // iterates the registry this subscription is absent from.
+                        if !crate::wasm_runtime::delegate_subscriptions::register(
                             contract_handler.executor().delegate_subscription_store(),
                             &contract_id,
                             delegate_key,
-                        );
+                        ) {
+                            tracing::warn!(
+                                contract = %contract_id,
+                                delegate = %delegate_key,
+                                "contract is at the per-contract delegate-subscription \
+                                 cap; the subscribe was refused outright (no \
+                                 notification hook, nothing on disk)"
+                            );
+                            // Err, and this is NOT the #5565 case. There, the
+                            // subscription succeeds and only the PIN is refused,
+                            // so reporting failure would be the worse lie. Here
+                            // the SUBSCRIPTION was refused, so notification
+                            // delivery — which the delegate had before #4669 —
+                            // silently stops unless it is told.
+                            inbound_responses.push(InboundDelegateMsg::SubscribeContractResponse(
+                                SubscribeContractResponse {
+                                    contract_id,
+                                    result: Err(
+                                        "contract is at the per-contract delegate-subscription cap"
+                                            .to_string(),
+                                    ),
+                                    context,
+                                },
+                            ));
+                            continue;
+                        }
                         // Register the DEMAND half (#4669 part 1 / #5467 Phase 1):
                         // without this the subscribe above is a passive local
                         // notification hook — it does not set `contract_in_use`,
