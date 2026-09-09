@@ -2949,6 +2949,87 @@ mod tests {
         );
     }
 
+    /// A delegate that imports a function the host does not provide. The
+    /// namespace is real and the symbol is not, which is exactly the shape of a
+    /// delegate built against a newer stdlib running on an older node.
+    const UNKNOWN_IMPORT_WAT: &str = r#"
+        (module
+          (import "freenet_delegate_management" "__frnt__delegate__no_such_function"
+            (func $missing (param i64 i64 i32) (result i64)))
+          (memory (export "memory") 1)
+          (func (export "process") (param i64 i64 i64) (result i64) (i64.const 0)))
+    "#;
+
+    /// The same module importing the wakeup host function that DOES exist.
+    const SCHEDULE_WAKEUP_IMPORT_WAT: &str = r#"
+        (module
+          (import "freenet_delegate_management" "__frnt__delegate__schedule_wakeup"
+            (func $schedule_wakeup (param i64 i64 i32) (result i64)))
+          (memory (export "memory") 1)
+          (func (export "process") (param i64 i64 i64) (result i64) (i64.const 0)))
+    "#;
+
+    fn instantiate_with_host_functions(wat: &str) -> Result<(), String> {
+        let config = RuntimeConfig {
+            enable_metering: false,
+            ..RuntimeConfig::default()
+        };
+        let mut engine = WasmtimeEngine::new(&config, false).expect("engine must build");
+        let store = engine.store.as_mut().expect("engine store present");
+        let eng = store.engine().clone();
+        let module = Module::new(&eng, wat.as_bytes()).expect("WAT must compile");
+        let mut linker: Linker<HostState> = Linker::new(&eng);
+        WasmtimeEngine::register_host_functions(&mut linker)
+            .expect("registering the host functions must succeed");
+        block_on_async(linker.instantiate_async(&mut *store, &module))
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
+    }
+
+    /// The property the ENTIRE host-function-vs-wire-variant argument rests on
+    /// (freenet-core#3972, freenet-stdlib#82), and which core had never tested:
+    /// a delegate importing a function the host does not provide fails at
+    /// INSTANTIATION, loudly and once, with the missing symbol named.
+    ///
+    /// Why it matters rather than being a WebAssembly triviality. A delegate's
+    /// outbound messages are serialized as ONE bincode batch and decoded whole,
+    /// so an unknown `OutboundDelegateMsg` variant fails the WHOLE batch — a
+    /// delegate returning `[ApplicationMessage(reply), ScheduleWakeup{..}]` to
+    /// an older node would have the REPLY discarded along with the wakeup, and
+    /// the user's action would silently do nothing. Since stdlib ships before
+    /// core by policy, that is the direction ordinary rollout produces every
+    /// time. `schedule_wakeup` is a host function precisely to fail the other
+    /// way, and this test is what makes that a checked claim rather than a
+    /// reasoned one.
+    #[test]
+    fn a_missing_delegate_import_fails_at_instantiation_naming_the_symbol() {
+        let err = instantiate_with_host_functions(UNKNOWN_IMPORT_WAT)
+            .expect_err("an unprovided import must not instantiate");
+        assert!(
+            err.contains("__frnt__delegate__no_such_function"),
+            "the failure must NAME the missing symbol so an operator can act on it, got: {err}"
+        );
+    }
+
+    /// The other half, and the one that would go red if the wakeup registration
+    /// were deleted or moved to a different namespace: a delegate importing
+    /// `__frnt__delegate__schedule_wakeup` from `freenet_delegate_management`
+    /// instantiates.
+    ///
+    /// Both the namespace and the symbol are load-bearing — they are the ABI
+    /// freenet-stdlib 0.10.0's `DelegateCtx::schedule_wakeup` declares, and a
+    /// mismatch in either turns every wakeup-using delegate into the
+    /// instantiation failure above.
+    #[test]
+    fn a_delegate_importing_schedule_wakeup_instantiates() {
+        instantiate_with_host_functions(SCHEDULE_WAKEUP_IMPORT_WAT).unwrap_or_else(|e| {
+            panic!(
+                "core must provide __frnt__delegate__schedule_wakeup in the \
+                 freenet_delegate_management namespace (freenet-core#3972): {e}"
+            )
+        });
+    }
+
     /// #4864 review (fix 3): `epoch_deadline_ticks` = `ceil(secs / 100ms) + 1`,
     /// the `+ 1` a phase-safety margin so a free-running ticker never traps a
     /// guest EARLY. Boundary cases.

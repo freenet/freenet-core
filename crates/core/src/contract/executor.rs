@@ -1079,6 +1079,18 @@ pub(crate) trait ContractExecutor: Send + 'static {
         None
     }
 
+    /// The parameters `key` was registered with, or `None` when this executor
+    /// keeps no delegate registry.
+    ///
+    /// A node-internal invocation has no client to supply params, and
+    /// `DelegateKey` identity covers `BLAKE3(code_hash ‖ params)` — so passing
+    /// empty params runs a parameterized delegate under a configuration it
+    /// never had. It does not fail; it misbehaves quietly, which is why the
+    /// wakeup path (freenet-core#3972) resolves them rather than defaulting.
+    fn registered_delegate_params(&self, _key: &DelegateKey) -> Option<Parameters<'static>> {
+        None
+    }
+
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;
 
     /// Remove all subscriptions for a disconnected client.

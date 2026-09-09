@@ -870,6 +870,31 @@ impl RuntimePool {
             .any(|executor| executor.runtime.has_delegate(key))
     }
 
+    /// How many delegates this node has registered.
+    ///
+    /// `max` across executors rather than the first: they share one index, so a
+    /// disagreement means a partially-initialised pool, and the LARGER answer is
+    /// the safe one — this figure gates whether boot reconciliation is willing
+    /// to delete rows at all (see `delegate_wakeups::restore`), and
+    /// under-reporting it would license exactly the deletion it exists to
+    /// prevent.
+    pub fn registered_delegate_count(&self) -> usize {
+        self.runtimes
+            .iter()
+            .flatten()
+            .map(|executor| executor.runtime.registered_delegate_count())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The parameters `key` was registered with, from whichever executor knows.
+    pub fn delegate_params(&self, key: &DelegateKey) -> Option<Parameters<'static>> {
+        self.runtimes
+            .iter()
+            .flatten()
+            .find_map(|executor| executor.runtime.delegate_params(key))
+    }
+
     /// Look up a code hash from an instance ID.
     /// Used for legacy contract migration during startup.
     pub fn code_hash_from_id(&self, instance_id: &ContractInstanceId) -> Option<CodeHash> {
@@ -895,6 +920,12 @@ impl ContractExecutor for RuntimePool {
         &self,
     ) -> Option<&dyn crate::wasm_runtime::delegate_wakeups::DelegateWakeupPersistence> {
         Some(self.shared_state_store.inner())
+    }
+
+    /// The registered params, so a wakeup re-enters the delegate under the
+    /// configuration it was registered with rather than an empty one.
+    fn registered_delegate_params(&self, key: &DelegateKey) -> Option<Parameters<'static>> {
+        self.delegate_params(key)
     }
 
     /// Forward the pending-reclamation registration to the ring's retry

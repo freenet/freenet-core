@@ -519,6 +519,40 @@ impl DelegateStore {
     pub fn code_hash_from_key(&self, key: &DelegateKey) -> Option<CodeHash> {
         self.key_to_code_part.get(key).map(|r| *r.value())
     }
+
+    /// How many delegates this node has registered.
+    ///
+    /// Read by boot reconciliation of the wakeup schedule (freenet-core#3972)
+    /// to decide whether a NEGATIVE answer from [`Self::code_hash_from_key`]
+    /// can be trusted. `new_with_shared` logs a `warn!` and continues with an
+    /// empty index when the ReDb read fails, so "this delegate is not
+    /// registered" and "the index did not load" are otherwise the same answer —
+    /// and acting on the second would delete every delegate's schedule.
+    pub fn registered_count(&self) -> usize {
+        self.key_to_code_part.len()
+    }
+
+    /// The parameters `key` was registered with, or `None` if this node has no
+    /// record of it.
+    ///
+    /// `DelegateKey` identity covers `BLAKE3(code_hash ‖ params)`, and
+    /// [`Self::fetch_delegate`] attaches whatever params the CALLER supplies
+    /// rather than the registered ones — so invoking a delegate with empty
+    /// params runs it under a configuration it never had. That is invisible: it
+    /// does not fail, it misbehaves.
+    ///
+    /// Read from the `.reg` file rather than held in memory because the
+    /// in-memory index maps key to code hash only. It is a sub-kilobyte read on
+    /// a path that runs at most once per wakeup, not per message.
+    pub fn registered_params(&self, key: &DelegateKey) -> Option<Parameters<'static>> {
+        // Index-gated for the same trust reason as `fetch_delegate`: a caller's
+        // `DelegateKey` is unverified serde data, and a bare filename lookup
+        // would answer for a key this node never recorded.
+        self.key_to_code_part.get(key)?;
+        let reg_path = self.delegates_dir.join(key.encode()).with_extension("reg");
+        let data = std::fs::read(&reg_path).ok()?;
+        parse_reg_file(&data).map(|(_, params)| params)
+    }
 }
 
 /// Write a .reg registration record file if it doesn't already exist.

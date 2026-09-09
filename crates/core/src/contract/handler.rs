@@ -194,16 +194,27 @@ impl ContractHandler for NetworkContractHandler {
         // Reconciles as it goes: a row whose delegate is no longer registered
         // is deleted rather than restored. Without that, an uninstalled
         // delegate's leases would be replayed on every subsequent boot forever.
+        //
+        // The registered-delegate COUNT is passed so that reconciliation can
+        // fail closed. `DelegateStore::new_with_shared` logs a `warn!` and
+        // continues with an EMPTY index when its ReDb read fails, so without
+        // this a transient index failure is indistinguishable from a mass
+        // uninstall — and the deletion below is irreversible.
         {
             let store = executor.state_store().inner().clone();
             match crate::wasm_runtime::delegate_wakeups::restore(
                 &store,
+                executor.registered_delegate_count(),
                 |key| executor.has_delegate(key),
                 std::time::SystemTime::now(),
                 std::time::Instant::now(),
             ) {
                 Ok(outcome) => {
-                    if outcome.restored > 0 || outcome.orphaned > 0 || outcome.over_cap > 0 {
+                    if outcome.deferred > 0 {
+                        // Already reported at `error!` inside `restore`; nothing
+                        // to add here, and reporting it as a restore would be
+                        // worse than saying nothing.
+                    } else if outcome.restored > 0 || outcome.orphaned > 0 || outcome.over_cap > 0 {
                         tracing::info!(
                             restored = outcome.restored,
                             orphaned = outcome.orphaned,

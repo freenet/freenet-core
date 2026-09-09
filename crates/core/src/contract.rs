@@ -3051,7 +3051,12 @@ async fn handle_delegate_wakeup<CH, P>(
         && park.is_parked(&delegate_key)
     {
         let store = contract_handler.executor().delegate_wakeup_store();
-        if crate::wasm_runtime::delegate_wakeups::defer(store, &due, std::time::SystemTime::now()) {
+        if crate::wasm_runtime::delegate_wakeups::defer(
+            store,
+            &due,
+            crate::wasm_runtime::delegate_wakeups::WAKEUP_PARK_RETRY,
+            std::time::SystemTime::now(),
+        ) {
             tracing::debug!(
                 delegate = %delegate_key,
                 "Delegate is parked; deferred its wakeup rather than clobbering \
@@ -3061,11 +3066,75 @@ async fn handle_delegate_wakeup<CH, P>(
         return;
     }
 
+    // AFFORDABILITY, checked here and not only at admission.
+    //
+    // `schedule` asks "were you solvent when you asked"; it cannot ask "can you
+    // afford what you are about to do", because a run's cost is unknown until
+    // it has happened. Without this second check a delegate holding 16 leases
+    // that all come due together gets 16 runs on one solvency check — 80 s of
+    // loop time against a 1% share that takes over two hours to earn. Deferring
+    // an unaffordable lease makes the overshoot ONE run instead of one per
+    // lease, which is what turns the duty budget into a bound on occupancy
+    // rather than only on the rate of asking.
+    //
+    // Deferred, never dropped: the delegate is not at fault for the node being
+    // busy, and it has no way to learn that a lease it was granted was thrown
+    // away. The wait is the computed repayment time, so it converges rather
+    // than ticking.
+    if let Err(wait) = crate::wasm_runtime::delegate_wakeups::affordability(
+        &delegate_key,
+        std::time::Instant::now(),
+    ) {
+        let store = contract_handler.executor().delegate_wakeup_store();
+        if crate::wasm_runtime::delegate_wakeups::defer(
+            store,
+            &due,
+            wait,
+            std::time::SystemTime::now(),
+        ) {
+            tracing::debug!(
+                delegate = %delegate_key,
+                wait_ms = wait.as_millis(),
+                "Deferred a due delegate wakeup: its unprompted-execution budget is \
+                 in debt, so it waits for the debt to clear rather than running now \
+                 (#3972)"
+            );
+        }
+        return;
+    }
+
     let inbound = vec![InboundDelegateMsg::WakeupFired { tag: due.tag }];
+
+    // THE REGISTERED PARAMS, not empty ones.
+    //
+    // `DelegateKey` identity covers `BLAKE3(code_hash ‖ params)`, and
+    // `DelegateStore::fetch_delegate` resolves the CODE through the index by key
+    // while attaching whatever params the caller supplies — so an empty
+    // `Parameters` here runs a parameterized delegate (the per-user / per-room
+    // shape #5268 re-keyed the module cache for) under a configuration it never
+    // had. It does not fail; it misbehaves quietly, and a wakeup is unprompted,
+    // so there is no client waiting on a wrong answer to notice.
+    //
+    // `handle_delegate_notification` still passes empty params — a known v1
+    // limitation named in `delegate_park::Continuation::params`. Fixing it there
+    // is a behaviour change to #5544's path and belongs in its own change, not
+    // smuggled into this one.
+    let params = contract_handler
+        .executor()
+        .registered_delegate_params(&delegate_key)
+        .unwrap_or_else(|| {
+            // Reachable on executors with no registry (mock, local-only), where
+            // empty is what every other path uses too.
+            tracing::debug!(
+                delegate = %delegate_key,
+                "No registered params for a waking delegate; using empty (#3972)"
+            );
+            Parameters::from(vec![])
+        });
 
     let req = DelegateRequest::ApplicationMessages {
         key: delegate_key.clone(),
-        params: Parameters::from(vec![]),
+        params,
         inbound,
     };
 
@@ -4961,6 +5030,15 @@ mod tests {
             "dispatch_delegate_request",
             "handle_delegate_resume",
             "run_queued_notification",
+            // #3972. Awaited from `contract_handling`'s top-of-loop fire block,
+            // which is on the one loop task per node — the same position as
+            // `handle_delegate_notification`, and the reason a wakeup is
+            // delivered from the loop rather than from the timer that armed it.
+            // A wakeup is the FOURTH route into a delegate and the first that
+            // nothing outside the node triggers, so it is also the one most
+            // likely to be moved off-loop by a later "the timer can just run it
+            // itself" change; that change is what this pin exists to catch.
+            "handle_delegate_wakeup",
         ];
         let mut callers: Vec<&str> = code
             .match_indices(&format!("{chokepoint}("))
@@ -7829,6 +7907,66 @@ mod hol_4391_tests {
     /// TTL — a park with a guard that has already fired, which is exactly the
     /// case the old sentence said could not exist. See
     /// `delegate_park::tests::the_backstop_leaves_a_park_whose_answer_is_already_in_hand`.
+    /// The relation that makes `MAX_WAKEUP_DEFERRALS` a backstop rather than a
+    /// delivery policy (#3972).
+    ///
+    /// A wakeup for a parked delegate is deferred rather than run, and a park
+    /// always terminates at [`delegate_park::PARK_TTL`] — so a park deferral
+    /// never reaches the drop. That is only true while the deferral window
+    /// outlasts the TTL, and "bounded by another module's timeout" is exactly
+    /// the cross-module assumption that rots silently the first time that
+    /// timeout is tuned. This turns the comment into a check: raise `PARK_TTL`
+    /// past the window and CI fails until someone raises the deferral bound
+    /// deliberately.
+    ///
+    /// It lives HERE rather than beside the constants it compares because this
+    /// is the one module that can see both — widening `PARK_TTL`'s visibility
+    /// for a test would be a change to #5544's surface for no other reason.
+    ///
+    /// FALSIFY: set `PARK_TTL` to 200 s, or `MAX_WAKEUP_DEFERRALS` to 8.
+    #[test]
+    fn a_parked_delegates_wakeup_is_never_dropped_before_the_park_is_swept() {
+        use crate::wasm_runtime::delegate_wakeups::{MAX_WAKEUP_DEFERRALS, WAKEUP_PARK_RETRY};
+        let window = WAKEUP_PARK_RETRY * MAX_WAKEUP_DEFERRALS;
+        let ttl = delegate_park::PARK_TTL;
+        assert!(
+            window > ttl,
+            "a wakeup would be DROPPED before its delegate's park is force-resumed: \
+             {MAX_WAKEUP_DEFERRALS} deferrals x {WAKEUP_PARK_RETRY:?} = {window:?}, \
+             but PARK_TTL is {ttl:?}. A dropped wakeup is a delegate that was told \
+             Ok(()), spent a lease, will never run, and cannot find out — raise \
+             MAX_WAKEUP_DEFERRALS rather than letting this ship."
+        );
+    }
+
+    /// The wakeup deadline gets its own `select!` arm, for the same reason
+    /// `park_deadline` does (#5544 B6 / #3972): a timer that only fires when
+    /// unrelated traffic happens to wake the loop is not a timer, and a quiet
+    /// node is both the normal state for a background peer AND precisely what a
+    /// scheduled wakeup exists for.
+    ///
+    /// A POSITION claim, which is all a source scrape can honestly make; that
+    /// the wakeup actually fires on an idle node is carried by
+    /// `tests/delegate_wakeup.rs`, which waits on a real node with no other
+    /// traffic.
+    ///
+    /// FALSIFY: delete either arm, or compute the deadline without awaiting it.
+    #[test]
+    fn the_wakeup_deadline_is_armed_and_the_loop_waits_on_it() {
+        let src = contract_handling_body();
+        let body = src.as_str();
+        assert!(
+            body.contains("delegate_wakeups::next_due_in("),
+            "contract_handling must compute the next wakeup deadline"
+        );
+        assert_eq!(
+            body.matches("tokio::time::sleep_until(deadline)").count(),
+            2,
+            "the idle select! must wait on BOTH the park sweep deadline and the \
+             wakeup deadline; one of them has been removed"
+        );
+    }
+
     #[test]
     fn park_sweep_deadline_is_armed_and_the_loop_waits_on_it() {
         // The loop must consult the deadline, not sweep only on other traffic.

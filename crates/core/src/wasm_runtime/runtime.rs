@@ -1100,6 +1100,19 @@ impl Runtime {
         self.delegate_store.code_hash_from_key(key).is_some()
     }
 
+    /// How many delegates this node has registered. See
+    /// [`DelegateStore::registered_count`] for why the wakeup schedule's boot
+    /// reconciliation needs it.
+    pub(crate) fn registered_delegate_count(&self) -> usize {
+        self.delegate_store.registered_count()
+    }
+
+    /// The parameters `key` was registered with. See
+    /// [`DelegateStore::registered_params`].
+    pub(crate) fn delegate_params(&self, key: &DelegateKey) -> Option<Parameters<'static>> {
+        self.delegate_store.registered_params(key)
+    }
+
     /// Get a clone of the backend engine for sharing with other runtimes.
     pub(crate) fn clone_backend_engine(&self) -> BackendEngine {
         self.engine.clone_backend_engine()

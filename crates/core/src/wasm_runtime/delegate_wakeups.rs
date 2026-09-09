@@ -194,6 +194,22 @@ pub(crate) const DELEGATE_DUTY_BURST_MICROS: u64 = 5_000_000;
 /// letting sustained unprompted work exceed 10%.
 pub(crate) const NODE_DUTY_BURST_MICROS: u64 = 30_000_000;
 
+/// Node credit held back from NEW leases, so a delegate re-arming a lease it
+/// already holds is not starved by the node's total load (#5597 property 4:
+/// "admission of new grants must not be able to starve renewal of existing
+/// ones").
+///
+/// A quarter of the node burst. The asymmetry is the point: a newcomer refused
+/// asks again, while an incumbent refused STOPS — its next run was the thing
+/// that would have re-armed it, so a single badly-timed refusal ends a periodic
+/// job silently and permanently. Those are not the same failure and must not be
+/// priced the same.
+///
+/// It does not weaken the node bound. A renewal still costs the delegate's own
+/// 1% budget, so the reserve cannot be drained by one delegate re-arming in a
+/// loop — it takes as many distinct delegates as the node bound already allows.
+pub(crate) const NODE_RENEWAL_RESERVE_MICROS: u64 = NODE_DUTY_BURST_MICROS / 4;
+
 // ---------------------------------------------------------------------------
 // Refusals.
 // ---------------------------------------------------------------------------
@@ -269,7 +285,20 @@ type Deadline = (u64, u64);
 #[derive(Debug)]
 struct DutyBudget {
     /// Remaining credit, in microseconds of loop occupancy.
-    credit_micros: u64,
+    ///
+    /// **SIGNED, and that is the whole point.** A run is charged after it
+    /// finishes, so a run always overshoots whatever credit remained. If the
+    /// overshoot were discarded (`saturating_sub` to zero) the budget would
+    /// forget every debt the moment it was incurred, and a delegate holding
+    /// [`MAX_WAKEUPS_PER_DELEGATE`] leases could spend 16 x
+    /// `max_execution_seconds` = 80 s of loop time — 133 minutes' worth of a 1%
+    /// share — before anything refused it, because each fire would find a
+    /// budget freshly reset to zero and every schedule between them would see
+    /// credit refilled from zero rather than from -5 s.
+    ///
+    /// Carrying the debt is what makes the fire-time check in
+    /// [`affordability`] bite: the overshoot is then ONE run, not sixteen.
+    credit_micros: i64,
     /// When `credit_micros` was last brought up to date. MONOTONIC on purpose:
     /// a wall-clock jump must not mint credit.
     last_refill: Instant,
@@ -278,7 +307,7 @@ struct DutyBudget {
 impl DutyBudget {
     fn new(burst: u64, now: Instant) -> Self {
         Self {
-            credit_micros: burst,
+            credit_micros: burst as i64,
             last_refill: now,
         }
     }
@@ -293,26 +322,47 @@ impl DutyBudget {
             return;
         }
         self.last_refill = now;
-        let earned = (elapsed.as_micros() as u64) / divisor;
-        self.credit_micros = self.credit_micros.saturating_add(earned).min(burst);
+        let earned = i64::try_from(elapsed.as_micros() / divisor as u128).unwrap_or(i64::MAX);
+        self.credit_micros = self.credit_micros.saturating_add(earned).min(burst as i64);
     }
 
-    /// Whether any credit remains. Admission is "you are not overdrawn", not
-    /// "you can afford the run" — the run's cost is unknown until it happens.
+    /// Whether any credit remains.
     fn has_credit(&self) -> bool {
         self.credit_micros > 0
     }
 
-    /// Charge a completed run.
-    fn charge(&mut self, spent: Duration) {
-        let spent = u64::try_from(spent.as_micros()).unwrap_or(u64::MAX);
-        self.credit_micros = self.credit_micros.saturating_sub(spent);
+    /// How long until this budget is solvent again, at `divisor`'s refill rate.
+    ///
+    /// `ZERO` when it already is. This is what a deferred wakeup waits for, so
+    /// a lease that cannot be afforded is rescheduled for exactly when it can
+    /// be, rather than retried on a fixed tick that is either wasteful or
+    /// wrong.
+    fn time_to_solvency(&self, divisor: u64) -> Duration {
+        if self.credit_micros > 0 {
+            return Duration::ZERO;
+        }
+        let deficit = self.credit_micros.unsigned_abs().saturating_add(1);
+        Duration::from_micros(deficit.saturating_mul(divisor))
+    }
+
+    /// Charge a completed run, carrying the debt.
+    ///
+    /// Debt is floored at one burst. Unbounded debt would let a single
+    /// pathological run (a guest wedged in an uninterruptible host call, #5594)
+    /// disable a delegate for hours; one burst of debt is one burst-worth of
+    /// recovery time, which is proportionate and bounded.
+    fn charge(&mut self, spent: Duration, burst: u64) {
+        let spent = i64::try_from(spent.as_micros()).unwrap_or(i64::MAX);
+        self.credit_micros = self
+            .credit_micros
+            .saturating_sub(spent)
+            .max(-(burst as i64));
     }
 
     /// Whether this budget is indistinguishable from a fresh one, and can
     /// therefore be dropped from the per-delegate map.
     fn is_full(&self, burst: u64) -> bool {
-        self.credit_micros >= burst
+        self.credit_micros >= burst as i64
     }
 }
 
@@ -461,20 +511,27 @@ pub(crate) fn schedule<S: DelegateWakeupPersistence + ?Sized>(
     {
         let mut sched = schedule_lock();
 
-        // 3. Loop occupancy, checked BEFORE the row caps so a delegate that is
-        //    spinning is told it is spinning (`DelegateBudget`) rather than
-        //    that it is full — the two call for different responses and the
-        //    spinner is the case that matters.
-        sched
-            .node_budget
-            .refill(mono, NODE_DUTY_DIVISOR, NODE_DUTY_BURST_MICROS);
-        if !sched.node_budget.has_credit() {
-            tracing::info!(
-                delegate = %delegate.encode(),
-                "Refused a delegate wakeup: the node's unprompted-execution budget is spent (#3972)"
-            );
-            return Err(WakeupRefusal::NodeBudget);
-        }
+        // A RENEWAL — re-arming a tag this delegate already holds — is
+        // recognised before anything else, because it changes what two of the
+        // checks below mean. It takes no new row (it displaces its own), and it
+        // draws on reserved node capacity (see `NODE_RENEWAL_RESERVE_MICROS`).
+        let renewing = sched.index.contains_key(&id);
+
+        // THE CALLER'S OWN RESPONSIBILITY IS CHECKED FIRST, ALWAYS.
+        //
+        // Both dimensions are bounded twice, per delegate and node-wide, and
+        // under contention BOTH bounds can be binding at once. Whichever is
+        // tested first is the code the delegate receives — so testing the node
+        // first would tell a delegate that is over its OWN limit "not your
+        // fault, retry later", which is the single most misleading thing this
+        // interface can say. The distinct codes exist so a delegate can tell
+        // "change what you are doing" from "wait"; getting the priority
+        // backwards hands it the wrong one in exactly the contended case where
+        // the distinction is worth having.
+
+        // 3. Loop occupancy, checked before the row caps: a delegate that is
+        //    spinning should be told it is spinning rather than that it is
+        //    full, because the spinner is the case that matters.
         let has_delegate_credit = match sched.delegate_budgets.get_mut(delegate) {
             Some(budget) => {
                 budget.refill(mono, DELEGATE_DUTY_DIVISOR, DELEGATE_DUTY_BURST_MICROS);
@@ -494,18 +551,36 @@ pub(crate) fn schedule<S: DelegateWakeupPersistence + ?Sized>(
             return Err(WakeupRefusal::DelegateBudget);
         }
 
-        // 2. Rows. A re-arm displaces its own lease, so it is checked against
+        sched
+            .node_budget
+            .refill(mono, NODE_DUTY_DIVISOR, NODE_DUTY_BURST_MICROS);
+        // RENEWAL CAPACITY IS RESERVED (#5597 property 4). A new lease must
+        // leave the reserve intact; a renewal may draw on it. Without this, a
+        // busy node refuses a well-behaved delegate's weekly re-arm on whatever
+        // second it happens to ask, and the delegate simply stops running —
+        // "the newcomer is refused" is the acceptable failure, "the incumbent
+        // silently loses what it had" is not.
+        //
+        // This does not weaken the node bound: a renewal still costs the
+        // delegate's OWN budget, checked above, so the reserve cannot be
+        // drained by one delegate re-arming in a loop.
+        let node_floor: i64 = if renewing {
+            0
+        } else {
+            NODE_RENEWAL_RESERVE_MICROS as i64
+        };
+        if sched.node_budget.credit_micros <= node_floor {
+            tracing::info!(
+                delegate = %delegate.encode(),
+                renewing,
+                "Refused a delegate wakeup: the node's unprompted-execution budget is spent (#3972)"
+            );
+            return Err(WakeupRefusal::NodeBudget);
+        }
+
+        // 2. Rows. A renewal displaces its own lease, so it is checked against
         //    neither cap.
-        let renewing = sched.index.contains_key(&id);
         if !renewing {
-            if sched.index.len() >= MAX_WAKEUPS_PER_NODE {
-                tracing::info!(
-                    delegate = %delegate.encode(),
-                    cap = MAX_WAKEUPS_PER_NODE,
-                    "Refused a delegate wakeup: the node is at its wakeup cap (#3972)"
-                );
-                return Err(WakeupRefusal::NodeFull);
-            }
             let held = sched.per_delegate.get(delegate).copied().unwrap_or(0);
             if held >= MAX_WAKEUPS_PER_DELEGATE {
                 tracing::info!(
@@ -514,6 +589,14 @@ pub(crate) fn schedule<S: DelegateWakeupPersistence + ?Sized>(
                     "Refused a delegate wakeup: this delegate is at its wakeup cap (#3972)"
                 );
                 return Err(WakeupRefusal::DelegateFull);
+            }
+            if sched.index.len() >= MAX_WAKEUPS_PER_NODE {
+                tracing::info!(
+                    delegate = %delegate.encode(),
+                    cap = MAX_WAKEUPS_PER_NODE,
+                    "Refused a delegate wakeup: the node is at its wakeup cap (#3972)"
+                );
+                return Err(WakeupRefusal::NodeFull);
             }
         }
     }
@@ -635,12 +718,21 @@ pub(crate) const WAKEUP_PARK_RETRY: Duration = Duration::from_secs(2);
 
 /// How many times one lease may be deferred before it is dropped.
 ///
-/// A park always terminates — `delegate_park::PARK_TTL` force-resumes it — so
-/// in practice this never binds: 64 deferrals at [`WAKEUP_PARK_RETRY`] is over
-/// two minutes against a 90-second TTL. It exists anyway because "bounded by
-/// another module's timeout" is a cross-module assumption that rots silently
-/// the first time that timeout is tuned, and the failure it would produce is a
-/// lease that never stops rescheduling itself.
+/// **This is a backstop against an unbounded retry, not a delivery policy.**
+/// Dropping a wakeup means a delegate was told `Ok(())`, spent a lease and will
+/// never be woken — the accepted-then-silently-dropped shape this whole code
+/// table exists to avoid — so it must not be reachable in ordinary operation,
+/// and it is not: a park always terminates at `delegate_park::PARK_TTL`, and
+/// `park_deferrals_outlast_the_park_ttl` FAILS if that stops being true.
+///
+/// That test is the difference between this and "bounded by another module's
+/// timeout", which is a cross-module assumption that rots silently the first
+/// time the timeout is tuned. Here, tuning `PARK_TTL` past this window breaks
+/// CI and someone raises this number deliberately.
+///
+/// A budget deferral cannot exhaust it either: that one waits for exactly the
+/// computed repayment time, so it converges in one or two attempts rather than
+/// ticking.
 pub(crate) const MAX_WAKEUP_DEFERRALS: u32 = 64;
 
 /// Put a lease [`take_due`] just returned back into the schedule, later.
@@ -662,23 +754,33 @@ pub(crate) const MAX_WAKEUP_DEFERRALS: u32 = 64;
 /// its own byte accounting, to solve a problem this primitive's own deadline
 /// already solves.
 ///
+/// `after` is how long to wait: [`WAKEUP_PARK_RETRY`] for a park (ride it out),
+/// or the delegate's computed time to solvency for a budget deferral (come back
+/// when you can afford it). A fixed tick would be wrong for the second — it
+/// would either burn attempts or wait far longer than the debt.
+///
 /// Returns `false` if the lease has been deferred [`MAX_WAKEUP_DEFERRALS`]
-/// times and was dropped instead.
+/// times and was dropped instead. That is logged at `error!`, not `debug!`:
+/// `release_max_level_info` compiles `debug!` out, and a wakeup that vanishes
+/// after a delegate was told `Ok(())` is exactly the kind of thing that must
+/// not be invisible in a shipped binary.
 pub(crate) fn defer<S: DelegateWakeupPersistence + ?Sized>(
     db: Option<&S>,
     due: &DueWakeup,
+    after: Duration,
     now: SystemTime,
 ) -> bool {
     if due.attempts >= MAX_WAKEUP_DEFERRALS {
-        tracing::info!(
+        tracing::error!(
             delegate = %due.delegate.encode(),
             attempts = due.attempts,
-            "Dropped a delegate wakeup: its delegate has been parked for every \
-             delivery attempt (#3972)"
+            "Dropped a delegate wakeup after exhausting every delivery attempt. The \
+             delegate was told this wakeup was scheduled and will not receive it \
+             (#3972)"
         );
         return false;
     }
-    let retry_at = to_millis(now).saturating_add(WAKEUP_PARK_RETRY.as_millis() as u64);
+    let retry_at = to_millis(now).saturating_add(after.as_millis() as u64);
 
     // Durable half first, as in `schedule`. A failure here is NOT a refusal —
     // the lease is already granted and there is no caller to tell — so the
@@ -727,15 +829,51 @@ pub(crate) fn charge_run(delegate: &DelegateKey, spent: Duration, mono: Instant)
     sched
         .node_budget
         .refill(mono, NODE_DUTY_DIVISOR, NODE_DUTY_BURST_MICROS);
-    sched.node_budget.charge(spent);
-    sched
+    sched.node_budget.charge(spent, NODE_DUTY_BURST_MICROS);
+    let budget = sched
         .delegate_budgets
         .entry(delegate.clone())
-        .or_insert_with(|| DutyBudget::new(DELEGATE_DUTY_BURST_MICROS, mono))
-        .refill(mono, DELEGATE_DUTY_DIVISOR, DELEGATE_DUTY_BURST_MICROS);
-    if let Some(budget) = sched.delegate_budgets.get_mut(delegate) {
-        budget.charge(spent);
-    }
+        .or_insert_with(|| DutyBudget::new(DELEGATE_DUTY_BURST_MICROS, mono));
+    budget.refill(mono, DELEGATE_DUTY_DIVISOR, DELEGATE_DUTY_BURST_MICROS);
+    budget.charge(spent, DELEGATE_DUTY_BURST_MICROS);
+}
+
+/// Whether a due lease can be RUN right now, and if not, how long until it can.
+///
+/// # Why admission alone is not enough
+///
+/// [`schedule`] checks credit BEFORE a run and [`charge_run`] debits AFTER it,
+/// so admission can only ever ask "were you solvent when you asked", never "can
+/// you afford what you are about to do" — the run's cost is unknowable until it
+/// has happened. A delegate holding [`MAX_WAKEUPS_PER_DELEGATE`] leases that
+/// all come due at once therefore gets 16 runs on the strength of one
+/// solvency check: 80 s of loop time at `max_execution_seconds`, against a 1%
+/// share that takes 133 MINUTES to earn it. "Bounded by the row cap" is true of
+/// that and is not a bound anyone should accept.
+///
+/// This closes it at the other end. A lease whose delegate is in debt is not
+/// run; it is deferred until the debt is repaid, so the overshoot is ONE run
+/// rather than one per lease held. That is what makes the duty budget a bound
+/// on loop occupancy rather than only on the rate of asking.
+///
+/// Returns `Err(wait)` with the LONGER of the node's and the delegate's
+/// recovery times — waiting for the shorter would just defer again.
+pub(crate) fn affordability(delegate: &DelegateKey, mono: Instant) -> Result<(), Duration> {
+    let mut sched = schedule_lock();
+    sched
+        .node_budget
+        .refill(mono, NODE_DUTY_DIVISOR, NODE_DUTY_BURST_MICROS);
+    let node_wait = sched.node_budget.time_to_solvency(NODE_DUTY_DIVISOR);
+    let delegate_wait = match sched.delegate_budgets.get_mut(delegate) {
+        Some(budget) => {
+            budget.refill(mono, DELEGATE_DUTY_DIVISOR, DELEGATE_DUTY_BURST_MICROS);
+            budget.time_to_solvency(DELEGATE_DUTY_DIVISOR)
+        }
+        // No entry is full credit; see `schedule`.
+        None => Duration::ZERO,
+    };
+    let wait = node_wait.max(delegate_wait);
+    if wait.is_zero() { Ok(()) } else { Err(wait) }
 }
 
 /// Release every lease `delegate` holds, in BOTH representations.
@@ -786,6 +924,11 @@ pub(crate) struct RestoreOutcome {
     /// Restored leases whose deadline had already passed, and which were
     /// therefore smeared across [`BOOT_SPREAD`] rather than fired at once.
     pub(crate) overdue: usize,
+    /// Rows left on disk, untouched, because the delegate registry could not be
+    /// trusted to answer "is this delegate gone" — see [`restore`]'s
+    /// `registered_delegates`. Non-zero means this boot deliberately did
+    /// nothing, and the next one will try again.
+    pub(crate) deferred: usize,
 }
 
 /// How widely an overdue backlog is spread at boot.
@@ -802,8 +945,25 @@ pub(crate) const BOOT_SPREAD: Duration = Duration::from_secs(60);
 ///
 /// `is_registered` answers whether a delegate still exists; boot reconciliation
 /// is the only place that question can be asked cheaply for every row at once.
+///
+/// # `registered_delegates`, and why reconciliation FAILS CLOSED
+///
+/// The delete here is irreversible, and its input is a NEGATIVE answer from a
+/// registry that can be empty for two entirely different reasons: this node
+/// really has no delegates, or `DelegateStore::new_with_shared` could not read
+/// the delegate index and logged a `warn!` before continuing with an empty map.
+/// A transient read failure would then look exactly like a mass uninstall, and
+/// this function would delete every wakeup on the node — the same "a read
+/// failure must not be read as 'nothing exists'" trap the wakeup table's own
+/// `Err` handling exists to avoid, arriving through a different door.
+///
+/// So a count of zero means "do not reconcile at all this boot". The cost is a
+/// boot's worth of stale rows on a node that genuinely uninstalled everything,
+/// cleaned up on the next boot; the cost of the other direction is every
+/// delegate's schedule, permanently.
 pub(crate) fn restore<S: DelegateWakeupPersistence + ?Sized>(
     db: &S,
+    registered_delegates: usize,
     is_registered: impl Fn(&DelegateKey) -> bool,
     now: SystemTime,
     mono: Instant,
@@ -812,6 +972,18 @@ pub(crate) fn restore<S: DelegateWakeupPersistence + ?Sized>(
     let mut outcome = RestoreOutcome::default();
     let now_ms = to_millis(now);
     let spread_ms = BOOT_SPREAD.as_millis() as u64;
+
+    if registered_delegates == 0 && !rows.is_empty() {
+        outcome.deferred = rows.len();
+        tracing::error!(
+            rows = rows.len(),
+            "Deferred delegate-wakeup reconciliation: this node has wakeup rows but no \
+             registered delegates, which is either a mass uninstall or a delegate index \
+             that failed to load. Nothing was restored or deleted; the next boot will \
+             try again (#3972)"
+        );
+        return Ok(outcome);
+    }
 
     let mut sched = schedule_lock();
     for (delegate, tag, due) in rows {
@@ -936,13 +1108,13 @@ pub(crate) mod test_support {
     }
 
     /// Remaining node loop-occupancy credit, in microseconds.
-    pub(crate) fn node_credit_micros() -> u64 {
+    pub(crate) fn node_credit_micros() -> i64 {
         schedule_lock().node_budget.credit_micros
     }
 
     /// Remaining per-delegate credit, or `None` if the delegate has no entry
     /// (which is equivalent to full credit).
-    pub(crate) fn delegate_credit_micros(delegate: &DelegateKey) -> Option<u64> {
+    pub(crate) fn delegate_credit_micros(delegate: &DelegateKey) -> Option<i64> {
         schedule_lock()
             .delegate_budgets
             .get(delegate)
@@ -952,6 +1124,12 @@ pub(crate) mod test_support {
     /// How many delegates hold a budget entry. Used to pin the GC.
     pub(crate) fn budget_entries() -> usize {
         schedule_lock().delegate_budgets.len()
+    }
+
+    /// Set the node's credit directly, so a reserve or debt condition can be
+    /// provoked without burning wall clock.
+    pub(crate) fn set_node_credit(micros: i64) {
+        schedule_lock().node_budget.credit_micros = micros;
     }
 
     /// Drain the node's credit so a budget refusal can be provoked.
@@ -1334,7 +1512,11 @@ mod tests {
             Duration::from_micros(DELEGATE_DUTY_BURST_MICROS + 1),
             mono,
         );
-        assert_eq!(test_support::delegate_credit_micros(&key(1)), Some(0));
+        assert_eq!(
+            test_support::delegate_credit_micros(&key(1)),
+            Some(-1),
+            "the overshoot is CARRIED as debt, not discarded — see DutyBudget::credit_micros"
+        );
         assert!(test_support::node_credit_micros() > 0);
 
         assert_eq!(
@@ -1409,7 +1591,7 @@ mod tests {
         );
         assert_eq!(
             test_support::delegate_credit_micros(&key(1)),
-            Some(60_000_000 / DELEGATE_DUTY_DIVISOR)
+            Some(60_000_000i64 / DELEGATE_DUTY_DIVISOR as i64)
         );
     }
 
@@ -1526,7 +1708,7 @@ mod tests {
             let mut due = take_due(Some(&db), clock, 10);
             assert_eq!(due.len(), 1, "the lease should still be in hand");
             let wakeup = due.remove(0);
-            if !defer(Some(&db), &wakeup, clock) {
+            if !defer(Some(&db), &wakeup, WAKEUP_PARK_RETRY, clock) {
                 break;
             }
             deferrals += 1;
@@ -1556,7 +1738,7 @@ mod tests {
         let due = take_due(Some(&db), clock, 10).remove(0);
         assert_eq!(test_support::outstanding(), 0);
 
-        assert!(defer(Some(&db), &due, clock));
+        assert!(defer(Some(&db), &due, WAKEUP_PARK_RETRY, clock));
         assert_eq!(
             test_support::outstanding_for(&key(1)),
             1,
@@ -1579,7 +1761,7 @@ mod tests {
         );
         let clock = now + Duration::from_secs(2);
         let due = take_due(Some(&db), clock, 10).remove(0);
-        assert!(defer(Some(&db), &due, clock));
+        assert!(defer(Some(&db), &due, WAKEUP_PARK_RETRY, clock));
 
         // The delegate re-arms the same tag itself. That is a NEW lease, not a
         // continuation of the one that kept missing its delegate.
@@ -1644,7 +1826,7 @@ mod tests {
         db.seed(&live, b"weekly", to_millis(now) + 600_000);
         db.seed(&gone, b"orphan", to_millis(now) + 600_000);
 
-        let outcome = restore(&db, |k| k == &live, now, mono).expect("restore should read");
+        let outcome = restore(&db, 1, |k| k == &live, now, mono).expect("restore should read");
         assert_eq!(outcome.restored, 1);
         assert_eq!(outcome.orphaned, 1);
         assert_eq!(test_support::outstanding_for(&live), 1);
@@ -1664,7 +1846,7 @@ mod tests {
         for i in 0..8 {
             db.seed(&d, format!("t{i}").as_bytes(), to_millis(now) - 86_400_000);
         }
-        let outcome = restore(&db, |_| true, now, mono).expect("restore should read");
+        let outcome = restore(&db, 1, |_| true, now, mono).expect("restore should read");
         assert_eq!(outcome.restored, 8);
         assert_eq!(outcome.overdue, 8);
         // Not all at `now`: a node down for a day must not boot into its whole
@@ -1689,7 +1871,7 @@ mod tests {
         // The distinction that matters: `Ok(empty)` here would be
         // indistinguishable from a clean boot while silently losing every
         // delegate's timer.
-        assert!(restore(&broken, |_| true, now, mono).is_err());
+        assert!(restore(&broken, 1, |_| true, now, mono).is_err());
     }
 
     #[test]
@@ -1806,6 +1988,267 @@ mod tests {
             "a larger divisor is a smaller share"
         );
         assert!(DELEGATE_DUTY_BURST_MICROS < NODE_DUTY_BURST_MICROS);
+    }
+
+    // -----------------------------------------------------------------------
+    // Which refusal wins when BOTH bounds bind.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_delegate_at_its_own_cap_on_a_full_node_is_told_it_is_at_its_own_cap() {
+        let (db, now, mono) = fresh();
+        // Fill the node to its cap, giving key(0) a full personal allocation
+        // too, so BOTH bounds bind at once for that delegate.
+        let per = MAX_WAKEUPS_PER_DELEGATE;
+        for d in 0..(MAX_WAKEUPS_PER_NODE / per) {
+            for i in 0..per {
+                assert_eq!(
+                    schedule(
+                        Some(&db),
+                        &key(d as u8),
+                        format!("tag-{i}").as_bytes(),
+                        Duration::from_secs(3600),
+                        now,
+                        mono
+                    ),
+                    Ok(())
+                );
+            }
+        }
+        assert_eq!(test_support::outstanding(), MAX_WAKEUPS_PER_NODE);
+        assert_eq!(test_support::outstanding_for(&key(0)), per);
+
+        // The ONE assertion this test exists for. Both caps are binding; the
+        // delegate must be told the one that is ITS fault, because that is the
+        // one it can act on. Telling it "the node is full" — blameless, retry
+        // later — would have it retry forever against a limit that is its own.
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(0),
+                b"mine",
+                Duration::from_secs(3600),
+                now,
+                mono
+            ),
+            Err(WakeupRefusal::DelegateFull),
+            "when both bounds bind, the caller's OWN limit is the one reported"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_delegate_in_debt_on_a_node_in_debt_is_told_about_its_own_debt() {
+        let (db, now, mono) = fresh();
+        // Put BOTH budgets into debt with one very expensive run.
+        charge_run(
+            &key(1),
+            Duration::from_micros(NODE_DUTY_BURST_MICROS * 2),
+            mono,
+        );
+        assert!(test_support::node_credit_micros() <= 0);
+        assert!(test_support::delegate_credit_micros(&key(1)).unwrap() <= 0);
+
+        assert_eq!(
+            schedule(Some(&db), &key(1), b"t", Duration::from_secs(60), now, mono),
+            Err(WakeupRefusal::DelegateBudget),
+            "when both budgets are spent, the delegate is told about ITS OWN — the \
+             only one it can do anything about"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Renewal capacity is reserved (#5597 property 4).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_renewal_is_admitted_from_reserved_node_capacity_that_refuses_a_new_lease() {
+        let (db, now, mono) = fresh();
+        let incumbent = key(1);
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &incumbent,
+                b"weekly",
+                Duration::from_secs(60),
+                now,
+                mono
+            ),
+            Ok(())
+        );
+
+        // Drive the node's credit into the reserve band: positive, but at or
+        // below the floor a NEW lease must leave intact.
+        test_support::set_node_credit(NODE_RENEWAL_RESERVE_MICROS as i64);
+
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(2),
+                b"newcomer",
+                Duration::from_secs(60),
+                now,
+                mono
+            ),
+            Err(WakeupRefusal::NodeBudget),
+            "a NEW lease must not eat the renewal reserve"
+        );
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &incumbent,
+                b"weekly",
+                Duration::from_secs(604_800),
+                now,
+                mono
+            ),
+            Ok(()),
+            "the incumbent's re-arm draws on the reserve: a newcomer refused asks \
+             again, while an incumbent refused STOPS — its next run was what would \
+             have re-armed it"
+        );
+        assert_eq!(test_support::outstanding_for(&incumbent), 1);
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn the_reserve_does_not_exempt_a_renewal_from_its_own_budget() {
+        let (db, now, mono) = fresh();
+        let spinner = key(1);
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &spinner,
+                b"loop",
+                Duration::from_secs(60),
+                now,
+                mono
+            ),
+            Ok(())
+        );
+        // The delegate spends its own allowance. The node still has plenty.
+        charge_run(
+            &spinner,
+            Duration::from_micros(DELEGATE_DUTY_BURST_MICROS + 1),
+            mono,
+        );
+        assert!(test_support::node_credit_micros() > NODE_RENEWAL_RESERVE_MICROS as i64);
+
+        // Without this, the reserve would be a hole: a delegate re-arming in a
+        // tight loop is exactly a renewal, and exempting renewals outright would
+        // remove the only bound on it.
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &spinner,
+                b"loop",
+                Duration::from_secs(60),
+                now,
+                mono
+            ),
+            Err(WakeupRefusal::DelegateBudget),
+            "a renewal draws on reserved NODE capacity, never on a waiver of its own"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The fire-time affordability check, which is what bounds the overshoot.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_run_is_charged_as_debt_so_the_next_one_is_not_affordable() {
+        let (_db, _now, mono) = fresh();
+        let d = key(1);
+        assert_eq!(affordability(&d, mono), Ok(()), "a fresh delegate can run");
+
+        // One `max_execution_seconds` run against a 5 s burst leaves it just
+        // solvent; a second puts it in debt. Were the debt discarded at zero,
+        // 16 leases would each find a budget freshly reset and the delegate
+        // would get 16 x 5 s = 80 s of loop time on one solvency check.
+        charge_run(&d, Duration::from_secs(5), mono);
+        charge_run(&d, Duration::from_secs(5), mono);
+        let wait = affordability(&d, mono).expect_err("a delegate in debt must not run");
+        assert!(
+            wait >= Duration::from_secs(400),
+            "the wait must be the real repayment time (5 s of debt at 1% is ~500 s), \
+             got {wait:?}"
+        );
+
+        // And it recovers on its own, at the stated rate.
+        assert_eq!(affordability(&d, mono + wait), Ok(()));
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn debt_is_bounded_so_one_pathological_run_cannot_disable_a_delegate_for_hours() {
+        let (_db, _now, mono) = fresh();
+        let d = key(1);
+        // A guest wedged in an uninterruptible host call (#5594) can be charged
+        // far more than its budget. The debt floor is what stops that becoming
+        // an unbounded ban.
+        charge_run(&d, Duration::from_secs(3600), mono);
+        assert_eq!(
+            test_support::delegate_credit_micros(&d),
+            Some(-(DELEGATE_DUTY_BURST_MICROS as i64))
+        );
+        let wait = affordability(&d, mono).expect_err("still in debt");
+        assert!(
+            wait <= Duration::from_secs(510),
+            "recovery must stay proportionate to one burst, got {wait:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_node_in_debt_defers_every_delegate_including_a_solvent_one() {
+        let (_db, _now, mono) = fresh();
+        let innocent = key(7);
+        test_support::set_node_credit(-1_000_000);
+        assert!(
+            affordability(&innocent, mono).is_err(),
+            "loop occupancy is a node resource; a solvent delegate still waits for it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Deferral bounds.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_budget_deferral_waits_for_the_debt_rather_than_ticking() {
+        let (db, now, mono) = fresh();
+        let d = key(1);
+        assert_eq!(
+            schedule(Some(&db), &d, b"t", Duration::from_secs(1), now, mono),
+            Ok(())
+        );
+        let clock = now + Duration::from_secs(2);
+        let due = take_due(Some(&db), clock, 10).remove(0);
+
+        charge_run(&d, Duration::from_secs(5), mono);
+        charge_run(&d, Duration::from_secs(5), mono);
+        let wait = affordability(&d, mono).expect_err("in debt");
+        assert!(defer(Some(&db), &due, wait, clock));
+
+        // One wait, not `wait / WAKEUP_PARK_RETRY` attempts — which at a 2 s
+        // tick would be 250 of them against a bound of 64, i.e. a dropped
+        // wakeup.
+        //
+        // Compared in MILLISECONDS because that is the resolution a durable
+        // deadline has: `persist_wakeup` stores ms since the epoch, so the
+        // sub-millisecond tail of `wait` is not something the schedule can
+        // represent, and asserting on it would be asserting on the test's
+        // arithmetic rather than on the behaviour.
+        let scheduled = next_due_in(clock).expect("the lease is back in the schedule");
+        assert_eq!(scheduled.as_millis(), wait.as_millis());
+        assert!(
+            scheduled >= WAKEUP_PARK_RETRY * 10,
+            "a budget deferral must wait for the DEBT, not tick at the park interval"
+        );
     }
 
     #[test]
