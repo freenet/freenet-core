@@ -46,6 +46,7 @@ A GUARD THAT CATCHES SOMETHING ON ITS FIRST RUN IS TELLING YOU THE CLASS IS
 MORE COMMON THAN YOU THOUGHT, not that you got unlucky once.
 """
 import atexit
+import re
 import os
 import signal
 import subprocess
@@ -134,19 +135,73 @@ class Tree:
             p.write_bytes(content)
 
 
+#: `cargo test -- <filter>` prints a full, cheerful summary line when the filter
+#: matches NOTHING:
+#:
+#:     test result: ok. 0 passed; 0 failed; 5588 filtered out
+#:
+#: which is textually indistinguishable from a real pass. A test renamed after a
+#: case was written therefore reports GREEN forever with zero tests executed.
+#: That is worst for the cases that EXPECT green -- the "documented limit,
+#: demonstrated rather than asserted" evidence -- because a rename there
+#: silently converts "watched to fail" back into "assumed", which is the exact
+#: thing this whole harness exists to stop.
+_RESULT = re.compile(r"test result: (\w+)\. (\d+) passed; (\d+) failed")
+
+
 def run_tests(tests):
+    """Run the named tests and classify. NO TESTS RUN IS NOT A PASS.
+
+    Verdicts key on the `test result:` line rather than on `"error:" in output`.
+    `cargo test` prints `error: test failed` for a FAILING TEST, so an
+    `error:`-keying classifier reports kills as compile breaks. Two people wrote
+    that same broken classifier independently here, which makes it a trap rather
+    than a mistake.
+    """
     r = subprocess.run(
         ["cargo", "test", "-p", "freenet", "--lib", "--"] + tests,
         cwd=WORKTREE, capture_output=True, text=True,
     )
     out = r.stdout + r.stderr
+    ran = sum(int(m[1]) + int(m[2]) for m in _RESULT.findall(out))
     if "test result: FAILED" in out:
         return "RED"
     if "error[" in out or "error: could not compile" in out:
         return "COMPILE ERROR"
     if "test result: ok" in out:
-        return "GREEN"
-    return "UNKNOWN"
+        # A filter that matched nothing. Never GREEN: green here would mean
+        # "the property held" when what happened is "nobody asked".
+        return "GREEN" if ran else "NO TESTS RAN"
+    # A non-unwinding panic (a null deref, say) ABORTS the process, so cargo
+    # prints no `test result:` line at all. That is a kill, not a mystery.
+    return "ABORTED (counts as RED)" if "error: test failed" in out else "UNKNOWN"
+
+
+def preflight(cases):
+    """Refuse to start if any named test does not exist EXACTLY once.
+
+    Checked before the first mutation rather than discovered as a suspicious
+    row, because the failure this prevents does not look like a failure: the
+    case reports its expected verdict having executed nothing. Catching it at
+    the start also costs one grep instead of a compile.
+    """
+    src = []
+    for path in (WORKTREE / "crates" / "core" / "src").rglob("*.rs"):
+        src.append(path.read_text(errors="replace"))
+    blob = "\n".join(src)
+    missing = []
+    for case in cases:
+        for name in case[4]:
+            n = blob.count(f"fn {name}(")
+            if n != 1:
+                missing.append((name, n))
+    if missing:
+        raise SystemExit(
+            "PREFLIGHT FAILED, no mutation applied. These test names do not "
+            "resolve to exactly one definition, so their cases would run zero "
+            "tests and report their expected verdict anyway:\n"
+            + "\n".join(f"  {name}: {n} definitions" for name, n in missing)
+        )
 
 
 def campaign(tree, cases, sha):

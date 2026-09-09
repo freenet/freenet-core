@@ -319,10 +319,12 @@ pub(super) fn parked_budget_for(total_ram: usize) -> usize {
 /// there unbounded. That is pre-existing — a park refused at admission already
 /// went that way — but this adds a second route to it, so it is stated rather
 /// than discovered. Deferring to a bound that does not exist is the same defect
-/// as the transient-peak claim corrected above, and #5607 covers both paths. It is not a failure, and it must not become one — an over-allowance
-/// fetch used to return `Err`, which failed a write that would have succeeded
-/// had the park been REFUSED instead of admitted, so whether a delegate's write
-/// worked depended on how many other delegates were parked.
+/// as the transient-peak claim corrected above, and #5607 covers both paths.
+///
+/// EXCEEDING THE ALLOWANCE IS NOT A FAILURE, and it must not become one. An
+/// over-allowance fetch used to return `Err`, which failed a write that would
+/// have succeeded had the park been REFUSED instead of admitted, so whether a
+/// delegate's write worked depended on how many other delegates were parked.
 ///
 /// RESERVED AT ADMISSION (see [`task_bytes`]) and ENFORCED WHEN THE FETCH
 /// COMPLETES (see `contract::within_fetch_allowance`), so retained bytes can

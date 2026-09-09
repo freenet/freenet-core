@@ -1370,7 +1370,38 @@ pub(crate) fn delta_budget_for(total_ram: usize, pool_size: usize) -> usize {
 /// test now checks the ACTUAL formula the resident-overhead budget composes
 /// against, not a second, potentially-drifting re-derivation of it.
 pub(crate) fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> usize {
-    // PER-EXECUTOR — multiplied by the pool.
+    declared_cache_ceiling_terms(memory_limit, pool_size)
+        .into_iter()
+        .map(|(_, bytes)| bytes)
+        .sum()
+}
+
+/// The labelled terms [`declared_cache_ceiling`] sums, in the order it sums
+/// them.
+///
+/// THE LABELS ARE WHY THIS IS A SLICE RATHER THAN AN EXPRESSION, and the reason
+/// is a defect the guard on it could not see.
+/// `declared_cache_ceiling_discovers_every_budget` asked whether a budget's
+/// NAME occurred anywhere in this function's source text. That is textual
+/// presence, not membership of the total: deleting `+ parked` from the sum
+/// while leaving `let parked = parked_budget_for(memory_limit);` above it
+/// compiles, because an unused `let` is a warning and `-D warnings` applies to
+/// clippy rather than to this build. The guard stayed GREEN, because the name
+/// was still there.
+///
+/// That is this change's own headline defect one level up. "A budget that
+/// exists and is not in the aggregate" became "a budget that is COMPUTED and
+/// not summed", inside the guard written to catch the first one.
+///
+/// A term reaches the total only by appearing in the returned slice, so a test
+/// that reads these labels is asserting about values that actually entered the
+/// sum. Both guards do that now instead of scraping this text, which is also
+/// why neither of them anchors on a signature any more.
+pub(crate) fn declared_cache_ceiling_terms(
+    memory_limit: usize,
+    pool_size: usize,
+) -> Vec<(&'static str, usize)> {
+    // PER-EXECUTOR — multiplied by the pool below.
     let summary = summary_budget_for(memory_limit, pool_size);
     let delta = delta_budget_for(memory_limit, pool_size);
     // One wasmtime Store per executor, each holding retired-instance bytes up
@@ -1403,13 +1434,29 @@ pub(crate) fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> u
     // out of the test module in the first place.
     let parked = crate::contract::delegate_park::parked_budget_for(memory_limit);
 
-    pool_size * (summary + delta + arena)
-        + contract_modules
-        + delegate_modules
-        + source_code
-        + interest_delta
-        + page_cache
-        + parked
+    vec![
+        // The pool multiplication IS #5268's defect 3.
+        // `declared_cache_ceiling_names_every_budget` checks it by scaling
+        // `pool_size` and observing these three terms scale with it, rather
+        // than by matching the multiplication as source text.
+        ("summary_budget_for", pool_size * summary),
+        ("delta_budget_for", pool_size * delta),
+        ("store_arena_budget_for", pool_size * arena),
+        ("budget_for_ram", contract_modules),
+        // Labelled by the DIVISOR because the delegate module cache has no
+        // budget function of its own: it is a fraction of the contract module
+        // cache, and that constant is the only name a reader can grep for.
+        ("DELEGATE_MODULE_CACHE_BUDGET_DIVISOR", delegate_modules),
+        ("SOURCE_CODE_CACHE_MAX_BYTES", source_code),
+        ("interest_delta_budget_for", interest_delta),
+        // Zero when the `redb` feature is off, and the LABEL is still present
+        // in that build on purpose: dropping it would make the discovery guard
+        // demand a `NOT_SUMMED` entry that is wrong in the default build.
+        // `nonzero_terms` below carries the exemption instead, where it is
+        // written down.
+        ("page_cache_size_for", page_cache),
+        ("parked_budget_for", parked),
+    ]
 }
 
 /// Fallback total-RAM estimate (1 GiB) when the OS query fails — mirrors the
@@ -1807,37 +1854,11 @@ mod tests {
     /// added there.
     #[test]
     fn declared_cache_ceiling_names_every_budget() {
-        const FULL: &str = include_str!("executor.rs");
-        // Built by concatenation so this pin's own copy of the anchor is NOT a
-        // verbatim match for it. A scrape whose anchor can match its own source
-        // silently re-scopes to a later occurrence and passes vacuously — the
-        // failure mode `.claude/rules/bug-prevention-patterns.md` records twice
-        // (#5102). The uniqueness assertion below is what makes that fail loudly
-        // instead: if the signature ever appears twice, or not at all, this stops.
-        let anchor = format!(
-            "fn declared_cache_ceiling(memory_limit: usize, {}",
-            "pool_size: usize) -> usize {"
-        );
-        assert_eq!(
-            FULL.matches(&anchor).count(),
-            1,
-            "the scrape anchor must occur EXACTLY once in this file; a second \
-             occurrence would let the pin scope itself to the wrong region"
-        );
-        let after = FULL.split(&anchor).nth(1).expect("anchor just counted");
-        // `declared_cache_ceiling` is a top-level (0-indent) function — #5333
-        // promoted it out of `mod tests` into production code — so it closes
-        // with `\n}` at column 0, not a nested method's `\n    }`. Require it,
-        // rather than letting a missing end anchor widen the region to EOF.
-        let body = after
-            .split_once("\n}")
-            .expect("could not locate the end of declared_cache_ceiling")
-            .0;
-        assert!(
-            !body.contains("\npub") && !body.contains("\nfn ") && !body.contains("\nconst "),
-            "the scoped region escaped past declared_cache_ceiling into a \
-             sibling item — this pin would pass vacuously"
-        );
+        // ONE GIB, FOUR WORKERS: a representative host, and the same figures
+        // the aggregate-safety test uses.
+        const ONE_GIB: usize = 1024 * 1024 * 1024;
+        let terms = declared_cache_ceiling_terms(ONE_GIB, 4);
+        let labels: Vec<&str> = terms.iter().map(|(label, _)| *label).collect();
 
         for required in [
             // per-executor, multiplied by the pool
@@ -1853,17 +1874,86 @@ mod tests {
             "parked_budget_for",
         ] {
             assert!(
-                body.contains(required),
+                labels.contains(&required),
                 "declared_cache_ceiling must include `{required}` in the aggregate \
                  it claims to sum; without it the bound passes while measuring less \
-                 than the node actually commits"
+                 than the node actually commits. Summed: {labels:?}"
             );
         }
-        assert!(
-            body.contains("pool_size * (summary + delta + arena)"),
-            "the per-executor terms must be multiplied by the pool size — that \
-             product IS defect 3"
-        );
+
+        // THE PER-EXECUTOR TERMS MUST CARRY THE POOL MULTIPLICATION, measured
+        // rather than matched. This used to assert the source text contained
+        // `pool_size * (summary + delta + arena)`, which is a true statement
+        // about characters and says nothing about the number returned: the same
+        // class of defect as the sibling guard's `body.contains(name)`. That
+        // product IS #5268's defect 3 -- the node commits `pool_size` copies
+        // while the ceiling declares one -- so it is worth checking as
+        // arithmetic.
+        //
+        // NOT "doubling the pool doubles the term". These three budget
+        // functions take `pool_size` THEMSELVES and split an envelope by it,
+        // then clamp, so the per-executor figure shrinks as the pool grows and
+        // the product is deliberately not linear. Measured: `delta_budget_for`
+        // gives 67108864 at pool 1 and 89478484 at pool 2. An earlier version
+        // of this assertion demanded exact doubling and failed on real values,
+        // which is the right way round for a guess to be wrong.
+        //
+        // WHAT THIS CATCHES, stated so nobody reads it as stronger than it is:
+        // the multiplication being dropped, or applied to the wrong term. It
+        // does NOT independently verify the budget functions themselves; each
+        // has its own tests, and re-deriving them here would only prove this
+        // test agrees with itself.
+        const POOL: usize = 4;
+        let terms = declared_cache_ceiling_terms(ONE_GIB, POOL);
+        let value = |terms: &[(&str, usize)], label: &str| -> usize {
+            terms
+                .iter()
+                .find(|(l, _)| *l == label)
+                .map(|(_, bytes)| *bytes)
+                .unwrap_or_else(|| panic!("`{label}` must be a summed term"))
+        };
+        for (label, per_executor) in [
+            ("summary_budget_for", summary_budget_for(ONE_GIB, POOL)),
+            ("delta_budget_for", delta_budget_for(ONE_GIB, POOL)),
+            (
+                "store_arena_budget_for",
+                crate::wasm_runtime::engine::store_arena_budget_for(ONE_GIB, POOL),
+            ),
+        ] {
+            assert_eq!(
+                value(&terms, label),
+                POOL * per_executor,
+                "`{label}` is PER-EXECUTOR, so the aggregate must count \
+                 `pool_size` of them. Declaring one copy of a budget the node \
+                 commits {POOL} times is #5268's defect 3, and hosting derives \
+                 its residual from this sum"
+            );
+        }
+
+        // ...and the node-wide ones must NOT be multiplied. Over-declaring
+        // starves hosting's residual instead of over-granting it: wrong in the
+        // safe direction, still wrong, and silent either way.
+        for (label, node_wide) in [
+            (
+                "budget_for_ram",
+                crate::wasm_runtime::budget_for_ram(ONE_GIB),
+            ),
+            (
+                "interest_delta_budget_for",
+                crate::ring::interest::interest_delta_budget_for(ONE_GIB),
+            ),
+            (
+                "parked_budget_for",
+                crate::contract::delegate_park::parked_budget_for(ONE_GIB),
+            ),
+        ] {
+            assert_eq!(
+                value(&terms, label),
+                node_wide,
+                "`{label}` is NODE-WIDE, one per node and shared by every \
+                 executor, so the aggregate must count it once"
+            );
+        }
     }
 
     /// The margin the aggregate passes by, asserted rather than assumed.
@@ -1911,7 +2001,6 @@ mod tests {
         );
     }
 
-    /// The other half of `declared_cache_ceiling_names_every_budget`, and the
     /// The other half of `declared_cache_ceiling_names_every_budget`, and the
     /// half that was missing: that one catches a summed budget being REMOVED;
     /// this one catches a new one being ADDED and not summed.
@@ -1967,9 +2056,26 @@ mod tests {
     /// caught by none of the three. Narrower than what rule 3 closed, but real
     /// — do not read the three rules as exhaustive.
     ///
-    /// FALSIFY by adding a tenth module-scope `*_BYTES` constant anywhere under
-    /// `crates/core/src` without summing it or listing it below. Verified by
-    /// doing exactly that.
+    /// WHAT IT ASKS, and what it used to ask instead. It reads the LABELS of
+    /// `declared_cache_ceiling_terms`, so "is this budget in the aggregate?" is
+    /// answered by the slice the total is summed from. It used to ask whether
+    /// the budget's name appeared anywhere in the scraped text of
+    /// `declared_cache_ceiling`, which is a different question with the same
+    /// answer most of the time: deleting `+ parked` from the sum while leaving
+    /// `let parked = parked_budget_for(memory_limit);` above it compiles, and
+    /// this guard stayed GREEN. That is the very defect the change leads with
+    /// ("a budget that exists and is not in the aggregate") reproduced one
+    /// level up as "a budget that is COMPUTED and not summed", inside the guard
+    /// written to catch it. Found in review, not by this test.
+    ///
+    /// FALSIFY three ways, all verified by doing them:
+    ///  * add a tenth module-scope `*_BYTES` constant anywhere under
+    ///    `crates/core/src` without summing it or listing it below;
+    ///  * delete a `(label, value)` entry from `declared_cache_ceiling_terms`
+    ///    while leaving its `let` binding in place — the case the old scrape
+    ///    could not see;
+    ///  * keep the label and zero its value, which is the same hole one
+    ///    indirection later and is why the non-zero check exists.
     #[test]
     fn declared_cache_ceiling_discovers_every_budget() {
         /// Budgets deliberately NOT in the aggregate, each with the reason.
@@ -2039,7 +2145,8 @@ mod tests {
             ("MIN_PARKED_BYTES", "clamp inside parked_budget_for"),
             (
                 "ELEMENT_OVERHEAD_BYTES",
-                "per-element overhead CHARGED AGAINST MAX_PARKED_BYTES, which is summed",
+                "per-element overhead CHARGED AGAINST the park budget, which is summed \
+                 via parked_budget_for",
             ),
             // Per-request / per-message limits. Bounded and released within one
             // operation, so they are not memory the node holds resident.
@@ -2089,23 +2196,67 @@ mod tests {
                 "IS the sum; including it would be self-referential",
             ),
             (
+                "declared_cache_ceiling_terms",
+                "IS the sum's term list; including it would be self-referential",
+            ),
+            (
                 "resident_overhead_budget_for",
                 "the CONSUMER of this aggregate; summing it would be circular",
             ),
         ];
 
-        // The scoped body of `declared_cache_ceiling`, by the same anchoring the
-        // sibling test uses and for the same reasons.
-        const FULL: &str = include_str!("executor.rs");
-        let anchor = format!(
-            "fn declared_cache_ceiling(memory_limit: usize, {}",
-            "pool_size: usize) -> usize {"
-        );
-        let after = FULL.split(&anchor).nth(1).expect("anchor must exist");
-        let body = after
-            .split_once("\n}")
-            .expect("could not locate the end of declared_cache_ceiling")
-            .0;
+        // WHAT THE SUM ACTUALLY CONSUMED, not what its source text mentions.
+        //
+        // This read `body.contains(name)` against the scraped text of
+        // `declared_cache_ceiling` until a reviewer pointed out that textual
+        // presence is not membership of the total: deleting `+ parked` from
+        // the sum while leaving `let parked = parked_budget_for(memory_limit);`
+        // in place compiles and left this guard GREEN, because the name was
+        // still in the body. "A budget that exists and is not in the
+        // aggregate" is the defect this whole change leads with; "a budget
+        // that is COMPUTED and not summed" is the same defect one level up,
+        // sitting inside the guard written to catch it.
+        //
+        // `declared_cache_ceiling_terms` exists so that this question has a
+        // real answer. A term reaches the total only by being in that slice.
+        const ONE_GIB: usize = 1024 * 1024 * 1024;
+        let terms = declared_cache_ceiling_terms(ONE_GIB, 4);
+        let summed: std::collections::BTreeSet<&str> =
+            terms.iter().map(|(label, _)| *label).collect();
+
+        // A LABEL WITH A ZEROED VALUE IS THE NEXT VERSION OF THE SAME HOLE.
+        // Keeping `("parked_budget_for", 0)` would satisfy every membership
+        // check above while contributing nothing to the aggregate hosting
+        // derives its residual from, so require each term to be non-zero on a
+        // representative host. The one legitimate zero is written down rather
+        // than tolerated by a `>= 0`.
+        const LEGITIMATELY_ZERO: &[(&str, &str)] = &[(
+            "page_cache_size_for",
+            "zero when the `redb` feature is off; the label stays so the \
+             discovery check below does not demand a NOT_SUMMED entry that \
+             would be wrong in the default build",
+        )];
+        for (label, bytes) in &terms {
+            if *bytes > 0 {
+                continue;
+            }
+            assert!(
+                LEGITIMATELY_ZERO.iter().any(|(l, _)| l == label),
+                "`{label}` is summed by `declared_cache_ceiling` but contributes \
+                 ZERO bytes on a 1 GiB / 4-worker host. A term present as a label \
+                 and absent from the total is the same defect as one missing \
+                 altogether, one indirection later. If the zero is deliberate, \
+                 add it to LEGITIMATELY_ZERO with the reason."
+            );
+        }
+        for (label, reason) in LEGITIMATELY_ZERO {
+            assert!(
+                summed.contains(label),
+                "LEGITIMATELY_ZERO excuses `{label}` ({reason}) but nothing by \
+                 that name is summed any more — a stale exemption is how this \
+                 table stops describing the code it constrains"
+            );
+        }
 
         // Walk the crate's sources.
         fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -2200,7 +2351,7 @@ mod tests {
         );
 
         for name in &found {
-            if body.contains(name.as_str()) {
+            if summed.contains(name.as_str()) {
                 continue;
             }
             assert!(

@@ -35,7 +35,7 @@ Usage:
 import subprocess
 import sys
 
-from park_mutation_harness import Tree, WORKTREE, campaign
+from park_mutation_harness import Tree, WORKTREE, campaign, preflight
 
 PARK = "crates/core/src/contract/delegate_park.rs"
 CONTRACT = "crates/core/src/contract.rs"
@@ -354,6 +354,33 @@ GUARDS_CASES = [
         "RED",
     ),
     (
+        # THE CASE THE OLD SCRAPE COULD NOT SEE. Until a reviewer found it,
+        # `declared_cache_ceiling_discovers_every_budget` asked whether a
+        # budget's NAME appeared in the text of `declared_cache_ceiling`, so
+        # deleting the term from the sum while leaving its `let` binding above
+        # kept the guard green. The campaign had not asked this question
+        # either: its two aggregate cases covered "a brand-new unsummed budget"
+        # and "a stale NOT_SUMMED entry", never "an existing summed term
+        # detached from the sum".
+        "a summed term detached from the sum, its `let` binding left in place",
+        EXECUTOR,
+        '        ("parked_budget_for", parked),\n    ]',
+        "    ]",
+        ["declared_cache_ceiling_discovers_every_budget"],
+        "RED",
+    ),
+    (
+        # ...and the same hole one indirection later: keep the label, zero the
+        # value. Every membership check still passes while the term contributes
+        # nothing to the aggregate hosting derives its residual from.
+        "a summed term's label kept while its value is zeroed",
+        EXECUTOR,
+        '        ("parked_budget_for", parked),',
+        '        ("parked_budget_for", 0),',
+        ["declared_cache_ceiling_discovers_every_budget"],
+        "RED",
+    ),
+    (
         "the notification path's registry sweep made conditional, position unchanged",
         CONTRACT,
         "    delegate_app_registry::sweep_expired();",
@@ -385,6 +412,9 @@ def main() -> None:
     if len(sys.argv) != 2 or sys.argv[1] not in CAMPAIGNS:
         raise SystemExit(f"usage: {sys.argv[0]} {{{'|'.join(CAMPAIGNS)}}}")
     name = sys.argv[1]
+    # BEFORE the lock and before any mutation: a case naming a test that does
+    # not exist runs zero tests and reports its expected verdict anyway.
+    preflight(CAMPAIGNS[name])
     tree = Tree(FILES)
     try:
         campaign(tree, CAMPAIGNS[name], f"{head_sha()} [{name}]")
