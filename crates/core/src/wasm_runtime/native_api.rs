@@ -1513,8 +1513,9 @@ impl DelegateCallEnv {
         // refused the subscription outright — neither representation recorded
         // it. Registering demand anyway would create a pin with no notification
         // hook and no durable row: `contract_in_use` demand that raises the
-        // eviction tier and the governance benefit while the delegate receives
-        // nothing, and that `drop_subscriptions_for_contract` cannot see,
+        // eviction tier while the delegate receives nothing (not the governance
+        // benefit — `beneficiary_counts` filters delegate ids out), and that
+        // `drop_subscriptions_for_contract` cannot see,
         // because it iterates the registry this subscription is absent from.
         // `executor_impl.rs`'s channel-closed arm names that exact state —
         // "demand without a hook is an unconsumable pin".
@@ -2646,12 +2647,6 @@ pub(super) mod delegate_contracts {
             // A disk-budget rejection is a store-capacity failure from the
             // delegate's perspective — map to the generic store-error code.
             DelegateEnvError::DiskBudgetExceeded(_) => contract_error_codes::ERR_STORE_ERROR as i64,
-            // The delegate handed us a state larger than the protocol allows.
-            // That is a caller error, not a store failure, so it maps to
-            // ERR_INVALID_PARAM rather than ERR_STORE_ERROR — and to an
-            // EXISTING code rather than a new one, because a new negative
-            // return value is a wire-visible change to the V2 delegate API
-            // that a delegate branching on codes would not expect.
             // A per-contract subscriber-cap refusal is a capacity failure
             // from the delegate's perspective, so it maps to the same generic
             // store-error code `DiskBudgetExceeded` uses — an EXISTING code
@@ -2661,6 +2656,11 @@ pub(super) mod delegate_contracts {
             DelegateEnvError::SubscriptionCapExceeded => {
                 contract_error_codes::ERR_STORE_ERROR as i64
             }
+            // The delegate handed us a state larger than the protocol allows.
+            // That is a caller error, not a store failure, so it maps to
+            // ERR_INVALID_PARAM rather than ERR_STORE_ERROR — and to an
+            // EXISTING code rather than a new one, for the same wire-compat
+            // reason as the arm above.
             DelegateEnvError::StateTooLarge { size, limit } => {
                 tracing::warn!(
                     state_size = size,

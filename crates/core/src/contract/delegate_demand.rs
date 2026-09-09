@@ -59,15 +59,28 @@
 //! is about, and it is an argument for settling that bound rather than a reason
 //! to inflate a second counter from here.
 //!
-//! That breadth cuts both ways and the governance one is worth stating outright
-//! rather than leaving as a surprise: `beneficiary_counts` derives a contract's
-//! governance BENEFIT from `client_subscriptions.len()`, so a delegate pin also
-//! raises the contract's benefit score and makes a resource-usage ban less
-//! likely. That is the intended reading — a delegate subscription is real local
-//! demand and should count as a beneficiary exactly like a WebSocket client —
-//! but it does mean an app can raise its own contracts' benefit through its
-//! delegate, which is the same unbounded-pinning surface #5467 open question 1
-//! is about, reached by a second route.
+//! That breadth stops at GOVERNANCE, deliberately, and the exception is worth
+//! stating outright because the rest of this module is about a delegate pin
+//! counting everywhere a WebSocket client does. `beneficiary_counts`
+//! (`ring/hosting.rs`) derives a contract's governance BENEFIT, and it filters
+//! delegate ids out before counting, so **a delegate pin contributes nothing to
+//! its own contract's benefit score.**
+//!
+//! Without that filter an app could raise its own contract's standing against
+//! the sweep built to catch it, by subscribing to itself from its own delegate:
+//! `LOCAL_DEMAND_WEIGHT` is 1.0 against `FORWARDED_DEMAND_WEIGHT` 0.1, so one
+//! self-subscribe would be worth ten genuine downstream subscribers, on exactly
+//! the contracts governance had already flagged as costing something. An input
+//! a contract can set for itself is not a defence. A WebSocket client is not
+//! the same case even when it is the same app: it needs a live connection and
+//! dies with it, where a delegate pin has no TTL and survives restarts.
+//!
+//! It is the same treatment the cost sweep gets from
+//! `non_delegate_local_and_downstream_counts`, and it is a NARROWING, so it can
+//! only make a ban more likely, never less. Pinned by
+//! `a_delegate_pin_does_not_raise_its_own_contracts_governance_benefit`, which
+//! also asserts a real client still counts, so the guard cannot pass by
+//! narrowing the signal to nothing.
 //!
 //! # Interaction with the hosting invariants (`.claude/rules/hosting-invariants.md`)
 //!
@@ -956,8 +969,9 @@ pub(crate) fn register_subscription(
     // on `contract_in_use` and re-queues), never re-evicted (it is out of the
     // cache, so no eviction decision can select it), and never repaired
     // (`reconcile_phantom_in_use` iterates `downstream_subscribers` only). It
-    // would also hold one of the node-wide pin slots forever and inflate
-    // governance benefit for a contract this node no longer hosts.
+    // would also hold one of the node-wide pin slots forever, for a contract
+    // this node no longer hosts. (It would NOT inflate governance benefit:
+    // `beneficiary_counts` filters delegate ids out.)
     //
     // One cache lookup closes the observable case. It is not a lock, so it does
     // not make the sequence atomic — an eviction landing after THIS check is
@@ -2391,7 +2405,8 @@ mod tests {
     /// The state this test exists to make unreachable: the next delegate is
     /// refused by the row cap, gets no hook and nothing on disk, and would
     /// still be admitted by the pin gate. That pin would raise the eviction
-    /// tier and the governance benefit for a delegate receiving nothing, and
+    /// tier for a delegate receiving nothing (not the governance benefit —
+    /// `beneficiary_counts` excludes delegate ids), and
     /// `drop_subscriptions_for_contract` could never retire it, because it
     /// iterates the registry the subscription is absent from —
     /// `executor_impl.rs`'s own words for it are "demand without a hook is an
@@ -2726,7 +2741,9 @@ mod tests {
     /// not enforced on the delegate path, so delegates could push
     /// `client_subscriptions[id]` past it while each stayed under its own
     /// per-delegate cap. That set is what `local_and_downstream_counts` (the
-    /// eviction ordering key) and governance's `beneficiary_counts` read.
+    /// eviction ordering key) reads in full, and what governance's
+    /// `beneficiary_counts` reads with delegate ids filtered out — which is
+    /// why the cap has to hold on the COMBINED set regardless.
     ///
     /// Fills the contract with ORDINARY client ids rather than delegates, for
     /// two reasons. It is the honest scenario — the bound is on the COMBINED
