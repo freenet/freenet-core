@@ -959,3 +959,866 @@ pub(crate) mod test_support {
         schedule_lock().node_budget.credit_micros = 0;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap as StdHashMap;
+    use std::sync::Mutex as StdMutex;
+
+    use freenet_stdlib::prelude::CodeHash;
+
+    /// A delegate key that differs from every other `key(n)`.
+    fn key(n: u8) -> DelegateKey {
+        DelegateKey::new([n; 32], CodeHash::new([n; 32]))
+    }
+
+    /// An in-memory stand-in for the durable half, so a test can assert that
+    /// BOTH representations moved — the property this module exists for.
+    #[derive(Default)]
+    struct RecordingStore {
+        rows: StdMutex<StdHashMap<(Vec<u8>, Vec<u8>), u64>>,
+        /// When set, every write and read fails. Models a backend outage.
+        broken: bool,
+    }
+
+    impl RecordingStore {
+        fn row_key(delegate: &DelegateKey, tag: &[u8]) -> (Vec<u8>, Vec<u8>) {
+            let mut id = delegate.bytes().to_vec();
+            id.extend_from_slice(delegate.code_hash().as_ref());
+            (id, tag.to_vec())
+        }
+
+        fn len(&self) -> usize {
+            self.rows.lock().unwrap().len()
+        }
+
+        fn contains(&self, delegate: &DelegateKey, tag: &[u8]) -> bool {
+            self.rows
+                .lock()
+                .unwrap()
+                .contains_key(&Self::row_key(delegate, tag))
+        }
+
+        fn due_for(&self, delegate: &DelegateKey, tag: &[u8]) -> Option<u64> {
+            self.rows
+                .lock()
+                .unwrap()
+                .get(&Self::row_key(delegate, tag))
+                .copied()
+        }
+
+        fn seed(&self, delegate: &DelegateKey, tag: &[u8], due: u64) {
+            self.rows
+                .lock()
+                .unwrap()
+                .insert(Self::row_key(delegate, tag), due);
+        }
+    }
+
+    impl DelegateWakeupPersistence for RecordingStore {
+        fn persist_wakeup(
+            &self,
+            delegate: &DelegateKey,
+            tag: &[u8],
+            due_millis: u64,
+        ) -> Result<(), String> {
+            if self.broken {
+                return Err("backend is down".to_string());
+            }
+            self.rows
+                .lock()
+                .unwrap()
+                .insert(Self::row_key(delegate, tag), due_millis);
+            Ok(())
+        }
+
+        fn forget_wakeup(&self, delegate: &DelegateKey, tag: &[u8]) {
+            self.rows
+                .lock()
+                .unwrap()
+                .remove(&Self::row_key(delegate, tag));
+        }
+
+        fn forget_wakeups_for_delegate(&self, delegate: &DelegateKey) {
+            let (id, _) = Self::row_key(delegate, &[]);
+            self.rows.lock().unwrap().retain(|(d, _), _| d != &id);
+        }
+
+        fn load_wakeups(&self) -> Result<Vec<(DelegateKey, Vec<u8>, u64)>, String> {
+            if self.broken {
+                return Err("backend is down".to_string());
+            }
+            // The row key stores the 64-byte delegate identity; rebuild the
+            // `DelegateKey` from it exactly as the redb backend does.
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|((id, tag), due)| {
+                    let mut k = [0u8; 32];
+                    let mut h = [0u8; 32];
+                    k.copy_from_slice(&id[..32]);
+                    h.copy_from_slice(&id[32..64]);
+                    (DelegateKey::new(k, CodeHash::new(h)), tag.clone(), *due)
+                })
+                .collect())
+        }
+    }
+
+    /// Clock origin for a test. `SystemTime` because deadlines are durable;
+    /// `Instant` because budgets must not be mintable by a wall-clock jump.
+    fn clocks() -> (SystemTime, Instant) {
+        (
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            Instant::now(),
+        )
+    }
+
+    fn fresh() -> (RecordingStore, SystemTime, Instant) {
+        let (now, mono) = clocks();
+        test_support::reset(mono);
+        (RecordingStore::default(), now, mono)
+    }
+
+    // -----------------------------------------------------------------------
+    // 1. Bytes.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_tag_over_the_cap_is_refused_and_one_at_the_cap_is_not() {
+        let (db, now, mono) = fresh();
+        // The BOUNDARY, not just the refusal: a cap tested only from the
+        // outside is equally consistent with a cap one byte too tight.
+        let exactly = vec![b'x'; MAX_WAKEUP_TAG_BYTES];
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(1),
+                &exactly,
+                Duration::from_secs(60),
+                now,
+                mono
+            ),
+            Ok(())
+        );
+
+        let too_big = vec![b'x'; MAX_WAKEUP_TAG_BYTES + 1];
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(1),
+                &too_big,
+                Duration::from_secs(60),
+                now,
+                mono
+            ),
+            Err(WakeupRefusal::TagTooLong)
+        );
+        // Refused in BOTH representations: an over-cap tag must not leave a
+        // durable row behind for boot restore to resurrect.
+        assert!(!db.contains(&key(1), &too_big));
+        assert_eq!(test_support::outstanding(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_delay_below_the_floor_is_refused_rather_than_clamped() {
+        let (db, now, mono) = fresh();
+        // freenet-stdlib CLAMPS this up to MIN_WAKEUP_DELAY before calling.
+        // The host refuses instead, so a delegate that bypassed the wrapper is
+        // TOLD rather than silently given something it did not ask for.
+        assert_eq!(
+            schedule(Some(&db), &key(1), b"t", Duration::ZERO, now, mono),
+            Err(WakeupRefusal::DelayTooShort)
+        );
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(1),
+                b"t",
+                MIN_WAKEUP_DELAY - Duration::from_millis(1),
+                now,
+                mono
+            ),
+            Err(WakeupRefusal::DelayTooShort)
+        );
+        assert_eq!(
+            schedule(Some(&db), &key(1), b"t", MIN_WAKEUP_DELAY, now, mono),
+            Ok(())
+        );
+        assert_eq!(db.len(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_delay_past_the_horizon_is_refused() {
+        let (db, now, mono) = fresh();
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(1),
+                b"t",
+                MAX_WAKEUP_DELAY + Duration::from_secs(1),
+                now,
+                mono
+            ),
+            Err(WakeupRefusal::DelayTooLong)
+        );
+        assert_eq!(
+            schedule(Some(&db), &key(1), b"t", MAX_WAKEUP_DELAY, now, mono),
+            Ok(())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. Rows.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_delegate_at_its_lease_cap_is_refused_with_its_own_code() {
+        let (db, now, mono) = fresh();
+        for i in 0..MAX_WAKEUPS_PER_DELEGATE {
+            assert_eq!(
+                schedule(
+                    Some(&db),
+                    &key(1),
+                    format!("tag-{i}").as_bytes(),
+                    Duration::from_secs(60),
+                    now,
+                    mono
+                ),
+                Ok(()),
+                "lease {i} should be granted"
+            );
+        }
+        assert_eq!(
+            test_support::outstanding_for(&key(1)),
+            MAX_WAKEUPS_PER_DELEGATE
+        );
+
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(1),
+                b"one-too-many",
+                Duration::from_secs(60),
+                now,
+                mono
+            ),
+            Err(WakeupRefusal::DelegateFull)
+        );
+        // A DIFFERENT delegate is unaffected: the per-delegate bound must not
+        // be the node bound wearing a per-delegate label (#5597 property 2).
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(2),
+                b"mine",
+                Duration::from_secs(60),
+                now,
+                mono
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_full_node_refuses_with_a_code_distinct_from_the_per_delegate_one() {
+        let (db, now, mono) = fresh();
+        // Fill the node using many delegates, so the per-delegate cap cannot
+        // be what refuses. 64 delegates x 16 leases = MAX_WAKEUPS_PER_NODE.
+        let per = MAX_WAKEUPS_PER_DELEGATE;
+        let delegates = MAX_WAKEUPS_PER_NODE / per;
+        for d in 0..delegates {
+            for i in 0..per {
+                assert_eq!(
+                    schedule(
+                        Some(&db),
+                        &key(d as u8),
+                        format!("tag-{i}").as_bytes(),
+                        Duration::from_secs(3600),
+                        now,
+                        mono
+                    ),
+                    Ok(())
+                );
+            }
+        }
+        assert_eq!(test_support::outstanding(), MAX_WAKEUPS_PER_NODE);
+
+        let newcomer = key(200);
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &newcomer,
+                b"first",
+                Duration::from_secs(60),
+                now,
+                mono
+            ),
+            Err(WakeupRefusal::NodeFull),
+            "a newcomer holding no leases must be told the NODE is full, not that it is"
+        );
+        assert_ne!(
+            WakeupRefusal::NodeFull.code(),
+            WakeupRefusal::DelegateFull.code(),
+            "the two call for opposite responses and must not collapse"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn rearming_a_tag_replaces_its_lease_instead_of_taking_another() {
+        let (db, now, mono) = fresh();
+        // The property that lets a weekly-rotation delegate hold ONE lease for
+        // its whole life rather than accumulating one per rotation.
+        for _ in 0..(MAX_WAKEUPS_PER_DELEGATE * 4) {
+            assert_eq!(
+                schedule(
+                    Some(&db),
+                    &key(1),
+                    b"rotate",
+                    Duration::from_secs(60),
+                    now,
+                    mono
+                ),
+                Ok(())
+            );
+        }
+        assert_eq!(test_support::outstanding_for(&key(1)), 1);
+        assert_eq!(db.len(), 1);
+
+        // And the DURABLE deadline moves with the in-memory one, or a restart
+        // would restore the superseded deadline.
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(1),
+                b"rotate",
+                Duration::from_secs(600),
+                now,
+                mono
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            db.due_for(&key(1), b"rotate"),
+            Some(to_millis(now) + 600_000)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. Loop occupancy.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_delegate_that_has_spent_its_duty_budget_is_refused_and_told_why() {
+        let (db, now, mono) = fresh();
+        assert_eq!(
+            schedule(Some(&db), &key(1), b"t", Duration::from_secs(60), now, mono),
+            Ok(()),
+            "with credit, the lease is granted"
+        );
+
+        // One run longer than the whole per-delegate burst. The node's burst is
+        // six times larger, so the NODE still has credit and the refusal below
+        // is unambiguously the per-delegate one.
+        charge_run(
+            &key(1),
+            Duration::from_micros(DELEGATE_DUTY_BURST_MICROS + 1),
+            mono,
+        );
+        assert_eq!(test_support::delegate_credit_micros(&key(1)), Some(0));
+        assert!(test_support::node_credit_micros() > 0);
+
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(1),
+                b"t2",
+                Duration::from_secs(60),
+                now,
+                mono
+            ),
+            Err(WakeupRefusal::DelegateBudget)
+        );
+        // A different delegate is not punished for this one's spending.
+        assert_eq!(
+            schedule(Some(&db), &key(2), b"t", Duration::from_secs(60), now, mono),
+            Ok(())
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_spent_node_budget_refuses_even_a_delegate_with_full_credit() {
+        let (db, now, mono) = fresh();
+        test_support::drain_node_credit();
+        let newcomer = key(9);
+        assert_eq!(
+            test_support::delegate_credit_micros(&newcomer),
+            None,
+            "no entry means full credit"
+        );
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &newcomer,
+                b"t",
+                Duration::from_secs(60),
+                now,
+                mono
+            ),
+            Err(WakeupRefusal::NodeBudget)
+        );
+        assert_ne!(
+            WakeupRefusal::NodeBudget.code(),
+            WakeupRefusal::DelegateBudget.code()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn duty_credit_refills_with_wall_clock_at_the_stated_share() {
+        let (db, now, mono) = fresh();
+        charge_run(
+            &key(1),
+            Duration::from_micros(DELEGATE_DUTY_BURST_MICROS),
+            mono,
+        );
+        assert_eq!(test_support::delegate_credit_micros(&key(1)), Some(0));
+
+        // A minute later, 1% of a minute is 600 ms of credit.
+        let later = mono + Duration::from_secs(60);
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(1),
+                b"t",
+                Duration::from_secs(60),
+                now,
+                later
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            test_support::delegate_credit_micros(&key(1)),
+            Some(60_000_000 / DELEGATE_DUTY_DIVISOR)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_budget_entry_is_dropped_once_it_is_indistinguishable_from_a_fresh_one() {
+        let (db, now, mono) = fresh();
+        assert_eq!(
+            schedule(Some(&db), &key(1), b"t", Duration::from_secs(1), now, mono),
+            Ok(())
+        );
+        assert_eq!(test_support::budget_entries(), 1);
+
+        // Fire it. The entry is at full credit and holds no leases, so it now
+        // says nothing a missing entry would not and the GC drops it — which is
+        // what time-bounds this map per the AGENTS.md rule against
+        // permanently-refreshable entries.
+        let fired = take_due(Some(&db), now + Duration::from_secs(2), 10);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(test_support::budget_entries(), 0);
+        assert_eq!(test_support::outstanding(), 0);
+        assert_eq!(db.len(), 0, "firing releases the durable row too");
+    }
+
+    // -----------------------------------------------------------------------
+    // Firing.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn only_past_deadlines_fire_and_they_fire_in_deadline_order() {
+        let (db, now, mono) = fresh();
+        for (tag, secs) in [
+            (b"c".as_slice(), 30u64),
+            (b"a".as_slice(), 10),
+            (b"b".as_slice(), 20),
+            (b"d".as_slice(), 600),
+        ] {
+            assert_eq!(
+                schedule(
+                    Some(&db),
+                    &key(1),
+                    tag,
+                    Duration::from_secs(secs),
+                    now,
+                    mono
+                ),
+                Ok(())
+            );
+        }
+        let fired = take_due(Some(&db), now + Duration::from_secs(35), 10);
+        let tags: Vec<&[u8]> = fired.iter().map(|w| w.tag.as_slice()).collect();
+        assert_eq!(
+            tags,
+            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
+        );
+        assert_eq!(
+            test_support::outstanding(),
+            1,
+            "the 600s lease is untouched"
+        );
+        assert!(db.contains(&key(1), b"d"));
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn the_fire_batch_is_bounded_and_the_remainder_stays_due() {
+        let (db, now, mono) = fresh();
+        for i in 0..10 {
+            assert_eq!(
+                schedule(
+                    Some(&db),
+                    &key(1),
+                    format!("t{i}").as_bytes(),
+                    Duration::from_secs(1),
+                    now,
+                    mono
+                ),
+                Ok(())
+            );
+        }
+        let later = now + Duration::from_secs(2);
+        assert_eq!(take_due(Some(&db), later, 4).len(), 4);
+        assert_eq!(test_support::outstanding(), 6);
+        assert_eq!(
+            next_due_in(later),
+            Some(Duration::ZERO),
+            "the remainder is still due, so the loop drains rather than sleeps"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn an_idle_node_with_no_wakeups_has_no_deadline_to_wake_for() {
+        let (_db, now, _mono) = fresh();
+        assert_eq!(next_due_in(now), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Deferral (the parked-delegate path).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn deferral_bounds_itself_without_reference_to_park_ttl() {
+        let (db, now, mono) = fresh();
+        assert_eq!(
+            schedule(Some(&db), &key(1), b"t", Duration::from_secs(1), now, mono),
+            Ok(())
+        );
+        let mut clock = now + Duration::from_secs(2);
+        let mut deferrals = 0u32;
+        loop {
+            let mut due = take_due(Some(&db), clock, 10);
+            assert_eq!(due.len(), 1, "the lease should still be in hand");
+            let wakeup = due.remove(0);
+            if !defer(Some(&db), &wakeup, clock) {
+                break;
+            }
+            deferrals += 1;
+            assert!(
+                deferrals <= MAX_WAKEUP_DEFERRALS + 1,
+                "deferral did not terminate"
+            );
+            clock += WAKEUP_PARK_RETRY + Duration::from_millis(1);
+        }
+        assert_eq!(deferrals, MAX_WAKEUP_DEFERRALS);
+        assert_eq!(
+            test_support::outstanding(),
+            0,
+            "the dropped lease is released"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_deferral_grants_nothing_new_and_moves_both_representations() {
+        let (db, now, mono) = fresh();
+        assert_eq!(
+            schedule(Some(&db), &key(1), b"t", Duration::from_secs(1), now, mono),
+            Ok(())
+        );
+        let clock = now + Duration::from_secs(2);
+        let due = take_due(Some(&db), clock, 10).remove(0);
+        assert_eq!(test_support::outstanding(), 0);
+
+        assert!(defer(Some(&db), &due, clock));
+        assert_eq!(
+            test_support::outstanding_for(&key(1)),
+            1,
+            "the lease is back, and it is the SAME one"
+        );
+        assert_eq!(
+            db.due_for(&key(1), b"t"),
+            Some(to_millis(clock) + WAKEUP_PARK_RETRY.as_millis() as u64)
+        );
+        assert_eq!(next_due_in(clock), Some(WAKEUP_PARK_RETRY));
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_fresh_grant_resets_the_deferral_count() {
+        let (db, now, mono) = fresh();
+        assert_eq!(
+            schedule(Some(&db), &key(1), b"t", Duration::from_secs(1), now, mono),
+            Ok(())
+        );
+        let clock = now + Duration::from_secs(2);
+        let due = take_due(Some(&db), clock, 10).remove(0);
+        assert!(defer(Some(&db), &due, clock));
+
+        // The delegate re-arms the same tag itself. That is a NEW lease, not a
+        // continuation of the one that kept missing its delegate.
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(1),
+                b"t",
+                Duration::from_secs(1),
+                clock,
+                mono
+            ),
+            Ok(())
+        );
+        let again = take_due(Some(&db), clock + Duration::from_secs(2), 10).remove(0);
+        assert_eq!(again.attempts, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Teardown and boot restore.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn forgetting_a_delegate_clears_both_representations_and_only_its_own() {
+        let (db, now, mono) = fresh();
+        for tag in [b"a".as_slice(), b"b".as_slice()] {
+            assert_eq!(
+                schedule(Some(&db), &key(1), tag, Duration::from_secs(60), now, mono),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            schedule(
+                Some(&db),
+                &key(2),
+                b"keep",
+                Duration::from_secs(60),
+                now,
+                mono
+            ),
+            Ok(())
+        );
+
+        forget_delegate(Some(&db), &key(1));
+        assert_eq!(test_support::outstanding_for(&key(1)), 0);
+        assert!(!db.contains(&key(1), b"a"));
+        assert!(!db.contains(&key(1), b"b"));
+        // The durable half is the half that matters here: a row left behind
+        // would be restored on every subsequent boot, firing forever into a
+        // delegate that no longer exists.
+        assert!(db.contains(&key(2), b"keep"));
+        assert_eq!(test_support::outstanding_for(&key(2)), 1);
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn boot_restore_reinstates_leases_and_drops_rows_whose_delegate_is_gone() {
+        let (db, now, mono) = fresh();
+        let live = key(1);
+        let gone = key(2);
+        db.seed(&live, b"weekly", to_millis(now) + 600_000);
+        db.seed(&gone, b"orphan", to_millis(now) + 600_000);
+
+        let outcome = restore(&db, |k| k == &live, now, mono).expect("restore should read");
+        assert_eq!(outcome.restored, 1);
+        assert_eq!(outcome.orphaned, 1);
+        assert_eq!(test_support::outstanding_for(&live), 1);
+        assert_eq!(test_support::outstanding_for(&gone), 0);
+        assert!(
+            !db.contains(&gone, b"orphan"),
+            "an orphan row must be deleted, not merely skipped, or every later boot replays it"
+        );
+        assert!(db.contains(&live, b"weekly"));
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn boot_restore_smears_an_overdue_backlog_instead_of_firing_it_at_once() {
+        let (db, now, mono) = fresh();
+        let d = key(1);
+        for i in 0..8 {
+            db.seed(&d, format!("t{i}").as_bytes(), to_millis(now) - 86_400_000);
+        }
+        let outcome = restore(&db, |_| true, now, mono).expect("restore should read");
+        assert_eq!(outcome.restored, 8);
+        assert_eq!(outcome.overdue, 8);
+        // Not all at `now`: a node down for a day must not boot into its whole
+        // backlog in one loop iteration.
+        assert_eq!(take_due(Some(&db), now, 100).len(), 1);
+        assert_eq!(test_support::outstanding_for(&d), 7);
+        assert_eq!(
+            take_due(Some(&db), now + BOOT_SPREAD, 100).len(),
+            7,
+            "and the whole backlog is inside the spread window"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn boot_restore_refuses_to_read_a_failing_store_as_an_empty_schedule() {
+        let (_db, now, mono) = fresh();
+        let broken = RecordingStore {
+            broken: true,
+            ..Default::default()
+        };
+        // The distinction that matters: `Ok(empty)` here would be
+        // indistinguishable from a clean boot while silently losing every
+        // delegate's timer.
+        assert!(restore(&broken, |_| true, now, mono).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_durable_write_that_fails_refuses_the_lease_in_both_representations() {
+        let (_db, now, mono) = fresh();
+        let broken = RecordingStore {
+            broken: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            schedule(
+                Some(&broken),
+                &key(1),
+                b"t",
+                Duration::from_secs(60),
+                now,
+                mono
+            ),
+            Err(WakeupRefusal::Storage)
+        );
+        assert_eq!(
+            test_support::outstanding(),
+            0,
+            "granting in memory only would be a lease a restart silently drops"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(delegate_wakeups)]
+    fn a_node_with_no_durable_store_still_grants_leases() {
+        let (_db, now, mono) = fresh();
+        // sqlite and the mock runtime. Documented degradation: the lease
+        // survives the process and not a restart. Refusing here would make the
+        // primitive unavailable under `--features sqlite` and in every mock
+        // test.
+        assert_eq!(
+            schedule(
+                None::<&RecordingStore>,
+                &key(1),
+                b"t",
+                Duration::from_secs(60),
+                now,
+                mono
+            ),
+            Ok(())
+        );
+        assert_eq!(test_support::outstanding(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // The codes themselves.
+    // -----------------------------------------------------------------------
+
+    /// Every refusal, so a new variant cannot be added without appearing here.
+    fn all_refusals() -> [WakeupRefusal; 8] {
+        use WakeupRefusal::*;
+        let all = [
+            TagTooLong,
+            DelayTooShort,
+            DelayTooLong,
+            DelegateFull,
+            NodeFull,
+            DelegateBudget,
+            NodeBudget,
+            Storage,
+        ];
+        // Destructured with no `..`, so adding a variant fails to COMPILE here
+        // rather than silently escaping both tests below.
+        let [_, _, _, _, _, _, _, _] = all;
+        all
+    }
+
+    #[test]
+    fn every_refusal_maps_to_a_distinct_negative_code() {
+        let mut seen = std::collections::HashSet::new();
+        for refusal in all_refusals() {
+            let code = refusal.code();
+            assert!(
+                code < 0,
+                "{refusal:?} must be negative: the guest wrapper maps every code >= 0 to Ok(())"
+            );
+            assert!(
+                seen.insert(code),
+                "{refusal:?} collides with another refusal on code {code}; collapsing two \
+                 refusals into one is the #5565 defect this primitive exists not to repeat"
+            );
+        }
+    }
+
+    #[test]
+    fn the_codes_cannot_collide_with_freenet_stdlibs_published_range() {
+        // stdlib's `delegate_host::error_codes` occupies -1..-10 and -20..-24.
+        // A collision would have a delegate read one refusal as another, which
+        // is worse than having no code at all.
+        for refusal in all_refusals() {
+            assert!(
+                refusal.code() <= -40,
+                "{refusal:?} at {} is inside the range stdlib may grow into",
+                refusal.code()
+            );
+        }
+    }
+
+    #[test]
+    fn the_per_delegate_bounds_sit_strictly_below_the_node_wide_ones() {
+        // #5597 property 2. The delegate PIN cap violates this — its
+        // per-delegate figure is five times the node figure, so the first
+        // delegate to ask can take the whole node allowance. A per-principal
+        // bound at or above the node bound is decorative.
+        assert!(MAX_WAKEUPS_PER_DELEGATE < MAX_WAKEUPS_PER_NODE);
+        assert!(
+            DELEGATE_DUTY_DIVISOR > NODE_DUTY_DIVISOR,
+            "a larger divisor is a smaller share"
+        );
+        assert!(DELEGATE_DUTY_BURST_MICROS < NODE_DUTY_BURST_MICROS);
+    }
+
+    #[test]
+    fn the_bounds_this_module_duplicates_still_match_freenet_stdlibs() {
+        // Duplicated rather than imported (see the constants' docs), so they
+        // can drift. This is what notices.
+        assert_eq!(
+            MAX_WAKEUP_TAG_BYTES,
+            freenet_stdlib::delegate_host::MAX_WAKEUP_TAG_BYTES
+        );
+        assert_eq!(
+            MIN_WAKEUP_DELAY,
+            freenet_stdlib::delegate_host::MIN_WAKEUP_DELAY
+        );
+    }
+}
