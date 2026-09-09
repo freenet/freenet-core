@@ -189,6 +189,13 @@ static BY_DELEGATE: LazyLock<
 static CAP_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// What [`subscribe`] did.
+///
+/// Deliberately NOT `#[must_use]`. The obligation that would justify it —
+/// releasing the evicted pair's interest hold — is discharged by [`subscribe`]
+/// itself, precisely because relying on callers to notice an enum arm is what
+/// this design avoids. Two of the three registration paths correctly ignore the
+/// return value, so `#[must_use]` would buy nothing and cost a `let _ =` at
+/// those sites, which reads as an obligation being waived when none exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SubscribeOutcome {
     /// A new (contract, delegate) pair was recorded.
@@ -308,6 +315,18 @@ pub(crate) fn subscribe(contract: ContractInstanceId, delegate: &DelegateKey) ->
         // which already costs milliseconds, and the scan is bounded by the cap.
         // Evicting more than strictly necessary would also discard legitimate
         // standing interest that nothing will re-establish.
+        //
+        // The scan runs UNDER the reverse-index write guard, which the same
+        // rule warns about and which the paragraph above does not answer. It is
+        // deliberate and it is what makes the cap exact: check, evict and
+        // insert have to be one atomic step, or two concurrent subscribes for
+        // the same delegate both observe `len() == cap - 1` and both insert.
+        // The cost is bounded and small — at most
+        // `MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE` (256) `Instant` comparisons
+        // over an in-memory map, holding ONE DashMap shard, contended only by
+        // other operations on delegates hashing to that same shard. Releasing
+        // the guard to scan would trade an exact bound for a lock-free one, and
+        // an off-by-a-few cap is not worth a re-entrancy hazard here.
         let coldest = owned
             .iter()
             .min_by_key(|(_, stamp)| **stamp)
@@ -316,16 +335,26 @@ pub(crate) fn subscribe(contract: ContractInstanceId, delegate: &DelegateKey) ->
             owned.remove(&coldest);
             drop_from_contract_map(&coldest, delegate);
             let total = CAP_EVICTIONS.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::warn!(
-                %delegate,
-                evicted_contract = %coldest,
-                new_contract = %contract,
-                cap = MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE,
-                cap_evictions_total = total,
-                "Delegate at its contract-subscription cap; evicted its coldest \
-                 subscription to admit a new one. The delegate is NOT told, and \
-                 will stop receiving notifications for the evicted contract."
-            );
+            // Throttled, and the throttle is the point rather than tidiness. A
+            // delegate parked at its cap evicts on EVERY subscribe, so an
+            // unthrottled line here is an amplifier: the cheapest possible
+            // remote action produces one log write each, which is the shape a
+            // refusal path must never have. The first eviction is always
+            // reported so a node that sheds once is not silent, and the running
+            // total on every line it does emit carries the rate, so nothing is
+            // lost by dropping the ones in between.
+            if total == 1 || total % 64 == 0 {
+                tracing::warn!(
+                    %delegate,
+                    evicted_contract = %coldest,
+                    new_contract = %contract,
+                    cap = MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE,
+                    cap_evictions_total = total,
+                    "Delegate at its contract-subscription cap; evicted its coldest \
+                     subscription to admit a new one. The delegate is NOT told, and \
+                     will stop receiving notifications for the evicted contract."
+                );
+            }
             evicted = Some(coldest);
         }
     }
@@ -471,12 +500,19 @@ fn drop_from_contract_map(contract: &ContractInstanceId, delegate: &DelegateKey)
 /// [`MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE`] instead of relying on eviction.
 /// Promote it out of `cfg(test)` when that lands.
 #[cfg(test)]
-pub(crate) fn unsubscribe(contract: &ContractInstanceId, delegate: &DelegateKey) {
+pub(crate) fn unsubscribe(contract: &ContractInstanceId, delegate: &DelegateKey) -> bool {
+    // Both halves are cleared whichever one the pair is recorded in, rather
+    // than gating the forward-map removal on the reverse-index hit. The two can
+    // disagree (see `subscribe`), and an unsubscribe that honoured only the
+    // reverse index would leave a delegate on the delivery path it just asked
+    // to leave. Returns whether anything was actually held, which is what #5600
+    // needs to answer "not subscribed" rather than reporting a silent success.
     let removed = match BY_DELEGATE.get_mut(delegate) {
         Some(mut owned) => owned.remove(contract).is_some(),
         None => false,
     };
-    if removed {
+    let was_listed = is_subscribed(contract, delegate);
+    if removed || was_listed {
         drop_from_contract_map(contract, delegate);
         BY_DELEGATE.remove_if(delegate, |_, owned| owned.is_empty());
         // Same obligation as the eviction branch of `subscribe`: this drops one
@@ -491,6 +527,7 @@ pub(crate) fn unsubscribe(contract: &ContractInstanceId, delegate: &DelegateKey)
         // it later means finding it as a production leak.
         crate::wasm_runtime::delegate_interest::release_pair(contract, delegate);
     }
+    removed || was_listed
 }
 
 /// Cap evictions since process start. See [`CAP_EVICTIONS`].
