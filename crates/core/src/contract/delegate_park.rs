@@ -312,7 +312,16 @@ pub(super) fn task_bytes(
     // COUNT (4 per park), which is a count cap standing in for a byte cap - the
     // pattern #5551 tracks. Bounding the arriving state properly belongs there,
     // where it can be fixed for both paths at once, not duplicated here.
-    let contract_op_bytes: usize = contract_ops.iter().map(|op| ctx_len(&op.context)).sum();
+    // TWO copies per pending op, deliberately: the off-loop task holds the
+    // `PendingContractOp` and the `ParkGuard` holds a clone of its
+    // `DelegateContext` in `owed_contract_ops`, so a synthesized failure can
+    // hand the delegate back its own continuation state instead of an empty one
+    // (#5542 finding F7). Charging one copy for two would under-count the park
+    // byte cap by exactly the thing that cap exists to bound.
+    let contract_op_bytes: usize = contract_ops
+        .iter()
+        .map(|op| ctx_len(&op.context).saturating_mul(2))
+        .sum();
     prompt_bytes + upsert_bytes + contract_op_bytes
 }
 
@@ -753,7 +762,7 @@ pub(super) struct DelegateResume {
     /// Network operations the off-loop task never resolved, for the same three
     /// reasons as `unresolved_upserts`. Turned into failure responses so the
     /// delegate is told rather than left waiting for one that will never come.
-    pub unresolved_contract_ops: Vec<(ContractInstanceId, ContractOpKind)>,
+    pub unresolved_contract_ops: Vec<(ContractInstanceId, ContractOpKind, DelegateContext)>,
 }
 
 /// RAII guard guaranteeing an off-loop task delivers EXACTLY ONE
@@ -797,7 +806,15 @@ struct ParkGuardPayload {
     /// contract, and reconciling those by SET membership would let one
     /// completion discharge both obligations, leaving the delegate waiting
     /// forever for a response nothing remained to produce.
-    owed_contract_ops: Vec<(ContractInstanceId, ContractOpKind)>,
+    /// Carries the delegate's own `DelegateContext` so a synthesized failure
+    /// hands back the CONTINUATION STATE the request arrived with, not an empty
+    /// one (#5542 finding F7). `DelegateContext` is how a delegate correlates a
+    /// response with its request; handing back `default()` reads to a delegate
+    /// state machine as "start over" rather than "this operation failed", which
+    /// corrupts it instead of merely failing an operation. The obligation is
+    /// outstanding for up to PARK_WORK_BUDGET (75 s), so this is not a
+    /// vanishing window.
+    owed_contract_ops: Vec<(ContractInstanceId, ContractOpKind, DelegateContext)>,
     /// Where the off-loop task deposits finished network operations, shared with
     /// the task for the same reason as `answers` and `fetches`: so `Drop` can
     /// see work that completed before a panic or cancellation (#5544 F2).
@@ -814,7 +831,7 @@ impl ParkGuard {
         owed_upserts: Vec<(ContractInstanceId, bool)>,
         answers: std::sync::Arc<std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>>,
         fetches: std::sync::Arc<std::sync::Mutex<Vec<ResolvedUpsert>>>,
-        owed_contract_ops: Vec<(ContractInstanceId, ContractOpKind)>,
+        owed_contract_ops: Vec<(ContractInstanceId, ContractOpKind, DelegateContext)>,
         contract_ops: std::sync::Arc<std::sync::Mutex<Vec<ResolvedContractOp>>>,
     ) -> Self {
         Self {
@@ -937,10 +954,10 @@ impl ParkGuard {
                 .or_default() += 1;
         }
         let mut unresolved_contract_ops = Vec::new();
-        for (id, kind) in owed_contract_ops {
+        for (id, kind, context) in owed_contract_ops {
             match resolved_ops.get_mut(&(id, kind)) {
                 Some(n) if *n > 0 => *n -= 1,
-                _ => unresolved_contract_ops.push((id, kind)),
+                _ => unresolved_contract_ops.push((id, kind, context)),
             }
         }
         if !unresolved_contract_ops.is_empty() {
@@ -2445,8 +2462,16 @@ mod tests {
             answers,
             fetches,
             vec![
-                (ContractInstanceId::new([9; 32]), ContractOpKind::Get),
-                (ContractInstanceId::new([8; 32]), ContractOpKind::Subscribe),
+                (
+                    ContractInstanceId::new([9; 32]),
+                    ContractOpKind::Get,
+                    DelegateContext::new(b"ctx-get".to_vec()),
+                ),
+                (
+                    ContractInstanceId::new([8; 32]),
+                    ContractOpKind::Subscribe,
+                    DelegateContext::new(b"ctx-sub".to_vec()),
+                ),
             ],
             Default::default(),
         ));
@@ -2455,10 +2480,21 @@ mod tests {
         assert_eq!(
             resume.unresolved_contract_ops,
             vec![
-                (ContractInstanceId::new([9; 32]), ContractOpKind::Get),
-                (ContractInstanceId::new([8; 32]), ContractOpKind::Subscribe),
+                (
+                    ContractInstanceId::new([9; 32]),
+                    ContractOpKind::Get,
+                    DelegateContext::new(b"ctx-get".to_vec()),
+                ),
+                (
+                    ContractInstanceId::new([8; 32]),
+                    ContractOpKind::Subscribe,
+                    DelegateContext::new(b"ctx-sub".to_vec()),
+                ),
             ],
-            "every owed network operation must be reported unresolved"
+            "every owed network operation must be reported unresolved, WITH the \
+             delegate's own context: a synthesized failure carrying \
+             `DelegateContext::default()` reads to a delegate state machine as \
+             \"start over\" rather than \"this operation failed\" (#5542 F7)"
         );
     }
 
@@ -2485,8 +2521,16 @@ mod tests {
             answers,
             fetches,
             vec![
-                (ContractInstanceId::new([9; 32]), ContractOpKind::Get),
-                (ContractInstanceId::new([9; 32]), ContractOpKind::Get),
+                (
+                    ContractInstanceId::new([9; 32]),
+                    ContractOpKind::Get,
+                    DelegateContext::default(),
+                ),
+                (
+                    ContractInstanceId::new([9; 32]),
+                    ContractOpKind::Get,
+                    DelegateContext::default(),
+                ),
             ],
             net_ops,
         ));
@@ -2498,7 +2542,11 @@ mod tests {
         );
         assert_eq!(
             resume.unresolved_contract_ops,
-            vec![(ContractInstanceId::new([9; 32]), ContractOpKind::Get)],
+            vec![(
+                ContractInstanceId::new([9; 32]),
+                ContractOpKind::Get,
+                DelegateContext::default()
+            )],
             "one completion must discharge exactly ONE of two identical \
              obligations, not both"
         );
@@ -2526,15 +2574,27 @@ mod tests {
             answers,
             fetches,
             vec![
-                (ContractInstanceId::new([9; 32]), ContractOpKind::Get),
-                (ContractInstanceId::new([9; 32]), ContractOpKind::Subscribe),
+                (
+                    ContractInstanceId::new([9; 32]),
+                    ContractOpKind::Get,
+                    DelegateContext::default(),
+                ),
+                (
+                    ContractInstanceId::new([9; 32]),
+                    ContractOpKind::Subscribe,
+                    DelegateContext::default(),
+                ),
             ],
             net_ops,
         ));
         let resume = rx.recv().await.expect("resume");
         assert_eq!(
             resume.unresolved_contract_ops,
-            vec![(ContractInstanceId::new([9; 32]), ContractOpKind::Subscribe)],
+            vec![(
+                ContractInstanceId::new([9; 32]),
+                ContractOpKind::Subscribe,
+                DelegateContext::default()
+            )],
             "the SUBSCRIBE must still be owed after only the GET completed"
         );
     }
@@ -2551,9 +2611,12 @@ mod tests {
         op.context = DelegateContext::new(vec![0u8; N]);
         let charged = task_bytes(&[], &[], std::slice::from_ref(&op));
         assert!(
-            charged >= N,
-            "a pending network op must be charged for the context it retains, \
-             got {charged} for a {N}-byte context"
+            charged >= 2 * N,
+            "a pending network op retains its context TWICE — once in the \
+             off-loop task's `PendingContractOp` and once in the `ParkGuard`'s \
+             `owed_contract_ops`, which is what lets a synthesized failure hand \
+             the delegate back its own continuation state (#5542 F7) — so both \
+             copies must be charged; got {charged} for a {N}-byte context"
         );
     }
 

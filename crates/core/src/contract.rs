@@ -2498,9 +2498,10 @@ where
                         let owed_contract_ops: Vec<(
                             ContractInstanceId,
                             delegate_park::ContractOpKind,
+                            DelegateContext,
                         )> = pending_contract_ops
                             .iter()
-                            .map(|op| (op.contract_id, op.kind))
+                            .map(|op| (op.contract_id, op.kind, op.context.clone()))
                             .collect();
                         // SINKS CREATED BEFORE THE GUARD, AND SHARED WITH IT
                         // (#5544 F2). They used to be created inside the
@@ -4435,11 +4436,15 @@ where
     // budget). Same reasoning as the unresolved upserts above: the delegate is
     // TOLD rather than left waiting. `DelegateContext` is defaulted because the
     // `PendingContractOp` that carried it is gone by then.
-    for (contract_id, kind) in unresolved_contract_ops {
+    for (contract_id, kind, context) in unresolved_contract_ops {
         all_inbound.push(contract_op_response_msg(
             kind,
             contract_id,
-            DelegateContext::default(),
+            // The delegate's OWN context, carried through the guard, not
+            // `default()` (#5542 finding F7). An empty context reads to a
+            // delegate state machine as "start over" rather than "this
+            // operation failed".
+            context,
             delegate_park::ContractOpOutcome::Failed(
                 "delegate network contract operation did not complete: its \
                  off-loop work ended early"
