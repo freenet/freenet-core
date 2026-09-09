@@ -540,6 +540,7 @@ mod tests {
                     Some(self.db.clone()),
                     Some(cb),
                     Some(admit),
+                    None,
                     delegate_key,
                     &mut self.delegate_store,
                     0,

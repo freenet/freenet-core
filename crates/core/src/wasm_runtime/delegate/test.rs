@@ -5061,6 +5061,7 @@ async fn reentering_a_live_instance_id_fails_closed() -> Result<(), Box<dyn std:
             runtime.state_store_db.clone(),
             runtime.state_write_callback.clone(),
             runtime.state_admit_callback.clone(),
+            runtime.delegate_subscribe_callback.clone(),
             delegate.key().clone(),
             &mut runtime.delegate_store,
             0,

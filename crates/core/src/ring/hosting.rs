@@ -2107,18 +2107,6 @@ impl HostingManager {
         ids
     }
 
-    /// The SPLIT genuine-demand counts pinning `contract`:
-    /// `(local_client_subscriptions, downstream_subscribers)`. This is the
-    /// subscriber-primary eviction key (#4642, Ian's confirmed ordering): the
-    /// cache orders victims ascending by `(local, downstream, recency_seq, key)`,
-    /// so a contract THIS node's own client is subscribed to (local >= 1) is
-    /// evicted LAST. Aligned with [`contract_in_use`](Self::contract_in_use) BY
-    /// CONSTRUCTION — it counts the exact same two sources, so `local + downstream
-    /// == 0` iff `!contract_in_use(k)`, keeping retention and the collapse/renewal
-    /// decision in agreement (per the piece-D source). Counts ALL downstream
-    /// entries (no lease filter, matching `has_downstream_subscribers`) so the
-    /// count equals `contract_in_use` exactly; the periodic
-    /// `expire_stale_downstream_subscribers` sweep keeps the map fresh.
     /// Whether `contract` currently carries an abandonment stamp.
     ///
     /// Test-only. Exists because `Ring::remove_client_subscription`'s reason to
@@ -2162,6 +2150,18 @@ impl HostingManager {
         (local, downstream)
     }
 
+    /// The SPLIT genuine-demand counts pinning `contract`:
+    /// `(local_client_subscriptions, downstream_subscribers)`. This is the
+    /// subscriber-primary eviction key (#4642, Ian's confirmed ordering): the
+    /// cache orders victims ascending by `(local, downstream, recency_seq, key)`,
+    /// so a contract THIS node's own client is subscribed to (local >= 1) is
+    /// evicted LAST. Aligned with [`contract_in_use`](Self::contract_in_use) BY
+    /// CONSTRUCTION — it counts the exact same two sources, so `local + downstream
+    /// == 0` iff `!contract_in_use(k)`, keeping retention and the collapse/renewal
+    /// decision in agreement (per the piece-D source). Counts ALL downstream
+    /// entries (no lease filter, matching `has_downstream_subscribers`) so the
+    /// count equals `contract_in_use` exactly; the periodic
+    /// `expire_stale_downstream_subscribers` sweep keeps the map fresh.
     pub(crate) fn local_and_downstream_counts(&self, contract: &ContractKey) -> (usize, usize) {
         let local = self
             .client_subscriptions
