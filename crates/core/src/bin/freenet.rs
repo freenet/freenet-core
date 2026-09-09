@@ -1008,8 +1008,8 @@ const EXIT_CODE_ALREADY_RUNNING: i32 = 43;
 #[error("another freenet instance is already running")]
 struct AlreadyRunningError;
 
-/// How many times to probe the WS API port, and how long to wait between
-/// probes, before concluding it is genuinely held by a live process.
+/// How many times to probe the WS API port before concluding it is genuinely
+/// held by a live process.
 ///
 /// A process that was just OOM-killed can keep its listening socket
 /// answering for a short window while the kernel finishes tearing it down.
@@ -1019,7 +1019,56 @@ struct AlreadyRunningError;
 /// the same still-answering corpse, burning systemd's `StartLimitBurst`
 /// before the socket was actually released and leaving the gateway down
 /// with no self-heal (#4565, 2026-07-17 vega outage).
+///
+/// # The corpse window, measured
+///
+/// The budget below is anchored to measurement, not to the intuition that a
+/// socket "goes away within seconds". Measured on Linux 6.8 (nova, 2026-09)
+/// by SIGKILLing a process holding a LISTEN socket and polling until
+/// `connect()` was refused:
+///
+/// | RSS at kill | LISTEN socket released at |
+/// |-------------|---------------------------|
+/// | 8 GiB       | t = 2.0 s                 |
+/// | 20 GiB      | t = 1.8 s                 |
+/// | 24 GiB      | t = 6.2 s                 |
+///
+/// The window tracks how much work `exit_mm()` has to do, which is why a
+/// large-RSS gateway holds its socket for seconds where a small process
+/// releases it in microseconds.
+///
+/// 6 attempts 1s apart sleeps ~5s in total (5 sleeps — the last attempt does
+/// not sleep after itself), which covers the 8 GiB and 20 GiB cases outright.
+///
+/// It does **not** cover the 24 GiB case: at 6.2s this loop has already given
+/// up and exited 43. That is stated rather than rounded up to "comfortably
+/// outlasts". The residual benefit in that case is a different one, and still
+/// worth having: spending ~5s per attempt spreads systemd's
+/// `StartLimitBurst=5` over ~25s instead of the milliseconds it took on
+/// 2026-07-17, so the burst is no longer exhausted before the socket is
+/// released and `Restart=always` still gets a real attempt afterwards.
 const EXISTING_PROCESS_PROBE_ATTEMPTS: u32 = 6;
+
+/// How long to wait between probes.
+///
+/// Deliberately **unjittered**, overriding `.claude/rules/code-style.md`'s
+/// "all retry/backoff loops MUST apply random jitter". Recorded here so the
+/// override is a decision on the record rather than a finding every future
+/// review and lint bot re-raises.
+///
+/// Jitter exists to break up a thundering herd: many independent retriers
+/// converging on one contended resource, where synchronised retries amplify
+/// the contention they are waiting out. This loop has none of that shape.
+///
+/// - It is a single process, polling its own loopback port and its own
+///   `/proc`, a bounded 6 times, once at startup. There is no fleet.
+/// - What it waits on is the kernel finishing `exit_files()` for a dead
+///   process. That runs on the kernel's own schedule; a loopback `connect()`
+///   and a `/proc/<pid>` stat neither compete for it nor push back on it, so
+///   aligned polls cannot prolong what they are waiting for.
+/// - Concurrent freenet instances poll different ports by construction — each
+///   probes only its own configured `ws_api` port — so there is no shared
+///   queue for them to synchronise on even in the multi-instance case.
 const EXISTING_PROCESS_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn check_for_existing_process(config: &Config) -> anyhow::Result<()> {
@@ -1045,6 +1094,13 @@ fn check_for_existing_process(config: &Config) -> anyhow::Result<()> {
 /// signal handling is wired up (there is nothing to interrupt against yet),
 /// so a plain blocking sleep between attempts is used rather than routing
 /// through a cancellable async retry loop.
+///
+/// That ordering is what makes the blocking sleep *correct* rather than
+/// merely unmonitored: no signal handler is installed until
+/// `run_network_node_with_signals`, so for the whole of these ~5s the
+/// **default signal disposition** still applies, and `systemctl stop`
+/// (SIGTERM) or Ctrl-C (SIGINT) terminates the process immediately. There is
+/// no handler that the sleep could be delaying.
 fn check_for_existing_process_with(
     port: u16,
     max_attempts: u32,
@@ -1059,6 +1115,13 @@ fn check_for_existing_process_with(
         }
 
         match find_owning_pid(port) {
+            // The fast-fail path, and the ONLY arm that exits 43 early.
+            //
+            // `pid_is_alive` is not what detects a corpse — a corpse does not
+            // reach this arm at all, because it presents as `None` (see that
+            // arm). Its job here is to NARROW the fast fail: we abandon
+            // startup immediately only for a PID we can still see in `/proc`,
+            // and everything else falls through to the retry.
             Some(pid) if pid_is_alive(pid) => {
                 tracing::warn!(
                     port = port,
@@ -1070,9 +1133,17 @@ fn check_for_existing_process_with(
                 return Err(AlreadyRunningError.into());
             }
             Some(pid) => {
-                // The PID that owned the port no longer exists: a corpse
-                // whose socket the kernel hasn't finished tearing down yet.
-                // Keep retrying rather than exiting 43 for a transient.
+                // A PID was resolved from the socket's inode, but `/proc/<pid>`
+                // had already gone by the time we checked it.
+                //
+                // This is NOT the OOM-kill corpse case, despite reading like
+                // it: it requires the fd table to still be readable during the
+                // scan and the process to vanish entirely in the microseconds
+                // before the liveness check — a narrow race, not the field
+                // behaviour. The corpse arrives as `None`; see below.
+                //
+                // Retry anyway: whatever produced it, nothing here justifies
+                // an unrecoverable exit 43.
                 tracing::debug!(
                     port = port,
                     pid = pid,
@@ -1082,10 +1153,40 @@ fn check_for_existing_process_with(
                 );
             }
             None => {
-                // Could not identify an owning PID (non-Linux, permissions,
-                // or the socket disappeared between the probe and the
-                // lookup). Retry — if it's still occupied on the last
-                // attempt we bail out below.
+                // THE LOAD-BEARING RETRY BRANCH: this, not the `Some(pid)` arm
+                // above, is what saves the node after an OOM kill.
+                //
+                // A corpse presents as `None`. Linux's `do_exit` runs
+                // `exit_mm()` before `exit_files()`, so for a SIGKILLed
+                // large-RSS process `/proc/<pid>/fd` becomes unreadable
+                // (EACCES) within ~25-50ms while the LISTEN socket survives
+                // for seconds (measured: see EXISTING_PROCESS_PROBE_ATTEMPTS).
+                // `find_process_on_port` identifies the owner by scanning
+                // `/proc/*/fd` for the socket's inode, so throughout the
+                // corpse window it matches nothing and returns `None`.
+                // (`/proc/<pid>` itself survives the whole window, so
+                // `pid_is_alive` would report a corpse ALIVE if a PID for one
+                // ever did reach it.)
+                //
+                // Two other situations land here, and both want this same
+                // retry rather than an exit 43:
+                //
+                //   * A genuinely live instance owned by a DIFFERENT uid.
+                //     Reading `/proc/<pid>/fd` requires the same uid or root,
+                //     so a manual `freenet network` run as your own user
+                //     against the system service running as the `freenet` user
+                //     gets `None`. That is the canonical "I forgot I already
+                //     have one running" case, and it now costs ~5s and prints
+                //     the generic port-occupied message below instead of the
+                //     immediate `kill {pid}` hint. Accepted deliberately: a
+                //     slower and vaguer error for a user at a terminal is a
+                //     better trade than an unrecoverable gateway outage.
+                //
+                //   * Non-Linux, where `find_process_on_port` returns `None`
+                //     unconditionally (see `pid_is_alive`'s non-Linux note).
+                //
+                // If the port is still occupied on the last attempt we bail
+                // out below.
                 tracing::debug!(
                     port = port,
                     attempt = attempt,
@@ -1109,17 +1210,33 @@ fn check_for_existing_process_with(
     Err(AlreadyRunningError.into())
 }
 
-/// Whether the process identified as owning a listening socket is still
-/// alive. Distinguishes a genuinely running instance from a corpse whose
-/// socket the kernel hasn't finished tearing down yet after a kill (e.g. an
-/// OOM kill, #4565).
+/// Whether the PID resolved from a listening socket is still present in
+/// `/proc`.
+///
+/// This does **not** detect the OOM-kill corpse of #4565, and an earlier
+/// version of this comment claimed it did. `/proc/<pid>` outlives the LISTEN
+/// socket, so a corpse would report ALIVE here — but a corpse never reaches
+/// this function at all, because `exit_files()` tears down its fd table first
+/// and `find_process_on_port` therefore returns `None` for the whole window.
+/// See the `None` arm of `check_for_existing_process_with`.
+///
+/// Its actual job is to narrow the fast-fail arm: exit 43 immediately only
+/// for a process we can still see, and let everything else retry.
 #[cfg(target_os = "linux")]
 fn pid_is_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
 /// We can't cheaply determine PID liveness off Linux; `find_process_on_port`
-/// already returns `None` there, so this is unreachable in practice.
+/// already returns `None` there unconditionally, so this is unreachable in
+/// practice.
+///
+/// The consequence of that `None` is worth stating plainly, because it is a
+/// real behavioural change for non-Linux operators: on macOS and Windows
+/// EVERY occupied-port startup now takes the `None` retry branch and pays the
+/// full ~5s probe budget before exiting 43, where before this change it
+/// exited immediately. There is no PID lookup on those platforms for the
+/// fast-fail arm to work from.
 #[cfg(not(target_os = "linux"))]
 fn pid_is_alive(_pid: u32) -> bool {
     true
@@ -2119,11 +2236,13 @@ mod tests {
         assert_eq!(parse_listening_inode(content, "1D55"), None);
     }
 
-    /// Regression test for #4565 (2026-07-17 vega outage): a corpse process
-    /// whose socket the kernel hasn't finished tearing down yet must not be
-    /// treated as a live instance. The port answers on the first two probes
-    /// (simulating the OOM-killed process's still-bound socket), then frees
-    /// once the kernel finishes reclaiming it.
+    /// The `Some(dead_pid)` shape: a PID resolved from the socket's inode
+    /// that has vanished from `/proc` by the time liveness is checked.
+    ///
+    /// This is a narrow race rather than the field behaviour — the real
+    /// OOM-kill corpse presents as `None`, covered by
+    /// `check_for_existing_process_with_retries_past_a_corpse_with_no_resolvable_pid`
+    /// below. Kept because the arm exists and must keep retrying.
     #[test]
     fn check_for_existing_process_with_retries_past_a_dying_corpse() {
         use super::check_for_existing_process_with;
@@ -2232,6 +2351,119 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(find_pid_calls.get(), 2);
+    }
+
+    /// Regression test for the ACTUAL production path of #4565 (2026-07-17
+    /// vega outage).
+    ///
+    /// During the corpse window `find_process_on_port` returns `None`, not
+    /// `Some(dead_pid)`: Linux's `do_exit` runs `exit_mm()` before
+    /// `exit_files()`, so a SIGKILLed large-RSS process loses a readable
+    /// `/proc/<pid>/fd` within ~25-50ms while its LISTEN socket survives for
+    /// seconds (measured on nova: 8 GiB -> 2.0s, 20 GiB -> 1.8s, 24 GiB ->
+    /// 6.2s). The inode scan therefore matches nothing for the whole window.
+    ///
+    /// So this — not the `Some(999)` + not-alive test above — is the case
+    /// that reproduces the outage and the case the fix has to survive. The
+    /// port answers on the first two probes and frees on the third.
+    #[test]
+    fn check_for_existing_process_with_retries_past_a_corpse_with_no_resolvable_pid() {
+        use super::check_for_existing_process_with;
+
+        let mut probes = 0u32;
+        let mut pid_lookups = 0u32;
+        let result = check_for_existing_process_with(
+            1234,
+            super::EXISTING_PROCESS_PROBE_ATTEMPTS,
+            std::time::Duration::ZERO,
+            || {
+                probes += 1;
+                probes <= 2
+            },
+            |_port| {
+                pid_lookups += 1;
+                // The corpse's fd table is already gone: nothing to match.
+                None
+            },
+            |_pid| unreachable!("no PID is resolvable during the corpse window"),
+        );
+
+        assert!(
+            result.is_ok(),
+            "an unresolvable owner must be retried past, not treated as a live \
+             instance — this is the branch that self-heals the OOM-kill outage"
+        );
+        assert_eq!(
+            probes, 3,
+            "must probe until the corpse's socket clears, then stop"
+        );
+        assert_eq!(
+            pid_lookups, 2,
+            "each occupied probe must attempt an owner lookup"
+        );
+    }
+
+    /// Wiring pin: `check_for_existing_process` must actually pass the probe
+    /// budget constants through to `check_for_existing_process_with`, and the
+    /// attempt count must be greater than one.
+    ///
+    /// Without this, a regression setting `EXISTING_PROCESS_PROBE_ATTEMPTS = 1`
+    /// deletes the entire retry — restoring the exact 2026-07-17 failure mode
+    /// — while every behavioural test above stays green, because they all pass
+    /// their own attempt counts in as arguments and so cannot see the constant.
+    /// Inlining a literal at the call site would be just as invisible.
+    ///
+    /// The scraped region is bounded to the function body via `braced_block`
+    /// (not a bare `split_once`, which would match the later occurrence in
+    /// this test's own assertion strings and pass vacuously — the #5102
+    /// failure mode, see `.claude/rules/bug-prevention-patterns.md`), and over
+    /// `production_region` so the test module is excluded outright.
+    #[test]
+    fn check_for_existing_process_wires_up_the_retry_budget() {
+        // A `const` block, so a regression to `ATTEMPTS = 1` fails the build
+        // outright rather than waiting for anyone to run this test. (It is also
+        // what `clippy::assertions_on_constants` requires of an assertion whose
+        // operands are all compile-time constants.)
+        const {
+            assert!(
+                super::EXISTING_PROCESS_PROBE_ATTEMPTS > 1,
+                "a single attempt is not a retry: with ATTEMPTS = 1 the loop \
+                 probes once and exits 43, which is precisely the pre-#4565 \
+                 behaviour that burned systemd's StartLimitBurst against a \
+                 corpse's socket"
+            );
+        }
+
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let prod = production_region(&src);
+        let body = squeeze(braced_block(
+            prod,
+            "fn check_for_existing_process(config: &Config) -> anyhow::Result<()> {",
+        ));
+
+        // Anti-vacuity: if brace matching over-ran the function, these markers
+        // from `check_for_existing_process_with` immediately below would be
+        // inside the region and the assertions would prove nothing.
+        for escaped in ["AlreadyRunningError", "port_is_occupied()", "thread::sleep"] {
+            assert!(
+                !body.contains(&squeeze(escaped)),
+                "the scoped function body escaped its braces (found `{escaped}`) \
+                 — this pin would pass vacuously"
+            );
+        }
+
+        for constant in [
+            "EXISTING_PROCESS_PROBE_ATTEMPTS",
+            "EXISTING_PROCESS_PROBE_INTERVAL",
+        ] {
+            assert!(
+                body.contains(constant),
+                "`check_for_existing_process` must pass `{constant}` to \
+                 `check_for_existing_process_with`; a hard-coded literal there \
+                 would make the constant (and its recorded justification) dead \
+                 code that no test can see"
+            );
+        }
     }
 
     /// Regression test for issue #4196: a plain `File::create` from
