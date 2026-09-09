@@ -126,6 +126,33 @@ actors (clients, network peers) can influence.
    → Whichever you pick, saturation must be visible in RELEASE builds:
      `info!` or a counter, never `debug!` alone.
 
+   → A cap ENFORCED ONLY AT ADMISSION is not maintained, it is merely
+     asserted once. The check runs when an entry is admitted and nothing
+     re-applies it, so "this collection holds at most N" stays true only
+     while the admission function is the sole way the set can grow and
+     the cap itself never falls. Lower the constant in a later release,
+     or add a second insertion path, and every existing over-cap entry
+     survives with nothing to notice it.
+
+     So for each cap, say in the doc comment WHICH writer is the only way
+     in, and pin that claim with a source-scrape test if the collection is
+     reachable from more than one module. Where the set can also grow by
+     another route, re-apply the cap at the point that reads it, not only
+     at the point that writes it.
+
+     Three instances turned up in one night on the #5467 delegate work:
+     the delegate pin cap, `MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT` on
+     the durable subscription rows (#5493), and a transport stream cap
+     that was rejected for the same reason. None was a live defect on its
+     own. The class is worth naming because all three read as bounded and
+     none of them re-checks anything.
+
+     Note this interacts with the two branches above. Reject-at-cap is
+     only correct for entries that age out, so a cap enforced once at
+     admission over a collection that NEVER ages out is the starving
+     variant by construction: the incumbents are permanent, so the cap is
+     permanently held. Fixing one without the other leaves the hole.
+
 2. Per-client/per-peer resource counts MUST be bounded.
    → A single client must not hold unbounded subscriptions across all keys
    → A single peer must not register unbounded interest across all contracts
