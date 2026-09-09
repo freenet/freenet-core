@@ -225,17 +225,6 @@ pub(crate) fn restore_registration<S: DelegateSubscriptionPersistence + ?Sized>(
     true
 }
 
-/// Drop durable rows no genuine subscribe has affirmed within the backend's
-/// idle horizon, returning `(expired, restamped)`.
-///
-/// Call at boot BEFORE [`load_persisted`], so an expired row is gone before
-/// restore can put its notification hook and its pin back. It touches only the
-/// durable set: at boot the in-memory registry is empty, so there is no second
-/// representation to keep in step.
-pub(crate) fn expire_stale<S: DelegateSubscriptionPersistence + ?Sized>(db: &S) -> (usize, usize) {
-    db.expire_stale_delegate_subscriptions()
-}
-
 // ---------------------------------------------------------------------------
 // Durable half.
 // ---------------------------------------------------------------------------
@@ -296,15 +285,6 @@ pub trait DelegateSubscriptionPersistence: Send + Sync {
         _delegate: &DelegateKey,
     ) -> bool {
         true
-    }
-
-    /// Drop rows not affirmed within the backend's idle horizon, returning
-    /// `(expired, restamped)`. Boot only; see [`expire_stale`].
-    ///
-    /// The default is `(0, 0)` because only the redb backend persists anything
-    /// at all, so for every other backend there is nothing that could go stale.
-    fn expire_stale_delegate_subscriptions(&self) -> (usize, usize) {
-        (0, 0)
     }
 }
 

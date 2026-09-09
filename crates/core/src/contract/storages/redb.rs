@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use freenet_stdlib::prelude::*;
 use redb::{
-    Database, DatabaseError, ReadTransaction, ReadableDatabase, ReadableTable, StorageError,
-    TableDefinition, TransactionError, WriteTransaction,
+    Database, DatabaseError, ReadTransaction, ReadableDatabase, ReadableTable,
+    ReadableTableMetadata, StorageError, TableDefinition, TransactionError, WriteTransaction,
 };
 
 use crate::wasm_runtime::StateStorage;
@@ -2047,49 +2047,42 @@ impl ReDb {
     /// enforce by refusing to register demand when this returns `false`.
     pub(crate) const MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT: usize = 256;
 
-    /// How long a durable delegate-subscription row survives without a GENUINE
-    /// re-subscribe before the boot expiry pass drops it.
+    /// Node-wide ceiling on durable delegate-subscription rows.
     ///
-    /// # THE VALUE IS AN OPEN DECISION, THE MECHANISM IS NOT
+    /// # WHY THE PER-CONTRACT CAP IS NOT A BOUND ON ITS OWN
     ///
-    /// The mechanism is required: `AGENTS.md` forbids an unbounded cleanup
-    /// exemption, and a row that is deliberately kept while its contract is
-    /// unhosted (see [`restore_persisted_subscriptions`]) can otherwise re-pin
-    /// that contract at an arbitrary future boot with nothing that would ever
-    /// remove it. The NUMBER is not derivable here and is set generously on
-    /// purpose. It is #5467 open question 1 ("how long should a dormant app
-    /// keep its user's contracts alive") narrowed to unhosted rows, and it is
-    /// one line to change. **180 days is a generous placeholder, not a derived
-    /// number, and ratifying it is Ian's call.** Tracked in #5622 with the
-    /// reasoning.
+    /// [`Self::MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT`] is per CONTRACT, so a
+    /// delegate that subscribes once to each of many contracts passes it every
+    /// time and writes a row every time. The per-delegate and node-wide PIN
+    /// caps (`MAX_PINS_PER_DELEGATE`, `MAX_DELEGATE_PINS_PER_NODE`) do not
+    /// catch it either, and the reason is an ordering detail worth stating
+    /// because it defeats the obvious answer: `delegate_subscriptions::register`
+    /// PERSISTS the row before `delegate_demand::register_subscription` checks
+    /// those caps, so a delegate keeps writing durable rows long after its pins
+    /// are refused. The refusal happens downstream of the write.
     ///
-    /// Why there is no anchor to derive it from: the in-repo precedent for this
-    /// shape, `PHANTOM_ABSOLUTE_MAX_AGE`, is a multiple of
-    /// `SUBSCRIPTION_LEASE_DURATION`, so several renewal cycles must fail
-    /// first. Nothing equivalent exists here, because the thing that
-    /// re-affirms a row is THE APP BEING USED, which the node does not bound.
-    /// River re-subscribes per session, so in practice this is "the user has
-    /// not opened the app in 180 days".
+    /// So without this, one delegate could grow this table — and the full scan
+    /// every boot pays over it — without bound. That is a containment hole in
+    /// a feature whose purpose is bounding what one delegate can consume, and
+    /// `.claude/rules/code-style.md` asks for an aggregate limit for exactly
+    /// this shape.
     ///
-    /// # WHAT A USER LOSES WHEN A ROW EXPIRES, AND WHAT THEY DO NOT
+    /// Checked with `Table::len()` inside the write transaction the insert
+    /// already opens, so it costs no extra scan and cannot race a concurrent
+    /// insert into an overshoot.
     ///
-    /// They lose the delegate's notification registration for that contract,
-    /// and the hosting pin that came with it, until the delegate subscribes
-    /// again. That is all. **The contract is not deleted**, its state is not
-    /// touched, it is not removed from the network, and the next time the app
-    /// runs its delegate re-subscribes and is pinned again.
+    /// The value is generous rather than tight: 10,000 rows is ~1 MB of keys
+    /// and a boot scan that stays trivial, while being far above any
+    /// legitimate node's delegate-subscription count. It bounds the growth
+    /// without being a limit real use meets.
     ///
-    /// That is why a generous value is the safe direction to be wrong in, and
-    /// why the mechanism is worth having at a value nobody has ratified yet.
-    ///
-    /// It is a wall-clock mechanism, and the clock error that actually happens
-    /// is the safe one: a node whose clock is BEHIND computes an age of zero
-    /// (the comparison saturates) and expires nothing, which is also what a
-    /// node booting with an unset RTC does. A clock that jumped more than this
-    /// horizon FORWARD would expire rows early, and nothing guards against
-    /// that; the restore log line reports `expired_stale` so it is at least
-    /// visible after the fact.
-    pub(crate) const DELEGATE_SUBSCRIPTION_MAX_IDLE_MS: u64 = 180 * 24 * 60 * 60 * 1000;
+    /// **Residual, tracked in #5622:** this is reject-at-cap over rows that
+    /// never age out, so once full it refuses newcomers indefinitely rather
+    /// than reclaiming. That is the starving branch of the same
+    /// `code-style.md` rule this PR extends, and giving it a recovery path is
+    /// an eviction-policy decision for a durable table, not something to
+    /// invent here.
+    pub(crate) const MAX_DELEGATE_SUBSCRIPTION_ROWS_PER_NODE: u64 = 10_000;
 
     /// Only rewrite a row's stamp when the stored one is older than this.
     ///
@@ -2110,12 +2103,55 @@ impl ReDb {
             .unwrap_or(0)
     }
 
-    /// Decode a delegate-subscription row value. `None` means UNSTAMPED (any
-    /// length but 8), which is restamped rather than treated as expired, so a
-    /// value-encoding change can never delete a row. See
-    /// [`DELEGATE_SUBSCRIPTIONS_TABLE`].
-    fn decode_delegate_subscription_stamp(value: &[u8]) -> Option<u64> {
-        <[u8; 8]>::try_from(value).ok().map(u64::from_be_bytes)
+    /// Earliest stamp we will believe: 2020-01-01T00:00:00Z in ms.
+    ///
+    /// A node whose clock is not yet set — Pi-class hardware with no RTC, a
+    /// freshly-booted VM, a container — reports a time near 1970, so a row
+    /// written in that window carries a stamp near zero. That is not a real
+    /// affirmation time and must not be read as one. Any date before this
+    /// project existed is such a reading.
+    pub(crate) const DELEGATE_SUBSCRIPTION_STAMP_FLOOR_MS: u64 = 1_577_836_800_000;
+
+    /// Decode a delegate-subscription row value against `now_ms`. `None` means
+    /// "do not trust this stamp, restamp it", which is what both callers
+    /// already do with an unreadable value — so this adds no new branch.
+    ///
+    /// # THIS IS WHERE CLOCK ANOMALIES ARE CAUGHT, AND WHY IT IS HERE
+    ///
+    /// Three cases return `None`:
+    ///
+    /// 1. **Any length but 8** — an older or foreign encoding.
+    /// 2. **Below [`Self::DELEGATE_SUBSCRIPTION_STAMP_FLOOR_MS`]** — written
+    ///    while the node's clock was unset. Without this, a row stamped near
+    ///    zero looks ~56 years old to any later horizon and would be deleted
+    ///    on the first boot with a correct clock. That is silent, permanent
+    ///    loss of exactly the durable state this table exists to preserve, on
+    ///    the unattended low-end nodes that are a large share of a
+    ///    peer-to-peer network and disproportionately the long-lived ones.
+    /// 3. **Ahead of `now_ms`** — written after a forward clock excursion (VM
+    ///    migration, RTC jump, an NTP step). Without this the row is immortal:
+    ///    a saturating age of zero is always inside the refresh granularity,
+    ///    so the write path returns early and never corrects it, and it is
+    ///    always inside any horizon, so nothing ages it out. That is precisely
+    ///    the permanently-exempt row `AGENTS.md` forbids, reached through the
+    ///    one input the surrounding argument did not consider.
+    ///
+    /// **The root cause is shared and so is the fix.** `saturating_sub` turns
+    /// every clock anomaly into a plausible-looking zero, and a zero reads as
+    /// "just affirmed" in one direction and "affirmed at the epoch" in the
+    /// other. Catching it at the decode closes both exits at once instead of
+    /// patching each.
+    ///
+    /// Note what is deliberately NOT done: guarding the plausibility of
+    /// `now_ms` itself. The reader's clock is already safe by saturation, and
+    /// case 2's scenario has a CORRECT clock at read time and a bad one at
+    /// write time — so a reader-side guard protects the wrong half.
+    fn decode_delegate_subscription_stamp(value: &[u8], now_ms: u64) -> Option<u64> {
+        let stamp = <[u8; 8]>::try_from(value).ok().map(u64::from_be_bytes)?;
+        if stamp < Self::DELEGATE_SUBSCRIPTION_STAMP_FLOOR_MS || stamp > now_ms {
+            return None;
+        }
+        Some(stamp)
     }
 
     /// 96-byte row key `contract_instance_id(32) || delegate_key64(64)`.
@@ -2203,12 +2239,11 @@ impl ReDb {
         let fresh_enough =
             self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
                 Ok(tbl) => Ok(match tbl.get(row_key.as_slice())? {
-                    Some(v) => Self::decode_delegate_subscription_stamp(v.value()).is_some_and(
-                        |affirmed| {
+                    Some(v) => Self::decode_delegate_subscription_stamp(v.value(), now_ms)
+                        .is_some_and(|affirmed| {
                             now_ms.saturating_sub(affirmed)
                                 < Self::DELEGATE_SUBSCRIPTION_STAMP_GRANULARITY_MS
-                        },
-                    ),
+                        }),
                     None => false,
                 }),
                 Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
@@ -2231,6 +2266,17 @@ impl ReDb {
                 // delegate that is merely renewing something it already holds.
                 tbl.insert(row_key.as_slice(), stamp.as_slice())?;
                 admitted = true;
+            } else if tbl.len()? >= Self::MAX_DELEGATE_SUBSCRIPTION_ROWS_PER_NODE {
+                // Node-wide ceiling. Checked before the per-contract range
+                // count because it is O(1) and the range scan is not.
+                tracing::warn!(
+                    contract = %contract,
+                    delegate = %delegate.encode(),
+                    cap = Self::MAX_DELEGATE_SUBSCRIPTION_ROWS_PER_NODE,
+                    "node is at the delegate-subscription ROW ceiling; refusing \
+                     to record a further subscription"
+                );
+                admitted = false;
             } else {
                 let count = tbl.range(lo.as_slice()..=hi.as_slice())?.count();
                 if count < Self::MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT {
@@ -2284,11 +2330,10 @@ impl ReDb {
     /// that cares about the difference (the expiry pass) distinguishes them by
     /// scanning, and no other caller does.
     ///
-    /// Test-only. Production never READS a stamp: the two places that care
-    /// about one both write it, and `expire_stale_delegate_subscriptions_at`
-    /// reads the values inside its own scan. It exists so a test asserts
-    /// against the real decode rather than a reimplementation of it, which
-    /// could agree with itself while disagreeing with the code.
+    /// Test-only. Nothing in production READS a stamp today; its only
+    /// consumer writes it. It exists so a test asserts against the real
+    /// decode rather than a reimplementation of it, which could agree with
+    /// itself while disagreeing with the code.
     ///
     /// # Errors
     /// Returns `Err` if the redb read transaction, table open or lookup fails.
@@ -2302,74 +2347,10 @@ impl ReDb {
         self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
             Ok(tbl) => Ok(tbl
                 .get(row_key.as_slice())?
-                .and_then(|v| Self::decode_delegate_subscription_stamp(v.value()))),
+                .and_then(|v| Self::decode_delegate_subscription_stamp(v.value(), Self::now_ms()))),
             Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
             Err(e) => Err(e.into()),
         })
-    }
-
-    /// Drop delegate-subscription rows not affirmed within `max_idle_ms`, and
-    /// stamp any unstamped row so a later pass can age it.
-    ///
-    /// **Boot only, before the event loop starts.** The scan and the write are
-    /// separate transactions, so a subscribe landing between them could have
-    /// its just-written row deleted. At boot there is no such writer: nothing
-    /// can invoke a delegate until the loop is running. Calling this from a
-    /// periodic sweep would need the two folded into one write transaction.
-    ///
-    /// Returns `(expired, restamped)`.
-    ///
-    /// # Errors
-    /// Returns `Err` if any redb transaction, table open, scan, write or commit
-    /// fails. The caller must not treat `Err` as "nothing to expire" in a way
-    /// that also drops rows: a failed expiry is a no-op, not an empty set.
-    pub(crate) fn expire_stale_delegate_subscriptions_at(
-        &self,
-        now_ms: u64,
-        max_idle_ms: u64,
-    ) -> Result<(usize, usize), redb::Error> {
-        let (expired, unstamped) =
-            self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
-                Ok(tbl) => {
-                    let mut expired: Vec<Vec<u8>> = Vec::new();
-                    let mut unstamped: Vec<Vec<u8>> = Vec::new();
-                    for entry in tbl.iter()? {
-                        let (k, v) = entry?;
-                        match Self::decode_delegate_subscription_stamp(v.value()) {
-                            Some(affirmed) => {
-                                if now_ms.saturating_sub(affirmed) >= max_idle_ms {
-                                    expired.push(k.value().to_vec());
-                                }
-                            }
-                            None => unstamped.push(k.value().to_vec()),
-                        }
-                    }
-                    Ok((expired, unstamped))
-                }
-                // Never recorded a subscription, so never created the table.
-                Err(redb::TableError::TableDoesNotExist(_)) => Ok((Vec::new(), Vec::new())),
-                Err(e) => Err(e.into()),
-            })?;
-
-        // Do not open a write transaction, and so do not CREATE the table, on
-        // the overwhelmingly common boot where there is nothing to do.
-        if expired.is_empty() && unstamped.is_empty() {
-            return Ok((0, 0));
-        }
-
-        let stamp = now_ms.to_be_bytes();
-        let txn = self.begin_write()?;
-        {
-            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
-            for key in &expired {
-                tbl.remove(key.as_slice())?;
-            }
-            for key in &unstamped {
-                tbl.insert(key.as_slice(), stamp.as_slice())?;
-            }
-        }
-        Self::commit_guarded(txn)?;
-        Ok((expired.len(), unstamped.len()))
     }
 
     /// Forget that `delegate` is subscribed to `contract`. Idempotent.
@@ -2405,6 +2386,31 @@ impl ReDb {
         contract: &ContractInstanceId,
     ) -> Result<(), redb::Error> {
         let (lo, hi) = Self::delegate_subscription_range(contract);
+
+        // Answer the empty case from a READ transaction, exactly as
+        // `add_delegate_subscription_at`'s fast path does and for the same
+        // reason. This sits on `ContractStore::remove_contract`, which is on
+        // the eviction reclamation funnel and three PUT-rollback paths, and
+        // redb's default durability is Immediate — so opening a write
+        // transaction unconditionally costs an fsync and an acquisition of
+        // redb's single writer lock per reclaimed contract, in the bursts a
+        // byte-pressure sweep arrives in. On virtually every node today there
+        // are zero delegate subscriptions, so that bought nothing at all.
+        //
+        // The read-then-write is not atomic, and does not need to be: a
+        // subscription landing between the two leaves a row for a contract
+        // being removed, which boot reconciliation drops as
+        // `dropped_contract_gone`. Self-healing, so not worth one transaction.
+        let has_rows =
+            self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
+                Ok(tbl) => Ok(tbl.range(lo.as_slice()..=hi.as_slice())?.next().is_some()),
+                Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+                Err(e) => Err(e.into()),
+            })?;
+        if !has_rows {
+            return Ok(());
+        }
+
         let txn = self.begin_write()?;
         {
             let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
@@ -2620,26 +2626,6 @@ impl crate::wasm_runtime::delegate_subscriptions::DelegateSubscriptionPersistenc
                      restoring it anyway rather than dropping the delegate's hook"
                 );
                 true
-            }
-        }
-    }
-
-    fn expire_stale_delegate_subscriptions(&self) -> (usize, usize) {
-        match self.expire_stale_delegate_subscriptions_at(
-            Self::now_ms(),
-            Self::DELEGATE_SUBSCRIPTION_MAX_IDLE_MS,
-        ) {
-            Ok(counts) => counts,
-            Err(error) => {
-                // A failed expiry pass is a no-op, deliberately. The rows stay,
-                // the next boot tries again, and nothing is dropped on the
-                // strength of a read that did not complete.
-                tracing::warn!(
-                    %error,
-                    "could not expire stale delegate subscriptions; the durable set is \
-                     unchanged and the next boot will retry"
-                );
-                (0, 0)
             }
         }
     }
@@ -3667,67 +3653,225 @@ mod tests {
             .expect("read stamp")
     }
 
-    /// A row no genuine subscribe has affirmed within the horizon is dropped;
-    /// one inside the horizon is not.
+    /// A stamp written while the clock was unset must be RESTAMPED, never read
+    /// as ancient.
     ///
-    /// The negative half is not decoration. An expiry pass that dropped
-    /// everything would satisfy the positive assertion on its own, and the
-    /// failure it would cause in the field (every delegate loses its pin at the
-    /// next boot) is worse than the leak this closes.
-    #[tokio::test]
-    async fn a_delegate_subscription_expires_once_nothing_affirms_it() {
-        let dir = TempDir::new().unwrap();
-        let store = ReDb::new(dir.path()).await.unwrap();
+    /// A node with no RTC reports a time near 1970, so rows it writes before
+    /// NTP lands carry a near-zero stamp. Read literally, that row looks ~56
+    /// years old to any horizon and is deleted on the first boot with a correct
+    /// clock — silent, permanent loss of exactly the state this table exists to
+    /// preserve, on the unattended low-end nodes that are a large share of a
+    /// peer-to-peer network.
+    ///
+    /// The assertion is on the DECODE returning `None`, because `None` is what
+    /// routes to the restamp path both callers already have.
+    #[test]
+    fn a_stamp_from_an_unset_clock_is_not_trusted() {
+        let now = 1_700_000_000_000u64;
 
-        let contract = ContractInstanceId::new([3; 32]);
-        let stale = expiry_test_delegate(1);
-        let recent = expiry_test_delegate(2);
-
-        let horizon = ReDb::DELEGATE_SUBSCRIPTION_MAX_IDLE_MS;
-        let now = 10 * horizon;
-
-        // One row affirmed exactly at the horizon, one a millisecond inside it.
-        assert!(
-            store
-                .add_delegate_subscription_at(&contract, &stale, now - horizon)
-                .unwrap()
-        );
-        assert!(
-            store
-                .add_delegate_subscription_at(&contract, &recent, now - horizon + 1)
-                .unwrap()
-        );
-
-        let (expired, restamped) = store
-            .expire_stale_delegate_subscriptions_at(now, horizon)
-            .unwrap();
-        assert_eq!(expired, 1, "exactly the row at the horizon must go");
-        assert_eq!(restamped, 0, "both rows were stamped, so none needs one");
-
-        let survivors: Vec<DelegateKey> = store
-            .load_all_delegate_subscriptions()
-            .unwrap()
-            .into_iter()
-            .map(|(_, d)| d)
-            .collect();
+        // What a node with an unset clock writes.
+        let epoch_ish = 42u64.to_be_bytes();
         assert_eq!(
-            survivors,
-            vec![recent],
-            "the row inside the horizon must survive — an expiry pass that drops \
-             everything would satisfy the count assertion above and take every \
-             delegate's pin with it at the next boot"
+            ReDb::decode_delegate_subscription_stamp(&epoch_ish, now),
+            None,
+            "a near-epoch stamp must not be read as a real affirmation time — \
+             read literally it is ~56 years old and any horizon deletes it"
+        );
+
+        // The boundary, both sides, so the floor is pinned rather than assumed.
+        let below = (ReDb::DELEGATE_SUBSCRIPTION_STAMP_FLOOR_MS - 1).to_be_bytes();
+        assert_eq!(
+            ReDb::decode_delegate_subscription_stamp(&below, now),
+            None,
+            "one millisecond below the floor must still be refused"
+        );
+        let at = ReDb::DELEGATE_SUBSCRIPTION_STAMP_FLOOR_MS.to_be_bytes();
+        assert_eq!(
+            ReDb::decode_delegate_subscription_stamp(&at, now),
+            Some(ReDb::DELEGATE_SUBSCRIPTION_STAMP_FLOOR_MS),
+            "the floor itself must be ACCEPTED, or the guard is rejecting valid \
+             stamps and every row is permanently restamped"
         );
     }
 
-    /// An unstamped row is STAMPED, never deleted.
+    /// A stamp in the FUTURE must be restamped, or the row becomes immortal.
     ///
-    /// Nothing in the field carries one today (this table is unreleased), so
-    /// this pins the direction of the fail-safe rather than a migration that
-    /// has to happen: a future value-encoding change must not be able to delete
-    /// every delegate subscription on the node by making the old values
-    /// unreadable.
+    /// After a forward clock excursion — VM migration, RTC jump, an NTP step —
+    /// a row carries a stamp ahead of now. Both comparisons in this file
+    /// saturate, so a future stamp yields an age of zero, which is always
+    /// inside the refresh granularity (so the write path returns early and
+    /// never corrects it) and always inside any horizon (so nothing ages it
+    /// out). That is the permanently-exempt row `AGENTS.md` forbids, reached
+    /// through the one input the surrounding argument did not consider.
+    #[test]
+    fn a_stamp_from_the_future_is_not_trusted() {
+        let now = 1_700_000_000_000u64;
+
+        let ahead = (now + 1).to_be_bytes();
+        assert_eq!(
+            ReDb::decode_delegate_subscription_stamp(&ahead, now),
+            None,
+            "a stamp ahead of now must be refused — trusting it makes the row \
+             immortal in both directions at once"
+        );
+        let exactly_now = now.to_be_bytes();
+        assert_eq!(
+            ReDb::decode_delegate_subscription_stamp(&exactly_now, now),
+            Some(now),
+            "a stamp of exactly now must be ACCEPTED — the common case is a row \
+             written this millisecond, and refusing it would restamp on every \
+             call and defeat the granularity throttle"
+        );
+    }
+
+    /// A future stamp is actually CORRECTED by the next subscribe, not merely
+    /// distrusted at the decode.
+    ///
+    /// The decode tests above pin the classification; this pins that the
+    /// classification reaches the durable row. Without it the guard could be
+    /// correct and still leave the bad stamp on disk forever.
     #[tokio::test]
-    async fn an_unstamped_delegate_subscription_row_is_stamped_not_dropped() {
+    async fn a_future_stamp_is_corrected_by_the_next_subscribe() {
+        let dir = TempDir::new().unwrap();
+        let store = ReDb::new(dir.path()).await.unwrap();
+
+        let contract = ContractInstanceId::new([12; 32]);
+        let delegate = expiry_test_delegate(12);
+        let now = 1_700_000_000_000u64;
+
+        // Written during a forward clock excursion: a year ahead.
+        let future = now + 365 * 24 * 60 * 60 * 1000;
+        assert!(
+            store
+                .add_delegate_subscription_at(&contract, &delegate, future)
+                .unwrap()
+        );
+        assert_eq!(stored_stamp(&store, &contract, &delegate), Some(future));
+
+        // The clock is correct again. This is INSIDE the granularity by a
+        // saturating read, so without the guard it would return early and leave
+        // the future stamp in place forever.
+        assert!(
+            store
+                .add_delegate_subscription_at(&contract, &delegate, now)
+                .unwrap()
+        );
+        assert_eq!(
+            stored_stamp(&store, &contract, &delegate),
+            Some(now),
+            "the future stamp must be corrected to the real time, or the row is \
+             permanently exempt from any horizon added later"
+        );
+    }
+
+    /// The node-wide row ceiling bounds what ONE delegate can write, which the
+    /// per-contract cap does not.
+    ///
+    /// The per-contract cap is per CONTRACT, so a delegate subscribing once to
+    /// each of many contracts passes it every time. The pin caps do not catch
+    /// it either, because the row is persisted BEFORE they are checked. This
+    /// asserts the ceiling holds against exactly that shape: one delegate, many
+    /// contracts, one row each.
+    #[tokio::test]
+    async fn one_delegate_cannot_grow_the_table_past_the_node_ceiling() {
+        let dir = TempDir::new().unwrap();
+        let store = ReDb::new(dir.path()).await.unwrap();
+
+        let delegate = expiry_test_delegate(11);
+        let cap = ReDb::MAX_DELEGATE_SUBSCRIPTION_ROWS_PER_NODE;
+        let now = 1_700_000_000_000;
+
+        // One row per contract, so the per-contract cap (256) is never the
+        // thing refusing — if it were, this test would pass for the wrong
+        // reason and prove nothing about the node-wide bound.
+        for n in 0..cap {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&n.to_be_bytes());
+            let contract = ContractInstanceId::new(bytes);
+            assert!(
+                store
+                    .add_delegate_subscription_at(&contract, &delegate, now)
+                    .unwrap(),
+                "row {n} must be admitted while under the node-wide ceiling"
+            );
+        }
+        assert_eq!(
+            store.load_all_delegate_subscriptions().unwrap().len() as u64,
+            cap,
+            "precondition: the table must actually be at the ceiling"
+        );
+
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&cap.to_be_bytes());
+        let overflow = ContractInstanceId::new(bytes);
+        assert!(
+            !store
+                .add_delegate_subscription_at(&overflow, &delegate, now)
+                .unwrap(),
+            "the node-wide ceiling must refuse the next row, from a contract \
+             whose own per-contract count is ZERO — that is the whole point, \
+             and without it one delegate grows this table without bound"
+        );
+        assert_eq!(
+            store.load_all_delegate_subscriptions().unwrap().len() as u64,
+            cap,
+            "and the refused row must not have been written"
+        );
+    }
+
+    /// Removing a contract with no delegate subscriptions must not open a write
+    /// transaction.
+    ///
+    /// This sits on the eviction reclamation funnel and three PUT-rollback
+    /// paths, and redb's durability is Immediate, so an unconditional write is
+    /// an fsync and an acquisition of the single writer lock per reclaimed
+    /// contract — in the bursts a byte-pressure sweep arrives in, on nodes that
+    /// almost always have zero delegate subscriptions.
+    ///
+    /// Asserted by source scrape rather than by timing, because a timing
+    /// assertion for "did not fsync" is exactly the kind that passes on a fast
+    /// disk regardless.
+    #[test]
+    fn removing_a_contract_with_no_subscriptions_takes_no_write_transaction() {
+        const SOURCE: &str = include_str!("redb.rs");
+        let start = SOURCE
+            .find("pub fn remove_delegate_subscriptions_for_contract(")
+            .expect("remove_delegate_subscriptions_for_contract must still exist");
+        let rel_end = SOURCE[start..]
+            .find("\n    }\n")
+            .expect("must still be a closed fn body");
+        let body = &SOURCE[start..start + rel_end];
+
+        // Window guard, separate from the assertion that uses it: a window
+        // truncated before `begin_write` would make the ordering check pass
+        // vacuously.
+        let write = body.find("self.begin_write()").expect(
+            "the scraped window no longer reaches the write transaction. Widen it; do NOT \
+             delete this check.",
+        );
+        let read = body
+            .find("self.read_guarded(")
+            .expect("the empty case must be answered from a READ transaction");
+        let early_return = body
+            .find("return Ok(());")
+            .expect("the empty case must return before the write");
+        assert!(
+            read < early_return && early_return < write,
+            "order must be read, then early return, then write. Got read at {read}, \
+             return at {early_return}, write at {write}."
+        );
+    }
+
+    /// A row carrying an unreadable value is STAMPED by the next genuine
+    /// subscribe, never treated as absent.
+    ///
+    /// Nothing in the field carries one, since this table is introduced
+    /// unreleased by #4669 part 2, so this pins the DIRECTION of the fail-safe
+    /// rather than a migration that has to happen: a future value-encoding
+    /// change must degrade to "restamp it", not to "this row does not count",
+    /// which at the cap would mean silently admitting past the bound.
+    #[tokio::test]
+    async fn a_row_with_an_unreadable_value_is_stamped_by_the_next_subscribe() {
         let dir = TempDir::new().unwrap();
         let store = ReDb::new(dir.path()).await.unwrap();
 
@@ -3745,23 +3889,29 @@ mod tests {
         assert_eq!(
             stored_stamp(&store, &contract, &delegate),
             None,
-            "precondition: the row must be UNSTAMPED, or this test is asserting \
+            "precondition: the row must be unreadable, or this test is asserting \
              about an ordinary row"
         );
 
-        let now = 12_345_678_000;
-        let (expired, restamped) = store
-            .expire_stale_delegate_subscriptions_at(now, ReDb::DELEGATE_SUBSCRIPTION_MAX_IDLE_MS)
-            .unwrap();
-        assert_eq!(
-            expired, 0,
-            "an unreadable value must never be read as infinitely old"
+        let now = 1_700_000_000_000;
+        assert!(
+            store
+                .add_delegate_subscription_at(&contract, &delegate, now)
+                .unwrap(),
+            "the row exists, so it must be admitted rather than counted against \
+             the cap a second time"
         );
-        assert_eq!(restamped, 1);
         assert_eq!(
             stored_stamp(&store, &contract, &delegate),
             Some(now),
-            "the row must now carry a stamp, so the NEXT pass can age it"
+            "the row must now carry a stamp, so a horizon added later (#5622) \
+             can act on it"
+        );
+        assert_eq!(
+            store.load_all_delegate_subscriptions().unwrap().len(),
+            1,
+            "and there must still be exactly one row: stamping is a rewrite, \
+             not an insert alongside the old one"
         );
     }
 
@@ -3775,7 +3925,7 @@ mod tests {
         let contract = ContractInstanceId::new([5; 32]);
         let delegate = expiry_test_delegate(3);
         let granularity = ReDb::DELEGATE_SUBSCRIPTION_STAMP_GRANULARITY_MS;
-        let first = 1_000_000_000;
+        let first = 1_700_000_000_000;
 
         assert!(
             store
@@ -3832,7 +3982,7 @@ mod tests {
             DelegateKey::new([b[0]; 32], CodeHash::from_code(&[b[0], b[1]]))
         };
 
-        let first = 1_000_000_000;
+        let first = 1_700_000_000_000;
         for n in 0..cap {
             assert!(
                 store

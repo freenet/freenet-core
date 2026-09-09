@@ -1160,13 +1160,6 @@ pub(crate) struct RestoreOutcome {
     pub(crate) dropped_delegate_gone: usize,
     /// Rows dropped because the contract is no longer in the contract store.
     pub(crate) dropped_contract_gone: usize,
-    /// Rows dropped by the expiry pass because no genuine subscribe affirmed
-    /// them within `DELEGATE_SUBSCRIPTION_MAX_IDLE_MS`. Counted before the
-    /// restore loop, so these never appear in `restored` or `pinned`.
-    pub(crate) expired_stale: usize,
-    /// Rows the expiry pass stamped because they carried no stamp. One write
-    /// per row, ever.
-    pub(crate) restamped: usize,
 }
 
 /// Put persisted delegate subscriptions back, dropping the stale ones
@@ -1200,21 +1193,37 @@ pub(crate) struct RestoreOutcome {
 /// the contract again. It is the same no-pin outcome a fresh subscribe gets in
 /// that state, counted by the same `not_hosted` counter.
 ///
-/// # Expiry
+/// # THIS EXEMPTION IS NOT TIME-BOUNDED, AND THAT IS A KNOWN, TRACKED GAP
 ///
-/// That kept-but-unhosted row is why this function opens with an expiry pass.
-/// Keeping it is right, but keeping it FOREVER is a cleanup exemption with no
-/// time bound, which `AGENTS.md` forbids: nothing else would ever look at the
-/// row again, and it can silently re-pin its contract at an arbitrary future
-/// boot. So a row no genuine subscribe has affirmed within
-/// `DELEGATE_SUBSCRIPTION_MAX_IDLE_MS` is dropped here, before the restore loop
-/// can put its hook and its pin back.
+/// Keeping the kept-but-unhosted row is right; keeping it FOREVER is a cleanup
+/// exemption with no time bound, which `AGENTS.md` forbids. Nothing ages the
+/// row out today, so it can re-pin its contract at an arbitrary future boot.
+/// **The rule is not satisfied here.** It is a recorded trade, not an
+/// oversight, and #5622 carries the analysis.
 ///
-/// The restore loop itself goes through
+/// An expiry pass was built and then deliberately taken back out, and the
+/// reason is worth keeping because it is not the obvious one. The only thing
+/// that refreshes a row's stamp is an explicit `subscribe_contract()`. A
+/// notification must NOT refresh it: an app that updates its own contract
+/// would then notify its own delegate, refresh its own row and keep its own
+/// pin alive forever, which is the self-granting loop a horizon exists to
+/// bound (the same shape as the governance self-exemption this module's header
+/// describes). But with only re-subscribe as the signal, a delegate that
+/// subscribes once and is then notified for months never refreshes, so a
+/// horizon would delete a subscription that is actively working — and the
+/// delegate most likely to behave that way is the one this feature exists for,
+/// the freenet/delta#30 site delegate that keeps a site available AFTER the
+/// tab closes. Choosing what counts as affirmation is the same class of
+/// decision as choosing the horizon, so both live in #5622.
+///
+/// What IS here is the half that makes #5622 a policy change rather than a
+/// second row-format change. The durable row carries a last-affirmed stamp,
+/// and the restore loop goes through
 /// [`restore_registration`](crate::wasm_runtime::delegate_subscriptions::restore_registration)
-/// rather than `register` for the same reason: `register` would stamp every row
-/// it replayed as affirmed now, so the exemption would be refreshed by the
-/// node's own restarts and could never expire.
+/// rather than `register` so that replaying the durable set does NOT refresh
+/// it. That ordering is the load-bearing part: `register` would stamp every
+/// row it replayed as affirmed now, so a node's own restarts would re-affirm
+/// everything and no horizon added later could ever fire.
 ///
 /// # On a read failure
 ///
@@ -1231,11 +1240,6 @@ pub(crate) fn restore_persisted_subscriptions<S>(
 where
     S: crate::wasm_runtime::delegate_subscriptions::DelegateSubscriptionPersistence + ?Sized,
 {
-    // Expire first, so a row past the idle horizon is gone before the loop
-    // below could put its notification hook and its pin back. See the Expiry
-    // section above for why the kept-but-unhosted row needs this at all.
-    let (expired_stale, restamped) = crate::wasm_runtime::delegate_subscriptions::expire_stale(db);
-
     let persisted = match crate::wasm_runtime::delegate_subscriptions::load_persisted(db) {
         Ok(rows) => rows,
         Err(error) => {
@@ -1246,19 +1250,11 @@ where
                  relying on some other route to keep its contracts hosted, which \
                  is the failure #4669 part 2 exists to close."
             );
-            return RestoreOutcome {
-                expired_stale,
-                restamped,
-                ..RestoreOutcome::default()
-            };
+            return RestoreOutcome::default();
         }
     };
     if persisted.is_empty() {
-        return RestoreOutcome {
-            expired_stale,
-            restamped,
-            ..RestoreOutcome::default()
-        };
+        return RestoreOutcome::default();
     }
 
     // Per-reason refusal counters, sampled around the loop.
@@ -1282,11 +1278,7 @@ where
     // the log then simply omits the breakdown rather than the whole line.
     let refusals_before = crate::node::network_status::delegate_pin_refusal_counts();
 
-    let mut outcome = RestoreOutcome {
-        expired_stale,
-        restamped,
-        ..RestoreOutcome::default()
-    };
+    let mut outcome = RestoreOutcome::default();
     for (instance_id, delegate) in persisted {
         if !delegate_is_registered(&delegate) {
             crate::wasm_runtime::delegate_subscriptions::forget_one(
@@ -1396,8 +1388,6 @@ where
         pinned = outcome.pinned,
         dropped_delegate_gone = outcome.dropped_delegate_gone,
         dropped_contract_gone = outcome.dropped_contract_gone,
-        expired_stale = outcome.expired_stale,
-        restamped = outcome.restamped,
         "restored persisted delegate subscriptions (#4669 part 2)"
     );
     outcome
@@ -1868,8 +1858,6 @@ mod tests {
                 pinned: 1,
                 dropped_delegate_gone: 0,
                 dropped_contract_gone: 0,
-                expired_stale: 0,
-                restamped: 0,
             }
         );
         assert!(
@@ -1973,8 +1961,6 @@ mod tests {
                 pinned: 1,
                 dropped_delegate_gone: 0,
                 dropped_contract_gone: 0,
-                expired_stale: 0,
-                restamped: 0,
             },
             "the row is inside the horizon, so restore must replay it in full and \
              the expiry pass must leave it alone"
@@ -1995,79 +1981,6 @@ mod tests {
             restarted.ring.contract_in_use(&key),
             "the pin must still come back; this test is about the stamp, and it \
              would pass vacuously if restore had simply stopped working"
-        );
-    }
-
-    /// A row past the horizon is dropped at boot instead of re-pinning its
-    /// contract, and the delegate's notification hook goes with it.
-    ///
-    /// The kept-but-unhosted row is what makes this reachable: reconciliation
-    /// keeps such a row deliberately, so without an idle horizon it sits on
-    /// disk forever and re-pins whenever the node next holds the contract.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn boot_restore_drops_a_subscription_no_one_has_affirmed_in_too_long() {
-        let _pin_outcomes = pin_outcome_guard().await;
-        use crate::contract::storages::ReDb;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let storage: ReDb = ReDb::new(dir.path()).await.expect("open redb");
-
-        let key = contract_key(84);
-        let delegate = delegate_key(84);
-        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
-
-        let fixture = seam_fixture("delegate-demand-4669-restore-expired").await;
-        let op_manager = fixture.op_manager.clone();
-        hosted_contract_on_real_storage(&op_manager.ring, &storage, key).await;
-
-        // One day past the horizon.
-        let stale_at = ReDb::now_ms()
-            .saturating_sub(ReDb::DELEGATE_SUBSCRIPTION_MAX_IDLE_MS)
-            .saturating_sub(24 * 60 * 60 * 1000);
-        assert!(
-            storage
-                .add_delegate_subscription_at(key.id(), &delegate, stale_at)
-                .expect("record the row")
-        );
-
-        let outcome = restore_persisted_subscriptions(
-            &op_manager,
-            &storage,
-            |id| (id == key.id()).then_some(key),
-            |_| true,
-        );
-
-        assert_eq!(
-            outcome,
-            RestoreOutcome {
-                restored: 0,
-                pinned: 0,
-                dropped_delegate_gone: 0,
-                dropped_contract_gone: 0,
-                expired_stale: 1,
-                restamped: 0,
-            },
-            "the row must be expired BEFORE the restore loop, so it is never \
-             restored and never pinned"
-        );
-        assert!(
-            crate::wasm_runtime::delegate_subscriptions::load_persisted(&storage)
-                .expect("read back")
-                .is_empty(),
-            "the durable row must be gone, or it re-pins the contract at the next \
-             boot and the horizon bounded nothing"
-        );
-        assert!(
-            !op_manager.ring.contract_in_use(&key),
-            "an expired subscription must leave no pin behind"
-        );
-        assert!(
-            !crate::wasm_runtime::delegate_subscriptions::test_support::is_registered(
-                key.id(),
-                &delegate
-            ),
-            "and no notification hook, so the two representations agree here as \
-             they do everywhere else"
         );
     }
 
@@ -2166,8 +2079,6 @@ mod tests {
                 pinned: 0,
                 dropped_delegate_gone: 1,
                 dropped_contract_gone: 0,
-                expired_stale: 0,
-                restamped: 0,
             }
         );
         assert!(!op_manager.ring.contract_in_use(&key));
@@ -2222,8 +2133,6 @@ mod tests {
                 pinned: 0,
                 dropped_delegate_gone: 0,
                 dropped_contract_gone: 1,
-                expired_stale: 0,
-                restamped: 0,
             }
         );
         assert!(
@@ -2278,8 +2187,6 @@ mod tests {
                 pinned: 0,
                 dropped_delegate_gone: 0,
                 dropped_contract_gone: 0,
-                expired_stale: 0,
-                restamped: 0,
             }
         );
         assert!(!op_manager.ring.contract_in_use(&key));
