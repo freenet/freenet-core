@@ -1900,7 +1900,7 @@ dependencies = [
  "ed25519-dalek",
  "either",
  "freenet",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.10.0",
  "futures 0.3.32",
  "glob",
  "hex",
@@ -2099,7 +2099,7 @@ dependencies = [
  "flatbuffers 25.12.19",
  "flate2",
  "freenet-macros 0.1.0",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.10.0",
  "freenet-test-network",
  "futures 0.3.32",
  "headers",
@@ -2223,7 +2223,7 @@ dependencies = [
  "clap",
  "freenet",
  "freenet-ping-types",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.10.0",
  "freenet-test-network",
  "futures 0.3.32",
  "rand 0.9.4",
@@ -2243,7 +2243,7 @@ name = "freenet-ping-contract"
 version = "0.1.11"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.10.0",
  "serde_json",
 ]
 
@@ -2253,7 +2253,7 @@ version = "0.1.11"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.10.0",
  "humantime",
  "humantime-serde",
  "serde",
@@ -2313,9 +2313,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.8.5"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b62aeba7634d1ae5c2d02f78db33ee40442511858275be5be2099d24a13b2559"
+checksum = "292b74aee3af1918f555051bb404010e89fdb8e77080b0056f564681bec58b35"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -2377,7 +2377,7 @@ dependencies = [
  "byteorder",
  "ciborium",
  "ed25519-dalek",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.10.0",
  "rand 0.9.4",
  "serde",
 ]
@@ -4247,7 +4247,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.10.0",
  "futures 0.3.32",
  "hex",
  "rand 0.9.4",
@@ -6851,14 +6851,14 @@ dependencies = [
 name = "test-contract-delta-trap"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.10.0",
 ]
 
 [[package]]
 name = "test-contract-integration"
 version = "0.1.11"
 dependencies = [
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.10.0",
  "serde",
  "serde_json",
 ]
@@ -6868,21 +6868,21 @@ name = "test-contract-mock-aligned"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.10.0",
 ]
 
 [[package]]
 name = "test-contract-requires-related"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.10.0",
 ]
 
 [[package]]
 name = "test-contract-update-nochange"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.10.0",
  "serde",
  "serde_json",
 ]
