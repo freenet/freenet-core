@@ -80,18 +80,41 @@ struct Hold {
     release: InterestRelease,
 }
 
+/// In-process identity of the node that took a hold: the address of its
+/// `Arc<OpManager>` (#5542 finding M3/F4).
+///
+/// The map is process-global, so its key has to be too, and "which node" is
+/// exactly "which `OpManager` instance" — there is no stable node id on
+/// `OpManager` to use instead. In production this is always a single value,
+/// because production runs one node per process; it earns its place in the
+/// in-process multi-node harness, which is the environment the module's own
+/// per-hold-closure design was written for.
+pub(crate) type NodeIdentity = usize;
+
 /// Outstanding local-interest refcounts taken on behalf of delegate
-/// subscriptions, keyed by the `(contract, delegate)` pair that owns them.
+/// subscriptions, keyed by the `(contract, delegate, node)` triple that owns
+/// them.
+///
+/// The NODE component is load-bearing and was missing. Keyed on the pair alone,
+/// `record`'s `or_insert` silently discarded a second node's obligation when two
+/// nodes in one process subscribed the same delegate to the same contract: both
+/// incremented, one hold existed, so release discharged one and leaked the
+/// other permanently. The module already argued that per-node behaviour matters
+/// here — it is why each hold carries its own release closure rather than a
+/// single global callback — but the key did not carry that intent.
 static DELEGATE_INTEREST_HOLDS: std::sync::LazyLock<
-    DashMap<(ContractInstanceId, DelegateKey), Hold>,
+    DashMap<(ContractInstanceId, DelegateKey, NodeIdentity), Hold>,
 > = std::sync::LazyLock::new(DashMap::new);
 
 /// Record that one local-interest refcount was taken for
 /// `(contract, delegate)`, and how to give it back.
 ///
-/// Idempotent per pair: recording twice keeps ONE obligation, matching the
-/// caller's own guarantee that it increments at most once per pair (the
-/// `already_subscribed` gate plus the in-round de-duplication). If that
+/// Idempotent per (pair, node): recording twice for the SAME node keeps ONE
+/// obligation, matching that caller's own guarantee that it increments at most
+/// once per pair (the `already_subscribed` gate plus the in-round
+/// de-duplication). A DIFFERENT node recording the same pair gets its own
+/// obligation, because it took its own refcount on its own `InterestManager` —
+/// collapsing the two is how the second one leaked. If that
 /// guarantee were ever broken, holding one obligation for two increments leaks
 /// — which is the safe direction, since the alternative is releasing interest
 /// that was never taken.
@@ -100,9 +123,10 @@ pub(crate) fn record(
     delegate: DelegateKey,
     key: ContractKey,
     release: InterestRelease,
+    node: NodeIdentity,
 ) {
     DELEGATE_INTEREST_HOLDS
-        .entry((contract, delegate))
+        .entry((contract, delegate, node))
         .or_insert(Hold { key, release });
 }
 
@@ -115,7 +139,7 @@ pub(crate) fn release_delegate(delegate: &DelegateKey) {
     // into `InterestManager`, which takes its own locks. Doing that under a
     // DashMap shard guard is how lock-order inversions get built.
     let mut discharged = Vec::new();
-    DELEGATE_INTEREST_HOLDS.retain(|(_, holder), hold| {
+    DELEGATE_INTEREST_HOLDS.retain(|(_, holder, _), hold| {
         if holder == delegate {
             discharged.push((hold.key, hold.release.clone()));
             false
@@ -134,7 +158,7 @@ pub(crate) fn release_delegate(delegate: &DelegateKey) {
 /// both of which drop every delegate subscription for one contract.
 pub(crate) fn release_contract(contract: &ContractInstanceId) {
     let mut discharged = Vec::new();
-    DELEGATE_INTEREST_HOLDS.retain(|(id, _), hold| {
+    DELEGATE_INTEREST_HOLDS.retain(|(id, _, _), hold| {
         if id == contract {
             discharged.push((hold.key, hold.release.clone()));
             false
@@ -171,6 +195,47 @@ mod tests {
         DelegateKey::new([byte; 32], CodeHash::new([byte; 32]))
     }
 
+    /// Two distinct in-process node identities. In production there is only
+    /// ever one; these stand for two `OpManager`s in one test process.
+    const NODE_A: NodeIdentity = 0xA;
+    const NODE_B: NodeIdentity = 0xB;
+
+    /// Two NODES in one process, subscribing the same delegate to the same
+    /// contract, each hold their own obligation (#5542 finding M3/F4).
+    ///
+    /// Keyed on `(contract, delegate)` alone, `record`'s `or_insert` made the
+    /// second node's call a silent no-op. Both nodes had incremented their own
+    /// `InterestManager`, one hold existed, so release discharged one node's
+    /// refcount and leaked the other's permanently. Exposure is the in-process
+    /// multi-node harness — which is exactly the environment this module's
+    /// per-hold release closure was designed for, so the key had to carry the
+    /// same intent the closure already did.
+    #[test]
+    fn two_nodes_holding_the_same_pair_each_keep_their_obligation() {
+        let (release_a, seen_a) = recorder();
+        let (release_b, seen_b) = recorder();
+        let d = delegate(240);
+        let k = key(241);
+
+        record(*k.id(), d.clone(), k, release_a, NODE_A);
+        record(*k.id(), d.clone(), k, release_b, NODE_B);
+
+        release_delegate(&d);
+
+        assert_eq!(
+            seen_a.lock().unwrap().len(),
+            1,
+            "node A's refcount must be released"
+        );
+        assert_eq!(
+            seen_b.lock().unwrap().len(),
+            1,
+            "node B took its own refcount on its own InterestManager, so it must \
+             get its own release; collapsing the two leaks whichever recorded \
+             second"
+        );
+    }
+
     /// The three sites that DROP a delegate subscription must each release the
     /// interest it held. The module tests above prove the mechanism; these
     /// prove it is actually reached, which is the half that silently rots — a
@@ -202,7 +267,7 @@ mod tests {
         /// Panics rather than returning empty if either anchor is missing, so a
         /// rename fails the pin loudly instead of vacuously passing it.
         fn region(src: &str, start: &str, end: &str) -> String {
-            let stripped = crate::contract::tests::strip_comments(src);
+            let stripped = crate::contract::source_pin_util::strip_comments(src);
             let from = stripped
                 .find(start)
                 .unwrap_or_else(|| panic!("anchor `{start}` must exist"));
@@ -274,7 +339,8 @@ mod tests {
     /// inert while looking present.
     #[test]
     fn the_subscribe_path_records_the_obligation_it_incurs() {
-        let contract = crate::contract::tests::strip_comments(include_str!("../contract.rs"));
+        let contract =
+            crate::contract::source_pin_util::strip_comments(include_str!("../contract.rs"));
         let body = contract
             .split("fn apply_resolved_contract_op<CH>(")
             .nth(1)
@@ -290,10 +356,27 @@ mod tests {
              release it (#5542)"
         );
         assert!(
-            body.contains("remove_local_client"),
-            "the recorded release closure must actually call \
-             `remove_local_client`; recording an obligation that discharges to \
-             nothing is the same leak with more code"
+            body.contains("delegate_interest_release_closure("),
+            "the recorded obligation must be built by the shared release-closure \
+             constructor; there are two sites that take this refcount now, and a \
+             second hand-written closure is where the next divergence lives"
+        );
+        // ...and that constructor must actually decrement. Following the
+        // extraction rather than dropping the assertion: the property being
+        // pinned is "the obligation discharges to a real decrement", and it is
+        // one function further away, not gone.
+        let closure = contract
+            .split("fn delegate_interest_release_closure(")
+            .nth(1)
+            .expect("delegate_interest_release_closure must exist");
+        let closure = &closure[..closure
+            .find("\nfn ")
+            .expect("delegate_interest_release_closure must be followed by another fn")];
+        assert!(
+            closure.contains("remove_local_client"),
+            "the release closure must actually call `remove_local_client`; \
+             recording an obligation that discharges to nothing is the same leak \
+             with more code"
         );
     }
 
@@ -316,11 +399,11 @@ mod tests {
     fn unregistering_a_delegate_releases_every_interest_it_held() {
         let (release, seen) = recorder();
         let d = delegate(200);
-        record(*key(201).id(), d.clone(), key(201), release.clone());
-        record(*key(202).id(), d.clone(), key(202), release.clone());
+        record(*key(201).id(), d.clone(), key(201), release.clone(), NODE_A);
+        record(*key(202).id(), d.clone(), key(202), release.clone(), NODE_A);
         // A different delegate's hold on one of the same contracts must survive.
         let other = delegate(203);
-        record(*key(201).id(), other.clone(), key(201), release);
+        record(*key(201).id(), other.clone(), key(201), release, NODE_A);
 
         release_delegate(&d);
 
@@ -332,7 +415,7 @@ mod tests {
             "every contract the delegate held interest in must be released"
         );
         assert!(
-            DELEGATE_INTEREST_HOLDS.contains_key(&(*key(201).id(), other)),
+            DELEGATE_INTEREST_HOLDS.contains_key(&(*key(201).id(), other, NODE_A)),
             "another delegate's hold on the same contract must NOT be discharged \
              — releasing interest a different subscriber holds is worse than the \
              leak this closes"
@@ -345,9 +428,9 @@ mod tests {
     fn removing_a_contract_releases_every_delegate_hold_on_it() {
         let (release, seen) = recorder();
         let target = key(210);
-        record(*target.id(), delegate(211), target, release.clone());
-        record(*target.id(), delegate(212), target, release.clone());
-        record(*key(213).id(), delegate(211), key(213), release);
+        record(*target.id(), delegate(211), target, release.clone(), NODE_A);
+        record(*target.id(), delegate(212), target, release.clone(), NODE_A);
+        record(*key(213).id(), delegate(211), key(213), release, NODE_A);
 
         release_contract(target.id());
 
@@ -357,7 +440,7 @@ mod tests {
             "both delegates' holds on the removed contract must be released"
         );
         assert!(
-            DELEGATE_INTEREST_HOLDS.contains_key(&(*key(213).id(), delegate(211))),
+            DELEGATE_INTEREST_HOLDS.contains_key(&(*key(213).id(), delegate(211), NODE_A)),
             "a hold on a DIFFERENT contract must survive"
         );
     }
@@ -370,7 +453,7 @@ mod tests {
     #[test]
     fn releasing_a_pair_that_holds_nothing_does_not_decrement() {
         let (release, seen) = recorder();
-        record(*key(220).id(), delegate(221), key(220), release);
+        record(*key(220).id(), delegate(221), key(220), release, NODE_A);
 
         release_delegate(&delegate(222));
         release_contract(key(223).id());
@@ -380,7 +463,7 @@ mod tests {
             "no hold matched, so nothing may be released"
         );
         assert!(
-            DELEGATE_INTEREST_HOLDS.contains_key(&(*key(220).id(), delegate(221))),
+            DELEGATE_INTEREST_HOLDS.contains_key(&(*key(220).id(), delegate(221), NODE_A)),
             "the unrelated hold must be untouched"
         );
     }
@@ -392,8 +475,14 @@ mod tests {
     #[test]
     fn a_pair_recorded_twice_holds_one_obligation() {
         let (release, seen) = recorder();
-        record(*key(230).id(), delegate(231), key(230), release.clone());
-        record(*key(230).id(), delegate(231), key(230), release);
+        record(
+            *key(230).id(),
+            delegate(231),
+            key(230),
+            release.clone(),
+            NODE_A,
+        );
+        record(*key(230).id(), delegate(231), key(230), release, NODE_A);
 
         release_delegate(&delegate(231));
 

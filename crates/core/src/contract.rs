@@ -768,6 +768,31 @@ fn contract_op_response_msg(
     }
 }
 
+/// The release half of a delegate-subscribe interest hold (#5542).
+///
+/// One constructor rather than two inline copies, because there are now two
+/// sites that take the refcount — the network path in
+/// `apply_resolved_contract_op` and the local-state path in the SUBSCRIBE arm —
+/// and a second hand-written copy is where the next divergence lives. That is
+/// the "manually-inlined originator side effects" row in
+/// `.claude/rules/bug-prevention-patterns.md`.
+///
+/// `Weak`, not `Arc`: the hold map is a process global, and a strong reference
+/// there would keep a shut-down node's `OpManager` alive for the life of the
+/// process. In the in-process multi-node harness that means every node ever
+/// built. A hold that cannot upgrade has nothing left to release, because the
+/// `InterestManager` it would decrement went with the `OpManager`.
+fn delegate_interest_release_closure(
+    op_manager: &std::sync::Arc<crate::node::OpManager>,
+) -> crate::wasm_runtime::delegate_interest::InterestRelease {
+    let weak = std::sync::Arc::downgrade(op_manager);
+    std::sync::Arc::new(move |key: &ContractKey| {
+        if let Some(op_manager) = weak.upgrade() {
+            op_manager.interest_manager.remove_local_client(key);
+        }
+    })
+}
+
 /// The egress ban gate, applied to delegate-originated network operations
 /// (#5542 finding B2).
 ///
@@ -960,16 +985,12 @@ where
                 // WEAK, so an outstanding hold never keeps a shut-down node's
                 // `OpManager` alive. A hold that cannot upgrade has nothing
                 // left to release.
-                let weak = std::sync::Arc::downgrade(&op_manager);
                 crate::wasm_runtime::delegate_interest::record(
                     pending.contract_id,
                     delegate_key.clone(),
                     key,
-                    std::sync::Arc::new(move |key: &ContractKey| {
-                        if let Some(op_manager) = weak.upgrade() {
-                            op_manager.interest_manager.remove_local_client(key);
-                        }
-                    }),
+                    delegate_interest_release_closure(&op_manager),
+                    std::sync::Arc::as_ptr(&op_manager) as usize,
                 );
             }
             None => {
@@ -1961,9 +1982,13 @@ where
         // 1. V2 delegates: subscribe_contract() host function (native_api.rs) registers
         //    during WASM execution and returns success/error synchronously.
         // 2. V1 delegates: emit SubscribeContractRequest in process() outbound, handled here.
-        // Both paths are idempotent — inserting the same (contract_id, delegate_key) twice
-        // is a no-op on the HashSet. After registration, the delegate receives
-        // ContractNotification messages when the subscribed contract's state changes.
+        // Re-asserting an ESTABLISHED subscription is idempotent: `already_subscribed`
+        // short-circuits it and the registry insert is a no-op. Two subscribes for the
+        // same NOT-yet-established contract in ONE invocation are not: the first is
+        // parked and the second is refused, naming that reason, because parking both
+        // would take two interest refcounts for one logical subscriber (#5542 M2).
+        // After registration, the delegate receives ContractNotification messages when
+        // the subscribed contract's state changes.
         //
         // TODO(#2830): UnsubscribeContractRequest is not yet handled. Delegates can
         // only unsubscribe implicitly via UnregisterDelegate cleanup.
@@ -1987,38 +2012,100 @@ where
                 // anything about. That is the silent-on-both-sides failure
                 // #5467 describes, reachable without the local store being
                 // empty at all.
-                let has_local_state = match contract_handler.executor().lookup_key(&contract_id) {
+                // The full key when this node holds BOTH the code and a state
+                // for it; `None` on all three local-miss shapes. Carried rather
+                // than reduced to a bool because the local branch below now
+                // needs the key to register demand (#5542 finding M4/F3).
+                let local_key = match contract_handler.executor().lookup_key(&contract_id) {
                     Some(full_key) => contract_handler
                         .executor()
                         .fetch_contract(full_key, false)
                         .await
-                        .is_ok_and(|(state, _)| state.is_some()),
-                    None => false,
+                        .ok()
+                        .and_then(|(state, _)| state.map(|_| full_key)),
+                    None => None,
                 };
-                let result = if has_local_state {
-                    // Contract is local: unchanged pre-#5542 behaviour. Register
-                    // the notification hook and answer.
+                // ORDER MATTERS: `already_subscribed` is tested FIRST, ahead of
+                // the local branch. It used to come second, which was harmless
+                // only while the local branch took no refcount. Now that it
+                // does, testing it second would let a delegate re-subscribing
+                // to a LOCAL contract take a fresh refcount on every repeat —
+                // the unbounded-demand failure this gate exists to prevent,
+                // reintroduced on the other branch.
+                let result = if already_subscribed(&contract_id, delegate_key) {
+                    // ALREADY HELD, so re-asserting it must be a no-op.
+                    //
+                    // This gate is load-bearing and is not obvious from the
+                    // code it guards. Both the network path and (since M4) the
+                    // local path end in `InterestManager::add_local_client`,
+                    // which is a REFCOUNT and is explicitly NOT idempotent (see
+                    // the `!is_renewal` gate at `operations/subscribe.rs`).
+                    // `DELEGATE_SUBSCRIPTIONS` is a map keyed by delegate, so
+                    // the pre-#5542 arm was idempotent for free and a delegate
+                    // re-subscribing in a loop cost nothing. Without this gate
+                    // each repeat takes another interest refcount for one
+                    // logical subscriber: demand that is never released,
+                    // growing without bound, on the exact path #5467 exists to
+                    // make trustworthy.
+                    Ok(())
+                } else if let Some(full_key) = local_key {
+                    // Contract is local, WITH state. Register the notification
+                    // hook — and register DEMAND, which this branch did not do
+                    // before (#5542 finding M4/F3).
+                    //
+                    // Without demand the copy is a zero-subscriber cached
+                    // contract, so under subscriber-primary eviction (hosting
+                    // invariant 3) it is the FIRST victim once capacity binds.
+                    // Eviction reclaims disk through
+                    // `ContractStore::remove_contract`, which wipes the
+                    // registry entry and releases any hold — and the delegate is
+                    // never told. That is #5467's silent-on-both-sides failure
+                    // on the branch this PR left unchanged, and it is the COMMON
+                    // case, because any client that has ever touched the
+                    // contract puts the node on this branch.
+                    //
+                    // This is also what the PR's own argument demands. It says
+                    // three things have to happen together — bootstrap the body,
+                    // register demand so the contract is not evicted out from
+                    // under the subscription, and establish the subscription.
+                    // On this branch the body is already here and the node is
+                    // already in the mesh for it, so item 2 was the only one
+                    // missing.
+                    let interest_registered = match contract_handler.executor().op_manager_handle()
+                    {
+                        Some(op_manager) => {
+                            if op_manager.interest_manager.add_local_client(&full_key) {
+                                crate::operations::broadcast_change_interests(
+                                    &op_manager,
+                                    vec![full_key],
+                                    vec![],
+                                )
+                                .await;
+                            }
+                            crate::wasm_runtime::delegate_interest::record(
+                                contract_id,
+                                delegate_key.clone(),
+                                full_key,
+                                delegate_interest_release_closure(&op_manager),
+                                std::sync::Arc::as_ptr(&op_manager) as usize,
+                            );
+                            true
+                        }
+                        // No `OpManager` means no eviction pressure worth
+                        // guarding against either: this is a mock/in-process
+                        // executor, so keep the pre-#5542 local-only answer.
+                        None => false,
+                    };
+                    tracing::debug!(
+                        contract = %contract_id,
+                        delegate_key = %delegate_key,
+                        interest_registered,
+                        "Delegate subscribed to a contract this node already holds"
+                    );
                     crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
                         .entry(contract_id)
                         .or_default()
                         .insert(delegate_key.clone());
-                    Ok(())
-                } else if already_subscribed(&contract_id, delegate_key) {
-                    // ALREADY HELD, so re-asserting it must be a no-op.
-                    //
-                    // This gate is load-bearing and is not obvious from the
-                    // code it guards. `run_executor_subscribe` ends in
-                    // `InterestManager::add_local_client`, which is a REFCOUNT
-                    // and is explicitly NOT idempotent (see the
-                    // `!is_renewal` gate at `operations/subscribe.rs`). The
-                    // registry it feeds, `DELEGATE_SUBSCRIPTIONS`, is a
-                    // `HashSet` — so the pre-#5542 arm was idempotent for free
-                    // and a delegate re-subscribing in a loop cost nothing.
-                    // Wiring the network path in without this gate makes each
-                    // repeat take another interest refcount for one logical
-                    // subscriber: demand that is never released, growing
-                    // without bound, on the exact path #5467 exists to make
-                    // trustworthy.
                     Ok(())
                 } else if parking.is_some()
                     && can_reach_network
@@ -2079,6 +2166,24 @@ where
                         "delegate parking is unavailable on this executor"
                     } else if delegate_network_op_banned(contract_handler, &contract_id) {
                         "this node has banned this contract (#5542 finding B2)"
+                    } else if pending_contract_ops.iter().any(|op| {
+                        op.contract_id == contract_id
+                            && op.kind == delegate_park::ContractOpKind::Subscribe
+                    }) {
+                        // #5542 finding M2. A delegate that emits two SUBSCRIBEs
+                        // for the same unseen contract in ONE invocation gets an
+                        // error for the second and a success for the first,
+                        // where the pre-#5542 `HashSet` arm was idempotent. The
+                        // duplicate cannot simply be answered `Ok`: nothing is
+                        // subscribed yet, and saying so before the network
+                        // subscribe exists is the lie #5263 removed from this
+                        // path. Nor can it be parked twice: two
+                        // `PendingContractOp`s for one pair would take two
+                        // interest refcounts for one logical subscriber. So it
+                        // is refused, but refused HONESTLY — the old text
+                        // blamed the fan-out cap, which was simply untrue.
+                        "a subscribe for this contract is already in flight in \
+                         this invocation; its response answers both"
                     } else {
                         "too many delegate network operations already in flight \
                          (MAX_NETWORK_CONTRACT_OPS_PER_PARK)"
@@ -5265,7 +5370,7 @@ pub(crate) enum ContractError {
 
 #[cfg(test)]
 #[allow(clippy::wildcard_enum_match_arm)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use crate::config::GlobalExecutor;
     use std::time::Duration;
@@ -5405,8 +5510,17 @@ pub(crate) mod tests {
     ///    worse than no pin, because it reads as coverage.
     pub(super) fn production_code() -> String {
         let full = include_str!("contract.rs");
-        let prod = full.split("\nmod tests {").next().unwrap_or(full);
-        strip_comments(prod)
+        // `.expect`, not `.unwrap_or(full)`. Falling back to the whole file
+        // silently includes every test module, so each pin's own assertion
+        // literal can satisfy it and every pin here widens to vacuous with no
+        // signal at all. That happened during #5542's M1 work: `mod tests` was
+        // briefly renamed, this anchor stopped matching, and two pins went green
+        // over changes they exist to catch. Fail closed instead — a missing
+        // anchor is a broken pin, not a permissive one.
+        let cutoff = full
+            .find("\nmod tests {")
+            .expect("contract.rs must have a top-level `mod tests` for pins to cut at");
+        strip_comments(&full[..cutoff])
     }
 
     /// Remove `//` line comments and `/* */` block comments, preserving
@@ -6729,6 +6843,21 @@ pub(crate) mod tests {
 // local-store-hit GETs that need no network at all. These tests drive the REAL
 // `contract_handling` loop and assert the fix off-loads that wait so unrelated
 // work keeps draining.
+/// Source-pin helpers shared with pins in OTHER modules (#5542 M1).
+///
+/// Declared here, AFTER `mod tests`, on purpose: everything before that anchor
+/// is what `tests::production_code` hands to a scrape, and a helper living
+/// inside that slice would add its own text to every pin's haystack.
+#[cfg(test)]
+pub(crate) mod source_pin_util {
+    /// See [`super::tests::strip_comments`]. Re-exported so a pin in another
+    /// module gets the same comment stripping rather than a third copy of it —
+    /// the copies are what drift.
+    pub(crate) fn strip_comments(src: &str) -> String {
+        super::tests::strip_comments(src)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::wildcard_enum_match_arm)]
 // These tests intentionally discard `JoinHandle`/`timeout` results in cleanup
