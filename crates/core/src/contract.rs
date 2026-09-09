@@ -8224,6 +8224,125 @@ mod hol_4391_tests {
         crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&bad_id);
     }
 
+    /// Build a real `OpManager` backed by a temp-dir `Config`, mirroring
+    /// `client_events::tests::build_op_manager`. The returned guard bundle
+    /// holds the channel endpoints open — drop it only when the test ends.
+    async fn build_op_manager(id: &str) -> (Arc<crate::node::OpManager>, Box<dyn std::any::Any>) {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::dev_tool::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+
+        let op_manager = Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+
+        let guards: Box<dyn std::any::Any> = Box::new((
+            notification_rx,
+            ch_channel,
+            wait_for_event,
+            result_router_rx,
+            task_monitor,
+        ));
+        (op_manager, guards)
+    }
+
+    /// #5542. The release obligation must be recorded for EVERY subscribe that
+    /// took a refcount — including one whose contract body never landed.
+    ///
+    /// `finalize_originator_subscribe` calls `add_local_client` OUTSIDE its
+    /// `if have_body` guard (`operations/subscribe.rs`), so a subscribe whose
+    /// `fetch_contract_if_missing` timed out still takes the refcount and still
+    /// returns `Ok(())`. On that path the executor's contract store holds no
+    /// code blob for the instance, so `lookup_key` — which resolves through
+    /// `ContractStore::code_hash_from_id` — returns `None`.
+    ///
+    /// Recording the obligation only when the full key resolves therefore left
+    /// exactly the leak this mechanism exists to close, on the feature's PRIMARY
+    /// path: a delegate subscribing to a contract this node has never seen,
+    /// inside a 2 s fetch window. It was reported as a `warn!` and nothing else.
+    #[tokio::test]
+    async fn a_subscribe_whose_body_never_landed_still_records_its_release_obligation() {
+        use delegate_park::{
+            ContractOpKind, ContractOpOutcome, PendingContractOp, ResolvedContractOp,
+        };
+        use freenet_stdlib::prelude::CodeHash;
+
+        let (op_manager, _guards) = build_op_manager("d5542-interest-hold").await;
+        let (send_halve, rcv_halve, _wait) = handler::contract_handler_channel();
+        let mut handler = MockWasmContractHandler::new_test(
+            rcv_halve,
+            Some(op_manager.clone()),
+            "d5542_interest_hold",
+        )
+        .await;
+        let _send = send_halve;
+
+        let dkey = DelegateKey::new([31u8; 32], CodeHash::new([31u8; 32]));
+        let id = ContractInstanceId::new([32u8; 32]);
+        // The key `add_local_client` was called with: the FULL key, carrying the
+        // real code hash, because the subscribe op knew it.
+        let full_key = ContractKey::from_id_and_code(id, CodeHash::new([33u8; 32]));
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&id);
+
+        // Stand in for what `run_executor_subscribe` did before returning Ok.
+        assert!(
+            op_manager.interest_manager.add_local_client(&full_key),
+            "the refcount this test is about must actually have been taken"
+        );
+        // ...and the body did NOT land, so the code blob is absent.
+        assert!(
+            handler.executor().lookup_key(&id).is_none(),
+            "this test is only meaningful while the full key is unresolvable"
+        );
+
+        let _ = apply_resolved_contract_op(
+            &mut handler,
+            ResolvedContractOp {
+                pending: PendingContractOp {
+                    contract_id: id,
+                    kind: ContractOpKind::Subscribe,
+                    context: DelegateContext::default(),
+                },
+                outcome: ContractOpOutcome::Subscribed,
+            },
+            &dkey,
+        );
+
+        // An ORDINARY removal path: unregistering the delegate.
+        crate::wasm_runtime::delegate_interest::release_delegate(&dkey);
+
+        assert!(
+            !op_manager.interest_manager.has_local_interest(&full_key),
+            "the local interest the subscribe took must be released when the \
+             subscription is dropped, even though the contract body never \
+             landed and the full `ContractKey` could not be resolved (#5542)"
+        );
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&id);
+    }
+
     /// #5542. A delegate SUBSCRIBE that cannot reach the network must still get
     /// a TERMINAL response, and the round-trip must complete.
     ///
