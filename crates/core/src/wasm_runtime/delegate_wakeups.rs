@@ -75,10 +75,34 @@
 //! is the same defect, not a new one, and it is the reason to re-express this
 //! in fuel when #5597's broker lands.
 //!
-//! Admission checks credit BEFORE a run and debits AFTER it, so a delegate can
-//! overshoot its share by (outstanding leases x longest run). That overshoot is
-//! bounded by check 2, and check 2's blindness to CPU is covered by check 3.
-//! The two compose; neither is sufficient alone.
+//! # Admission cannot bound occupancy. Only the fire path can.
+//!
+//! This is the load-bearing thing to understand about check 3, and it took a
+//! wrong version to find:
+//!
+//! > **Admission can only ever ask "were you solvent when you asked", never
+//! > "can you afford what you are about to do" — because a run's cost is
+//! > unknown until it has happened.**
+//!
+//! So [`schedule`] credits before a run and [`charge_run`] debits after it, and
+//! a delegate holding [`MAX_WAKEUPS_PER_DELEGATE`] leases that all come due
+//! together gets sixteen runs on the strength of ONE solvency check. At
+//! `max_execution_seconds` that is 80 s of loop time, against a 1% share that
+//! takes 133 MINUTES to earn. "Bounded by the row cap" is true of that and
+//! carries no information — and a bound that is technically correct and
+//! uninformative is worse than an absent one, because it stops anyone looking.
+//!
+//! The original version was worse still: `charge` saturated at zero, so every
+//! debt was DISCARDED the instant it was incurred. Each of the sixteen fires
+//! found a freshly reset budget, and every schedule between them saw credit
+//! refilling from zero rather than from -5 s.
+//!
+//! Two things fix it, and both are necessary. [`DutyBudget::credit_micros`] is
+//! SIGNED, so a debt survives to be repaid; and [`affordability`] is checked at
+//! FIRE time, so a lease whose delegate is in debt is deferred for the computed
+//! repayment interval rather than run. The overshoot is then one run, not one
+//! per lease held. The fire-time check is not belt-and-braces — it is the only
+//! place the question can be asked at all.
 //!
 //! # Refusal is a value, not a log line
 //!
@@ -271,6 +295,9 @@ impl WakeupRefusal {
 /// A lease's identity. Re-arming the same `(delegate, tag)` replaces the lease
 /// rather than taking a second one.
 type WakeupId = (DelegateKey, Vec<u8>);
+
+/// One durable row as the backend hands it back: `(delegate, tag, due_millis)`.
+type PersistedWakeup = (DelegateKey, Vec<u8>, u64);
 
 /// Deadline ordering key: `(due_millis_since_epoch, seq)`. The sequence number
 /// breaks ties so two wakeups due in the same millisecond both survive and fire
@@ -1073,7 +1100,7 @@ pub trait DelegateWakeupPersistence: Send + Sync {
     ///
     /// `Err` means the store could not be read. A caller must NOT treat that as
     /// "no wakeups" — see [`RestoreOutcome`].
-    fn load_wakeups(&self) -> Result<Vec<(DelegateKey, Vec<u8>, u64)>, String> {
+    fn load_wakeups(&self) -> Result<Vec<PersistedWakeup>, String> {
         Ok(Vec::new())
     }
 }
@@ -1151,17 +1178,21 @@ mod tests {
         DelegateKey::new([n; 32], CodeHash::new([n; 32]))
     }
 
+    /// A durable row's key as the test store holds it: the 64-byte delegate
+    /// identity, then the tag.
+    type RowKey = (Vec<u8>, Vec<u8>);
+
     /// An in-memory stand-in for the durable half, so a test can assert that
     /// BOTH representations moved — the property this module exists for.
     #[derive(Default)]
     struct RecordingStore {
-        rows: StdMutex<StdHashMap<(Vec<u8>, Vec<u8>), u64>>,
+        rows: StdMutex<StdHashMap<RowKey, u64>>,
         /// When set, every write and read fails. Models a backend outage.
         broken: bool,
     }
 
     impl RecordingStore {
-        fn row_key(delegate: &DelegateKey, tag: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        fn row_key(delegate: &DelegateKey, tag: &[u8]) -> RowKey {
             let mut id = delegate.bytes().to_vec();
             id.extend_from_slice(delegate.code_hash().as_ref());
             (id, tag.to_vec())
@@ -1223,7 +1254,7 @@ mod tests {
             self.rows.lock().unwrap().retain(|(d, _), _| d != &id);
         }
 
-        fn load_wakeups(&self) -> Result<Vec<(DelegateKey, Vec<u8>, u64)>, String> {
+        fn load_wakeups(&self) -> Result<Vec<PersistedWakeup>, String> {
             if self.broken {
                 return Err("backend is down".to_string());
             }
@@ -1976,18 +2007,22 @@ mod tests {
         }
     }
 
+    /// #5597 property 2, as a COMPILE-TIME check.
+    ///
+    /// The delegate pin cap violates this — its per-delegate figure is five
+    /// times the node figure, so the first delegate to ask can take the whole
+    /// node allowance, and a per-principal bound at or above the node bound is
+    /// decorative. These are constants, so the relation can be enforced where
+    /// it cannot be got wrong at all rather than where a test has to be run.
     #[test]
     fn the_per_delegate_bounds_sit_strictly_below_the_node_wide_ones() {
-        // #5597 property 2. The delegate PIN cap violates this — its
-        // per-delegate figure is five times the node figure, so the first
-        // delegate to ask can take the whole node allowance. A per-principal
-        // bound at or above the node bound is decorative.
-        assert!(MAX_WAKEUPS_PER_DELEGATE < MAX_WAKEUPS_PER_NODE);
-        assert!(
-            DELEGATE_DUTY_DIVISOR > NODE_DUTY_DIVISOR,
-            "a larger divisor is a smaller share"
-        );
-        assert!(DELEGATE_DUTY_BURST_MICROS < NODE_DUTY_BURST_MICROS);
+        const {
+            assert!(MAX_WAKEUPS_PER_DELEGATE < MAX_WAKEUPS_PER_NODE);
+            // A LARGER divisor is a SMALLER share.
+            assert!(DELEGATE_DUTY_DIVISOR > NODE_DUTY_DIVISOR);
+            assert!(DELEGATE_DUTY_BURST_MICROS < NODE_DUTY_BURST_MICROS);
+            assert!(NODE_RENEWAL_RESERVE_MICROS < NODE_DUTY_BURST_MICROS);
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -20,8 +20,14 @@
 //!   import by hand — the position from which a guest-side check is not a bound
 //!   — and that is the only way to observe that the host re-checks.
 
+// Wildcard arms here exist ONLY to satisfy `HostResponse`'s
+// `#[non_exhaustive]`; every response this test can meaningfully distinguish is
+// matched above them, and enumerating the rest would have to be re-edited on
+// every unrelated variant addition.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use anyhow::{bail, ensure};
-use freenet::test_utils::{TestContext, TestResult, load_delegate};
+use freenet::test_utils::{TestContext, load_delegate};
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
     client_api::{ClientRequest, HostResponse, WebApi},
