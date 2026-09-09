@@ -522,12 +522,17 @@ impl ContractStore {
             .map_err(|e| anyhow::anyhow!("Failed to remove contract index: {e}"))?;
         self.key_to_code_part.remove(key.id());
 
-        // Clean up any delegate subscriptions for this contract instance.
+        // Clean up any delegate subscriptions for this contract instance —
+        // BOTH the in-memory notification hook and the durable row (#4669
+        // part 2). Clearing the durable row here is what stops a removed
+        // contract's subscriptions being restored, pin and all, at every
+        // subsequent boot. `ContractStore` owns a `Storage` handle, so this
+        // site reaches the durable copy even though it cannot reach the ring.
         //
-        // Only the notification hook is cleared here; the matching DEMAND
-        // registration (#4669 part 1, `contract::delegate_demand`) is not,
-        // because `wasm_runtime` is deliberately independent of `ring` and has
-        // no `OpManager` to reach.
+        // The matching DEMAND registration (#4669 part 1,
+        // `contract::delegate_demand`) is still not cleared here, because
+        // `wasm_runtime` is deliberately independent of `ring` and has no
+        // `OpManager` to reach.
         //
         // For the EVICTION path that does not matter: a delegate's demand makes
         // `contract_in_use` true, so an in-use contract can only reach removal
@@ -543,13 +548,14 @@ impl ContractStore {
         // delegate had subscribed to an earlier instance of the same id, that
         // rollback drops its notification hook while its demand stays. The
         // contract is then pinned with nothing able to consume its updates.
-        // Bounded, not silent-forever: the pin lapses on node restart, and the
+        // Bounded, not silent-forever: the pin lapses on node restart — and
+        // it stays lapsed, because the durable row goes with the hook on the
+        // line below, so boot restore does not resurrect it — and the
         // delegate's next subscribe re-installs the hook (both paths are
         // idempotent). Closing it properly wants the demand and the hook to be
-        // one record with one owner, which is #4669 part 3's durable
-        // delegate-subscription store — not another mirrored teardown call at
-        // each rollback site, which is the drift this module exists to avoid.
-        super::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+        // one record with one owner, which is not another mirrored teardown
+        // call at each rollback site — the drift this module exists to avoid.
+        super::delegate_subscriptions::forget_contract(Some(&self.db), key.id());
 
         // The WASM blob on disk is keyed by code hash and shared by every
         // contract instance with the same code (e.g. all River rooms share

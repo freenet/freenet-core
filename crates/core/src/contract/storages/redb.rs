@@ -264,6 +264,35 @@ pub(crate) const DELEGATE_ORIGINS_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(crate) const RESERVED_MARKER_HASHES_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("delegate_reserved_marker_hashes");
 
+/// Durable record of which delegates have subscribed to which contracts
+/// (#4669 part 2 / #5467).
+///
+/// The in-memory twin is `wasm_runtime::delegate_subscriptions`' registry, and
+/// **both are written through one choke point** in that module — nothing else
+/// may open this table for writing. The two are deliberately not allowed to be
+/// separate records with separate call sites: three cleanup paths clear the
+/// in-memory map, and a durable copy that any one of them forgot would leave a
+/// pin nothing ever releases (the "manually-mirrored state" shape in
+/// `.claude/rules/bug-prevention-patterns.md`).
+///
+/// Why it has to be durable at all: since #4669 part 1 a delegate subscription
+/// carries a hosting PIN, and a delegate only runs when something invokes it.
+/// The thing that would invoke it is a notification on the contract whose pin
+/// a restart just dropped, so an in-memory-only subscription cannot re-arm
+/// itself — it waits for the user to reopen the app, which is precisely the
+/// case the delegate exists to cover.
+///
+/// CONTRACT-MAJOR on purpose. Removing a contract (eviction, PUT rollback, the
+/// notification channel closing) is a prefix range scan; removing a delegate
+/// walks the in-memory registry for the contracts that delegate holds and
+/// issues point deletes, so neither teardown ever needs a full table scan. The
+/// only full scan is the one at boot.
+///
+/// Key: ContractInstanceId (32 bytes) || DelegateKey (64 bytes) = 96 bytes
+/// Value: single presence byte
+pub(crate) const DELEGATE_SUBSCRIPTIONS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_contract_subscriptions");
+
 /// Metadata about a hosted contract, persisted to survive restarts.
 #[derive(Debug, Clone, Copy)]
 pub struct HostingMetadata {
@@ -1962,6 +1991,183 @@ impl ReDb {
         })
     }
 
+    // ========== Delegate contract subscriptions (#4669 part 2) ==========
+
+    /// Per-CONTRACT cap on durably-recorded delegate subscriptions.
+    ///
+    /// `client_subscriptions` — the map a pin lands in — is already bounded at
+    /// [`crate::contract::executor::MAX_SUBSCRIBERS_PER_CONTRACT`] (256), so a
+    /// 257th delegate on one contract could never have obtained a pin anyway.
+    /// The bound is repeated here because this table is written from a path
+    /// a delegate drives, and `.claude/rules/code-style.md` requires a per-key
+    /// collection to be bounded where it GROWS, not only where it is read.
+    ///
+    /// It is deliberately the same number rather than a second, looser one: two
+    /// caps on the same fan-out that disagree is how you get a durable row with
+    /// no pin and no way to tell which bound refused.
+    pub(crate) const MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT: usize = 256;
+
+    /// 96-byte row key `contract_instance_id(32) || delegate_key64(64)`.
+    fn delegate_subscription_row_key(
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+    ) -> [u8; 96] {
+        let mut k = [0u8; 96];
+        k[..32].copy_from_slice(contract.as_bytes());
+        k[32..].copy_from_slice(&Self::delegate_key64(delegate));
+        k
+    }
+
+    /// Inclusive `[lo, hi]` bounds covering every subscription row for
+    /// `contract`.
+    fn delegate_subscription_range(contract: &ContractInstanceId) -> ([u8; 96], [u8; 96]) {
+        let mut lo = [0u8; 96];
+        lo[..32].copy_from_slice(contract.as_bytes());
+        let mut hi = [0xffu8; 96];
+        hi[..32].copy_from_slice(contract.as_bytes());
+        (lo, hi)
+    }
+
+    /// Record that `delegate` is subscribed to `contract`. Idempotent; bounded
+    /// at [`Self::MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT`] per contract.
+    ///
+    /// Returns whether the subscription is recorded after this call — `false`
+    /// only when the per-contract cap refused a NEW row. The caller uses that to
+    /// keep the in-memory registry in step, so the two representations agree at
+    /// the cap instead of diverging there.
+    ///
+    /// # Errors
+    /// Returns `Err` if the redb write transaction, table open, range count or
+    /// commit fails.
+    pub fn add_delegate_subscription(
+        &self,
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+    ) -> Result<bool, redb::Error> {
+        let row_key = Self::delegate_subscription_row_key(contract, delegate);
+        let (lo, hi) = Self::delegate_subscription_range(contract);
+        let txn = self.begin_write()?;
+        let admitted;
+        {
+            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            if tbl.get(row_key.as_slice())?.is_some() {
+                admitted = true;
+            } else {
+                let count = tbl.range(lo.as_slice()..=hi.as_slice())?.count();
+                if count < Self::MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT {
+                    tbl.insert(row_key.as_slice(), [1u8].as_slice())?;
+                    admitted = true;
+                } else {
+                    tracing::warn!(
+                        contract = %contract,
+                        delegate = %delegate.encode(),
+                        cap = Self::MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT,
+                        "contract is at the per-contract delegate-subscription cap; \
+                         refusing to record a further subscription"
+                    );
+                    admitted = false;
+                }
+            }
+        }
+        Self::commit_guarded(txn)?;
+        Ok(admitted)
+    }
+
+    /// Forget that `delegate` is subscribed to `contract`. Idempotent.
+    ///
+    /// # Errors
+    /// Returns `Err` if the redb write transaction, table open, remove or
+    /// commit fails.
+    pub fn remove_delegate_subscription(
+        &self,
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+    ) -> Result<(), redb::Error> {
+        let row_key = Self::delegate_subscription_row_key(contract, delegate);
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            tbl.remove(row_key.as_slice())?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Forget every delegate subscription recorded for `contract`. Idempotent.
+    ///
+    /// A prefix range scan, which is why the row key is contract-major: this is
+    /// the teardown that runs on eviction and on PUT rollback, i.e. the one that
+    /// must not cost a full table scan.
+    ///
+    /// # Errors
+    /// Returns `Err` if the redb write transaction, table open, range scan,
+    /// remove or commit fails.
+    pub fn remove_delegate_subscriptions_for_contract(
+        &self,
+        contract: &ContractInstanceId,
+    ) -> Result<(), redb::Error> {
+        let (lo, hi) = Self::delegate_subscription_range(contract);
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            // Collect first: `retain_in` would borrow the table mutably while
+            // the range iterator is alive.
+            let doomed: Vec<Vec<u8>> = tbl
+                .range(lo.as_slice()..=hi.as_slice())?
+                .filter_map(|entry| entry.ok().map(|(k, _)| k.value().to_vec()))
+                .collect();
+            for k in doomed {
+                tbl.remove(k.as_slice())?;
+            }
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Every recorded `(contract, delegate)` subscription. Read once, at boot.
+    ///
+    /// A malformed row is skipped rather than panicking the read; it can only
+    /// arise from a corrupt or foreign write, and dropping it degrades to "this
+    /// subscription is not restored", which is the pre-#4669-part-2 behaviour
+    /// for that one row rather than a boot failure.
+    ///
+    /// # Errors
+    /// Returns `Err` if the redb read transaction, table open or scan fails.
+    /// The caller must NOT treat `Err` as "no subscriptions": that would
+    /// silently drop every delegate's pin on a transient read failure, which is
+    /// the exact failure this table exists to prevent.
+    pub fn load_all_delegate_subscriptions(
+        &self,
+    ) -> Result<Vec<(ContractInstanceId, DelegateKey)>, redb::Error> {
+        self.read_guarded(|txn| {
+            let tbl = match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
+                Ok(tbl) => tbl,
+                // A node that has never recorded a subscription has never
+                // created the table. That is not an error; it is an empty set.
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(e) => return Err(e.into()),
+            };
+            let mut out = Vec::new();
+            for entry in tbl.iter()? {
+                let (k, _v) = entry?;
+                let bytes = k.value();
+                if bytes.len() != 96 {
+                    continue;
+                }
+                let (Ok(instance), Ok(delegate_bytes), Ok(code_hash)) = (
+                    <[u8; 32]>::try_from(&bytes[..32]),
+                    <[u8; 32]>::try_from(&bytes[32..64]),
+                    <[u8; 32]>::try_from(&bytes[64..]),
+                ) else {
+                    continue;
+                };
+                out.push((
+                    ContractInstanceId::new(instance),
+                    DelegateKey::new(delegate_bytes, CodeHash::from(&code_hash)),
+                ));
+            }
+            Ok(out)
+        })
+    }
+
     // ==================== Broken Invariants Methods ====================
     // Per-contract record of detected CRDT-invariant violations. See
     // `ring::broken_invariants` for the in-memory tracker.
@@ -2033,6 +2239,65 @@ impl ReDb {
             }
             Ok(result)
         })
+    }
+}
+
+/// The redb backend is the one that actually persists delegate subscriptions;
+/// see `DELEGATE_SUBSCRIPTIONS_TABLE`. Errors are logged and swallowed rather
+/// than propagated, because the caller's alternative is to fail a subscribe
+/// that would otherwise work for the life of the process — a regression. The
+/// failure class that must not be continued through (a poisoned database) is
+/// already handled inside `commit_guarded` / `read_guarded`, which abort the
+/// process for a supervised restart.
+impl crate::wasm_runtime::delegate_subscriptions::DelegateSubscriptionPersistence for ReDb {
+    fn persist_delegate_subscription(
+        &self,
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+    ) -> bool {
+        match self.add_delegate_subscription(contract, delegate) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    %contract,
+                    delegate = %delegate,
+                    "could not record a delegate subscription durably; it will work \
+                     for the life of this process but will NOT survive a restart"
+                );
+                true
+            }
+        }
+    }
+
+    fn forget_delegate_subscription(&self, contract: &ContractInstanceId, delegate: &DelegateKey) {
+        if let Err(error) = self.remove_delegate_subscription(contract, delegate) {
+            tracing::warn!(
+                %error,
+                %contract,
+                delegate = %delegate,
+                "could not clear a delegate subscription from disk; boot \
+                 reconciliation will drop it if the delegate or contract is gone"
+            );
+        }
+    }
+
+    fn forget_delegate_subscriptions_for_contract(&self, contract: &ContractInstanceId) {
+        if let Err(error) = self.remove_delegate_subscriptions_for_contract(contract) {
+            tracing::warn!(
+                %error,
+                %contract,
+                "could not clear this contract's delegate subscriptions from disk; \
+                 boot reconciliation will drop them if the contract is gone"
+            );
+        }
+    }
+
+    fn load_delegate_subscriptions(
+        &self,
+    ) -> Result<Vec<(ContractInstanceId, DelegateKey)>, String> {
+        self.load_all_delegate_subscriptions()
+            .map_err(|e| e.to_string())
     }
 }
 

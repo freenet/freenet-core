@@ -412,11 +412,17 @@ impl Executor<Runtime> {
             DelegateRequest::UnregisterDelegate(key) => {
                 self.delegate_origin_ids.remove(&key);
 
-                // Remove delegate from all contract subscription entries
-                crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, subscribers| {
-                    subscribers.remove(&key);
-                    !subscribers.is_empty()
-                });
+                // Remove delegate from all contract subscription entries, in
+                // BOTH representations — the in-memory notification registry
+                // and the durable table that would otherwise restore these
+                // subscriptions (and their pins) at every subsequent boot, for
+                // a delegate that no longer exists (#4669 part 2). One choke
+                // point writes both; see
+                // `wasm_runtime::delegate_subscriptions`.
+                crate::wasm_runtime::delegate_subscriptions::forget_delegate(
+                    Some(self.state_store.inner()),
+                    &key,
+                );
 
                 // Drop the matching DEMAND registrations (#4669 part 1). The
                 // retain above clears only the notification hook; the demand

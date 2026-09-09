@@ -5,7 +5,6 @@ use freenet_stdlib::prelude::{
     ContractInstanceId, ContractKey, DelegateKey, SecretsId, encode_secret_key_list,
 };
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -75,16 +74,6 @@ pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateEnvSlot>> =
 /// or dropping it before the guest returns, silently reintroduces the hazard.
 pub(super) static LIVE_DELEGATE_GUESTS: LazyLock<dashmap::DashSet<InstanceId>> =
     LazyLock::new(dashmap::DashSet::default);
-
-/// Global registry of delegate subscriptions to contracts.
-///
-/// When a V2 delegate calls `subscribe_contract()`, the (contract, delegate) pair is
-/// recorded here. When this node commits a new contract state,
-/// `Executor::finalize_state_commit` checks this registry and sends
-/// notifications to subscribed delegates.
-pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
-    DashMap<ContractInstanceId, HashSet<DelegateKey>>,
-> = LazyLock::new(DashMap::default);
 
 /// Shared, in-memory cache of `DelegateContext` bytes keyed by `DelegateKey`.
 ///
@@ -1505,12 +1494,17 @@ impl DelegateCallEnv {
         // Validate the contract is known
         let contract_key = self.resolve_contract_key(instance_id)?;
 
-        // Register in global subscription registry (the REACTIVE half: this is
-        // what `ContractNotification` delivery reads).
-        DELEGATE_SUBSCRIPTIONS
-            .entry(*instance_id)
-            .or_default()
-            .insert(self.delegate_key.clone());
+        // Register the subscription, in BOTH representations (the REACTIVE
+        // half `ContractNotification` delivery reads, and the durable row that
+        // survives a restart). `delegate_subscriptions` is the only way to
+        // reach either, so the two cannot be written apart — see its module
+        // docs. `state_store_db` is `None` on local-only and mock runtimes,
+        // where the subscription is in-memory only, exactly as before #4669.
+        crate::wasm_runtime::delegate_subscriptions::register(
+            self.state_store_db.as_ref(),
+            instance_id,
+            &self.delegate_key,
+        );
 
         // Register the DEMAND half (#4669 part 1 / #5467 Phase 1). The registry
         // insert above is read only by the notification path — nothing in

@@ -2378,8 +2378,9 @@ where
 
     /// Send notifications to delegates subscribed to a contract's state changes.
     ///
-    /// Checks the global `DELEGATE_SUBSCRIPTIONS` registry and sends a
-    /// `DelegateNotification` for each subscribed delegate through the channel.
+    /// Reads the subscription registry (`wasm_runtime::delegate_subscriptions`)
+    /// and sends a `DelegateNotification` for each subscribed delegate through
+    /// the channel.
     ///
     /// This is a **best-effort, lossy** notification path: if the bounded channel
     /// is full, notifications are dropped rather than blocking the commit path.
@@ -2393,13 +2394,11 @@ where
 
         let instance_id = *key.id();
         // Snapshot subscribers and release the DashMap read-lock before sending
-        let subscribers: Vec<DelegateKey> = {
-            let entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&instance_id);
-            match entry {
-                Some(ref s) if !s.is_empty() => s.iter().cloned().collect(),
+        let subscribers: Vec<DelegateKey> =
+            match crate::wasm_runtime::delegate_subscriptions::subscribers(&instance_id) {
+                Some(s) if !s.is_empty() => s.into_iter().collect(),
                 _ => return,
-            }
-        };
+            };
 
         tracing::debug!(
             contract = %key,
@@ -2463,7 +2462,14 @@ where
                     // the demand become one record with one owner (#4669 part
                     // 3), which is also the only fix that could make a
                     // node-wide sweep coherent.
-                    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&instance_id);
+                    // Clears the durable row too. A subscription left on disk
+                    // here would be restored — pin and all — at every
+                    // subsequent boot, with no hook and nothing to release it
+                    // (#4669 part 2).
+                    crate::wasm_runtime::delegate_subscriptions::forget_contract(
+                        Some(self.state_store.inner()),
+                        &instance_id,
+                    );
                     if let Some(op_manager) = &self.op_manager {
                         // ONE collapse decision for the whole subscriber list,
                         // not one per delegate. Spawning it per delegate makes N

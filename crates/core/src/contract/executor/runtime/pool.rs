@@ -896,6 +896,13 @@ impl ContractExecutor for RuntimePool {
         Some(self.op_manager.clone())
     }
 
+    fn delegate_subscription_store(
+        &self,
+    ) -> Option<&dyn crate::wasm_runtime::delegate_subscriptions::DelegateSubscriptionPersistence>
+    {
+        Some(self.shared_state_store.inner())
+    }
+
     async fn fetch_contract(
         &mut self,
         key: ContractKey,

@@ -1341,13 +1341,16 @@ where
         }
 
         // Process SUBSCRIBE requests
-        // There are two registration paths that converge on DELEGATE_SUBSCRIPTIONS:
+        // There are two registration paths that converge on
+        // `wasm_runtime::delegate_subscriptions`:
         // 1. V2 delegates: subscribe_contract() host function (native_api.rs) registers
         //    during WASM execution and returns success/error synchronously.
         // 2. V1 delegates: emit SubscribeContractRequest in process() outbound, handled here.
-        // Both paths are idempotent — inserting the same (contract_id, delegate_key) twice
-        // is a no-op on the HashSet. After registration, the delegate receives
-        // ContractNotification messages when the subscribed contract's state changes.
+        // Both paths are idempotent — recording the same (contract_id, delegate_key) twice
+        // is a no-op in both the in-memory registry and the durable table. After
+        // registration, the delegate receives ContractNotification messages when
+        // the subscribed contract's state changes, and the subscription survives
+        // a node restart (#4669 part 2).
         //
         // TODO(#2830): UnsubscribeContractRequest is not yet handled. Delegates can
         // only unsubscribe implicitly via UnregisterDelegate cleanup.
@@ -1365,13 +1368,17 @@ where
                 // Validate contract existence before registering (matches V2 host function behavior)
                 let result =
                     if let Some(full_key) = contract_handler.executor().lookup_key(&contract_id) {
-                        // Register subscription in the global registry (the
-                        // REACTIVE half: this is what `ContractNotification`
-                        // delivery reads).
-                        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-                            .entry(contract_id)
-                            .or_default()
-                            .insert(delegate_key.clone());
+                        // Record the subscription in BOTH representations —
+                        // the REACTIVE half `ContractNotification` delivery
+                        // reads, and the durable row that survives a restart
+                        // (#4669 part 2). One choke point, so a future cleanup
+                        // path cannot clear one and leave the other; see
+                        // `wasm_runtime::delegate_subscriptions`.
+                        crate::wasm_runtime::delegate_subscriptions::register(
+                            contract_handler.executor().delegate_subscription_store(),
+                            &contract_id,
+                            delegate_key,
+                        );
                         // Register the DEMAND half (#4669 part 1 / #5467 Phase 1):
                         // without this the subscribe above is a passive local
                         // notification hook — it does not set `contract_in_use`,

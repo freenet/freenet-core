@@ -1134,6 +1134,25 @@ pub(crate) trait ContractExecutor: Send + 'static {
     fn op_manager_handle(&self) -> Option<Arc<OpManager>> {
         None
     }
+
+    /// The store that records delegate subscriptions durably, if this executor
+    /// has one (#4669 part 2).
+    ///
+    /// The V1 `SubscribeContractRequest` arm in `contract.rs` runs against the
+    /// `ContractExecutor` trait, not a concrete executor, so it needs this to
+    /// reach the same durable record the V2 host function writes — both go
+    /// through `wasm_runtime::delegate_subscriptions`, which is the only writer
+    /// of either representation.
+    ///
+    /// Returns `None` for local-only and mock executors, where a delegate
+    /// subscription stays in memory and does not survive a restart, exactly as
+    /// before #4669 part 2.
+    fn delegate_subscription_store(
+        &self,
+    ) -> Option<&dyn crate::wasm_runtime::delegate_subscriptions::DelegateSubscriptionPersistence>
+    {
+        None
+    }
 }
 
 /// Tracks contracts that have undergone corrupted-state recovery.

@@ -235,6 +235,13 @@ impl Pool {
     }
 }
 
+/// The sqlite backend does NOT persist delegate subscriptions: it has none of
+/// redb's auxiliary tables, and redb is the default feature and what ships.
+/// Taking the no-op default means a sqlite node degrades to the in-memory
+/// registry, i.e. to the pre-#4669-part-2 behaviour, rather than silently
+/// claiming a durability it does not have.
+impl crate::wasm_runtime::delegate_subscriptions::DelegateSubscriptionPersistence for Pool {}
+
 impl StateStorage for Pool {
     type Error = SqlDbError;
 
