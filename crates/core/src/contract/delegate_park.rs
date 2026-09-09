@@ -561,6 +561,17 @@ pub(super) struct Continuation {
     /// is correct — and is also why #5558 (a delegate notified of its own
     /// writes) is a separate unbounded loop that this does not close.
     pub iterations: usize,
+    /// Fire-and-forget self-heal GETs this round-trip has already started, so
+    /// `MAX_NETWORK_CONTRACT_OPS_PER_PARK` bounds the WHOLE round-trip rather
+    /// than each leg of it — the same defect as `iterations` above, one budget
+    /// over (#5542 finding B1).
+    ///
+    /// The parked GET/SUBSCRIBE half does not need this because parking itself
+    /// serialises it: `pending_contract_ops` being non-empty ends the run, and
+    /// parks are capped node-wide. The UPDATE self-heal starts a driver and
+    /// lets the loop continue, so nothing serialises it and the count has to be
+    /// carried explicitly.
+    pub self_heal_fetches_started: usize,
     pub params: Parameters<'static>,
     pub origin_contract: Option<ContractInstanceId>,
     pub connection_scope: ConnectionScope,
@@ -1523,6 +1534,7 @@ mod tests {
 
     fn continuation() -> Continuation {
         Continuation {
+            self_heal_fetches_started: 0,
             params: Parameters::from(Vec::new()),
             origin_contract: None,
             connection_scope: ConnectionScope::Local,

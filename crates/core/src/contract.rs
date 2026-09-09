@@ -1071,6 +1071,16 @@ struct RunSeed {
     /// and legitimately starts a fresh count — see the constant's rustdoc, and
     /// #5558 for the separate gap that leaves open.
     iterations: usize,
+    /// Fire-and-forget self-heal GETs already started, so
+    /// `MAX_NETWORK_CONTRACT_OPS_PER_PARK` bounds the whole round-trip and
+    /// neither a further iteration nor a park can reset it (#5542 finding B1).
+    ///
+    /// It rides HERE, beside `iterations`, because it is the same kind of
+    /// budget with the same failure mode, and that failure has already been
+    /// found and fixed once in this file under #5544 S1. Declared as a loop
+    /// local it reset on every one of up to `MAX_CONTRACT_REQUEST_ITERATIONS`
+    /// iterations, so the real ceiling was 100x the documented one.
+    self_heal_fetches_started: usize,
 }
 
 /// Outcome of one delegate run.
@@ -1167,6 +1177,7 @@ where
     let RunSeed {
         accumulated: mut accumulated_messages,
         mut iterations,
+        mut self_heal_fetches_started,
     } = seed;
 
     loop {
@@ -1355,25 +1366,20 @@ where
         // same reason as `deferred_upserts` (#5542) — the work is a network
         // operation and this is the serial loop.
         let mut pending_contract_ops: Vec<delegate_park::PendingContractOp> = Vec::new();
-        // Delegate-originated network operations started in this round trip that
-        // are NOT in `pending_contract_ops`: the UPDATE arm's self-heal fetches,
-        // which are fire-and-forget rather than parked (#5542, review finding
-        // 5A). They are counted alongside the parked ops against the SAME
-        // `MAX_NETWORK_CONTRACT_OPS_PER_PARK` budget.
+        // NOTE on `self_heal_fetches_started`: it is bound from `RunSeed` ABOVE
+        // this loop, deliberately. It counts the UPDATE arm's fire-and-forget
+        // self-heal GETs, which are not in `pending_contract_ops` because
+        // nothing parks them, and it shares the
+        // `MAX_NETWORK_CONTRACT_OPS_PER_PARK` budget with the parked ops so the
+        // documented node-wide ceiling of MAX_PARKED_DELEGATES (64) x 4 = 256
+        // is a statement about ALL delegate-originated network work.
         //
-        // Without this the PR's own fan-out argument does not hold. It declines
-        // to put a bound inside `start_sub_op_get` on the grounds that "each of
-        // its existing callers is bounded by itself", and bounds the delegate
-        // GET/SUBSCRIBE paths at 4 per park for a node-wide ceiling of
-        // MAX_PARKED_DELEGATES (64) x 4 = 256. The self-heal fetch is a new
-        // caller of `start_sub_op_get` that was NOT bounded by itself: one round
-        // trip emitting N `UpdateContractRequest`s for N DISTINCT unseen
-        // instance ids fired N background sub-op GETs, each running to
-        // OPERATION_TTL. The per-contract 5-minute cooldown does not bind across
-        // distinct ids, so nothing capped N. Sharing the budget restores the 256
-        // ceiling as a statement about all delegate-originated network work
-        // rather than only the parked half.
-        let mut self_heal_fetches_started = 0usize;
+        // Declaring it here — inside the loop, as the first version of this fix
+        // did — reset it on every iteration and made the real ceiling 100x the
+        // documented one. Do NOT move it back; the parked half tolerates a
+        // loop-local count only because parking ends the run, and the self-heal
+        // half has no such serialisation.
+        //
         // Whether this executor can reach the network at all. `None` on the
         // mock/in-process executors used by unit tests and by
         // `handle_delegate_notification`'s test seams; those keep the
@@ -2234,9 +2240,11 @@ where
                     inter_delegate,
                     accumulated: std::mem::take(&mut accumulated_messages),
                     inbound_so_far: std::mem::take(&mut inbound_responses),
-                    // Carry the count so the cap bounds the ROUND-TRIP, not
-                    // each leg (#5544 S1).
+                    // Carry the counts so the caps bound the ROUND-TRIP, not
+                    // each leg (#5544 S1 for iterations; #5542 finding B1 for
+                    // the fan-out budget).
                     iterations,
+                    self_heal_fetches_started,
                     // Attached by the caller right after we return `Parked` (it
                     // owns the channel), or carried straight through if this run
                     // is itself a resume that is parking again.
@@ -2454,6 +2462,7 @@ where
                         accumulated_messages = continuation.accumulated;
                         inbound_responses = continuation.inbound_so_far;
                         iterations = continuation.iterations;
+                        self_heal_fetches_started = continuation.self_heal_fetches_started;
                         *ctx.carried_responder = continuation.responder;
                     }
                 }
@@ -4137,6 +4146,7 @@ where
 
     let delegate_park::Continuation {
         iterations,
+        self_heal_fetches_started,
         params,
         origin_contract,
         connection_scope,
@@ -4233,6 +4243,7 @@ where
             RunSeed {
                 accumulated,
                 iterations,
+                self_heal_fetches_started,
             },
         )
         .await
@@ -8332,6 +8343,98 @@ mod hol_4391_tests {
         (op_manager, guards)
     }
 
+    /// #5542 finding B1/F1. The delegate network fan-out budget must span the
+    /// WHOLE round trip, not one iteration of it.
+    ///
+    /// BEHAVIOURAL on purpose. The defect this pins is the lexical SCOPE of a
+    /// binding, and the sibling source-scrape pin
+    /// (`every_delegate_network_operation_is_charged_against_the_park_budget`)
+    /// is structurally unable to see it: the gate text was right, the increment
+    /// was right, and the counter was declared inside the `loop {`, so it reset
+    /// on each of up to `MAX_CONTRACT_REQUEST_ITERATIONS` (100) iterations. The
+    /// scrape stayed green through the exact defect it was written to prevent.
+    /// A scrape can pin an API surface; it cannot pin a scope.
+    ///
+    /// The observable is `pending_contract_fetches`, which
+    /// `try_self_heal_fetch_for_local_originator` inserts into once per contract
+    /// it actually starts a fetch for. Every id here is distinct, so the map's
+    /// size IS the number of fire-and-forget GETs this round trip launched.
+    #[tokio::test]
+    async fn the_self_heal_fanout_budget_spans_the_whole_round_trip() {
+        use freenet_stdlib::prelude::{UpdateContractRequest, UpdateData};
+
+        let _guard = TEST_GUARD.lock().await;
+        let (op_manager, _guards) = build_op_manager("d5542-fanout").await;
+        // A connection is a precondition: without one the self-heal refuses
+        // before the budget is ever consulted (finding 5B), and the test would
+        // pass for the wrong reason.
+        let keypair = crate::transport::TransportKeypair::new();
+        op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.3),
+            "127.0.0.1:46001".parse().unwrap(),
+            keypair.public().clone(),
+            false,
+        );
+
+        let (send, rcv_halve, _wait) = handler::contract_handler_channel();
+        let mut handler =
+            MockWasmContractHandler::new_test(rcv_halve, Some(op_manager.clone()), "d5542_fanout")
+                .await;
+        let script = handler.runtime_mut().delegate_script.clone();
+
+        // Three iterations, each asking to UPDATE four DISTINCT contracts this
+        // node has never seen. The store is empty, so every one takes the
+        // `None =>` self-heal branch.
+        const ITERATIONS: u8 = 3;
+        const PER_ITERATION: u8 = 4;
+        for i in 0..ITERATIONS {
+            let msgs: Vec<OutboundDelegateMsg> = (0..PER_ITERATION)
+                .map(|j| {
+                    let mut id = [0u8; 32];
+                    id[0] = 0xF0 + i;
+                    id[1] = j;
+                    OutboundDelegateMsg::UpdateContractRequest(UpdateContractRequest::new(
+                        ContractInstanceId::new(id),
+                        UpdateData::State(vec![1u8, 2, 3].into()),
+                    ))
+                })
+                .collect();
+            script.lock().unwrap().push_back(msgs.into());
+        }
+
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            },
+        ));
+        let key = test_delegate_key();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            send.send_to_handler(delegate_event(&key)),
+        )
+        .await
+        .expect("the round trip must terminate");
+
+        let started = op_manager.pending_contract_fetches.len();
+        handle.abort();
+        assert!(
+            started > 0,
+            "the test is vacuous unless at least one self-heal fetch started; \
+             got none, so the UPDATE arm never reached the network branch"
+        );
+        assert!(
+            started <= delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK,
+            "a single delegate round trip started {started} fire-and-forget \
+             network GETs against a per-round-trip budget of {}; the budget \
+             resets per ITERATION, so the real ceiling is that times \
+             MAX_CONTRACT_REQUEST_ITERATIONS ({}) rather than the documented \
+             node-wide 256 (#5542 finding B1)",
+            delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK,
+            MAX_CONTRACT_REQUEST_ITERATIONS,
+        );
+    }
+
     /// #5542 finding 5A. EVERY delegate-originated network operation started in
     /// one round trip is charged against `MAX_NETWORK_CONTRACT_OPS_PER_PARK` —
     /// including the UPDATE arm's self-heal fetch, which is fire-and-forget
@@ -9054,6 +9157,7 @@ mod hol_4391_tests {
     fn parked_continuation() -> delegate_park::Continuation {
         delegate_park::Continuation {
             iterations: 0,
+            self_heal_fetches_started: 0,
             params: Parameters::from(Vec::new()),
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
