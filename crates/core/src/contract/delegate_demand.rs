@@ -152,7 +152,19 @@
 //!    flags such a victim `was_in_use` (`ring/hosting/cache.rs`, `local +
 //!    downstream > 0`), and `local` counts delegate synthetic ids.
 //!
-//! 4. **Process exit.** Demand is in-memory; nothing survives a restart.
+//! 4. ~~**Process exit.**~~ **NO LONGER A RELEASE (#4669 part 2).** Demand is
+//!    still in-memory, so a restart does drop it — but the SUBSCRIPTION is now
+//!    durable, and boot restore re-registers the pin before any delegate runs
+//!    (`restore_persisted_subscriptions`). A restart therefore lapses a pin and
+//!    immediately reinstates it, which is the whole point of durability and
+//!    also the removal of the one release that never depended on the delegate
+//!    behaving. Read the resource enumeration below with that in mind: it was
+//!    written when there were four releases and there are now three.
+//!
+//!    A restart still releases a pin PERMANENTLY in exactly one case, and it is
+//!    the reconciliation case rather than a bound: a row whose delegate is no
+//!    longer registered, or whose contract has left the contract store, is
+//!    dropped from disk at boot instead of restored.
 //!
 //! **Enumerate the RESOURCES separately, because the answer differs per
 //! resource and generalising from one is how this section was wrong before.**
@@ -162,14 +174,31 @@
 //!
 //! - **Disk/memory bytes — BOUNDED.** Path 3 above. A pin cannot outrank the
 //!   byte budget; a delegate that pins and disappears does not strand storage.
-//! - **Node-wide pin SLOTS — NOT bounded by any reclaim path.** Nothing
-//!   releases a slot held by a healthy, still-running, well-behaved delegate.
-//!   Path 3 only fires under BYTE pressure, so a node holding
+//! - **Node-wide pin SLOTS — NOT bounded by any reclaim path, and since
+//!   #4669 part 2 not bounded by process lifetime either.** Nothing releases a
+//!   slot held by a healthy, still-running, well-behaved delegate. Path 3 only
+//!   fires under BYTE pressure, so a node holding
 //!   [`MAX_DELEGATE_PINS_PER_NODE`] small pinned contracts with free disk never
-//!   triggers it, and the slots are consumed for the life of the process. One
-//!   app can therefore take the whole allowance and every other app's delegate
-//!   is refused — while being told its subscribe succeeded. That is a live
+//!   triggers it; path 4 used to clear the slots at every restart, and now
+//!   restores them instead. One app can therefore take the whole allowance and
+//!   every other app's delegate is refused — while being told its subscribe
+//!   succeeded — and that state now persists across restarts. A live
 //!   starvation, not a theoretical one.
+//!
+//!   **This trips `.claude/rules/code-style.md`'s own two-branch test for a
+//!   capped per-key collection, and it is worth naming rather than leaving to
+//!   be rediscovered.** That rule permits reject-at-cap only for entries that
+//!   AGE OUT, on the stated grounds that "incumbents roll off on their own, so
+//!   a newcomer's wait is bounded". Delegate pins have no TTL and are never
+//!   refreshed, so neither branch's premise held even before durability — the
+//!   roll-off was a restart, i.e. an accident of process lifetime rather than a
+//!   property of the collection. Removing that accident makes the violation
+//!   explicit: the first [`MAX_DELEGATE_PINS_PER_NODE`] pins a node ever
+//!   accepts can hold the cap permanently. This is #5467 open question 1 and is
+//!   deliberately not answered here — a horizon on a dormant app's pins is a
+//!   product judgement, not an implementation detail. The durable row is the
+//!   natural place to hang one, since it is written on every subscribe and is
+//!   now the record with one owner.
 //! - **Broadcast/cost capacity — bounded only because of an explicit fix.**
 //!   `cost_eviction_candidate` vetoes on any local subscriber, so a pin would
 //!   have made a contract permanently immune to the #4861 cost sweep. The cost
@@ -180,6 +209,19 @@
 //! So: storage is bounded, cost capacity is bounded by construction, and pin
 //! slots are not. The caps bound how fast slots are consumed and by whom; they
 //! do not make the consumption reclaimable.
+//!
+//! Stated once more in the form a reviewer asks for it: **is eviction a real
+//! release, or is it circular?** It is real and not circular — a pin does not
+//! veto eviction, it only sorts last (`victim_order`), and
+//! `teardown_evicted_in_use_contract` clears `client_subscriptions` wholesale
+//! for the victim. But it is PRESSURE-GATED: `evict_over_budget` returns an
+//! empty candidate list before evaluating anything while the node is under both
+//! budgets, and `cost_eviction_candidate` requires `attributed_rate > 0.0`, so
+//! an idle contract is never a cost candidate either. For a single small idle
+//! pin on a node with headroom there is therefore NO release that does not
+//! require the delegate to act. The bound is on the aggregate — pins consume
+//! bytes and count slots, so enough of them create the pressure that sheds them
+//! — never on the individual pin.
 //!
 //! The real cost is a PRIORITY one, not a storage leak: a pinned contract
 //! displaces unpinned ones under budget pressure, and in the all-local-
