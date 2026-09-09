@@ -73,14 +73,31 @@ use freenet_stdlib::prelude::{ContractInstanceId, DelegateKey};
 ///
 /// # What it bounds, and what it does not
 ///
-/// The worst case is not this number: a hostile app may spawn child delegates,
-/// each with its own budget, so the reachable total is
-/// `MAX_CREATED_DELEGATES_PER_NODE` (1024) x this. That composition is BOUNDED,
-/// which is the property that matters and the one the client-side cap does not
-/// have — `MAX_SUBSCRIPTIONS_PER_CLIENT` is per-`ClientId` and a client mints a
-/// fresh `ClientId` by opening another WebSocket, so that cap bounds nothing in
-/// aggregate. This one cannot be reset that way: a delegate key is derived from
-/// its code and params, and creating more delegates is separately capped.
+/// **This bounds one delegate. It does NOT give the node an aggregate ceiling,
+/// and an earlier version of this comment claimed it did.** That claim said the
+/// reachable total was `MAX_CREATED_DELEGATES_PER_NODE` (1024) x this, and it is
+/// wrong: that counter is incremented only by the `create_delegate` host
+/// function (`native_api.rs`), and `delegates.rs` states outright that
+/// "delegates registered directly by apps were never counted". So an app that
+/// registers delegates over its own WebSocket increments nothing, each distinct
+/// code+params pair is a distinct `DelegateKey`, and each such key gets a fresh
+/// budget of its own. The number of delegates is not bounded on that path, so
+/// neither is the product.
+///
+/// What IS bounded is the delegate-spawns-delegate composition: a delegate
+/// created by another delegate does pass through the counter, so that path is
+/// capped at 1024 x this.
+///
+/// State the residual rather than leaving the reader to find it: against an app
+/// that will register unlimited distinct delegates, this constant limits the
+/// blast radius of any ONE of them and nothing more. That is still worth having
+/// — it is what stops a single delegate accumulating an unbounded standing
+/// claim — but it is a per-principal bound, not a node-wide one, and the
+/// node-wide ceiling has to come from bounding delegate registration, which is
+/// not this change. The comparison with `MAX_SUBSCRIPTIONS_PER_CLIENT` (per
+/// `ClientId`, and a client mints a fresh one by opening another WebSocket) is
+/// therefore a similarity and not a contrast, which is the opposite of what this
+/// paragraph used to say.
 ///
 /// **A count is not a byte budget** (`.claude/rules/code-style.md`, clause 4), so
 /// state the byte story explicitly rather than leaving a count to imply one. Two
@@ -197,9 +214,11 @@ pub(crate) enum SubscribeOutcome {
     ///    incremented per subscribe and never decremented on eviction leaks, and
     ///    a leaked count never falls back to zero.
     ///
-    /// Ignoring this variant compiles (it is one arm of an enum), so the risk is
-    /// a caller that matches only `Registered` and treats the rest as success.
-    /// Match it explicitly.
+    /// **The `delegate_interest` hold is discharged by [`subscribe`] itself**, so
+    /// a caller does not have to remember to do it — ignoring this variant
+    /// compiles, it is one arm of an enum, and two of the three registration
+    /// paths ignore the return value entirely. Any OTHER per-pair resource a
+    /// future caller takes at registration must still be released here.
     RegisteredEvicting(ContractInstanceId),
 }
 
@@ -484,6 +503,24 @@ pub(crate) fn cap_evictions_total() -> u64 {
 #[cfg(test)]
 pub(crate) fn subscription_count(delegate: &DelegateKey) -> usize {
     BY_DELEGATE.get(delegate).map_or(0, |owned| owned.len())
+}
+
+/// When a notification for `contract` was last delivered to `delegate`.
+///
+/// Exists so a test can pin the PRODUCTION call to [`note_notified`] rather than
+/// only the helper. The helper being correct says nothing about it being wired
+/// up, and the wiring is the half that rots: delete the call in
+/// `send_delegate_contract_notifications` and every stamp stays at its
+/// registration time, so eviction starts targeting the delegate's BUSIEST
+/// subscription instead of its coldest, silently and with the suite still green.
+#[cfg(test)]
+pub(crate) fn last_notified(
+    contract: &ContractInstanceId,
+    delegate: &DelegateKey,
+) -> Option<tokio::time::Instant> {
+    BY_DELEGATE
+        .get(delegate)
+        .and_then(|owned| owned.get(contract).copied())
 }
 
 /// Whether `delegate` is subscribed to `contract`.
