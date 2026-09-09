@@ -1425,7 +1425,7 @@ where
 mod tests {
     use super::*;
 
-    /// Strip `//` comment text from a scraped window before matching.
+    /// Strip comment text from a scraped window before matching.
     ///
     /// Without this every call-guarding pin in this module can be defeated by
     /// COMMENTING OUT the call it guards: `contains` is just as happy inside a
@@ -1433,13 +1433,12 @@ mod tests {
     /// inert. That is the same "true answer about the wrong text" shape
     /// `.claude/rules/testing.md` describes, reached from a direction the
     /// window guards do not cover.
-    /// Strip comments from a scraped window before matching.
     ///
     /// Delegates to `contract::tests::strip_comments`, the state-machine
     /// stripper `.claude/rules/bug-prevention-patterns.md` points at, rather
     /// than the line-oriented `line.find("//")` this used to be. That version
     /// missed `/* */` entirely, so a pin it guarded could be defeated by
-    /// commenting the call out one syntax over — and a guard that catches only
+    /// commenting the call out one syntax over, and a guard that catches only
     /// the variant you thought of is a search with a blind spot.
     fn code_only(window: &str) -> String {
         crate::contract::tests::strip_comments(window)
@@ -1918,13 +1917,19 @@ mod tests {
     /// rather than the durability test silently passing on stale state.
     /// Boot restore must NOT re-affirm the rows it replays.
     ///
-    /// This is the assertion the whole expiry design rests on. The durable row
-    /// carries a last-affirmed stamp so it can age out; if replaying the set at
-    /// boot refreshed that stamp, a node restarting periodically would
-    /// re-affirm every row it ever accepted and none could ever expire. That is
-    /// the permanently-refreshable GC exemption `AGENTS.md` forbids, and the
-    /// exact shape `.claude/rules/code-style.md` names, so the guard is on the
-    /// stamp VALUE rather than on which function got called.
+    /// Nothing ages a row out today, so this pins a property no CURRENT code
+    /// consumes — deliberately. It is the property any horizon added later
+    /// (#5622) depends on: if replaying the durable set at boot refreshed the
+    /// stamp, a node restarting periodically would re-affirm every row it ever
+    /// accepted and no horizon could ever fire. That is the
+    /// permanently-refreshable GC exemption `AGENTS.md` forbids, and the exact
+    /// shape `.claude/rules/code-style.md` names.
+    ///
+    /// Pinning it now is the point. The property is invisible while nothing
+    /// expires, so without this test it could be broken silently and only
+    /// discovered by whoever implements the horizon and finds it does nothing.
+    /// The guard is on the stamp VALUE rather than on which function was
+    /// called, so it survives a refactor that renames either.
     ///
     /// The mutation that must redden this: swap `restore_registration` back to
     /// `register` in `restore_persisted_subscriptions`.
@@ -1944,9 +1949,9 @@ mod tests {
         let op_manager = first.op_manager.clone();
         hosted_contract_on_real_storage(&op_manager.ring, &storage, key).await;
 
-        // Affirmed 30 days ago: comfortably inside the 180-day horizon, so the
-        // expiry pass must leave it alone, and far enough past the 1h stamp
-        // granularity that a refresh would be unmistakable.
+        // Affirmed 30 days ago: far enough past the 1h stamp granularity that a
+        // refresh would be unmistakable, and recent enough to be plausible to
+        // the clock guard.
         let thirty_days_ms = 30 * 24 * 60 * 60 * 1000;
         let affirmed_at = ReDb::now_ms().saturating_sub(thirty_days_ms);
         assert!(
@@ -1991,8 +1996,8 @@ mod tests {
                 dropped_delegate_gone: 0,
                 unresolved_contract: 0,
             },
-            "the row is inside the horizon, so restore must replay it in full and \
-             the expiry pass must leave it alone"
+            "restore must replay the row in full: a resolvable contract with a \
+             registered delegate is restored and pinned"
         );
         assert_eq!(
             storage

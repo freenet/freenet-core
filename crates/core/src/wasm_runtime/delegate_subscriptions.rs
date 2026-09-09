@@ -244,7 +244,8 @@ pub(crate) fn restore_registration<S: DelegateSubscriptionPersistence + ?Sized>(
 /// contract-handling loop reaches its executor generically.
 pub trait DelegateSubscriptionPersistence: Send + Sync {
     /// Record `(contract, delegate)`. Returns whether it is recorded after the
-    /// call; `false` means a per-contract cap refused it.
+    /// call; `false` means a cap refused it — per-contract or node-wide, and
+    /// the caller does not need to know which, only that no row exists.
     fn persist_delegate_subscription(
         &self,
         _contract: &ContractInstanceId,

@@ -286,33 +286,59 @@ pub(crate) const RESERVED_MARKER_HASHES_TABLE: TableDefinition<&[u8], &[u8]> =
 /// notification channel closing) is a prefix range scan; removing a delegate
 /// walks the in-memory registry for the contracts that delegate holds and
 /// issues point deletes, so neither teardown ever needs a full table scan. The
-/// only full scans are at boot: the expiry pass and then the restore load.
+/// only full scan is the restore load at boot.
 ///
 /// Key: ContractInstanceId (32 bytes) || DelegateKey (64 bytes) = 96 bytes
 /// Value: last-affirmed stamp, 8 bytes big-endian milliseconds since the UNIX
 /// epoch.
 ///
-/// The stamp exists so the row can be AGED OUT. Without it a row whose contract
-/// still exists but is no longer hosted is kept forever: it is deliberately not
-/// dropped by boot reconciliation (the delegate still wants notifications, and
-/// the pin returns if the node re-hosts the contract), and nothing else would
-/// ever look at it again. `AGENTS.md` requires a cleanup exemption to be
-/// time-bounded, and a row that can silently re-pin a contract at some
-/// arbitrary future boot is one.
+/// # THE STAMP DOES NOT CLOSE THE `AGENTS.md` GAP. NOTHING AGES A ROW OUT.
 ///
-/// Only a GENUINE delegate subscribe refreshes the stamp. Boot restore
-/// explicitly does not, which is the whole point: a stamp that restore
-/// refreshed would be re-affirmed by the node's own restarts, making the
-/// exemption permanently refreshable, which is the trap
-/// `.claude/rules/code-style.md` names and `AGENTS.md` forbids. What the stamp
-/// therefore measures is "when was this app last used", because a delegate only
-/// runs when something invokes it.
+/// Stated at the top because a maintainer entering here and one entering at
+/// [`restore_persisted_subscriptions`] must not be told different things.
+/// **No expiry exists.** A row whose contract still exists but is no longer
+/// hosted is kept forever: boot reconciliation deliberately does not drop it
+/// (the delegate still wants notifications, and the pin returns if the node
+/// re-hosts), and nothing else ever looks at it again. `AGENTS.md` requires a
+/// cleanup exemption to be time-bounded and this one is not.
 ///
-/// A value shorter than 8 bytes is read as UNSTAMPED and restamped at the next
-/// expiry pass rather than treated as infinitely old, so no row is ever deleted
-/// merely for predating the stamp. Nothing in the field carries such a row
-/// today (the table is introduced unreleased, by #4669 part 2); the branch is
-/// there so a future value-encoding change fails safe rather than destructive.
+/// **What that costs**, since an unbounded exemption should name its price: an
+/// idle pinned contract holds a `contract_in_use` pin that raises its eviction
+/// tier indefinitely, so a node can retain a contract nobody uses ahead of one
+/// that is used, until the delegate unregisters or the node goes over budget.
+///
+/// An expiry pass was built and removed; the reasoning is on
+/// `restore_persisted_subscriptions` and in #5622. The short version is that
+/// only an explicit re-subscribe can refresh a stamp without opening a
+/// self-granting loop, and a delegate that subscribes once and is then merely
+/// notified would have its working subscription deleted.
+///
+/// # SO WHAT IS THE STAMP FOR
+///
+/// It makes #5622 a policy change rather than a second row-format change, and
+/// it preserves the property any later horizon depends on: **only a GENUINE
+/// delegate subscribe refreshes it.** Boot restore explicitly does not, since
+/// a stamp the node's own restarts refreshed could never age out, which is the
+/// trap `.claude/rules/code-style.md` names.
+///
+/// # WHAT BOUNDS THE TABLE IN THE MEANTIME
+///
+/// Not the stamp. [`ReDb::MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT`] and
+/// [`ReDb::MAX_DELEGATE_SUBSCRIPTION_ROWS_PER_NODE`] are the substitute bound
+/// for the absent horizon: rows do not age out, so the caps are what stop the
+/// table growing without limit. Both are reject-at-cap and so starve newcomers
+/// once full, tracked in #5622 alongside the horizon.
+///
+/// **Both caps are redb-only.** The sqlite backend persists nothing here, so it
+/// has no table to bound; its in-memory registry is bounded only by the pin
+/// caps in `delegate_demand`.
+///
+/// A value that is not 8 bytes, or whose stamp is implausible, is read as
+/// UNSTAMPED and rewritten by the next genuine subscribe rather than treated as
+/// ancient — see [`ReDb::decode_delegate_subscription_stamp`]. No row is ever
+/// dropped for carrying a value this code cannot read. Nothing in the field
+/// carries one (the table is introduced unreleased, by #4669 part 2); the
+/// branch is there so a future value-encoding change fails safe.
 pub(crate) const DELEGATE_SUBSCRIPTIONS_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("delegate_contract_subscriptions");
 
@@ -2085,6 +2111,11 @@ impl ReDb {
     /// legitimate node's delegate-subscription count. It bounds the growth
     /// without being a limit real use meets.
     ///
+    /// **redb only.** The sqlite backend persists no delegate subscriptions, so
+    /// it has no table to bound; its in-memory registry is bounded only by the
+    /// pin caps in `delegate_demand`. Same for
+    /// [`Self::MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT`].
+    ///
     /// **Residual, tracked in #5622:** this is reject-at-cap over rows that
     /// never age out, so once full it refuses newcomers indefinitely rather
     /// than reclaiming. That is the starving branch of the same
@@ -2245,14 +2276,26 @@ impl ReDb {
         // An UNSTAMPED row does not take this path: it falls through to the
         // write so the stamp is established. That is bounded at one write per
         // row, because the row is stamped from then on.
+        //
+        // A node whose OWN clock is not set takes this path on presence alone.
+        // It cannot write a meaningful stamp — everything it produces is below
+        // the floor and reads back as unstamped — so rewriting would mean
+        // taking redb's writer lock on the WASM call stack for every repeat
+        // subscribe, forever, to store a value the decode rejects. Presence is
+        // the most this node can establish, and the next subscribe made with a
+        // real clock stamps the row.
+        let clock_is_set = now_ms >= Self::DELEGATE_SUBSCRIPTION_STAMP_FLOOR_MS;
         let fresh_enough =
             self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
                 Ok(tbl) => Ok(match tbl.get(row_key.as_slice())? {
-                    Some(v) => Self::decode_delegate_subscription_stamp(v.value(), now_ms)
-                        .is_some_and(|affirmed| {
-                            now_ms.saturating_sub(affirmed)
-                                < Self::DELEGATE_SUBSCRIPTION_STAMP_GRANULARITY_MS
-                        }),
+                    Some(v) => {
+                        !clock_is_set
+                            || Self::decode_delegate_subscription_stamp(v.value(), now_ms)
+                                .is_some_and(|affirmed| {
+                                    now_ms.saturating_sub(affirmed)
+                                        < Self::DELEGATE_SUBSCRIPTION_STAMP_GRANULARITY_MS
+                                })
+                    }
                     None => false,
                 }),
                 Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
@@ -2303,6 +2346,17 @@ impl ReDb {
                 }
             }
         }
+        if !admitted {
+            // A refusal wrote nothing, so committing would cost an fsync and an
+            // acquisition of redb's single writer lock to persist no change.
+            // Same shape as the empty-range guard in
+            // `remove_delegate_subscriptions_for_contract`, and it matters more
+            // here: with no expiry, a contract or node at a cap STAYS there, so
+            // every later subscribe would pay that fsync indefinitely, on the
+            // WASM call stack. Dropping the transaction aborts it.
+            drop(txn);
+            return Ok(false);
+        }
         Self::commit_guarded(txn)?;
         Ok(admitted)
     }
@@ -2335,9 +2389,10 @@ impl ReDb {
 
     /// When `(contract, delegate)` was last affirmed by a genuine subscribe.
     ///
-    /// `None` if the row is absent OR carries no readable stamp; the caller
-    /// that cares about the difference (the expiry pass) distinguishes them by
-    /// scanning, and no other caller does.
+    /// `None` if the row is absent, carries no readable stamp, or carries one
+    /// the clock guard rejects. Nothing distinguishes those cases today,
+    /// because nothing needs to: the sole consumer treats all three the same
+    /// way, by rewriting the stamp.
     ///
     /// Test-only. Nothing in production READS a stamp today; its only
     /// consumer writes it. It exists so a test asserts against the real
@@ -3671,6 +3726,125 @@ mod tests {
             .expect("read stamp")
     }
 
+    /// A refused subscribe must not commit a write transaction.
+    ///
+    /// A refusal writes nothing, so committing costs an fsync and an
+    /// acquisition of redb's single writer lock to persist no change. With no
+    /// expiry, a contract that reaches its cap STAYS there, so every subsequent
+    /// subscribe would pay that cost indefinitely — and this runs synchronously
+    /// on the WASM call stack.
+    ///
+    /// Source-scraped rather than timed, because "did not fsync" is exactly the
+    /// assertion that passes on a fast disk whether or not the fix is present.
+    #[test]
+    fn a_refused_subscribe_does_not_commit() {
+        const SOURCE: &str = include_str!("redb.rs");
+        let start = SOURCE
+            .find("pub(crate) fn add_delegate_subscription_at(")
+            .expect("add_delegate_subscription_at must still exist");
+        let rel_end = SOURCE[start..]
+            .find("\n    }\n")
+            .expect("must still be a closed fn body");
+        let body = &crate::contract::tests::strip_comments(&SOURCE[start..start + rel_end]);
+
+        // Window guard, separate from the assertion: a window truncated before
+        // the commit would make the ordering check below pass vacuously.
+        let commit = body
+            .find("Self::commit_guarded(txn)")
+            .expect("the scraped window no longer reaches the commit. Widen it; do NOT delete.");
+        // Anchor on the CONDITION, not just the return. A pin that looked only
+        // for `return Ok(false);` before the commit stayed green when the
+        // condition was neutered to `if false {` — the text was all still
+        // there, in the right order, guarding nothing. Verified by mutation:
+        // that is how this assertion got its first line.
+        let guard = body
+            .find("if !admitted {")
+            .expect("the refusal must still be gated on `!admitted`, or this pin is                      asserting about text that no longer runs");
+        let bail = body
+            .find("return Ok(false);")
+            .expect("a refusal must return before the commit, not fall through to it");
+        assert!(
+            guard < bail && bail < commit,
+            "order must be the !admitted guard, then the return, then the commit. \
+             Got guard at {guard}, return at {bail}, commit at {commit}."
+        );
+    }
+
+    /// A node whose clock is not set must not rewrite a present row on every
+    /// repeat subscribe.
+    ///
+    /// Everything such a node stamps is below the plausibility floor and so
+    /// reads back as unstamped, so a naive "unstamped means restamp" would take
+    /// redb's writer lock on the WASM call stack for every repeat subscribe,
+    /// forever, to store a value the decode rejects. Presence is the most this
+    /// node can establish and it is enough.
+    #[tokio::test]
+    async fn a_clockless_node_does_not_rewrite_a_present_row() {
+        let dir = TempDir::new().unwrap();
+        let store = ReDb::new(dir.path()).await.unwrap();
+
+        let contract = ContractInstanceId::new([21; 32]);
+        let delegate = expiry_test_delegate(21);
+
+        // A clock that has not been set: well below the floor.
+        let unset = 5_000u64;
+        assert!(
+            store
+                .add_delegate_subscription_at(&contract, &delegate, unset)
+                .unwrap()
+        );
+        assert_eq!(
+            stored_stamp(&store, &contract, &delegate),
+            None,
+            "precondition: what a clockless node writes must read back as \
+             unstamped, or this test is not exercising the case"
+        );
+
+        // Repeat subscribes must be answered from the read transaction. The
+        // observable proxy for "took no write" is that the row is unchanged:
+        // a rewrite would store `unset + 1` and it would still read as None,
+        // so assert on the RAW bytes rather than the decoded stamp.
+        let raw = |s: &ReDb| -> Option<Vec<u8>> {
+            let row_key = ReDb::delegate_subscription_row_key(&contract, &delegate);
+            s.read_guarded(|txn| {
+                let tbl = match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
+                    Ok(t) => t,
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                    Err(e) => return Err(e.into()),
+                };
+                Ok(tbl.get(row_key.as_slice())?.map(|v| v.value().to_vec()))
+            })
+            .unwrap()
+        };
+        let before = raw(&store);
+        assert!(
+            store
+                .add_delegate_subscription_at(&contract, &delegate, unset + 1)
+                .unwrap()
+        );
+        assert_eq!(
+            raw(&store),
+            before,
+            "a repeat subscribe on a clockless node must leave the row byte-for-byte \
+             alone. Rewriting it means taking the writer lock on every call forever, \
+             to store a stamp the decode will reject anyway."
+        );
+
+        // And once the clock IS set, the row is stamped for real.
+        let real = 1_700_000_000_000u64;
+        assert!(
+            store
+                .add_delegate_subscription_at(&contract, &delegate, real)
+                .unwrap()
+        );
+        assert_eq!(
+            stored_stamp(&store, &contract, &delegate),
+            Some(real),
+            "the first subscribe made with a real clock must stamp the row, or a \
+             node that boots clockless once never gets a usable stamp"
+        );
+    }
+
     /// A stamp written while the clock was unset must be RESTAMPED, never read
     /// as ancient.
     ///
@@ -3797,22 +3971,38 @@ mod tests {
 
         let delegate = expiry_test_delegate(11);
         let cap = ReDb::MAX_DELEGATE_SUBSCRIPTION_ROWS_PER_NODE;
-        let now = 1_700_000_000_000;
+        let now = 1_700_000_000_000u64;
 
+        // Fill to the ceiling in ONE transaction. Calling the public writer
+        // `cap` times would be 10,000 redb commits, and redb's durability is
+        // Immediate, so that is 10,000 fsyncs on a shared runner: minutes of
+        // wall time to build a fixture. The SETUP is not what this test
+        // asserts; the REFUSAL is, and that still goes through the real writer.
+        //
         // One row per contract, so the per-contract cap (256) is never the
-        // thing refusing — if it were, this test would pass for the wrong
-        // reason and prove nothing about the node-wide bound.
-        for n in 0..cap {
-            let mut bytes = [0u8; 32];
-            bytes[..8].copy_from_slice(&n.to_be_bytes());
-            let contract = ContractInstanceId::new(bytes);
-            assert!(
-                store
-                    .add_delegate_subscription_at(&contract, &delegate, now)
-                    .unwrap(),
-                "row {n} must be admitted while under the node-wide ceiling"
-            );
+        // thing refusing. If it were, this test would pass for the wrong reason
+        // and prove nothing about the node-wide bound.
+        {
+            let txn = store.begin_write().unwrap();
+            {
+                let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE).unwrap();
+                for n in 0..cap {
+                    let mut bytes = [0u8; 32];
+                    bytes[..8].copy_from_slice(&n.to_be_bytes());
+                    let contract = ContractInstanceId::new(bytes);
+                    let key = ReDb::delegate_subscription_row_key(&contract, &delegate);
+                    tbl.insert(key.as_slice(), now.to_be_bytes().as_slice())
+                        .unwrap();
+                }
+            }
+            ReDb::commit_guarded(txn).unwrap();
         }
+        assert_eq!(
+            store.load_all_delegate_subscriptions().unwrap().len() as u64,
+            cap,
+            "fixture guard: the bulk fill must actually have written `cap` rows, \
+             or the refusal below proves nothing"
+        );
         assert_eq!(
             store.load_all_delegate_subscriptions().unwrap().len() as u64,
             cap,
@@ -3858,7 +4048,11 @@ mod tests {
         let rel_end = SOURCE[start..]
             .find("\n    }\n")
             .expect("must still be a closed fn body");
-        let body = &SOURCE[start..start + rel_end];
+        // Comment-stripped, for the reason this round fixed three other pins:
+        // without it the early return can be commented out and this stays
+        // green. Third instance in one PR, which is why it is now a rule
+        // (`.claude/rules/code-style.md`).
+        let body = &crate::contract::tests::strip_comments(&SOURCE[start..start + rel_end]);
 
         // Window guard, separate from the assertion that uses it: a window
         // truncated before `begin_write` would make the ordering check pass

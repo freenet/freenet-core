@@ -145,6 +145,13 @@ actors (clients, network peers) can influence.
      that never age out, which is the starving branch above. A reader who
      hits one wants the other; the residual is tracked in #5622.
 
+     And say WHICH BACKEND a cap covers when a project has more than one.
+     #5493's two caps are redb-only; the sqlite backend persists nothing
+     there, so it has no table to bound and no cap. An unqualified "this is
+     capped" reads as a property of the system when it is a property of one
+     implementation, which is how a second backend ships without the bound
+     and nobody notices.
+
      Three instances turned up in one night on the #5467 delegate work:
      the delegate pin cap, `MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT` on
      the durable subscription rows (#5493), and a transport stream cap

@@ -679,7 +679,6 @@ pub struct DelegatePinRefusalStats {
 /// shadow-compare — so a nonzero `retract_diffs` reflects that missing
 /// site-local retraction, as intended, not a live-advertisement leak.
 #[derive(Default, Clone, Copy)]
-
 pub struct ReconcileShadowStats {
     /// Total shadow comparisons performed at this site (the denominator — one
     /// per decision site invocation).
