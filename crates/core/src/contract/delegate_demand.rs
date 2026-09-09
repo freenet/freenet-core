@@ -1885,6 +1885,176 @@ mod tests {
     /// change made `clear_in_memory_for` or the fresh fixture stop reproducing
     /// a restart, this test goes green-for-the-wrong-reason first and fails,
     /// rather than the durability test silently passing on stale state.
+    /// Boot restore must NOT re-affirm the rows it replays.
+    ///
+    /// This is the assertion the whole expiry design rests on. The durable row
+    /// carries a last-affirmed stamp so it can age out; if replaying the set at
+    /// boot refreshed that stamp, a node restarting periodically would
+    /// re-affirm every row it ever accepted and none could ever expire. That is
+    /// the permanently-refreshable GC exemption `AGENTS.md` forbids, and the
+    /// exact shape `.claude/rules/code-style.md` names, so the guard is on the
+    /// stamp VALUE rather than on which function got called.
+    ///
+    /// The mutation that must redden this: swap `restore_registration` back to
+    /// `register` in `restore_persisted_subscriptions`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn boot_restore_does_not_reaffirm_the_rows_it_replays() {
+        let _pin_outcomes = pin_outcome_guard().await;
+        use crate::contract::storages::ReDb;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: ReDb = ReDb::new(dir.path()).await.expect("open redb");
+
+        let key = contract_key(83);
+        let delegate = delegate_key(83);
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+
+        let first = seam_fixture("delegate-demand-4669-restore-no-reaffirm-before").await;
+        let op_manager = first.op_manager.clone();
+        hosted_contract_on_real_storage(&op_manager.ring, &storage, key).await;
+
+        // Affirmed 30 days ago: comfortably inside the 180-day horizon, so the
+        // expiry pass must leave it alone, and far enough past the 1h stamp
+        // granularity that a refresh would be unmistakable.
+        let thirty_days_ms = 30 * 24 * 60 * 60 * 1000;
+        let affirmed_at = ReDb::now_ms().saturating_sub(thirty_days_ms);
+        assert!(
+            storage
+                .add_delegate_subscription_at(key.id(), &delegate, affirmed_at)
+                .expect("record the row"),
+            "precondition: the row must be admitted"
+        );
+        crate::wasm_runtime::delegate_subscriptions::test_support::register_in_memory_only(
+            key.id(),
+            &delegate,
+        );
+        assert!(register_subscription(&op_manager, &delegate, &key));
+        assert_eq!(
+            storage
+                .delegate_subscription_affirmed_at(key.id(), &delegate)
+                .expect("read stamp"),
+            Some(affirmed_at),
+            "precondition: the row carries the old stamp before the restart"
+        );
+
+        // ---- restart ---------------------------------------------------
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+        drop(first);
+
+        let second = seam_fixture("delegate-demand-4669-restore-no-reaffirm-after").await;
+        let restarted = second.op_manager.clone();
+        hosted_contract_on_real_storage(&restarted.ring, &storage, key).await;
+
+        let outcome = restore_persisted_subscriptions(
+            &restarted,
+            &storage,
+            |id| (id == key.id()).then_some(key),
+            |_| true,
+        );
+
+        assert_eq!(
+            outcome,
+            RestoreOutcome {
+                restored: 1,
+                pinned: 1,
+                dropped_delegate_gone: 0,
+                dropped_contract_gone: 0,
+                expired_stale: 0,
+                restamped: 0,
+            },
+            "the row is inside the horizon, so restore must replay it in full and \
+             the expiry pass must leave it alone"
+        );
+        assert_eq!(
+            storage
+                .delegate_subscription_affirmed_at(key.id(), &delegate)
+                .expect("read stamp"),
+            Some(affirmed_at),
+            "boot restore must leave the stamp EXACTLY where it was. A restore \
+             that re-affirms means a node's own restarts keep every row it ever \
+             accepted alive, so nothing can expire and the bound this stamp \
+             exists to create does not exist."
+        );
+
+        // Declining to re-affirm must not have cost the delegate its pin.
+        assert!(
+            restarted.ring.contract_in_use(&key),
+            "the pin must still come back; this test is about the stamp, and it \
+             would pass vacuously if restore had simply stopped working"
+        );
+    }
+
+    /// A row past the horizon is dropped at boot instead of re-pinning its
+    /// contract, and the delegate's notification hook goes with it.
+    ///
+    /// The kept-but-unhosted row is what makes this reachable: reconciliation
+    /// keeps such a row deliberately, so without an idle horizon it sits on
+    /// disk forever and re-pins whenever the node next holds the contract.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn boot_restore_drops_a_subscription_no_one_has_affirmed_in_too_long() {
+        let _pin_outcomes = pin_outcome_guard().await;
+        use crate::contract::storages::ReDb;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: ReDb = ReDb::new(dir.path()).await.expect("open redb");
+
+        let key = contract_key(84);
+        let delegate = delegate_key(84);
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+
+        let fixture = seam_fixture("delegate-demand-4669-restore-expired").await;
+        let op_manager = fixture.op_manager.clone();
+        hosted_contract_on_real_storage(&op_manager.ring, &storage, key).await;
+
+        // One day past the horizon.
+        let stale_at = ReDb::now_ms()
+            .saturating_sub(ReDb::DELEGATE_SUBSCRIPTION_MAX_IDLE_MS)
+            .saturating_sub(24 * 60 * 60 * 1000);
+        assert!(storage
+            .add_delegate_subscription_at(key.id(), &delegate, stale_at)
+            .expect("record the row"));
+
+        let outcome = restore_persisted_subscriptions(
+            &op_manager,
+            &storage,
+            |id| (id == key.id()).then_some(key),
+            |_| true,
+        );
+
+        assert_eq!(
+            outcome,
+            RestoreOutcome {
+                restored: 0,
+                pinned: 0,
+                dropped_delegate_gone: 0,
+                dropped_contract_gone: 0,
+                expired_stale: 1,
+                restamped: 0,
+            },
+            "the row must be expired BEFORE the restore loop, so it is never \
+             restored and never pinned"
+        );
+        assert!(
+            crate::wasm_runtime::delegate_subscriptions::load_persisted(&storage)
+                .expect("read back")
+                .is_empty(),
+            "the durable row must be gone, or it re-pins the contract at the next \
+             boot and the horizon bounded nothing"
+        );
+        assert!(
+            !op_manager.ring.contract_in_use(&key),
+            "an expired subscription must leave no pin behind"
+        );
+        assert!(
+            !crate::wasm_runtime::delegate_subscriptions::test_support::is_registered(
+                key.id(),
+                &delegate
+            ),
+            "and no notification hook, so the two representations agree here as \
+             they do everywhere else"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn an_in_memory_only_subscription_does_not_survive_a_restart() {
         let _pin_outcomes = pin_outcome_guard().await;

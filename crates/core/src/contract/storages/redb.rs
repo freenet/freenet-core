@@ -2088,7 +2088,7 @@ impl ReDb {
     pub(crate) const DELEGATE_SUBSCRIPTION_STAMP_GRANULARITY_MS: u64 = 60 * 60 * 1000;
 
     /// Milliseconds since the UNIX epoch, saturating at 0 before it.
-    fn now_ms() -> u64 {
+    pub(crate) fn now_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -2258,6 +2258,29 @@ impl ReDb {
         self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
             Ok(tbl) => Ok(tbl.get(row_key.as_slice())?.is_some()),
             Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+            Err(e) => Err(e.into()),
+        })
+    }
+
+    /// When `(contract, delegate)` was last affirmed by a genuine subscribe.
+    ///
+    /// `None` if the row is absent OR carries no readable stamp; the caller
+    /// that cares about the difference (the expiry pass) distinguishes them by
+    /// scanning, and no other caller does.
+    ///
+    /// # Errors
+    /// Returns `Err` if the redb read transaction, table open or lookup fails.
+    pub(crate) fn delegate_subscription_affirmed_at(
+        &self,
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+    ) -> Result<Option<u64>, redb::Error> {
+        let row_key = Self::delegate_subscription_row_key(contract, delegate);
+        self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
+            Ok(tbl) => Ok(tbl
+                .get(row_key.as_slice())?
+                .and_then(|v| Self::decode_delegate_subscription_stamp(v.value()))),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
             Err(e) => Err(e.into()),
         })
     }
@@ -3616,22 +3639,14 @@ mod tests {
         DelegateKey::new([seed; 32], CodeHash::from_code(&[seed]))
     }
 
-    /// Read a row's stored stamp, or `None` if the row is absent. Goes to the
-    /// table directly: the assertion is about the VALUE, and no accessor
-    /// exposes it.
-    fn stored_stamp(store: &ReDb, contract: &ContractInstanceId, delegate: &DelegateKey) -> Option<u64> {
-        let row_key = ReDb::delegate_subscription_row_key(contract, delegate);
+    /// Read a row's stored stamp, or `None` if the row is absent or unstamped.
+    fn stored_stamp(
+        store: &ReDb,
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+    ) -> Option<u64> {
         store
-            .read_guarded(|txn| {
-                let tbl = match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
-                    Ok(tbl) => tbl,
-                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-                    Err(e) => return Err(e.into()),
-                };
-                Ok(tbl
-                    .get(row_key.as_slice())?
-                    .and_then(|v| ReDb::decode_delegate_subscription_stamp(v.value())))
-            })
+            .delegate_subscription_affirmed_at(contract, delegate)
             .expect("read stamp")
     }
 
