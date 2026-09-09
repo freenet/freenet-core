@@ -409,7 +409,9 @@ static SCHEDULE: LazyLock<Mutex<Schedule>> =
 /// every subsequent wakeup for the life of the process is a worse outcome than
 /// continuing. Nothing here is a security invariant.
 fn schedule_lock() -> std::sync::MutexGuard<'static, Schedule> {
-    SCHEDULE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SCHEDULE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn to_millis(t: SystemTime) -> u64 {

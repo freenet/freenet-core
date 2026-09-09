@@ -203,10 +203,7 @@ impl ContractHandler for NetworkContractHandler {
                 std::time::Instant::now(),
             ) {
                 Ok(outcome) => {
-                    if outcome.restored > 0
-                        || outcome.orphaned > 0
-                        || outcome.over_cap > 0
-                    {
+                    if outcome.restored > 0 || outcome.orphaned > 0 || outcome.over_cap > 0 {
                         tracing::info!(
                             restored = outcome.restored,
                             orphaned = outcome.orphaned,

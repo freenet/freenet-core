@@ -2295,10 +2295,9 @@ where
         // admission grants new leases. The loop is making progress on work it
         // holds, which is the same argument the `delegate_resumes` `continue`
         // above rests on.
-        let wakeup_deadline = crate::wasm_runtime::delegate_wakeups::next_due_in(
-            std::time::SystemTime::now(),
-        )
-        .map(|remaining| tokio::time::Instant::now() + remaining);
+        let wakeup_deadline =
+            crate::wasm_runtime::delegate_wakeups::next_due_in(std::time::SystemTime::now())
+                .map(|remaining| tokio::time::Instant::now() + remaining);
         tokio::select! {
             result = contract_handler.channel().recv_from_sender() => {
                 let (id, event, priority) = result?;
