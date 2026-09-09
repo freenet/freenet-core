@@ -4358,8 +4358,8 @@ async fn put_and_await(
 /// node without it is chosen, and a run where no such node exists FAILS LOUDLY
 /// instead of passing quietly — a vacuous pass is the outcome to design
 /// against, because it reports success while checking less.
-async fn a_node_without_the_contract<'a>(
-    ctx: &'a mut TestContext,
+async fn a_node_without_the_contract(
+    ctx: &mut TestContext,
     contract: &ContractContainer,
     state: WrappedState,
     candidates: &[&str],
