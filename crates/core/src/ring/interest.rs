@@ -4049,8 +4049,7 @@ mod tests {
             ContractInstanceId::new([7u8; 32]),
             CodeHash::new([9u8; 32]),
         );
-        let instance_only =
-            ContractKey::from_id_and_code(*full.id(), CodeHash::new([0u8; 32]));
+        let instance_only = ContractKey::from_id_and_code(*full.id(), CodeHash::new([0u8; 32]));
 
         assert!(manager.add_local_client(&full));
         assert!(manager.has_local_interest(&full));
