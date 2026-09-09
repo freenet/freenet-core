@@ -1405,15 +1405,16 @@ mod tests {
     /// inert. That is the same "true answer about the wrong text" shape
     /// `.claude/rules/testing.md` describes, reached from a direction the
     /// window guards do not cover.
+    /// Strip comments from a scraped window before matching.
+    ///
+    /// Delegates to `contract::tests::strip_comments`, the state-machine
+    /// stripper `.claude/rules/bug-prevention-patterns.md` points at, rather
+    /// than the line-oriented `line.find("//")` this used to be. That version
+    /// missed `/* */` entirely, so a pin it guarded could be defeated by
+    /// commenting the call out one syntax over — and a guard that catches only
+    /// the variant you thought of is a search with a blind spot.
     fn code_only(window: &str) -> String {
-        window
-            .lines()
-            .map(|line| match line.find("//") {
-                Some(ix) => &line[..ix],
-                None => line,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        crate::contract::tests::strip_comments(window)
     }
 
     fn delegate_key(seed: u8) -> DelegateKey {
@@ -3196,7 +3197,10 @@ mod tests {
         let arm_end = SOURCE[arm..]
             .find(r#"Err("Contract not found""#)
             .expect("the V1 subscribe arm must still have its not-found branch");
-        let body = &SOURCE[arm..arm + arm_end];
+        // Strip comments: without this the pin is defeated by commenting the
+        // call out, which is exactly what someone does while debugging — the
+        // one moment the pin is the only thing still watching.
+        let body = &code_only(&SOURCE[arm..arm + arm_end]);
         assert!(
             body.contains("delegate_subscriptions::register("),
             "the V1 subscribe arm must still record the notification hook — \
@@ -3222,10 +3226,16 @@ mod tests {
         // Production region only. The test module at the end of that file
         // builds many more `Runtime`s and installs no callbacks, which is
         // fine — they have no ring to register with.
-        let production = SOURCE
-            .split_once("\n#[cfg(test)]")
-            .map(|(head, _)| head)
-            .unwrap_or(SOURCE);
+        // Comment-stripped: a `matches().count()` pin counts a commented-out
+        // call exactly like a live one, so without this the equality below is
+        // satisfied by a constructor whose install is commented out.
+        let production = code_only(
+            SOURCE
+                .split_once("\n#[cfg(test)]")
+                .map(|(head, _)| head)
+                .unwrap_or(SOURCE),
+        );
+        let production = production.as_str();
 
         // Truncation guard, and it is load-bearing rather than belt-and-braces.
         // `split_once` takes the FIRST `#[cfg(test)]` in the file and there are
@@ -3314,7 +3324,10 @@ mod tests {
         let body_end = SOURCE[start..]
             .find("\n    }\n")
             .expect("subscribe_contract_sync must still be a closed fn body");
-        let body = &SOURCE[start..start + body_end];
+        // Comment-stripped for the same reason as the sibling pins: an
+        // ordering assertion over `.find()` offsets is satisfied just as well
+        // by a commented-out call.
+        let body = &code_only(&SOURCE[start..start + body_end]);
 
         let resolve = body
             .find("resolve_contract_key(")
