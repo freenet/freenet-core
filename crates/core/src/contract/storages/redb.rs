@@ -2059,7 +2059,9 @@ impl ReDb {
     /// remove it. The NUMBER is not derivable here and is set generously on
     /// purpose. It is #5467 open question 1 ("how long should a dormant app
     /// keep its user's contracts alive") narrowed to unhosted rows, and it is
-    /// one line to change.
+    /// one line to change. **180 days is a generous placeholder, not a derived
+    /// number, and ratifying it is Ian's call.** Tracked in #5622 with the
+    /// reasoning.
     ///
     /// Why there is no anchor to derive it from: the in-repo precedent for this
     /// shape, `PHANTOM_ABSOLUTE_MAX_AGE`, is a multiple of
@@ -2069,11 +2071,16 @@ impl ReDb {
     /// River re-subscribes per session, so in practice this is "the user has
     /// not opened the app in 180 days".
     ///
-    /// What expiry costs when it is wrong: the user's own node stops pinning
-    /// the user's own contract. It does not delete the contract, and the next
-    /// time the app runs its delegate re-subscribes and re-pins. That is why a
-    /// generous value is the safe direction to be wrong in, and why the
-    /// mechanism is worth having at a value nobody has ratified yet.
+    /// # WHAT A USER LOSES WHEN A ROW EXPIRES, AND WHAT THEY DO NOT
+    ///
+    /// They lose the delegate's notification registration for that contract,
+    /// and the hosting pin that came with it, until the delegate subscribes
+    /// again. That is all. **The contract is not deleted**, its state is not
+    /// touched, it is not removed from the network, and the next time the app
+    /// runs its delegate re-subscribes and is pinned again.
+    ///
+    /// That is why a generous value is the safe direction to be wrong in, and
+    /// why the mechanism is worth having at a value nobody has ratified yet.
     ///
     /// It is a wall-clock mechanism, and the clock error that actually happens
     /// is the safe one: a node whose clock is BEHIND computes an age of zero
@@ -2277,8 +2284,15 @@ impl ReDb {
     /// that cares about the difference (the expiry pass) distinguishes them by
     /// scanning, and no other caller does.
     ///
+    /// Test-only. Production never READS a stamp: the two places that care
+    /// about one both write it, and `expire_stale_delegate_subscriptions_at`
+    /// reads the values inside its own scan. It exists so a test asserts
+    /// against the real decode rather than a reimplementation of it, which
+    /// could agree with itself while disagreeing with the code.
+    ///
     /// # Errors
     /// Returns `Err` if the redb read transaction, table open or lookup fails.
+    #[cfg(test)]
     pub(crate) fn delegate_subscription_affirmed_at(
         &self,
         contract: &ContractInstanceId,
@@ -3631,12 +3645,6 @@ mod tests {
         );
     }
 
-    /// Full store → get → remove → load round trip for the per-user secrets
-    /// index, exercising `store_user_secrets_index`, `get_user_secrets_index`,
-    /// `remove_user_secrets_index` (otherwise uncalled in non-test builds),
-    /// and `load_all_user_secrets_index`. Pins that the composite
-    /// `(DelegateKey, UserId)` key round-trips and that two users under the
-    /// same delegate are independent.
     // ---- delegate-subscription idle expiry (#4669 part 2) -----------------
     //
     // The row that makes this necessary is the KEPT-BUT-UNHOSTED one: boot
@@ -3850,6 +3858,12 @@ mod tests {
         );
     }
 
+    /// Full store → get → remove → load round trip for the per-user secrets
+    /// index, exercising `store_user_secrets_index`, `get_user_secrets_index`,
+    /// `remove_user_secrets_index` (otherwise uncalled in non-test builds),
+    /// and `load_all_user_secrets_index`. Pins that the composite
+    /// `(DelegateKey, UserId)` key round-trips and that two users under the
+    /// same delegate are independent.
     #[tokio::test]
     async fn user_secrets_index_store_get_remove_load_round_trip() {
         let temp_dir = TempDir::new().unwrap();
