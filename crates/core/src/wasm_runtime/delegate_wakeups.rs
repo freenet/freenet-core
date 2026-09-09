@@ -337,6 +337,13 @@ struct Schedule {
     /// Tie-breaker for equal deadlines, and what makes a displaced lease's
     /// stale `order` key unambiguous.
     next_seq: u64,
+    /// How many times a lease has been DEFERRED because its delegate was parked
+    /// when it came due. See [`defer`].
+    ///
+    /// Only ever holds ids that are currently deferred: [`take_due`] moves the
+    /// count out with the lease, so an entry exists only between a deferral and
+    /// the lease's next due time. Bounded by the outstanding-lease caps.
+    deferrals: HashMap<WakeupId, u32>,
     /// The node's loop-occupancy allowance.
     node_budget: DutyBudget,
     /// Per-delegate loop-occupancy allowances.
@@ -359,6 +366,7 @@ impl Schedule {
             index: HashMap::new(),
             per_delegate: HashMap::new(),
             next_seq: 0,
+            deferrals: HashMap::new(),
             node_budget: DutyBudget::new(NODE_DUTY_BURST_MICROS, now),
             delegate_budgets: HashMap::new(),
         }
@@ -530,6 +538,9 @@ pub(crate) fn schedule<S: DelegateWakeupPersistence + ?Sized>(
     // admission bound, not a safety invariant, and one slot of slack under
     // concurrent scheduling is not worth holding a lock across a disk write.
     sched.remove_lease(&id);
+    // A fresh grant resets the deferral count: this is a new lease on the same
+    // tag, not a continuation of the one that kept missing its delegate.
+    sched.deferrals.remove(&id);
     let seq = sched.next_seq;
     sched.next_seq = sched.next_seq.saturating_add(1);
     let deadline = (due, seq);
@@ -561,9 +572,9 @@ pub(crate) fn take_due<S: DelegateWakeupPersistence + ?Sized>(
     db: Option<&S>,
     now: SystemTime,
     max: usize,
-) -> Vec<(DelegateKey, Vec<u8>)> {
+) -> Vec<DueWakeup> {
     let cutoff = to_millis(now);
-    let mut fired = Vec::new();
+    let mut fired: Vec<DueWakeup> = Vec::new();
     {
         let mut sched = schedule_lock();
         while fired.len() < max {
@@ -583,16 +594,115 @@ pub(crate) fn take_due<S: DelegateWakeupPersistence + ?Sized>(
                     sched.per_delegate.remove(&id.0);
                 }
             }
-            fired.push(id);
+            // Move the deferral count OUT with the lease. A lease that is
+            // delivered never puts it back, so the map holds only currently
+            // -deferred ids and needs no separate sweep.
+            let attempts = sched.deferrals.remove(&id).unwrap_or(0);
+            let (delegate, tag) = id;
+            fired.push(DueWakeup {
+                delegate,
+                tag,
+                attempts,
+            });
         }
         sched.gc_budgets();
     }
     if let Some(db) = db {
-        for (delegate, tag) in &fired {
-            db.forget_wakeup(delegate, tag);
+        for due in &fired {
+            db.forget_wakeup(&due.delegate, &due.tag);
         }
     }
     fired
+}
+
+/// A lease whose deadline has passed, handed to the loop to deliver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DueWakeup {
+    pub(crate) delegate: DelegateKey,
+    pub(crate) tag: Vec<u8>,
+    /// How many times this lease has already been deferred because its delegate
+    /// was parked. Pass it back to [`defer`] to keep the bound honest.
+    pub(crate) attempts: u32,
+}
+
+/// How long a lease waits when its delegate was parked at delivery time.
+///
+/// Short, because a park is short: the point is to ride out the park, not to
+/// reschedule the job.
+pub(crate) const WAKEUP_PARK_RETRY: Duration = Duration::from_secs(2);
+
+/// How many times one lease may be deferred before it is dropped.
+///
+/// A park always terminates — `delegate_park::PARK_TTL` force-resumes it — so
+/// in practice this never binds: 64 deferrals at [`WAKEUP_PARK_RETRY`] is over
+/// two minutes against a 90-second TTL. It exists anyway because "bounded by
+/// another module's timeout" is a cross-module assumption that rots silently
+/// the first time that timeout is tuned, and the failure it would produce is a
+/// lease that never stops rescheduling itself.
+pub(crate) const MAX_WAKEUP_DEFERRALS: u32 = 64;
+
+/// Put a lease [`take_due`] just returned back into the schedule, later.
+///
+/// Used when the delegate is PARKED at delivery time (#5544): running it would
+/// clobber the parked continuation's context, and dropping it would lose a job
+/// the delegate was told it had.
+///
+/// **This grants nothing and therefore takes no admission check.** It re-inserts
+/// a lease that was already admitted, at a later deadline; it cannot increase
+/// the number of leases a delegate holds, and it consumes no loop occupancy
+/// because no run happens. Calling it with an id `take_due` did not just return
+/// WOULD be a grant, and must not be done.
+///
+/// Deferring is right here in a way it would not be for a contract
+/// notification: a wakeup carries no payload and nothing about it goes stale,
+/// and the stdlib's guarantee is only ever "not before". Queueing it behind the
+/// park instead would need a third `PendingRun` variant with its own cap and
+/// its own byte accounting, to solve a problem this primitive's own deadline
+/// already solves.
+///
+/// Returns `false` if the lease has been deferred [`MAX_WAKEUP_DEFERRALS`]
+/// times and was dropped instead.
+pub(crate) fn defer<S: DelegateWakeupPersistence + ?Sized>(
+    db: Option<&S>,
+    due: &DueWakeup,
+    now: SystemTime,
+) -> bool {
+    if due.attempts >= MAX_WAKEUP_DEFERRALS {
+        tracing::info!(
+            delegate = %due.delegate.encode(),
+            attempts = due.attempts,
+            "Dropped a delegate wakeup: its delegate has been parked for every \
+             delivery attempt (#3972)"
+        );
+        return false;
+    }
+    let retry_at = to_millis(now).saturating_add(WAKEUP_PARK_RETRY.as_millis() as u64);
+
+    // Durable half first, as in `schedule`. A failure here is NOT a refusal —
+    // the lease is already granted and there is no caller to tell — so the
+    // in-memory re-insert proceeds and the loss is bounded to a restart.
+    if let Some(db) = db
+        && let Err(error) = db.persist_wakeup(&due.delegate, &due.tag, retry_at)
+    {
+        tracing::warn!(
+            delegate = %due.delegate.encode(),
+            %error,
+            "Could not re-persist a deferred delegate wakeup; it will still fire \
+             unless the node restarts first (#3972)"
+        );
+    }
+
+    let id: WakeupId = (due.delegate.clone(), due.tag.clone());
+    let mut sched = schedule_lock();
+    let seq = sched.next_seq;
+    sched.next_seq = sched.next_seq.saturating_add(1);
+    let deadline = (retry_at, seq);
+    sched.remove_lease(&id);
+    sched.order.insert(deadline, id.clone());
+    sched.index.insert(id.clone(), deadline);
+    *sched.per_delegate.entry(due.delegate.clone()).or_insert(0) += 1;
+    sched.deferrals.insert(id, due.attempts.saturating_add(1));
+    true
 }
 
 /// How long until the next lease is due, or `None` if none are.
@@ -646,6 +756,7 @@ pub(crate) fn forget_delegate<S: DelegateWakeupPersistence + ?Sized>(
             .collect();
         for id in ids {
             sched.remove_lease(&id);
+            sched.deferrals.remove(&id);
         }
         sched.delegate_budgets.remove(delegate);
     }

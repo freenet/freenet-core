@@ -182,6 +182,55 @@ impl ContractHandler for NetworkContractHandler {
         // bug. See .claude/rules/hosting-invariants.md (invariant 1).
         op_manager.rehydrate_local_hosting_interest();
 
+        // Re-arm the delegate wakeup schedule (freenet-core#3972).
+        //
+        // Unlike every other piece of per-delegate state, a wakeup CANNOT
+        // re-arm itself: the thing that would invoke the delegate to reschedule
+        // is the wakeup this restart just dropped. So a schedule not restored
+        // here is not "restored late", it is gone — and the practical recovery
+        // is "the user opens the app", which is exactly the case a scheduled
+        // wakeup exists to cover.
+        //
+        // Reconciles as it goes: a row whose delegate is no longer registered
+        // is deleted rather than restored. Without that, an uninstalled
+        // delegate's leases would be replayed on every subsequent boot forever.
+        {
+            let store = executor.state_store().inner().clone();
+            match crate::wasm_runtime::delegate_wakeups::restore(
+                &store,
+                |key| executor.has_delegate(key),
+                std::time::SystemTime::now(),
+                std::time::Instant::now(),
+            ) {
+                Ok(outcome) => {
+                    if outcome.restored > 0
+                        || outcome.orphaned > 0
+                        || outcome.over_cap > 0
+                    {
+                        tracing::info!(
+                            restored = outcome.restored,
+                            orphaned = outcome.orphaned,
+                            over_cap = outcome.over_cap,
+                            overdue = outcome.overdue,
+                            "Restored the delegate wakeup schedule (#3972)"
+                        );
+                    }
+                }
+                // NOT treated as "no wakeups". A read failure that silently
+                // emptied the schedule would look identical to a clean boot and
+                // would lose every delegate's timer, so it is reported and the
+                // durable rows are left alone for the next boot to try again.
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "Could not read the delegate wakeup schedule; pending \
+                         wakeups will not fire until a boot that can read it \
+                         (#3972)"
+                    );
+                }
+            }
+        }
+
         Ok(Self { executor, channel })
     }
 

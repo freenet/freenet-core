@@ -1088,6 +1088,18 @@ impl Runtime {
         self.engine.is_healthy()
     }
 
+    /// Whether this node still has `key` registered.
+    ///
+    /// A narrow accessor rather than widening `delegate_store`'s visibility:
+    /// the one caller outside this module is boot reconciliation of the wakeup
+    /// schedule (freenet-core#3972), which must drop a durable lease whose
+    /// delegate is gone. Resolved through this node's own delegate index, for
+    /// the same reason `prepare_delegate_call` does — `key.code_hash()` is
+    /// unverified serde data.
+    pub(crate) fn has_delegate(&self, key: &DelegateKey) -> bool {
+        self.delegate_store.code_hash_from_key(key).is_some()
+    }
+
     /// Get a clone of the backend engine for sharing with other runtimes.
     pub(crate) fn clone_backend_engine(&self) -> BackendEngine {
         self.engine.clone_backend_engine()

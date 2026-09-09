@@ -289,6 +289,20 @@ impl Executor<Runtime> {
                     !subscribers.is_empty()
                 });
 
+                // Release every wakeup lease this delegate holds, in BOTH the
+                // in-memory schedule and the durable table (freenet-core#3972).
+                //
+                // Skipping the durable half here is the specific failure the
+                // `delegate_wakeups` module is shaped to prevent: the row would
+                // be restored on every subsequent boot and fire forever into a
+                // delegate that no longer exists — silent, because the
+                // in-memory half would look correct. Boot reconciliation drops
+                // such orphans as a backstop, but a backstop is not the fix.
+                crate::wasm_runtime::delegate_wakeups::forget_delegate(
+                    Some(self.state_store.inner()),
+                    &key,
+                );
+
                 // Clean up delegate creation tracking to prevent unbounded growth
                 self.runtime.inherited_origins.remove(&key);
 
