@@ -489,7 +489,7 @@ grep -rn 'include_str!("' crates/core/src/bin/ | grep -v assets
 
 ## Finishing the sentence and stopping there
 
-The author knows the rule. They have just written it down, in this file, in
+The author knows the rule. They have just written it down, in a comment, in
 this edit. Then a few hundred lines away, or twenty lines below, or in the
 function immediately adjacent, the same edit does the thing the sentence
 forbids.
