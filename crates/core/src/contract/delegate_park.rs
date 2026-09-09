@@ -2522,10 +2522,7 @@ mod tests {
         let resume = rx.recv().await.expect("resume");
         assert_eq!(
             resume.unresolved_contract_ops,
-            vec![(
-                ContractInstanceId::new([9; 32]),
-                ContractOpKind::Subscribe
-            )],
+            vec![(ContractInstanceId::new([9; 32]), ContractOpKind::Subscribe)],
             "the SUBSCRIBE must still be owed after only the GET completed"
         );
     }

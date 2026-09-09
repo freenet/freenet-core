@@ -775,10 +775,14 @@ fn contract_op_response_msg(
 /// insert — done HERE and only on success, so the registry never claims a
 /// delivery path that was not established, and so the registry has exactly one
 /// writer on this path.
-fn apply_resolved_contract_op(
+fn apply_resolved_contract_op<CH>(
+    contract_handler: &mut CH,
     resolved: delegate_park::ResolvedContractOp,
     delegate_key: &DelegateKey,
-) -> InboundDelegateMsg<'static> {
+) -> InboundDelegateMsg<'static>
+where
+    CH: ContractHandler + Send + 'static,
+{
     let delegate_park::ResolvedContractOp { pending, outcome } = resolved;
     if matches!(
         (pending.kind, &outcome),
@@ -791,6 +795,62 @@ fn apply_resolved_contract_op(
             .entry(pending.contract_id)
             .or_default()
             .insert(delegate_key.clone());
+        // RECORD THE OBLIGATION THIS SUBSCRIBE JUST INCURRED (#5542).
+        //
+        // `run_executor_subscribe` ended in
+        // `InterestManager::add_local_client`, a per-contract REFCOUNT that
+        // takes no client id. Nothing on any delegate path could give it back:
+        // the only decrement outside `ring/interest.rs` is keyed by `ClientId`
+        // and driven by a WebSocket disconnect, which a delegate never reaches.
+        // The permanent interest is not itself wrong — a delegate subscription
+        // is permanent — but three ordinary paths DROP a delegate subscription
+        // (`UnregisterDelegate`, contract removal, notification-channel-closed
+        // cleanup), and without this record they would leave the refcount
+        // standing forever, so `cleanup_contract_if_no_interest` never fires and
+        // the node holds demand nothing can retire.
+        //
+        // Recorded HERE and nowhere else, because this is the only site that
+        // takes a refcount: a subscribe answered from the local store takes
+        // none, and neither does the V2 `subscribe_contract_sync` host
+        // function. Driving release from the record rather than from the
+        // subscription set is what makes over-release impossible — a decrement
+        // for a pair that never incremented would fall on interest a real
+        // client holds, which is strictly worse than the leak.
+        //
+        // The key is resolvable now precisely because the subscribe succeeded:
+        // `run_executor_subscribe` bootstrapped the body, so the contract is
+        // local. If it somehow is not, we cannot name the interest to release
+        // and must not guess.
+        match (
+            contract_handler.executor().lookup_key(&pending.contract_id),
+            contract_handler.executor().op_manager_handle(),
+        ) {
+            (Some(full_key), Some(op_manager)) => {
+                // WEAK, so an outstanding hold never keeps a shut-down node's
+                // `OpManager` alive. A hold that cannot upgrade has nothing
+                // left to release.
+                let weak = std::sync::Arc::downgrade(&op_manager);
+                crate::wasm_runtime::delegate_interest::record(
+                    pending.contract_id,
+                    delegate_key.clone(),
+                    full_key,
+                    std::sync::Arc::new(move |key: &ContractKey| {
+                        if let Some(op_manager) = weak.upgrade() {
+                            op_manager.interest_manager.remove_local_client(key);
+                        }
+                    }),
+                );
+            }
+            _ => {
+                tracing::warn!(
+                    contract = %pending.contract_id,
+                    delegate_key = %delegate_key,
+                    "Delegate subscribe succeeded but its local-interest hold could \
+                     not be recorded; that interest will not be released when the \
+                     subscription is dropped (#5542)"
+                );
+            }
+        }
         tracing::debug!(
             contract = %pending.contract_id,
             delegate_key = %delegate_key,
@@ -823,25 +883,36 @@ fn apply_resolved_contract_op(
 /// background until `OPERATION_TTL` and leaks nothing; the same is already true
 /// of `Executor::local_state_or_from_network`.
 ///
-/// RESIDUAL, on the SUBSCRIBE branch only, stated because it is invisible from
-/// either side of the call. `run_executor_subscribe` reaches
-/// `finalize_originator_subscribe`, whose last side effects are
-/// `interest_manager.add_local_client` (a REFCOUNT — see the caller's
-/// `already_subscribed` gate) and then `broadcast_change_interests`. Cancelling
-/// the future between those two takes the refcount and returns no `Ok`, so this
-/// reports `Failed`, the caller installs no `DELEGATE_SUBSCRIPTIONS` hook, and a
-/// later retry passes `already_subscribed` and takes a SECOND refcount for one
-/// logical subscriber.
+/// RESIDUAL, on the SUBSCRIBE branch, and it is NARROWER than it first looks —
+/// but only because the broader case is now actually fixed, so read both halves
+/// before concluding anything from this note.
 ///
-/// Not compensated for here, deliberately. The only compensation available is
-/// `remove_local_client`, and this side of the call cannot tell whether
-/// `add_local_client` ran — so a decrement issued on the wrong branch would
-/// release an interest some OTHER subscriber holds, which is worse than the
-/// leak. Closing it properly means making the registration idempotent or
-/// transactional inside `subscribe`, which is a change to that operation rather
-/// than to this caller. The window is the tail of a 75 s budget and each
-/// occurrence costs one unreleased interest entry, so it is recorded rather
-/// than papered over.
+/// `run_executor_subscribe` reaches `finalize_originator_subscribe`, whose last
+/// side effects are `interest_manager.add_local_client` (a per-contract
+/// REFCOUNT, taking no client id, explicitly non-idempotent) and then
+/// `broadcast_change_interests`.
+///
+/// The BROAD case — that nothing on any delegate path could ever decrement what
+/// this takes, so the three ordinary paths that drop a delegate subscription
+/// left the interest standing forever — is closed by
+/// `wasm_runtime::delegate_interest`, which records the obligation at the point
+/// the caller installs the subscription hook and discharges it at all three
+/// removal sites. An earlier version of this note reasoned only about the
+/// cancellation window below and ASSUMED the success path was balanced. It was
+/// not; the balancing decrement is the client-disconnect sweep, and a delegate
+/// never reaches it.
+///
+/// What remains: cancelling the future BETWEEN `add_local_client` and its
+/// return takes the refcount while this reports `Failed`, so the caller
+/// installs no hook and records no obligation, and a later retry takes a second
+/// refcount for one logical subscriber. Still not compensated for, and for an
+/// unchanged reason: this side of the call cannot tell whether
+/// `add_local_client` ran, so a decrement on the wrong branch would release
+/// interest some OTHER subscriber holds — strictly worse than the leak.
+/// Closing it means making the registration transactional inside `subscribe`,
+/// which is a change to that operation rather than to this caller. The window
+/// is the tail of a 75 s budget and each occurrence costs one unreleased
+/// interest entry.
 async fn run_contract_op_off_loop(
     op_manager: std::sync::Arc<crate::node::OpManager>,
     pending: &delegate_park::PendingContractOp,
@@ -1652,13 +1723,11 @@ where
                         // comparable: it carries its own code, so a delegate can
                         // only PUT contracts it can build.
                         let healing = can_reach_network
-                            && contract_handler
-                                .executor()
-                                .op_manager_handle()
-                                .is_some_and(|op_manager| {
-                                    op_manager
-                                        .try_self_heal_fetch_for_local_originator(contract_id)
-                                });
+                            && contract_handler.executor().op_manager_handle().is_some_and(
+                                |op_manager| {
+                                    op_manager.try_self_heal_fetch_for_local_originator(contract_id)
+                                },
+                            );
                         tracing::debug!(
                             contract = %contract_id,
                             healing,
@@ -1778,8 +1847,7 @@ where
                     Ok(())
                 } else if parking.is_some()
                     && can_reach_network
-                    && pending_contract_ops.len()
-                        < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
+                    && pending_contract_ops.len() < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
                     && !pending_contract_ops.iter().any(|op| {
                         op.contract_id == contract_id
                             && op.kind == delegate_park::ContractOpKind::Subscribe
@@ -2261,12 +2329,9 @@ where
                                         };
                                         let outcome =
                                             run_contract_op_off_loop(op_manager, &pending).await;
-                                        sink.lock()
-                                            .unwrap()
-                                            .push(delegate_park::ResolvedContractOp {
-                                                pending,
-                                                outcome,
-                                            });
+                                        sink.lock().unwrap().push(
+                                            delegate_park::ResolvedContractOp { pending, outcome },
+                                        );
                                     }
                                 }))
                                 .await;
@@ -2351,8 +2416,7 @@ where
                     pending.contract_id,
                     pending.context,
                     delegate_park::ContractOpOutcome::Failed(
-                        "no delegate park available for a network contract operation"
-                            .to_string(),
+                        "no delegate park available for a network contract operation".to_string(),
                     ),
                 );
                 inbound_responses.push(msg);
@@ -4047,7 +4111,11 @@ where
     // only on success, so the registry never advertises a delivery path that was
     // never established.
     for resolved in contract_ops {
-        all_inbound.push(apply_resolved_contract_op(resolved, &delegate_key));
+        all_inbound.push(apply_resolved_contract_op(
+            contract_handler,
+            resolved,
+            &delegate_key,
+        ));
     }
     // Network operations the off-loop task never resolved (panic, cancellation,
     // budget). Same reasoning as the unresolved upserts above: the delegate is
@@ -8054,10 +8122,9 @@ mod hol_4391_tests {
             ContractOpOutcome::Failed("boom".to_string()),
         );
         match get_failed {
-            InboundDelegateMsg::GetContractResponse(r) => assert!(
-                r.state.is_none(),
-                "a failed GET must not fabricate a state"
-            ),
+            InboundDelegateMsg::GetContractResponse(r) => {
+                assert!(r.state.is_none(), "a failed GET must not fabricate a state")
+            }
             other => panic!("a failed GET must still answer the delegate, got {other:?}"),
         }
 
@@ -8102,12 +8169,15 @@ mod hol_4391_tests {
     /// installed for a subscription that never got established gives a delegate
     /// that believes it is subscribed and then never hears anything — the
     /// silent-on-both-sides failure, one layer up.
-    #[test]
-    fn the_notification_hook_is_installed_only_on_a_successful_subscribe() {
+    #[tokio::test]
+    async fn the_notification_hook_is_installed_only_on_a_successful_subscribe() {
         use delegate_park::{
             ContractOpKind, ContractOpOutcome, PendingContractOp, ResolvedContractOp,
         };
-        let dkey = DelegateKey::new([21u8; 32], freenet_stdlib::prelude::CodeHash::new([21u8; 32]));
+        let dkey = DelegateKey::new(
+            [21u8; 32],
+            freenet_stdlib::prelude::CodeHash::new([21u8; 32]),
+        );
         let ok_id = ContractInstanceId::new([22u8; 32]);
         let bad_id = ContractInstanceId::new([23u8; 32]);
         // Global registry: use ids unique to this test so it does not race the
@@ -8115,7 +8185,9 @@ mod hol_4391_tests {
         crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&ok_id);
         crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&bad_id);
 
+        let (mut handler, _send) = build_handler(vec![]).await;
         let _ = apply_resolved_contract_op(
+            &mut handler,
             ResolvedContractOp {
                 pending: PendingContractOp {
                     contract_id: ok_id,
@@ -8127,6 +8199,7 @@ mod hol_4391_tests {
             &dkey,
         );
         let _ = apply_resolved_contract_op(
+            &mut handler,
             ResolvedContractOp {
                 pending: PendingContractOp {
                     contract_id: bad_id,

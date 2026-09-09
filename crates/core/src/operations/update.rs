@@ -3440,7 +3440,9 @@ mod tests {
             "the first attempt must start a fetch and say so"
         );
         assert!(
-            op_manager.pending_contract_fetches.contains_key(&instance_id),
+            op_manager
+                .pending_contract_fetches
+                .contains_key(&instance_id),
             "the attempt must be recorded in the SHARED cooldown map, or a client \
              asking for the same contract fetches it a second time"
         );

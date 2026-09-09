@@ -4421,9 +4421,11 @@ async fn test_delegate_get_reaches_the_network_for_an_unseen_contract(
     let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
     let delegate_key = delegate.key().clone();
 
-    let state = WrappedState::from(test_utils::create_todo_list_with_item("Published by node-a"));
-    let mut client = a_node_without_the_contract(ctx, &contract, state, &["node-b", "node-c", "node-d"])
-        .await?;
+    let state = WrappedState::from(test_utils::create_todo_list_with_item(
+        "Published by node-a",
+    ));
+    let mut client =
+        a_node_without_the_contract(ctx, &contract, state, &["node-b", "node-c", "node-d"]).await?;
 
     register_delegate(&mut client, &delegate, &delegate_key).await?;
 
@@ -4498,9 +4500,11 @@ async fn test_delegate_subscribe_reaches_the_network_for_an_unseen_contract(
     let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
     let delegate_key = delegate.key().clone();
 
-    let state = WrappedState::from(test_utils::create_todo_list_with_item("Published by node-a"));
-    let mut client = a_node_without_the_contract(ctx, &contract, state, &["node-b", "node-c", "node-d"])
-        .await?;
+    let state = WrappedState::from(test_utils::create_todo_list_with_item(
+        "Published by node-a",
+    ));
+    let mut client =
+        a_node_without_the_contract(ctx, &contract, state, &["node-b", "node-c", "node-d"]).await?;
 
     register_delegate(&mut client, &delegate, &delegate_key).await?;
 
