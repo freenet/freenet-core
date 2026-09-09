@@ -226,6 +226,28 @@ pub(crate) enum WakeupRefusal {
     Storage,
 }
 
+impl WakeupRefusal {
+    /// The negative host code this refusal is reported to the delegate as.
+    ///
+    /// A total match with no wildcard arm, so adding a refusal without giving
+    /// it a code is a compile error rather than a silent collapse onto an
+    /// existing one — which is the specific way `subscribe_contract`'s `bool`
+    /// went wrong (#5565).
+    pub(crate) fn code(self) -> i64 {
+        use crate::wasm_runtime::delegate_api::wakeup_error_codes as codes;
+        match self {
+            Self::TagTooLong => codes::ERR_WAKEUP_TAG_TOO_LONG,
+            Self::DelayTooShort => codes::ERR_WAKEUP_DELAY_TOO_SHORT,
+            Self::DelayTooLong => codes::ERR_WAKEUP_DELAY_TOO_LONG,
+            Self::DelegateFull => codes::ERR_WAKEUP_DELEGATE_FULL,
+            Self::NodeFull => codes::ERR_WAKEUP_NODE_FULL,
+            Self::DelegateBudget => codes::ERR_WAKEUP_DELEGATE_BUDGET,
+            Self::NodeBudget => codes::ERR_WAKEUP_NODE_BUDGET,
+            Self::Storage => codes::ERR_WAKEUP_STORAGE,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The schedule.
 // ---------------------------------------------------------------------------

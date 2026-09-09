@@ -235,6 +235,20 @@ impl Pool {
     }
 }
 
+/// The sqlite backend keeps NO durable wakeup rows (freenet-core#3972).
+///
+/// Every method defaults to a no-op, so a wakeup scheduled on a sqlite node
+/// lives in the in-memory schedule alone: it survives the process and not a
+/// restart. That is the documented degradation, not an oversight — ten of
+/// redb's twelve tables have no sqlite counterpart, redb is the default feature
+/// and what ships, and the alternative (refusing `schedule_wakeup` outright
+/// here) would make the primitive unavailable under `--features sqlite` rather
+/// than merely less durable.
+///
+/// A delegate cannot be told which of the two it is on: the guest wrapper maps
+/// every non-negative code to `Ok(())`. See `wakeup_error_codes`.
+impl crate::wasm_runtime::delegate_wakeups::DelegateWakeupPersistence for Pool {}
+
 impl StateStorage for Pool {
     type Error = SqlDbError;
 

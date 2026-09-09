@@ -265,6 +265,24 @@ pub(crate) const DELEGATE_ORIGINS_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(crate) const RESERVED_MARKER_HASHES_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("delegate_reserved_marker_hashes");
 
+/// Pending delegate wakeup leases (freenet-core#3972).
+///
+/// Key: `delegate_key64(64) || tag` (65..=192 bytes). Value: the deadline as
+/// 8 big-endian bytes of milliseconds since the Unix epoch.
+///
+/// Delegate-major on purpose: `UnregisterDelegate` and boot reconciliation both
+/// need "every lease this delegate holds", and that is a prefix range scan
+/// rather than a full table scan. Big-endian on purpose too, though it buys
+/// nothing here — the ordering that matters (by deadline) lives in the
+/// in-memory index, because the durable half is read exactly once, at boot.
+///
+/// A wakeup is the only delegate state a restart MUST NOT lose: a week-long
+/// delay is worthless if a restart discards it, and unlike a subscription a
+/// delegate cannot re-arm one, because the thing that would invoke it to do so
+/// is the wakeup that was just dropped.
+pub(crate) const DELEGATE_WAKEUPS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_wakeups");
+
 /// Metadata about a hosted contract, persisted to survive restarts.
 #[derive(Debug, Clone, Copy)]
 pub struct HostingMetadata {
@@ -1963,6 +1981,31 @@ impl ReDb {
         })
     }
 
+    // ========== Delegate wakeup leases (#3972) ==========
+
+    /// Inclusive `[lo, hi]` bounds covering every wakeup row for `delegate`.
+    ///
+    /// `hi` is the 64-byte prefix followed by `MAX_WAKEUP_TAG_BYTES` `0xff`
+    /// bytes, which is above every tag the host will accept and still below any
+    /// other delegate's prefix — every `delegate_key64` is exactly 64 bytes, so
+    /// two different delegates differ within the first 64 and no row of one can
+    /// sort inside the other's range.
+    fn wakeup_range(delegate: &DelegateKey) -> (Vec<u8>, Vec<u8>) {
+        let prefix = Self::delegate_key64(delegate);
+        let lo = prefix.to_vec();
+        let mut hi = prefix.to_vec();
+        hi.extend_from_slice(
+            &[0xffu8; crate::wasm_runtime::delegate_wakeups::MAX_WAKEUP_TAG_BYTES],
+        );
+        (lo, hi)
+    }
+
+    fn wakeup_row_key(delegate: &DelegateKey, tag: &[u8]) -> Vec<u8> {
+        let mut k = Self::delegate_key64(delegate).to_vec();
+        k.extend_from_slice(tag);
+        k
+    }
+
     // ==================== Broken Invariants Methods ====================
     // Per-contract record of detected CRDT-invariant violations. See
     // `ring::broken_invariants` for the in-memory tracker.
@@ -2034,6 +2077,154 @@ impl ReDb {
             }
             Ok(result)
         })
+    }
+}
+
+/// The durable half of the wakeup schedule (freenet-core#3972).
+///
+/// Every method here is reached ONLY through
+/// `crate::wasm_runtime::delegate_wakeups`, which owns the in-memory half and
+/// writes both together. Calling these directly would create exactly the
+/// disagreement that module exists to prevent.
+impl crate::wasm_runtime::delegate_wakeups::DelegateWakeupPersistence for ReDb {
+    fn persist_wakeup(
+        &self,
+        delegate: &DelegateKey,
+        tag: &[u8],
+        due_millis: u64,
+    ) -> Result<(), String> {
+        let key = Self::wakeup_row_key(delegate, tag);
+        let txn = self.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut tbl = txn
+                .open_table(DELEGATE_WAKEUPS_TABLE)
+                .map_err(|e| e.to_string())?;
+            // Insert, not insert-if-absent: re-arming a tag REPLACES its lease,
+            // and the durable row must move with it or a restart would restore
+            // the old deadline.
+            tbl.insert(key.as_slice(), due_millis.to_be_bytes().as_slice())
+                .map_err(|e| e.to_string())?;
+        }
+        Self::commit_guarded(txn).map_err(|e| e.to_string())
+    }
+
+    fn forget_wakeup(&self, delegate: &DelegateKey, tag: &[u8]) {
+        let key = Self::wakeup_row_key(delegate, tag);
+        let result = (|| -> Result<(), redb::Error> {
+            let txn = self.begin_write()?;
+            {
+                let mut tbl = txn.open_table(DELEGATE_WAKEUPS_TABLE)?;
+                tbl.remove(key.as_slice())?;
+            }
+            Self::commit_guarded(txn)
+        })();
+        if let Err(error) = result {
+            // Logged at `warn!` rather than swallowed: a row that outlives its
+            // lease is restored on the next boot and fires into a delegate that
+            // was not expecting it. That is bounded (the caps still apply and
+            // the delegate simply gets one spurious wakeup), so it is not worth
+            // failing the fire over — but it must leave evidence.
+            tracing::warn!(
+                delegate = %delegate.encode(),
+                %error,
+                "Could not remove a delegate wakeup row; it may fire once more after a restart (#3972)"
+            );
+        }
+    }
+
+    fn forget_wakeups_for_delegate(&self, delegate: &DelegateKey) {
+        let (lo, hi) = Self::wakeup_range(delegate);
+        let result = (|| -> Result<usize, redb::Error> {
+            let txn = self.begin_write()?;
+            let mut removed = 0usize;
+            {
+                let mut tbl = txn.open_table(DELEGATE_WAKEUPS_TABLE)?;
+                // Collect then remove: redb's `range` borrows the table, so the
+                // removals cannot run inside the iteration. Bounded by
+                // MAX_WAKEUPS_PER_DELEGATE in the steady state, and by the
+                // whole table in the pathological one (a delegate whose rows
+                // outlived a cap change), which is still under
+                // MAX_WAKEUPS_PER_NODE.
+                let keys: Vec<Vec<u8>> = tbl
+                    .range(lo.as_slice()..=hi.as_slice())?
+                    .filter_map(|entry| entry.ok().map(|(k, _)| k.value().to_vec()))
+                    .collect();
+                for key in keys {
+                    tbl.remove(key.as_slice())?;
+                    removed += 1;
+                }
+            }
+            Self::commit_guarded(txn)?;
+            Ok(removed)
+        })();
+        match result {
+            Ok(removed) if removed > 0 => {
+                tracing::debug!(
+                    delegate = %delegate.encode(),
+                    removed,
+                    "Removed a delegate's wakeup rows (#3972)"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    delegate = %delegate.encode(),
+                    %error,
+                    "Could not remove a delegate's wakeup rows; they may be restored \
+                     on the next boot and are dropped there as orphans (#3972)"
+                );
+            }
+        }
+    }
+
+    fn load_wakeups(&self) -> Result<Vec<(DelegateKey, Vec<u8>, u64)>, String> {
+        self.read_guarded(|txn| {
+            let tbl = match txn.open_table(DELEGATE_WAKEUPS_TABLE) {
+                Ok(tbl) => tbl,
+                // A node that has never scheduled a wakeup has no table. That
+                // is "no wakeups", not a read failure — the distinction matters
+                // because the caller must NOT treat a genuine read failure as
+                // an empty schedule.
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(e) => return Err(e.into()),
+            };
+            let mut out = Vec::new();
+            for entry in tbl.iter()? {
+                let (k, v) = entry?;
+                let key_bytes = k.value();
+                let value_bytes = v.value();
+                // Decode fallibly, skipping malformed rows rather than
+                // panicking a boot: a corrupt row must cost one wakeup, not the
+                // node's ability to start.
+                let (Some(key_part), Some(hash_part), Some(due_part)) = (
+                    key_bytes.get(..32),
+                    key_bytes.get(32..64),
+                    value_bytes.get(..8),
+                ) else {
+                    tracing::warn!(
+                        len = key_bytes.len(),
+                        "Skipping a malformed delegate wakeup row (#3972)"
+                    );
+                    continue;
+                };
+                let (Ok(key), Ok(hash), Ok(due)) = (
+                    <[u8; 32]>::try_from(key_part),
+                    <[u8; 32]>::try_from(hash_part),
+                    <[u8; 8]>::try_from(due_part),
+                ) else {
+                    tracing::warn!("Skipping a malformed delegate wakeup row (#3972)");
+                    continue;
+                };
+                let tag = key_bytes.get(64..).unwrap_or(&[]).to_vec();
+                out.push((
+                    DelegateKey::new(key, CodeHash::new(hash)),
+                    tag,
+                    u64::from_be_bytes(due),
+                ));
+            }
+            Ok(out)
+        })
+        .map_err(|e| e.to_string())
     }
 }
 

@@ -2130,6 +2130,42 @@ impl WasmtimeEngine {
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
+        // Scheduled wakeups (freenet-core#3972). SYNCHRONOUS (`func_wrap`, not
+        // `func_wrap_async`): the whole call is a bounds-checked copy of at
+        // most 128 bytes out of guest memory plus a `Mutex`-guarded map update,
+        // with the durable write behind it. There is no `.await` to add and no
+        // reason to pay for a boxed future on a call a delegate may make on
+        // every run.
+        //
+        // Registering it here is also what makes the primitive DETECTABLE. Core
+        // does not trap unknown imports, so before this line a delegate calling
+        // `__frnt__delegate__schedule_wakeup` failed at instantiation with the
+        // symbol named — loudly, once. That failure mode is precisely why the
+        // guest half is a host function rather than an `OutboundDelegateMsg`
+        // variant: an unknown outbound variant fails the WHOLE bincode batch
+        // and would take the unrelated `ApplicationMessage` beside it with it,
+        // so a user's action would silently do nothing. See
+        // `missing_import_fails_at_instantiation_naming_the_symbol`, which pins
+        // the property that argument rests on.
+        linker
+            .func_wrap(
+                "freenet_delegate_management",
+                "__frnt__delegate__schedule_wakeup",
+                |mut caller: Caller<'_, HostState>,
+                 after_millis: i64,
+                 tag_ptr: i64,
+                 tag_len: i32| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::delegate_management::schedule_wakeup_impl(
+                        after_millis,
+                        tag_ptr,
+                        tag_len,
+                    )
+                },
+            )
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
+
         // Contract I/O namespace: streaming refill buffer
         linker
             .func_wrap(
