@@ -288,6 +288,14 @@ impl Executor<Runtime> {
                     subscribers.remove(&key);
                     !subscribers.is_empty()
                 });
+                // ...and give back the local interest those subscriptions took
+                // (#5542). Dropping the subscription without this leaves
+                // `local_interests` permanently above zero for the contract, so
+                // `cleanup_contract_if_no_interest` never fires and the node
+                // holds demand nothing can retire. A pair that took no refcount
+                // — a subscribe answered from the local store, or the V2 host
+                // function — has no hold recorded, so this is a no-op for it.
+                crate::wasm_runtime::delegate_interest::release_delegate(&key);
 
                 // Clean up delegate creation tracking to prevent unbounded growth
                 self.runtime.inherited_origins.remove(&key);

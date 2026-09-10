@@ -2433,8 +2433,10 @@ where
                         "Delegate notification channel closed — removing stale subscriptions"
                     );
                     // Receiver is gone; clean up all subscriptions for this contract
-                    // to prevent repeated failed sends on future state updates.
+                    // to prevent repeated failed sends on future state updates,
+                    // and release the interest they took (#5542).
                     crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&instance_id);
+                    crate::wasm_runtime::delegate_interest::release_contract(&instance_id);
                     return;
                 }
             }

@@ -522,8 +522,12 @@ impl ContractStore {
             .map_err(|e| anyhow::anyhow!("Failed to remove contract index: {e}"))?;
         self.key_to_code_part.remove(key.id());
 
-        // Clean up any delegate subscriptions for this contract instance.
+        // Clean up any delegate subscriptions for this contract instance, and
+        // release the local interest they took (#5542). The release is
+        // self-discharging — each hold carries its own node's closure — so this
+        // module keeps no `crate::ring` dependency.
         super::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+        super::delegate_interest::release_contract(key.id());
 
         // The WASM blob on disk is keyed by code hash and shared by every
         // contract instance with the same code (e.g. all River rooms share

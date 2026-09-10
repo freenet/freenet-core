@@ -301,6 +301,124 @@ impl OpManager {
         let _tx = super::get::op_ctx_task::start_targeted_sub_op_get(self, instance_id, sender_pkl);
     }
 
+    /// Self-heal a contract a LOCAL ORIGINATOR asked to update but this node
+    /// does not hold, when there is no sender to fetch it from (#5542).
+    ///
+    /// This is [`try_auto_fetch_contract`](Self::try_auto_fetch_contract)'s
+    /// sibling for the delegate path, and it exists because that function
+    /// cannot serve it — for two independent reasons, both structural:
+    ///
+    /// * it needs a `sender_addr` to resolve a first-hop `PeerKeyLocation`, and
+    ///   a delegate UPDATE has no sender. The delegate IS the originator, on
+    ///   this node. Passing an address that resolves to nothing makes that
+    ///   function log "cannot auto-fetch", release its cooldown slot and return
+    ///   — a silent no-op, which is the worst of the three outcomes.
+    /// * it takes a `&ContractKey`, and for the case that matters here — a
+    ///   contract this node has never seen — a delegate holds only a
+    ///   `ContractInstanceId` and cannot construct one.
+    ///
+    /// So the fetch is an untargeted [`start_sub_op_get`], which routes on the
+    /// instance id alone, rather than a targeted one. Everything else is
+    /// deliberately identical to the originator path, including SHARING
+    /// `pending_contract_fetches` — one cooldown covers both, so a delegate and
+    /// a client asking for the same contract do not fetch it twice.
+    ///
+    /// Returns whether a fetch was started, so the caller can tell the delegate
+    /// honestly whether a retry has anything to wait for. `false` for a node
+    /// with no connections and for a contract still inside the shared cooldown;
+    /// neither takes or holds a cooldown slot it cannot use.
+    ///
+    /// Fire-and-forget: the caller does NOT await it. The point is the side
+    /// effect — the contract cached locally — so the delegate's next attempt
+    /// succeeds, matching the client contract of "fail now, self-heal in the
+    /// background, the retry succeeds".
+    pub(crate) fn try_self_heal_fetch_for_local_originator(
+        &self,
+        instance_id: freenet_stdlib::prelude::ContractInstanceId,
+    ) -> bool {
+        use crate::config::GlobalSimulationTime;
+        use dashmap::mapref::entry::Entry;
+
+        // EGRESS BAN GATE (#5542 finding B2). `try_auto_fetch_contract`'s
+        // client-originated sibling is reached only from paths that already
+        // passed `reject_if_contract_banned` at `start_client_update`; this one
+        // is reached from a delegate, which never crosses a client entry point.
+        // Without this check a delegate could make this node originate network
+        // traffic for a contract it has banned, defeating the egress half of the
+        // invariant documented at `operations.rs`.
+        if crate::operations::reject_if_contract_banned(self, &instance_id).is_err() {
+            tracing::debug!(
+                contract = %instance_id,
+                phase = "egress_banned_reject",
+                "Not starting a delegate-originated self-heal fetch: contract is banned"
+            );
+            return false;
+        }
+
+        // A fetch that cannot possibly route must NOT burn the shared 5-minute
+        // slot, and must not be reported to the delegate as started (#5542
+        // finding 5B). `try_auto_fetch_contract` has the same discipline: it
+        // takes the slot, fails to resolve a first-hop peer, and RELEASES it.
+        //
+        // "CANNOT ROUTE" IS NOT "ZERO PROMOTED CONNECTIONS", and conflating the
+        // two disabled this path for the whole bootstrap window. A node that
+        // has joined but not yet promoted any connection still reaches the
+        // network through a configured gateway: `start_sub_op_get`'s drivers all
+        // consult `bootstrap_gateway_target` for exactly that case, and there is
+        // a pin in `get/op_ctx_task.rs` requiring them to. Checking
+        // `num_connections() == 0` here refused before the primitive could use
+        // the fallback it already has, so delegate UPDATE self-healing was off
+        // until ring promotion — on a path this PR exists to add.
+        //
+        // Ask the same question the driver asks: no promoted connections AND no
+        // usable configured gateway.
+        let can_route = self.ring.connection_manager.connection_count() > 0
+            || crate::operations::bootstrap::bootstrap_gateway_target(self, |_| false).is_some();
+        if !can_route {
+            tracing::debug!(
+                contract = %instance_id,
+                "Not starting a delegate-originated self-heal fetch: no promoted \
+                 connections and no usable configured gateway"
+            );
+            return false;
+        }
+
+        let now_ms = GlobalSimulationTime::read_time_ms();
+        // Same atomic entry-API rate limit as the originator path, against the
+        // same map, for the same reason: check-then-insert would race.
+        match self.pending_contract_fetches.entry(instance_id) {
+            Entry::Occupied(mut existing) => {
+                let elapsed_ms = now_ms.saturating_sub(*existing.get());
+                if elapsed_ms < CONTRACT_FETCH_COOLDOWN_MS {
+                    tracing::debug!(
+                        contract = %instance_id,
+                        "Delegate-originated self-heal fetch still in cooldown"
+                    );
+                    return false;
+                }
+                *existing.get_mut() = now_ms;
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(now_ms);
+            }
+        }
+
+        tracing::info!(
+            contract = %instance_id,
+            "Auto-fetching a contract a delegate tried to UPDATE but this node \
+             does not hold (#5542)"
+        );
+        // Receiver dropped: the caller wants the caching side effect, not the
+        // result. The driver logs its own outcome and self-terminates at
+        // OPERATION_TTL.
+        let (_tx, _rx) = super::get::op_ctx_task::start_sub_op_get(
+            self,
+            instance_id,
+            /* return_contract_code */ true,
+        );
+        true
+    }
+
     /// The advertised co-hosts of a contract: peers that announced, via the
     /// advertisement layer, that they host it.
     ///
@@ -3348,6 +3466,135 @@ mod tests {
             wait_for_event,
         ));
         (op_manager, notifications_receiver, guard)
+    }
+
+    /// #5542. The delegate self-heal fetch shares the CLIENT originator path's
+    /// cooldown, and reports honestly whether it actually started one.
+    ///
+    /// Both halves are load-bearing and neither is visible from the call site.
+    /// The shared map is what stops a delegate and a client fetching the same
+    /// contract twice. The return value is what the delegate's error message is
+    /// built from: told "a background fetch has been started" when none was, a
+    /// delegate retries into a five-minute silence with no way to know why.
+    #[tokio::test]
+    async fn delegate_self_heal_fetch_shares_the_originator_cooldown_and_reports_it() {
+        let (op_manager, _rx, _guard) = build_notification_test_node("selfheal_5542").await;
+        let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([77u8; 32]);
+        // A connection is now a PRECONDITION, not scenery: a node with none
+        // cannot route the fetch, so it refuses rather than burning the shared
+        // cooldown slot (finding 5B, and its own test below). This test is about
+        // the cooldown being SHARED and REPORTED, so give it the connectivity
+        // that case assumes.
+        let _peer = connect_peer(&op_manager, 45_501, 0.25);
+
+        assert!(
+            op_manager.try_self_heal_fetch_for_local_originator(instance_id),
+            "the first attempt must start a fetch and say so"
+        );
+        assert!(
+            op_manager
+                .pending_contract_fetches
+                .contains_key(&instance_id),
+            "the attempt must be recorded in the SHARED cooldown map, or a client \
+             asking for the same contract fetches it a second time"
+        );
+        assert!(
+            !op_manager.try_self_heal_fetch_for_local_originator(instance_id),
+            "a second attempt inside CONTRACT_FETCH_COOLDOWN_MS must be refused, and \
+             must REPORT the refusal so the delegate is not promised a repair that \
+             is not running"
+        );
+    }
+
+    /// A delegate must not be able to make this node originate network traffic
+    /// for a contract it has BANNED (#5542 finding B2).
+    ///
+    /// `reject_if_contract_banned` runs at the top of every CLIENT originator
+    /// entry point, so the egress half of the ban invariant — a banned contract
+    /// can neither receive new state via this node nor transmit new state via it
+    /// — held for every path that crosses one. The delegate paths call the
+    /// internal drivers directly and crossed none of them, so this fetch was
+    /// reachable for a banned contract.
+    ///
+    /// The assertion on the cooldown map is the one that matters: refusing while
+    /// still taking the slot would be a second bug wearing the first one's fix.
+    #[tokio::test]
+    async fn a_banned_contract_gets_no_delegate_self_heal_fetch() {
+        let (op_manager, _rx, _guard) = build_notification_test_node("selfheal_5542_banned").await;
+        let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([79u8; 32]);
+        let _peer = connect_peer(&op_manager, 45_503, 0.5);
+
+        op_manager.ring.contract_ban_list.ban(
+            instance_id,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
+            crate::ring::contract_ban_list::BanReason::AutoMad,
+        );
+        assert!(
+            op_manager.ring.contract_ban_list.is_banned(&instance_id),
+            "the ban must be in force, or this test proves nothing"
+        );
+
+        assert!(
+            !op_manager.try_self_heal_fetch_for_local_originator(instance_id),
+            "a banned contract must not get a delegate-originated network fetch"
+        );
+        assert!(
+            !op_manager
+                .pending_contract_fetches
+                .contains_key(&instance_id),
+            "and the refusal must not burn the shared cooldown slot"
+        );
+
+        // An UNBANNED contract on the same node still proceeds, so the refusal
+        // above is the ban and not some unrelated precondition.
+        let allowed = freenet_stdlib::prelude::ContractInstanceId::new([80u8; 32]);
+        assert!(
+            op_manager.try_self_heal_fetch_for_local_originator(allowed),
+            "an unbanned contract must still be fetchable on this node"
+        );
+    }
+
+    /// A node with no connections must NOT burn the shared five-minute cooldown
+    /// slot, and must not tell the delegate a fetch started (#5542, finding 5B).
+    ///
+    /// `try_auto_fetch_contract` already has this discipline: it takes the slot,
+    /// fails to resolve a first-hop peer, and RELEASES it (`update.rs`, the
+    /// `get_peer_by_addr` miss). The self-heal path routes untargeted, so it has
+    /// no first-hop peer to resolve and had no equivalent check — it took the
+    /// slot unconditionally and returned `true`. The delegate was then told "a
+    /// background fetch has been started, so retry shortly" and every retry for
+    /// the next five minutes was refused by the slot the failed attempt had
+    /// taken, which is the exact opposite of the honesty this return value
+    /// exists to provide.
+    #[tokio::test]
+    async fn a_self_heal_fetch_with_no_connections_takes_no_cooldown_slot() {
+        let (op_manager, _rx, _guard) = build_notification_test_node("selfheal_5542_noconn").await;
+        let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([78u8; 32]);
+        assert_eq!(
+            op_manager.ring.connection_manager.num_connections(),
+            0,
+            "this test is only meaningful on a node that cannot route"
+        );
+
+        assert!(
+            !op_manager.try_self_heal_fetch_for_local_originator(instance_id),
+            "a fetch that cannot route must be reported as not started"
+        );
+        assert!(
+            !op_manager
+                .pending_contract_fetches
+                .contains_key(&instance_id),
+            "and it must not hold the shared cooldown slot, or the delegate's \
+             retries are refused for five minutes by an attempt that never ran"
+        );
+
+        // With a connection the same call proceeds, so the refusal above is the
+        // connectivity check and not some unrelated precondition.
+        let _peer = connect_peer(&op_manager, 45_502, 0.75);
+        assert!(
+            op_manager.try_self_heal_fetch_for_local_originator(instance_id),
+            "the same contract must be fetchable once the node can route"
+        );
     }
 
     /// Connect a peer and return `(pub_key, addr)`.

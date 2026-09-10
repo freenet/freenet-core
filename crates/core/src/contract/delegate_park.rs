@@ -202,6 +202,32 @@ pub(super) const MAX_PENDING_NOTIFICATION_CONTRACTS: usize = 16;
 /// to the old behaviour beats dropping a delegate's write.
 pub(super) const MAX_DEFERRED_UPSERTS_PER_PARK: usize = 4;
 
+/// Per-park cap on delegate contract operations that must reach the NETWORK
+/// (#5542): a GET or SUBSCRIBE for a contract this node has never seen.
+///
+/// CALLER-SIDE BY DESIGN, and it has to be. `start_sub_op_get` has no
+/// concurrency bound of any kind and must not grow one: each of its existing
+/// callers is bounded by ITSELF, not by the primitive - phantom repair by
+/// `MAX_PHANTOM_REPAIRS_PER_INTERVAL` per pass, the deferred related fetch by
+/// `MAX_DEFERRED_UPSERTS_PER_PARK` x `MAX_RELATED_CONTRACTS_PER_REQUEST`,
+/// subscribe by one per subscribe. A bound inside the primitive would silently
+/// reshape all three, including the phantom-repair path that restores a hosting
+/// invariant.
+///
+/// 4, matching `MAX_DEFERRED_UPSERTS_PER_PARK`. One `process()` return may name
+/// arbitrarily many contracts this node has never seen, and each one is a full
+/// network GET, so the fan-out has to be capped where it is created. Node-wide
+/// worst case is `MAX_PARKED_DELEGATES` (64) x 4 = 256 delegate-originated
+/// network operations in flight, which matches the client path's
+/// `MAX_INFLIGHT_DEFERRALS` (256) rather than exceeding it.
+///
+/// Over the cap the excess is REFUSED, never run inline. #5544's park-cap
+/// fallback to an inline wait is explicitly NOT inheritable here, and says so at
+/// its own call site: "inline" for a delegate GET means a sub-op GET on the
+/// serial `contract_handling` loop for up to 120 s, reachable by any delegate
+/// once the other 63 park slots are taken.
+pub(super) const MAX_NETWORK_CONTRACT_OPS_PER_PARK: usize = 4;
+
 /// Node-wide cap on the bytes a park may hold (#5544 S4).
 ///
 /// `MAX_PARKED_DELEGATES` bounds the NUMBER of parks, which is not the same as
@@ -246,6 +272,7 @@ pub(super) fn continuation_bytes(continuation: &Continuation) -> usize {
 pub(super) fn task_bytes(
     prompts: &[freenet_stdlib::prelude::UserInputRequest<'static>],
     upserts: &[PendingUpsert],
+    contract_ops: &[PendingContractOp],
 ) -> usize {
     let prompt_bytes: usize = prompts
         .iter()
@@ -276,7 +303,26 @@ pub(super) fn task_bytes(
             update + code + related
         })
         .sum();
-    prompt_bytes + upsert_bytes
+    // RESIDUAL, stated rather than papered over: this charges what a pending
+    // network op holds AT ADMISSION - its echoed `DelegateContext` - and cannot
+    // charge the state the network will return, because that size is unknown
+    // until the GET completes. Same shape and same magnitude as the residual
+    // already carried by `PendingUpsert.missing`, whose fetched related states
+    // are likewise uncharged. `MAX_NETWORK_CONTRACT_OPS_PER_PARK` bounds the
+    // COUNT (4 per park), which is a count cap standing in for a byte cap - the
+    // pattern #5551 tracks. Bounding the arriving state properly belongs there,
+    // where it can be fixed for both paths at once, not duplicated here.
+    // TWO copies per pending op, deliberately: the off-loop task holds the
+    // `PendingContractOp` and the `ParkGuard` holds a clone of its
+    // `DelegateContext` in `owed_contract_ops`, so a synthesized failure can
+    // hand the delegate back its own continuation state instead of an empty one
+    // (#5542 finding F7). Charging one copy for two would under-count the park
+    // byte cap by exactly the thing that cap exists to bound.
+    let contract_op_bytes: usize = contract_ops
+        .iter()
+        .map(|op| ctx_len(&op.context).saturating_mul(2))
+        .sum();
+    prompt_bytes + upsert_bytes + contract_op_bytes
 }
 
 /// Approximate bytes a queued delegate request pins.
@@ -524,6 +570,17 @@ pub(super) struct Continuation {
     /// is correct — and is also why #5558 (a delegate notified of its own
     /// writes) is a separate unbounded loop that this does not close.
     pub iterations: usize,
+    /// Fire-and-forget self-heal GETs this round-trip has already started, so
+    /// `MAX_NETWORK_CONTRACT_OPS_PER_PARK` bounds the WHOLE round-trip rather
+    /// than each leg of it — the same defect as `iterations` above, one budget
+    /// over (#5542 finding B1).
+    ///
+    /// The parked GET/SUBSCRIBE half does not need this because parking itself
+    /// serialises it: `pending_contract_ops` being non-empty ends the run, and
+    /// parks are capped node-wide. The UPDATE self-heal starts a driver and
+    /// lets the loop continue, so nothing serialises it and the count has to be
+    /// carried explicitly.
+    pub self_heal_fetches_started: usize,
     pub params: Parameters<'static>,
     pub origin_contract: Option<ContractInstanceId>,
     pub connection_scope: ConnectionScope,
@@ -618,6 +675,86 @@ pub(super) struct ResolvedUpsert {
     pub fetched: Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>,
 }
 
+/// Which delegate-originated network operation a [`PendingContractOp`] carries
+/// (#5542). Part of the identity a [`ParkGuard`] reconciles by, so a GET and a
+/// SUBSCRIBE naming the same contract are two distinct obligations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum ContractOpKind {
+    /// `GetContractRequest` for a contract this node has never seen.
+    Get,
+    /// `SubscribeContractRequest` for a contract this node has never seen.
+    Subscribe,
+}
+
+/// A delegate GET or SUBSCRIBE that the local store could not answer and which
+/// must therefore reach the network (#5542).
+///
+/// Off-loaded for the same reason as [`PendingUpsert`]: the work is a network
+/// operation, and awaiting one on the serial `contract_handling` loop freezes
+/// every contract operation on the node for its whole duration. Unlike an
+/// upsert, nothing has to be re-run on the loop afterwards - the response is
+/// pure data - but the SUBSCRIBE registry insert is still done there, so
+/// `DELEGATE_SUBSCRIPTIONS` is only ever written from one place.
+pub(super) struct PendingContractOp {
+    /// Unique per request, for the lifetime of the process.
+    ///
+    /// Reconciliation used to match owed against resolved by
+    /// `(contract_id, kind)` COUNT. That is enough to get the NUMBER of
+    /// unresolved operations right, and not enough to get their IDENTITY right:
+    /// two GETs naming the same contract with DIFFERENT `DelegateContext`s are
+    /// interchangeable under that key, so if only the second completes, the
+    /// count consumes the FIRST owed entry, the real response carries the
+    /// second's context, and the synthesized failure carries the second's
+    /// context too. One request gets two answers and the other gets none, and
+    /// the delegate's own correlation state is what is swapped.
+    ///
+    /// That only became reachable when the context was added to the owed
+    /// entries (#5542 F7). Before it, every synthesized failure carried
+    /// `DelegateContext::default()`, so there was no identity to mismatch.
+    pub id: u64,
+    pub contract_id: ContractInstanceId,
+    pub kind: ContractOpKind,
+    /// Echoed back to the delegate so it can match the response to its request.
+    /// This is the continuation state that survives the park: the delegate's
+    /// own `DelegateContext` round-trips through the response.
+    pub context: DelegateContext,
+}
+
+impl PendingContractOp {
+    /// Next request id. Monotonic per process; only ever compared for equality
+    /// within one park's owed/resolved reconciliation.
+    pub(super) fn next_id() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// What a [`PendingContractOp`]'s network work produced.
+pub(super) enum ContractOpOutcome {
+    /// A GET completed. `Some` is the state the network returned; `None` means
+    /// the network itself answered NotFound.
+    ///
+    /// NOTE the residual, which this type cannot fix: `GetContractResponse.state`
+    /// is a bare `Option<WrappedState>` in freenet-stdlib, so by the time this
+    /// reaches the delegate, "the network says this contract does not exist"
+    /// and "we could not reach the network" are both `None`. Distinguishing
+    /// them needs a stdlib wire change (#5542 scope item 4) and is deliberately
+    /// not faked here.
+    Fetched(Option<WrappedState>),
+    /// A SUBSCRIBE completed: the contract body was bootstrapped, a network
+    /// subscription was established and demand was registered.
+    Subscribed,
+    /// The operation failed - infrastructure error, exhausted retries, or no
+    /// `OpManager` on this executor.
+    Failed(String),
+}
+
+/// A [`PendingContractOp`] whose off-loop network work has finished.
+pub(super) struct ResolvedContractOp {
+    pub pending: PendingContractOp,
+    pub outcome: ContractOpOutcome,
+}
+
 /// Sent from an off-loop task back to the `contract_handling` loop.
 pub(super) struct DelegateResume {
     pub delegate_key: DelegateKey,
@@ -644,6 +781,13 @@ pub(super) struct DelegateResume {
     /// or ran out of budget. `(contract, is_put)`, turned into failure
     /// responses by the resume handler so the delegate is told.
     pub unresolved_upserts: Vec<(ContractInstanceId, bool)>,
+    /// Delegate GET/SUBSCRIBE operations whose network work finished off-loop
+    /// (#5542), turned into inbound responses on the loop.
+    pub contract_ops: Vec<ResolvedContractOp>,
+    /// Network operations the off-loop task never resolved, for the same three
+    /// reasons as `unresolved_upserts`. Turned into failure responses so the
+    /// delegate is told rather than left waiting for one that will never come.
+    pub unresolved_contract_ops: Vec<(ContractInstanceId, ContractOpKind, DelegateContext)>,
 }
 
 /// RAII guard guaranteeing an off-loop task delivers EXACTLY ONE
@@ -681,6 +825,25 @@ struct ParkGuardPayload {
     /// finished before a panic or cancellation (#5544 F2).
     answers: std::sync::Arc<std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>>,
     fetches: std::sync::Arc<std::sync::Mutex<Vec<ResolvedUpsert>>>,
+    /// Network operations this park owes a response for, as
+    /// `(contract, kind)` (#5542). A MULTISET for the same reason as
+    /// `owed_upserts`: one `process()` return can emit two GETs naming the same
+    /// contract, and reconciling those by SET membership would let one
+    /// completion discharge both obligations, leaving the delegate waiting
+    /// forever for a response nothing remained to produce.
+    /// Carries the delegate's own `DelegateContext` so a synthesized failure
+    /// hands back the CONTINUATION STATE the request arrived with, not an empty
+    /// one (#5542 finding F7). `DelegateContext` is how a delegate correlates a
+    /// response with its request; handing back `default()` reads to a delegate
+    /// state machine as "start over" rather than "this operation failed", which
+    /// corrupts it instead of merely failing an operation. The obligation is
+    /// outstanding for up to PARK_WORK_BUDGET (75 s), so this is not a
+    /// vanishing window.
+    owed_contract_ops: Vec<(u64, ContractInstanceId, ContractOpKind, DelegateContext)>,
+    /// Where the off-loop task deposits finished network operations, shared with
+    /// the task for the same reason as `answers` and `fetches`: so `Drop` can
+    /// see work that completed before a panic or cancellation (#5544 F2).
+    contract_ops: std::sync::Arc<std::sync::Mutex<Vec<ResolvedContractOp>>>,
 }
 
 impl ParkGuard {
@@ -693,6 +856,8 @@ impl ParkGuard {
         owed_upserts: Vec<(ContractInstanceId, bool)>,
         answers: std::sync::Arc<std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>>,
         fetches: std::sync::Arc<std::sync::Mutex<Vec<ResolvedUpsert>>>,
+        owed_contract_ops: Vec<(u64, ContractInstanceId, ContractOpKind, DelegateContext)>,
+        contract_ops: std::sync::Arc<std::sync::Mutex<Vec<ResolvedContractOp>>>,
     ) -> Self {
         Self {
             payload: Some(ParkGuardPayload {
@@ -703,6 +868,8 @@ impl ParkGuard {
                 owed_upserts,
                 answers,
                 fetches,
+                owed_contract_ops,
+                contract_ops,
             }),
         }
     }
@@ -728,10 +895,33 @@ impl ParkGuard {
             owed_upserts,
             answers,
             fetches,
+            owed_contract_ops,
+            contract_ops,
         } = p;
 
-        let mut inbound = std::mem::take(&mut *answers.lock().unwrap());
-        let upserts = std::mem::take(&mut *fetches.lock().unwrap());
+        // NEVER `.unwrap()` HERE. `deliver` runs from `Drop`, `Drop` runs while
+        // the off-loop task is UNWINDING from a panic, and that task holds these
+        // very locks across the expressions it pushes into them — so the mutex
+        // it panicked under is poisoned. `.unwrap()` on a poisoned mutex panics,
+        // and a panic in `Drop` during unwinding ABORTS THE PROCESS: no
+        // unwinding, no other delegate's park resumed, no client answered.
+        //
+        // The poison flag carries no information this path can act on. The data
+        // is a plain `Vec` of already-built results; a writer that died
+        // mid-push leaves it structurally intact, and delivering what is there
+        // is exactly what every other exit does. Take the inner value.
+        //
+        // All three converted together on purpose. Poison-tolerance is a
+        // property of the WHOLE Drop path, not of one lock in it: leaving any
+        // one as `.unwrap()` leaves the abort reachable, so a partial
+        // conversion reads as fixed while the failure mode is unchanged.
+        // (#5606 is converting the first two for this same reason; #5615 added
+        // the third. Whichever lands second must confirm all three, not just
+        // its own.)
+        let mut inbound = std::mem::take(&mut *answers.lock().unwrap_or_else(|e| e.into_inner()));
+        let upserts = std::mem::take(&mut *fetches.lock().unwrap_or_else(|e| e.into_inner()));
+        let contract_ops =
+            std::mem::take(&mut *contract_ops.lock().unwrap_or_else(|e| e.into_inner()));
 
         // TERMINAL RESULTS ARE PRODUCED HERE, not in the task body, so that
         // EVERY exit produces them — including a panic or a cancellation, which
@@ -800,6 +990,38 @@ impl ParkGuard {
             );
         }
 
+        // RECONCILED BY REQUEST IDENTITY, not by `(contract, kind)` count.
+        //
+        // A count gets the NUMBER of unresolved operations right and their
+        // IDENTITY wrong. Two GETs naming one contract are interchangeable
+        // under that key, so when only the second completes, the count consumes
+        // the FIRST owed entry while the real response and the synthesized
+        // failure both carry the SECOND's `DelegateContext` — one request
+        // answered twice, one never, and the delegate's correlation state
+        // swapped underneath it. Matching on `PendingContractOp::id` cannot
+        // confuse two requests, whatever they name.
+        //
+        // This subsumes the multiset reasoning that was here (#5544 F1/F3):
+        // distinct requests have distinct ids, so duplicates are handled by
+        // construction rather than by counting.
+        let resolved_ids: std::collections::HashSet<u64> =
+            contract_ops.iter().map(|r| r.pending.id).collect();
+        let mut unresolved_contract_ops = Vec::new();
+        for (op_id, id, kind, context) in owed_contract_ops {
+            if !resolved_ids.contains(&op_id) {
+                unresolved_contract_ops.push((id, kind, context));
+            }
+        }
+        if !unresolved_contract_ops.is_empty() {
+            tracing::warn!(
+                delegate = %delegate_key,
+                count = unresolved_contract_ops.len(),
+                "Off-loop delegate work ended without resolving every network \
+                 contract operation; synthesizing failures so the delegate is \
+                 told rather than left waiting (#5542)"
+            );
+        }
+
         if resume_tx
             .send(DelegateResume {
                 delegate_key: delegate_key.clone(),
@@ -808,6 +1030,8 @@ impl ParkGuard {
                 inbound,
                 upserts,
                 unresolved_upserts,
+                contract_ops,
+                unresolved_contract_ops,
             })
             .is_err()
         {
@@ -1379,6 +1603,7 @@ mod tests {
 
     fn continuation() -> Continuation {
         Continuation {
+            self_heal_fetches_started: 0,
             params: Parameters::from(Vec::new()),
             origin_contract: None,
             connection_scope: ConnectionScope::Local,
@@ -1738,6 +1963,8 @@ mod tests {
             Vec::new(),
             answers,
             fetches,
+            Vec::new(),
+            Default::default(),
         ));
 
         // The loop takes it off the channel but runs out of budget before
@@ -1844,6 +2071,8 @@ mod tests {
             Vec::new(),
             answers,
             fetches,
+            Vec::new(),
+            Default::default(),
         ));
 
         tokio::time::advance(PARK_TTL + Duration::from_secs(1)).await;
@@ -1906,6 +2135,8 @@ mod tests {
             Vec::new(),
             answers,
             fetches,
+            Vec::new(),
+            Default::default(),
         ));
 
         assert!(
@@ -1957,6 +2188,8 @@ mod tests {
             inbound: vec![answer(1)],
             upserts: Vec::new(),
             unresolved_upserts: Vec::new(),
+            contract_ops: Vec::new(),
+            unresolved_contract_ops: Vec::new(),
         });
 
         tokio::time::advance(PARK_TTL + Duration::from_secs(1)).await;
@@ -2245,11 +2478,229 @@ mod tests {
             .collect()
     }
 
+    fn net_op(contract: u8, kind: ContractOpKind) -> PendingContractOp {
+        net_op_with(PendingContractOp::next_id(), contract, kind, Vec::new())
+    }
+
+    /// A pending op with an explicit id and context, so a test can express
+    /// TWO DISTINCT requests that look identical under `(contract, kind)`.
+    fn net_op_with(
+        id: u64,
+        contract: u8,
+        kind: ContractOpKind,
+        context: Vec<u8>,
+    ) -> PendingContractOp {
+        PendingContractOp {
+            id,
+            contract_id: ContractInstanceId::new([contract; 32]),
+            kind,
+            context: DelegateContext::new(context),
+        }
+    }
+
+    /// #5542. Every delegate network operation a park owes must produce a
+    /// terminal outcome on EVERY exit, including the `Drop` path a panic or a
+    /// cancellation takes. Without this the delegate waits forever for a
+    /// `GetContractResponse` nothing remains to produce — the same failure
+    /// #5544 P2 had to fix for prompts and upserts, at a third level.
+    #[tokio::test]
+    async fn drop_reports_every_owed_network_op_as_unresolved() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (answers, fetches) = sinks();
+        drop(ParkGuard::new(
+            tx,
+            key(1),
+            0,
+            Vec::new(),
+            Vec::new(),
+            answers,
+            fetches,
+            vec![
+                (
+                    1,
+                    ContractInstanceId::new([9; 32]),
+                    ContractOpKind::Get,
+                    DelegateContext::new(b"ctx-get".to_vec()),
+                ),
+                (
+                    2,
+                    ContractInstanceId::new([8; 32]),
+                    ContractOpKind::Subscribe,
+                    DelegateContext::new(b"ctx-sub".to_vec()),
+                ),
+            ],
+            Default::default(),
+        ));
+        let resume = rx.recv().await.expect("drop must still resume the park");
+        assert_eq!(resume.cause, ResumeCause::TimedOut);
+        assert_eq!(
+            resume.unresolved_contract_ops,
+            vec![
+                (
+                    ContractInstanceId::new([9; 32]),
+                    ContractOpKind::Get,
+                    DelegateContext::new(b"ctx-get".to_vec()),
+                ),
+                (
+                    ContractInstanceId::new([8; 32]),
+                    ContractOpKind::Subscribe,
+                    DelegateContext::new(b"ctx-sub".to_vec()),
+                ),
+            ],
+            "every owed network operation must be reported unresolved, WITH the \
+             delegate's own context: a synthesized failure carrying \
+             `DelegateContext::default()` reads to a delegate state machine as \
+             \"start over\" rather than \"this operation failed\" (#5542 F7)"
+        );
+    }
+
+    /// #5542, inheriting #5544 F1/F3. `owed_contract_ops` is a MULTISET: one
+    /// `process()` return can emit two `GetContractRequest`s naming the same
+    /// contract. Reconciling by SET membership would let ONE completion
+    /// discharge BOTH obligations, and the delegate would wait forever for the
+    /// second response.
+    #[tokio::test]
+    async fn network_ops_are_reconciled_by_count_not_by_set() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (answers, fetches) = sinks();
+        let net_ops: std::sync::Arc<std::sync::Mutex<Vec<ResolvedContractOp>>> = Default::default();
+        // The SECOND request is the one that completed. Under the old
+        // count-based reconciliation this discharged the FIRST owed entry.
+        net_ops.lock().unwrap().push(ResolvedContractOp {
+            pending: net_op_with(12, 9, ContractOpKind::Get, b"second".to_vec()),
+            outcome: ContractOpOutcome::Fetched(None),
+        });
+        drop(ParkGuard::new(
+            tx,
+            key(1),
+            0,
+            Vec::new(),
+            Vec::new(),
+            answers,
+            fetches,
+            vec![
+                (
+                    11,
+                    ContractInstanceId::new([9; 32]),
+                    ContractOpKind::Get,
+                    DelegateContext::new(b"first".to_vec()),
+                ),
+                (
+                    12,
+                    ContractInstanceId::new([9; 32]),
+                    ContractOpKind::Get,
+                    DelegateContext::new(b"second".to_vec()),
+                ),
+            ],
+            net_ops,
+        ));
+        let resume = rx.recv().await.expect("resume");
+        assert_eq!(
+            resume.contract_ops.len(),
+            1,
+            "the completed operation must survive the drop path"
+        );
+        assert_eq!(
+            resume.unresolved_contract_ops,
+            vec![(
+                ContractInstanceId::new([9; 32]),
+                ContractOpKind::Get,
+                DelegateContext::new(b"first".to_vec())
+            )],
+            "one completion must discharge exactly ONE of two obligations that \
+             look identical under `(contract, kind)` — and it must discharge \
+             THE ONE THAT COMPLETED. Reconciling by count consumed the FIRST \
+             owed entry while the real response and the synthesized failure \
+             both carried the SECOND's context: one request answered twice, one \
+             never (#5542, Codex P2)"
+        );
+    }
+
+    /// #5542. `kind` is part of the obligation's identity: a GET and a
+    /// SUBSCRIBE naming one contract are two different promises to the
+    /// delegate, and answering the GET must not silently discharge the
+    /// SUBSCRIBE.
+    #[tokio::test]
+    async fn a_get_and_a_subscribe_for_one_contract_are_two_obligations() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (answers, fetches) = sinks();
+        let net_ops: std::sync::Arc<std::sync::Mutex<Vec<ResolvedContractOp>>> = Default::default();
+        net_ops.lock().unwrap().push(ResolvedContractOp {
+            pending: net_op_with(21, 9, ContractOpKind::Get, Vec::new()),
+            outcome: ContractOpOutcome::Fetched(None),
+        });
+        drop(ParkGuard::new(
+            tx,
+            key(1),
+            0,
+            Vec::new(),
+            Vec::new(),
+            answers,
+            fetches,
+            vec![
+                (
+                    21,
+                    ContractInstanceId::new([9; 32]),
+                    ContractOpKind::Get,
+                    DelegateContext::default(),
+                ),
+                (
+                    22,
+                    ContractInstanceId::new([9; 32]),
+                    ContractOpKind::Subscribe,
+                    DelegateContext::default(),
+                ),
+            ],
+            net_ops,
+        ));
+        let resume = rx.recv().await.expect("resume");
+        assert_eq!(
+            resume.unresolved_contract_ops,
+            vec![(
+                ContractInstanceId::new([9; 32]),
+                ContractOpKind::Subscribe,
+                DelegateContext::default()
+            )],
+            "the SUBSCRIBE must still be owed after only the GET completed"
+        );
+    }
+
+    /// #5542. The park's byte cap must charge what a pending network operation
+    /// retains. A delegate chooses its own `DelegateContext`, so charging zero
+    /// for it makes `MAX_PARKED_BYTES` blind to 4 x 64 delegate-supplied
+    /// payloads — the same "count cap standing in for a byte cap" this file
+    /// already fixed twice.
+    #[tokio::test]
+    async fn pending_network_ops_are_charged_for_their_context() {
+        const N: usize = 32 * 1024;
+        let mut op = net_op(9, ContractOpKind::Get);
+        op.context = DelegateContext::new(vec![0u8; N]);
+        let charged = task_bytes(&[], &[], std::slice::from_ref(&op));
+        assert!(
+            charged >= 2 * N,
+            "a pending network op retains its context TWICE — once in the \
+             off-loop task's `PendingContractOp` and once in the `ParkGuard`'s \
+             `owed_contract_ops`, which is what lets a synthesized failure hand \
+             the delegate back its own continuation state (#5542 F7) — so both \
+             copies must be charged; got {charged} for a {N}-byte context"
+        );
+    }
+
     #[tokio::test]
     async fn guard_delivers_exactly_one_resume_on_success() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (answers, fetches) = sinks();
-        let guard = ParkGuard::new(tx, key(1), 0, Vec::new(), Vec::new(), answers, fetches);
+        let guard = ParkGuard::new(
+            tx,
+            key(1),
+            0,
+            Vec::new(),
+            Vec::new(),
+            answers,
+            fetches,
+            Vec::new(),
+            Default::default(),
+        );
         guard.send();
         let resume = rx.recv().await.expect("one resume");
         assert_eq!(resume.cause, ResumeCause::Completed);
@@ -2276,6 +2727,8 @@ mod tests {
             vec![(ContractInstanceId::new([3; 32]), true)],
             answers,
             fetches,
+            Vec::new(),
+            Default::default(),
         ));
         let resume = rx.recv().await.expect("drop must still resume the park");
         assert_eq!(resume.cause, ResumeCause::TimedOut);
@@ -2310,6 +2763,8 @@ mod tests {
             Vec::new(),
             answers,
             fetches,
+            Vec::new(),
+            Default::default(),
         ));
         let resume = rx.recv().await.expect("resume");
         let kept: Vec<&InboundDelegateMsg<'static>> = resume
@@ -2353,6 +2808,8 @@ mod tests {
             vec![(contract, true), (contract, true)],
             answers,
             fetches,
+            Vec::new(),
+            Default::default(),
         ));
         let resume = rx.recv().await.expect("resume");
         assert_eq!(

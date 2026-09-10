@@ -677,6 +677,466 @@ where
     upsert_response_msg(pending.is_put, contract_id, pending.context, result)
 }
 
+/// Whether `delegate_key` already holds a subscription to `contract_id`.
+///
+/// Extracted so the non-idempotency guard in the SUBSCRIBE arm has a name, and
+/// so it can be unit-tested without a running loop. See that call site for why
+/// the guard exists: `add_local_client` is a refcount, `DELEGATE_SUBSCRIPTIONS`
+/// is a set, and wiring the network path in without this makes a re-subscribe
+/// leak demand.
+fn already_subscribed(
+    contract_id: &freenet_stdlib::prelude::ContractInstanceId,
+    delegate_key: &DelegateKey,
+    op_manager: Option<&std::sync::Arc<crate::node::OpManager>>,
+) -> bool {
+    match op_manager {
+        // PER-NODE, because the question is "has THIS node established it"
+        // (#5542, Codex P2). `DELEGATE_SUBSCRIPTIONS` is process-global and
+        // carries no node identity, so consulting it alone answers for the
+        // PROCESS: in an in-process multi-node run the second node to subscribe
+        // the same delegate to the same contract saw the first node's entry,
+        // short-circuited, and returned `Ok(())` having taken no refcount of its
+        // own and established no network subscription. The first-arrival
+        // process-global pattern from `testing.md`.
+        //
+        // Note the node-keyed hold map alone could not fix that: it made the
+        // RELEASE side per-node while this gate, one level above it, still
+        // answered from another node's registration and returned before any
+        // hold was recorded.
+        Some(op_manager) => crate::wasm_runtime::delegate_interest::holds(
+            contract_id,
+            delegate_key,
+            op_manager.node_identity,
+        ),
+        // No `OpManager`: no refcount can have been taken, so the registry is
+        // the only record there is, and a mock executor has exactly one node.
+        None => crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+            .get(contract_id)
+            .is_some_and(|subs| subs.contains(delegate_key)),
+    }
+}
+
+/// Build the terminal inbound message for a delegate network operation (#5542).
+///
+/// Pure, and deliberately separate from the code that RUNS the operation: the
+/// off-loop task, the resume handler and the `ParkGuard`'s
+/// panic/cancellation/timeout path all have to produce the same shapes, and
+/// three inlined copies is how a failure arm silently diverges from a success
+/// arm.
+fn contract_op_response_msg(
+    kind: delegate_park::ContractOpKind,
+    contract_id: freenet_stdlib::prelude::ContractInstanceId,
+    context: DelegateContext,
+    outcome: delegate_park::ContractOpOutcome,
+) -> InboundDelegateMsg<'static> {
+    use delegate_park::{ContractOpKind, ContractOpOutcome};
+    match (kind, outcome) {
+        (ContractOpKind::Get, ContractOpOutcome::Fetched(state)) => {
+            InboundDelegateMsg::GetContractResponse(GetContractResponse {
+                contract_id,
+                state,
+                context,
+            })
+        }
+        (ContractOpKind::Subscribe, ContractOpOutcome::Subscribed) => {
+            InboundDelegateMsg::SubscribeContractResponse(SubscribeContractResponse {
+                contract_id,
+                result: Ok(()),
+                context,
+            })
+        }
+        (ContractOpKind::Get, outcome) => {
+            // A GET that failed. `GetContractResponse` has no error channel, so
+            // this collapses to `state: None` and the delegate cannot tell it
+            // from a genuine NotFound — #5542 scope item 4, which needs a
+            // freenet-stdlib wire change. Logged at warn so the operator can,
+            // even though the delegate cannot.
+            if let ContractOpOutcome::Failed(err) = &outcome {
+                tracing::warn!(
+                    contract = %contract_id,
+                    error = %err,
+                    "Delegate network GET failed; the delegate is told \
+                     `state: None`, which it cannot distinguish from a genuine \
+                     NotFound (#5542 scope item 4)"
+                );
+            }
+            InboundDelegateMsg::GetContractResponse(GetContractResponse {
+                contract_id,
+                state: None,
+                context,
+            })
+        }
+        (ContractOpKind::Subscribe, outcome) => {
+            let err = match outcome {
+                ContractOpOutcome::Failed(err) => err,
+                // Unreachable by construction: only a GET produces `Fetched`,
+                // and `Subscribed` is taken by the arm above. Enumerated rather
+                // than wildcarded so a new outcome variant is a compile error
+                // here instead of silently landing in this string.
+                //
+                // Reported as a failure rather than silently rewritten as a
+                // success: telling a delegate its subscription is live when the
+                // node cannot say that is the class of lie #5263 removed from
+                // the delegate response path.
+                ContractOpOutcome::Fetched(_) | ContractOpOutcome::Subscribed => {
+                    "delegate subscribe resolved with a non-subscribe outcome".to_string()
+                }
+            };
+            InboundDelegateMsg::SubscribeContractResponse(SubscribeContractResponse {
+                contract_id,
+                result: Err(err),
+                context,
+            })
+        }
+    }
+}
+
+/// The release half of a delegate-subscribe interest hold (#5542).
+///
+/// One constructor rather than two inline copies, because there are now two
+/// sites that take the refcount — the network path in
+/// `apply_resolved_contract_op` and the local-state path in the SUBSCRIBE arm —
+/// and a second hand-written copy is where the next divergence lives. That is
+/// the "manually-inlined originator side effects" row in
+/// `.claude/rules/bug-prevention-patterns.md`.
+///
+/// `Weak`, not `Arc`: the hold map is a process global, and a strong reference
+/// there would keep a shut-down node's `OpManager` alive for the life of the
+/// process. In the in-process multi-node harness that means every node ever
+/// built. A hold that cannot upgrade has nothing left to release, because the
+/// `InterestManager` it would decrement went with the `OpManager`.
+fn delegate_interest_release_closure(
+    op_manager: &std::sync::Arc<crate::node::OpManager>,
+) -> crate::wasm_runtime::delegate_interest::InterestRelease {
+    let weak = std::sync::Arc::downgrade(op_manager);
+    std::sync::Arc::new(move |key: &ContractKey| {
+        if let Some(op_manager) = weak.upgrade() {
+            op_manager.interest_manager.remove_local_client(key);
+        }
+    })
+}
+
+/// The egress ban gate, applied to delegate-originated network operations
+/// (#5542 finding B2).
+///
+/// `reject_if_contract_banned` is called at the top of every CLIENT originator
+/// entry point — `start_client_put` / `_get` / `_subscribe` / `_update` — so
+/// that a banned contract's request is refused before it consumes this node's
+/// outbound resources. The invariant that gate exists to hold is stated at
+/// `operations.rs`: a banned contract can neither receive new state via this
+/// node nor transmit new state via it.
+///
+/// The delegate paths call the INTERNAL drivers — `start_sub_op_get` and
+/// `run_executor_subscribe` — rather than those client entry points, so they
+/// sat underneath the gate entirely. A delegate could originate GET, SUBSCRIBE
+/// and the UPDATE self-heal fetch for a contract this node has banned, which
+/// defeats the egress half of the invariant on a path the ban list cannot see.
+///
+/// Applied at ADMISSION rather than inside the drivers: putting it in
+/// `start_sub_op_get` would reshape all of its callers, including the
+/// phantom-repair path that restores a hosting invariant, which this PR
+/// deliberately declines to do. Refusing at admission also means the delegate
+/// gets the ordinary refusal it already understands rather than a driver-level
+/// error it has no channel for.
+///
+/// `false` when there is no `OpManager`: no network operation can start without
+/// one, so there is nothing to gate.
+fn delegate_network_op_banned<CH>(
+    contract_handler: &mut CH,
+    contract_id: &freenet_stdlib::prelude::ContractInstanceId,
+) -> bool
+where
+    CH: ContractHandler + Send + 'static,
+{
+    let Some(op_manager) = contract_handler.executor().op_manager_handle() else {
+        return false;
+    };
+    crate::operations::reject_if_contract_banned(&op_manager, contract_id).is_err()
+}
+
+/// Give back the local interest that resolved-but-dropped SUBSCRIBEs took
+/// (#5542 finding B3).
+///
+/// Called from the one path that discards a `DelegateResume` without running
+/// `apply_resolved_contract_op`: a resume whose park is gone, because the
+/// `PARK_TTL` backstop ended it without consuming the guard. That is reachable
+/// by NODE LOAD alone — no delegate behaviour is required — and each occurrence
+/// would otherwise cost one permanently unreleasable refcount.
+///
+/// Releases only for `(Subscribe, Subscribed)`, the same evidence
+/// `delegate_interest::record` gates on, so it can never decrement interest a
+/// different subscriber holds. Installs no `DELEGATE_SUBSCRIPTIONS` hook: the
+/// delegate is not told it is subscribed, and nothing advertises a delivery
+/// path that will not be served.
+///
+/// Logged at `warn!`, not `debug!`. The dropped resume is ordinary; a refcount
+/// leaving with it is not, and an operator seeing this repeatedly is seeing
+/// parks lose the race to the backstop.
+fn release_stranded_subscribe_interest<CH>(
+    contract_handler: &mut CH,
+    delegate_key: &DelegateKey,
+    contract_ops: &[delegate_park::ResolvedContractOp],
+) where
+    CH: ContractHandler + Send + 'static,
+{
+    let stranded: Vec<freenet_stdlib::prelude::ContractInstanceId> = contract_ops
+        .iter()
+        .filter(|resolved| {
+            matches!(
+                (resolved.pending.kind, &resolved.outcome),
+                (
+                    delegate_park::ContractOpKind::Subscribe,
+                    delegate_park::ContractOpOutcome::Subscribed
+                )
+            )
+        })
+        .map(|resolved| resolved.pending.contract_id)
+        .collect();
+    if stranded.is_empty() {
+        return;
+    }
+    let Some(op_manager) = contract_handler.executor().op_manager_handle() else {
+        tracing::warn!(
+            delegate = %delegate_key,
+            count = stranded.len(),
+            "Dropped resume carried resolved delegate subscribes but this \
+             executor has no OpManager, so their local interest cannot be \
+             released (#5542)"
+        );
+        return;
+    };
+    for contract_id in stranded {
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            contract_id,
+            freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+        );
+        let lost_interest = op_manager.interest_manager.remove_local_client(&key);
+        tracing::warn!(
+            contract = %contract_id,
+            delegate = %delegate_key,
+            lost_interest,
+            "Released the local interest of a delegate SUBSCRIBE whose resume \
+             was dropped on epoch mismatch; without this the refcount could \
+             never be discharged (#5542 finding B3)"
+        );
+    }
+}
+
+/// Finish a resolved delegate network operation ON the loop (#5542).
+///
+/// The network work happened off-loop; what is left is the part that must be
+/// serial. For a successful SUBSCRIBE that is the `DELEGATE_SUBSCRIPTIONS`
+/// insert — done HERE and only on success, so the registry never claims a
+/// delivery path that was not established, and so the registry has exactly one
+/// writer on this path.
+fn apply_resolved_contract_op<CH>(
+    contract_handler: &mut CH,
+    resolved: delegate_park::ResolvedContractOp,
+    delegate_key: &DelegateKey,
+) -> InboundDelegateMsg<'static>
+where
+    CH: ContractHandler + Send + 'static,
+{
+    let delegate_park::ResolvedContractOp { pending, outcome } = resolved;
+    if matches!(
+        (pending.kind, &outcome),
+        (
+            delegate_park::ContractOpKind::Subscribe,
+            delegate_park::ContractOpOutcome::Subscribed
+        )
+    ) {
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+            .entry(pending.contract_id)
+            .or_default()
+            .insert(delegate_key.clone());
+        // RECORD THE OBLIGATION THIS SUBSCRIBE JUST INCURRED (#5542).
+        //
+        // `run_executor_subscribe` ended in
+        // `InterestManager::add_local_client`, a per-contract REFCOUNT that
+        // takes no client id. Nothing on any delegate path could give it back:
+        // the only decrement outside `ring/interest.rs` is keyed by `ClientId`
+        // and driven by a WebSocket disconnect, which a delegate never reaches.
+        // The permanent interest is not itself wrong — a delegate subscription
+        // is permanent — but three ordinary paths DROP a delegate subscription
+        // (`UnregisterDelegate`, contract removal, notification-channel-closed
+        // cleanup), and without this record they would leave the refcount
+        // standing forever, so `cleanup_contract_if_no_interest` never fires and
+        // the node holds demand nothing can retire.
+        //
+        // Recorded HERE and nowhere else, because this is the only site that
+        // takes a refcount: a subscribe answered from the local store takes
+        // none, and neither does the V2 `subscribe_contract_sync` host
+        // function. Driving release from the record rather than from the
+        // subscription set is what makes over-release impossible — a decrement
+        // for a pair that never incremented would fall on interest a real
+        // client holds, which is strictly worse than the leak.
+        //
+        // The obligation is recorded whether or not the FULL key resolves, and
+        // that is load-bearing rather than defensive. `run_executor_subscribe`
+        // usually bootstraps the body, but `finalize_originator_subscribe` calls
+        // `add_local_client` OUTSIDE its `if have_body` guard
+        // (`operations/subscribe.rs`), so a subscribe whose
+        // `fetch_contract_if_missing` timed out inside its 2 s window takes the
+        // refcount and still returns `Ok(())` with no code blob stored. On that
+        // path `lookup_key` — which resolves through
+        // `ContractStore::code_hash_from_id` — is `None`. Recording only when
+        // it is `Some` therefore left the whole leak standing on the feature's
+        // PRIMARY path (a delegate subscribing to a contract this node has never
+        // seen), reported as a `warn!` and nothing else.
+        //
+        // Falling back to an instance-only key is exact, not a guess.
+        // `InterestManager::local_interests` is keyed by `ContractKey`, whose
+        // `Hash`/`Eq` are INSTANCE-ONLY (freenet-stdlib `contract_interface/
+        // key.rs`), and the hash index derives from `id().as_bytes()`
+        // (`ring::interest::contract_hash`), so `remove_local_client` and
+        // `cleanup_contract_if_no_interest` resolve exactly the entry
+        // `add_local_client` created with the full key. Same device as the
+        // `probe_key` in `node.rs`. The full key is still preferred where it is
+        // available, so logs and any future code-hash-sensitive consumer see the
+        // real one.
+        match contract_handler.executor().op_manager_handle() {
+            Some(op_manager) => {
+                let key = contract_handler
+                    .executor()
+                    .lookup_key(&pending.contract_id)
+                    .unwrap_or_else(|| {
+                        ContractKey::from_id_and_code(
+                            pending.contract_id,
+                            freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+                        )
+                    });
+                // WEAK, so an outstanding hold never keeps a shut-down node's
+                // `OpManager` alive. A hold that cannot upgrade has nothing
+                // left to release.
+                crate::wasm_runtime::delegate_interest::record(
+                    pending.contract_id,
+                    delegate_key.clone(),
+                    key,
+                    delegate_interest_release_closure(&op_manager),
+                    op_manager.node_identity,
+                );
+            }
+            None => {
+                // No `OpManager` means no `run_executor_subscribe` ran, so no
+                // refcount was taken and there is nothing to record. Reachable
+                // only from a test executor built without one.
+                tracing::debug!(
+                    contract = %pending.contract_id,
+                    delegate_key = %delegate_key,
+                    "Delegate subscribe resolved on an executor with no OpManager; \
+                     no local interest was taken, so none is recorded (#5542)"
+                );
+            }
+        }
+        tracing::debug!(
+            contract = %pending.contract_id,
+            delegate_key = %delegate_key,
+            "Delegate subscribed to a contract this node had not seen: body \
+             bootstrapped, network subscription established, demand registered \
+             and the notification hook installed (#5542)"
+        );
+    }
+    contract_op_response_msg(pending.kind, pending.contract_id, pending.context, outcome)
+}
+
+/// Run one delegate-originated network operation, OFF the serial loop (#5542).
+///
+/// Both entry points are the node-internal ones that already exist and already
+/// take a bare `ContractInstanceId`, which is all a delegate has:
+///
+/// * GET -> `start_sub_op_get(.., return_contract_code: true)`. The code is
+///   requested so the contract arrives complete and the full `ContractKey` can
+///   be formed locally, which is what makes the delegate's next operation on
+///   that contract an ordinary local hit.
+/// * SUBSCRIBE -> `run_executor_subscribe`, which bootstraps the body,
+///   registers demand and establishes the network subscription. NOT the client
+///   `Get { subscribe: true }` path: that one needs a subscription listener
+///   channel, a client id and a request id, none of which a delegate has.
+///
+/// No timeout of its own. The caller wraps the whole off-loop body in
+/// `PARK_WORK_BUDGET` (75 s, under `PARK_TTL`), so an operation that outruns
+/// the budget is reported as unresolved by the `ParkGuard` and the delegate is
+/// told. A sub-op GET whose receiver is dropped that way continues in the
+/// background until `OPERATION_TTL` and leaks nothing; the same is already true
+/// of `Executor::local_state_or_from_network`.
+///
+/// RESIDUAL, on the SUBSCRIBE branch, and it is NARROWER than it first looks —
+/// but only because the broader case is now actually fixed, so read both halves
+/// before concluding anything from this note.
+///
+/// `run_executor_subscribe` reaches `finalize_originator_subscribe`, whose last
+/// side effects are `interest_manager.add_local_client` (a per-contract
+/// REFCOUNT, taking no client id, explicitly non-idempotent) and then
+/// `broadcast_change_interests`.
+///
+/// The BROAD case — that nothing on any delegate path could ever decrement what
+/// this takes, so the three ordinary paths that drop a delegate subscription
+/// left the interest standing forever — is closed by
+/// `wasm_runtime::delegate_interest`, which records the obligation at the point
+/// the caller installs the subscription hook and discharges it at all three
+/// removal sites. An earlier version of this note reasoned only about the
+/// cancellation window below and ASSUMED the success path was balanced. It was
+/// not; the balancing decrement is the client-disconnect sweep, and a delegate
+/// never reaches it.
+///
+/// What remains: cancelling the future BETWEEN `add_local_client` and its
+/// return takes the refcount while this reports `Failed`, so the caller
+/// installs no hook and records no obligation, and a later retry takes a second
+/// refcount for one logical subscriber. Still not compensated for, and for an
+/// unchanged reason: this side of the call cannot tell whether
+/// `add_local_client` ran, so a decrement on the wrong branch would release
+/// interest some OTHER subscriber holds — strictly worse than the leak.
+/// Closing it means making the registration transactional inside `subscribe`,
+/// which is a change to that operation rather than to this caller. The window
+/// is the tail of a 75 s budget and each occurrence costs one unreleased
+/// interest entry.
+async fn run_contract_op_off_loop(
+    op_manager: std::sync::Arc<crate::node::OpManager>,
+    pending: &delegate_park::PendingContractOp,
+) -> delegate_park::ContractOpOutcome {
+    use delegate_park::{ContractOpKind, ContractOpOutcome};
+    match pending.kind {
+        ContractOpKind::Get => {
+            let (_tx, rx) = crate::operations::get::op_ctx_task::start_sub_op_get(
+                &op_manager,
+                pending.contract_id,
+                /* return_contract_code */ true,
+            );
+            match rx.await {
+                Ok(crate::operations::get::op_ctx_task::SubOpGetOutcome::Found(result)) => {
+                    ContractOpOutcome::Fetched(Some(result.state))
+                }
+                Ok(crate::operations::get::op_ctx_task::SubOpGetOutcome::NotFound(reason)) => {
+                    tracing::debug!(
+                        contract = %pending.contract_id,
+                        %reason,
+                        "Delegate network GET: contract not found on the network"
+                    );
+                    ContractOpOutcome::Fetched(None)
+                }
+                Ok(crate::operations::get::op_ctx_task::SubOpGetOutcome::Infra(err)) => {
+                    ContractOpOutcome::Failed(err.to_string())
+                }
+                Err(_) => ContractOpOutcome::Failed("sub-op GET task dropped".to_string()),
+            }
+        }
+        ContractOpKind::Subscribe => {
+            let executor_tx =
+                crate::message::Transaction::new::<crate::operations::subscribe::SubscribeMsg>();
+            match crate::operations::subscribe::run_executor_subscribe(
+                op_manager,
+                pending.contract_id,
+                executor_tx,
+            )
+            .await
+            {
+                Ok(()) => ContractOpOutcome::Subscribed,
+                Err(err) => ContractOpOutcome::Failed(err.to_string()),
+            }
+        }
+    }
+}
+
 /// Drive the permission prompts for one delegate iteration and build the
 /// `UserResponse` messages to feed back.
 ///
@@ -761,6 +1221,22 @@ struct RunSeed {
     /// and legitimately starts a fresh count — see the constant's rustdoc, and
     /// #5558 for the separate gap that leaves open.
     iterations: usize,
+    /// Fire-and-forget self-heal GETs already started, so
+    /// `MAX_NETWORK_CONTRACT_OPS_PER_PARK` bounds the whole round-trip and
+    /// neither a further iteration nor a park can reset it (#5542 finding B1).
+    ///
+    /// It rides HERE, beside `iterations`, because it is the same kind of
+    /// budget with the same failure mode, and that failure has already been
+    /// found and fixed once in this file under #5544 S1. Declared as a loop
+    /// local it reset on every one of up to `MAX_CONTRACT_REQUEST_ITERATIONS`
+    /// iterations, so the real ceiling was 100x the documented one.
+    ///
+    /// Scope boundary, the same one `iterations` carries and for the same
+    /// reason: this bounds a ROUND-TRIP, including across parks. A contract
+    /// NOTIFICATION is a genuinely new invocation and starts a fresh budget,
+    /// which is correct — and is also why #5558, a delegate notified of its own
+    /// writes, is a separate unbounded loop that this does not close.
+    self_heal_fetches_started: usize,
 }
 
 /// Outcome of one delegate run.
@@ -857,6 +1333,7 @@ where
     let RunSeed {
         accumulated: mut accumulated_messages,
         mut iterations,
+        mut self_heal_fetches_started,
     } = seed;
 
     loop {
@@ -1040,6 +1517,30 @@ where
         // node does not hold. Their network fetch is off-loaded with the rest of
         // this iteration's slow work rather than awaited here (#5544 stall 1).
         let mut deferred_upserts: Vec<delegate_park::PendingUpsert> = Vec::new();
+        // Delegate GET/SUBSCRIBE requests naming a contract this node has never
+        // seen. Off-loaded with the rest of this iteration's slow work for the
+        // same reason as `deferred_upserts` (#5542) — the work is a network
+        // operation and this is the serial loop.
+        let mut pending_contract_ops: Vec<delegate_park::PendingContractOp> = Vec::new();
+        // NOTE on `self_heal_fetches_started`: it is bound from `RunSeed` ABOVE
+        // this loop, deliberately. It counts the UPDATE arm's fire-and-forget
+        // self-heal GETs, which are not in `pending_contract_ops` because
+        // nothing parks them, and it shares the
+        // `MAX_NETWORK_CONTRACT_OPS_PER_PARK` budget with the parked ops so the
+        // documented node-wide ceiling of MAX_PARKED_DELEGATES (64) x 4 = 256
+        // is a statement about ALL delegate-originated network work.
+        //
+        // Declaring it here — inside the loop, as the first version of this fix
+        // did — reset it on every iteration and made the real ceiling 100x the
+        // documented one. Do NOT move it back; the parked half tolerates a
+        // loop-local count only because parking ends the run, and the self-heal
+        // half has no such serialisation.
+        //
+        // Whether this executor can reach the network at all. `None` on the
+        // mock/in-process executors used by unit tests and by
+        // `handle_delegate_notification`'s test seams; those keep the
+        // pre-#5542 local-only answers rather than pretending to have tried.
+        let can_reach_network = contract_handler.executor().op_manager_handle().is_some();
 
         // Process PUT requests (fire-and-forget: upsert state, send result back).
         // This calls upsert_contract_state which stores locally AND automatically
@@ -1160,10 +1661,27 @@ where
                 let contract_id = req.contract_id;
                 let context = req.context;
 
-                // Look up the full key from the instance id
-                let state = match contract_handler.executor().lookup_key(&contract_id) {
+                // LOCAL FIRST, and "local" means A STATE, not a known key.
+                //
+                // `lookup_key` answering `Some` says this node knows the
+                // contract's CODE; `fetch_contract` can still return
+                // `Ok((None, _))` for it, because the code and the state are
+                // separately present. That third shape is not a rare corner: it
+                // was observed on a live two-node run of
+                // `test_delegate_get_reaches_the_network_for_an_unseen_contract`,
+                // where the publishing peer's PUT had propagated the container
+                // to the delegate's node without its state, and it produced
+                // EXACTLY the #5542 symptom — a silent `state: None` the
+                // delegate cannot tell from an empty contract — while sailing
+                // past a fix that only handled the `lookup_key` miss.
+                //
+                // So all three local-miss shapes (no key, key but no state, key
+                // but a failing read) fall through to the same network path
+                // below. This mirrors `Executor::local_state_or_from_network`,
+                // which likewise treats a failed `state_store.get` as a miss
+                // rather than as an answer.
+                let local_state = match contract_handler.executor().lookup_key(&contract_id) {
                     Some(full_key) => {
-                        // Fetch the contract state
                         match contract_handler
                             .executor()
                             .fetch_contract(full_key, false)
@@ -1180,10 +1698,65 @@ where
                             }
                         }
                     }
+                    None => None,
+                };
+                let state = match local_state {
+                    Some(state) => Some(state),
                     None => {
-                        tracing::debug!(
+                        // #5542. The contract is not in the local store, which
+                        // until now ended the request: the delegate got
+                        // `state: None` and no attempt was ever made to reach
+                        // the network. That is what made a delegate's whole
+                        // reason for existing conditional on a browser tab
+                        // being open to prime the store first.
+                        //
+                        // NOT awaited here. This runs on the serial
+                        // `contract_handling` loop, and a sub-op GET runs to
+                        // SUB_OP_FETCH_TIMEOUT (120 s) — awaiting it inline
+                        // would freeze every GET, PUT, UPDATE, subscribe
+                        // registration and notification delivery on the node
+                        // for that long. Park instead and answer on the
+                        // resumed run, carrying the delegate's own
+                        // `DelegateContext` across the gap.
+                        if parking.is_some()
+                            && can_reach_network
+                            && !delegate_network_op_banned(contract_handler, &contract_id)
+                            && pending_contract_ops.len() + self_heal_fetches_started
+                                < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
+                        {
+                            pending_contract_ops.push(delegate_park::PendingContractOp {
+                                id: delegate_park::PendingContractOp::next_id(),
+                                contract_id,
+                                kind: delegate_park::ContractOpKind::Get,
+                                context,
+                            });
+                            continue;
+                        }
+                        // REFUSED, never run inline: see
+                        // `MAX_NETWORK_CONTRACT_OPS_PER_PARK` and #5544's note
+                        // at its own park-cap fallback, which says in terms
+                        // that the fallback is not inheritable by a delegate
+                        // operation that reaches the network.
+                        //
+                        // The refusal is INVISIBLE TO THE DELEGATE, and that is
+                        // a real limitation rather than an oversight:
+                        // `GetContractResponse` carries `Option<WrappedState>`
+                        // and no error channel, so a refusal, a network
+                        // NotFound and an unreachable network are all `None`.
+                        // Fixing that is #5542 scope item 4 and needs a
+                        // freenet-stdlib wire change; faking a distinction here
+                        // would be worse than naming the gap.
+                        tracing::warn!(
                             contract = %contract_id,
-                            "Contract not found locally for delegate GetContractRequest"
+                            delegate_key = %delegate_key,
+                            can_reach_network,
+                            parking = parking.is_some(),
+                            inflight = pending_contract_ops.len(),
+                            "Refusing a delegate GET for a contract this node has \
+                             not seen: no network reach, or past \
+                             MAX_NETWORK_CONTRACT_OPS_PER_PARK. Answering with \
+                             `state: None`, which the delegate cannot tell from \
+                             a genuine NotFound (#5542 scope item 4)"
                         );
                         None
                     }
@@ -1319,14 +1892,92 @@ where
                         }
                     }
                     None => {
+                        // #5542 scope item 3, DECIDED rather than left to fall
+                        // out of the implementation.
+                        //
+                        // A delegate UPDATE for a contract this node does not
+                        // hold keeps FAILING -- and now ALSO self-heals in the
+                        // background, so the delegate's retry succeeds. That is
+                        // not a compromise between the two obvious options; it
+                        // is the contract a CLIENT UPDATE already has on this
+                        // node, and the reason to match it is that a delegate
+                        // should not be a second-class client.
+                        //
+                        // The client path (`operations/update.rs`, the
+                        // `phase = "auto_fetch_originator"` site) fails the
+                        // UPDATE and calls `try_auto_fetch_contract` with
+                        // `AutoFetchReason::Originator`, which is deliberately
+                        // NOT gated on `contract_in_use` -- "suppressing it
+                        // would strand the client's UPDATE behind a contract
+                        // that never gets fetched". A delegate is a local
+                        // originator with something waiting on the retry, which
+                        // is exactly the case that reason exists for.
+                        //
+                        // Why a SIBLING helper and not that function: it needs a
+                        // `sender_addr` to resolve a first-hop peer, and a
+                        // delegate UPDATE has no sender -- the delegate is the
+                        // originator, here. Handing it an address that resolves
+                        // to nothing makes it log, release its cooldown slot and
+                        // return, i.e. a silent no-op. It also takes a
+                        // `&ContractKey`, which a delegate cannot construct for
+                        // a contract it has never seen. See
+                        // `try_self_heal_fetch_for_local_originator`.
+                        //
+                        // NOT bootstrapped inline, and not parked like GET and
+                        // SUBSCRIBE. Bootstrapping would widen a delegate's
+                        // write reach in one step from "contracts this node
+                        // already holds" to "any contract in the keyspace,
+                        // named by instance id alone", on the same change that
+                        // first gives delegates network reach at all and before
+                        // #5543's containment ladder exists. PUT is not
+                        // comparable: it carries its own code, so a delegate can
+                        // only PUT contracts it can build.
+                        // Charged against the SAME per-round-trip budget as the
+                        // parked GET/SUBSCRIBE ops (finding 5A; see
+                        // `self_heal_fetches_started`). Past the budget the
+                        // UPDATE still fails with the message below, exactly as
+                        // it does when the cooldown suppresses the fetch — the
+                        // delegate is never told a repair is running when none
+                        // is.
+                        let within_fanout_budget = pending_contract_ops.len()
+                            + self_heal_fetches_started
+                            < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK;
+                        let healing = can_reach_network
+                            && within_fanout_budget
+                            && contract_handler.executor().op_manager_handle().is_some_and(
+                                |op_manager| {
+                                    op_manager.try_self_heal_fetch_for_local_originator(contract_id)
+                                },
+                            );
+                        if healing {
+                            self_heal_fetches_started += 1;
+                        }
                         tracing::debug!(
                             contract = %contract_id,
+                            healing,
                             "Contract not found locally for delegate UpdateContractRequest"
                         );
+                        // The message states the TIMESCALE, because the shared
+                        // cooldown is 5 minutes and a delegate that retries once
+                        // and gives up would otherwise be told to retry with no
+                        // idea that the answer may not be ready yet. When the
+                        // fetch was suppressed by that cooldown, say so rather
+                        // than promising a repair that is not running.
+                        let detail = if healing {
+                            "contract not known to this node; a background fetch has been \
+                             started, so retry shortly. GET or SUBSCRIBE it first to wait \
+                             for it deterministically (#5542)"
+                        } else {
+                            "contract not known to this node and no background fetch was \
+                             started (already attempted within the last 5 minutes, too many \
+                             delegate network operations already in flight, this node has no \
+                             network handle, or it has no connections). GET or SUBSCRIBE it \
+                             first (#5542)"
+                        };
                         inbound_responses.push(InboundDelegateMsg::UpdateContractResponse(
                             UpdateContractResponse {
                                 contract_id,
-                                result: Err("Contract not found".to_string()),
+                                result: Err(detail.to_string()),
                                 context,
                             },
                         ));
@@ -1361,9 +2012,13 @@ where
         // 1. V2 delegates: subscribe_contract() host function (native_api.rs) registers
         //    during WASM execution and returns success/error synchronously.
         // 2. V1 delegates: emit SubscribeContractRequest in process() outbound, handled here.
-        // Both paths are idempotent — inserting the same (contract_id, delegate_key) twice
-        // is a no-op on the HashSet. After registration, the delegate receives
-        // ContractNotification messages when the subscribed contract's state changes.
+        // Re-asserting an ESTABLISHED subscription is idempotent: `already_subscribed`
+        // short-circuits it and the registry insert is a no-op. Two subscribes for the
+        // same NOT-yet-established contract in ONE invocation are not: the first is
+        // parked and the second is refused, naming that reason, because parking both
+        // would take two interest refcounts for one logical subscriber (#5542 M2).
+        // After registration, the delegate receives ContractNotification messages when
+        // the subscribed contract's state changes.
         //
         // TODO(#2830): UnsubscribeContractRequest is not yet handled. Delegates can
         // only unsubscribe implicitly via UnregisterDelegate cleanup.
@@ -1378,25 +2033,242 @@ where
                 let contract_id = req.contract_id;
                 let context = req.context;
 
-                // Validate contract existence before registering (matches V2 host function behavior)
-                let result = if contract_handler
-                    .executor()
-                    .lookup_key(&contract_id)
-                    .is_some()
-                {
-                    // Register subscription in the global registry
-                    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-                        .entry(contract_id)
-                        .or_default()
-                        .insert(delegate_key.clone());
-                    Ok(())
-                } else {
-                    tracing::debug!(
-                        contract = %contract_id,
-                        "Contract not found locally for delegate SubscribeContractRequest"
-                    );
-                    Err("Contract not found".to_string())
+                // Same "local means A STATE, not a known key" test as the GET
+                // arm above, and for the same reason. Gating on `lookup_key`
+                // alone let a node that holds the contract's CODE but none of
+                // its state register the notification hook and answer `Ok`,
+                // taking no network subscription — so the delegate believed it
+                // was subscribed to a contract this node could not tell it
+                // anything about. That is the silent-on-both-sides failure
+                // #5467 describes, reachable without the local store being
+                // empty at all.
+                // The full key when this node holds BOTH the code and a state
+                // for it; `None` on all three local-miss shapes. Carried rather
+                // than reduced to a bool because the local branch below now
+                // needs the key to register demand (#5542 finding M4/F3).
+                let local_key = match contract_handler.executor().lookup_key(&contract_id) {
+                    Some(full_key) => contract_handler
+                        .executor()
+                        .fetch_contract(full_key, false)
+                        .await
+                        .ok()
+                        .and_then(|(state, _)| state.map(|_| full_key)),
+                    None => None,
                 };
+                // ORDER MATTERS: `already_subscribed` is tested FIRST, ahead of
+                // the local branch. It used to come second, which was harmless
+                // only while the local branch took no refcount. Now that it
+                // does, testing it second would let a delegate re-subscribing
+                // to a LOCAL contract take a fresh refcount on every repeat —
+                // the unbounded-demand failure this gate exists to prevent,
+                // reintroduced on the other branch.
+                // Computed ONCE for the whole arm, and consulted before the
+                // local branch as well as the network one (#5542 finding N2).
+                //
+                // B2 gated the three paths that reach the network. M4 then added
+                // an interest registration to the LOCAL branch, which emitted
+                // nothing when B2 was written, and it inherited no gate. That
+                // branch calls `broadcast_change_interests`, which is a real
+                // outbound wire effect: `operations.rs` -> `p2p_protoc.rs` ->
+                // `broadcast.rs` builds an `InterestSync { ChangeInterests }`
+                // and sends it to every connected peer, who then record this
+                // node as interested and add it to their UPDATE and
+                // summary/delta fan-out targets. The node would be soliciting
+                // inbound traffic for a contract it has banned, which is the
+                // narrow claim `contract_ban_list.rs` makes in as many words
+                // ("refuse to register interest").
+                //
+                // `add_local_client` also outlives the message: it is the
+                // refcount subscriber-primary eviction ranks on (hosting
+                // invariant 3), so leaving it ungated lets a delegate pin a
+                // banned contract resident indefinitely — against the strongest
+                // signal the node has that it wants the contract gone.
+                //
+                // Gated HERE and not downstream because by
+                // `handle_broadcast_change_interests` the payload is
+                // `Vec<u32>` interest hashes and the `ContractInstanceId` is
+                // gone.
+                let op_manager_for_gate = contract_handler.executor().op_manager_handle();
+                let banned = delegate_network_op_banned(contract_handler, &contract_id);
+                let result =
+                    if already_subscribed(&contract_id, delegate_key, op_manager_for_gate.as_ref())
+                    {
+                        // ALREADY HELD, so re-asserting it must be a no-op.
+                        //
+                        // This gate is load-bearing and is not obvious from the
+                        // code it guards. Both the network path and (since M4) the
+                        // local path end in `InterestManager::add_local_client`,
+                        // which is a REFCOUNT and is explicitly NOT idempotent (see
+                        // the `!is_renewal` gate at `operations/subscribe.rs`).
+                        // `DELEGATE_SUBSCRIPTIONS` is a map keyed by delegate, so
+                        // the pre-#5542 arm was idempotent for free and a delegate
+                        // re-subscribing in a loop cost nothing. Without this gate
+                        // each repeat takes another interest refcount for one
+                        // logical subscriber: demand that is never released,
+                        // growing without bound, on the exact path #5467 exists to
+                        // make trustworthy.
+                        Ok(())
+                    } else if banned {
+                        // Every subscribe path refuses a banned contract, local or
+                        // network. Before this the local branch answered `Ok` and
+                        // advertised interest for it.
+                        tracing::warn!(
+                            contract = %contract_id,
+                            delegate_key = %delegate_key,
+                            "Refusing a delegate SUBSCRIBE for a contract this node \
+                             has banned (#5542 finding N2)"
+                        );
+                        Err("this node has banned this contract (#5542)".to_string())
+                    } else if let Some(full_key) = local_key {
+                        // Contract is local, WITH state. Register the notification
+                        // hook — and register DEMAND, which this branch did not do
+                        // before (#5542 finding M4/F3).
+                        //
+                        // Without demand the copy is a zero-subscriber cached
+                        // contract, so under subscriber-primary eviction (hosting
+                        // invariant 3) it is the FIRST victim once capacity binds.
+                        // Eviction reclaims disk through
+                        // `ContractStore::remove_contract`, which wipes the
+                        // registry entry and releases any hold — and the delegate is
+                        // never told. That is #5467's silent-on-both-sides failure
+                        // on the branch this PR left unchanged, and it is the COMMON
+                        // case, because any client that has ever touched the
+                        // contract puts the node on this branch.
+                        //
+                        // This is also what the PR's own argument demands. It says
+                        // three things have to happen together — bootstrap the body,
+                        // register demand so the contract is not evicted out from
+                        // under the subscription, and establish the subscription.
+                        // On this branch the body is already here and the node is
+                        // already in the mesh for it, so item 2 was the only one
+                        // missing.
+                        let interest_registered =
+                            match contract_handler.executor().op_manager_handle() {
+                                Some(op_manager) => {
+                                    if op_manager.interest_manager.add_local_client(&full_key) {
+                                        crate::operations::broadcast_change_interests(
+                                            &op_manager,
+                                            vec![full_key],
+                                            vec![],
+                                        )
+                                        .await;
+                                    }
+                                    crate::wasm_runtime::delegate_interest::record(
+                                        contract_id,
+                                        delegate_key.clone(),
+                                        full_key,
+                                        delegate_interest_release_closure(&op_manager),
+                                        op_manager.node_identity,
+                                    );
+                                    true
+                                }
+                                // No `OpManager` means no eviction pressure worth
+                                // guarding against either: this is a mock/in-process
+                                // executor, so keep the pre-#5542 local-only answer.
+                                None => false,
+                            };
+                        tracing::debug!(
+                            contract = %contract_id,
+                            delegate_key = %delegate_key,
+                            interest_registered,
+                            "Delegate subscribed to a contract this node already holds"
+                        );
+                        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+                            .entry(contract_id)
+                            .or_default()
+                            .insert(delegate_key.clone());
+                        Ok(())
+                    } else if parking.is_some()
+                        && can_reach_network
+                        && !banned
+                        && pending_contract_ops.len() + self_heal_fetches_started
+                            < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
+                        && !pending_contract_ops.iter().any(|op| {
+                            op.contract_id == contract_id
+                                && op.kind == delegate_park::ContractOpKind::Subscribe
+                        })
+                    {
+                        // #5542. Subscribing to a contract this node has never seen
+                        // is the PRIMARY use case, not an edge case: a delegate that
+                        // wants to learn about a per-address contract after the tab
+                        // is closed has no other way to name it.
+                        //
+                        // OPENING THIS GATE ALONE WOULD SHIP THE FEATURE SILENT.
+                        // The arm above does one thing — insert into
+                        // `DELEGATE_SUBSCRIPTIONS` — which is a local notification
+                        // hook that nothing in `ring/` reads. It establishes no
+                        // network subscription, so a delegate would subscribe
+                        // successfully to a contract it has never seen and then
+                        // never hear anything, which is #5467's silent-on-both-sides
+                        // failure reintroduced one layer up. Three things have to
+                        // happen together, and `run_executor_subscribe` is chosen
+                        // because it is the one entry point that does all three:
+                        //
+                        //   1. bootstrap the contract body
+                        //      (`finalize_originator_subscribe` ->
+                        //      `fetch_contract_if_missing` -> `start_sub_op_get`),
+                        //   2. register demand (`interest_manager.add_local_client`,
+                        //      so the contract is kept alive rather than evicted out
+                        //      from under the subscription),
+                        //   3. establish the real network subscription.
+                        //
+                        // The notification hook (the `DELEGATE_SUBSCRIPTIONS`
+                        // insert) is then done on the loop when the park resumes, and
+                        // ONLY on success — so a failed subscribe leaves no hook
+                        // claiming a delivery path that does not exist.
+                        //
+                        // The last conjunct de-duplicates WITHIN this round trip;
+                        // `already_subscribed` covers repeats ACROSS round trips.
+                        // Both are needed for the refcount argument above to hold.
+                        pending_contract_ops.push(delegate_park::PendingContractOp {
+                            id: delegate_park::PendingContractOp::next_id(),
+                            contract_id,
+                            kind: delegate_park::ContractOpKind::Subscribe,
+                            context,
+                        });
+                        continue;
+                    } else {
+                        // REFUSED, never inline — same rule as the GET arm above.
+                        // Unlike GET, `SubscribeContractResponse.result` is a
+                        // `Result<(), String>`, so this refusal IS visible to the
+                        // delegate and says which of the three reasons it was.
+                        let why = if !can_reach_network {
+                            "this node has no network handle"
+                        } else if parking.is_none() {
+                            "delegate parking is unavailable on this executor"
+                        } else if pending_contract_ops.iter().any(|op| {
+                            op.contract_id == contract_id
+                                && op.kind == delegate_park::ContractOpKind::Subscribe
+                        }) {
+                            // #5542 finding M2. A delegate that emits two SUBSCRIBEs
+                            // for the same unseen contract in ONE invocation gets an
+                            // error for the second and a success for the first,
+                            // where the pre-#5542 `HashSet` arm was idempotent. The
+                            // duplicate cannot simply be answered `Ok`: nothing is
+                            // subscribed yet, and saying so before the network
+                            // subscribe exists is the lie #5263 removed from this
+                            // path. Nor can it be parked twice: two
+                            // `PendingContractOp`s for one pair would take two
+                            // interest refcounts for one logical subscriber. So it
+                            // is refused, but refused HONESTLY — the old text
+                            // blamed the fan-out cap, which was simply untrue.
+                            "a subscribe for this contract is already in flight in \
+                         this invocation; its response answers both"
+                        } else {
+                            "too many delegate network operations already in flight \
+                         (MAX_NETWORK_CONTRACT_OPS_PER_PARK)"
+                        };
+                        tracing::warn!(
+                            contract = %contract_id,
+                            delegate_key = %delegate_key,
+                            why,
+                            "Refusing a delegate SUBSCRIBE for a contract this node \
+                             has not seen (#5542)"
+                        );
+                        Err(format!(
+                            "cannot subscribe to a contract this node has not seen: {why}"
+                        ))
+                    };
 
                 inbound_responses.push(InboundDelegateMsg::SubscribeContractResponse(
                     SubscribeContractResponse {
@@ -1624,11 +2496,15 @@ where
         // `process_outbound` and the WASM `process()` call has returned — and
         // the deferrable upsert has already rolled back its partial work. All
         // that is needed is to re-enter the delegate when the results arrive.
-        if !user_input_requests.is_empty() || !deferred_upserts.is_empty() {
+        if !user_input_requests.is_empty()
+            || !deferred_upserts.is_empty()
+            || !pending_contract_ops.is_empty()
+        {
             tracing::debug!(
                 delegate_key = %delegate_key,
                 prompts = user_input_requests.len(),
                 deferred_upserts = deferred_upserts.len(),
+                network_contract_ops = pending_contract_ops.len(),
                 "Off-loading slow delegate work from the contract-handling loop"
             );
 
@@ -1649,9 +2525,11 @@ where
                     inter_delegate,
                     accumulated: std::mem::take(&mut accumulated_messages),
                     inbound_so_far: std::mem::take(&mut inbound_responses),
-                    // Carry the count so the cap bounds the ROUND-TRIP, not
-                    // each leg (#5544 S1).
+                    // Carry the counts so the caps bound the ROUND-TRIP, not
+                    // each leg (#5544 S1 for iterations; #5542 finding B1 for
+                    // the fan-out budget).
                     iterations,
+                    self_heal_fetches_started,
                     // Attached by the caller right after we return `Parked` (it
                     // owns the channel), or carried straight through if this run
                     // is itself a resume that is parking again.
@@ -1662,7 +2540,11 @@ where
                 // continuation points at: the prompts and the deferred upserts
                 // live for exactly as long as the park, and a single upsert can
                 // own a full state plus related contracts plus code.
-                let task_bytes = delegate_park::task_bytes(&user_input_requests, &deferred_upserts);
+                let task_bytes = delegate_park::task_bytes(
+                    &user_input_requests,
+                    &deferred_upserts,
+                    &pending_contract_ops,
+                );
                 match ctx
                     .park
                     .park(delegate_key.clone(), continuation, task_bytes)
@@ -1678,6 +2560,20 @@ where
                             .iter()
                             .map(|u| (*u.key.id(), u.is_put))
                             .collect();
+                        // Third owed category (#5542). Same discipline as the
+                        // two above: what the park OWES is recorded here, so
+                        // the guard can synthesize a terminal response on
+                        // EVERY exit — including a panic or cancellation, which
+                        // reach `Drop` and never run the task's own cleanup.
+                        let owed_contract_ops: Vec<(
+                            u64,
+                            ContractInstanceId,
+                            delegate_park::ContractOpKind,
+                            DelegateContext,
+                        )> = pending_contract_ops
+                            .iter()
+                            .map(|op| (op.id, op.contract_id, op.kind, op.context.clone()))
+                            .collect();
                         // SINKS CREATED BEFORE THE GUARD, AND SHARED WITH IT
                         // (#5544 F2). They used to be created inside the
                         // spawned future, so `ParkGuard::drop` could not see
@@ -1692,6 +2588,9 @@ where
                         let fetch_sink: std::sync::Arc<
                             std::sync::Mutex<Vec<delegate_park::ResolvedUpsert>>,
                         > = Default::default();
+                        let net_op_sink: std::sync::Arc<
+                            std::sync::Mutex<Vec<delegate_park::ResolvedContractOp>>,
+                        > = Default::default();
                         let guard = delegate_park::ParkGuard::new(
                             ctx.park.resume_tx().clone(),
                             delegate_key.clone(),
@@ -1700,12 +2599,15 @@ where
                             owed_upserts,
                             answers_sink.clone(),
                             fetch_sink.clone(),
+                            owed_contract_ops,
+                            net_op_sink.clone(),
                         );
                         let prompter = std::sync::Arc::clone(prompter);
                         let key = delegate_key.clone();
                         let op_manager = contract_handler.executor().op_manager_handle();
                         let prompts = std::mem::take(&mut user_input_requests);
                         let upserts = std::mem::take(&mut deferred_upserts);
+                        let net_ops = std::mem::take(&mut pending_contract_ops);
                         // Fire-and-forget is safe precisely because of the
                         // guard: it delivers exactly one resume even if this
                         // task is dropped, panics or is cancelled, so the park
@@ -1739,10 +2641,54 @@ where
                                             pending.missing.clone(),
                                         )
                                         .await;
-                                        sink.lock().unwrap().push(delegate_park::ResolvedUpsert {
-                                            pending,
-                                            fetched,
-                                        });
+                                        sink.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                            delegate_park::ResolvedUpsert { pending, fetched },
+                                        );
+                                    }
+                                }))
+                                .await;
+                            };
+                            // Delegate GET/SUBSCRIBE that must reach the network
+                            // (#5542). Concurrent with the prompts and the
+                            // related fetches, and under the same
+                            // PARK_WORK_BUDGET: run sequentially they could sum
+                            // past PARK_TTL, at which point the loop's backstop
+                            // would force-resume while this task was still
+                            // running and discard its result.
+                            //
+                            // Results land in the SHARED sink as they complete,
+                            // not at the end, so a budget expiry or a panic
+                            // still delivers the ones that finished — the same
+                            // reason the two sinks above are shared with the
+                            // guard (#5544 F2).
+                            let network_ops = async {
+                                let op_manager = op_manager.clone();
+                                futures::future::join_all(net_ops.into_iter().map(|pending| {
+                                    let op_manager = op_manager.clone();
+                                    let sink = net_op_sink.clone();
+                                    async move {
+                                        let Some(op_manager) = op_manager else {
+                                            // Unreachable: the arms only enqueue
+                                            // when `can_reach_network`. Recorded
+                                            // as a failure rather than dropped,
+                                            // so the delegate is told either way.
+                                            sink.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                                delegate_park::ResolvedContractOp {
+                                                    outcome:
+                                                        delegate_park::ContractOpOutcome::Failed(
+                                                            "no op manager on this executor"
+                                                                .to_string(),
+                                                        ),
+                                                    pending,
+                                                },
+                                            );
+                                            return;
+                                        };
+                                        let outcome =
+                                            run_contract_op_off_loop(op_manager, &pending).await;
+                                        sink.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                            delegate_park::ResolvedContractOp { pending, outcome },
+                                        );
                                     }
                                 }))
                                 .await;
@@ -1762,7 +2708,7 @@ where
                             };
                             let done =
                                 tokio::time::timeout(delegate_park::PARK_WORK_BUDGET, async {
-                                    tokio::join!(answers, fetches)
+                                    tokio::join!(answers, fetches, network_ops)
                                 })
                                 .await;
                             // The guard reads the sinks itself, so this path
@@ -1802,11 +2748,37 @@ where
                         accumulated_messages = continuation.accumulated;
                         inbound_responses = continuation.inbound_so_far;
                         iterations = continuation.iterations;
+                        self_heal_fetches_started = continuation.self_heal_fetches_started;
                         *ctx.carried_responder = continuation.responder;
                     }
                 }
             }
 
+            // #5542 network operations are REFUSED here, never run inline —
+            // the one place this function's inline fallback does not apply, and
+            // the park-cap fallback below says why in its own comment: a
+            // delegate GET or SUBSCRIBE awaited on this loop is a network
+            // operation of up to 120 s, not a self-inflicted 10-60 s local
+            // wait. Refusing loudly is the whole point; dropping them would
+            // leave the delegate waiting for a response nobody would send.
+            for pending in std::mem::take(&mut pending_contract_ops) {
+                tracing::warn!(
+                    contract = %pending.contract_id,
+                    delegate_key = %delegate_key,
+                    "Delegate network contract operation refused: no park was \
+                     available (cap reached, or no parking context). Refused \
+                     rather than awaited on the serial loop (#5542)"
+                );
+                let msg = contract_op_response_msg(
+                    pending.kind,
+                    pending.contract_id,
+                    pending.context,
+                    delegate_park::ContractOpOutcome::Failed(
+                        "no delegate park available for a network contract operation".to_string(),
+                    ),
+                );
+                inbound_responses.push(msg);
+            }
             // Inline fallback: no parking context (direct unit-test calls), or
             // the park cap was hit.
             for pending in std::mem::take(&mut deferred_upserts) {
@@ -2077,6 +3049,8 @@ where
                     // own guard still fires and is rejected on epoch, so
                     // nothing is answered twice.
                     unresolved_upserts: Vec::new(),
+                    contract_ops: Vec::new(),
+                    unresolved_contract_ops: Vec::new(),
                 },
             )
             .await;
@@ -3420,6 +4394,8 @@ where
         inbound,
         upserts,
         unresolved_upserts,
+        contract_ops,
+        unresolved_contract_ops,
     } = resume;
 
     let Some((continuation, pending)) = park.take_matching(&delegate_key, epoch) else {
@@ -3440,6 +4416,32 @@ where
             "Resume for a park that no longer exists (force-resumed by the TTL \
              backstop, or already ended) — dropping"
         );
+        // DISCHARGE WHAT THE DROPPED OPS ALREADY TOOK (#5542 finding B3).
+        //
+        // Dropping the resume drops `contract_ops` with it, so
+        // `apply_resolved_contract_op` never runs and
+        // `delegate_interest::record` never runs. But a `Subscribed` outcome
+        // means `run_executor_subscribe` ALREADY called `add_local_client` —
+        // on the network path via `finalize_originator_subscribe`, or directly
+        // on the local-hit path. With no hold recorded, `release_delegate` and
+        // `release_contract` have nothing to discharge, so that refcount is
+        // stranded permanently: exactly the leak `wasm_runtime::delegate_interest`
+        // exists to close, arriving through a door this PR opened.
+        //
+        // Give it back directly rather than recording a hold and installing the
+        // notification hook. Absorbing would keep a live network subscription,
+        // which is tempting, but per-delegate exclusion queues an
+        // `UnregisterDelegate` BEHIND the park, so by the time a late resume
+        // arrives the delegate may already be gone — and installing its hook
+        // then resurrects a subscription for a delegate that no longer exists.
+        //
+        // This cannot over-release. It fires only on `Subscribed`, which is the
+        // same evidence `record` itself uses, and it releases through the
+        // instance-only key for the reason given at
+        // `delegate_subscribe_interest_handle`: `ContractKey`'s `Hash`/`Eq` are
+        // instance-only, so it resolves exactly the entry `add_local_client`
+        // created.
+        release_stranded_subscribe_interest(contract_handler, &delegate_key, &contract_ops);
         return 0;
     };
     // The resumed run itself, plus one per pending request drained below.
@@ -3456,6 +4458,7 @@ where
 
     let delegate_park::Continuation {
         iterations,
+        self_heal_fetches_started,
         params,
         origin_contract,
         connection_scope,
@@ -3485,6 +4488,38 @@ where
             Err(ExecutorError::other(anyhow::anyhow!(
                 "delegate upsert did not complete: its off-loop work ended early"
             ))),
+        ));
+    }
+    // Delegate network GET/SUBSCRIBE results (#5542). Nothing has to be re-run
+    // on the loop for these — the network work is done — but a successful
+    // SUBSCRIBE installs its `DELEGATE_SUBSCRIPTIONS` hook here, on the loop and
+    // only on success, so the registry never advertises a delivery path that was
+    // never established.
+    for resolved in contract_ops {
+        all_inbound.push(apply_resolved_contract_op(
+            contract_handler,
+            resolved,
+            &delegate_key,
+        ));
+    }
+    // Network operations the off-loop task never resolved (panic, cancellation,
+    // budget). Same reasoning as the unresolved upserts above: the delegate is
+    // TOLD rather than left waiting. `DelegateContext` is defaulted because the
+    // `PendingContractOp` that carried it is gone by then.
+    for (contract_id, kind, context) in unresolved_contract_ops {
+        all_inbound.push(contract_op_response_msg(
+            kind,
+            contract_id,
+            // The delegate's OWN context, carried through the guard, not
+            // `default()` (#5542 finding F7). An empty context reads to a
+            // delegate state machine as "start over" rather than "this
+            // operation failed".
+            context,
+            delegate_park::ContractOpOutcome::Failed(
+                "delegate network contract operation did not complete: its \
+                 off-loop work ended early"
+                    .to_string(),
+            ),
         ));
     }
     all_inbound.extend(inbound);
@@ -3524,6 +4559,7 @@ where
             RunSeed {
                 accumulated,
                 iterations,
+                self_heal_fetches_started,
             },
         )
         .await
@@ -4549,8 +5585,17 @@ mod tests {
     ///    worse than no pin, because it reads as coverage.
     pub(super) fn production_code() -> String {
         let full = include_str!("contract.rs");
-        let prod = full.split("\nmod tests {").next().unwrap_or(full);
-        strip_comments(prod)
+        // `.expect`, not `.unwrap_or(full)`. Falling back to the whole file
+        // silently includes every test module, so each pin's own assertion
+        // literal can satisfy it and every pin here widens to vacuous with no
+        // signal at all. That happened during #5542's M1 work: `mod tests` was
+        // briefly renamed, this anchor stopped matching, and two pins went green
+        // over changes they exist to catch. Fail closed instead — a missing
+        // anchor is a broken pin, not a permissive one.
+        let cutoff = full
+            .find("\nmod tests {")
+            .expect("contract.rs must have a top-level `mod tests` for pins to cut at");
+        strip_comments(&full[..cutoff])
     }
 
     /// Remove `//` line comments and `/* */` block comments, preserving
@@ -4565,7 +5610,7 @@ mod tests {
     /// of that line is dropped; and Rust block comments nest, which this does
     /// not model. Either can only REMOVE text a pin looks for, turning a pin
     /// red rather than green — never the reverse.
-    pub(super) fn strip_comments(src: &str) -> String {
+    pub(crate) fn strip_comments(src: &str) -> String {
         enum S {
             Code,
             Line,
@@ -5873,6 +6918,21 @@ mod tests {
 // local-store-hit GETs that need no network at all. These tests drive the REAL
 // `contract_handling` loop and assert the fix off-loads that wait so unrelated
 // work keeps draining.
+/// Source-pin helpers shared with pins in OTHER modules (#5542 M1).
+///
+/// Declared here, AFTER `mod tests`, on purpose: everything before that anchor
+/// is what `tests::production_code` hands to a scrape, and a helper living
+/// inside that slice would add its own text to every pin's haystack.
+#[cfg(test)]
+pub(crate) mod source_pin_util {
+    /// See [`super::tests::strip_comments`]. Re-exported so a pin in another
+    /// module gets the same comment stripping rather than a third copy of it —
+    /// the copies are what drift.
+    pub(crate) fn strip_comments(src: &str) -> String {
+        super::tests::strip_comments(src)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::wildcard_enum_match_arm)]
 // These tests intentionally discard `JoinHandle`/`timeout` results in cleanup
@@ -7439,6 +8499,956 @@ mod hol_4391_tests {
         handle.abort();
     }
 
+    /// #5542. The mapping from a resolved network operation to the message the
+    /// delegate actually receives, covering every outcome including the ones
+    /// that cannot happen by construction.
+    ///
+    /// Pure and exhaustive on purpose: the off-loop task, the resume handler
+    /// and the `ParkGuard`'s panic path all funnel through this one function,
+    /// and the failure this pins is a failure arm quietly producing a SUCCESS
+    /// shape — telling a delegate its subscription is live when the node cannot
+    /// say that.
+    #[test]
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn contract_op_response_msg_maps_every_outcome() {
+        use delegate_park::{ContractOpKind, ContractOpOutcome};
+        let id = ContractInstanceId::new([4u8; 32]);
+        let ctx = DelegateContext::new(b"cont".to_vec());
+
+        let found = contract_op_response_msg(
+            ContractOpKind::Get,
+            id,
+            ctx.clone(),
+            ContractOpOutcome::Fetched(Some(WrappedState::new(b"hello".to_vec()))),
+        );
+        match found {
+            InboundDelegateMsg::GetContractResponse(r) => {
+                assert_eq!(r.state.as_deref(), Some(&b"hello"[..]));
+                assert_eq!(r.context.as_ref(), ctx.as_ref(), "context must round-trip");
+            }
+            other => panic!("a resolved GET must answer with GetContractResponse, got {other:?}"),
+        }
+
+        let get_failed = contract_op_response_msg(
+            ContractOpKind::Get,
+            id,
+            ctx.clone(),
+            ContractOpOutcome::Failed("boom".to_string()),
+        );
+        match get_failed {
+            InboundDelegateMsg::GetContractResponse(r) => {
+                assert!(r.state.is_none(), "a failed GET must not fabricate a state")
+            }
+            other => panic!("a failed GET must still answer the delegate, got {other:?}"),
+        }
+
+        let subscribed = contract_op_response_msg(
+            ContractOpKind::Subscribe,
+            id,
+            ctx.clone(),
+            ContractOpOutcome::Subscribed,
+        );
+        match subscribed {
+            InboundDelegateMsg::SubscribeContractResponse(r) => {
+                assert!(r.result.is_ok(), "a completed subscribe must report Ok")
+            }
+            other => panic!("expected SubscribeContractResponse, got {other:?}"),
+        }
+
+        let sub_failed = contract_op_response_msg(
+            ContractOpKind::Subscribe,
+            id,
+            ctx,
+            ContractOpOutcome::Failed("no hosting peers".to_string()),
+        );
+        match sub_failed {
+            InboundDelegateMsg::SubscribeContractResponse(r) => {
+                let err = r
+                    .result
+                    .expect_err("a failed subscribe MUST NOT be reported as success");
+                assert!(
+                    err.contains("no hosting peers"),
+                    "the delegate must be told WHY, got {err:?}"
+                );
+            }
+            other => panic!("expected SubscribeContractResponse, got {other:?}"),
+        }
+    }
+
+    /// #5542. The `DELEGATE_SUBSCRIPTIONS` hook is installed ONLY when the
+    /// network subscription actually succeeded.
+    ///
+    /// This is the concrete form of the warning on the issue: that map is a
+    /// local notification hook and nothing in `ring/` reads it, so a hook
+    /// installed for a subscription that never got established gives a delegate
+    /// that believes it is subscribed and then never hears anything — the
+    /// silent-on-both-sides failure, one layer up.
+    #[tokio::test]
+    async fn the_notification_hook_is_installed_only_on_a_successful_subscribe() {
+        use delegate_park::{
+            ContractOpKind, ContractOpOutcome, PendingContractOp, ResolvedContractOp,
+        };
+        let dkey = DelegateKey::new(
+            [21u8; 32],
+            freenet_stdlib::prelude::CodeHash::new([21u8; 32]),
+        );
+        let ok_id = ContractInstanceId::new([22u8; 32]);
+        let bad_id = ContractInstanceId::new([23u8; 32]);
+        // Global registry: use ids unique to this test so it does not race the
+        // rest of the suite.
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&ok_id);
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&bad_id);
+
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let _ = apply_resolved_contract_op(
+            &mut handler,
+            ResolvedContractOp {
+                pending: PendingContractOp {
+                    id: delegate_park::PendingContractOp::next_id(),
+                    contract_id: ok_id,
+                    kind: ContractOpKind::Subscribe,
+                    context: DelegateContext::default(),
+                },
+                outcome: ContractOpOutcome::Subscribed,
+            },
+            &dkey,
+        );
+        let _ = apply_resolved_contract_op(
+            &mut handler,
+            ResolvedContractOp {
+                pending: PendingContractOp {
+                    id: delegate_park::PendingContractOp::next_id(),
+                    contract_id: bad_id,
+                    kind: ContractOpKind::Subscribe,
+                    context: DelegateContext::default(),
+                },
+                outcome: ContractOpOutcome::Failed("network exhausted".to_string()),
+            },
+            &dkey,
+        );
+
+        assert!(
+            already_subscribed(&ok_id, &dkey, None),
+            "a successful subscribe must install the notification hook"
+        );
+        assert!(
+            !already_subscribed(&bad_id, &dkey, None),
+            "a FAILED subscribe must not install a hook: it would advertise a \
+             delivery path that was never established"
+        );
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&ok_id);
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&bad_id);
+    }
+
+    /// Build a real `OpManager` backed by a temp-dir `Config`, mirroring
+    /// `client_events::tests::build_op_manager`. The returned guard bundle
+    /// holds the channel endpoints open — drop it only when the test ends.
+    /// Like [`build_op_manager`] but hands back the event-loop notification
+    /// RECEIVER, so a test can assert on what the node actually emitted.
+    ///
+    /// That distinction matters for the ban gate: asserting the gate's source
+    /// text proves only that a call exists. `broadcast_change_interests` emits
+    /// `NodeEvent::BroadcastChangeInterests`, which `p2p_protoc` turns into an
+    /// `InterestSync { ChangeInterests }` sent to every connected peer, so the
+    /// event is the observable that corresponds to the wire effect.
+    async fn build_op_manager_with_events(
+        id: &str,
+    ) -> (
+        Arc<crate::node::OpManager>,
+        tokio::sync::mpsc::Receiver<
+            either::Either<crate::message::NetMessage, crate::message::NodeEvent>,
+        >,
+        Box<dyn std::any::Any>,
+    ) {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::dev_tool::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        let guards: Box<dyn std::any::Any> =
+            Box::new((ch_channel, wait_for_event, result_router_rx, task_monitor));
+        (op_manager, notification_rx.notifications_receiver, guards)
+    }
+
+    /// Whether a `BroadcastChangeInterests` was emitted, draining what is there.
+    fn emitted_change_interests(
+        rx: &mut tokio::sync::mpsc::Receiver<
+            either::Either<crate::message::NetMessage, crate::message::NodeEvent>,
+        >,
+    ) -> bool {
+        let mut seen = false;
+        while let Ok(item) = rx.try_recv() {
+            if matches!(
+                item,
+                either::Either::Right(crate::message::NodeEvent::BroadcastChangeInterests { .. })
+            ) {
+                seen = true;
+            }
+        }
+        seen
+    }
+
+    async fn build_op_manager(id: &str) -> (Arc<crate::node::OpManager>, Box<dyn std::any::Any>) {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::dev_tool::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+
+        let op_manager = Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+
+        let guards: Box<dyn std::any::Any> = Box::new((
+            notification_rx,
+            ch_channel,
+            wait_for_event,
+            result_router_rx,
+            task_monitor,
+        ));
+        (op_manager, guards)
+    }
+
+    /// #5542. The SUBSCRIBE arm's `already_subscribed` gate must be tested
+    /// BEFORE the local-state branch, and this pins that ordering.
+    ///
+    /// The ordering is load-bearing and looks stylistic, which is the worst
+    /// case in this class: the regression and the correct code are textually
+    /// identical, so a reviewer sees a rearrangement rather than a defect.
+    /// Before M4 the local branch took no refcount, so testing the gate second
+    /// was harmless. M4 made that branch call `add_local_client`, and
+    /// `add_local_client` is a per-contract refcount that is explicitly NOT
+    /// idempotent — so with the arms in the other order a delegate
+    /// re-subscribing to a contract this node HOLDS takes a fresh refcount on
+    /// every repeat, which is the unbounded-demand failure the gate exists to
+    /// prevent, arriving on the branch nobody was watching.
+    ///
+    /// Asserts the CONSEQUENCE rather than a counter: subscribe twice, release
+    /// once through the ordinary `UnregisterDelegate` path, and require the
+    /// interest to be gone. Two refcounts for one logical subscriber survive a
+    /// single release, and nothing in the tree can ever discharge the excess —
+    /// which is the harm, not the count.
+    #[tokio::test]
+    async fn re_subscribing_to_a_local_contract_takes_no_further_demand() {
+        use freenet_stdlib::prelude::{ContractCode, Parameters, WrappedContract};
+
+        let _guard = TEST_GUARD.lock().await;
+        let (op_manager, _guards) = build_op_manager("d5542-resub").await;
+        let (send, rcv_halve, _wait) = handler::contract_handler_channel();
+        let mut handler =
+            MockWasmContractHandler::new_test(rcv_halve, Some(op_manager.clone()), "d5542_resub")
+                .await;
+
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![0xD4u8; 32])),
+            Parameters::from(vec![]),
+        )));
+        let key = contract.key();
+
+        // The SAME contract, subscribed twice in one round trip.
+        let script = handler.runtime_mut().delegate_script.clone();
+        for _ in 0..2 {
+            script.lock().unwrap().push_back(
+                vec![OutboundDelegateMsg::SubscribeContractRequest(
+                    freenet_stdlib::prelude::SubscribeContractRequest::new(*key.id()),
+                )]
+                .into(),
+            );
+        }
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            },
+        ));
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            put_local(&send, contract, WrappedState::new(vec![7u8; 8])),
+        )
+        .await
+        .expect("PUT must not hang");
+        assert!(
+            matches!(resp, ContractHandlerEvent::PutResponse { .. }),
+            "expected a PutResponse, got {resp}"
+        );
+
+        let dkey = test_delegate_key();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            send.send_to_handler(delegate_event(&dkey)),
+        )
+        .await
+        .expect("the round trip must terminate");
+
+        assert!(
+            op_manager.interest_manager.has_local_interest(&key),
+            "the first subscribe must have registered demand, or this test \
+             proves nothing about the second"
+        );
+
+        // The ordinary removal path, exactly once.
+        crate::wasm_runtime::delegate_interest::release_delegate(&dkey);
+
+        assert!(
+            !op_manager.interest_manager.has_local_interest(&key),
+            "two subscribes to one local contract must hold ONE refcount, so a \
+             single release discharges it. Interest still standing means the \
+             repeat took a second refcount that nothing can ever give back — \
+             `already_subscribed` is being tested AFTER the local branch"
+        );
+
+        handle.abort();
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+    }
+
+    /// #5542 findings M4 and N2, together, because they are two halves of one
+    /// branch and neither was covered.
+    ///
+    /// M4 made the local-state SUBSCRIBE branch register DEMAND, without which
+    /// the copy is zero-subscriber and is the first eviction victim under
+    /// hosting invariant 3 — the delegate's subscription dies silently. N2 is
+    /// that M4's registration inherited no ban gate, on the PR that added one
+    /// to the three sibling paths.
+    ///
+    /// The negative asserts the EMISSION does not happen, not that the gate's
+    /// source text exists. `broadcast_change_interests` emits
+    /// `BroadcastChangeInterests`, which `p2p_protoc` turns into an
+    /// `InterestSync { ChangeInterests }` sent to every connected peer, who then
+    /// record this node as interested and add it to their UPDATE fan-out. A
+    /// source-text assertion cannot tell whether that reaches the wire.
+    #[tokio::test]
+    async fn a_banned_local_contract_registers_no_demand_and_advertises_nothing() {
+        use freenet_stdlib::prelude::{ContractCode, Parameters, WrappedContract};
+
+        let _guard = TEST_GUARD.lock().await;
+        let (op_manager, mut events, _guards) =
+            build_op_manager_with_events("d5542-n2-local").await;
+        let (send, rcv_halve, _wait) = handler::contract_handler_channel();
+        let mut handler = MockWasmContractHandler::new_test(
+            rcv_halve,
+            Some(op_manager.clone()),
+            "d5542_n2_local",
+        )
+        .await;
+
+        // Two contracts this node will HOLD, one of them banned. The keys are
+        // needed before the loop starts (to script the delegate), the PUTs need
+        // the loop running (they go through the handler channel), so build the
+        // contracts first and store them after the spawn.
+        let contracts: Vec<ContractContainer> = [0xC1u8, 0xC2u8]
+            .into_iter()
+            .map(|seed| {
+                ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+                    Arc::new(ContractCode::from(vec![seed; 32])),
+                    Parameters::from(vec![]),
+                )))
+            })
+            .collect();
+        let allowed_key = contracts[0].key();
+        let banned_key = contracts[1].key();
+        op_manager.ring.contract_ban_list.ban(
+            *banned_key.id(),
+            tokio::time::Instant::now() + Duration::from_secs(3600),
+            crate::ring::contract_ban_list::BanReason::AutoMad,
+        );
+
+        let script = handler.runtime_mut().delegate_script.clone();
+        for key in [banned_key, allowed_key] {
+            script.lock().unwrap().push_back(
+                vec![OutboundDelegateMsg::SubscribeContractRequest(
+                    freenet_stdlib::prelude::SubscribeContractRequest::new(*key.id()),
+                )]
+                .into(),
+            );
+            crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+        }
+
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            },
+        ));
+
+        // Store both, so `lookup_key` resolves and `fetch_contract` returns
+        // state — which is what puts the SUBSCRIBE arm on the LOCAL branch, the
+        // branch this test is about.
+        for (seed, contract) in [0xC1u8, 0xC2u8].into_iter().zip(contracts) {
+            let resp = tokio::time::timeout(
+                Duration::from_secs(10),
+                put_local(&send, contract, WrappedState::new(vec![seed; 8])),
+            )
+            .await
+            .expect("PUT must not hang");
+            assert!(
+                matches!(resp, ContractHandlerEvent::PutResponse { .. }),
+                "expected a PutResponse, got {resp}"
+            );
+        }
+        // The PUTs themselves emit interest changes; drain so the assertion
+        // below is about the SUBSCRIBE and not about them.
+        let _ = emitted_change_interests(&mut events);
+
+        let dkey = test_delegate_key();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            send.send_to_handler(delegate_event(&dkey)),
+        )
+        .await
+        .expect("the round trip must terminate");
+
+        // The BANNED contract: no demand, and nothing advertised.
+        assert!(
+            !op_manager.interest_manager.has_local_interest(&banned_key),
+            "a delegate must not register demand for a contract this node has \
+             banned; `add_local_client` is the refcount subscriber-primary \
+             eviction ranks on, so it pins the contract against the strongest \
+             signal the node has that it wants it gone (#5542 N2)"
+        );
+        assert!(
+            !already_subscribed(banned_key.id(), &dkey, None),
+            "and it must not install a notification hook for it either"
+        );
+
+        // The ALLOWED contract: demand registered AND advertised, so the
+        // negatives above are the ban and not a broken branch.
+        assert!(
+            op_manager.interest_manager.has_local_interest(&allowed_key),
+            "an unbanned local contract MUST register demand, or the copy is \
+             zero-subscriber and is evicted out from under the subscription \
+             (#5542 M4)"
+        );
+        assert!(
+            already_subscribed(allowed_key.id(), &dkey, None),
+            "and it must install the notification hook"
+        );
+        assert!(
+            emitted_change_interests(&mut events),
+            "registering demand must advertise it — this is the emission that \
+             becomes an InterestSync ChangeInterests on the wire, and if it \
+             never fires the positive assertions above prove less than they look"
+        );
+
+        handle.abort();
+        for key in [banned_key, allowed_key] {
+            crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+        }
+    }
+
+    /// #5542 finding B2. A delegate must not be able to originate a network
+    /// operation for a contract this node has BANNED.
+    ///
+    /// `reject_if_contract_banned` runs at the top of every CLIENT originator
+    /// entry point (`start_client_put` / `_get` / `_subscribe` / `_update`), so
+    /// the egress half of the ban invariant held for everything that crossed
+    /// one. The delegate GET and SUBSCRIBE arms call the internal drivers
+    /// `start_sub_op_get` and `run_executor_subscribe` directly, crossing none
+    /// of them, so they sat underneath the gate entirely.
+    ///
+    /// COVERAGE SHAPE, stated rather than implied: this proves the gate
+    /// function against a real `ContractBanList` on a real `OpManager`, and the
+    /// companion pin below proves both admission sites call it. Driving the two
+    /// arms end-to-end would need the refusal to be distinguishable from an
+    /// admitted-then-failed network op at the delegate boundary, and it is not:
+    /// `GetContractResponse` has no error channel at all, and both outcomes
+    /// reach the delegate as a `SubscribeContractResponse`. The UPDATE arm's
+    /// equivalent IS covered behaviourally, in
+    /// `operations::update::tests::a_banned_contract_gets_no_delegate_self_heal_fetch`,
+    /// because its refusal is observable in `pending_contract_fetches`.
+    #[tokio::test]
+    async fn a_banned_contract_refuses_delegate_originated_network_ops() {
+        let (op_manager, _guards) = build_op_manager("d5542-ban").await;
+        let (_send, rcv_halve, _wait) = handler::contract_handler_channel();
+        let mut handler =
+            MockWasmContractHandler::new_test(rcv_halve, Some(op_manager.clone()), "d5542_ban")
+                .await;
+
+        let banned = ContractInstanceId::new([61u8; 32]);
+        let allowed = ContractInstanceId::new([62u8; 32]);
+        op_manager.ring.contract_ban_list.ban(
+            banned,
+            tokio::time::Instant::now() + Duration::from_secs(3600),
+            crate::ring::contract_ban_list::BanReason::AutoMad,
+        );
+
+        assert!(
+            delegate_network_op_banned(&mut handler, &banned),
+            "a banned contract must be refused a delegate-originated network op"
+        );
+        assert!(
+            !delegate_network_op_banned(&mut handler, &allowed),
+            "an unbanned contract must still be admitted, or the gate is refusing \
+             everything and proves nothing"
+        );
+    }
+
+    /// #5542 findings B2 and N2. Every delegate side effect that reaches the
+    /// network or registers demand must sit behind the egress ban gate.
+    ///
+    /// Counts the SIDE EFFECTS rather than the gates, which is the correction
+    /// N2 asked for. The previous version asserted an absolute number of gate
+    /// calls, so it could not notice the thing that actually went wrong: M4
+    /// added an `add_local_client` plus a `broadcast_change_interests` to a
+    /// branch that previously emitted nothing, and inherited no gate. A pin on
+    /// the gate count is blind to a new ungated side effect; a pin on the side
+    /// effects is not.
+    ///
+    /// This is a count-based approximation and is stated as one — it cannot
+    /// prove a given side effect is dominated by a given check. Its job is to
+    /// stop a fourth site being added without anyone revisiting the gating, and
+    /// the behavioural tests
+    /// (`a_banned_contract_refuses_delegate_originated_network_ops`,
+    /// `a_banned_local_contract_registers_no_demand_and_advertises_nothing`)
+    /// are what prove the gates actually fire.
+    #[test]
+    fn every_delegate_interest_side_effect_sits_behind_the_ban_gate() {
+        let code = super::tests::production_code();
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let registers_demand = flat.matches("interest_manager.add_local_client(").count();
+        let starts_network_op = flat.matches("pending_contract_ops.push(").count();
+        let side_effects = registers_demand + starts_network_op;
+        assert_eq!(
+            side_effects, 3,
+            "expected exactly three delegate-originated interest side effects in \
+             this file — the GET and SUBSCRIBE network admissions, and the \
+             local-state SUBSCRIBE branch's demand registration. Found \
+             {side_effects} ({registers_demand} demand registrations, \
+             {starts_network_op} network admissions). A NEW one must be gated by \
+             `delegate_network_op_banned` before it registers interest or \
+             advertises it, and must then update this count deliberately rather \
+             than by reflex — that is the whole point of it being pinned."
+        );
+
+        let gate_calls = flat.matches("delegate_network_op_banned(").count();
+        assert!(
+            gate_calls >= 2,
+            "the GET arm and the SUBSCRIBE arm must each consult the gate; found \
+             {gate_calls}. The SUBSCRIBE arm's single check covers both its \
+             local and its network branch, so this is a floor rather than an \
+             equality."
+        );
+    }
+
+    /// #5542 finding B3/F2. A resolved SUBSCRIBE whose resume is dropped on
+    /// epoch mismatch must give back the interest it already took.
+    ///
+    /// `run_executor_subscribe` calls `add_local_client` before it returns, so
+    /// by the time the resume is built the refcount exists. If the park is gone
+    /// — the `PARK_TTL` backstop ended it without consuming the off-loop task's
+    /// guard, so that guard's resume still arrives —
+    /// `handle_delegate_resume` returns early and `apply_resolved_contract_op`
+    /// never runs, so `delegate_interest::record` never runs either. Nothing
+    /// could then discharge it: both release functions work from the hold map,
+    /// which has no entry for that pair.
+    ///
+    /// Reachable by NODE LOAD alone. No delegate behaviour is required, and the
+    /// delegate is the victim rather than the cause. The code at the early
+    /// return already documents that the path is reachable, having retracted an
+    /// earlier comment that claimed otherwise.
+    #[tokio::test]
+    async fn a_dropped_resume_gives_back_the_interest_its_subscribe_took() {
+        use delegate_park::{
+            ContractOpKind, ContractOpOutcome, PendingContractOp, ResolvedContractOp,
+        };
+        use freenet_stdlib::prelude::CodeHash;
+
+        let _guard = TEST_GUARD.lock().await;
+        let (op_manager, _guards) = build_op_manager("d5542-stale-resume").await;
+        let (_send, rcv_halve, _wait) = handler::contract_handler_channel();
+        let mut handler = MockWasmContractHandler::new_test(
+            rcv_halve,
+            Some(op_manager.clone()),
+            "d5542_stale_resume",
+        )
+        .await;
+
+        let dkey = DelegateKey::new([51u8; 32], CodeHash::new([51u8; 32]));
+        let id = ContractInstanceId::new([52u8; 32]);
+        let full_key = ContractKey::from_id_and_code(id, CodeHash::new([53u8; 32]));
+
+        // What `run_executor_subscribe` did before the resume was built.
+        assert!(
+            op_manager.interest_manager.add_local_client(&full_key),
+            "the refcount this test is about must actually have been taken"
+        );
+
+        // A park context with NOTHING parked, so `take_matching` rejects the
+        // resume exactly as it does after the TTL backstop has ended the park.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx);
+
+        let runs = handle_delegate_resume(
+            &mut handler,
+            &mut park,
+            &Arc::new(GatedPrompter {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            }),
+            delegate_park::DelegateResume {
+                delegate_key: dkey.clone(),
+                epoch: 7,
+                cause: delegate_park::ResumeCause::Completed,
+                inbound: Vec::new(),
+                upserts: Vec::new(),
+                unresolved_upserts: Vec::new(),
+                contract_ops: vec![ResolvedContractOp {
+                    pending: PendingContractOp {
+                        id: delegate_park::PendingContractOp::next_id(),
+                        contract_id: id,
+                        kind: ContractOpKind::Subscribe,
+                        context: DelegateContext::default(),
+                    },
+                    outcome: ContractOpOutcome::Subscribed,
+                }],
+                unresolved_contract_ops: Vec::new(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            runs, 0,
+            "this test is only meaningful while the resume is actually DROPPED; \
+             a non-zero run count means it was absorbed and the early return \
+             never ran"
+        );
+        assert!(
+            !op_manager.interest_manager.has_local_interest(&full_key),
+            "a dropped resume must give back the local interest its resolved \
+             SUBSCRIBE already took; nothing else can ever discharge it, because \
+             no hold was recorded (#5542 finding B3)"
+        );
+        assert!(
+            !already_subscribed(&id, &dkey, None),
+            "and it must NOT install a notification hook: the delegate may be \
+             gone by now, and advertising a delivery path nothing will serve is \
+             the failure this PR exists to prevent"
+        );
+    }
+
+    /// #5542 finding B1/F1. The delegate network fan-out budget must span the
+    /// WHOLE round trip, not one iteration of it.
+    ///
+    /// BEHAVIOURAL on purpose. The defect this pins is the lexical SCOPE of a
+    /// binding, and the sibling source-scrape pin
+    /// (`every_delegate_network_operation_is_charged_against_the_park_budget`)
+    /// is structurally unable to see it: the gate text was right, the increment
+    /// was right, and the counter was declared inside the `loop {`, so it reset
+    /// on each of up to `MAX_CONTRACT_REQUEST_ITERATIONS` (100) iterations. The
+    /// scrape stayed green through the exact defect it was written to prevent.
+    /// A scrape can pin an API surface; it cannot pin a scope.
+    ///
+    /// The observable is `pending_contract_fetches`, which
+    /// `try_self_heal_fetch_for_local_originator` inserts into once per contract
+    /// it actually starts a fetch for. Every id here is distinct, so the map's
+    /// size IS the number of fire-and-forget GETs this round trip launched.
+    #[tokio::test]
+    async fn the_self_heal_fanout_budget_spans_the_whole_round_trip() {
+        use freenet_stdlib::prelude::{UpdateContractRequest, UpdateData};
+
+        let _guard = TEST_GUARD.lock().await;
+        let (op_manager, _guards) = build_op_manager("d5542-fanout").await;
+        // A connection is a precondition: without one the self-heal refuses
+        // before the budget is ever consulted (finding 5B), and the test would
+        // pass for the wrong reason.
+        let keypair = crate::transport::TransportKeypair::new();
+        op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.3),
+            "127.0.0.1:46001".parse().unwrap(),
+            keypair.public().clone(),
+            false,
+        );
+
+        let (send, rcv_halve, _wait) = handler::contract_handler_channel();
+        let mut handler =
+            MockWasmContractHandler::new_test(rcv_halve, Some(op_manager.clone()), "d5542_fanout")
+                .await;
+        let script = handler.runtime_mut().delegate_script.clone();
+
+        // Three iterations, each asking to UPDATE four DISTINCT contracts this
+        // node has never seen. The store is empty, so every one takes the
+        // `None =>` self-heal branch.
+        const ITERATIONS: u8 = 3;
+        const PER_ITERATION: u8 = 4;
+        for i in 0..ITERATIONS {
+            let msgs: Vec<OutboundDelegateMsg> = (0..PER_ITERATION)
+                .map(|j| {
+                    let mut id = [0u8; 32];
+                    id[0] = 0xF0 + i;
+                    id[1] = j;
+                    OutboundDelegateMsg::UpdateContractRequest(UpdateContractRequest::new(
+                        ContractInstanceId::new(id),
+                        UpdateData::State(vec![1u8, 2, 3].into()),
+                    ))
+                })
+                .collect();
+            script.lock().unwrap().push_back(msgs.into());
+        }
+
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            },
+        ));
+        let key = test_delegate_key();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            send.send_to_handler(delegate_event(&key)),
+        )
+        .await
+        .expect("the round trip must terminate");
+
+        let started = op_manager.pending_contract_fetches.len();
+        handle.abort();
+        assert!(
+            started > 0,
+            "the test is vacuous unless at least one self-heal fetch started; \
+             got none, so the UPDATE arm never reached the network branch"
+        );
+        assert!(
+            started <= delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK,
+            "a single delegate round trip started {started} fire-and-forget \
+             network GETs against a per-round-trip budget of {}; the budget \
+             resets per ITERATION, so the real ceiling is that times \
+             MAX_CONTRACT_REQUEST_ITERATIONS ({}) rather than the documented \
+             node-wide 256 (#5542 finding B1)",
+            delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK,
+            MAX_CONTRACT_REQUEST_ITERATIONS,
+        );
+    }
+
+    /// #5542 finding 5A. EVERY delegate-originated network operation started in
+    /// one round trip is charged against `MAX_NETWORK_CONTRACT_OPS_PER_PARK` —
+    /// including the UPDATE arm's self-heal fetch, which is fire-and-forget
+    /// rather than parked and so does not appear in `pending_contract_ops`.
+    ///
+    /// This is what makes the PR's node-wide ceiling true. It declines to bound
+    /// `start_sub_op_get` internally on the grounds that "each of its existing
+    /// callers is bounded by itself"; the self-heal fetch was a new caller that
+    /// was not, so one round trip emitting N `UpdateContractRequest`s for N
+    /// distinct unseen instance ids fired N background GETs, each running to
+    /// OPERATION_TTL, with a per-contract cooldown that does not bind across
+    /// distinct ids.
+    ///
+    /// Source-scrape because the three gates sit inside one long `async fn` on
+    /// the serial loop and reaching the UPDATE arm's network branch needs a live
+    /// executor, a delegate script and a routable node. Anchored on the API
+    /// surface (the constant and the counter), not on surrounding prose, and it
+    /// asserts the counter is INCREMENTED as well as read — a budget whose
+    /// counter never rises is vacuous, which is the failure this shape invites.
+    #[test]
+    fn every_delegate_network_operation_is_charged_against_the_park_budget() {
+        let code = super::tests::production_code();
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let bounds = flat
+            .matches("< delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK")
+            .count();
+        assert_eq!(
+            bounds, 3,
+            "expected exactly three per-round-trip fan-out gates (GET, UPDATE \
+             self-heal, SUBSCRIBE); a fourth delegate-originated network \
+             operation must join this budget rather than open a new one"
+        );
+
+        let charged = flat
+            .matches(
+                "pending_contract_ops.len() + self_heal_fetches_started \
+                 < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK",
+            )
+            .count();
+        assert_eq!(
+            charged, bounds,
+            "every fan-out gate must count the fire-and-forget self-heal fetches \
+             as well as the parked ops; a gate reading `pending_contract_ops.len()` \
+             alone lets the UPDATE arm's fetches escape the ceiling"
+        );
+
+        assert!(
+            flat.contains("if healing { self_heal_fetches_started += 1; }"),
+            "the counter must be incremented when a self-heal fetch actually \
+             starts, or the term above is permanently zero and the budget is \
+             vacuous while looking present"
+        );
+    }
+
+    /// #5542. The release obligation must be recorded for EVERY subscribe that
+    /// took a refcount — including one whose contract body never landed.
+    ///
+    /// `finalize_originator_subscribe` calls `add_local_client` OUTSIDE its
+    /// `if have_body` guard (`operations/subscribe.rs`), so a subscribe whose
+    /// `fetch_contract_if_missing` timed out still takes the refcount and still
+    /// returns `Ok(())`. On that path the executor's contract store holds no
+    /// code blob for the instance, so `lookup_key` — which resolves through
+    /// `ContractStore::code_hash_from_id` — returns `None`.
+    ///
+    /// Recording the obligation only when the full key resolves therefore left
+    /// exactly the leak this mechanism exists to close, on the feature's PRIMARY
+    /// path: a delegate subscribing to a contract this node has never seen,
+    /// inside a 2 s fetch window. It was reported as a `warn!` and nothing else.
+    #[tokio::test]
+    async fn a_subscribe_whose_body_never_landed_still_records_its_release_obligation() {
+        use delegate_park::{
+            ContractOpKind, ContractOpOutcome, PendingContractOp, ResolvedContractOp,
+        };
+        use freenet_stdlib::prelude::CodeHash;
+
+        let (op_manager, _guards) = build_op_manager("d5542-interest-hold").await;
+        let (send_halve, rcv_halve, _wait) = handler::contract_handler_channel();
+        let mut handler = MockWasmContractHandler::new_test(
+            rcv_halve,
+            Some(op_manager.clone()),
+            "d5542_interest_hold",
+        )
+        .await;
+        let _send = send_halve;
+
+        let dkey = DelegateKey::new([31u8; 32], CodeHash::new([31u8; 32]));
+        let id = ContractInstanceId::new([32u8; 32]);
+        // The key `add_local_client` was called with: the FULL key, carrying the
+        // real code hash, because the subscribe op knew it.
+        let full_key = ContractKey::from_id_and_code(id, CodeHash::new([33u8; 32]));
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&id);
+
+        // Stand in for what `run_executor_subscribe` did before returning Ok.
+        assert!(
+            op_manager.interest_manager.add_local_client(&full_key),
+            "the refcount this test is about must actually have been taken"
+        );
+        // ...and the body did NOT land, so the code blob is absent.
+        assert!(
+            handler.executor().lookup_key(&id).is_none(),
+            "this test is only meaningful while the full key is unresolvable"
+        );
+
+        let _ = apply_resolved_contract_op(
+            &mut handler,
+            ResolvedContractOp {
+                pending: PendingContractOp {
+                    id: delegate_park::PendingContractOp::next_id(),
+                    contract_id: id,
+                    kind: ContractOpKind::Subscribe,
+                    context: DelegateContext::default(),
+                },
+                outcome: ContractOpOutcome::Subscribed,
+            },
+            &dkey,
+        );
+
+        // An ORDINARY removal path: unregistering the delegate.
+        crate::wasm_runtime::delegate_interest::release_delegate(&dkey);
+
+        assert!(
+            !op_manager.interest_manager.has_local_interest(&full_key),
+            "the local interest the subscribe took must be released when the \
+             subscription is dropped, even though the contract body never \
+             landed and the full `ContractKey` could not be resolved (#5542)"
+        );
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&id);
+    }
+
+    /// #5542. A delegate SUBSCRIBE that cannot reach the network must still get
+    /// a TERMINAL response, and the round-trip must complete.
+    ///
+    /// The executor here has no `OpManager` (`build_handler` passes `None`), so
+    /// the request is refused rather than parked. Refusing is the correct
+    /// behaviour — #5544's park-cap fallback to an inline wait is explicitly not
+    /// inheritable by an operation that reaches the network — but a refusal that
+    /// is DROPPED rather than answered leaves the delegate waiting forever for a
+    /// `SubscribeContractResponse` nobody will send. That is what this pins.
+    #[tokio::test]
+    async fn a_delegate_subscribe_that_cannot_reach_the_network_is_still_answered() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        let observations = handler.runtime_mut().delegate_observations.clone();
+        let unseen = ContractInstanceId::new([42u8; 32]);
+        script.lock().unwrap().push_back(
+            vec![OutboundDelegateMsg::SubscribeContractRequest(
+                freenet_stdlib::prelude::SubscribeContractRequest::new(unseen),
+            )]
+            .into(),
+        );
+
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            },
+        ));
+        let key = test_delegate_key();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send_to_handler(delegate_event(&key)),
+        )
+        .await
+        .expect("the round-trip must terminate, not hang on an unanswered subscribe")
+        .expect("handler responds");
+        assert!(
+            matches!(resp, ContractHandlerEvent::DelegateResponse(_)),
+            "expected a DelegateResponse, got {resp}"
+        );
+
+        let saw_response = observations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|o| o.inbound_kinds.contains(&"SubscribeContractResponse"));
+        assert!(
+            saw_response,
+            "the delegate must be fed a SubscribeContractResponse even when the \
+             subscribe is refused; dropping it leaves the delegate waiting for a \
+             response nobody will send"
+        );
+        handle.abort();
+    }
+
     /// A delegate that prompts TWICE parks, resumes, and parks again. Its
     /// client must still be answered exactly once, at the end.
     ///
@@ -7976,6 +9986,7 @@ mod hol_4391_tests {
     fn parked_continuation() -> delegate_park::Continuation {
         delegate_park::Continuation {
             iterations: 0,
+            self_heal_fetches_started: 0,
             params: Parameters::from(Vec::new()),
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
