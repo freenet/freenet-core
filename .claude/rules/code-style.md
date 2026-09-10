@@ -147,8 +147,17 @@ actors (clients, network peers) can influence.
      contract::executor::declared_cache_ceiling. The hosting budget
      (ring::hosting::cache::resident_overhead_budget_for) is a RESIDUAL of
      that sum, so an unnamed budget silently over-grants hosted contracts
-     against memory already committed. Pinned by
-     declared_cache_ceiling_names_every_budget.
+     against memory already committed. Pinned by TWO tests that catch
+     OPPOSITE things, and citing only the first is how a reader ends up
+     trusting the weaker one: declared_cache_ceiling_names_every_budget
+     validates a hardcoded list, so it catches a summed budget being
+     REMOVED and cannot catch one being ADDED, which is the case that
+     matters for a new budget. declared_cache_ceiling_discovers_every_budget
+     walks the crate for budget-shaped declarations and requires each to be
+     summed or listed in NOT_SUMMED with a written reason. Both read the
+     LABELS of declared_cache_ceiling_terms rather than scraping source
+     text, because a name occurring in the function body does not mean its
+     value entered the total.
 
 WHY: Unbounded collections are amplification vectors.
 An attacker who can register N subscribers or open N channels can

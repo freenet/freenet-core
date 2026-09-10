@@ -524,6 +524,102 @@ async fn fetch_related_off_loop(
     }
 }
 
+/// Fetches refused for exceeding their park's reserve, since process start.
+///
+/// A COUNTER AS WELL AS THE `warn!`, per this repo's own rule that "a refusal
+/// that is not counted renders as a clean zero" — the same reasoning behind
+/// `delegate_park::RefusalCounts`. The degradation here is legitimate (the
+/// fetch is refused and the upsert re-runs inline on the serial loop, so the
+/// write still completes, more slowly), which is precisely why it needs to be
+/// visible: a
+/// legitimate behaviour change that nothing counts is indistinguishable from
+/// nothing happening, and the symptom an operator sees is latency somewhere
+/// else entirely.
+static REFUSED_OVERSIZED_FETCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn refused_oversized_fetches() -> usize {
+    REFUSED_OVERSIZED_FETCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reject a completed off-loop related fetch that retained more than the park
+/// reserved for it at admission.
+///
+/// The other half of `delegate_park::upsert_fetch_allowance`: the reserve is
+/// taken in `task_bytes` before the fetch starts, and this is what makes the
+/// reserve true rather than aspirational. Without it the fetched states went
+/// into the resume sink and then an unbounded channel with no accounting at
+/// all, so one park could retain ~2 GiB against a nominal 64 MiB cap.
+///
+/// AN OVER-ALLOWANCE FETCH IS NOT A FAILURE. It returns
+/// [`delegate_park::FetchDisposition::RetryInline`], and the resume path re-runs
+/// the upsert inline on the serial loop. An earlier version returned `Err`,
+/// which failed the write — and did so only when the park was ADMITTED, since a
+/// park REFUSED at admission falls back inline with no allowance applied at
+/// all. Whether a delegate's write succeeded therefore depended on how many
+/// other delegates happened to be parked, which is the opposite of what a
+/// pressure signal should do. A genuine fetch failure still passes through
+/// unchanged, through the branch the delegate already handles.
+///
+/// Applied at the CALL SITE rather than inside `fetch_related_off_loop` so the
+/// test stub (`OFF_LOOP_FETCH_OVERRIDE`), which returns before that function's
+/// body runs, is bounded by it too. A budget a test fixture can walk past is
+/// not a budget.
+fn within_fetch_allowance(
+    fetched: Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>,
+    missing: &[ContractInstanceId],
+    allowance: delegate_park::ByteCount,
+) -> delegate_park::FetchDisposition {
+    let states = match fetched {
+        Ok(states) => states,
+        // A real fetch failure passes straight through: it is the caller's
+        // existing all-or-nothing outcome, not an allowance decision.
+        Err(err) => return delegate_park::FetchDisposition::Resolved(Err(err)),
+    };
+    // Composed in `ByteCount` for the same reason everything else is: these are
+    // contract-supplied lengths and `+` on them must not wrap.
+    let bytes: delegate_park::ByteCount = states
+        .iter()
+        .map(|(_, state)| delegate_park::ByteCount::new(state.as_ref().len()))
+        .sum();
+    if bytes > allowance {
+        let id = states
+            .first()
+            .map(|(id, _)| *id)
+            .or_else(|| missing.first().copied())
+            .unwrap_or_else(|| ContractInstanceId::new([0u8; 32]));
+        let total = REFUSED_OVERSIZED_FETCHES
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        tracing::warn!(
+            fetched_bytes = %bytes,
+            allowance = %allowance,
+            contract = %id,
+            total_refused = total,
+            // SAYS WHAT THE CODE DOES. This read "failing the upsert", which
+            // stopped being true when the disposition became `RetryInline`:
+            // the write completes on the inline path. An operator-facing line
+            // that reports a failure where none occurred is worse than no line,
+            // because it is the signal for one of the three degradations this
+            // change promises are observable.
+            "Off-loop related fetch retained more than the park reserved for \
+             it; re-running this upsert INLINE on the serial loop rather than \
+             holding unbounded bytes behind a park. The write still completes; \
+             the cost is a stall (#5554 follow-up)"
+        );
+        // RETRY INLINE, DO NOT FAIL. Returning `Err` here failed the write —
+        // and failed it precisely when the park was ADMITTED, so an identical
+        // request succeeded on a busier node that refused the park and went
+        // inline. The states are dropped at this statement (`states` is owned
+        // and goes out of scope), so nothing oversized is retained; the upsert
+        // is re-run on the loop at resume, which costs a second fetch and a
+        // stall and completes the write.
+        return delegate_park::FetchDisposition::RetryInline;
+    }
+    delegate_park::FetchDisposition::Resolved(Ok(states))
+}
+
 /// Whether a delegate run may deliver delegate-to-delegate messages.
 ///
 /// This exists because the callers of
@@ -622,6 +718,17 @@ where
     CH: ContractHandler + Send + 'static,
 {
     let delegate_park::ResolvedUpsert { pending, fetched } = resolved;
+    let delegate_park::FetchDisposition::Resolved(fetched) = fetched else {
+        // Unreachable: the caller routes `RetryInline` to
+        // `run_deferred_upsert_inline` before reaching here. Stated as an
+        // invariant rather than silently treated as a failure, because
+        // reporting an over-allowance as a failed write is exactly the defect
+        // the disposition enum exists to prevent.
+        unreachable!(
+            "RetryInline must be routed to run_deferred_upsert_inline by the \
+             caller, not resolved here"
+        )
+    };
     let contract_id = *pending.key.id();
     let mut related_contracts = pending.related_contracts;
     let result = match fetched {
@@ -1079,6 +1186,7 @@ where
                                 < delegate_park::MAX_DEFERRED_UPSERTS_PER_PARK =>
                     {
                         deferred_upserts.push(delegate_park::PendingUpsert {
+                            id: delegate_park::UpsertId::next(),
                             key: contract_key,
                             update,
                             related_contracts: req.related_contracts,
@@ -1280,6 +1388,7 @@ where
                                         < delegate_park::MAX_DEFERRED_UPSERTS_PER_PARK =>
                             {
                                 deferred_upserts.push(delegate_park::PendingUpsert {
+                                    id: delegate_park::UpsertId::next(),
                                     key: full_key,
                                     update: update_value,
                                     related_contracts: RelatedContracts::default(),
@@ -1662,7 +1771,13 @@ where
                 // continuation points at: the prompts and the deferred upserts
                 // live for exactly as long as the park, and a single upsert can
                 // own a full state plus related contracts plus code.
-                let task_bytes = delegate_park::task_bytes(&user_input_requests, &deferred_upserts);
+                // ONE SOURCE for the reserve and the later enforcement.
+                let fetch_allowance = ctx.park.upsert_fetch_allowance();
+                let task_bytes = delegate_park::task_bytes(
+                    &user_input_requests,
+                    &deferred_upserts,
+                    fetch_allowance,
+                );
                 match ctx
                     .park
                     .park(delegate_key.clone(), continuation, task_bytes)
@@ -1674,10 +1789,13 @@ where
                         // and never run the task's own cleanup (#5544 P2).
                         let owed: Vec<u32> =
                             user_input_requests.iter().map(|r| r.request_id).collect();
-                        let owed_upserts: Vec<(ContractInstanceId, bool)> = deferred_upserts
-                            .iter()
-                            .map(|u| (*u.key.id(), u.is_put))
-                            .collect();
+                        // Built by `delegate_park::owed_upserts` rather than
+                        // inline: the CONTEXT has to ride along or a
+                        // synthesized failure cannot be matched to the request
+                        // that produced it, and an inline `map` here is exactly
+                        // where that was got wrong and where no test could see
+                        // it. See that function.
+                        let owed_upserts = delegate_park::owed_upserts(&deferred_upserts);
                         // SINKS CREATED BEFORE THE GUARD, AND SHARED WITH IT
                         // (#5544 F2). They used to be created inside the
                         // spawned future, so `ParkGuard::drop` could not see
@@ -1727,8 +1845,10 @@ where
                             // they could sum past PARK_TTL, at which point the
                             // loop's backstop sweep would force-resume while this
                             // task was still running and its result would be
-                            // discarded. Keeping the budget below the TTL means
-                            // the guard always wins the race.
+                            // discarded. Keeping the budget below the TTL gives
+                            // the guard a MARGIN in that race, not a guarantee
+                            // — see `PARK_WORK_BUDGET`, where the same sentence
+                            // was corrected and this copy was missed.
                             let fetches = async {
                                 futures::future::join_all(upserts.into_iter().map(|pending| {
                                     let op_manager = op_manager.clone();
@@ -1739,6 +1859,13 @@ where
                                             pending.missing.clone(),
                                         )
                                         .await;
+                                        // Bound what is RETAINED against what
+                                        // the park reserved before fetching.
+                                        let fetched = within_fetch_allowance(
+                                            fetched,
+                                            &pending.missing,
+                                            fetch_allowance,
+                                        );
                                         sink.lock().unwrap().push(delegate_park::ResolvedUpsert {
                                             pending,
                                             fetched,
@@ -2020,85 +2147,78 @@ where
                         resume,
                     )
                     .await;
-                    resume_budget = resume_budget.saturating_sub(runs.max(1));
+                    // A resume whose park is already gone did no work, but it
+                    // still costs one unit: charging zero would let a run of
+                    // stale resumes spin this batch without bound.
+                    resume_budget = resume_budget.saturating_sub(runs.unwrap_or(0).max(1));
                 }
                 None => break,
             }
         }
 
         // Backstop sweep for parks that neither completed nor were dropped
-        // (see `PARK_TTL`). Force-resume them so a wedged delegate cannot stay
-        // wedged: the resume drains its pending queue and answers its client.
+        // (see `PARK_TTL`). Extracted so its BUDGET is testable — see
+        // `sweep_expired_parks`, which also holds the reasoning that used to
+        // live here. It still runs at the top of the iteration, before the
+        // export/event/notification drains and the fair-queue pop, so nothing
+        // about the ordering this loop depends on has moved.
         //
-        // `expired` re-reads the resume channel ITSELF and excludes any park
-        // whose answer has arrived — it takes the receiver precisely so this
-        // decision cannot be made from the stale buffer the batch above
-        // snapshotted before it started awaiting (#5554).
-        for (delegate_key, epoch) in park_ctx.expired(
-            tokio::time::Instant::now(),
+        // Its budget is its OWN, not what the resume batch above has left. A
+        // node with a steady stream of resumes would otherwise never sweep, and
+        // the backstop exists precisely for the case where something is wedged.
+        //
+        // WORST CASE PER ITERATION IS 105 DELEGATE RUNS, NOT 32 AND NOT 80.
+        // This comment has now been wrong twice in the same change, in the same
+        // direction, and the second time is the more instructive one.
+        //
+        // It first said "2 x MAX_RESUME_DRAIN_BATCH" = 32, which understates it
+        // by more than three times. Corrected to 80 after deriving the two
+        // budgeted loops properly. A reviewer then found that 80 counts only
+        // those two and omits a THIRD delegate-run path in this same loop body:
+        // the `let _ = handle_delegate_resume(..)` select arm below, which
+        // discards its run count exactly as the sweep did before M2 fixed it.
+        // At up to 25 runs that is 105.
+        //
+        // Narrower than it sounds, and worth saying so rather than leaving the
+        // number to imply more than it means: that arm is in the IDLE select,
+        // reached only with the fair queue already empty, so it is not the
+        // head-of-line shape M2 is about. It is still a delegate run inside one
+        // iteration, so a per-iteration bound that omits it is wrong.
+        //
+        // The lesson is the one this change keeps relearning. Correcting an
+        // over-strong bound is not the same as deriving the right one, and the
+        // corrected figure inherits whatever the original derivation forgot to
+        // enumerate. Both errors were mine, in the change whose subject is
+        // over-strong bound claims, a few hundred lines from the
+        // `PARK_WORK_BUDGET` "the guard always wins" correction.
+        //
+        // The arithmetic, because a bound worth stating is worth deriving.
+        // BOTH loops test the budget BEFORE consuming a victim's cost — the
+        // batch as `while resume_budget > 0`, the sweep as
+        // `if spent >= budget { break }`. So fifteen one-run victims take a
+        // 16-unit budget down to its last unit, and the sixteenth is STILL
+        // admitted, at up to `1 + MAX_PENDING_PER_DELEGATE +
+        // MAX_PENDING_NOTIFICATION_CONTRACTS` = 25 runs (see
+        // `handle_delegate_resume`). Each BUDGETED loop is therefore
+        // `(MAX_RESUME_DRAIN_BATCH - 1) + 25` = 40, and the two together are 80.
+        // The unbudgeted idle-select arm adds up to another 25, giving 105.
+        //
+        // Still a bound, and still bounded by constants — which is what the
+        // budget is for. It is simply 105 rather than 32, and stating the real
+        // number is the whole point of the exercise this comment sits inside.
+        // `the_sweep_budget_admits_one_maximal_victim_past_the_limit` pins the
+        // boundary, which the original test could not see because its victims
+        // cost exactly one run each.
+        sweep_expired_parks(
+            &mut contract_handler,
+            &mut park_ctx,
+            &prompter,
             &mut delegate_resume_rx,
             &mut delegate_resumes,
-        ) {
-            // ...and re-ask per victim, because THIS loop awaits too: a guard
-            // firing while park X is being force-resumed is invisible to the
-            // decision already made about park Y. No `.await` between this
-            // check and `take_matching` inside `handle_delegate_resume`.
-            if !park_ctx.should_force_resume(
-                &delegate_key,
-                epoch,
-                &mut delegate_resume_rx,
-                &mut delegate_resumes,
-            ) {
-                tracing::debug!(
-                    delegate = %delegate_key,
-                    epoch,
-                    "Park reached PARK_TTL but its resume arrived while an \
-                     earlier force-resume was running — running that instead, \
-                     so the answer it carries is not discarded (#5554)"
-                );
-                continue;
-            }
-            // Force-resume the park we OBSERVED, by epoch. The off-loop task's
-            // ParkGuard is untouched and still owes a resume; carrying the epoch
-            // is what lets that late resume be recognised as stale and dropped
-            // rather than absorbed by whatever park exists by then (#5544 H1).
-            let swept = delegate_key.clone();
-            let _ = handle_delegate_resume(
-                &mut contract_handler,
-                &mut park_ctx,
-                &prompter,
-                delegate_park::DelegateResume {
-                    delegate_key,
-                    epoch,
-                    cause: delegate_park::ResumeCause::TimedOut,
-                    inbound: Vec::new(),
-                    upserts: Vec::new(),
-                    // The sweep does not know what the task owed; that task's
-                    // own guard still fires and is rejected on epoch, so
-                    // nothing is answered twice.
-                    unresolved_upserts: Vec::new(),
-                },
-            )
-            .await;
-            // Logged AFTER the resume, not before, so nothing sits between
-            // `should_force_resume` and `take_matching` (the first statement of
-            // `handle_delegate_resume`) — that gap is the residual window this
-            // fix narrows, and the cheapest way to keep it narrow is to put
-            // nothing in it. On the service path this line is microseconds
-            // (`tracing_appender::non_blocking`, which drops on overflow), so
-            // this is keeping the window free of anything whose cost is not
-            // obviously bounded rather than a fix for a measured cost.
-            //
-            // The message text is UNCHANGED on purpose: it is the log signature
-            // operators grep for, paired with the later "Resume for a park that
-            // no longer exists" from the stale guard. Reword it and that pairing
-            // stops being findable.
-            tracing::warn!(
-                delegate = %swept,
-                epoch,
-                "Delegate park exceeded PARK_TTL — force-resuming"
-            );
-        }
+            tokio::time::Instant::now(),
+            MAX_RESUME_DRAIN_BATCH,
+        )
+        .await;
 
         // Drain completed off-loop EXPORTS (#4531 / #4381 P5): return/replace the
         // executor and answer the parked client. Bounded by MAX_CONCURRENT_EXPORTS
@@ -2205,15 +2325,33 @@ where
         // shrink for that to hold.
         //
         // SECOND, LOAD-BEARING JOB (#5554): this `continue` is also what keeps
-        // a DECLINED sweep from spinning the select. The sweep can now decline
-        // a past-due park, so `next_sweep_deadline()` can stay in the past
-        // across an iteration — and `sleep_until` on a past deadline returns
+        // a DECLINED sweep from spinning the select. The sweep can decline a
+        // past-due park, so `next_sweep_deadline()` can stay in the past across
+        // an iteration — and `sleep_until` on a past deadline returns
         // immediately, which would be a hot wake loop. It cannot reach the
         // select: declining requires the park's resume to be in
         // `delegate_resumes`, nothing between here and there pops from it, so
         // the buffer is non-empty and this fires before the deadline is even
         // computed. Keep the two together; moving this below `park_deadline`
         // would reopen it.
+        //
+        // THE SWEEP'S BUDGET IS A SECOND WAY TO LEAVE THE DEADLINE IN THE PAST,
+        // and this guard does NOT cover it — say so rather than let the
+        // paragraph above be read as covering both. A budget-deferred park
+        // leaves nothing in `delegate_resumes`, so the select is reached with a
+        // past deadline and wakes immediately. That is not a spin, and the
+        // reason is different from the one above: reaching the select with a
+        // past-due park left over means the sweep spent its whole budget, and
+        // every unit of that budget is charged only when `take_matching`
+        // succeeded — i.e. a park was actually ended. So each such wake does up
+        // to MAX_RESUME_DRAIN_BATCH delegate runs and strictly reduces the
+        // past-due set, and the fair queue gets a turn between them, which is
+        // the point of capping rather than looping inside the sweep.
+        //
+        // The zero-progress case is the one to check, and it is unreachable:
+        // spending nothing while past-due parks remain means every victim
+        // declined, and declining puts the resume in `delegate_resumes`, so
+        // this guard fires and the deadline is never computed.
         if !delegate_resumes.is_empty() {
             continue;
         }
@@ -2260,6 +2398,14 @@ where
                 // iteration, so there is exactly one sweep implementation.
             }
             Some(delegate_resume) = delegate_resume_rx.recv() => {
+                // THE THIRD DELEGATE-RUN PATH IN THIS LOOP BODY, and it is
+                // counted in the per-iteration bound at the top (105, not 80).
+                // The `let _ =` discards a run count exactly as the TTL sweep
+                // did before M2, but this arm is NOT that defect: it is in the
+                // idle select, so it is reached only with the fair queue
+                // already empty and cannot block anything ahead of it. If that
+                // ever stops being true, this needs a budget and the bound
+                // above needs re-deriving.
                 let _ = handle_delegate_resume(
                     &mut contract_handler,
                     &mut park_ctx,
@@ -3382,6 +3528,136 @@ async fn send_delegate_response<CH>(
     }
 }
 
+/// Force-resume every park that has outlived [`delegate_park::PARK_TTL`],
+/// bounded by `budget` delegate runs. Returns the runs performed.
+///
+/// The backstop for parks that neither completed nor were dropped: the resume
+/// drains the park's pending queue and answers its client, so a wedged delegate
+/// cannot stay wedged.
+///
+/// THE BUDGET IS THE POINT, and it was missing. `expired` can return up to
+/// `MAX_PARKED_DELEGATES` (64) victims and one force-resume costs up to
+/// `1 + MAX_PENDING_PER_DELEGATE + MAX_PENDING_NOTIFICATION_CONTRACTS` (25)
+/// delegate runs, so this loop could execute **1600 WASM delegate runs** in a
+/// single pass with no fair-queue interleaving and no yield — every
+/// GET/PUT/UPDATE/subscribe on the node waiting behind it. The triggering
+/// condition is 64 parked delegates whose off-loop tasks are wedged, which is
+/// exactly what this backstop exists for. `handle_delegate_resume` returns its
+/// run count *specifically* so a caller can spend it, and its rustdoc says an
+/// unaccounted drain "could do many of them before the fair queue got a single
+/// turn — exactly the head-of-line blocking the batch cap exists to prevent";
+/// the sweep discarded it with `let _ =` sixty lines below the batch that
+/// spends it.
+///
+/// DEFERRING COSTS NOTHING, which is why a cap is the right shape here rather
+/// than a yield. `expired` is recomputed from scratch on every iteration, and
+/// `next_sweep_deadline()` for a park already past its TTL is an instant in the
+/// PAST, so `sleep_until` returns immediately and the loop comes straight back
+/// for the rest — after the fair queue has had its turn, which is the whole
+/// object. A deferred victim is re-listed, not dropped.
+///
+/// Extracted from `contract_handling` for one reason: the budget is only
+/// testable if something can call the sweep. `now` is a parameter for the same
+/// reason — the loop passes `Instant::now()`, and a test passes an instant past
+/// the TTL without having to pause the runtime clock and fight the
+/// `PARK_WORK_BUDGET` and `USER_INPUT_TIMEOUT` timers that auto-advance would
+/// fire first. See
+/// `the_ttl_sweep_is_bounded_and_leaves_the_rest_for_the_next_pass`.
+async fn sweep_expired_parks<CH, P>(
+    contract_handler: &mut CH,
+    park_ctx: &mut delegate_park::DelegateParkCtx,
+    prompter: &std::sync::Arc<P>,
+    delegate_resume_rx: &mut tokio::sync::mpsc::UnboundedReceiver<delegate_park::DelegateResume>,
+    delegate_resumes: &mut std::collections::VecDeque<delegate_park::DelegateResume>,
+    now: tokio::time::Instant,
+    budget: usize,
+) -> usize
+where
+    CH: ContractHandler + Send + 'static,
+    P: UserInputPrompter + 'static,
+{
+    let mut spent = 0usize;
+    // `expired` re-reads the resume channel ITSELF and excludes any park whose
+    // answer has arrived — it takes the receiver precisely so this decision
+    // cannot be made from the stale buffer the caller's resume batch
+    // snapshotted before it started awaiting (#5554).
+    for (delegate_key, epoch) in park_ctx.expired(now, delegate_resume_rx, delegate_resumes) {
+        if spent >= budget {
+            tracing::debug!(
+                spent,
+                budget,
+                "TTL sweep budget spent; the remaining past-due parks are \
+                 re-listed on the next iteration so the fair queue gets a turn"
+            );
+            break;
+        }
+        // ...and re-ask per victim, because THIS loop awaits too: a guard
+        // firing while park X is being force-resumed is invisible to the
+        // decision already made about park Y. No `.await` between this
+        // check and `take_matching` inside `handle_delegate_resume`.
+        if !park_ctx.should_force_resume(&delegate_key, epoch, delegate_resume_rx, delegate_resumes)
+        {
+            tracing::debug!(
+                delegate = %delegate_key,
+                epoch,
+                "Park reached PARK_TTL but its resume arrived while an \
+                 earlier force-resume was running — running that instead, \
+                 so the answer it carries is not discarded (#5554)"
+            );
+            continue;
+        }
+        // Force-resume the park we OBSERVED, by epoch. The off-loop task's
+        // ParkGuard is untouched and still owes a resume; carrying the epoch
+        // is what lets that late resume be recognised as stale and dropped
+        // rather than absorbed by whatever park exists by then (#5544 H1).
+        let swept = delegate_key.clone();
+        let runs = handle_delegate_resume(
+            contract_handler,
+            park_ctx,
+            prompter,
+            delegate_park::DelegateResume {
+                delegate_key,
+                epoch,
+                cause: delegate_park::ResumeCause::TimedOut,
+                inbound: Vec::new(),
+                upserts: Vec::new(),
+                // The sweep does not know what the task owed; that task's
+                // own guard still fires and is rejected on epoch, so
+                // nothing is answered twice.
+                unresolved_upserts: Vec::new(),
+            },
+        )
+        .await;
+        // NOTHING WAS FORCE-RESUMED, so nothing is charged and nothing is
+        // logged. Reachable when the delegate re-parked during an earlier
+        // victim's force-resume: `take_matching` then finds no park at this
+        // epoch and returns without touching anything. The `warn!` below fired
+        // unconditionally, counting sweeps that did not happen — which degrades
+        // exactly the pairing the comment on it describes.
+        let Some(runs) = runs else { continue };
+        spent = spent.saturating_add(runs.max(1));
+        // Logged AFTER the resume, not before, so nothing sits between
+        // `should_force_resume` and `take_matching` (the first statement of
+        // `handle_delegate_resume`) — that gap is the residual window #5554
+        // narrows, and the cheapest way to keep it narrow is to put nothing in
+        // it. On the service path this line is microseconds
+        // (`tracing_appender::non_blocking`, which drops on overflow), so this
+        // is keeping the window free of anything whose cost is not obviously
+        // bounded rather than a fix for a measured cost.
+        //
+        // The message text is UNCHANGED on purpose: it is the log signature
+        // operators grep for, paired with the later "Resume for a park that
+        // no longer exists" from the stale guard. Reword it and that pairing
+        // stops being findable.
+        tracing::warn!(
+            delegate = %swept,
+            epoch,
+            "Delegate park exceeded PARK_TTL — force-resuming"
+        );
+    }
+    spent
+}
+
 /// Re-enter a delegate whose park has resolved, then drain whatever queued
 /// behind it.
 ///
@@ -3389,12 +3665,31 @@ async fn send_delegate_response<CH>(
 /// WAIT happened off it. This is the counterpart to #4391's
 /// `handle_deferred_resume`.
 ///
-/// Returns the number of delegate runs performed, INCLUDING the pending
-/// requests drained behind the park. The loop spends that against its
-/// `MAX_RESUME_DRAIN_BATCH` budget (#5544 S5): each drained request is a full
-/// delegate run, so an unaccounted drain could do many of them before the fair
-/// queue got a single turn — exactly the head-of-line blocking the batch cap
-/// exists to prevent.
+/// `Some(runs)` is the number of delegate runs performed, INCLUDING the pending
+/// requests drained behind the park, and is always at least 1. `None` means no
+/// park matched `(key, epoch)`, so nothing ran at all.
+///
+/// The BATCHING callers spend the count against a budget (#5544 S5): each
+/// drained request is a full delegate run, so an unaccounted drain could do
+/// many of them before the fair queue got a single turn — exactly the
+/// head-of-line blocking the batch cap exists to prevent. That was true of the
+/// resume batch and false of the TTL sweep, which discarded the count with
+/// `let _ =` while performing up to 1600 runs in one pass; see
+/// `sweep_expired_parks`.
+///
+/// NOT "every caller", which an earlier version of this said. The idle
+/// `select!` arm in `contract_handling` still discards it, and that is
+/// deliberate: it runs at most ONE resume and then returns to the top of the
+/// loop, where the batch's own budget governs everything that follows. Saying
+/// "every" in the doc of a change whose subject is over-claiming doc comments
+/// was the wrong word, and the exception is cheaper to name than to defend.
+///
+/// `None` is distinguished from `Some(0)` rather than folded into it because
+/// the sweep needs the difference: it must log "force-resuming" only for a park
+/// it actually force-resumed, and a resume for a delegate that has since
+/// re-parked reaches this function and returns without touching anything.
+/// Deriving that from a zero count happens to work today and would break
+/// silently the first time a legitimate resume did no runs.
 ///
 /// Worst case for ONE resume is `1 + MAX_PENDING_PER_DELEGATE +
 /// MAX_PENDING_NOTIFICATION_CONTRACTS` runs: the resumed run itself, the queued
@@ -3408,7 +3703,7 @@ async fn handle_delegate_resume<CH, P>(
     park: &mut delegate_park::DelegateParkCtx,
     prompter: &std::sync::Arc<P>,
     resume: delegate_park::DelegateResume,
-) -> usize
+) -> Option<usize>
 where
     CH: ContractHandler + Send + 'static,
     P: UserInputPrompter + 'static,
@@ -3440,7 +3735,7 @@ where
             "Resume for a park that no longer exists (force-resumed by the TTL \
              backstop, or already ended) — dropping"
         );
-        return 0;
+        return None;
     };
     // The resumed run itself, plus one per pending request drained below.
     let mut runs = 1usize;
@@ -3471,17 +3766,36 @@ where
     // Re-run any deferred upserts ON the loop (WASM stays serial; only the
     // fetch happened off it), then feed their responses back with the rest.
     for resolved in upserts {
-        all_inbound.push(apply_resolved_upsert(contract_handler, resolved).await);
+        // AN OVER-ALLOWANCE FETCH DEGRADES TO INLINE HERE, on the serial loop,
+        // which is where `run_deferred_upsert_inline` already belongs. This is
+        // what makes `upsert_fetch_allowance`'s "degrades to the inline path"
+        // true rather than aspirational: the write completes, at the cost of a
+        // second fetch and a stall for this one operation.
+        match resolved.fetched {
+            delegate_park::FetchDisposition::RetryInline => {
+                all_inbound
+                    .push(run_deferred_upsert_inline(contract_handler, resolved.pending).await);
+            }
+            delegate_park::FetchDisposition::Resolved(_) => {
+                all_inbound.push(apply_resolved_upsert(contract_handler, resolved).await);
+            }
+        }
     }
     // Upserts the off-loop task never resolved (panic, cancellation, budget).
     // The delegate is TOLD they failed rather than left waiting for a response
-    // nothing remains to produce (#5544 P2). `DelegateContext` is defaulted
-    // because the `PendingUpsert` that carried it is gone by then.
-    for (contract_id, is_put) in unresolved_upserts {
+    // nothing remains to produce (#5544 P2).
+    //
+    // WITH THE CONTEXT THE DELEGATE SENT. This defaulted it, on the reasoning
+    // that "the `PendingUpsert` that carried it is gone by then" — true, and
+    // the bug rather than the reason: the context is how a delegate correlates
+    // a response with the request that produced it, so a defaulted one can be
+    // applied to the wrong logical request and is unusable outright when two
+    // requests target the same contract. `OwedUpsert` now carries it.
+    for owed in unresolved_upserts {
         all_inbound.push(upsert_response_msg(
-            is_put,
-            contract_id,
-            DelegateContext::default(),
+            owed.is_put,
+            owed.contract,
+            owed.context,
             Err(ExecutorError::other(anyhow::anyhow!(
                 "delegate upsert did not complete: its off-loop work ended early"
             ))),
@@ -3615,7 +3929,7 @@ where
             }
         }
     }
-    runs
+    Some(runs)
 }
 
 /// Re-run a notification-driven delegate invocation that had been queued behind
@@ -4616,9 +4930,32 @@ mod tests {
 
     /// Byte index just past the `}` matching the `{` at `open`.
     ///
+    /// SKIPS COMMENTS AND LITERALS, and that is not a refinement. Counting
+    /// bytes naively, a single `}` written inside a comment ends the region
+    /// early: a reviewer demonstrated it by injecting one line of the form
+    /// `// note: closing brace } for context` into the middle of
+    /// `handle_delegate_notification` and watching the scraped region lose
+    /// about 3.8 KB, with no panic and no failed assertion. The guard simply
+    /// examined less.
+    ///
+    /// THE ASYMMETRY IS WHAT MAKES IT WORTH THE CODE. A stray OPENING brace
+    /// runs the counter off the end of the file and panics, loudly. A stray
+    /// CLOSING brace truncates and says nothing. And "the closing brace `}`"
+    /// is the more natural phrase to write in prose, so the silent direction
+    /// is also the likelier typo. This helper is the replacement for a text
+    /// anchor that failed open, in a change whose whole argument is that a
+    /// guard which can fail open is not a guard; inheriting a quieter version
+    /// of the same failure would have been that argument losing to itself.
+    ///
     /// Panics rather than returning on unbalanced braces: a scrape that cannot
     /// bound its region must fail loudly, never silently scan the rest of the
     /// file.
+    ///
+    /// WHAT IT DOES NOT HANDLE, stated rather than implied: raw strings
+    /// (`r#"..."#`) and nested block comments are not parsed. Neither appears
+    /// in the regions this is used on. It is a scrape, not a lexer, and the
+    /// point is only that ordinary prose and ordinary string literals cannot
+    /// move the boundary.
     pub(super) fn end_of_block(code: &str, open: usize) -> usize {
         let bytes = code.as_bytes();
         assert_eq!(
@@ -4627,8 +4964,47 @@ mod tests {
             "end_of_block must be given the index of an opening brace"
         );
         let mut depth = 0usize;
-        for (i, b) in bytes.iter().enumerate().skip(open) {
+        let mut i = open;
+        while i < bytes.len() {
+            let b = bytes[i];
+            let next = bytes.get(i + 1).copied();
             match b {
+                // Line comment: everything to the newline is prose.
+                b'/' if next == Some(b'/') => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                // Block comment. Not nested-aware; see the doc above.
+                b'/' if next == Some(b'*') => {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 2;
+                    continue;
+                }
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        // A backslash escapes the next byte, including a quote.
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                    i += 1;
+                    continue;
+                }
+                // A char literal, distinguished from a lifetime (`'a`) by the
+                // closing quote. `'{'` and `'}'` are both real Rust.
+                b'\'' => {
+                    let close = if next == Some(b'\\') { i + 3 } else { i + 2 };
+                    if bytes.get(close) == Some(&b'\'') {
+                        i = close + 1;
+                        continue;
+                    }
+                    i += 1;
+                    continue;
+                }
                 b'{' => depth += 1,
                 b'}' => {
                     depth -= 1;
@@ -4638,8 +5014,64 @@ mod tests {
                 }
                 _ => {}
             }
+            i += 1;
         }
         panic!("unbalanced braces from byte {open}: the scrape cannot bound this block");
+    }
+
+    #[test]
+    fn end_of_block_is_not_moved_by_a_brace_in_prose_or_a_literal() {
+        // THE REVIEWER'S EXACT DEMONSTRATION, reduced. Naive byte counting
+        // ended the region at the `}` inside the comment, silently.
+        let with_comment =
+            "fn f() {\n    // note: closing brace } for context\n    g();\n}\nfn after() {}\n";
+        let open = with_comment.find('{').expect("a body");
+        assert_eq!(
+            &with_comment[open..end_of_block(with_comment, open)],
+            "{\n    // note: closing brace } for context\n    g();\n}",
+            "a closing brace inside a line comment must not end the region"
+        );
+
+        for (label, src) in [
+            ("block comment", "fn f() {\n    /* } */\n    g();\n}\n"),
+            (
+                "string literal",
+                "fn f() {\n    let s = \"}\";\n    g();\n}\n",
+            ),
+            (
+                "escaped quote",
+                "fn f() {\n    let s = \"\\\"}\";\n    g();\n}\n",
+            ),
+            ("char literal", "fn f() {\n    let c = '}';\n    g();\n}\n"),
+            (
+                "escaped char",
+                "fn f() {\n    let c = '\\'';\n    let d = '}';\n    g();\n}\n",
+            ),
+            // A lifetime is NOT a char literal, and mis-parsing one as a
+            // three-byte token would skip real code after it.
+            (
+                "lifetime",
+                "fn f<'a>() {\n    let x: &'a str = \"\";\n    g();\n}\n",
+            ),
+        ] {
+            let open = src.find('{').expect("a body");
+            let region = &src[open..end_of_block(src, open)];
+            assert!(
+                region.ends_with("g();\n}"),
+                "{label}: region ended early at {region:?}"
+            );
+        }
+
+        // An OPENING brace in prose still panics rather than truncating,
+        // because the counter runs off the end. Kept as a positive assertion
+        // so the comment-skipping above cannot be "fixed" into ignoring an
+        // unbalanced region.
+        let unbalanced = "fn f() {\n    g();\n";
+        let open = unbalanced.find('{').expect("a body");
+        assert!(
+            std::panic::catch_unwind(|| end_of_block(unbalanced, open)).is_err(),
+            "an unterminated block must panic, never return a truncated region"
+        );
     }
 
     /// The text of one function, bounded by BRACE MATCHING rather than by the
@@ -4670,26 +5102,255 @@ mod tests {
     /// Used by the chokepoint pin to check what runs OFF the loop. Panics on a
     /// spawn form it does not recognise, so a new one is reviewed rather than
     /// silently skipped.
+    ///
+    /// THAT SENTENCE USED TO BE FALSE, in the two independent ways a scan like
+    /// this can be false, and both were demonstrated against the real file:
+    ///
+    ///  * It matched the fixed literals `spawn(` and `spawn_blocking(`, so any
+    ///    other spawn token was not matched AT ALL — not panicked on, skipped.
+    ///    `tokio::task::spawn_local(async move { .. })` placed inside
+    ///    `dispatch_delegate_request` (an ALLOWED function, so checks 1 and 2
+    ///    are satisfied) left the chokepoint pin GREEN, while the identical
+    ///    injection written `GlobalExecutor::spawn(` went red. `spawn_on`,
+    ///    `spawn_pinned` and `spawn_local` are all that shape, and enumerating
+    ///    `spawn_blocking(` as a second literal was itself evidence that the
+    ///    prefix problem was already known.
+    ///  * It bound the task body to "the first `{` within 40 characters after
+    ///    the paren", which is a guess about layout, not about syntax. Handing
+    ///    a pre-built future to a RECOGNISED spawn —
+    ///    `let fut = async move { .. }; GlobalExecutor::spawn(fut);` followed
+    ///    by any short block — latched the scan onto that unrelated block and
+    ///    never scanned the future at all. Also green.
+    ///
+    /// So the scan is now anchored on SYNTAX at both ends. Every identifier
+    /// containing `spawn` that is applied as a call is a candidate, and its
+    /// first argument must be a literal block-producing expression — `async
+    /// {`, `async move {`, a closure — whose brace is where the body starts.
+    /// Anything else reaches the panic the paragraph above promises, which is
+    /// the point: an unfamiliar spawn form is a thing to review, not a thing to
+    /// skip.
     pub(super) fn spawned_bodies(code: &str) -> Vec<&str> {
-        let mut out = Vec::new();
-        for pattern in ["spawn(", "spawn_blocking("] {
-            for (idx, m) in code.match_indices(pattern) {
-                let arg_start = idx + m.len();
-                let rel = code[arg_start..].find('{').unwrap_or_else(|| {
-                    panic!("a `{pattern}` at byte {idx} is never followed by a block")
-                });
-                assert!(
-                    rel < 40,
-                    "unrecognised spawn form at byte {idx}: this pin bounds a \
-                     spawned task by the block it is handed, and no block \
-                     follows within 40 characters. Teach it the new form rather \
-                     than letting a spawned task go unscanned."
-                );
-                let open = arg_start + rel;
-                out.push(&code[open..end_of_block(code, open)]);
+        fn is_ident(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        fn skip_ws(code: &str, mut i: usize) -> usize {
+            while code
+                .as_bytes()
+                .get(i)
+                .is_some_and(|b| b.is_ascii_whitespace())
+            {
+                i += 1;
             }
+            i
+        }
+        /// Consume `kw` at `i`, but only where it is a WHOLE identifier — so
+        /// `moved` is not read as `move` and the scan does not walk into the
+        /// middle of a name.
+        fn eat_kw(code: &str, i: usize, kw: &str) -> Option<usize> {
+            let end = i + kw.len();
+            let boundary = !code.as_bytes().get(end).copied().is_some_and(is_ident);
+            (code.get(i..end) == Some(kw) && boundary).then_some(end)
+        }
+
+        let bytes = code.as_bytes();
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(rel) = code[cursor..].find("spawn") {
+            let hit = cursor + rel;
+            // Widen to the whole identifier this occurrence sits in, so the
+            // candidate set is "every spawn-family name" rather than a list
+            // somebody has to remember to extend.
+            let mut start = hit;
+            while start > 0 && is_ident(bytes[start - 1]) {
+                start -= 1;
+            }
+            let mut name_end = hit + "spawn".len();
+            while bytes.get(name_end).copied().is_some_and(is_ident) {
+                name_end += 1;
+            }
+            cursor = name_end;
+            // Only a CALL spawns anything. A mention of the name in a type, a
+            // path or a binding spawns no task and has no body to scan.
+            if bytes.get(name_end) != Some(&b'(') {
+                continue;
+            }
+            let ident = &code[start..name_end];
+
+            let mut i = skip_ws(code, name_end + 1);
+            if let Some(next) = eat_kw(code, i, "async") {
+                i = skip_ws(code, next);
+            }
+            if let Some(next) = eat_kw(code, i, "move") {
+                i = skip_ws(code, next);
+            }
+            if bytes.get(i) == Some(&b'|') {
+                let close = i
+                    + 1
+                    + code[i + 1..].find('|').unwrap_or_else(|| {
+                        panic!(
+                            "`{ident}` at byte {start} opens a closure parameter \
+                             list that is never closed"
+                        )
+                    });
+                i = skip_ws(code, close + 1);
+            }
+            assert_eq!(
+                bytes.get(i),
+                Some(&b'{'),
+                "unrecognised spawn form: `{ident}` at byte {start} is not \
+                 handed a literal block (`async {{`, `async move {{`, or a \
+                 closure). This pin bounds a spawned task by the block it is \
+                 given, so a task handed a pre-built future or a named function \
+                 would go UNSCANNED — and an unscanned spawn is exactly how a \
+                 delegate run gets off the serial loop without this pin \
+                 noticing. Teach it the new form rather than letting it skip."
+            );
+            out.push(&code[i..end_of_block(code, i)]);
         }
         out
+    }
+
+    /// Whether the `fn ` at `at` opens a DECLARATION, rather than appearing in
+    /// a function-pointer type (`f: fn (u8)`), a path, or a string. True when
+    /// everything between the start of that line and `at` is whitespace or a
+    /// declaration modifier.
+    pub(super) fn is_fn_declaration(code: &str, at: usize) -> bool {
+        let line_start = code[..at].rfind('\n').map_or(0, |i| i + 1);
+        code[line_start..at].split_whitespace().all(|tok| {
+            matches!(tok, "async" | "const" | "unsafe" | "extern" | "pub")
+                || tok.starts_with("pub(")
+                || tok.starts_with('"') // extern "C"
+        })
+    }
+
+    /// The name of the nearest preceding `fn` DECLARATION, whatever modifiers
+    /// precede it, or `""` when there is none.
+    ///
+    /// THE SAME DEFECT AS `spawned_bodies`', one scan over, and it was live.
+    /// The version this replaced anchored on `"\nfn "` and `"\nasync fn "` —
+    /// a declaration in column 0 with no visibility prefix. This file's
+    /// production text contains `pub(crate) async fn contract_handling`,
+    /// `pub(crate) fn set_off_loop_fetch_override` and a dozen indented `impl`
+    /// methods, none of which that scan can see. So a
+    /// `.execute_delegate_request(` placed in a new `pub async fn` declared
+    /// immediately after an ALLOWED function was attributed to that allowed
+    /// function, and both of the chokepoint pin's first two checks passed.
+    /// `fn_region`'s own rustdoc already warns about this exact needle ("it
+    /// misses `pub async fn`, `pub(crate) async fn` and every other visibility
+    /// prefix"); the warning had simply never been applied here.
+    pub(super) fn enclosing_fn(code: &str, idx: usize) -> &str {
+        code[..idx]
+            .match_indices("fn ")
+            .filter(|(i, _)| is_fn_declaration(code, *i))
+            .last()
+            .map(|(i, m)| {
+                let after = &code[i + m.len()..];
+                after
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or("")
+            })
+            .unwrap_or("")
+    }
+
+    /// The scrape helpers above are themselves guards, so they get guards.
+    ///
+    /// Every one of these cases was found GREEN against the real file by a
+    /// post-merge audit of #5554 — that is, the chokepoint pin passed while the
+    /// invariant it names was violated. They are unit tests on synthetic source
+    /// rather than injections into this file because that is the only form that
+    /// SURVIVES: a one-off injection verifies the scan once, on the day it is
+    /// done, and this workstream has now found four separate pins that passed
+    /// while their invariant was broken. A scan nobody can re-falsify is the
+    /// thing that keeps going wrong.
+    #[test]
+    fn the_spawn_scan_sees_every_spawn_family_call() {
+        // The literal `spawn(`/`spawn_blocking(` list matched none of these, so
+        // each was silently skipped rather than reaching the panic the rustdoc
+        // promises. `spawn_local` is the one the audit actually demonstrated.
+        for token in [
+            "GlobalExecutor::spawn",
+            "tokio::task::spawn_local",
+            "tokio::task::spawn_blocking",
+            "handle.spawn_on",
+            "pool.spawn_pinned",
+        ] {
+            let code = format!("async fn allowed() {{ {token}(async move {{ NEEDLE }}); }}");
+            let bodies = spawned_bodies(&code);
+            assert_eq!(bodies.len(), 1, "`{token}` must be scanned, not skipped");
+            assert!(
+                bodies[0].contains("NEEDLE"),
+                "`{token}`'s task body must be what is scanned, got {:?}",
+                bodies[0]
+            );
+        }
+    }
+
+    /// A mention of a spawn-family name that is not a CALL spawns nothing, so
+    /// it must not be scanned — and must not panic either, or the pin fails on
+    /// perfectly ordinary code and gets softened by the next person to hit it.
+    #[test]
+    fn the_spawn_scan_ignores_names_that_are_not_calls() {
+        let code = "fn f() { let spawn_handle: JoinHandle<()> = h; drop(spawn_handle); }";
+        assert!(spawned_bodies(code).is_empty());
+    }
+
+    /// A closure body is a task body: `spawn_blocking(move || { .. })` must be
+    /// scanned through the parameter list, not stop at it.
+    #[test]
+    fn the_spawn_scan_bounds_a_closure_body() {
+        let code = "fn f() { spawn_blocking(move || { NEEDLE }); }";
+        let bodies = spawned_bodies(code);
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("NEEDLE"));
+    }
+
+    /// The second audit defeat, and the subtler one: it uses a RECOGNISED spawn
+    /// token. Bounding the body by "the first `{` within 40 characters" is a
+    /// guess about layout, so handing the spawn a pre-built future latched the
+    /// scan onto an unrelated nearby block and never scanned the task at all.
+    /// The scan must PANIC here, which is what its rustdoc has always claimed.
+    #[test]
+    #[should_panic(expected = "unrecognised spawn form")]
+    fn a_spawn_handed_a_prebuilt_future_panics_instead_of_scanning_the_next_block() {
+        let code = "fn f() { let fut = async move { NEEDLE }; \
+                    GlobalExecutor::spawn(fut); if c { let _x = 1; } }";
+        let _ = spawned_bodies(code);
+    }
+
+    /// The owner scan must see a declaration behind a visibility prefix. Where
+    /// it does not, a call in the new function is attributed to whichever
+    /// prefix-free declaration happens to precede it — which for a function
+    /// declared just after the chokepoint is the chokepoint itself, so checks 1
+    /// and 2 both report a true answer about the wrong function.
+    #[test]
+    fn the_owner_scan_sees_declarations_behind_a_visibility_prefix() {
+        for decl in [
+            "fn evil",
+            "async fn evil",
+            "pub fn evil",
+            "pub async fn evil",
+            "pub(crate) async fn evil",
+            "pub(super) fn evil",
+            "    fn evil", // an indented `impl` method
+        ] {
+            let code = format!("async fn allowed() {{}}\n{decl}() {{ NEEDLE }}\n");
+            let idx = code.find("NEEDLE").expect("needle");
+            assert_eq!(
+                enclosing_fn(&code, idx),
+                "evil",
+                "`{decl}` must be recognised as the enclosing declaration"
+            );
+        }
+    }
+
+    /// ...and must NOT mistake a function-pointer type or a path for one, or it
+    /// reports a nonsense owner and the pin fails on correct code.
+    #[test]
+    fn the_owner_scan_ignores_fn_that_is_not_a_declaration() {
+        let code = "async fn allowed() {\n    let f: fn (u8) = g;\n    NEEDLE\n}\n";
+        let idx = code.find("NEEDLE").expect("needle");
+        assert_eq!(enclosing_fn(code, idx), "allowed");
     }
 
     /// PIN: the NODE-WIDE "one delegate `process()` at a time" invariant, held
@@ -4725,30 +5386,23 @@ mod tests {
     /// chokepoint, or — the case checks 1 and 2 could not see — put either
     /// call inside a `GlobalExecutor::spawn` body WITHIN one of the four
     /// allowed functions. All three fail. Verified by doing all three.
+    ///
+    /// Two further falsifications, added after a post-merge audit found this
+    /// pin GREEN under both. Each defeated a SCAN rather than the property, so
+    /// the fix was to the scan and each now has its own unit test beside the
+    /// helper it belongs to:
+    ///  * `tokio::task::spawn_local(async move { ..chokepoint.. })` inside an
+    ///    allowed function — an unenumerated spawn token, skipped rather than
+    ///    panicked on (see `spawned_bodies`);
+    ///  * `.execute_delegate_request(` in a new `pub async fn` declared
+    ///    immediately after the chokepoint — a declaration form the owner scan
+    ///    could not see (see `enclosing_fn`).
     #[test]
     fn every_delegate_run_is_reached_from_the_serial_loop() {
         // Production text only, comments stripped. Both needles occur in this
         // test's own prose and in the module's doc comments, and a scrape that
         // counted those would report a true fact about the wrong text (#5450).
         let code = production_code();
-
-        // The nearest preceding `fn` declaration at statement position.
-        fn enclosing_fn(code: &str, idx: usize) -> &str {
-            code[..idx]
-                .rmatch_indices("\nfn ")
-                .next()
-                .into_iter()
-                .chain(code[..idx].rmatch_indices("\nasync fn ").next())
-                .max_by_key(|(i, _)| *i)
-                .map(|(i, m)| {
-                    let after = &code[i + m.len()..];
-                    after
-                        .split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .next()
-                        .unwrap_or("")
-                })
-                .unwrap_or("")
-        }
 
         // 1. The executor call is reached through ONE chokepoint.
         let chokepoint = "handle_delegate_with_contract_requests";
@@ -4859,26 +5513,40 @@ mod tests {
     /// That the prohibition survives without quoting the old code is the signal
     /// this pin was guarding behaviour rather than shape.
     ///
-    /// Pinned from source rather than behaviourally because both mock
-    /// executors return `Err` unconditionally, so no fixture can drive the
-    /// executor to hand back a wrong-variant `Ok`.
+    /// KNOWN LIMIT, and the reason this is no longer the only guard. It is a
+    /// TEXT scrape, so it constrains what the arm says, not what it does:
+    /// `return unexpected_response_outcome();` behind a new helper satisfies
+    /// both assertions while the arm reports the violation to the client as an
+    /// empty success. A mutation campaign confirmed exactly that defeat. Comment
+    /// stripping (added here) closes the commented-out variant; nothing a text
+    /// scrape can do closes the indirection.
+    ///
+    /// So the PROHIBITION is now held behaviourally by
+    /// `hol_4391_tests::an_unexpected_executor_response_reaches_the_client_as_an_error`,
+    /// and this pin is kept for what a scrape is good at: catching the arm
+    /// being deleted or inverted in place. The claim that no fixture could
+    /// drive it was true when written — every mock path returned
+    /// `DelegateResponse` or `Err` — and stopped being true when the mock grew
+    /// `delegate_wrong_variant`, which exists for this test. A prohibition
+    /// worth pinning is worth being able to execute.
     #[test]
     fn unexpected_response_variant_does_not_become_a_fake_success() {
-        let full = include_str!("contract.rs");
-        let cutoff = full
-            .find("\nmod tests {")
-            .expect("contract.rs must have a top-level `mod tests`");
-        let src = &full[..cutoff];
-
-        let start = src
-            .find("async fn handle_delegate_with_contract_requests")
-            .expect("handle_delegate_with_contract_requests must exist");
-        let body = &src[start..];
-        let end = body[1..]
-            .find("\nasync fn ")
-            .map(|i| i + 1)
-            .unwrap_or(body.len());
-        let body = &body[..end];
+        // `production_code()`, NOT raw `include_str!`. #5554's commit message
+        // said both widened pins "strip line comments before scraping"; that
+        // was true of the TTL-sweep pin and FALSE of this one, which scraped
+        // raw. The asymmetry is what made the mutation campaign's defeat work:
+        // replacing the arm with a helper call and leaving a stale
+        // `// was DelegateRunOutcome::Failed(...)` comment kept this green
+        // while the arm reported an internal invariant violation to the client
+        // as an EMPTY SUCCESS. A commit message describing a property the code
+        // does not have is its own instance of the pattern this workstream
+        // keeps finding.
+        //
+        // `fn_region` bounds by brace matching rather than by "the next
+        // `\nasync fn `" — the same widening hazard `fn_region`'s own rustdoc
+        // describes, which this pin's hand-rolled bound had.
+        let src = production_code();
+        let body = fn_region(&src, "async fn handle_delegate_with_contract_requests");
 
         let arm = body
             .find("phase = \"unexpected_response\"")
@@ -4919,6 +5587,18 @@ mod tests {
     /// forbids everything the original forbade — its failure return is one of
     /// the exits — plus the two parking introduced.
     ///
+    /// KNOWN LIMIT, and it is exactly the one this pin's own assertion message
+    /// oversells. It pins POSITION. The message says the sweep "must not become
+    /// conditional on the delegate doing anything in particular", and position
+    /// cannot express conditionality: wrapping the sweep in
+    /// `if std::hint::black_box(false) { .. }` WITHOUT MOVING IT leaves this
+    /// green while the sweep never runs. A mutation campaign confirmed that.
+    /// Same lesson as the drain-before-sweep pin this file already records —
+    /// position is the right tool for order and the wrong tool for everything
+    /// else — and the same remedy: the property is now held behaviourally by
+    /// `hol_4391_tests::the_notification_path_actually_runs_the_registry_sweep`,
+    /// and this keeps only the ordering claim a scrape can really make.
+    ///
     /// The source is truncated at the test module BEFORE scraping: the needles
     /// also occur in this function's own text, which `include_str!` pulls in
     /// (see #5450).
@@ -4930,15 +5610,24 @@ mod tests {
             .expect("contract.rs must have a top-level `mod tests`");
         let src = &full[..cutoff];
 
-        let start = src
-            .find("async fn handle_delegate_notification")
-            .expect("handle_delegate_notification must exist");
-        let body = &src[start..];
-        let end = body[1..]
-            .find("\nasync fn ")
-            .map(|i| i + 1)
-            .unwrap_or(body.len());
-        let body = &body[..end];
+        // BRACE MATCHING, NOT THE NEXT `\nasync fn `. This bounded the region
+        // on that needle until a reviewer measured it: 242 lines scraped
+        // against a 163-line function, so it had already swallowed the
+        // following item and stopped at some later declaration. Benign today,
+        // because every needle it finds is inside the real function and the
+        // `min` over exits is unchanged. It fails OPEN, though: delete the
+        // sweep from the notification path while a neighbouring function
+        // inside the widened window has one, and `find` succeeds against the
+        // neighbour while the notification path no longer sweeps.
+        //
+        // `fn_region`'s own rustdoc warns about this needle, ten lines from
+        // where `fn_region` is used, and this change applied that lesson to
+        // `enclosing_fn` and to the P5b pin and left this one. That is the rule
+        // this change adds to `.claude/rules/bug-prevention-patterns.md`
+        // ("Finishing the sentence and stopping there") failing on its own
+        // author, which is the third instance and the reason the entry says to
+        // grep for every other consumer of the anchor.
+        let body = fn_region(src, "async fn handle_delegate_notification");
 
         // STRIP LINE COMMENTS FIRST. The needles below occur in this
         // function's own prose — the sweep's comment explains which exits used
@@ -4993,6 +5682,17 @@ mod tests {
     ///  2. the notification path — which has no connection and therefore
     ///     hardcodes `Local` — is `InterDelegateDispatch::Suppressed`, so that
     ///     hardcoded value can never reach the hop.
+    ///
+    /// KNOWN LIMIT, the same one carried by
+    /// `consent_prompt_identity_comes_from_the_gated_origin`: property 1 is a
+    /// claim about the TOKEN at the call site, not about the value it carries.
+    /// It forbids the literal `ConnectionScope::Local` in the hop's arguments,
+    /// which rebinding `connection_scope` to that literal beforehand satisfies
+    /// while laundering the scope exactly as the literal would have. What it
+    /// does catch — the hop being changed to hardcode a scope, and the
+    /// scopeless notification path being allowed to reach it — is what it is
+    /// for; do not read it as proving the forwarded value is the originating
+    /// one.
     #[test]
     fn inter_delegate_hop_forwards_the_originating_scope() {
         // Comments stripped (`production_code`): without that, commenting the
@@ -5058,6 +5758,15 @@ mod tests {
     /// the gate being deleted or moved below its consumer, which it does. The
     /// region is bounded to the function so the pin cannot match its own
     /// assertion strings further down the file.
+    ///
+    /// KNOWN LIMIT, so nobody reads this as stronger than it is: it asserts
+    /// POSITION — the gate is present and precedes its consumer — and nothing
+    /// about dataflow. Re-shadowing `origin_contract` with the ungated value
+    /// between the two (`let origin_contract = raw_origin;`) leaves both
+    /// `find`s satisfied and the ordering true while the gate is inert, and
+    /// this pin stays green. Only a reader or a behavioural test closes that;
+    /// keep the gate as the LAST binding of `origin_contract` before the
+    /// prompt.
     ///
     /// It scrapes `production_code()`, which strips comments, and that is
     /// load-bearing rather than tidiness: the earlier version scraped raw text,
@@ -5898,7 +6607,53 @@ mod hol_4391_tests {
     struct OverrideGuard;
     impl OverrideGuard {
         fn install(stub: OffLoopFetchStub) -> Self {
-            set_off_loop_fetch_override(Some(stub));
+            // THE MARGIN IS CHECKED HERE, not asserted in a comment somewhere
+            // else. `within_fetch_allowance` increments a process-global
+            // refusal counter, and
+            // `an_oversized_related_fetch_is_refused_and_counted` asserts on
+            // that counter EXACTLY. Its `#[serial_test::serial]` attribute is
+            // not what makes that safe: these tests serialise among themselves
+            // through `TEST_GUARD`, a different mechanism, so they can run
+            // alongside it. What makes it safe is that no stub here returns a
+            // state big enough to take the refusal branch.
+            //
+            // That was a fact about the tests that happened to exist. Wrapping
+            // every installed stub makes it a fact about all of them, including
+            // the ones nobody has written, and it fails AT THE MISTAKE: adding
+            // a large-stub test panics here with the reason, instead of making
+            // an unrelated test flaky in a way that only parses if you have
+            // read a comment in another module.
+            //
+            // For scale: every stub today returns seven bytes against a floor
+            // allowance of 512 KiB, so this is not load-bearing now. It is here
+            // for the test that is not written yet.
+            let floor = delegate_park::min_upsert_fetch_allowance();
+            let checked: OffLoopFetchStub = Arc::new(move |missing| {
+                let inner = stub(missing);
+                Box::pin(async move {
+                    let out = inner.await;
+                    if let Ok(states) = &out {
+                        for (id, state) in states {
+                            assert!(
+                                delegate_park::ByteCount::new(state.as_ref().len()) <= floor,
+                                "off-loop fetch stub returned {} bytes for {id}, over the \
+                                 floor per-fetch allowance of {floor}. That reaches the \
+                                 refusal branch of `within_fetch_allowance`, which \
+                                 increments the process-global \
+                                 REFUSED_OVERSIZED_FETCHES and breaks \
+                                 `an_oversized_related_fetch_is_refused_and_counted`'s \
+                                 exact-equality assertion intermittently. Either shrink \
+                                 the stub, or join that test's \
+                                 `#[serial_test::serial(oversized_fetch_counter)]` group \
+                                 and say why",
+                                state.as_ref().len()
+                            );
+                        }
+                    }
+                    out
+                })
+            });
+            set_off_loop_fetch_override(Some(checked));
             OverrideGuard
         }
     }
@@ -7709,6 +8464,12 @@ mod hol_4391_tests {
     /// this shape and the wrong tool for the other; the lesson was never "never
     /// assert order".
     ///
+    /// SCOPE, since the sweep now has a budget: this guard covers the DECLINED
+    /// sweep only. A park deferred for budget leaves nothing in
+    /// `delegate_resumes` and does reach the select with a past deadline — that
+    /// is bounded by the budget being charged only for parks actually ended,
+    /// not by this guard, and the loop comment says so at more length.
+    ///
     /// FALSIFY by deleting the `continue` guard, commenting it out, or moving
     /// it below `park_ctx.next_sweep_deadline()`.
     #[test]
@@ -7739,6 +8500,713 @@ mod hol_4391_tests {
              `delegate_resumes`, so this guard is what keeps that unreachable \
              (#5554)"
         );
+    }
+
+    /// An empty continuation: enough to make a real park, and nothing more.
+    /// `handle_delegate_resume` on one of these completes without re-entering
+    /// the delegate (nothing to feed back), which is what keeps the sweep test
+    /// below about the BUDGET rather than about the executor.
+    fn park_continuation() -> delegate_park::Continuation {
+        delegate_park::Continuation {
+            iterations: 0,
+            params: Parameters::from(Vec::new()),
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+            inter_delegate: InterDelegateDispatch::Allowed,
+            accumulated: Vec::new(),
+            inbound_so_far: Vec::new(),
+            responder: None,
+            delivery: delegate_park::Delivery::Client,
+        }
+    }
+
+    /// THE BOUNDARY the sibling test cannot reach: a maximal-cost victim
+    /// admitted on the budget's LAST unit.
+    ///
+    /// Both budgeted loops test the budget BEFORE a victim's cost is known —
+    /// `while resume_budget > 0` and `if spent >= budget { break }` — so
+    /// `MAX_RESUME_DRAIN_BATCH - 1` one-run victims walk the budget down to its
+    /// final unit and the next victim is STILL admitted, at up to
+    /// `1 + MAX_PENDING_PER_DELEGATE + MAX_PENDING_NOTIFICATION_CONTRACTS` = 25
+    /// runs. The real per-loop bound is therefore `(budget - 1) + 25` = 40, and
+    /// 80 across both BUDGETED loops (105 counting the unbudgeted idle-select
+    /// arm, see `contract_handling`) — not the `2 x MAX_RESUME_DRAIN_BATCH` = 32 the
+    /// loop comment claimed until this test was written.
+    ///
+    /// The sibling test could not see it because every victim there costs
+    /// exactly one run, so the budget is spent in units of one and never
+    /// straddles the limit. This one gives the LAST victim a full pending queue
+    /// and asserts the overshoot both ways: it must exceed the budget (or the
+    /// cost is being checked before it is spent, and the documented bound is
+    /// wrong in the other direction) and it must not exceed the derived
+    /// ceiling.
+    ///
+    /// FALSIFY by moving the budget check after the cost is spent: the first
+    /// assertion then goes red.
+    #[tokio::test]
+    async fn the_sweep_budget_admits_one_maximal_victim_past_the_limit() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park_ctx = delegate_park::DelegateParkCtx::new(tx);
+        let mut buffered = std::collections::VecDeque::new();
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+
+        // EXACTLY MAX_RESUME_DRAIN_BATCH victims, with the LAST one carrying a
+        // queue so its force-resume costs more than a single run.
+        //
+        // The count is the whole fixture. `expired` returns victims in epoch
+        // order and epochs are assigned in park order, so victim N is swept
+        // Nth. With `budget + 1` victims the budget breaks at the 17th and the
+        // costly one is never reached — the first version of this test did
+        // exactly that and reported `spent == 16`, i.e. no overshoot, which
+        // looks like the bound holding. The costly victim has to sit ON the
+        // boundary: fifteen one-run victims take `spent` to 15, and the
+        // sixteenth is admitted because `15 >= 16` is false.
+        let victims = MAX_RESUME_DRAIN_BATCH;
+        let mut keys = Vec::new();
+        for i in 0..victims {
+            let byte = u8::try_from(i).expect("fits");
+            let key = DelegateKey::new(
+                [byte; 32],
+                freenet_stdlib::prelude::CodeHash::new([byte; 32]),
+            );
+            assert!(matches!(
+                park_ctx.park(
+                    key.clone(),
+                    park_continuation(),
+                    delegate_park::ByteCount::default()
+                ),
+                delegate_park::ParkAdmission::Admitted { .. }
+            ));
+            keys.push(key);
+        }
+        let costly = keys.last().expect("a last victim").clone();
+        for i in 0..delegate_park::MAX_PENDING_PER_DELEGATE {
+            let outcome = park_ctx.queue_pending(
+                &costly,
+                delegate_park::PendingRun::Client {
+                    id: handler::EventId { id: i as u64 },
+                    req: DelegateRequest::ApplicationMessages {
+                        key: costly.clone(),
+                        params: Parameters::from(Vec::new()),
+                        inbound: Vec::new(),
+                    },
+                    origin_contract: None,
+                    connection_scope: crate::client_events::ConnectionScope::Local,
+                    user_context: None,
+                },
+            );
+            assert!(
+                matches!(outcome, delegate_park::QueueOutcome::Queued),
+                "the queue behind the costly victim must actually fill, or this \
+                 test measures a one-run victim like every other"
+            );
+        }
+
+        let past_due =
+            tokio::time::Instant::now() + delegate_park::PARK_TTL + Duration::from_secs(1);
+        let spent = sweep_expired_parks(
+            &mut handler,
+            &mut park_ctx,
+            &prompter,
+            &mut rx,
+            &mut buffered,
+            past_due,
+            MAX_RESUME_DRAIN_BATCH,
+        )
+        .await;
+
+        // THE POINT: the budget is tested BEFORE a victim's cost is known, so
+        // the last admitted victim can carry the whole queue past the limit.
+        // The bound is real but it is `(budget - 1) + max_victim_cost`, not
+        // `budget` — and the comment in `contract_handling` said the latter
+        // until this test was written.
+        assert!(
+            spent > MAX_RESUME_DRAIN_BATCH,
+            "a maximal victim admitted on the budget's last unit must be able to \
+             overshoot it — if this holds at exactly the budget, the loop is \
+             checking the cost BEFORE spending it and the documented bound is \
+             wrong in the other direction. Spent {spent}"
+        );
+        let ceiling = (MAX_RESUME_DRAIN_BATCH - 1)
+            + 1
+            + delegate_park::MAX_PENDING_PER_DELEGATE
+            + delegate_park::MAX_PENDING_NOTIFICATION_CONTRACTS;
+        assert!(
+            spent <= ceiling,
+            "...but it must not exceed `(budget - 1) + 1 + \
+             MAX_PENDING_PER_DELEGATE + MAX_PENDING_NOTIFICATION_CONTRACTS` = \
+             {ceiling}, which is the real per-loop bound the loop comment now \
+             states. Spent {spent}"
+        );
+    }
+
+    /// The ORIGINAL sweep-budget test, which cannot see the boundary above:
+    /// its victims cost exactly one run each, so the budget is consumed in
+    /// units of one and never straddles the limit.
+    /// M2: the TTL backstop must not perform an unbounded number of delegate
+    /// runs in a single pass.
+    ///
+    /// `expired` can return up to `MAX_PARKED_DELEGATES` (64) victims and one
+    /// force-resume costs up to `1 + MAX_PENDING_PER_DELEGATE +
+    /// MAX_PENDING_NOTIFICATION_CONTRACTS` (25) delegate runs, so the sweep
+    /// could execute 1600 WASM runs with no fair-queue interleaving and no
+    /// yield — every GET/PUT/UPDATE/subscribe on the node waiting behind it.
+    /// The triggering condition is 64 parked delegates whose off-loop tasks are
+    /// wedged, i.e. precisely what the backstop exists for.
+    ///
+    /// `handle_delegate_resume` returns its run count so the caller can spend
+    /// it, and the resume batch sixty lines above does; the sweep threw it away
+    /// with `let _ =`.
+    ///
+    /// FALSIFY by removing the budget check from `sweep_expired_parks`: the
+    /// first pass then clears every park and the second assertion goes red.
+    /// The third and fourth assertions are what stop that from being fixable by
+    /// simply sweeping FEWER parks — the deferred victims must still be swept,
+    /// and `expired` recomputing every pass is what makes deferring free.
+    ///
+    /// LIMIT, and it is why the boundary test below exists: every victim here
+    /// costs exactly ONE run, so the budget is consumed in units of one and
+    /// never straddles its limit. That is what let the loop comment claim a
+    /// per-iteration bound of `2 x MAX_RESUME_DRAIN_BATCH` for as long as it
+    /// did — the case that disproves it cannot arise in this fixture.
+    #[tokio::test]
+    async fn the_ttl_sweep_is_bounded_and_leaves_the_rest_for_the_next_pass() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park_ctx = delegate_park::DelegateParkCtx::new(tx);
+        let mut buffered = std::collections::VecDeque::new();
+        let prompter = Arc::new(GatedPrompter {
+            gate: Arc::new(tokio::sync::Semaphore::new(0)),
+        });
+
+        // More victims than the budget, all past due at the same instant: the
+        // backstop's own scenario, scaled down.
+        let victims = MAX_RESUME_DRAIN_BATCH + 4;
+        for i in 0..victims {
+            let byte = u8::try_from(i).expect("victims fits in a byte");
+            let key = DelegateKey::new(
+                [byte; 32],
+                freenet_stdlib::prelude::CodeHash::new([byte; 32]),
+            );
+            assert!(
+                matches!(
+                    park_ctx.park(
+                        key,
+                        park_continuation(),
+                        delegate_park::ByteCount::default()
+                    ),
+                    delegate_park::ParkAdmission::Admitted { .. }
+                ),
+                "every park must be admitted, or this test is measuring the cap"
+            );
+        }
+        assert_eq!(park_ctx.parked_count(), victims);
+
+        // Instant::now() is a PARAMETER precisely so this needs no paused
+        // clock: pausing would auto-advance to PARK_WORK_BUDGET and
+        // USER_INPUT_TIMEOUT first, neither of which is what is under test.
+        let past_due =
+            tokio::time::Instant::now() + delegate_park::PARK_TTL + Duration::from_secs(1);
+
+        let spent = sweep_expired_parks(
+            &mut handler,
+            &mut park_ctx,
+            &prompter,
+            &mut rx,
+            &mut buffered,
+            past_due,
+            MAX_RESUME_DRAIN_BATCH,
+        )
+        .await;
+        assert_eq!(
+            spent, MAX_RESUME_DRAIN_BATCH,
+            "one sweep must spend its budget and stop, not run every past-due \
+             park it can find"
+        );
+        assert_eq!(
+            park_ctx.parked_count(),
+            victims - MAX_RESUME_DRAIN_BATCH,
+            "the over-budget victims must still be PARKED. Without the budget \
+             this pass force-resumes all {victims} of them — up to 25 delegate \
+             runs each, on the serial loop, with the fair queue getting no turn"
+        );
+
+        // Deferred, not dropped: `expired` is recomputed every pass, so the
+        // rest are swept on the next one. That is what makes capping the right
+        // shape here rather than a yield.
+        let spent = sweep_expired_parks(
+            &mut handler,
+            &mut park_ctx,
+            &prompter,
+            &mut rx,
+            &mut buffered,
+            past_due,
+            MAX_RESUME_DRAIN_BATCH,
+        )
+        .await;
+        assert_eq!(spent, victims - MAX_RESUME_DRAIN_BATCH);
+        assert_eq!(
+            park_ctx.parked_count(),
+            0,
+            "a deferred victim must be re-listed and swept, not skipped — the \
+             backstop still has to un-wedge every wedged delegate"
+        );
+    }
+
+    /// M3: a notification-driven run that PARKS must, on resume, fan its
+    /// residual messages out to the registered apps — not to a client
+    /// responder that does not exist.
+    ///
+    /// `Delivery::Apps` -> `Delivery::Client` at the notification park site
+    /// survives the whole suite: with no client behind a notification, the
+    /// `Client` arm finds `carried_responder == None` and the delegate's reply
+    /// is silently dropped. Nothing observed the difference, because every
+    /// existing test of this path either never parks or never looks at where
+    /// the residual output went.
+    ///
+    /// So this parks through the notification path and then resumes, and the
+    /// observation is the registered app receiving the message. The
+    /// counterfactual is built in: the run must actually park first (asserted),
+    /// or the resume path is never exercised and the delivery target is never
+    /// chosen.
+    ///
+    /// FALSIFY by changing `delivery` at that site to `Delivery::Client`.
+    #[tokio::test]
+    async fn a_parked_notification_run_delivers_its_residual_output_to_apps() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        // First entry parks (it asks for user input); the resumed entry emits
+        // the reply the app must receive.
+        script.lock().unwrap().push_back(prompt_outbound().into());
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: vec![OutboundDelegateMsg::ApplicationMessage(
+                freenet_stdlib::prelude::ApplicationMessage::new(b"for-the-app".to_vec()),
+            )],
+            writes_context: None,
+        });
+
+        let key = DelegateKey::new(
+            [0x33; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x33; 32]),
+        );
+        let (app_tx, mut app_rx) = tokio::sync::mpsc::channel(4);
+        assert!(
+            delegate_app_registry::register_app(
+                &key,
+                crate::client_events::ClientId::next(),
+                delegate_app_registry::AppIdentity::Local,
+                app_tx,
+            ),
+            "the app registration must be accepted, or this measures nothing"
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx);
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+
+        handle_delegate_notification(
+            &mut handler,
+            executor::DelegateNotification {
+                delegate_key: key.clone(),
+                contract_id: ContractInstanceId::new([0x33; 32]),
+                new_state: Arc::new(WrappedState::new(b"changed".to_vec())),
+            },
+            &prompter,
+            Some(&mut park),
+        )
+        .await;
+        assert!(
+            park.is_parked(&key),
+            "the notification-driven run must PARK, or the resume path this \
+             test is about is never reached"
+        );
+
+        // The off-loop task answers the prompt and delivers its resume.
+        let resume = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the off-loop task must deliver a resume")
+            .expect("resume channel open");
+        handle_delegate_resume(&mut handler, &mut park, &prompter, resume).await;
+
+        let delivered = tokio::time::timeout(Duration::from_secs(5), app_rx.recv())
+            .await
+            .expect(
+                "a resumed notification run must fan its residual messages out \
+                 to registered apps; with Delivery::Client there is no \
+                 responder behind a notification and the reply is dropped",
+            )
+            .expect("app channel open");
+        match delivered {
+            Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key: k, values }) => {
+                assert_eq!(k, key);
+                assert!(
+                    values.iter().any(|v| matches!(
+                        v,
+                        OutboundDelegateMsg::ApplicationMessage(m)
+                            if m.payload == b"for-the-app"
+                    )),
+                    "the app must receive the delegate's actual reply, got {values:?}"
+                );
+            }
+            other => panic!("expected a DelegateResponse to the app, got {other:?}"),
+        }
+    }
+
+    /// The fetch allowance REFUSES, and the refusal is visible.
+    ///
+    /// Two halves, and the second is the one that gets skipped. A bound that
+    /// silently pushes a delegate back onto the serial loop is a behaviour
+    /// change nobody can trace: the symptom is latency somewhere else, six
+    /// months later, and nothing connects it to a related contract that grew
+    /// past 2 MiB. This repo's own rule says a refusal that is not counted
+    /// renders as a clean zero, so it is counted as well as logged.
+    ///
+    /// Note the allowance is well under `MAX_STATE_SIZE` (50 MiB) by design —
+    /// see `upsert_fetch_allowance`. A legitimately large related contract
+    /// degrades to the pre-#5544 inline path, which is slower but loses
+    /// nothing.
+    ///
+    /// AMBIENT STATE, HANDLED RATHER THAN IGNORED. `REFUSED_OVERSIZED_FETCHES`
+    /// is a process-global static and this binary runs tests in one process,
+    /// so an exact `before + 1` would be a test that fails for a reason other
+    /// than the thing it names the moment a second caller lands — the shared-
+    /// process class recorded in `.claude/rules/bug-prevention-patterns.md`.
+    /// `#[serial]` keeps other counter tests out of the window, and the
+    /// increment is asserted as `>` rather than `== before + 1` so a concurrent
+    /// production caller cannot turn a real pass into a spurious failure. The
+    /// exact-equality half is kept where it is safe and load-bearing: the
+    /// ACCEPTED case must not increment at all.
+    ///
+    /// FALSIFY by removing the size check from `within_fetch_allowance`: the
+    /// oversized fetch is then accepted and both assertions go red.
+    #[test]
+    #[serial_test::serial(oversized_fetch_counter)]
+    fn an_oversized_related_fetch_is_refused_and_counted() {
+        let id = ContractInstanceId::new([1u8; 32]);
+        let allowance = 1024usize;
+
+        let before = refused_oversized_fetches();
+        let within = within_fetch_allowance(
+            Ok(vec![(id, WrappedState::new(vec![0u8; allowance]))]),
+            &[id],
+            delegate_park::ByteCount::new(allowance),
+        );
+        assert!(
+            matches!(
+                within,
+                delegate_park::FetchDisposition::Resolved(Ok(ref v)) if v.len() == 1
+            ),
+            "a fetch inside its reserve must be RESOLVED with its states, or \
+             this test would pass for the wrong reason"
+        );
+        // EXACT EQUALITY HERE, AND WHAT ACTUALLY MAKES IT SAFE. The rustdoc
+        // above argues for `>` on the other half because
+        // `REFUSED_OVERSIZED_FETCHES` is process-global and this binary runs
+        // its tests in one process. That argument applies here too, and
+        // `#[serial_test::serial(oversized_fetch_counter)]` does NOT answer it:
+        // it excludes only tests in that one group, and the
+        // `OFF_LOOP_FETCH_OVERRIDE` tests are serialised among themselves by a
+        // different mechanism (their own `TEST_GUARD`), so they can run
+        // alongside this one.
+        //
+        // What makes the equality safe is that none of them can increment this
+        // counter: their stubs return small states and the floor allowance is
+        // 512 KiB at an 8 MiB budget, so they never take the refusal branch.
+        // That is a SIZE MARGIN, not serialisation, and saying so is the point
+        // -- a reader who believes the serial attribute is doing the work will
+        // add a test with a large stub and get an inexplicable flake here.
+        assert_eq!(
+            refused_oversized_fetches(),
+            before,
+            "an accepted fetch must not be counted as a refusal — without this \
+             half a counter that always increments would pass. If this ever \
+             fails intermittently, look for a NEW test whose off-loop stub \
+             returns states over the fetch allowance, not for a bug here"
+        );
+
+        let over = within_fetch_allowance(
+            Ok(vec![(id, WrappedState::new(vec![0u8; allowance + 1]))]),
+            &[id],
+            delegate_park::ByteCount::new(allowance),
+        );
+        assert!(
+            matches!(over, delegate_park::FetchDisposition::RetryInline),
+            "a fetch beyond its reserve must be sent back to the INLINE path, \
+             not accepted and not failed. Accepting it makes the reservation a \
+             decoration; failing it fails a write that would have succeeded had \
+             the park been refused instead of admitted"
+        );
+        assert!(
+            refused_oversized_fetches() > before,
+            "the refusal must be COUNTED. It is a legitimate degradation — the \
+             delegate keeps its write, it just costs a stall — which is exactly \
+             why an operator needs to be able to see that it happened"
+        );
+    }
+
+    /// M3, the SIBLING SITE: a QUEUED notification that parks on its own run
+    /// must also fan its residual output out to apps.
+    ///
+    /// `run_queued_notification` builds its own `ParkingCtx` with its own
+    /// `delivery`, and the test above cannot reach it: that one parks on the
+    /// first notification, this one parks on a notification that was QUEUED
+    /// behind an existing park and drained later. Flipping this site to
+    /// `Delivery::Client` left the suite green with the other test in place —
+    /// checked, not assumed. Every defect this workstream has found has had a
+    /// sibling, and a test that covers one of two identical sites is how the
+    /// second one survives.
+    ///
+    /// FALSIFY by changing `delivery` in `run_queued_notification`.
+    #[tokio::test]
+    async fn a_queued_notification_that_parks_also_delivers_to_apps() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        // 1: the resumed original run, which says nothing.
+        // 2: the drained queued notification, which parks.
+        // 3: that park's resume, whose reply the app must receive.
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: Vec::new(),
+            writes_context: None,
+        });
+        script.lock().unwrap().push_back(prompt_outbound().into());
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: vec![OutboundDelegateMsg::ApplicationMessage(
+                freenet_stdlib::prelude::ApplicationMessage::new(b"from-the-queue".to_vec()),
+            )],
+            writes_context: None,
+        });
+
+        let key = DelegateKey::new(
+            [0x34; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x34; 32]),
+        );
+        let (app_tx, mut app_rx) = tokio::sync::mpsc::channel(4);
+        assert!(delegate_app_registry::register_app(
+            &key,
+            crate::client_events::ClientId::next(),
+            delegate_app_registry::AppIdentity::Local,
+            app_tx,
+        ));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx.clone());
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+
+        // A park already in flight, so the notification below is QUEUED rather
+        // than run — which is what routes it through `run_queued_notification`.
+        let delegate_park::ParkAdmission::Admitted { epoch } = park.park(
+            key.clone(),
+            park_continuation(),
+            delegate_park::ByteCount::default(),
+        ) else {
+            panic!("the initial park must be admitted");
+        };
+
+        handle_delegate_notification(
+            &mut handler,
+            executor::DelegateNotification {
+                delegate_key: key.clone(),
+                contract_id: ContractInstanceId::new([0x34; 32]),
+                new_state: Arc::new(WrappedState::new(b"changed".to_vec())),
+            },
+            &prompter,
+            Some(&mut park),
+        )
+        .await;
+
+        // Resume the original park: it completes, then DRAINS the queued
+        // notification, whose run parks again — at the site under test.
+        handle_delegate_resume(
+            &mut handler,
+            &mut park,
+            &prompter,
+            delegate_park::DelegateResume {
+                delegate_key: key.clone(),
+                epoch,
+                cause: delegate_park::ResumeCause::Completed,
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                    freenet_stdlib::prelude::ApplicationMessage::new(b"go".to_vec()),
+                )],
+                upserts: Vec::new(),
+                unresolved_upserts: Vec::new(),
+            },
+        )
+        .await;
+        assert!(
+            park.is_parked(&key),
+            "the drained notification's run must PARK, or the site this test is \
+             about is never reached"
+        );
+
+        let resume = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the off-loop task must deliver a resume")
+            .expect("resume channel open");
+        handle_delegate_resume(&mut handler, &mut park, &prompter, resume).await;
+
+        let delivered = tokio::time::timeout(Duration::from_secs(5), app_rx.recv())
+            .await
+            .expect(
+                "a QUEUED notification whose run parked must still fan its \
+                 residual messages out to apps on resume; with Delivery::Client \
+                 there is no responder and the reply is dropped",
+            )
+            .expect("app channel open");
+        match delivered {
+            Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { values, .. }) => {
+                assert!(
+                    values.iter().any(|v| matches!(
+                        v,
+                        OutboundDelegateMsg::ApplicationMessage(m)
+                            if m.payload == b"from-the-queue"
+                    )),
+                    "the app must receive the queued run's reply, got {values:?}"
+                );
+            }
+            other => panic!("expected a DelegateResponse to the app, got {other:?}"),
+        }
+    }
+
+    /// P4b: the notification path must actually RUN the delegate->apps TTL
+    /// sweep, not merely contain it.
+    ///
+    /// `sweep_expired` is that registry's ONLY garbage collection — the
+    /// AGENTS.md GC-exemption bound rests on it — and the sibling source pin
+    /// checks where the call SITS. Wrapping it in `if black_box(false) { .. }`
+    /// with its position unchanged leaves that pin green while nothing is ever
+    /// reaped, which a mutation campaign demonstrated. Position cannot express
+    /// conditionality.
+    ///
+    /// So this drives the path and observes the consequence: a registration
+    /// older than `REGISTRATION_TTL` is gone afterwards. `route_to_apps`
+    /// returning 0 is the observation, and the assertion BEFORE the sweep is
+    /// what stops it passing vacuously — the registration must be live first,
+    /// or "nothing was delivered" proves nothing.
+    ///
+    /// FALSIFY by making the sweep conditional, or deleting it.
+    #[tokio::test(start_paused = true)]
+    async fn the_notification_path_actually_runs_the_registry_sweep() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+
+        // A delegate key of its own, so a parallel test's registrations in this
+        // process-global registry cannot be confused for this one's.
+        let key = DelegateKey::new(
+            [0x5b; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x5b; 32]),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        assert!(
+            delegate_app_registry::register_app(
+                &key,
+                crate::client_events::ClientId::next(),
+                delegate_app_registry::AppIdentity::Local,
+                tx,
+            ),
+            "the registration must be accepted, or this test measures nothing"
+        );
+        assert_eq!(
+            delegate_app_registry::route_to_apps(
+                &key,
+                Ok(freenet_stdlib::client_api::HostResponse::Ok)
+            ),
+            1,
+            "COUNTERFACTUAL: the registration must be live before the sweep, or \
+             a later zero would prove nothing"
+        );
+
+        // Past the TTL, so the sweep has something to reap.
+        tokio::time::advance(delegate_app_registry::REGISTRATION_TTL + Duration::from_secs(1))
+            .await;
+
+        // Any notification drives the path; this one is for an unrelated
+        // delegate, which is the point — the sweep is the registry's GC and
+        // must not be conditional on what the notified delegate does.
+        handle_delegate_notification(
+            &mut handler,
+            executor::DelegateNotification {
+                delegate_key: test_delegate_key(),
+                contract_id: ContractInstanceId::new([0x5b; 32]),
+                new_state: Arc::new(WrappedState::new(b"changed".to_vec())),
+            },
+            &Arc::new(crate::contract::user_input::AutoApprovePrompter),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            delegate_app_registry::route_to_apps(
+                &key,
+                Ok(freenet_stdlib::client_api::HostResponse::Ok)
+            ),
+            0,
+            "the notification path must RUN the TTL sweep, not merely contain \
+             it: this registration is past REGISTRATION_TTL and nothing else \
+             reaps the delegate->apps registry"
+        );
+    }
+
+    /// P5b: the executor answering a delegate request with a variant that is
+    /// NOT a delegate response must reach the client as an ERROR.
+    ///
+    /// This is the prohibition #5263 established and #5544 re-expressed in the
+    /// outcome enum, and until now it was held only by a source scrape — which
+    /// a mutation campaign defeated with a helper-call indirection, leaving the
+    /// arm reporting an internal invariant violation to the client as an empty
+    /// success while the pin stayed green.
+    ///
+    /// Executing it needs a mock that can produce a wrong variant, which is
+    /// what `delegate_wrong_variant` is for. Nothing else can: every other mock
+    /// path returns `DelegateResponse` or `Err`, and "no fixture can drive it"
+    /// is what justified pinning from source in the first place. That was a
+    /// reason to extend the fixture, not a reason to accept a weaker guard.
+    ///
+    /// FALSIFY by changing the arm to yield `Completed`, or by routing it
+    /// through a helper that does — the case the source pin cannot see.
+    #[tokio::test]
+    async fn an_unexpected_executor_response_reaches_the_client_as_an_error() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        handler
+            .runtime_mut()
+            .delegate_wrong_variant
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let send = Arc::new(send);
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            crate::contract::user_input::AutoApprovePrompter,
+        ));
+
+        let key = test_delegate_key();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send_to_handler(delegate_event(&key)),
+        )
+        .await
+        .expect("the delegate request must be answered, not dropped")
+        .expect("delegate request must respond");
+
+        match response {
+            ContractHandlerEvent::DelegateResponse(result) => {
+                assert!(
+                    result.is_err(),
+                    "the executor answered with a non-delegate variant — an \
+                     internal invariant violation. The client must be able to \
+                     tell that from `the delegate said nothing`, so it has to \
+                     arrive as Err, not as an empty success (#5263)"
+                );
+            }
+            other => panic!("expected DelegateResponse, got {other}"),
+        }
+
+        handle.abort();
     }
 
     /// B1: a contract notification arriving for a delegate that is currently
@@ -7785,7 +9253,11 @@ mod hol_4391_tests {
             .insert(key.clone(), b"parked-continuation".to_vec());
         assert!(
             matches!(
-                park.park(key.clone(), parked_continuation(), 0),
+                park.park(
+                    key.clone(),
+                    parked_continuation(),
+                    delegate_park::ByteCount::default()
+                ),
                 delegate_park::ParkAdmission::Admitted { .. }
             ),
             "the delegate must start out parked"
@@ -7997,6 +9469,7 @@ mod hol_4391_tests {
     ) -> delegate_park::ResolvedUpsert {
         delegate_park::ResolvedUpsert {
             pending: delegate_park::PendingUpsert {
+                id: delegate_park::UpsertId::next(),
                 key: contract.key(),
                 update: Either::Left(WrappedState::new(b"a_state".to_vec())),
                 related_contracts: RelatedContracts::default(),
@@ -8005,7 +9478,7 @@ mod hol_4391_tests {
                 context: DelegateContext::default(),
                 missing: vec![related],
             },
-            fetched,
+            fetched: delegate_park::FetchDisposition::Resolved(fetched),
         }
     }
 
