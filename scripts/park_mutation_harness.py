@@ -93,8 +93,17 @@ class Tree:
                 f"both produce meaningless verdicts. Wait for it, or remove the "
                 f"lock if you are certain no run is live."
             ) from None
-        os.write(fd, f"pid={os.getpid()}\n".encode())
-        os.close(fd)
+        # THE `write`/`close` ARE INSIDE THE GUARD TOO, and that is not
+        # pedantry: they sat between the exclusive create and the `try` below,
+        # so an `OSError` from either one -- a full disk, an exhausted fd table
+        # -- left the lock on disk with no cleanup armed. The guard against a
+        # stranded lock had a two-line window in which it stranded the lock.
+        # Found by an external reviewer after I had already fixed the LARGER
+        # window below and written a paragraph about it, which is the reason
+        # this comment exists rather than a shorter one: fixing an instance is
+        # not the same as closing the class, and I had stopped looking at the
+        # first `try` I added.
+        #
         # EVERYTHING AFTER THE ACQUISITION IS INSIDE THE TRY, and the reason is
         # that the window between the two is where this lock strands itself.
         # `read_bytes()` on a missing file -- a wrong `$PARK_HARNESS_WORKTREE`,
@@ -109,6 +118,8 @@ class Tree:
         # the third time in this workstream that a guard's own failure mode has
         # been disguised as the guard doing its job.
         try:
+            os.write(fd, f"pid={os.getpid()}\n".encode())
+            os.close(fd)
             self.paths = [WORKTREE / p for p in paths]
             self.pristine = {p: p.read_bytes() for p in self.paths}
             self._armed = True
@@ -139,10 +150,72 @@ class Tree:
             print(f"!! RESTORE FAILED for {bad} -- WORKING TREE IS DIRTY", flush=True)
             return
         self._armed = False
+        # Only once the restore has been VERIFIED above: clearing it earlier
+        # would delete the way back while the tree might still need it.
+        self.RECOVERY.unlink(missing_ok=True)
         self.LOCK.unlink(missing_ok=True)
+
+    #: Where the pristine contents are written BEFORE the first mutation, so a
+    #: death that runs no handler at all still leaves a way back. `finally`,
+    #: `atexit` and the signal handlers all cover an orderly exit; SIGKILL, an
+    #: OOM kill and a hard interpreter death run NONE of them, and that is
+    #: precisely when a mutation is stranded in a tracked source file. The whole
+    #: argument for this class is that a stranded mutation COMPILES, so nothing
+    #: downstream looks wrong.
+    #:
+    #: Written before the source is touched rather than after, because a
+    #: recovery record that is only durable once the risky step has succeeded is
+    #: not a recovery record.
+    RECOVERY = WORKTREE / ".park-mutation-harness.recovery"
+
+    def _persist_recovery(self):
+        """Snapshot to disk. Idempotent, and called before the first mutation."""
+        if self.RECOVERY.exists():
+            return
+        import json
+
+        self.RECOVERY.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "worktree": str(WORKTREE),
+                    "files": {str(p): c.decode("utf-8", "surrogateescape")
+                              for p, c in self.pristine.items()},
+                },
+                indent=1,
+            )
+        )
+
+    @classmethod
+    def recover(cls):
+        """Restore from a record left by a harness that died without cleaning up.
+
+        Deliberately a separate entry point rather than something the next run
+        does automatically: a tree that needs recovering is a tree somebody
+        should look at, and silently repairing it would hide the very event the
+        record exists to report.
+        """
+        if not cls.RECOVERY.exists():
+            print("no recovery record; nothing to restore")
+            return
+        import json
+
+        data = json.loads(cls.RECOVERY.read_text())
+        for path, content in data["files"].items():
+            pathlib_path = Path(path)
+            encoded = content.encode("utf-8", "surrogateescape")
+            if pathlib_path.read_bytes() != encoded:
+                pathlib_path.write_bytes(encoded)
+                print(f"restored {path}")
+            else:
+                print(f"already pristine {path}")
+        cls.RECOVERY.unlink(missing_ok=True)
+        cls.LOCK.unlink(missing_ok=True)
+        print(f"recovered from a run by pid {data['pid']}; lock released")
 
     def mutate(self, path, old, new):
         """Apply a unique textual mutation; returns False if it does not match."""
+        self._persist_recovery()
         p = WORKTREE / path
         src = self.pristine[p].decode()
         if src.count(old) != 1:
@@ -212,6 +285,49 @@ def run_tests(tests):
               "panic is a kill)", flush=True)
         return "RED"
     return "UNKNOWN"
+
+
+def require_clean_worktree():
+    """Refuse to run on a worktree with tracked modifications.
+
+    A CAMPAIGN LABELS EVERY ROW WITH `HEAD`, and that label is a claim about
+    what was measured. If the tree carries tracked modifications, the harness
+    snapshots and tests THAT content while the table says `HEAD`, so the result
+    is true about something the SHA does not identify: a real verdict attached
+    to the wrong subject, which is the hardest kind to catch later because
+    nothing about it looks wrong.
+
+    I disclosed this hole before it was found -- that I could not reconstruct
+    whether the tree had been clean throughout an earlier run, and that the
+    harness verifying its own restore was evidence of a different thing. An
+    external reviewer arrived at it from the other side and named the remedy,
+    which is better than either: do not rely on anyone remembering to check,
+    refuse to produce a label that cannot be vouched for.
+
+    UNTRACKED files are fine and deliberately allowed: the lock and the recovery
+    record are untracked by design, and so is a scratch note beside the code.
+    Only tracked modifications change what is compiled.
+    """
+    r = subprocess.run(
+        ["git", "-C", str(WORKTREE), "status", "--porcelain", "--untracked-files=no"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise SystemExit(
+            f"cannot determine whether {WORKTREE} is clean, so no result from it "
+            f"can be labelled by HEAD: {r.stderr.strip()}"
+        )
+    dirty = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    if dirty:
+        listing = "\n".join(f"  {ln}" for ln in dirty)
+        raise SystemExit(
+            "REFUSING TO RUN: the worktree has tracked modifications, so every "
+            "row would be labelled with a HEAD that does not describe what was "
+            "measured.\n"
+            f"{listing}\n"
+            "Commit or stash them and re-run. If a previous harness died without "
+            "restoring, `Tree.recover()` puts the tree back and says what it did."
+        )
 
 
 def preflight(cases):

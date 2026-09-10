@@ -35,7 +35,7 @@ Usage:
 import subprocess
 import sys
 
-from park_mutation_harness import Tree, WORKTREE, campaign, preflight
+from park_mutation_harness import Tree, WORKTREE, campaign, preflight, require_clean_worktree
 
 PARK = "crates/core/src/contract/delegate_park.rs"
 CONTRACT = "crates/core/src/contract.rs"
@@ -412,8 +412,12 @@ def main() -> None:
     if len(sys.argv) != 2 or sys.argv[1] not in CAMPAIGNS:
         raise SystemExit(f"usage: {sys.argv[0]} {{{'|'.join(CAMPAIGNS)}}}")
     name = sys.argv[1]
-    # BEFORE the lock and before any mutation: a case naming a test that does
-    # not exist runs zero tests and reports its expected verdict anyway.
+    # BEFORE the lock and before any mutation. A dirty tree makes every row's
+    # HEAD label describe something other than what ran; a case naming a test
+    # that does not exist runs zero tests and reports its expected verdict
+    # anyway. Both produce a table that looks finished and is not about what it
+    # says it is about.
+    require_clean_worktree()
     preflight(CAMPAIGNS[name])
     tree = Tree(FILES)
     try:
