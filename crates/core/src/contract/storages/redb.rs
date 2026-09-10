@@ -2160,6 +2160,12 @@ impl ReDb {
     }
 
     /// Total delegate-subscription rows refused by a cap since start.
+    ///
+    /// Test-only: nothing in production reads it, because the counter exists to
+    /// make the THROTTLE checkable rather than to be consumed. Exposing it
+    /// unconditionally is dead code in the lib build, which is the second time
+    /// this file has done that with a test-only accessor.
+    #[cfg(test)]
     pub(crate) fn delegate_subscription_cap_refusals() -> u64 {
         DELEGATE_SUBSCRIPTION_CAP_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
     }
