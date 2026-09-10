@@ -3156,6 +3156,97 @@ mod tests {
         );
     }
 
+    /// L4: a POISONED sink lock must not abort the process from `Drop`.
+    ///
+    /// THIS TEST EXISTS BECAUSE THE PR CLAIMED IT DID. The change said "every
+    /// fix was verified by making it fail", and this was the one fix with no
+    /// falsification behind it: reverting both `unwrap_or_else(|e|
+    /// e.into_inner())` calls in `deliver` left the whole suite green, because
+    /// nothing anywhere poisoned either mutex. A universal claim in the
+    /// description of a change about ornamental guards, with one guard under it
+    /// that had only ever been watched to pass.
+    ///
+    /// THE PATH, and it is what makes the abort reachable rather than
+    /// theoretical. The off-loop task pushes into these sinks as
+    /// `sink.lock().unwrap().push(<expr>)`. The lock guard is created BEFORE
+    /// `<expr>` is evaluated, so a panic while BUILDING the pushed value
+    /// poisons the very mutex `Drop` then reads. Neither half looks dangerous
+    /// alone: an unwrap in `Drop` reads as "probably fine", and a panic while
+    /// computing an argument reads as ordinary. Together they abort the
+    /// process, because a panic in `Drop` during unwinding is not recoverable.
+    ///
+    /// FALSIFY by restoring `.lock().unwrap()` on either sink in `deliver`:
+    /// this test panics inside `Drop` instead of delivering. Verified by doing
+    /// exactly that, on both lines independently.
+    #[tokio::test]
+    async fn a_poisoned_sink_lock_still_delivers_from_drop() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let k = key(1);
+        let (answers, fetches) = sinks();
+
+        // A real answer lands first, so the delivery has something to carry and
+        // the assertion below cannot pass by delivering nothing.
+        answers.lock().unwrap().push(answer(1));
+
+        // POISON BOTH, the way the production path does it: panic while holding
+        // the guard. `catch_unwind` keeps the poisoning panic out of the test's
+        // own result; the mutex stays poisoned afterwards, which is the state
+        // under test.
+        let poison_answers = std::sync::Arc::clone(&answers);
+        let poisoned_answers = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poison_answers.lock().unwrap();
+            panic!("off-loop task died while holding the answers sink");
+        }));
+        assert!(
+            poisoned_answers.is_err(),
+            "the answers sink must be poisoned BY A PANIC, or this test is \
+             exercising an ordinary lock"
+        );
+        let poison_fetches = std::sync::Arc::clone(&fetches);
+        let poisoned_fetches = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poison_fetches.lock().unwrap();
+            panic!("off-loop task died while holding the fetches sink");
+        }));
+        assert!(
+            poisoned_fetches.is_err(),
+            "the fetches sink must be poisoned BY A PANIC, or this test is \
+             exercising an ordinary lock"
+        );
+        assert!(
+            answers.lock().is_err() && fetches.lock().is_err(),
+            "both sinks must actually be POISONED, or this test proves nothing \
+             about the poisoned path"
+        );
+
+        // The guard drops on the panic path, exactly as it does when the
+        // off-loop task unwinds. Before the fix this panicked inside `Drop`.
+        drop(ParkGuard::new(
+            tx,
+            k.clone(),
+            7,
+            vec![1],
+            Vec::new(),
+            answers,
+            fetches,
+        ));
+
+        let resume = rx.try_recv().expect(
+            "a poisoned sink must still produce a resume: the data behind it is \
+             append-only, so a writer that died mid-push left it consistent, and \
+             delivering what it holds is what this path exists to do",
+        );
+        assert_eq!(resume.delegate_key, k);
+        assert_eq!(resume.epoch, 7);
+        assert!(
+            resume
+                .inbound
+                .iter()
+                .any(|m| matches!(m, InboundDelegateMsg::UserResponse(r) if r.request_id == 1)),
+            "the answer written before the poisoning must still be delivered, \
+             not discarded with the lock"
+        );
+    }
+
     /// #5554: the backstop must NOT sweep a park whose resume is already in the
     /// loop's hands — because sweeping it throws away a human's Allow.
     ///

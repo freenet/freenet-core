@@ -2167,12 +2167,30 @@ where
         // node with a steady stream of resumes would otherwise never sweep, and
         // the backstop exists precisely for the case where something is wedged.
         //
-        // WORST CASE PER ITERATION IS 80 DELEGATE RUNS, NOT 32. An earlier
-        // version of this comment said "2 x MAX_RESUME_DRAIN_BATCH", which
-        // understates it by two and a half times — an over-strong bound claim
-        // in the change whose subject is over-strong bound claims, written a
-        // few hundred lines from the `PARK_WORK_BUDGET` "the guard always wins"
-        // correction, by someone reading the file for exactly this.
+        // WORST CASE PER ITERATION IS 105 DELEGATE RUNS, NOT 32 AND NOT 80.
+        // This comment has now been wrong twice in the same change, in the same
+        // direction, and the second time is the more instructive one.
+        //
+        // It first said "2 x MAX_RESUME_DRAIN_BATCH" = 32, which understates it
+        // by more than three times. Corrected to 80 after deriving the two
+        // budgeted loops properly. A reviewer then found that 80 counts only
+        // those two and omits a THIRD delegate-run path in this same loop body:
+        // the `let _ = handle_delegate_resume(..)` select arm below, which
+        // discards its run count exactly as the sweep did before M2 fixed it.
+        // At up to 25 runs that is 105.
+        //
+        // Narrower than it sounds, and worth saying so rather than leaving the
+        // number to imply more than it means: that arm is in the IDLE select,
+        // reached only with the fair queue already empty, so it is not the
+        // head-of-line shape M2 is about. It is still a delegate run inside one
+        // iteration, so a per-iteration bound that omits it is wrong.
+        //
+        // The lesson is the one this change keeps relearning. Correcting an
+        // over-strong bound is not the same as deriving the right one, and the
+        // corrected figure inherits whatever the original derivation forgot to
+        // enumerate. Both errors were mine, in the change whose subject is
+        // over-strong bound claims, a few hundred lines from the
+        // `PARK_WORK_BUDGET` "the guard always wins" correction.
         //
         // The arithmetic, because a bound worth stating is worth deriving.
         // BOTH loops test the budget BEFORE consuming a victim's cost — the
@@ -2181,11 +2199,12 @@ where
         // 16-unit budget down to its last unit, and the sixteenth is STILL
         // admitted, at up to `1 + MAX_PENDING_PER_DELEGATE +
         // MAX_PENDING_NOTIFICATION_CONTRACTS` = 25 runs (see
-        // `handle_delegate_resume`). Each loop is therefore
+        // `handle_delegate_resume`). Each BUDGETED loop is therefore
         // `(MAX_RESUME_DRAIN_BATCH - 1) + 25` = 40, and the two together are 80.
+        // The unbudgeted idle-select arm adds up to another 25, giving 105.
         //
         // Still a bound, and still bounded by constants — which is what the
-        // budget is for. It is simply 80 rather than 32, and stating the real
+        // budget is for. It is simply 105 rather than 32, and stating the real
         // number is the whole point of the exercise this comment sits inside.
         // `the_sweep_budget_admits_one_maximal_victim_past_the_limit` pins the
         // boundary, which the original test could not see because its victims
@@ -2379,6 +2398,14 @@ where
                 // iteration, so there is exactly one sweep implementation.
             }
             Some(delegate_resume) = delegate_resume_rx.recv() => {
+                // THE THIRD DELEGATE-RUN PATH IN THIS LOOP BODY, and it is
+                // counted in the per-iteration bound at the top (105, not 80).
+                // The `let _ =` discards a run count exactly as the TTL sweep
+                // did before M2, but this arm is NOT that defect: it is in the
+                // idle select, so it is reached only with the fair queue
+                // already empty and cannot block anything ahead of it. If that
+                // ever stops being true, this needs a budget and the bound
+                // above needs re-deriving.
                 let _ = handle_delegate_resume(
                     &mut contract_handler,
                     &mut park_ctx,
@@ -8503,7 +8530,8 @@ mod hol_4391_tests {
     /// final unit and the next victim is STILL admitted, at up to
     /// `1 + MAX_PENDING_PER_DELEGATE + MAX_PENDING_NOTIFICATION_CONTRACTS` = 25
     /// runs. The real per-loop bound is therefore `(budget - 1) + 25` = 40, and
-    /// 80 across both loops — not the `2 x MAX_RESUME_DRAIN_BATCH` = 32 the
+    /// 80 across both BUDGETED loops (105 counting the unbudgeted idle-select
+    /// arm, see `contract_handling`) — not the `2 x MAX_RESUME_DRAIN_BATCH` = 32 the
     /// loop comment claimed until this test was written.
     ///
     /// The sibling test could not see it because every victim there costs
