@@ -3,6 +3,7 @@ mod contract_store;
 mod delegate;
 pub(crate) mod delegate_api;
 mod delegate_store;
+pub(crate) mod delegate_subscriptions;
 pub(crate) mod engine;
 mod error;
 pub(crate) mod mock_state_storage;
@@ -76,10 +77,16 @@ pub(crate) use module_cache::{
     MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES,
 };
 pub(crate) use native_api::{
-    DELEGATE_SUBSCRIPTIONS, DelegateContextCache, SharedDelegateCounter, SharedInheritedOrigins,
+    DelegateContextCache, SharedDelegateCounter, SharedInheritedOrigins,
     new_delegate_context_cache, new_delegate_counter, new_inherited_origins,
     release_created_delegate_slot,
 };
+// The registry moved into `delegate_subscriptions`, which owns both it and the
+// durable copy (#4669 part 2). Production code reaches it only through that
+// module's functions; the pre-existing delegate tests that drive the map
+// directly keep the old name through this test-only re-export.
+#[cfg(test)]
+pub(crate) use delegate_subscriptions::test_support::registry as delegate_subscription_registry;
 // Narrow re-export rather than making `native_api` crate-visible: only the
 // conformance test driver (outside the `wasm_runtime` subtree) needs the
 // clock-override primitive, and widening the whole module would also expose
@@ -93,7 +100,7 @@ pub(crate) use native_api::time::override_contract_clock;
 // naming the type, so gate the re-export to avoid an unused-import warning.
 #[cfg(test)]
 pub(crate) use native_api::InheritedOriginsEntry;
-pub use runtime::{ContractExecError, Runtime};
+pub use runtime::{ContractExecError, DelegateSubscribeCallback, Runtime};
 pub(crate) use runtime::{
     RuntimeConfig, SharedModuleCache, StateWriteCallback, default_wasmtime_cache_size_bytes_for_dir,
 };

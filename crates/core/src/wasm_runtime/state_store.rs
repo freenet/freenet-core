@@ -130,7 +130,9 @@ impl From<StateStoreError> for crate::wasm_runtime::ContractError {
     }
 }
 
-pub trait StateStorage {
+pub trait StateStorage:
+    crate::wasm_runtime::delegate_subscriptions::DelegateSubscriptionPersistence
+{
     type Error;
     /// Store state for a contract. Takes `&self` because implementations
     /// (like ReDb) handle internal locking for concurrent access.

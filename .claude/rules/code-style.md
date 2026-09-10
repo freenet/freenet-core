@@ -126,6 +126,64 @@ actors (clients, network peers) can influence.
    → Whichever you pick, saturation must be visible in RELEASE builds:
      `info!` or a counter, never `debug!` alone.
 
+   → A cap ENFORCED ONLY AT ADMISSION is not maintained, it is merely
+     asserted once. The check runs when an entry is admitted and nothing
+     re-applies it, so "this collection holds at most N" stays true only
+     while the admission function is the sole way the set can grow and
+     the cap itself never falls. Lower the constant in a later release,
+     or add a second insertion path, and every existing over-cap entry
+     survives with nothing to notice it.
+
+     So for each cap, say in the doc comment WHICH writer is the only way
+     in, and pin that claim with a source-scrape test if the collection is
+     reachable from more than one module. Where the set can also grow by
+     another route, re-apply the cap at the point that reads it, not only
+     at the point that writes it.
+
+     Note also that BOTH branches of this rule can be live in one change.
+     #5493 added this entry AND enforces two reject-at-cap bounds over rows
+     that never age out, which is the starving branch above. A reader who
+     hits one wants the other; the residual is tracked in #5622.
+
+     And say WHICH BACKEND a cap covers when a project has more than one.
+     #5493's two caps are redb-only; the sqlite backend persists nothing
+     there, so it has no table to bound and no cap. An unqualified "this is
+     capped" reads as a property of the system when it is a property of one
+     implementation, which is how a second backend ships without the bound
+     and nobody notices.
+
+     Four instances turned up in one night on the #5467 delegate work:
+     the delegate pin cap over `client_subscriptions`,
+     `MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT` over the durable rows
+     (#5493), `MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE` over `BY_DELEGATE`,
+     the reverse index counting distinct contracts one delegate holds
+     (#5623), and a transport stream cap that was rejected for the same
+     reason. None was a live defect on its own. The class is worth naming
+     because all of them read as bounded and none re-checks anything.
+
+     **Four caps over four DIFFERENT sets, in one subsystem.** A delegate
+     can sit at #5623's cap while nowhere near the pin cap, and the two
+     refusals mean different things to whoever reads them. #5493's test
+     `the_row_cap_and_the_pin_cap_count_different_sets` is an author
+     documenting that two of them cannot agree by construction.
+
+     When you find yourself adding the fourth cap over the fourth set, the
+     caps are not the problem. It means the thing being capped is not one
+     object: here "a delegate subscription" is an in-memory forward entry,
+     a reverse-index entry, a hosting pin and a durable row, each acquired
+     and released by different code with no type-level connection. That is
+     the "paired `Option` fields that must co-occur" row in
+     `bug-prevention-patterns.md` at a larger scale, and it has the same
+     remedy: make it ONE object whose construction acquires every part and
+     whose `Drop` releases every part, so a cap counts the one set that
+     exists and a teardown cannot discharge three of four.
+
+     Note this interacts with the two branches above. Reject-at-cap is
+     only correct for entries that age out, so a cap enforced once at
+     admission over a collection that NEVER ages out is the starving
+     variant by construction: the incumbents are permanent, so the cap is
+     permanently held. Fixing one without the other leaves the hole.
+
 2. Per-client/per-peer resource counts MUST be bounded.
    → A single client must not hold unbounded subscriptions across all keys
    → A single peer must not register unbounded interest across all contracts
@@ -465,7 +523,44 @@ Is this a public API?
 Is this implementation logic?
   → Comment explains WHY, not WHAT
   → If code needs a WHAT comment, refactor for clarity instead
+
+INSERTING near a doc comment? Re-check what it is still attached to.
+  → An insertion anchored on an ATTRIBUTE or a SIGNATURE lands AFTER
+    the doc comment, not before it. `#[tokio::test]`, `pub fn`, a
+    match arm, a struct field. Anchoring on any of them puts the new
+    item between an existing doc block and the thing it documents.
+  → The result is silent: the doc now describes the wrong item, and
+    the item it was written for has none.
+  → NO TEST CATCHES THIS, because a comment has no test. It survives
+    review because a reviewer reads the diff, where the doc block is
+    unchanged context and the insertion looks correct in isolation.
 ```
+
+**Three instances in one PR (#5493), plus two more the same day:**
+
+- `native_api.rs`: `StateTooLarge`'s comment, explaining a mapping to
+  `ERR_INVALID_PARAM`, ended up above the `SubscriptionCapExceeded` arm,
+  which returns `ERR_STORE_ERROR`. A reader checking which code a
+  subscription-cap refusal returns read the wrong answer off the comment
+  directly above it. Reported as a "duplicated comment", which it was not.
+- `redb.rs`: a test block inserted at `#[tokio::test]` split a doc comment
+  from its test. Caught only because clippy's `empty_line_after_doc_comments`
+  fired, and only after an unrelated `-D dead-code` fix exposed it.
+- `network_status.rs`: a new field inserted between a long doc block about
+  reconcile-shadow sites and the fields it describes, so the block documented
+  the new field and every shadow field was left bare.
+
+Two things follow. **When you insert programmatically, anchor on the doc
+comment's START, not on the item's attribute or signature**, or insert after
+the previous item's closing brace. And **after any scripted insertion near
+rustdoc, read the surrounding twenty lines** rather than trusting that the
+diff looked right.
+
+The same shape applies to a fix that closes a surface: grep for every claim
+ABOUT that surface, in any wording, not just the file the fix touched. In
+#5493 a governance filter landed in `hosting.rs` while five of the six stale
+claims about it lived in two other files, and a review that searched for the
+reported phrase found four of six.
 
 ### BEFORE submitting code
 

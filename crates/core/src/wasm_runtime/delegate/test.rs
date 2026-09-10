@@ -3157,6 +3157,79 @@ async fn test_v2_delegate_subscribe_known() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// V2 E2E: a real delegate's `subscribe_contract()` reaches the demand
+/// callback, through the real `Runtime` execution path (#4669).
+///
+/// This closes the one seam in the V2 half that nothing else covers.
+/// `Runtime::exec_inbound_with_env` is the SOLE production caller of
+/// `DelegateCallEnv::new`, and it is where `delegate_subscribe_callback` is
+/// threaded into the env. Replace that argument with `None` and every other
+/// guard in the change still passes:
+///
+/// - the constructor pin scrapes `contract/executor/runtime.rs`, which still
+///   installs the callback on the `Runtime`;
+/// - the ordering pin scrapes `native_api.rs`, whose `if let Some(register)` is
+///   still present, now permanently `None`;
+/// - the `delegate_api.rs` callback tests build a `DelegateCallEnv` directly
+///   and never go through this function;
+/// - the two-node E2E drives the V1 path and cannot observe demand anyway.
+///
+/// So the entire V2 half of the feature could go dead with everything green.
+/// That is the "silent omission in a seam between two pinned things" shape the
+/// module doc invokes as its own rationale, and it deserves a test that runs
+/// the real thing rather than another scrape.
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_subscribe_reaches_the_demand_callback_through_the_real_runtime()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::{Arc, Mutex};
+    use v2_contracts_messages::*;
+
+    let (delegate, mut runtime, contract_instance_id, _temp_dir) =
+        setup_v2_runtime_with_contract(54, Some(&[1])).await?;
+    let cid: [u8; 32] = contract_instance_id.as_bytes().try_into().unwrap();
+
+    let seen: Arc<Mutex<Vec<(DelegateKey, ContractKey)>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    runtime.set_delegate_subscribe_callback(Arc::new(
+        move |delegate: &DelegateKey, key: &ContractKey| {
+            recorder.lock().unwrap().push((delegate.clone(), *key));
+        },
+    ));
+
+    let response = send_v2_message(
+        &mut runtime,
+        &delegate,
+        &InboundAppMessage::SubscribeContract { contract_id: cid },
+    )?;
+    match response {
+        OutboundAppMessage::Success { contract_id } => assert_eq!(contract_id, cid),
+        other @ OutboundAppMessage::ContractState { .. }
+        | other @ OutboundAppMessage::ContractNotFound { .. }
+        | other @ OutboundAppMessage::Failed { .. } => {
+            panic!("Expected Success from SUBSCRIBE, got {:?}", other)
+        }
+    }
+
+    let calls = seen.lock().unwrap();
+    assert_eq!(
+        1,
+        calls.len(),
+        "a V2 subscribe driven through the real Runtime must reach the demand \
+         callback exactly once — if this is 0, the callback is not being \
+         threaded into DelegateCallEnv and the V2 half registers no demand"
+    );
+    assert_eq!(delegate.key(), &calls[0].0);
+    assert_eq!(
+        &contract_instance_id,
+        calls[0].1.id(),
+        "the callback must receive the resolved ContractKey for the subscribed \
+         contract — the ring is keyed by ContractKey, so a wrong key registers \
+         demand nothing can match"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_put_contract_request_response() -> Result<(), Box<dyn std::error::Error>> {
     use capabilities_messages::*;
@@ -3509,7 +3582,7 @@ async fn test_contract_notification_delivered() -> Result<(), Box<dyn std::error
 ///
 /// Verifies the full pipeline:
 /// 1. Delegate subscribes to a contract via SubscribeContractRequest
-/// 2. Subscription is registered in DELEGATE_SUBSCRIPTIONS
+/// 2. Subscription is registered in delegate_subscription_registry()
 /// 3. ContractNotification is delivered to the delegate
 /// 4. Delegate responds with ContractNotificationReceived
 /// 5. Cleanup: unregister delegate removes subscription entries
@@ -3602,7 +3675,7 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
         .code_hash_from_id(&subscribe_req.contract_id)
         .is_some()
     {
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+        crate::wasm_runtime::delegate_subscription_registry()
             .entry(subscribe_req.contract_id)
             .or_default()
             .insert(delegate_key.clone());
@@ -3663,7 +3736,8 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
 
     // --- Step 2: Verify registry is populated ---
     {
-        let entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&contract_instance_id);
+        let entry =
+            crate::wasm_runtime::delegate_subscription_registry().get(&contract_instance_id);
         let subscribers = entry.as_ref().unwrap();
         assert!(
             subscribers.contains(&delegate_key),
@@ -3733,13 +3807,13 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
     }
 
     // --- Step 5: Cleanup on delegate unregister ---
-    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, subscribers| {
+    crate::wasm_runtime::delegate_subscription_registry().retain(|_, subscribers| {
         subscribers.remove(&delegate_key);
         !subscribers.is_empty()
     });
 
     // Verify cleanup
-    let entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&contract_instance_id);
+    let entry = crate::wasm_runtime::delegate_subscription_registry().get(&contract_instance_id);
     assert!(
         entry.is_none() || entry.as_ref().unwrap().is_empty(),
         "Subscription should be cleaned up after delegate unregister"
@@ -3830,7 +3904,7 @@ async fn test_notification_application_message_routed_to_registered_app()
         OutboundDelegateMsg::SubscribeContractRequest(req) => req.clone(),
         other => panic!("Expected SubscribeContractRequest, got {other:?}"),
     };
-    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+    crate::wasm_runtime::delegate_subscription_registry()
         .entry(subscribe_req.contract_id)
         .or_default()
         .insert(delegate_key.clone());
@@ -3936,7 +4010,7 @@ async fn test_notification_application_message_routed_to_registered_app()
         "after disconnect no app should remain registered"
     );
 
-    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, subs| {
+    crate::wasm_runtime::delegate_subscription_registry().retain(|_, subs| {
         subs.remove(&delegate_key);
         !subs.is_empty()
     });
@@ -3944,7 +4018,7 @@ async fn test_notification_application_message_routed_to_registered_app()
     Ok(())
 }
 
-/// Test: removing a contract cleans up DELEGATE_SUBSCRIPTIONS.
+/// Test: removing a contract cleans up delegate_subscription_registry().
 #[tokio::test(flavor = "multi_thread")]
 async fn test_contract_removal_cleans_subscriptions() -> Result<(), Box<dyn std::error::Error>> {
     use crate::contract::storages::Storage;
@@ -3976,7 +4050,7 @@ async fn test_contract_removal_cleans_subscriptions() -> Result<(), Box<dyn std:
     let delegate_key_a = DelegateKey::new([1u8; 32], CodeHash::new([10u8; 32]));
     let delegate_key_b = DelegateKey::new([2u8; 32], CodeHash::new([20u8; 32]));
     {
-        let mut entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+        let mut entry = crate::wasm_runtime::delegate_subscription_registry()
             .entry(contract_instance_id)
             .or_default();
         entry.insert(delegate_key_a);
@@ -3985,7 +4059,7 @@ async fn test_contract_removal_cleans_subscriptions() -> Result<(), Box<dyn std:
 
     // Verify subscriptions exist
     assert!(
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+        crate::wasm_runtime::delegate_subscription_registry()
             .get(&contract_instance_id)
             .is_some()
     );
@@ -3995,7 +4069,7 @@ async fn test_contract_removal_cleans_subscriptions() -> Result<(), Box<dyn std:
 
     // Verify subscriptions are cleaned up
     assert!(
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+        crate::wasm_runtime::delegate_subscription_registry()
             .get(&contract_instance_id)
             .is_none(),
         "DELEGATE_SUBSCRIPTIONS should be cleaned up when contract is removed"
@@ -5044,6 +5118,7 @@ async fn reentering_a_live_instance_id_fails_closed() -> Result<(), Box<dyn std:
             runtime.state_store_db.clone(),
             runtime.state_write_callback.clone(),
             runtime.state_admit_callback.clone(),
+            runtime.delegate_subscribe_callback.clone(),
             delegate.key().clone(),
             &mut runtime.delegate_store,
             0,

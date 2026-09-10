@@ -867,6 +867,23 @@ impl RuntimePool {
                 .code_hash_from_id(instance_id)
         })
     }
+
+    /// Whether `key` names a delegate that is still registered on this node.
+    ///
+    /// Boot reconciliation uses this to drop a persisted delegate subscription
+    /// whose delegate was uninstalled while the node was down (#4669 part 2).
+    /// Restoring one would create a pin for a delegate that can never run, and
+    /// therefore can never unregister and release it.
+    ///
+    /// Shaped like `code_hash_from_id`: the delegate store is per-executor, so
+    /// ask each in turn. A delegate registered through any executor is
+    /// registered on the node.
+    pub fn delegate_is_registered(&self, key: &DelegateKey) -> bool {
+        self.runtimes
+            .iter()
+            .flatten()
+            .any(|executor| executor.runtime.delegate_is_registered(key))
+    }
 }
 
 impl ContractExecutor for RuntimePool {
@@ -894,6 +911,13 @@ impl ContractExecutor for RuntimePool {
 
     fn op_manager_handle(&self) -> Option<Arc<crate::node::OpManager>> {
         Some(self.op_manager.clone())
+    }
+
+    fn delegate_subscription_store(
+        &self,
+    ) -> Option<&dyn crate::wasm_runtime::delegate_subscriptions::DelegateSubscriptionPersistence>
+    {
+        Some(self.shared_state_store.inner())
     }
 
     async fn fetch_contract(

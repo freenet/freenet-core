@@ -182,6 +182,40 @@ impl ContractHandler for NetworkContractHandler {
         // bug. See .claude/rules/hosting-invariants.md (invariant 1).
         op_manager.rehydrate_local_hosting_interest();
 
+        // #4669 part 2: put persisted delegate subscriptions back, and their
+        // hosting pins with them.
+        //
+        // Ordering is load-bearing at both ends. It runs AFTER the hosting
+        // cache is loaded above, because the pin gate is
+        // `is_hosting_contract && contract_state_present` — restoring earlier
+        // would refuse every pin and silently produce exactly the node this
+        // work exists to prevent. And it runs BEFORE this function returns,
+        // which is before the node event loop exists, so nothing can invoke a
+        // delegate first: a delegate never observes a window in which its own
+        // subscription is missing.
+        //
+        // Reconciliation happens here too, not as a follow-up: a row whose
+        // delegate was uninstalled while the node was down, or whose contract
+        // is no longer in the store, is DROPPED. Restoring one would create a
+        // pin nothing can ever release, because neither the delegate that would
+        // unregister it nor the contract that would evict it exists.
+        {
+            let restore_outcome = crate::contract::delegate_demand::restore_persisted_subscriptions(
+                &op_manager,
+                &storage,
+                |instance_id| {
+                    executor
+                        .code_hash_from_id(instance_id)
+                        .map(|code_hash| ContractKey::from_id_and_code(*instance_id, code_hash))
+                },
+                |delegate| executor.delegate_is_registered(delegate),
+            );
+            debug_assert!(
+                restore_outcome.pinned <= restore_outcome.restored,
+                "a pinned subscription is by construction also a restored one"
+            );
+        }
+
         Ok(Self { executor, channel })
     }
 

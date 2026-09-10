@@ -192,6 +192,12 @@ impl MockStateStorage {
     }
 }
 
+/// In-memory test storage persists nothing, so it takes the no-op default.
+impl crate::wasm_runtime::delegate_subscriptions::DelegateSubscriptionPersistence
+    for MockStateStorage
+{
+}
+
 impl StateStorage for MockStateStorage {
     type Error = MockStorageError;
 

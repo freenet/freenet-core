@@ -283,11 +283,65 @@ impl Executor<Runtime> {
             DelegateRequest::UnregisterDelegate(key) => {
                 self.delegate_origin_ids.remove(&key);
 
-                // Remove delegate from all contract subscription entries
-                crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, subscribers| {
-                    subscribers.remove(&key);
-                    !subscribers.is_empty()
-                });
+                // Remove delegate from all contract subscription entries, in
+                // BOTH representations — the in-memory notification registry
+                // and the durable table that would otherwise restore these
+                // subscriptions (and their pins) at every subsequent boot, for
+                // a delegate that no longer exists (#4669 part 2). One choke
+                // point writes both; see
+                // `wasm_runtime::delegate_subscriptions`.
+                crate::wasm_runtime::delegate_subscriptions::forget_delegate(
+                    Some(self.state_store.inner()),
+                    &key,
+                );
+
+                // Drop the matching DEMAND registrations (#4669 part 1). The
+                // call above clears only the subscription record (hook and
+                // durable row); the demand this delegate holds in the ring's
+                // client-subscription map is
+                // a separate record, and leaving it behind would pin every
+                // contract the delegate ever subscribed to for the life of the
+                // process — a permanent, un-collapsible lease. Mirrors the
+                // WebSocket disconnect path in `client_events.rs`, including
+                // its upstream-collapse decision.
+                //
+                // AUTHORIZATION, PRE-EXISTING AND UNFIXED. There is an
+                // authorization gap on this teardown path, and this PR WIDENS
+                // WHAT IT COSTS: the same teardown now drops the delegate's
+                // ring demand as well as its notification hooks, so the reach
+                // is larger than it was before #4669.
+                //
+                // The mechanism is deliberately not stated here. It is tracked
+                // in a private advisory together with the related gap noted in
+                // `contract::delegate_demand`'s module header, and it stays
+                // there until there is a fix — a public repo is not where an
+                // open hole gets its method written down, in a comment or in a
+                // commit message. See `no-public-disclosure-before-fix`.
+                //
+                // SCOPE MISMATCH, unfixed: the call above walks the
+                // process-global subscription registry, so it clears this
+                // delegate's hooks on EVERY node in the process, while the
+                // demand drop below reaches only THIS node's ring. In a
+                // shared-process multi-node test (every `#[freenet_test]`),
+                // unregistering on node A therefore strips node B's hooks and
+                // leaves B's demand — a pin with nothing able to consume its
+                // updates. Production runs one node per process, so the impact
+                // is test-only; it is not closed by scoping the demand drop,
+                // because the registry has no node dimension to scope BY. The
+                // same mismatch exists in the channel-closed arm
+                // (`executor_impl.rs`). Both close when the hook and the demand
+                // become one record with one owner (#4669 part 3).
+                //
+                // #4669 part 2 adds a third scope to the same test-only shape,
+                // in the safe direction: the DURABLE rows are per-node, because
+                // each node has its own database. So node A clears node B's
+                // in-memory hooks but not B's durable rows, and B's next boot
+                // restores them. That is the failure mode one wants of the
+                // three — B recovers — and it is still only reachable in a
+                // shared-process test.
+                if let Some(op_manager) = &self.op_manager {
+                    crate::contract::delegate_demand::drop_delegate_demand(op_manager, &key);
+                }
 
                 // Clean up delegate creation tracking to prevent unbounded growth
                 self.runtime.inherited_origins.remove(&key);

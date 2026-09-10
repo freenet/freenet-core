@@ -5,7 +5,6 @@ use freenet_stdlib::prelude::{
     ContractInstanceId, ContractKey, DelegateKey, SecretsId, encode_secret_key_list,
 };
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -75,16 +74,6 @@ pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateEnvSlot>> =
 /// or dropping it before the guest returns, silently reintroduces the hazard.
 pub(super) static LIVE_DELEGATE_GUESTS: LazyLock<dashmap::DashSet<InstanceId>> =
     LazyLock::new(dashmap::DashSet::default);
-
-/// Global registry of delegate subscriptions to contracts.
-///
-/// When a V2 delegate calls `subscribe_contract()`, the (contract, delegate) pair is
-/// recorded here. When this node commits a new contract state,
-/// `Executor::finalize_state_commit` checks this registry and sends
-/// notifications to subscribed delegates.
-pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
-    DashMap<ContractInstanceId, HashSet<DelegateKey>>,
-> = LazyLock::new(DashMap::default);
 
 /// Shared, in-memory cache of `DelegateContext` bytes keyed by `DelegateKey`.
 ///
@@ -617,6 +606,12 @@ pub(super) struct DelegateCallEnv {
     /// `put_contract_state_sync` / `update_contract_state_sync` and can abort
     /// it. See `super::runtime::StateAdmitCallback`.
     state_admit_callback: Option<super::runtime::StateAdmitCallback>,
+    /// Optional demand registration invoked after a successful V2
+    /// `subscribe_contract()` (#4669 part 1 / #5467 Phase 1). Without it the V2
+    /// subscribe records only the `DELEGATE_SUBSCRIPTIONS` notification hook and
+    /// never sets `contract_in_use`, so the pin silently does not take. See
+    /// `super::runtime::DelegateSubscribeCallback`.
+    delegate_subscribe_callback: Option<super::runtime::DelegateSubscribeCallback>,
     /// Interior-mutable pointer to the runtime's DelegateStore. Valid only during
     /// synchronous `process()` call. Used for creating child delegates.
     delegate_store: std::cell::UnsafeCell<*mut DelegateStore>,
@@ -883,6 +878,14 @@ pub(super) enum DelegateEnvError {
     /// The state exceeds `MAX_STATE_SIZE`. Enforced here because the V2 path
     /// bypasses `StateStore::{store,update}`, where the ceiling normally lives.
     StateTooLarge { size: usize, limit: usize },
+    /// The contract is at `MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT`, so NO
+    /// subscription was recorded — no notification hook, no durable row.
+    ///
+    /// Distinct from a refused PIN, which is a different outcome and is still
+    /// reported as success (#5565): here the subscribe itself did not happen,
+    /// so notification delivery — a pre-existing feature the delegate is
+    /// relying on — silently stops unless this is surfaced.
+    SubscriptionCapExceeded,
 }
 
 /// Errors that can occur during delegate creation via `create_delegate_sync`.
@@ -916,6 +919,7 @@ impl DelegateCallEnv {
         state_store_db: Option<Storage>,
         state_write_callback: Option<super::runtime::StateWriteCallback>,
         state_admit_callback: Option<super::runtime::StateAdmitCallback>,
+        delegate_subscribe_callback: Option<super::runtime::DelegateSubscribeCallback>,
         delegate_key: DelegateKey,
         delegate_store: &mut DelegateStore,
         creation_depth: u32,
@@ -933,6 +937,7 @@ impl DelegateCallEnv {
             state_store_db,
             state_write_callback,
             state_admit_callback,
+            delegate_subscribe_callback,
             delegate_store: std::cell::UnsafeCell::new(delegate_store as *mut DelegateStore),
             creation_depth,
             creations_this_call: std::cell::Cell::new(0),
@@ -1495,13 +1500,48 @@ impl DelegateCallEnv {
         instance_id: &ContractInstanceId,
     ) -> Result<(), DelegateEnvError> {
         // Validate the contract is known
-        let _contract_key = self.resolve_contract_key(instance_id)?;
+        let contract_key = self.resolve_contract_key(instance_id)?;
 
-        // Register in global subscription registry
-        DELEGATE_SUBSCRIPTIONS
-            .entry(*instance_id)
-            .or_default()
-            .insert(self.delegate_key.clone());
+        // Register the subscription, in BOTH representations (the REACTIVE
+        // half `ContractNotification` delivery reads, and the durable row that
+        // survives a restart). `delegate_subscriptions` is the only way to
+        // reach either, so the two cannot be written apart — see its module
+        // docs. `state_store_db` is `None` on local-only and mock runtimes,
+        // where the subscription is in-memory only, exactly as before #4669.
+        //
+        // THE RETURN VALUE IS LOAD-BEARING. `false` means the per-contract cap
+        // refused the subscription outright — neither representation recorded
+        // it. Registering demand anyway would create a pin with no notification
+        // hook and no durable row: `contract_in_use` demand that raises the
+        // eviction tier while the delegate receives nothing (not the governance
+        // benefit — `beneficiary_counts` filters delegate ids out), and that
+        // `drop_subscriptions_for_contract` cannot see,
+        // because it iterates the registry this subscription is absent from.
+        // `executor_impl.rs`'s channel-closed arm names that exact state —
+        // "demand without a hook is an unconsumable pin".
+        if !crate::wasm_runtime::delegate_subscriptions::register(
+            self.state_store_db.as_ref(),
+            instance_id,
+            &self.delegate_key,
+        ) {
+            // Err, not Ok. This is NOT the #5565 case: there, the subscription
+            // succeeds and only the PIN is refused, so reporting failure would
+            // be the worse lie. Here the SUBSCRIPTION was refused, so
+            // notification delivery — which the delegate already had before
+            // #4669 — silently stops. `Err` is both available and true.
+            return Err(DelegateEnvError::SubscriptionCapExceeded);
+        }
+
+        // Register the DEMAND half (#4669 part 1 / #5467 Phase 1). The registry
+        // insert above is read only by the notification path — nothing in
+        // `ring/` reads it — so without this the subscribe does not set
+        // `contract_in_use`, does not enter `contracts_needing_renewal()`, and
+        // does not raise the contract's eviction tier. `None` on a runtime with
+        // no ring (local-only / mock executors), where there is no demand
+        // machinery to register with.
+        if let Some(register) = &self.delegate_subscribe_callback {
+            register(&self.delegate_key, &contract_key);
+        }
 
         Ok(())
     }
@@ -2607,12 +2647,20 @@ pub(super) mod delegate_contracts {
             // A disk-budget rejection is a store-capacity failure from the
             // delegate's perspective — map to the generic store-error code.
             DelegateEnvError::DiskBudgetExceeded(_) => contract_error_codes::ERR_STORE_ERROR as i64,
+            // A per-contract subscriber-cap refusal is a capacity failure
+            // from the delegate's perspective, so it maps to the same generic
+            // store-error code `DiskBudgetExceeded` uses — an EXISTING code
+            // rather than a new one, because a new negative return value is a
+            // wire-visible change to the V2 delegate API that a delegate
+            // branching on codes would not expect.
+            DelegateEnvError::SubscriptionCapExceeded => {
+                contract_error_codes::ERR_STORE_ERROR as i64
+            }
             // The delegate handed us a state larger than the protocol allows.
             // That is a caller error, not a store failure, so it maps to
             // ERR_INVALID_PARAM rather than ERR_STORE_ERROR — and to an
-            // EXISTING code rather than a new one, because a new negative
-            // return value is a wire-visible change to the V2 delegate API
-            // that a delegate branching on codes would not expect.
+            // EXISTING code rather than a new one, for the same wire-compat
+            // reason as the arm above.
             DelegateEnvError::StateTooLarge { size, limit } => {
                 tracing::warn!(
                     state_size = size,
@@ -2908,6 +2956,12 @@ pub(super) mod delegate_contracts {
     /// subscription interest in the global `DELEGATE_SUBSCRIPTIONS` registry.
     /// When the subscribed contract's state changes, `Executor::finalize_state_commit`
     /// delivers a `ContractNotification` to this delegate.
+    ///
+    /// It ALSO registers ring demand, when this node is hosting the contract
+    /// (#4669) — see `contract::delegate_demand::register_subscription` for the
+    /// gate and for what happens when the node resolves the contract without
+    /// hosting it. Both halves are recorded; only the notification half was
+    /// recorded before.
     ///
     /// ## Returns
     /// - `0`: success (contract is known, subscription registered)
@@ -3256,6 +3310,7 @@ mod secret_read_memo_tests {
                 None,
                 None,
                 None,
+                None,
                 delegate_key(),
                 &mut f.delegate_store,
                 0,
@@ -3464,6 +3519,7 @@ mod secret_read_memo_tests {
                 state_store_db,
                 state_write_callback,
                 state_admit_callback,
+                delegate_subscribe_callback,
                 delegate_store,
                 creation_depth,
                 creations_this_call,
@@ -3482,6 +3538,7 @@ mod secret_read_memo_tests {
                 state_store_db,
                 state_write_callback,
                 state_admit_callback,
+                delegate_subscribe_callback,
                 delegate_store,
                 creation_depth,
                 creations_this_call,

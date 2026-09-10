@@ -8,6 +8,7 @@ use either::Either;
 use freenet_stdlib::prelude::*;
 
 pub(crate) mod delegate_app_registry;
+pub(crate) mod delegate_demand;
 mod delegate_park;
 mod executor;
 mod fair_queue;
@@ -1357,13 +1358,16 @@ where
         }
 
         // Process SUBSCRIBE requests
-        // There are two registration paths that converge on DELEGATE_SUBSCRIPTIONS:
+        // There are two registration paths that converge on
+        // `wasm_runtime::delegate_subscriptions`:
         // 1. V2 delegates: subscribe_contract() host function (native_api.rs) registers
         //    during WASM execution and returns success/error synchronously.
         // 2. V1 delegates: emit SubscribeContractRequest in process() outbound, handled here.
-        // Both paths are idempotent — inserting the same (contract_id, delegate_key) twice
-        // is a no-op on the HashSet. After registration, the delegate receives
-        // ContractNotification messages when the subscribed contract's state changes.
+        // Both paths are idempotent — recording the same (contract_id, delegate_key) twice
+        // is a no-op in both the in-memory registry and the durable table. After
+        // registration, the delegate receives ContractNotification messages when
+        // the subscribed contract's state changes, and the subscription survives
+        // a node restart (#4669 part 2).
         //
         // TODO(#2830): UnsubscribeContractRequest is not yet handled. Delegates can
         // only unsubscribe implicitly via UnregisterDelegate cleanup.
@@ -1379,24 +1383,79 @@ where
                 let context = req.context;
 
                 // Validate contract existence before registering (matches V2 host function behavior)
-                let result = if contract_handler
-                    .executor()
-                    .lookup_key(&contract_id)
-                    .is_some()
-                {
-                    // Register subscription in the global registry
-                    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-                        .entry(contract_id)
-                        .or_default()
-                        .insert(delegate_key.clone());
-                    Ok(())
-                } else {
-                    tracing::debug!(
-                        contract = %contract_id,
-                        "Contract not found locally for delegate SubscribeContractRequest"
-                    );
-                    Err("Contract not found".to_string())
-                };
+                let result =
+                    if let Some(full_key) = contract_handler.executor().lookup_key(&contract_id) {
+                        // Record the subscription in BOTH representations —
+                        // the REACTIVE half `ContractNotification` delivery
+                        // reads, and the durable row that survives a restart
+                        // (#4669 part 2). One choke point, so a future cleanup
+                        // path cannot clear one and leave the other; see
+                        // `wasm_runtime::delegate_subscriptions`.
+                        //
+                        // THE RETURN VALUE IS LOAD-BEARING. `false` means the
+                        // per-contract cap refused the subscription outright —
+                        // neither representation recorded it. Registering demand
+                        // anyway would leave a pin with no notification hook and
+                        // no durable row: `contract_in_use` demand raising the
+                        // eviction tier while the delegate receives nothing, and
+                        // invisible to `drop_subscriptions_for_contract`, which
+                        // iterates the registry this subscription is absent from.
+                        if !crate::wasm_runtime::delegate_subscriptions::register(
+                            contract_handler.executor().delegate_subscription_store(),
+                            &contract_id,
+                            delegate_key,
+                        ) {
+                            tracing::warn!(
+                                contract = %contract_id,
+                                delegate = %delegate_key,
+                                "contract is at the per-contract delegate-subscription \
+                                 cap; the subscribe was refused outright (no \
+                                 notification hook, nothing on disk)"
+                            );
+                            // Err, and this is NOT the #5565 case. There, the
+                            // subscription succeeds and only the PIN is refused,
+                            // so reporting failure would be the worse lie. Here
+                            // the SUBSCRIPTION was refused, so notification
+                            // delivery — which the delegate had before #4669 —
+                            // silently stops unless it is told.
+                            inbound_responses.push(InboundDelegateMsg::SubscribeContractResponse(
+                                SubscribeContractResponse {
+                                    contract_id,
+                                    result: Err(
+                                        "contract is at the per-contract delegate-subscription cap"
+                                            .to_string(),
+                                    ),
+                                    context,
+                                },
+                            ));
+                            continue;
+                        }
+                        // Register the DEMAND half (#4669 part 1 / #5467 Phase 1):
+                        // without this the subscribe above is a passive local
+                        // notification hook — it does not set `contract_in_use`,
+                        // does not enter `contracts_needing_renewal()`, and does
+                        // not raise the contract's eviction tier, so the pin
+                        // silently does not take. See `delegate_demand`.
+                        //
+                        // `op_manager_handle()` is `None` for local-only / mock
+                        // executors with no ring; those have no demand machinery to
+                        // register with, and the notification half above still
+                        // works, so this degrades to exactly the old behavior.
+                        if let Some(op_manager) = contract_handler.executor().op_manager_handle() {
+                            delegate_demand::register_subscription(
+                                &op_manager,
+                                delegate_key,
+                                &full_key,
+                            );
+                        }
+                        Ok(())
+                    } else {
+                        tracing::debug!(
+                            contract = %contract_id,
+                            "Contract not found locally for delegate SubscribeContractRequest"
+                        );
+                        Err("Contract not found".to_string())
+                    };
 
                 inbound_responses.push(InboundDelegateMsg::SubscribeContractResponse(
                     SubscribeContractResponse {
