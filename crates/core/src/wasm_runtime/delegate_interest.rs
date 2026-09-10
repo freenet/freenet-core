@@ -219,6 +219,53 @@ mod tests {
     const NODE_A: NodeIdentity = 0xA;
     const NODE_B: NodeIdentity = 0xB;
 
+    /// A release closure must run with NO `DELEGATE_INTEREST_HOLDS` shard lock
+    /// held — the collect-first discipline in `release_delegate` and
+    /// `release_contract` (#5542 WARNING 4).
+    ///
+    /// Those functions collect the holds inside `retain` and invoke the release
+    /// closures AFTER it returns, because `retain` holds a shard write lock and
+    /// a release closure reaches into `InterestManager`, which takes its own
+    /// locks. Calling out under a shard guard is how lock-order inversions get
+    /// built. The comment saying so was load-bearing and had no counterfactual:
+    /// the existing tests use a closure that only pushes to a `Vec`, so they
+    /// pass identically whether `release(&key)` sits inside the `retain` body or
+    /// after it.
+    ///
+    /// This closes that by having the closure probe the map it was released
+    /// from. `try_get` reports `Locked` rather than blocking, so moving the
+    /// call back inside `retain` makes this FAIL rather than deadlock — a
+    /// hanging test would be a worse guard than none.
+    #[test]
+    fn a_release_closure_runs_with_no_shard_lock_held() {
+        let d = delegate(180);
+        let k = key(181);
+        let pair = (*k.id(), d.clone());
+        let saw_locked: Arc<Mutex<Option<bool>>> = Default::default();
+
+        let probe = saw_locked.clone();
+        let release: InterestRelease = Arc::new(move |_k: &ContractKey| {
+            // Same shard as the entry being released, since it is the same key.
+            let locked = matches!(
+                DELEGATE_INTEREST_HOLDS.try_get(&pair),
+                dashmap::try_result::TryResult::Locked
+            );
+            *probe.lock().unwrap() = Some(locked);
+        });
+        record(*k.id(), d.clone(), k, release, NODE_A);
+
+        release_delegate(&d);
+
+        assert_eq!(
+            *saw_locked.lock().unwrap(),
+            Some(false),
+            "the release closure must run AFTER `retain` has released its shard \
+             lock. `Some(true)` means it ran under the guard, which is the \
+             lock-order inversion the collect-first step exists to prevent; \
+             `None` means the closure never ran and this test proved nothing"
+        );
+    }
+
     /// A pair-keyed lookup must find EVERY node's hold for that pair.
     ///
     /// This is the compatibility constraint the per-delegate subscription cap
