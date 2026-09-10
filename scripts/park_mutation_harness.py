@@ -201,8 +201,17 @@ def run_tests(tests):
             return f"NO TESTS RAN ({', '.join(unmatched)})"
         return "GREEN"
     # A non-unwinding panic (a null deref, say) ABORTS the process, so cargo
-    # prints no `test result:` line at all. That is a kill, not a mystery.
-    return "ABORTED (counts as RED)" if "error: test failed" in out else "UNKNOWN"
+    # prints no `test result:` line at all. That is a KILL, so it must return
+    # exactly "RED": `campaign` compares verdicts for equality, so a decorated
+    # string like "ABORTED (counts as RED)" is scored as a mismatch and printed
+    # with `!!`. It masked nothing, but it put a false alarm in front of the
+    # next person to run this, which is its own kind of noise -- and a campaign
+    # nobody trusts the output of is a campaign nobody runs.
+    if "error: test failed" in out:
+        print("      (aborted without a `test result:` line; a non-unwinding "
+              "panic is a kill)", flush=True)
+        return "RED"
+    return "UNKNOWN"
 
 
 def preflight(cases):

@@ -261,6 +261,22 @@ pub(super) fn parked_budget_for(total_ram: usize) -> usize {
     (total_ram / PARKED_RAM_DIVISOR).clamp(MIN_PARKED_BYTES, MAX_PARKED_BYTES)
 }
 
+/// The SMALLEST per-fetch allowance any host can yield.
+///
+/// Test-only, and it exists so a claim stops being prose. `within_fetch_allowance`
+/// increments a process-global refusal counter, and
+/// `an_oversized_related_fetch_is_refused_and_counted` asserts on that counter
+/// EXACTLY. What keeps the exact assertion safe is NOT its
+/// `#[serial_test::serial]` attribute: the off-loop-fetch tests serialise among
+/// themselves by a different mechanism and can run alongside it. It is safe
+/// because no other test's stub returns a state large enough to reach the
+/// refusal branch, which was a fact about the tests that happened to exist,
+/// written in a comment. `OverrideGuard::install` now checks it against this.
+#[cfg(test)]
+pub(super) fn min_upsert_fetch_allowance() -> ByteCount {
+    upsert_fetch_allowance(MIN_PARKED_BYTES)
+}
+
 /// Bytes ONE deferred upsert's off-loop related-contract fetch may RETAIN.
 ///
 /// This closes the largest hole in the byte bound, and the hole was total: the

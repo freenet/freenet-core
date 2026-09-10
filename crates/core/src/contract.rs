@@ -4903,9 +4903,32 @@ mod tests {
 
     /// Byte index just past the `}` matching the `{` at `open`.
     ///
+    /// SKIPS COMMENTS AND LITERALS, and that is not a refinement. Counting
+    /// bytes naively, a single `}` written inside a comment ends the region
+    /// early: a reviewer demonstrated it by injecting one line of the form
+    /// `// note: closing brace } for context` into the middle of
+    /// `handle_delegate_notification` and watching the scraped region lose
+    /// about 3.8 KB, with no panic and no failed assertion. The guard simply
+    /// examined less.
+    ///
+    /// THE ASYMMETRY IS WHAT MAKES IT WORTH THE CODE. A stray OPENING brace
+    /// runs the counter off the end of the file and panics, loudly. A stray
+    /// CLOSING brace truncates and says nothing. And "the closing brace `}`"
+    /// is the more natural phrase to write in prose, so the silent direction
+    /// is also the likelier typo. This helper is the replacement for a text
+    /// anchor that failed open, in a change whose whole argument is that a
+    /// guard which can fail open is not a guard; inheriting a quieter version
+    /// of the same failure would have been that argument losing to itself.
+    ///
     /// Panics rather than returning on unbalanced braces: a scrape that cannot
     /// bound its region must fail loudly, never silently scan the rest of the
     /// file.
+    ///
+    /// WHAT IT DOES NOT HANDLE, stated rather than implied: raw strings
+    /// (`r#"..."#`) and nested block comments are not parsed. Neither appears
+    /// in the regions this is used on. It is a scrape, not a lexer, and the
+    /// point is only that ordinary prose and ordinary string literals cannot
+    /// move the boundary.
     pub(super) fn end_of_block(code: &str, open: usize) -> usize {
         let bytes = code.as_bytes();
         assert_eq!(
@@ -4914,8 +4937,47 @@ mod tests {
             "end_of_block must be given the index of an opening brace"
         );
         let mut depth = 0usize;
-        for (i, b) in bytes.iter().enumerate().skip(open) {
+        let mut i = open;
+        while i < bytes.len() {
+            let b = bytes[i];
+            let next = bytes.get(i + 1).copied();
             match b {
+                // Line comment: everything to the newline is prose.
+                b'/' if next == Some(b'/') => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                // Block comment. Not nested-aware; see the doc above.
+                b'/' if next == Some(b'*') => {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 2;
+                    continue;
+                }
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        // A backslash escapes the next byte, including a quote.
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                    i += 1;
+                    continue;
+                }
+                // A char literal, distinguished from a lifetime (`'a`) by the
+                // closing quote. `'{'` and `'}'` are both real Rust.
+                b'\'' => {
+                    let close = if next == Some(b'\\') { i + 3 } else { i + 2 };
+                    if bytes.get(close) == Some(&b'\'') {
+                        i = close + 1;
+                        continue;
+                    }
+                    i += 1;
+                    continue;
+                }
                 b'{' => depth += 1,
                 b'}' => {
                     depth -= 1;
@@ -4925,8 +4987,64 @@ mod tests {
                 }
                 _ => {}
             }
+            i += 1;
         }
         panic!("unbalanced braces from byte {open}: the scrape cannot bound this block");
+    }
+
+    #[test]
+    fn end_of_block_is_not_moved_by_a_brace_in_prose_or_a_literal() {
+        // THE REVIEWER'S EXACT DEMONSTRATION, reduced. Naive byte counting
+        // ended the region at the `}` inside the comment, silently.
+        let with_comment =
+            "fn f() {\n    // note: closing brace } for context\n    g();\n}\nfn after() {}\n";
+        let open = with_comment.find('{').expect("a body");
+        assert_eq!(
+            &with_comment[open..end_of_block(with_comment, open)],
+            "{\n    // note: closing brace } for context\n    g();\n}",
+            "a closing brace inside a line comment must not end the region"
+        );
+
+        for (label, src) in [
+            ("block comment", "fn f() {\n    /* } */\n    g();\n}\n"),
+            (
+                "string literal",
+                "fn f() {\n    let s = \"}\";\n    g();\n}\n",
+            ),
+            (
+                "escaped quote",
+                "fn f() {\n    let s = \"\\\"}\";\n    g();\n}\n",
+            ),
+            ("char literal", "fn f() {\n    let c = '}';\n    g();\n}\n"),
+            (
+                "escaped char",
+                "fn f() {\n    let c = '\\'';\n    let d = '}';\n    g();\n}\n",
+            ),
+            // A lifetime is NOT a char literal, and mis-parsing one as a
+            // three-byte token would skip real code after it.
+            (
+                "lifetime",
+                "fn f<'a>() {\n    let x: &'a str = \"\";\n    g();\n}\n",
+            ),
+        ] {
+            let open = src.find('{').expect("a body");
+            let region = &src[open..end_of_block(src, open)];
+            assert!(
+                region.ends_with("g();\n}"),
+                "{label}: region ended early at {region:?}"
+            );
+        }
+
+        // An OPENING brace in prose still panics rather than truncating,
+        // because the counter runs off the end. Kept as a positive assertion
+        // so the comment-skipping above cannot be "fixed" into ignoring an
+        // unbalanced region.
+        let unbalanced = "fn f() {\n    g();\n";
+        let open = unbalanced.find('{').expect("a body");
+        assert!(
+            std::panic::catch_unwind(|| end_of_block(unbalanced, open)).is_err(),
+            "an unterminated block must panic, never return a truncated region"
+        );
     }
 
     /// The text of one function, bounded by BRACE MATCHING rather than by the
@@ -6462,7 +6580,53 @@ mod hol_4391_tests {
     struct OverrideGuard;
     impl OverrideGuard {
         fn install(stub: OffLoopFetchStub) -> Self {
-            set_off_loop_fetch_override(Some(stub));
+            // THE MARGIN IS CHECKED HERE, not asserted in a comment somewhere
+            // else. `within_fetch_allowance` increments a process-global
+            // refusal counter, and
+            // `an_oversized_related_fetch_is_refused_and_counted` asserts on
+            // that counter EXACTLY. Its `#[serial_test::serial]` attribute is
+            // not what makes that safe: these tests serialise among themselves
+            // through `TEST_GUARD`, a different mechanism, so they can run
+            // alongside it. What makes it safe is that no stub here returns a
+            // state big enough to take the refusal branch.
+            //
+            // That was a fact about the tests that happened to exist. Wrapping
+            // every installed stub makes it a fact about all of them, including
+            // the ones nobody has written, and it fails AT THE MISTAKE: adding
+            // a large-stub test panics here with the reason, instead of making
+            // an unrelated test flaky in a way that only parses if you have
+            // read a comment in another module.
+            //
+            // For scale: every stub today returns seven bytes against a floor
+            // allowance of 512 KiB, so this is not load-bearing now. It is here
+            // for the test that is not written yet.
+            let floor = delegate_park::min_upsert_fetch_allowance();
+            let checked: OffLoopFetchStub = Arc::new(move |missing| {
+                let inner = stub(missing);
+                Box::pin(async move {
+                    let out = inner.await;
+                    if let Ok(states) = &out {
+                        for (id, state) in states {
+                            assert!(
+                                delegate_park::ByteCount::new(state.as_ref().len()) <= floor,
+                                "off-loop fetch stub returned {} bytes for {id}, over the \
+                                 floor per-fetch allowance of {floor}. That reaches the \
+                                 refusal branch of `within_fetch_allowance`, which \
+                                 increments the process-global \
+                                 REFUSED_OVERSIZED_FETCHES and breaks \
+                                 `an_oversized_related_fetch_is_refused_and_counted`'s \
+                                 exact-equality assertion intermittently. Either shrink \
+                                 the stub, or join that test's \
+                                 `#[serial_test::serial(oversized_fetch_counter)]` group \
+                                 and say why",
+                                state.as_ref().len()
+                            );
+                        }
+                    }
+                    out
+                })
+            });
+            set_off_loop_fetch_override(Some(checked));
             OverrideGuard
         }
     }

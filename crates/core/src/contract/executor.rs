@@ -1436,9 +1436,16 @@ pub(crate) fn declared_cache_ceiling_terms(
 
     vec![
         // The pool multiplication IS #5268's defect 3.
-        // `declared_cache_ceiling_names_every_budget` checks it by scaling
-        // `pool_size` and observing these three terms scale with it, rather
-        // than by matching the multiplication as source text.
+        // `declared_cache_ceiling_names_every_budget` checks it by comparing
+        // each of these three against `pool_size *` its own budget function,
+        // rather than by matching the multiplication as source text.
+        //
+        // NOT by scaling `pool_size` and watching the term scale, which is
+        // what this comment said and what that test explicitly rejects: these
+        // functions take `pool_size` themselves and split an envelope by it
+        // before clamping, so the product is deliberately not linear
+        // (`delta_budget_for` gives 67,108,864 at pool 1 and 89,478,484 at
+        // pool 2).
         ("summary_budget_for", pool_size * summary),
         ("delta_budget_for", pool_size * delta),
         ("store_arena_budget_for", pool_size * arena),
@@ -1451,9 +1458,11 @@ pub(crate) fn declared_cache_ceiling_terms(
         ("interest_delta_budget_for", interest_delta),
         // Zero when the `redb` feature is off, and the LABEL is still present
         // in that build on purpose: dropping it would make the discovery guard
-        // demand a `NOT_SUMMED` entry that is wrong in the default build.
-        // `nonzero_terms` below carries the exemption instead, where it is
-        // written down.
+        // demand a `NOT_SUMMED` entry that is wrong in the default build. The
+        // `LEGITIMATELY_ZERO` table in
+        // `declared_cache_ceiling_discovers_every_budget` carries the
+        // exemption instead, where it is written down and checked for
+        // staleness.
         ("page_cache_size_for", page_cache),
         ("parked_budget_for", parked),
     ]
@@ -1930,6 +1939,46 @@ mod tests {
             );
         }
 
+        // THE THREE TERMS NOTHING ELSE CHECKS. The non-zero check in the
+        // sibling guard is a FLOOR, not a value: drop the `2 *` from
+        // `source_code` and a declared 20 MiB term halves while every guard
+        // stays green. The direction is what makes that worth an assertion
+        // rather than a note -- the margin tests are inequalities, and
+        // UNDER-declaring satisfies an inequality more easily, so the failure
+        // is a silent over-grant of resident overhead against memory already
+        // committed. That is the `resident_overhead_budget_for` residual
+        // hazard this whole change is about, arriving through the guard built
+        // for it.
+        assert_eq!(
+            value(&terms, "SOURCE_CODE_CACHE_MAX_BYTES"),
+            2 * SOURCE_CODE_CACHE_MAX_BYTES as usize,
+            "there are TWO source-WASM byte caches (#5268 made them node-wide \
+             and shared); declaring one is declaring half the memory the node \
+             commits"
+        );
+        assert_eq!(
+            value(&terms, "DELEGATE_MODULE_CACHE_BUDGET_DIVISOR"),
+            crate::wasm_runtime::budget_for_ram(ONE_GIB)
+                / crate::wasm_runtime::DELEGATE_MODULE_CACHE_BUDGET_DIVISOR,
+            "the delegate module cache is a fixed fraction of the contract \
+             module cache; it has no budget function of its own, so nothing \
+             else pins this term"
+        );
+        #[cfg(feature = "redb")]
+        assert_eq!(
+            value(&terms, "page_cache_size_for"),
+            crate::contract::storages::redb::page_cache_size_for(ONE_GIB),
+            "the redb page cache must be declared at its real size"
+        );
+        #[cfg(not(feature = "redb"))]
+        assert_eq!(
+            value(&terms, "page_cache_size_for"),
+            0,
+            "without the `redb` feature there is no page cache to declare, and \
+             the label is kept only so the discovery guard does not demand a \
+             NOT_SUMMED entry that is wrong in the default build"
+        );
+
         // ...and the node-wide ones must NOT be multiplied. Over-declaring
         // starves hosting's residual instead of over-granting it: wrong in the
         // safe direction, still wrong, and silent either way.
@@ -2005,12 +2054,18 @@ mod tests {
     /// half that was missing: that one catches a summed budget being REMOVED;
     /// this one catches a new one being ADDED and not summed.
     ///
-    /// WHY THE SIBLING COULD NOT DO IT. That test is scrupulously defended
-    /// against every vacuity mode its author anticipated — it asserts its
-    /// scrape anchor occurs exactly once so it cannot match its own text,
-    /// requires a closing `\n}` rather than widening to EOF, and asserts the
-    /// scoped region did not escape into a sibling item. All of that is well
-    /// built. Then it validates a HARDCODED LIST of eight names. Its doc says
+    /// WHY THE SIBLING COULD NOT DO IT, in the form it had when this test was
+    /// written. It scraped its own source with `include_str!` and was
+    /// scrupulously defended against every vacuity mode its author
+    /// anticipated: anchor uniqueness, a required closing brace, a
+    /// region-escape check. All of that was well built, and ALL OF IT IS GONE
+    /// NOW, because the scrape it defended was itself the defect. Both guards
+    /// read the labels of `declared_cache_ceiling_terms` today, so neither has
+    /// an anchor to defend. This paragraph praised that machinery for one
+    /// commit longer than the machinery existed.
+    ///
+    /// What survives is the reason the two tests are not redundant. That one
+    /// validates a HARDCODED LIST of names. Its doc said
     /// "every budget that consumes node memory has to appear in the sum, and a
     /// new one is added here at the same time it is added there" — which is an
     /// honour-system requirement written as though it were a check. A ninth
@@ -2217,6 +2272,83 @@ mod tests {
                 "resident_overhead_budget_for",
                 "the CONSUMER of this aggregate; summing it would be circular",
             ),
+            // FOUND BY WIDENING THE TYPE PREDICATE TO `u64`, which is the
+            // point: this name existed for releases and this guard could not
+            // see it. Correctly excluded, so nothing was wrong with the code
+            // -- but "correctly excluded" was luck rather than a decision
+            // until this row existed.
+            // ---- Everything below became visible when the type predicate
+            // widened to `u64`. All fourteen are legitimately excluded, which
+            // is the point worth recording: nothing was WRONG, and none of it
+            // was a decision anybody had written down. A guard that cannot see
+            // a name cannot be said to have excluded it.
+            //
+            // Consumer-side hosting terms. `resident_overhead_budget_for` and
+            // the hosting state-byte budget CONSUME this aggregate; summing
+            // their own constants here would be circular.
+            (
+                "MIN_RESIDENT_OVERHEAD_BUDGET_BYTES",
+                "floor inside resident_overhead_budget_for, the consumer of this sum",
+            ),
+            (
+                "MIN_DEFAULT_HOSTING_BUDGET_BYTES",
+                "clamp inside the hosting state-byte budget, on the consumer side",
+            ),
+            (
+                "MAX_DEFAULT_HOSTING_BUDGET_BYTES",
+                "clamp inside the hosting state-byte budget, on the consumer side",
+            ),
+            (
+                "LEGACY_FLAT_HOSTING_BUDGET_BYTES",
+                "migration sentinel for a pre-A2 pinned hosting budget (#4565), not a \
+                 budget this node declares",
+            ),
+            // Clamps inside `wasmtime_cache_size_for_ram`, which is itself
+            // excluded above as an ON-DISK cache.
+            (
+                "MIN_WASMTIME_CACHE_SIZE_BYTES",
+                "clamp inside wasmtime_cache_size_for_ram, which is on-disk",
+            ),
+            (
+                "MAX_WASMTIME_CACHE_SIZE_BYTES",
+                "clamp inside wasmtime_cache_size_for_ram, which is on-disk",
+            ),
+            (
+                "WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES",
+                "RAM fallback for that same on-disk cache",
+            ),
+            // On-disk caps. RAM-derived in places, resident in none.
+            (
+                "DEFAULT_MAX_HOSTING_DISK_BYTES",
+                "DISK cap for hosted contracts, not resident memory",
+            ),
+            (
+                "WEBAPP_CACHE_MAX_BYTES",
+                "unpacked-webapp cache under the XDG CACHE dir; on disk, and by its own \
+                 doc outside the node's disk accounting too, so it is not resident memory",
+            ),
+            ("LOG_DIR_MAX_BYTES", "on-disk log rotation cap"),
+            ("MIN_LOG_DIR_MAX_BYTES", "clamp for that log rotation cap"),
+            (
+                "MIN_COMPACTION_RECLAIM_BYTES",
+                "threshold that decides whether redb compaction is worth running, not a budget",
+            ),
+            // Test-support harness, not a running node.
+            (
+                "STANDALONE_CONTRACT_STORE_BYTES",
+                "conformance runtime-oracle harness store size, not a node budget",
+            ),
+            (
+                "STANDALONE_DELEGATE_STORE_BYTES",
+                "conformance runtime-oracle harness store size, not a node budget",
+            ),
+            (
+                "BASELINE_MEMORY_RESERVATION_BYTES",
+                "reserved BY resident_overhead_budget_for on the consumer side: it is \
+                 subtracted from total RAM to leave headroom for everything NOT declared \
+                 here. Summing it into the declaration would double-count it against the \
+                 residual it exists to protect",
+            ),
         ];
 
         // WHAT THE SUM ACTUALLY CONSUMED, not what its source text mentions.
@@ -2313,8 +2445,17 @@ mod tests {
                     // leaving a stale `NOT_SUMMED` entry behind — a guard
                     // narrowing itself as a side effect of an unrelated fix.
                     && {
+                        // `u64` AS WELL, because a real summed budget was
+                        // already invisible to this scan:
+                        // `SOURCE_CODE_CACHE_MAX_BYTES` is `u64`. The guard
+                        // whose job is catching a NEWLY ADDED budget could not
+                        // see one that had been in the sum for releases, and
+                        // the RESIDUAL paragraph above named only the
+                        // parameter-name gap, so the doc understated it too.
                         let ty = tail.trim_start();
-                        ty.starts_with("usize") || ty.starts_with("ByteCount")
+                        ty.starts_with("usize")
+                            || ty.starts_with("u64")
+                            || ty.starts_with("ByteCount")
                     }
                     && name.ends_with("_BYTES")
                 {
