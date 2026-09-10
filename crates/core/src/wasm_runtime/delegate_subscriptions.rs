@@ -229,6 +229,60 @@ pub(crate) enum SubscribeOutcome {
     RegisteredEvicting(ContractInstanceId),
 }
 
+/// A test-only pause between the two index writes in [`subscribe`], used to make
+/// the guard OBSERVABLE rather than to catch a race by luck.
+///
+/// The window this exists for is a handful of instructions wide, and whether it
+/// opens depends on whether the thread happens to be descheduled inside it. That
+/// makes an unaided concurrency test a property of machine load rather than of
+/// the code: measured against a deliberately broken build it caught the defect
+/// on a heavily loaded box and **0 times in 5 on a quiet one**. A test that
+/// passes on an idle CI runner and fails on a busy one is indistinguishable
+/// from flakiness and gets "fixed" with a retry.
+///
+/// Pausing at the exact point turns that into a decision rather than a race.
+/// The call sits between the reverse-index write and the forward-index write,
+/// so its position RELATIVE TO THE GUARD is the thing under test:
+///
+///  * guard held across both writes (correct): the pause happens while holding
+///    it, every other subscriber for that delegate blocks on the guard, and
+///    nothing can interleave. The test passes.
+///  * guard dropped before the forward write (the defect): the pause happens
+///    with nothing held, other subscribers proceed, fill the cap and evict this
+///    very contract before its forward entry is written. The test fails, every
+///    time.
+///
+/// So the hook is live in BOTH versions — it is not scaffolding that only means
+/// something against a reverted fix.
+///
+/// A pause and not a barrier, deliberately: a rendezvous here deadlocks the
+/// correct version, because the guard holder would wait for a task the guard is
+/// blocking. Armed for ONE designated contract so a test pays a single delay
+/// rather than one per subscribe.
+#[cfg(test)]
+pub(crate) mod race_hook {
+    use super::ContractInstanceId;
+    use std::sync::Mutex;
+
+    static ARMED: Mutex<Option<ContractInstanceId>> = Mutex::new(None);
+
+    /// Pause the next `subscribe` for `contract` inside the window.
+    pub(crate) fn arm(contract: ContractInstanceId) {
+        *ARMED.lock().unwrap() = Some(contract);
+    }
+
+    pub(crate) fn disarm() {
+        *ARMED.lock().unwrap() = None;
+    }
+
+    pub(super) fn maybe_pause(contract: &ContractInstanceId) {
+        let armed = *ARMED.lock().unwrap() == Some(*contract);
+        if armed {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+}
+
 /// Record `delegate`'s interest in `contract`, enforcing the per-delegate cap.
 ///
 /// # Why this evicts instead of refusing at the cap
@@ -362,6 +416,10 @@ pub(crate) fn subscribe(contract: ContractInstanceId, delegate: &DelegateKey) ->
     }
 
     owned.insert(contract, now);
+    // Between the two writes, so a test can prove the guard actually spans them.
+    // A no-op unless armed; see `race_hook`.
+    #[cfg(test)]
+    race_hook::maybe_pause(&contract);
     // Under the SAME guard as the reverse-index insert above, not after it.
     //
     // Dropping the guard first leaves a window in which another task
@@ -838,72 +896,101 @@ mod tests {
     async fn concurrent_subscribes_never_exceed_the_cap() {
         use std::sync::Arc;
 
-        const TASKS: u16 = 8;
-        const PER_TASK: u16 = 40;
-        const ROUNDS: u16 = 60;
+        const FILLERS: u16 = 8;
+        const PER_FILLER: u16 = 40;
         const BASE: u16 = 20000;
+        const VICTIM: u16 = 19999;
 
-        // LOOPED ON PURPOSE, and the loop is the difference between a guard and
-        // an ornament. A single round detected the admission race roughly one
-        // time in seven when it was measured against the broken code — and the
-        // `ci` nextest profile sets `retries = 2`, so a probabilistic test is
-        // WORSE than none: the 1-in-7 run that catches the regression is retried
-        // twice, almost certainly passes, and CI reports green. The retry
-        // converts a real catch into a pass. Driving the window ~60 times per
-        // execution makes a single run fail essentially always, which is the
-        // only shape that survives a retry.
+        // DETERMINISTIC, not probabilistic, and the difference is the whole
+        // value of this test. Racing `subscribe` unaided caught the real
+        // admission defect 0 times in 5 against a deliberately broken build on
+        // an idle machine, and once on a loaded one — detection was a property
+        // of machine load, not of the code, which is the kind of test that goes
+        // green on a quiet CI runner and gets a retry bolted on when it is not.
         //
-        // Multi-threaded for the same reason: `subscribe` is synchronous, so on
-        // a current-thread runtime the sequence is atomic for free and the test
-        // would prove nothing.
+        // `race_hook` pauses ONE subscribe between the reverse-index write and
+        // the forward-index write. That makes the guard's SPAN observable: with
+        // both writes under one guard the fillers below block and cannot
+        // interleave, and with the forward write outside it they proceed, fill
+        // the cap, and evict the victim before its forward entry exists.
         let d = dkey(16);
-        for round in 0..ROUNDS {
-            let barrier = Arc::new(tokio::sync::Barrier::new(TASKS as usize));
-            let mut handles = Vec::new();
-            for t in 0..TASKS {
-                let delegate = d.clone();
-                let barrier = Arc::clone(&barrier);
-                handles.push(tokio::spawn(async move {
-                    barrier.wait().await;
-                    for i in 0..PER_TASK {
-                        subscribe(cid(BASE + t * PER_TASK + i), &delegate);
-                    }
-                }));
-            }
-            for h in handles {
-                h.await.expect("no subscribing task may panic");
-            }
+        let victim = cid(VICTIM);
+        race_hook::arm(victim);
 
-            let held = subscription_count(&d);
-            assert!(
-                held <= MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE,
-                "round {round}: the cap must hold under concurrency — {held} held \
-                 against a cap of {MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE}. \
-                 Exceeding it means check-evict-insert was not atomic and two \
-                 subscribes both admitted against the same free slot"
-            );
+        let start = Arc::new(tokio::sync::Barrier::new(2));
+        let victim_task = {
+            let delegate = d.clone();
+            let start = Arc::clone(&start);
+            tokio::spawn(async move {
+                start.wait().await;
+                tokio::task::spawn_blocking(move || subscribe(victim, &delegate))
+                    .await
+                    .expect("victim subscribe must not panic")
+            })
+        };
 
-            // The two indexes must agree. This is the assertion that caught the
-            // real admission race: the counts alone cannot see a pair that is
-            // listed for delivery but not counted against the budget.
-            let mut listed = 0;
-            for t in 0..TASKS {
-                for i in 0..PER_TASK {
-                    if is_subscribed(&cid(BASE + t * PER_TASK + i), &d) {
-                        listed += 1;
-                    }
+        // Enough subscribes to fill the cap and then keep evicting, so the
+        // victim ages into being the coldest entry while it is paused.
+        let fillers = {
+            let delegate = d.clone();
+            let start = Arc::clone(&start);
+            tokio::spawn(async move {
+                start.wait().await;
+                let mut handles = Vec::new();
+                for t in 0..FILLERS {
+                    let delegate = delegate.clone();
+                    handles.push(tokio::task::spawn_blocking(move || {
+                        for i in 0..PER_FILLER {
+                            subscribe(cid(BASE + t * PER_FILLER + i), &delegate);
+                        }
+                    }));
+                }
+                for h in handles {
+                    h.await.expect("no filler task may panic");
+                }
+            })
+        };
+
+        victim_task.await.expect("victim task joined");
+        fillers.await.expect("filler task joined");
+        race_hook::disarm();
+
+        let held = subscription_count(&d);
+        assert!(
+            held <= MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE,
+            "the cap must hold under concurrency: {held} held against a cap of \
+             {MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE}"
+        );
+
+        // The assertion that matters. A pair present in the forward index but
+        // absent from the reverse one leaves the delegate on the delivery path
+        // for a subscription that occupies none of its budget and that cap
+        // eviction can never choose as a victim, because eviction picks from the
+        // index that lost it.
+        assert!(
+            !(is_subscribed(&victim, &d) && last_notified(&victim, &d).is_none()),
+            "the victim is listed in the forward index but absent from the \
+             reverse one: the two index writes did not happen under one guard, \
+             so a concurrent subscriber evicted it in the window between them"
+        );
+        let mut listed = 0;
+        for t in 0..FILLERS {
+            for i in 0..PER_FILLER {
+                if is_subscribed(&cid(BASE + t * PER_FILLER + i), &d) {
+                    listed += 1;
                 }
             }
-            assert_eq!(
-                listed, held,
-                "round {round}: every contract the reverse index counts must also \
-                 be listed in the forward index. A forward-only pair leaves the \
-                 delegate on the delivery path for a subscription that occupies \
-                 none of its budget and that cap eviction can never choose"
-            );
-
-            cleanup(&d);
         }
+        if is_subscribed(&victim, &d) {
+            listed += 1;
+        }
+        assert_eq!(
+            listed, held,
+            "every contract the forward index lists must also be counted in the \
+             reverse index"
+        );
+
+        cleanup(&d);
     }
 
     /// The two indexes can disagree, and a re-subscribe must repair it rather
