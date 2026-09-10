@@ -3916,6 +3916,19 @@ mod tests {
     // moves the stamp, and an implausible stamp is rewritten rather than
     // believed. See `DELEGATE_SUBSCRIPTIONS_TABLE`.
 
+    /// Serialises the tests that drive `DELEGATE_SUBSCRIPTION_CAP_REFUSALS`.
+    ///
+    /// That counter is process-global by design, and `cargo test` runs these in
+    /// ONE process, so a sibling test that refuses even once lands in another
+    /// test's before/after delta. `repeated_cap_refusals_do_not_log_every_time`
+    /// measured 201 against its own 200 for exactly that reason.
+    ///
+    /// Weakening the assertion to `>=` would have hidden it: 199 of this test's
+    /// own refusals plus two from siblings also reads as 201. The lock keeps the
+    /// exact equality, which is the assertion that can tell a throttle that went
+    /// SILENT from one that is merely quiet.
+    static CAP_REFUSAL_COUNTER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn stamp_test_delegate(seed: u8) -> DelegateKey {
         DelegateKey::new([seed; 32], CodeHash::from_code(&[seed]))
     }
@@ -4033,6 +4046,10 @@ mod tests {
     /// each. Third instance of that shape in one release.
     #[tokio::test]
     async fn repeated_cap_refusals_do_not_log_every_time() {
+        // Shares the process-global refusal counter; see `CAP_REFUSAL_COUNTER`.
+        let _counter = CAP_REFUSAL_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let store = ReDb::new(dir.path()).await.unwrap();
 
@@ -4322,6 +4339,10 @@ mod tests {
     /// contracts, one row each.
     #[tokio::test]
     async fn one_delegate_cannot_grow_the_table_past_the_node_ceiling() {
+        // Shares the process-global refusal counter; see `CAP_REFUSAL_COUNTER`.
+        let _counter = CAP_REFUSAL_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let store = ReDb::new(dir.path()).await.unwrap();
 
@@ -4540,6 +4561,10 @@ mod tests {
     /// and the row would then expire under it.
     #[tokio::test]
     async fn reaffirming_an_existing_row_is_not_refused_at_the_cap() {
+        // Shares the process-global refusal counter; see `CAP_REFUSAL_COUNTER`.
+        let _counter = CAP_REFUSAL_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let store = ReDb::new(dir.path()).await.unwrap();
 
