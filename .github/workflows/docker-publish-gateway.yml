@@ -1,0 +1,476 @@
+name: Publish Docker Image (Gateway)
+
+# Mirrors docker-publish.yml (the node image) exactly in structure and in why
+# it is wired the way it is -- see that file for the fuller rationale on the
+# release.published trigger, the RELEASE_PAT dependency, and the GHCR
+# first-publish visibility caveat. Kept as a SEPARATE workflow rather than a
+# matrix over both images because the two images ship different binaries'
+# worth of assertions (--is-gateway, --skip-load-from-network,
+# --transport-keypair, PUBLIC_NETWORK_ADDRESS) and a shared workflow would
+# either lose that specificity or need as much per-image branching as just
+# having two files, while risking the node's already-proven workflow in the
+# same change.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (for example, v0.2.132)'
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - 'docker/freenet-gateway/**'
+      - '.github/workflows/docker-publish-gateway.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'docker/freenet-gateway/**'
+      - '.github/workflows/docker-publish-gateway.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-publish-gateway-${{ github.event.release.tag_name || inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify entrypoint and image build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
+
+      - name: Shellcheck the entrypoint and its tests
+        run: |
+          set -euo pipefail
+          shellcheck -s sh docker/freenet-gateway/freenet-gateway-startup.sh
+          shellcheck -s sh docker/freenet-gateway/test-entrypoint.sh
+          shellcheck -s sh docker/freenet-gateway/healthcheck.sh
+
+      - name: Test the update supervisor
+        run: docker/freenet-gateway/test-entrypoint.sh
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build both architectures without pushing
+        uses: docker/build-push-action@v7
+        with:
+          context: docker/freenet-gateway
+          file: docker/freenet-gateway/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: |
+            FREENET_VERSION=${{ github.event.release.tag_name || inputs.tag || 'latest' }}
+
+      - name: Build amd64 image for local checks
+        uses: docker/build-push-action@v7
+        with:
+          context: docker/freenet-gateway
+          file: docker/freenet-gateway/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: freenet-gateway:verify
+          build-args: |
+            FREENET_VERSION=${{ github.event.release.tag_name || inputs.tag || 'latest' }}
+
+      - name: Build arm64 image for local checks
+        uses: docker/build-push-action@v7
+        with:
+          context: docker/freenet-gateway
+          file: docker/freenet-gateway/Dockerfile
+          platforms: linux/arm64
+          push: false
+          load: true
+          tags: freenet-gateway:verify-arm64
+          build-args: |
+            FREENET_VERSION=${{ github.event.release.tag_name || inputs.tag || 'latest' }}
+
+      - name: The arm64 binary runs under emulation
+        run: |
+          set -euo pipefail
+          out=$(docker run --rm --platform linux/arm64 \
+            --entrypoint /usr/local/lib/freenet/freenet \
+            freenet-gateway:verify-arm64 --version)
+          echo "$out"
+          echo "$out" | grep -qE '^Freenet version: [0-9]+\.[0-9]+\.[0-9]+'
+
+      - name: The shipped binary runs and reports a version
+        run: |
+          set -euo pipefail
+          version_output=$(docker run --rm \
+            --entrypoint /usr/local/lib/freenet/freenet \
+            freenet-gateway:verify --version)
+          echo "$version_output"
+          echo "$version_output" | grep -qE '^Freenet version: [0-9]+\.[0-9]+\.[0-9]+'
+
+      - name: The shipped version matches the release tag
+        if: ${{ github.event.release.tag_name || inputs.tag }}
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          expected="${RELEASE_TAG#v}"
+          actual=$(docker run --rm \
+            --entrypoint /usr/local/lib/freenet/freenet \
+            freenet-gateway:verify --version \
+            | sed -n 's/^Freenet version: \([^ ]*\).*/\1/p')
+          echo "expected ${expected}, image ships ${actual}"
+          test "$expected" = "$actual"
+
+      # The properties that make this specifically a GATEWAY image, asserted
+      # on the shipped entrypoint text. A gateway that silently lost
+      # --is-gateway, --skip-load-from-network or its keypair handling would
+      # look identical to a plain node in every other check above.
+      - name: The shipped entrypoint keeps its gateway-specific guarantees
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint cat freenet-gateway:verify \
+            /usr/local/bin/freenet-gateway-startup > entrypoint.sh
+
+          require() {
+            grep -qE "$1" entrypoint.sh \
+              || { echo "::error::$2"; exit 1; }
+          }
+
+          require '^export FREENET_SUPERVISED=1$' \
+            'entrypoint does not export FREENET_SUPERVISED=1, so the gateway treats itself as unsupervised and exits 42 without ever updating'
+          require '^export FREENET_SYSTEMD_FAST_CRASH=1$' \
+            'entrypoint does not opt in to the fast-crash exit code, so a boot wedge is indistinguishable from an available update'
+          require '^ +--config-dir "\$CONFIG_DIR" ' \
+            'entrypoint does not pass --config-dir; gateway state would land in the image layer and be lost on upgrade'
+          require '^ +--data-dir "\$DATA_DIR" ' \
+            'entrypoint does not pass --data-dir; gateway state would land in the image layer and be lost on upgrade'
+          require '^ +--is-gateway ' \
+            'entrypoint does not pass --is-gateway; the shipped image would start a plain node instead of a gateway'
+          require '^ +--skip-load-from-network ' \
+            'entrypoint does not pass --skip-load-from-network'
+          require '^ +--transport-keypair "\$TRANSPORT_KEYPAIR" ' \
+            'entrypoint does not pass --transport-keypair; the gateway would use an ephemeral identity every restart'
+          require 'PUBLIC_NETWORK_ADDRESS is not set' \
+            'entrypoint no longer fails fast when PUBLIC_NETWORK_ADDRESS is missing'
+          require 'ensure_transport_keypair' \
+            'entrypoint no longer generates a transport keypair on first start'
+
+          if grep -qE '^ *"\$RUN_BIN" network.*--disable-auto-update' entrypoint.sh; then
+            echo "::error::entrypoint disables auto-update unconditionally"
+            exit 1
+          fi
+
+          echo "entrypoint assertions passed"
+
+      # Runs the REAL entrypoint in the REAL image against a volume, same
+      # rationale as the node's equivalent check: every check above uses
+      # `--entrypoint`, bypassing freenet-gateway-startup entirely, so the
+      # gosu privilege drop, the volume seeding, the keypair generation and
+      # where the gateway actually puts its state are all unexercised there.
+      - name: The running container puts gateway state on the volume and generates its identity
+        run: |
+          set -euo pipefail
+          docker volume create freenet-gateway-verify-data >/dev/null
+          docker run -d --name freenet-gateway-verify \
+            -e PUBLIC_NETWORK_ADDRESS=203.0.113.42 \
+            -v freenet-gateway-verify-data:/data freenet-gateway:verify >/dev/null
+
+          for _ in $(seq 1 60); do
+            if docker exec freenet-gateway-verify test -f /data/keys/transport-keypair.pem 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+
+          echo "--- entrypoint output ---"
+          docker logs freenet-gateway-verify 2>&1 | tail -30
+
+          fail() { echo "::error::$1"; docker rm -f freenet-gateway-verify >/dev/null; exit 1; }
+
+          docker exec freenet-gateway-verify test -f /data/keys/transport-keypair.pem \
+            || fail "no transport keypair was generated; a gateway with no stable identity is not a gateway"
+
+          key_len=$(docker exec freenet-gateway-verify sh -c 'wc -c < /data/keys/transport-keypair.pem')
+          [ "$key_len" = 64 ] \
+            || fail "generated transport keypair is ${key_len} bytes, expected exactly 64 (32-byte X25519 secret, hex-encoded)"
+
+          docker exec freenet-gateway-verify test -x /data/bin/freenet \
+            || fail "entrypoint did not seed the runnable binary onto the volume"
+
+          if docker exec freenet-gateway-verify test -d /home/freenet/.local/share/freenet; then
+            fail "gateway wrote state into the image layer at /home/freenet; it would be lost on recreate"
+          fi
+
+          docker exec freenet-gateway-verify test -f /data/node.pid \
+            || fail "no gateway pid recorded; the gateway is not running (see the entrypoint output above)"
+          node_pid=$(docker exec freenet-gateway-verify cat /data/node.pid)
+          argv=$(docker exec freenet-gateway-verify sh -c "tr '\0' ' ' < /proc/${node_pid}/cmdline")
+          echo "gateway argv: ${argv}"
+
+          case "$argv" in
+            *--disable-auto-update*)
+              fail "the running gateway was started with --disable-auto-update; it would stop updating and eventually fall below min-compatible-version" ;;
+          esac
+
+          for expected_arg in \
+            "--config-dir /data/config" \
+            "--data-dir /data/node" \
+            "--is-gateway" \
+            "--skip-load-from-network" \
+            "--transport-keypair /data/keys/transport-keypair.pem" \
+            "--public-network-address 203.0.113.42"
+          do
+            case "$argv" in
+              *"$expected_arg"*) ;;
+              *) fail "the running gateway was not given ${expected_arg}" ;;
+            esac
+          done
+
+          node_uid=$(docker exec freenet-gateway-verify sh -c "awk '/^Uid:/ {print \$2}' /proc/${node_pid}/status")
+          echo "gateway uid: ${node_uid}"
+          test "$node_uid" != 0 || fail "the gateway is running as root; the privilege drop did not happen"
+
+          for var in FREENET_LOG_TO_CONSOLE LOG_DIR NETWORK_PORT WS_API_PORT \
+                     FREENET_CONFIG_DIR FREENET_DATA_DIR FREENET_BIN_DIR TRANSPORT_KEYPAIR; do
+            value=$(docker run --rm --entrypoint printenv freenet-gateway:verify "$var" || true)
+            if [ -z "$value" ]; then
+              fail "the shipped image does not set ${var}"
+            fi
+            echo "${var}=${value}"
+          done
+
+          echo "state placement and identity generation verified"
+          docker rm -f freenet-gateway-verify >/dev/null
+          docker volume rm freenet-gateway-verify-data >/dev/null
+
+      # A container started WITHOUT PUBLIC_NETWORK_ADDRESS must fail fast and
+      # say why, rather than silently starting a gateway nobody can reach.
+      # The unit test in test-entrypoint.sh covers this against the fake
+      # binary; this covers it against the real one.
+      - name: A gateway refuses to start without PUBLIC_NETWORK_ADDRESS
+        run: |
+          set -euo pipefail
+          set +e
+          output=$(docker run --rm freenet-gateway:verify 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          test "$status" -ne 0 \
+            || { echo "::error::container exited 0 without PUBLIC_NETWORK_ADDRESS; it should refuse to start"; exit 1; }
+          echo "$output" | grep -q 'PUBLIC_NETWORK_ADDRESS is not set' \
+            || { echo "::error::failure did not explain the missing PUBLIC_NETWORK_ADDRESS"; exit 1; }
+
+      - name: The release manifest signature was verified
+        if: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          status=$(docker run --rm --entrypoint cat freenet-gateway:verify \
+            /etc/freenet/signature-status)
+          echo "signature status: ${status}"
+          test "$status" = verified
+
+  publish:
+    name: Build and publish image
+    needs: verify
+    if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Derive version tags
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          minor="${version%.*}"
+          echo "tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "minor=${minor}" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event.release.prerelease }}" = "true" ]; then
+            is_stable=false
+          elif printf '%s' "$version" | grep -q -- '-'; then
+            is_stable=false
+          else
+            is_stable=true
+          fi
+          echo "is_stable=${is_stable}" >> "$GITHUB_OUTPUT"
+          echo "stable release: ${is_stable}"
+
+      - uses: docker/metadata-action@v6
+        id: metadata
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/freenet-gateway
+          tags: |
+            type=raw,value=${{ steps.version.outputs.tag }}
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ steps.version.outputs.minor }},enable=${{ steps.version.outputs.is_stable == 'true' }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_stable == 'true' }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+
+      # NOTE for the first successful run: GHCR creates the package PRIVATE by
+      # default, so `docker pull ghcr.io/freenet/freenet-gateway` fails for
+      # everyone until its visibility is set to public once, under the
+      # repository's Packages settings. Nothing in this workflow can do that,
+      # and the failure looks like a missing image rather than a permissions
+      # problem. Same caveat the node image's first publish hit.
+      - uses: docker/build-push-action@v7
+        with:
+          context: docker/freenet-gateway
+          file: docker/freenet-gateway/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          build-args: |
+            FREENET_VERSION=${{ steps.version.outputs.tag }}
+
+  smoke:
+    name: Smoke-test the published image
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Both published architectures run and report the released version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/freenet-gateway
+        run: |
+          set -euo pipefail
+          expected="${RELEASE_TAG#v}"
+          for platform in linux/amd64 linux/arm64; do
+            echo "--- ${platform} ---"
+            actual=$(docker run --rm --platform "$platform" \
+              --entrypoint /usr/local/lib/freenet/freenet \
+              "${IMAGE}:${RELEASE_TAG}" --version \
+              | sed -n 's/^Freenet version: \([^ ]*\).*/\1/p')
+            echo "expected ${expected}, image ships ${actual}"
+            test "$expected" = "$actual"
+          done
+
+  public-pull:
+    name: The published package is publicly pullable
+    needs: smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: The published package is publicly pullable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/freenet-gateway
+          REPO_OWNER: ${{ github.repository_owner }}
+          PACKAGE: freenet-gateway
+        run: |
+          set -euo pipefail
+          visibility=$(gh api "orgs/${REPO_OWNER}/packages/container/${PACKAGE}" \
+            --jq '.visibility // empty' 2>/dev/null || true)
+          visibility=${visibility:-unknown}
+          echo "package visibility: ${visibility}"
+
+          anon_ok=0
+          anon_home=$(mktemp -d)
+          for attempt in 1 2 3; do
+            if DOCKER_CONFIG="$anon_home" DOCKER_CLI_EXPERIMENTAL=enabled \
+              docker manifest inspect "${IMAGE}:${RELEASE_TAG}" >/dev/null 2>&1; then
+              anon_ok=1
+              break
+            fi
+            [ "$attempt" = 3 ] || sleep $(( 10 + RANDOM % 5 ))
+          done
+          rm -rf "$anon_home"
+          echo "anonymous manifest fetch: ${anon_ok}"
+
+          if [ "$anon_ok" = 1 ]; then
+            if [ "$visibility" != public ] && [ "$visibility" != unknown ]; then
+              echo "::warning::Anonymous pull works, but the package visibility field reads '${visibility}'. Worth a look, but not a broken release."
+            fi
+            exit 0
+          fi
+
+          if [ "$visibility" = public ]; then
+            echo "::error::The package visibility field reads 'public', but an anonymous manifest fetch of ${IMAGE}:${RELEASE_TAG} failed three times. This is NOT the private-package case -- suspect a transient GHCR failure or an anonymous rate limit, and re-run this workflow. If it persists, check the package page: https://github.com/orgs/${REPO_OWNER}/packages/container/package/${PACKAGE}"
+            exit 1
+          fi
+
+          if [ "$visibility" = unknown ]; then
+            echo "::error::Could not pull ${IMAGE}:${RELEASE_TAG} anonymously, and could not read the package visibility either (the API lookup failed -- GITHUB_TOKEN may lack read access to org packages). Most likely the GHCR package is still private. Check https://github.com/orgs/${REPO_OWNER}/packages/container/package/${PACKAGE} and see docs/RELEASING.md, 'One-time setup: GHCR package visibility'."
+            exit 1
+          fi
+
+          echo "::error::The image published, but the GHCR package is '${visibility}', so nobody outside the org can pull it. GitHub creates a new package private and offers no API to change it, so this needs one manual change, once, ever: open https://github.com/orgs/${REPO_OWNER}/packages/container/package/${PACKAGE}, go to package settings, and set visibility to Public. Then re-run this workflow with: gh workflow run docker-publish-gateway.yml --field tag=\"${RELEASE_TAG}\". See docs/RELEASING.md, 'One-time setup: GHCR package visibility'."
+          exit 1
+
+  notify-not-public:
+    name: Notify dev room if the published image is not publicly pullable
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [public-pull]
+    if: |
+      always() &&
+      (github.event_name == 'release' || github.event_name == 'workflow_dispatch') &&
+      (needs.public-pull.result == 'failure' || needs.public-pull.result == 'cancelled')
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: notify-not-public
+        uses: ./.github/actions/river-dev-notify
+        with:
+          message: "🐳 The Docker image for ${{ github.event.release.tag_name || inputs.tag }} (gateway) published FINE, but it could not be pulled anonymously -- so `docker pull ghcr.io/freenet/freenet-gateway` fails for everyone outside the org. The image is NOT stale and running containers are unaffected; this is a registry visibility setting, and GitHub offers no API to change it. Fix once at ${{ github.server_url }}/orgs/${{ github.repository_owner }}/packages/container/package/freenet-gateway (package settings -> visibility -> Public), then re-run. See docs/RELEASING.md, 'One-time setup: GHCR package visibility'. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
+
+  notify-publish-failure:
+    name: Notify dev room if the image publish failed
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [verify, publish, smoke]
+    if: |
+      always() &&
+      (github.event_name == 'release' || github.event_name == 'workflow_dispatch') &&
+      (needs.verify.result == 'failure' || needs.verify.result == 'cancelled' ||
+       needs.publish.result == 'failure' || needs.publish.result == 'cancelled' ||
+       needs.smoke.result == 'failure' || needs.smoke.result == 'cancelled')
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: notify-docker-publish-failure
+        uses: ./.github/actions/river-dev-notify
+        with:
+          message: "🐳 The Docker image publish for ${{ github.event.release.tag_name || inputs.tag }} (gateway) FAILED. `ghcr.io/freenet/freenet-gateway:latest` is now stale, so anyone starting a new container gets the previous release. Containers already running are unaffected: they self-update and do not depend on the image being current. Re-run with `gh workflow run docker-publish-gateway.yml --field tag=${{ github.event.release.tag_name || inputs.tag }}`. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
