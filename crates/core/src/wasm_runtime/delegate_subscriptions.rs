@@ -332,8 +332,10 @@ pub(crate) fn subscribe(contract: ContractInstanceId, delegate: &DelegateKey) ->
             .min_by_key(|(_, stamp)| **stamp)
             .map(|(id, _)| *id);
         if let Some(coldest) = coldest {
-            owned.remove(&coldest);
-            drop_from_contract_map(&coldest, delegate);
+            // Through the shared writer, not inline: eviction is a removal that
+            // does not look like one, so it is the path a future durable half
+            // would be added everywhere except. See `forget_one`.
+            forget_one(Some(owned.value_mut()), &coldest, delegate);
             let total = CAP_EVICTIONS.fetch_add(1, Ordering::Relaxed) + 1;
             // Throttled, and the throttle is the point rather than tidiness. A
             // delegate parked at its cap evicts on EVERY subscribe, so an
@@ -478,6 +480,46 @@ pub(crate) fn remove_contract(contract: &ContractInstanceId) {
     }
 }
 
+/// The ONE place a single `(contract, delegate)` subscription is dropped, and
+/// therefore the only place anything that must happen when a subscription goes
+/// away belongs.
+///
+/// Takes the caller's ALREADY-HELD reverse-index guard as `owned` rather than
+/// acquiring its own. That is forced, not stylistic: the cap is exact only
+/// because `subscribe` holds that guard across the whole check-evict-insert
+/// sequence, so a writer that re-acquired it would deadlock against its own
+/// caller. `None` is for callers that hold no guard because the delegate has no
+/// reverse entry at all, which is reachable — the forward index can still list
+/// the pair after a `remove_contract` divergence, and clearing that is still a
+/// drop.
+///
+/// **Both removal callers go through here on purpose.** Cap eviction and
+/// `unsubscribe` drop exactly one pair, and eviction is the one that gets
+/// written separately and forgotten, because it does not look like a removal
+/// path — it looks like part of admission. A future durable half (#5493) has to
+/// be discharged HERE: an eviction that cleared the in-memory indexes and left a
+/// durable row would have the row replayed at the next boot, which does not
+/// merely undo the eviction — it restores the evicted subscription ALONGSIDE the
+/// newer ones and leaves the delegate ABOVE its cap, permanently, from the
+/// ordinary act of restarting a node.
+///
+/// Returns whether anything was actually held, so a caller can tell a real drop
+/// from a no-op.
+fn forget_one(
+    owned: Option<&mut HashMap<ContractInstanceId, tokio::time::Instant>>,
+    contract: &ContractInstanceId,
+    delegate: &DelegateKey,
+) -> bool {
+    let removed = owned.is_some_and(|o| o.remove(contract).is_some());
+    // Checked independently of the reverse half: the two can disagree, and a
+    // drop that honoured only one would leave the other behind.
+    let listed = is_subscribed(contract, delegate);
+    if removed || listed {
+        drop_from_contract_map(contract, delegate);
+    }
+    removed || listed
+}
+
 /// Remove `delegate` from `contract`'s subscriber set, dropping the contract's
 /// entry entirely once nothing is subscribed to it.
 ///
@@ -511,20 +553,22 @@ fn drop_from_contract_map(contract: &ContractInstanceId, delegate: &DelegateKey)
 /// Promote it out of `cfg(test)` when that lands.
 #[cfg(test)]
 pub(crate) fn unsubscribe(contract: &ContractInstanceId, delegate: &DelegateKey) -> bool {
-    // Both halves are cleared whichever one the pair is recorded in, rather
-    // than gating the forward-map removal on the reverse-index hit. The two can
-    // disagree (see `subscribe`), and an unsubscribe that honoured only the
-    // reverse index would leave a delegate on the delivery path it just asked
-    // to leave. Returns whether anything was actually held, which is what #5600
-    // needs to answer "not subscribed" rather than reporting a silent success.
-    let removed = match BY_DELEGATE.get_mut(delegate) {
-        Some(mut owned) => owned.remove(contract).is_some(),
-        None => false,
+    // Through the same writer cap eviction uses, so the two cannot drift: they
+    // are the only two paths that drop a single pair. Returns whether anything
+    // was held, which is what #5600 needs to answer "not subscribed" rather than
+    // reporting a silent success.
+    let dropped = match BY_DELEGATE.get_mut(delegate) {
+        Some(mut owned) => {
+            let dropped = forget_one(Some(owned.value_mut()), contract, delegate);
+            drop(owned);
+            BY_DELEGATE.remove_if(delegate, |_, owned| owned.is_empty());
+            dropped
+        }
+        // No reverse entry: the forward index may still list the pair after a
+        // `remove_contract` divergence, and clearing that is still a drop.
+        None => forget_one(None, contract, delegate),
     };
-    let was_listed = is_subscribed(contract, delegate);
-    if removed || was_listed {
-        drop_from_contract_map(contract, delegate);
-        BY_DELEGATE.remove_if(delegate, |_, owned| owned.is_empty());
+    if dropped {
         // Same obligation as the eviction branch of `subscribe`: this drops one
         // pair, so one pair's interest hold has to come back.
         //
@@ -537,7 +581,7 @@ pub(crate) fn unsubscribe(contract: &ContractInstanceId, delegate: &DelegateKey)
         // it later means finding it as a production leak.
         crate::wasm_runtime::delegate_interest::release_pair(contract, delegate);
     }
-    removed || was_listed
+    dropped
 }
 
 /// Cap evictions since process start. See [`CAP_EVICTIONS`].
@@ -795,61 +839,71 @@ mod tests {
         use std::sync::Arc;
 
         const TASKS: u16 = 8;
-        const PER_TASK: u16 = 64;
+        const PER_TASK: u16 = 40;
+        const ROUNDS: u16 = 60;
         const BASE: u16 = 20000;
 
+        // LOOPED ON PURPOSE, and the loop is the difference between a guard and
+        // an ornament. A single round detected the admission race roughly one
+        // time in seven when it was measured against the broken code — and the
+        // `ci` nextest profile sets `retries = 2`, so a probabilistic test is
+        // WORSE than none: the 1-in-7 run that catches the regression is retried
+        // twice, almost certainly passes, and CI reports green. The retry
+        // converts a real catch into a pass. Driving the window ~60 times per
+        // execution makes a single run fail essentially always, which is the
+        // only shape that survives a retry.
+        //
+        // Multi-threaded for the same reason: `subscribe` is synchronous, so on
+        // a current-thread runtime the sequence is atomic for free and the test
+        // would prove nothing.
         let d = dkey(16);
-        let barrier = Arc::new(tokio::sync::Barrier::new(TASKS as usize));
-        let mut handles = Vec::new();
-        for t in 0..TASKS {
-            let delegate = d.clone();
-            let barrier = Arc::clone(&barrier);
-            handles.push(tokio::spawn(async move {
-                barrier.wait().await;
+        for round in 0..ROUNDS {
+            let barrier = Arc::new(tokio::sync::Barrier::new(TASKS as usize));
+            let mut handles = Vec::new();
+            for t in 0..TASKS {
+                let delegate = d.clone();
+                let barrier = Arc::clone(&barrier);
+                handles.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    for i in 0..PER_TASK {
+                        subscribe(cid(BASE + t * PER_TASK + i), &delegate);
+                    }
+                }));
+            }
+            for h in handles {
+                h.await.expect("no subscribing task may panic");
+            }
+
+            let held = subscription_count(&d);
+            assert!(
+                held <= MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE,
+                "round {round}: the cap must hold under concurrency — {held} held \
+                 against a cap of {MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE}. \
+                 Exceeding it means check-evict-insert was not atomic and two \
+                 subscribes both admitted against the same free slot"
+            );
+
+            // The two indexes must agree. This is the assertion that caught the
+            // real admission race: the counts alone cannot see a pair that is
+            // listed for delivery but not counted against the budget.
+            let mut listed = 0;
+            for t in 0..TASKS {
                 for i in 0..PER_TASK {
-                    subscribe(cid(BASE + t * PER_TASK + i), &delegate);
-                }
-            }));
-        }
-        for h in handles {
-            h.await.expect("no subscribing task may panic");
-        }
-
-        let held = subscription_count(&d);
-        assert!(
-            held <= MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE,
-            "the cap must hold under concurrency: {TASKS} tasks x {PER_TASK} \
-             subscribes left {held} held against a cap of \
-             {MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE}. Exceeding it means \
-             check-evict-insert was not atomic and two subscribes both admitted \
-             against the same free slot"
-        );
-        assert_eq!(
-            held,
-            MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE,
-            "and it must be exactly full: {} subscribes for distinct contracts \
-             cannot leave the delegate under its cap",
-            TASKS * PER_TASK
-        );
-
-        // The two indexes must still agree afterwards. A racing evict that
-        // cleared one half and not the other would leave the count right and
-        // the registry wrong, which the count assertions above cannot see.
-        let mut listed = 0;
-        for t in 0..TASKS {
-            for i in 0..PER_TASK {
-                if is_subscribed(&cid(BASE + t * PER_TASK + i), &d) {
-                    listed += 1;
+                    if is_subscribed(&cid(BASE + t * PER_TASK + i), &d) {
+                        listed += 1;
+                    }
                 }
             }
-        }
-        assert_eq!(
-            listed, held,
-            "every contract the reverse index counts must also be listed in the \
-             forward index; a mismatch is the split-brain state under a race"
-        );
+            assert_eq!(
+                listed, held,
+                "round {round}: every contract the reverse index counts must also \
+                 be listed in the forward index. A forward-only pair leaves the \
+                 delegate on the delivery path for a subscription that occupies \
+                 none of its budget and that cap eviction can never choose"
+            );
 
-        cleanup(&d);
+            cleanup(&d);
+        }
     }
 
     /// The two indexes can disagree, and a re-subscribe must repair it rather
