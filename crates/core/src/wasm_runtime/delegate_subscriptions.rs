@@ -392,6 +392,24 @@ mod tests {
     /// failing test, and the row returns at the next boot restore. A
     /// clean-looking merge is the dangerous outcome here, not a messy one.
     ///
+    /// # THE WINDOW FAILS CLOSED IN BOTH DIRECTIONS, AND ONLY ONE IS OBVIOUS
+    ///
+    /// `SOURCE.split(..).next()` always yields a part, so a missing anchor does
+    /// not error, it hands back the WHOLE FILE including this test module. That
+    /// is the fail-open shape worth worrying about here, and the
+    /// `static REGISTRY:` assertion below does not cover it: that guards
+    /// TRUNCATION, not EXPANSION.
+    ///
+    /// What covers expansion is the exact-set equality. The test module mutates
+    /// `REGISTRY` itself, through `test_support`'s helpers, so an expanded
+    /// window adds owners like `clear_in_memory_for` and
+    /// `register_in_memory_only` and the assertion fails.
+    ///
+    /// Verified rather than reasoned: replacing the split anchor with one that
+    /// cannot match reddens this test with nine owners instead of five. Written
+    /// down because `.next()` invites exactly this doubt, and the next reader
+    /// should not have to re-derive the answer.
+    ///
     /// If this fails after a merge or rebase, do NOT just add the new name.
     /// Check first that the new path writes the durable half, by calling an
     /// existing writer or by persisting itself. Then add it.
