@@ -710,10 +710,9 @@ fn already_subscribed(
         ),
         // No `OpManager`: no refcount can have been taken, so the registry is
         // the only record there is, and a mock executor has exactly one node.
-        None => crate::wasm_runtime::delegate_subscriptions::is_subscribed(
-            contract_id,
-            delegate_key,
-        ),
+        None => {
+            crate::wasm_runtime::delegate_subscriptions::is_subscribed(contract_id, delegate_key)
+        }
     }
 }
 

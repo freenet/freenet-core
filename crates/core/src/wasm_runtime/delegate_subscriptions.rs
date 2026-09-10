@@ -993,6 +993,74 @@ mod tests {
         cleanup(&d);
     }
 
+    /// Cap eviction must discharge EVERY node's hold under the evicted pair,
+    /// not just the first.
+    ///
+    /// #5615 keys the hold map by `(contract, delegate)` with node identity in
+    /// the VALUE, because two nodes in an in-process run each take their own
+    /// refcount on their own `InterestManager`. So `release_pair` has to drain
+    /// the whole per-node map. Discharging one and dropping the entry leaves the
+    /// other node's interest standing with nothing left to release it, which is
+    /// the leak `delegate_interest` exists to close, reintroduced through
+    /// eviction.
+    ///
+    /// This fails against a `release_pair` that takes the first hold and
+    /// returns, which is the shape the single-`Hold` value type before #5615's
+    /// M3 fix would naturally have produced.
+    #[tokio::test(start_paused = true)]
+    async fn cap_eviction_discharges_every_node_holding_the_evicted_pair() {
+        use crate::wasm_runtime::delegate_interest;
+        use std::sync::{Arc, Mutex};
+
+        const NODE_A: delegate_interest::NodeIdentity = 0xA1;
+        const NODE_B: delegate_interest::NodeIdentity = 0xB1;
+
+        let d = dkey(17);
+        let victim = cid(8800);
+
+        let released: Arc<Mutex<Vec<delegate_interest::NodeIdentity>>> = Default::default();
+        let make_release = |node| {
+            let sink = released.clone();
+            let release: delegate_interest::InterestRelease = Arc::new(move |_k| {
+                sink.lock().unwrap().push(node);
+            });
+            release
+        };
+        let ckey = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            victim,
+            CodeHash::new([0xD5; 32]),
+        );
+
+        subscribe(victim, &d);
+        // Two nodes each took their own refcount for the same pair.
+        delegate_interest::record(victim, d.clone(), ckey, make_release(NODE_A), NODE_A);
+        delegate_interest::record(victim, d.clone(), ckey, make_release(NODE_B), NODE_B);
+
+        for i in 1..MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE {
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            subscribe(cid(8800 + i as u16), &d);
+        }
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+
+        assert_eq!(
+            subscribe(cid(9200), &d),
+            SubscribeOutcome::RegisteredEvicting(victim),
+            "the victim must be the eviction target, or this test proves nothing"
+        );
+
+        let mut seen = released.lock().unwrap().clone();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![NODE_A, NODE_B],
+            "evicting a pair must give back EVERY node's refcount for it; \
+             discharging only the first leaves the second node's interest \
+             standing with nothing able to release it"
+        );
+
+        cleanup(&d);
+    }
+
     /// The two indexes can disagree, and a re-subscribe must repair it rather
     /// than dedup against the half that survived.
     ///
@@ -1157,8 +1225,16 @@ mod tests {
 
         // Both took an interest refcount, as the network-resolved subscribe
         // path does.
-        delegate_interest::record(victim, d.clone(), ckey(victim), make_release(victim));
-        delegate_interest::record(sibling, d.clone(), ckey(sibling), make_release(sibling));
+        // One node; the multi-node case is the test below.
+        const NODE: delegate_interest::NodeIdentity = 0xC1;
+        delegate_interest::record(victim, d.clone(), ckey(victim), make_release(victim), NODE);
+        delegate_interest::record(
+            sibling,
+            d.clone(),
+            ckey(sibling),
+            make_release(sibling),
+            NODE,
+        );
 
         for i in 2..MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE {
             tokio::time::advance(std::time::Duration::from_millis(1)).await;

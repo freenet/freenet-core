@@ -152,7 +152,7 @@ pub(crate) fn record(
 /// Whether THIS node already holds an interest obligation for
 /// `(contract, delegate)` (#5542, Codex P2).
 ///
-/// The subscription registry `DELEGATE_SUBSCRIPTIONS` is process-global and
+/// The subscription registry is process-global and
 /// carries no node identity, so asking it "is this delegate already subscribed"
 /// answers for the PROCESS, not for this node. In an in-process multi-node run
 /// the second node to subscribe the same delegate to the same contract sees the
@@ -226,10 +226,20 @@ pub(crate) fn release_pair(contract: &ContractInstanceId, delegate: &DelegateKey
     // doing that under a DashMap guard is how lock-order inversions get built.
     // `remove` hands back the owned entry, so the guard is gone by the time the
     // closure runs.
-    let Some((_, hold)) = DELEGATE_INTEREST_HOLDS.remove(&(*contract, delegate.clone())) else {
+    // EVERY node's hold under this pair, not the first. The value is a map
+    // keyed by node identity (#5542 M3), because two nodes in an in-process run
+    // each take their own refcount on their own `InterestManager`. Discharging
+    // one and dropping the entry would leave the other's interest standing with
+    // nothing left to release it, which is the leak this whole module exists to
+    // close, reintroduced by an eviction. #5615's
+    // `a_pair_keyed_lookup_discharges_every_node_holding_it` pins the same
+    // property from the other side.
+    let Some((_, holds)) = DELEGATE_INTEREST_HOLDS.remove(&(*contract, delegate.clone())) else {
         return;
     };
-    (hold.release)(&hold.key);
+    for hold in holds.into_values() {
+        (hold.release)(&hold.key);
+    }
 }
 
 /// Release every hold taken for `contract`, across all delegates.
