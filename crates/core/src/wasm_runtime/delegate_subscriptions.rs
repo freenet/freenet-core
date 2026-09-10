@@ -370,3 +370,128 @@ pub(crate) mod test_support {
             .is_some_and(|entry| entry.contains(delegate))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Every mutation of `REGISTRY` lives in a writer that also writes the
+    /// durable half. This pins the SET of them.
+    ///
+    /// # WHY A NAMES PIN RATHER THAN A BEHAVIOURAL TEST
+    ///
+    /// The guarantee this module provides is structural: the `static` is
+    /// private, so nothing outside can reach it, and every writer inside writes
+    /// both representations. A behavioural test can only exercise the paths
+    /// that EXIST. It can never fail because someone ADDED a sixth one that
+    /// forgot the durable half. This can.
+    ///
+    /// That is a live risk rather than a hypothetical. #5623 encapsulates this
+    /// same static behind this same module for its own per-delegate cap, and
+    /// merges before this branch. If its cap-eviction removes an entry through
+    /// a new route instead of calling `forget_one`, the in-memory set shrinks,
+    /// the durable row survives, the two diverge with no conflict marker and no
+    /// failing test, and the row returns at the next boot restore. A
+    /// clean-looking merge is the dangerous outcome here, not a messy one.
+    ///
+    /// If this fails after a merge or rebase, do NOT just add the new name.
+    /// Check first that the new path writes the durable half, by calling an
+    /// existing writer or by persisting itself. Then add it.
+    ///
+    /// `restore_registration` is deliberately listed while NOT writing the
+    /// durable half: it replays rows already on disk, and refreshing their
+    /// stamps is exactly what must not happen (see its own docs). It is the one
+    /// sanctioned mutation that only reads the durable side, and naming it here
+    /// makes that a decision on the record rather than an omission.
+    #[test]
+    fn every_registry_mutation_lives_in_a_known_writer() {
+        const SOURCE: &str = include_str!("delegate_subscriptions.rs");
+        let production = SOURCE
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("split always yields at least one part");
+        assert!(
+            production.contains("static REGISTRY:"),
+            "the production window must contain the static itself. If this fires \
+             the window is truncated and every assertion below is vacuous."
+        );
+
+        // Offset-based, NOT line-based. The mutations are written as
+        //
+        //     REGISTRY
+        //         .entry(*contract)
+        //
+        // so a scan requiring `REGISTRY` and the operator on ONE line finds two
+        // of the five writers and silently passes on a shorter list. The first
+        // version of this test did exactly that, and only the explicit expected
+        // set turned it from a green vacuous pin into a red one.
+        const MUTATORS: [&str; 7] = [
+            ".entry(",
+            ".remove(",
+            ".remove_if(",
+            ".retain(",
+            ".get_mut(",
+            ".insert(",
+            ".clear(",
+        ];
+
+        // Every `fn` header with its byte offset, so a mutation can be mapped
+        // back to the function containing it. Track the offset explicitly while
+        // walking lines; slicing from a newline and taking `.lines().next()`
+        // yields an empty string, which is how the previous attempt found zero
+        // headers and attributed everything to file scope.
+        let mut headers: Vec<(usize, &str)> = Vec::new();
+        let mut offset = 0usize;
+        for line in production.lines() {
+            let t = line.trim_start();
+            if let Some(after) = t
+                .strip_prefix("pub(crate) fn ")
+                .or_else(|| t.strip_prefix("pub fn "))
+                .or_else(|| t.strip_prefix("fn "))
+            {
+                let name = after.split(['(', '<']).next().unwrap_or(after);
+                headers.push((offset, name));
+            }
+            offset += line.len() + 1;
+        }
+
+        let mut owners: Vec<&str> = Vec::new();
+        let mut search = 0usize;
+        while let Some(rel) = production[search..].find("REGISTRY") {
+            let at = search + rel;
+            search = at + "REGISTRY".len();
+            // Bound the lookahead to this statement, so an unrelated later
+            // call cannot be attributed to this occurrence.
+            let stmt_end = production[at..]
+                .find(';')
+                .map(|e| at + e)
+                .unwrap_or(production.len());
+            let stmt = &production[at..stmt_end];
+            if !MUTATORS.iter().any(|op| stmt.contains(op)) {
+                continue;
+            }
+            let owner = headers
+                .iter()
+                .take_while(|(pos, _)| *pos < at)
+                .last()
+                .map(|(_, name)| *name)
+                .unwrap_or("<file scope>");
+            owners.push(owner);
+        }
+        owners.sort_unstable();
+        owners.dedup();
+
+        assert_eq!(
+            owners,
+            [
+                "forget_contract",
+                "forget_delegate",
+                "forget_one",
+                "register",
+                "restore_registration",
+            ],
+            "the set of functions mutating REGISTRY changed. Every one must also \
+             write the durable half, or the two representations diverge silently \
+             and the row returns at the next boot. Verify the new path persists \
+             BEFORE adding its name here."
+        );
+    }
+}
