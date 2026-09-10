@@ -20,20 +20,14 @@
 //! the same reason `delegate_app_registry` owns both `DELEGATE_APPS` and
 //! `CLIENT_REGISTRATION_COUNTS` rather than exporting them.
 //!
-//! # The two registration paths
+//! # The registration path
 //!
-//! Both converge here, and a bound that missed either would be free to bypass:
-//!
-//!  1. **V2** delegates call the `subscribe_contract` host function, which
-//!     reaches [`subscribe`] via `native_api::DelegateCallEnv::subscribe_contract_sync`.
-//!  2. **V1** delegates emit `OutboundDelegateMsg::SubscribeContractRequest`,
-//!     handled in `contract::handle_delegate_with_contract_requests`.
-//!
-//! A delegate chooses which of the two it gets: `Runtime::prepare_delegate_call`
-//! selects `DelegateApiVersion::V2` iff the module imports the async host
-//! functions, and `V1` otherwise. So the version is not a property the node
-//! assigns — it is a property of the guest WASM, and a bound applied to only one
-//! path is an opt-out rather than a bound.
+//! A delegate subscribes by emitting
+//! `OutboundDelegateMsg::SubscribeContractRequest`, handled in
+//! `contract::handle_delegate_with_contract_requests`, which reaches
+//! [`subscribe`]. There used to be a second path, the `subscribe_contract` host
+//! function, and a bound applied to only one of the two would have been an
+//! opt-out; that host function was removed in #5637.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -491,7 +485,7 @@ pub(crate) fn remove_delegate(delegate: &DelegateKey) {
     // removing the entry and then walking a detached snapshot.
     //
     // Executors are a pool, so `UnregisterDelegate` does not run on the same
-    // thread as the V2 host call or `apply_resolved_contract_op`. A `subscribe`
+    // thread as `apply_resolved_contract_op`. A `subscribe`
     // for this delegate completing inside a snapshot walk would recreate the
     // reverse-index entry and insert into the forward map, and the walk would
     // then strip the forward half back out — leaving exactly the disagreement

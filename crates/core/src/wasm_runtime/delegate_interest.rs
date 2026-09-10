@@ -37,8 +37,7 @@
 //!
 //! * **No `crate::ring` dependency here.** The removal sites live in
 //!   `wasm_runtime`, `InterestManager` lives in `ring`, and the closure is
-//!   built where an `OpManager` is already in hand. Same trick as the
-//!   `state_write_callback` / `state_admit_callback` hooks on `Runtime`.
+//!   built where an `OpManager` is already in hand.
 //! * **Per-node, not process-global behaviour.** The map itself is a global,
 //!   matching the registry it shadows, but each hold carries ITS OWN node's
 //!   release closure. A single global callback bound to one node's `OpManager`
@@ -52,9 +51,7 @@
 //! # What is recorded, and what deliberately is not
 //!
 //! **Only acquisitions this node actually made.** A subscribe answered from the
-//! local store takes no refcount, and neither does the V2
-//! `subscribe_contract_sync` host function — both only insert the registry
-//! hook. So this map is a strict subset of the subscription registry, keyed by
+//! local store takes no refcount — it only inserts the registry hook. So this map is a strict subset of the subscription registry, keyed by
 //! the same pair, and releasing is driven from HERE rather than from the
 //! registry. That is what makes over-release impossible: an entry exists if and
 //! only if `add_local_client` ran for that pair, so a decrement can never fall
@@ -218,8 +215,7 @@ pub(crate) fn release_delegate(delegate: &DelegateKey) {
 /// written.
 ///
 /// A no-op for a pair holding nothing, exactly like the other two: most pairs
-/// take no refcount at all (a subscribe answered from the local store, and the
-/// V2 host function).
+/// take no refcount at all (a subscribe answered from the local store).
 pub(crate) fn release_pair(contract: &ContractInstanceId, delegate: &DelegateKey) {
     // Remove first and release afterwards, outside the shard guard: a release
     // closure reaches into `InterestManager`, which takes its own locks, and
@@ -626,9 +622,8 @@ mod tests {
     }
 
     /// Releasing a pair that never took a refcount must be a no-op, not a
-    /// decrement. A subscribe answered from the local store takes none, and
-    /// neither does the V2 `subscribe_contract_sync` host function — so the
-    /// removal paths call these functions for pairs that hold nothing, and a
+    /// decrement. A subscribe answered from the local store takes none, so
+    /// the removal paths call these functions for pairs that hold nothing, and a
     /// decrement there would fall on interest a real client holds.
     #[test]
     fn releasing_a_pair_that_holds_nothing_does_not_decrement() {

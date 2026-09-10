@@ -85,17 +85,6 @@ pub use network_bridge::{EventLoopExitReason, NetworkStats, reset_channel_id_cou
 use crate::topology::rate::Rate;
 use crate::transport::{TransportKeypair, TransportPublicKey};
 pub(crate) use op_state_manager::OpManager;
-// Re-exported so the V2 propagation tests can assert on the drain read's
-// outcome and its bound from outside `node`. Both were untestable from
-// `contract::executor::pool_tests` while these modules were private, which is
-// part of why the drain path had no behavioural coverage at all.
-// `#[cfg(test)]`: both are reached only from `pool_tests`, so an unqualified
-// re-export is an unused import in a non-test build -- and CI runs clippy with
-// `-D warnings`, which turns that into a build failure.
-#[cfg(test)]
-pub(crate) use network_bridge::p2p_protoc::V2_BROADCAST_DRAIN_READ_TIMEOUT;
-#[cfg(test)]
-pub(crate) use op_state_manager::DrainStateRead;
 
 mod network_bridge;
 
@@ -7101,7 +7090,7 @@ mod tests {
     // sqlite,...` fails to compile (~52 lib errors / ~99 lib-test errors). The
     // SQLite `Pool` backend (crates/core/src/contract/storages/sqlite.rs) has
     // drifted behind `ReDb` and is missing ~15 methods the rest of the crate
-    // calls (get_state_sync / store_state_sync / update_state_sync,
+    // calls (get_state_sync / store_state_sync,
     // contract_blob_lock, {load_all,store,remove}_{contract,delegate,secrets,
     // user_secrets}_index). A SQLite mirror of the redb test below can only be
     // added once the SQLite backend is repaired (out of scope here: this change

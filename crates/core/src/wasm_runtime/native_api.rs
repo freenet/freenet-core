@@ -585,27 +585,11 @@ pub(super) struct DelegateCallEnv {
     /// Read-only pointer to the ContractStore for index lookups
     /// (ContractInstanceId → CodeHash). Valid only during synchronous process().
     contract_store: *const ContractStore,
-    /// Clone of the state storage backend (ReDb). Used by V2 delegates to read
-    /// contract state synchronously via host functions. ReDb is Arc<Database>
-    /// internally, so cloning is cheap.
+    /// Clone of the state storage backend (ReDb), read by
+    /// [`Self::local_contract_state`]. Only ever READ: no delegate host function
+    /// writes contract state (that method's docs say why). ReDb is
+    /// `Arc<Database>` internally, so cloning is cheap.
     state_store_db: Option<Storage>,
-    /// Optional callback invoked AFTER a successful, content-CHANGING V2
-    /// delegate state write (`put_contract_state_sync` /
-    /// `update_contract_state_sync`). The V2 path bypasses the executor's
-    /// `state_store.{store,update}` chokepoints, so this hook re-applies what
-    /// they do: it invalidates `StateStore`'s caches, bumps the per-contract
-    /// generation and refreshes the hosting-cache snapshot (closing the
-    /// EvictContract re-host race), reports StateBytesWritten, records the
-    /// contract-update timestamp, and — for a write that CHANGED the stored
-    /// bytes — queues the key-only `NodeEvent::V2DelegateStateChanged` that
-    /// propagates it (#5479). See `super::runtime::StateWriteCallback` and
-    /// `after_state_write`.
-    state_write_callback: Option<super::runtime::StateWriteCallback>,
-    /// Pre-write disk-budget admission gate for V2 delegate writes (#4683,
-    /// PR 3). Runs BEFORE the raw `Storage` write in
-    /// `put_contract_state_sync` / `update_contract_state_sync` and can abort
-    /// it. See `super::runtime::StateAdmitCallback`.
-    state_admit_callback: Option<super::runtime::StateAdmitCallback>,
     /// Interior-mutable pointer to the runtime's DelegateStore. Valid only during
     /// synchronous `process()` call. Used for creating child delegates.
     delegate_store: std::cell::UnsafeCell<*mut DelegateStore>,
@@ -725,7 +709,7 @@ pub(super) struct DelegateCallEnv {
 //     It does not bound EFFECTS, only pointer validity. Between the wall clock
 //     firing and the removal completing, an abandoned guest can still finish a
 //     host call it had already entered — a `set_secret`, a
-//     `put_contract_state_sync`. Those writes land after the caller has been
+//     `create_delegate`. Those writes land after the caller has been
 //     told the call timed out. That is not unsoundness, but do not read
 //     "removal bounds the dereferences" as "removal bounds what the guest did".
 //
@@ -733,7 +717,7 @@ pub(super) struct DelegateCallEnv {
 //     `remove` is waiting for the shard write lock, a new READ of that shard
 //     blocks behind it. A host function that took a second `DELEGATE_ENV.get`
 //     while already holding a `Ref` would therefore hang rather than merely
-//     contend. All 15 current call sites take exactly one guard and drop it
+//     contend. Every current call site takes exactly one guard and drops it
 //     before returning, which is the only reason this is safe today; a single
 //     nested `get` is the whole distance to a hung node. Keep every host
 //     function to one guard at a time.
@@ -861,17 +845,8 @@ impl std::ops::Deref for DelegateEnvSlot {
 pub(super) enum DelegateEnvError {
     /// State store (ReDb) is not configured on this runtime.
     StoreNotConfigured,
-    /// Contract code hash not found in the ContractStore index.
-    ContractCodeNotRegistered,
-    /// No existing state for this contract (required by UPDATE).
-    NoExistingState,
     /// ReDb read/write error.
     StorageError(String),
-    /// Pre-write disk-budget admission gate rejected the V2 write (#4683).
-    DiskBudgetExceeded(String),
-    /// The state exceeds `MAX_STATE_SIZE`. Enforced here because the V2 path
-    /// bypasses `StateStore::{store,update}`, where the ceiling normally lives.
-    StateTooLarge { size: usize, limit: usize },
 }
 
 /// Errors that can occur during delegate creation via `create_delegate_sync`.
@@ -903,8 +878,6 @@ impl DelegateCallEnv {
         secret_store: &mut SecretsStore,
         contract_store: &ContractStore,
         state_store_db: Option<Storage>,
-        state_write_callback: Option<super::runtime::StateWriteCallback>,
-        state_admit_callback: Option<super::runtime::StateAdmitCallback>,
         delegate_key: DelegateKey,
         delegate_store: &mut DelegateStore,
         creation_depth: u32,
@@ -920,8 +893,6 @@ impl DelegateCallEnv {
             user_context,
             contract_store: contract_store as *const ContractStore,
             state_store_db,
-            state_write_callback,
-            state_admit_callback,
             delegate_store: std::cell::UnsafeCell::new(delegate_store as *mut DelegateStore),
             creation_depth,
             creations_this_call: std::cell::Cell::new(0),
@@ -1174,27 +1145,31 @@ impl DelegateCallEnv {
         Ok(child_key)
     }
 
-    /// Resolve a ContractInstanceId to a ContractKey using the contract index.
-    fn resolve_contract_key(
-        &self,
-        instance_id: &ContractInstanceId,
-    ) -> Result<ContractKey, DelegateEnvError> {
-        let code_hash = self
-            .contract_store()
-            .code_hash_from_id(instance_id)
-            .ok_or(DelegateEnvError::ContractCodeNotRegistered)?;
-        Ok(ContractKey::from_id_and_code(*instance_id, code_hash))
-    }
-
-    /// Look up contract state by instance ID using the local ReDb store.
+    /// The state THIS NODE already holds for `instance_id`, or `None`.
     ///
-    /// Returns `Some(state_bytes)` if found, `None` if the contract is not stored locally.
-    /// This is the synchronous fast path used by V2 delegates instead of the
-    /// GetContractRequest/Response round-trip.
+    /// A local lookup, not a GET. It never reaches the network, so `None` means
+    /// "this node does not hold it", not "the contract does not exist". A
+    /// delegate that needs a contract's state wherever it lives emits
+    /// `OutboundDelegateMsg::GetContractRequest`, which does reach the network
+    /// (#5615).
     ///
-    /// Uses `ReDb::get_state_sync` — a purely synchronous ReDb read transaction
-    /// with no async overhead.
-    pub(super) fn get_contract_state_sync(
+    /// Exposed to WASM as `__frnt__delegate__get_contract_state(_len)`, the
+    /// names freenet-stdlib's `DelegateCtx::get_contract_state` links
+    /// against. The honest name lives here and should reach delegate authors
+    /// through a stdlib rename, not an ABI break.
+    ///
+    /// This is the only contract-state host function a delegate has, on
+    /// purpose. The host functions that WROTE contract state
+    /// (`put_contract_state`, `update_contract_state`) and the one that
+    /// subscribed were removed in #5637. The writes went straight to the raw
+    /// `Storage`, bypassing the executor's `state_store.{store,update}`
+    /// chokepoints, so every side effect those perform had to be re-applied by
+    /// hand, and two omissions reached production: the disk-budget gate
+    /// (#4683) and network propagation (#5479). A delegate writes contract
+    /// state by emitting `PutContractRequest` / `UpdateContractRequest`, which
+    /// go through those chokepoints. Do not add a write host function here;
+    /// route the write through the message path.
+    pub(super) fn local_contract_state(
         &self,
         instance_id: &ContractInstanceId,
     ) -> Result<Option<Vec<u8>>, DelegateEnvError> {
@@ -1215,290 +1190,6 @@ impl DelegateCallEnv {
             Ok(None) => Ok(None),
             Err(e) => Err(DelegateEnvError::StorageError(e.to_string())),
         }
-    }
-
-    /// Reject a V2 delegate write whose state exceeds `MAX_STATE_SIZE`.
-    ///
-    /// `StateStore::{store,update}` enforce this ceiling, and the V1 commit
-    /// path enforces it again before broadcasting. The V2 bypass writes
-    /// through the raw `Storage`, which does not — so before #5479 an
-    /// oversized V2 write was a local-disk problem, and after it the same
-    /// uncapped `WrappedState` would reach the fan-out and go on the wire,
-    /// where every recipient rejects it at its own guard AFTER paying for the
-    /// transfer. Enforcing it here, next to the disk-budget gate, keeps the
-    /// ceiling where the write is. (The queued event itself carries no state,
-    /// but the drain reads this value back and broadcasts it, so the ceiling is
-    /// still what keeps an oversized state off the wire.)
-    fn check_state_size(state_size: usize) -> Result<(), DelegateEnvError> {
-        if state_size > crate::wasm_runtime::MAX_STATE_SIZE {
-            return Err(DelegateEnvError::StateTooLarge {
-                size: state_size,
-                limit: crate::wasm_runtime::MAX_STATE_SIZE,
-            });
-        }
-        Ok(())
-    }
-
-    /// Whether `new_state` differs from what is already stored for `key`.
-    ///
-    /// The V1 path never reaches commit-or-broadcast for a byte-identical
-    /// apply — `bridged_upsert_contract_state_inner` short-circuits to
-    /// `UpsertResult::NoChange`, and that filter is load-bearing rather than
-    /// incidental (`ring::broadcast_coverage` records that no-change applies
-    /// are ~97% of received contract bytes). Without the same filter here, the
-    /// ordinary delegate shape "on each message, recompute my state and store
-    /// it" — idempotent, writing identical bytes most of the time — would go
-    /// from zero network fan-out to one full fan-out per message. That is a
-    /// self-inflicted storm needing no attacker, so it is checked, at the cost
-    /// of one ReDb read per V2 write (the V1 path reads the current state
-    /// too).
-    ///
-    /// A read error is reported as CHANGED: failing towards an extra
-    /// broadcast is recoverable, failing towards a silent drop is the bug
-    /// #5479 is about.
-    ///
-    /// # This read and the write that follows it are NOT atomic
-    ///
-    /// The comparison happens here; the write happens further down
-    /// `put_contract_state_sync` / `update_contract_state_sync`. Nothing holds
-    /// a lock across the two, and this code owns nothing that makes the pair
-    /// safe. **Correctness depends on delegate `process()` being GLOBALLY
-    /// serialized by the contract-handling loop** — `execute_delegate_request`
-    /// is reached only from `handle_delegate_with_contract_requests`, whose
-    /// call sites all `await` it inline on that single-task loop with no
-    /// spawn, so two V2 delegate writes cannot run concurrently on a node.
-    ///
-    /// Were that to change, this gate could suppress a REAL change. The
-    /// interleaving is not the symmetric one it looks like: writer A whose own
-    /// bytes happen to equal what it reads decides "no change" and will
-    /// suppress; writer B then commits and broadcasts different bytes; A then
-    /// writes its own bytes and stays silent. Local state ends at A's value
-    /// while the network last heard B's, and nothing re-announces it until the
-    /// next write or the anti-entropy heartbeat. That is precisely the
-    /// idempotent-rewrite workload this gate exists to catch, so the racy case
-    /// would be the common case rather than an exotic one.
-    ///
-    /// # Per-delegate exclusion would NOT be enough
-    ///
-    /// Read this before concluding some newer delegate-concurrency mechanism
-    /// already covers this gate. **The racing pair is two DIFFERENT delegates
-    /// writing the same contract**, so an exclusion that serializes each
-    /// delegate against itself leaves the race fully intact. Only GLOBAL
-    /// serialization of delegate execution — or an atomic compare-and-write
-    /// here — closes it.
-    ///
-    /// #5544 (implemented by #5554) removes a node-wide stall by moving work
-    /// off this loop, and **preserves the global serialization above**: the
-    /// off-loop task captures neither a `ContractHandler` nor an executor, so
-    /// it structurally cannot invoke a delegate — its jobs (awaiting a human,
-    /// driving a sub-op GET) need neither, and a resumed `process()` always
-    /// runs back on the loop. Parking therefore opens a window in which a
-    /// different delegate may START, not one in which two may RUN. The gate
-    /// stays safe across that change.
-    ///
-    /// # The durable fix
-    ///
-    /// The guarantee above is an unenforced property of the contract-handling
-    /// loop, not an invariant this code holds. Nothing here fails if a future
-    /// change breaks it. The durable fix is to make the compare-and-write
-    /// atomic — fold the comparison into the same ReDb write transaction as
-    /// the store, the way `update_state_sync` already does its check-and-write
-    /// — so this gate stops depending on a caller-side property at all.
-    fn state_content_changed(
-        &self,
-        contract_key: &ContractKey,
-        new_state: &freenet_stdlib::prelude::WrappedState,
-    ) -> bool {
-        let Some(ref db) = self.state_store_db else {
-            return true;
-        };
-        match db.get_state_sync(contract_key) {
-            Ok(Some(existing)) => existing.as_ref() != new_state.as_ref(),
-            Ok(None) => true,
-            Err(e) => {
-                tracing::debug!(
-                    contract = %contract_key,
-                    error = %e,
-                    "could not read the stored state to test for a no-op V2 write; \
-                     treating it as changed"
-                );
-                true
-            }
-        }
-    }
-
-    /// The post-write sequence every V2 delegate state write owes, in one
-    /// place.
-    ///
-    /// A V2 write goes straight through the raw `Storage`, bypassing the
-    /// executor's `state_store.{store,update}` chokepoints — so every side
-    /// effect those chokepoints perform has to be re-applied here, and the
-    /// one that gets forgotten is silent. That has already happened twice:
-    /// the disk-budget admission gate (#4683) and network propagation
-    /// (#5479, where a V2 write returned success and the network never
-    /// learned of it). Hence one helper called from both write paths rather
-    /// than the sequence hand-inlined at each — the "manually-inlined
-    /// originator side effects" row in
-    /// `.claude/rules/bug-prevention-patterns.md`.
-    ///
-    /// Everything here is best-effort: the write has already committed, and
-    /// nothing below is worth rolling it back for. The installed callback
-    /// (see `super::runtime::StateWriteCallback` and
-    /// `contract::executor::runtime::v2_delegate_state_write_callback`)
-    /// invalidates the `StateStore` caches, runs `Ring::commit_state_write`,
-    /// and — only when `content_changed` — queues the fan-out that propagates
-    /// the write.
-    fn after_state_write(
-        &self,
-        contract_key: &ContractKey,
-        new_state: &freenet_stdlib::prelude::WrappedState,
-        content_changed: bool,
-    ) {
-        if !content_changed {
-            tracing::debug!(
-                contract = %contract_key,
-                event = "v2_delegate_write_no_content_change",
-                "V2 delegate rewrote identical state; no fan-out"
-            );
-        }
-        // ALWAYS invoked, including for a byte-identical rewrite — the hook
-        // decides for itself what the unchanged case skips.
-        //
-        // The V1 `UpsertResult::NoChange` short-circuit is NOT a precedent for
-        // returning early here, and the difference is the whole point: V1
-        // short-circuits BEFORE writing, so nothing committed and there is
-        // nothing to record. The V2 path has already written to the raw
-        // `Storage` by the time this runs, so the bookkeeping the hook performs
-        // — in particular `Ring::commit_state_write`, whose generation bump is
-        // what tells a scheduled `EvictContract` that the contract was written
-        // after it was queued (`pool.rs::remove_contract` guard 3) — is owed
-        // whether or not the CONTENT changed. Skipping it left a committed
-        // write invisible to that guard, so an in-flight eviction could reclaim
-        // a contract that had just been written.
-        if let Some(cb) = &self.state_write_callback {
-            cb(contract_key, new_state, content_changed);
-        }
-    }
-
-    /// Store (PUT) contract state by instance ID.
-    ///
-    /// The contract's code hash must already be registered in the ContractStore
-    /// index (i.e., the contract code was previously stored). This writes the
-    /// state to ReDb synchronously.
-    ///
-    /// Returns `Ok(())` on success.
-    pub(super) fn put_contract_state_sync(
-        &self,
-        instance_id: &ContractInstanceId,
-        state: Vec<u8>,
-    ) -> Result<(), DelegateEnvError> {
-        let Some(ref db) = self.state_store_db else {
-            return Err(DelegateEnvError::StoreNotConfigured);
-        };
-
-        let contract_key = self.resolve_contract_key(instance_id)?;
-        // Wrap BEFORE the admission gate so exactly one value is admitted,
-        // written, and handed to the post-write hook — `WrappedState` is
-        // `Arc<Vec<u8>>`, so the clone into `store_state_sync` below is a
-        // refcount bump, not a state copy. The "manually-inlined originator
-        // side effects" row in `.claude/rules/bug-prevention-patterns.md`
-        // applies here: a refactor that reconstructs the state for the hook
-        // instead of passing the written one is how these paths drift.
-        let new_state = freenet_stdlib::prelude::WrappedState::new(state);
-        let state_size = new_state.as_ref().len();
-        Self::check_state_size(state_size)?;
-        let content_changed = self.state_content_changed(&contract_key, &new_state);
-
-        // Disk-budget admission gate (#4683): the V2 path bypasses the executor
-        // `state_store` chokepoint where the gate normally runs, so apply it here
-        // BEFORE the raw write. This is a V2 PUT — the HARD gate (`is_update =
-        // false`): a new footprint entering, rejected if it would push the
-        // aggregate over budget. On rejection nothing lands, so no rollback is
-        // needed. No-op admit until the disk tracker is seeded.
-        if let Some(admit) = &self.state_admit_callback {
-            if let Err(cause) = admit(&contract_key, state_size, false) {
-                return Err(DelegateEnvError::DiskBudgetExceeded(cause));
-            }
-        }
-
-        db.store_state_sync(&contract_key, new_state.clone())
-            .map_err(|e| DelegateEnvError::StorageError(e.to_string()))?;
-
-        self.after_state_write(&contract_key, &new_state, content_changed);
-
-        Ok(())
-    }
-
-    /// Update contract state by instance ID.
-    ///
-    /// Like PUT, but only succeeds if the contract already has stored state.
-    /// Returns an error if no prior state exists.
-    pub(super) fn update_contract_state_sync(
-        &self,
-        instance_id: &ContractInstanceId,
-        state: Vec<u8>,
-    ) -> Result<(), DelegateEnvError> {
-        let Some(ref db) = self.state_store_db else {
-            return Err(DelegateEnvError::StoreNotConfigured);
-        };
-
-        let contract_key = self.resolve_contract_key(instance_id)?;
-        // Wrap before the admission gate — see `put_contract_state_sync`.
-        let new_state = freenet_stdlib::prelude::WrappedState::new(state);
-        let state_size = new_state.as_ref().len();
-        Self::check_state_size(state_size)?;
-        let content_changed = self.state_content_changed(&contract_key, &new_state);
-
-        // Disk-budget admission gate (#4683): apply the executor-chokepoint gate
-        // that the V2 path bypasses, BEFORE the raw write. This is a V2 UPDATE —
-        // the GROWTH-ONLY gate (`is_update = true`): a mutation of an
-        // already-counted footprint. A shrinking or size-holding write always
-        // admits, even over budget, so a CRDT merge never blocks convergence;
-        // only genuine growth is bounded. Nothing lands on rejection. No-op admit
-        // until the disk tracker is seeded.
-        if let Some(admit) = &self.state_admit_callback {
-            if let Err(cause) = admit(&contract_key, state_size, true) {
-                return Err(DelegateEnvError::DiskBudgetExceeded(cause));
-            }
-        }
-
-        // Atomic check-and-write in a single ReDb write transaction.
-        match db.update_state_sync(&contract_key, new_state.clone()) {
-            Ok(true) => {
-                self.after_state_write(&contract_key, &new_state, content_changed);
-                Ok(())
-            }
-            Ok(false) => Err(DelegateEnvError::NoExistingState),
-            Err(e) => Err(DelegateEnvError::StorageError(e.to_string())),
-        }
-    }
-
-    /// Register a subscription interest for a contract.
-    ///
-    /// Validates the contract is known and records the (contract, delegate) pair
-    /// in the global subscription registry. When this node commits a new state
-    /// for the contract, `Executor::finalize_state_commit` sends a
-    /// `ContractNotification` to the delegate.
-    ///
-    /// Registration goes through `delegate_subscriptions::subscribe` rather than
-    /// touching the registry directly, so this path is bounded by
-    /// `MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE` exactly as the V1 path is. A
-    /// bound applied to only one of the two would be an opt-out: a delegate
-    /// selects V1 simply by not importing the async host functions
-    /// (`Runtime::prepare_delegate_call`).
-    pub(super) fn subscribe_contract_sync(
-        &self,
-        instance_id: &ContractInstanceId,
-    ) -> Result<(), DelegateEnvError> {
-        // Validate the contract is known
-        let _contract_key = self.resolve_contract_key(instance_id)?;
-
-        // Register in global subscription registry, under the per-delegate cap.
-        // The cap evicts rather than refuses, so this cannot fail and cannot
-        // starve a delegate that reaches it; see `delegate_subscriptions`.
-        crate::wasm_runtime::delegate_subscriptions::subscribe(*instance_id, &self.delegate_key);
-
-        Ok(())
     }
 }
 
@@ -2491,50 +2182,40 @@ pub(super) mod delegate_secrets {
     }
 }
 
-/// Host functions for async contract state access (V2 delegate API).
-///
-/// These allow a V2 delegate to read contract state directly during `process()`,
-/// eliminating the GetContractRequest/GetContractResponse round-trip.
-///
-/// **Async host functions**: These are registered via `Function::new_typed_async`
-/// so they can be called with `call_async` on a `StoreAsync`. This establishes
-/// the async execution pattern needed for future operations (network fetches,
-/// PUT operations, subscriptions) that will genuinely yield.
-///
-/// Currently the implementations are synchronous internally (ReDb reads), but
-/// because they're registered as async, the delegate execution path must use
-/// `call_async` via a `StoreAsync`.
+/// The `local_contract_state` host functions: a delegate's read-only view of
+/// contract state THIS NODE already holds. See
+/// [`DelegateCallEnv::local_contract_state`] for what it is not.
 ///
 /// ## Usage Pattern (from WASM)
 ///
-/// 1. Call `get_contract_state_len(id_ptr, 32)` to get the state size
+/// 1. Call `__frnt__delegate__get_contract_state_len(id_ptr, 32)` to get the
+///    state size
 /// 2. Allocate a buffer of that size
-/// 3. Call `get_contract_state(id_ptr, 32, out_ptr, out_len)` to read the state
+/// 3. Call `__frnt__delegate__get_contract_state(id_ptr, 32, out_ptr, out_len)`
+///    to read the state
 ///
 /// ## Error Codes
 /// - Non-negative values on success (byte counts)
 /// - `ERR_NOT_IN_PROCESS` (-1): called outside process()
 /// - `ERR_INVALID_PARAM` (-4): invalid parameter
 /// - `ERR_BUFFER_TOO_SMALL` (-6): output buffer too small
-/// - `ERR_CONTRACT_NOT_FOUND` (-7): contract not in local store
+/// - `ERR_CONTRACT_NOT_FOUND` (-7): this node does not hold the contract
 /// - `ERR_STORE_ERROR` (-8): internal storage error
+/// - `ERR_MEMORY_BOUNDS` (-9): a pointer outside the guest's linear memory
 pub(super) mod delegate_contracts {
     use super::*;
     use crate::wasm_runtime::delegate_api::contract_error_codes;
 
-    /// Implementation of get_contract_state_len.
-    ///
-    /// Extracted as a free function so it can be called from the async wrapper.
-    /// Accesses only global statics (MEM_ADDR, DELEGATE_ENV) which are Send + 'static.
-    pub(crate) fn get_contract_state_len_impl(id_ptr: i64, id_len: i32) -> i64 {
+    /// Implementation of `__frnt__delegate__get_contract_state_len`.
+    pub(crate) fn local_contract_state_len_impl(id_ptr: i64, id_len: i32) -> i64 {
         let id = current_instance_id();
         if id == -1 {
-            tracing::warn!("delegate get_contract_state_len called outside process()");
+            tracing::warn!("delegate local_contract_state_len called outside process()");
             return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
         }
         if id_len != 32 {
             tracing::warn!(
-                "delegate get_contract_state_len: expected 32-byte instance ID, got {id_len}"
+                "delegate local_contract_state_len: expected 32-byte instance ID, got {id_len}"
             );
             return contract_error_codes::ERR_INVALID_PARAM as i64;
         }
@@ -2551,7 +2232,7 @@ pub(super) mod delegate_contracts {
         let Some(id_src) =
             validate_and_compute_ptr::<u8>(id_ptr, info.start_ptr, 32, info.mem_size)
         else {
-            tracing::error!("Memory bounds violation in delegate get_contract_state_len");
+            tracing::error!("Memory bounds violation in delegate local_contract_state_len");
             return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
         };
         // SAFETY: `id_src` was validated by `validate_and_compute_ptr` to point to
@@ -2561,19 +2242,19 @@ pub(super) mod delegate_contracts {
             .unwrap();
         let contract_id = ContractInstanceId::new(id_bytes);
 
-        match env.get_contract_state_sync(&contract_id) {
+        match env.local_contract_state(&contract_id) {
             Ok(Some(state_bytes)) => {
                 tracing::debug!(
                     contract = %contract_id,
                     size = state_bytes.len(),
-                    "V2 delegate: get_contract_state_len succeeded"
+                    "delegate local_contract_state_len succeeded"
                 );
                 state_bytes.len() as i64
             }
             Ok(None) => {
                 tracing::debug!(
                     contract = %contract_id,
-                    "V2 delegate: contract not found in local store"
+                    "delegate local_contract_state: this node does not hold the contract"
                 );
                 contract_error_codes::ERR_CONTRACT_NOT_FOUND as i64
             }
@@ -2581,7 +2262,7 @@ pub(super) mod delegate_contracts {
                 tracing::error!(
                     contract = %contract_id,
                     error = ?e,
-                    "V2 delegate: state store error"
+                    "delegate local_contract_state: state store error"
                 );
                 delegate_env_error_to_code(&e)
             }
@@ -2592,69 +2273,12 @@ pub(super) mod delegate_contracts {
     pub(crate) fn delegate_env_error_to_code(err: &DelegateEnvError) -> i64 {
         match err {
             DelegateEnvError::StoreNotConfigured => contract_error_codes::ERR_STORE_ERROR as i64,
-            DelegateEnvError::ContractCodeNotRegistered => {
-                contract_error_codes::ERR_CONTRACT_CODE_NOT_REGISTERED as i64
-            }
-            DelegateEnvError::NoExistingState => {
-                contract_error_codes::ERR_CONTRACT_NOT_FOUND as i64
-            }
             DelegateEnvError::StorageError(_) => contract_error_codes::ERR_STORE_ERROR as i64,
-            // A disk-budget rejection is a store-capacity failure from the
-            // delegate's perspective — map to the generic store-error code.
-            DelegateEnvError::DiskBudgetExceeded(_) => contract_error_codes::ERR_STORE_ERROR as i64,
-            // The delegate handed us a state larger than the protocol allows.
-            // That is a caller error, not a store failure, so it maps to
-            // ERR_INVALID_PARAM rather than ERR_STORE_ERROR — and to an
-            // EXISTING code rather than a new one, because a new negative
-            // return value is a wire-visible change to the V2 delegate API
-            // that a delegate branching on codes would not expect.
-            DelegateEnvError::StateTooLarge { size, limit } => {
-                tracing::warn!(
-                    state_size = size,
-                    limit,
-                    "V2 delegate write rejected: state exceeds MAX_STATE_SIZE"
-                );
-                contract_error_codes::ERR_INVALID_PARAM as i64
-            }
         }
     }
 
-    /// Read a 32-byte contract instance ID from WASM memory.
-    ///
-    /// Shared helper for all contract host functions. Validates the instance ID
-    /// pointer and length, returning the ContractInstanceId on success.
-    /// Only acquires and drops the MEM_ADDR guard to read WASM memory metadata.
-    fn read_instance_id(id_ptr: i64, id_len: i32) -> Result<ContractInstanceId, i64> {
-        let id = current_instance_id();
-        if id == -1 {
-            return Err(contract_error_codes::ERR_NOT_IN_PROCESS as i64);
-        }
-        if id_len != 32 {
-            tracing::warn!("delegate contract host fn: expected 32-byte instance ID, got {id_len}");
-            return Err(contract_error_codes::ERR_INVALID_PARAM as i64);
-        }
-        let Some(info) = MEM_ADDR.get(&id) else {
-            return Err(contract_error_codes::ERR_NOT_IN_PROCESS as i64);
-        };
-        let start_ptr = info.start_ptr;
-        let mem_size = info.mem_size;
-        drop(info);
-
-        let Some(id_src) = validate_and_compute_ptr::<u8>(id_ptr, start_ptr, 32, mem_size) else {
-            return Err(contract_error_codes::ERR_MEMORY_BOUNDS as i64);
-        };
-        // SAFETY: `id_src` was validated by `validate_and_compute_ptr` to point to
-        // 32 bytes within the WASM linear memory.
-        let id_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(id_src, 32) }
-            .try_into()
-            .unwrap();
-        Ok(ContractInstanceId::new(id_bytes))
-    }
-
-    /// Implementation of get_contract_state.
-    ///
-    /// Extracted as a free function so it can be called from the async wrapper.
-    pub(crate) fn get_contract_state_impl(
+    /// Implementation of `__frnt__delegate__get_contract_state`.
+    pub(crate) fn local_contract_state_impl(
         id_ptr: i64,
         id_len: i32,
         out_ptr: i64,
@@ -2662,17 +2286,17 @@ pub(super) mod delegate_contracts {
     ) -> i64 {
         let id = current_instance_id();
         if id == -1 {
-            tracing::warn!("delegate get_contract_state called outside process()");
+            tracing::warn!("delegate local_contract_state called outside process()");
             return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
         }
         if id_len != 32 {
             tracing::warn!(
-                "delegate get_contract_state: expected 32-byte instance ID, got {id_len}"
+                "delegate local_contract_state: expected 32-byte instance ID, got {id_len}"
             );
             return contract_error_codes::ERR_INVALID_PARAM as i64;
         }
         if out_len < 0 {
-            tracing::warn!("delegate get_contract_state: negative out_len={out_len}");
+            tracing::warn!("delegate local_contract_state: negative out_len={out_len}");
             return contract_error_codes::ERR_INVALID_PARAM as i64;
         }
         let Some(info) = MEM_ADDR.get(&id) else {
@@ -2688,7 +2312,7 @@ pub(super) mod delegate_contracts {
         let Some(id_src) =
             validate_and_compute_ptr::<u8>(id_ptr, info.start_ptr, 32, info.mem_size)
         else {
-            tracing::error!("Memory bounds violation in delegate get_contract_state (id)");
+            tracing::error!("Memory bounds violation in delegate local_contract_state (id)");
             return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
         };
         // SAFETY: `id_src` was validated by `validate_and_compute_ptr` to point to
@@ -2698,14 +2322,14 @@ pub(super) mod delegate_contracts {
             .unwrap();
         let contract_id = ContractInstanceId::new(id_bytes);
 
-        match env.get_contract_state_sync(&contract_id) {
+        match env.local_contract_state(&contract_id) {
             Ok(Some(state_bytes)) => {
                 let state_len = state_bytes.len();
                 let out_len_usize = out_len as usize;
 
                 if state_len > out_len_usize {
                     tracing::debug!(
-                        "delegate get_contract_state buffer too small: need {state_len}, have {out_len_usize}"
+                        "delegate local_contract_state buffer too small: need {state_len}, have {out_len_usize}"
                     );
                     return contract_error_codes::ERR_BUFFER_TOO_SMALL as i64;
                 }
@@ -2721,7 +2345,7 @@ pub(super) mod delegate_contracts {
                     info.mem_size,
                 ) else {
                     tracing::error!(
-                        "Memory bounds violation in delegate get_contract_state (output)"
+                        "Memory bounds violation in delegate local_contract_state (output)"
                     );
                     return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
                 };
@@ -2735,14 +2359,14 @@ pub(super) mod delegate_contracts {
                 tracing::debug!(
                     contract = %contract_id,
                     bytes_written = state_len,
-                    "V2 delegate: get_contract_state succeeded"
+                    "delegate local_contract_state succeeded"
                 );
                 state_len as i64
             }
             Ok(None) => {
                 tracing::debug!(
                     contract = %contract_id,
-                    "V2 delegate: contract not found"
+                    "delegate local_contract_state: this node does not hold the contract"
                 );
                 contract_error_codes::ERR_CONTRACT_NOT_FOUND as i64
             }
@@ -2750,190 +2374,9 @@ pub(super) mod delegate_contracts {
                 tracing::error!(
                     contract = %contract_id,
                     error = ?e,
-                    "V2 delegate: state store error"
+                    "delegate local_contract_state: state store error"
                 );
                 delegate_env_error_to_code(&e)
-            }
-        }
-    }
-
-    /// Implementation of put_contract_state.
-    ///
-    /// Writes contract state to the local ReDb store. Requires the contract's
-    /// code hash to be registered in the ContractStore index.
-    ///
-    /// ## Returns
-    /// - `0`: success
-    /// - Negative error code on failure
-    pub(crate) fn put_contract_state_impl(
-        id_ptr: i64,
-        id_len: i32,
-        state_ptr: i64,
-        state_len: i64,
-    ) -> i64 {
-        let contract_id = match read_instance_id(id_ptr, id_len) {
-            Ok(id) => id,
-            Err(code) => return code,
-        };
-
-        if state_len < 0 {
-            tracing::warn!("delegate put_contract_state: negative state_len={state_len}");
-            return contract_error_codes::ERR_INVALID_PARAM as i64;
-        }
-
-        let id = current_instance_id();
-        let Some(info) = MEM_ADDR.get(&id) else {
-            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
-        };
-        let Some(env) = DELEGATE_ENV.get(&id) else {
-            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
-        };
-
-        // Read state bytes from WASM memory
-        let state_bytes = if state_len == 0 {
-            vec![]
-        } else {
-            let Some(src) = validate_and_compute_ptr::<u8>(
-                state_ptr,
-                info.start_ptr,
-                state_len as usize,
-                info.mem_size,
-            ) else {
-                tracing::error!("Memory bounds violation in delegate put_contract_state (state)");
-                return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
-            };
-            // SAFETY: `src` was validated by `validate_and_compute_ptr` to point to
-            // `state_len` bytes within the WASM linear memory.
-            unsafe { std::slice::from_raw_parts(src, state_len as usize) }.to_vec()
-        };
-
-        match env.put_contract_state_sync(&contract_id, state_bytes) {
-            Ok(()) => {
-                tracing::debug!(
-                    contract = %contract_id,
-                    "V2 delegate: put_contract_state succeeded"
-                );
-                contract_error_codes::SUCCESS as i64
-            }
-            Err(ref e) => {
-                tracing::debug!(
-                    contract = %contract_id,
-                    error = ?e,
-                    "V2 delegate: put_contract_state failed"
-                );
-                delegate_env_error_to_code(e)
-            }
-        }
-    }
-
-    /// Implementation of update_contract_state.
-    ///
-    /// Like PUT, but only succeeds if the contract already has stored state.
-    ///
-    /// ## Returns
-    /// - `0`: success
-    /// - `ERR_CONTRACT_NOT_FOUND (-7)`: no existing state to update
-    /// - Negative error code on other failures
-    pub(crate) fn update_contract_state_impl(
-        id_ptr: i64,
-        id_len: i32,
-        state_ptr: i64,
-        state_len: i64,
-    ) -> i64 {
-        let contract_id = match read_instance_id(id_ptr, id_len) {
-            Ok(id) => id,
-            Err(code) => return code,
-        };
-
-        if state_len < 0 {
-            tracing::warn!("delegate update_contract_state: negative state_len={state_len}");
-            return contract_error_codes::ERR_INVALID_PARAM as i64;
-        }
-
-        let id = current_instance_id();
-        let Some(info) = MEM_ADDR.get(&id) else {
-            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
-        };
-        let Some(env) = DELEGATE_ENV.get(&id) else {
-            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
-        };
-
-        // Read state bytes from WASM memory
-        let state_bytes = if state_len == 0 {
-            vec![]
-        } else {
-            let Some(src) = validate_and_compute_ptr::<u8>(
-                state_ptr,
-                info.start_ptr,
-                state_len as usize,
-                info.mem_size,
-            ) else {
-                tracing::error!(
-                    "Memory bounds violation in delegate update_contract_state (state)"
-                );
-                return contract_error_codes::ERR_MEMORY_BOUNDS as i64;
-            };
-            // SAFETY: `src` was validated by `validate_and_compute_ptr` to point to
-            // `state_len` bytes within the WASM linear memory.
-            unsafe { std::slice::from_raw_parts(src, state_len as usize) }.to_vec()
-        };
-
-        match env.update_contract_state_sync(&contract_id, state_bytes) {
-            Ok(()) => {
-                tracing::debug!(
-                    contract = %contract_id,
-                    "V2 delegate: update_contract_state succeeded"
-                );
-                contract_error_codes::SUCCESS as i64
-            }
-            Err(ref e) => {
-                tracing::debug!(
-                    contract = %contract_id,
-                    error = ?e,
-                    "V2 delegate: update_contract_state failed"
-                );
-                delegate_env_error_to_code(e)
-            }
-        }
-    }
-
-    /// Implementation of subscribe_contract.
-    ///
-    /// Validates that the contract is known (code hash resolvable) and registers
-    /// subscription interest in the global `delegate_subscriptions` registry.
-    /// When the subscribed contract's state changes, `Executor::finalize_state_commit`
-    /// delivers a `ContractNotification` to this delegate.
-    ///
-    /// ## Returns
-    /// - `0`: success (contract is known, subscription registered)
-    /// - `ERR_CONTRACT_CODE_NOT_REGISTERED (-10)`: unknown contract
-    /// - Negative error code on other failures
-    pub(crate) fn subscribe_contract_impl(id_ptr: i64, id_len: i32) -> i64 {
-        let contract_id = match read_instance_id(id_ptr, id_len) {
-            Ok(id) => id,
-            Err(code) => return code,
-        };
-
-        let id = current_instance_id();
-        let Some(env) = DELEGATE_ENV.get(&id) else {
-            return contract_error_codes::ERR_NOT_IN_PROCESS as i64;
-        };
-
-        match env.subscribe_contract_sync(&contract_id) {
-            Ok(()) => {
-                tracing::debug!(
-                    contract = %contract_id,
-                    "V2 delegate: subscribe_contract succeeded"
-                );
-                contract_error_codes::SUCCESS as i64
-            }
-            Err(ref e) => {
-                tracing::debug!(
-                    contract = %contract_id,
-                    error = ?e,
-                    "V2 delegate: subscribe_contract failed"
-                );
-                delegate_env_error_to_code(e)
             }
         }
     }
@@ -2941,7 +2384,7 @@ pub(super) mod delegate_contracts {
 
 /// Host functions for delegate management (creating child delegates).
 ///
-/// Provides the `create_delegate` host function that allows V2 delegates to
+/// Provides the `create_delegate` host function that allows delegates to
 /// spawn new delegates inline during `process()` execution.
 pub(super) mod delegate_management {
     use super::*;
@@ -3249,8 +2692,6 @@ mod secret_read_memo_tests {
                 &mut f.secret_store,
                 &f.contract_store,
                 None,
-                None,
-                None,
                 delegate_key(),
                 &mut f.delegate_store,
                 0,
@@ -3457,8 +2898,6 @@ mod secret_read_memo_tests {
                 user_context,
                 contract_store,
                 state_store_db,
-                state_write_callback,
-                state_admit_callback,
                 delegate_store,
                 creation_depth,
                 creations_this_call,
@@ -3475,8 +2914,6 @@ mod secret_read_memo_tests {
                 user_context,
                 contract_store,
                 state_store_db,
-                state_write_callback,
-                state_admit_callback,
                 delegate_store,
                 creation_depth,
                 creations_this_call,

@@ -121,7 +121,8 @@
 //!
 //! **CRITICAL: With `async_support(true)`, ALL function calls must use `call_async()`**
 //!
-//! We enable async support for V2 delegate async host functions:
+//! We enable async support because the `create_delegate` host function is
+//! registered with `func_wrap_async`:
 //!
 //! ```rust,ignore
 //! wasmtime_config.async_support(true);
@@ -918,13 +919,6 @@ impl WasmEngine for WasmtimeEngine {
         compiled_module_size(module)
     }
 
-    fn module_has_async_imports(&self, module: &Module) -> bool {
-        module.imports().any(|import| {
-            import.module() == "freenet_delegate_contracts"
-                || import.module() == "freenet_delegate_management"
-        })
-    }
-
     fn create_instance(
         &mut self,
         module: &Module,
@@ -1112,32 +1106,13 @@ impl WasmEngine for WasmtimeEngine {
         b: i64,
         c: i64,
     ) -> Result<i64, WasmError> {
-        // V1 delegate `process()`. Routed through the SAME blocking helper as
+        // Delegate `process()`. Routed through the SAME blocking helper as
         // contract execution (#5480). Before that this ran `block_on_async`
         // directly on the calling thread, so a delegate got the epoch trap and
         // nothing else: no wall-clock backstop (so #4864's dead-ticker case left
         // it with no preemption at all) and no panic capture. `Some(handle.id)`
         // carries the delegate instance id onto the thread that runs the guest —
         // see `GuestDelegateInstance`.
-        self.call_typed_blocking(handle, name, (a, b, c), Some(handle.id))
-    }
-
-    fn call_3i64_async_imports(
-        &mut self,
-        handle: &InstanceHandle,
-        name: &str,
-        a: i64,
-        b: i64,
-        c: i64,
-    ) -> Result<i64, WasmError> {
-        // V2 delegate `process()`. Identical mechanism to `call_3i64` — the
-        // engine has `async_support(true)`, so EVERY guest entry already goes
-        // through `call_async`; the V2-only part is that this module's imports
-        // include `freenet_delegate_contracts`, registered with
-        // `func_wrap_async`. Those host functions are plain synchronous bodies
-        // wrapped in `async move` with no `.await` point (see their registration
-        // in `create_backend_engine`), so they run on the blocking-pool thread
-        // exactly as they ran on the caller's.
         self.call_typed_blocking(handle, name, (a, b, c), Some(handle.id))
     }
 
@@ -2003,93 +1978,47 @@ impl WasmtimeEngine {
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
-        // Delegate contracts namespace (async host functions for V2 delegates)
-        // These are registered as async to support future async operations,
-        // but currently complete synchronously (ReDb reads).
+        // Delegate contracts namespace: ONE read-only host function pair.
         //
-        // SAFETY of refreshing before the async block: The _impl functions
-        // (e.g. get_contract_state_impl) are synchronous ReDb reads that
-        // complete immediately inside the async block — no .await points
-        // exist that could yield back to the WASM guest and allow further
-        // memory.grow calls. If these ever become truly async with .await
-        // points, the refresh must move inside the async block using a
-        // mechanism that can access the Store (e.g. wasmtime's
-        // `Caller`-based async pattern).
+        // `local_contract_state` answers "what state does THIS NODE hold for
+        // this contract" from the local store. It is not a GET, and there is
+        // deliberately no write or subscribe beside it: the write host
+        // functions that used to live here bypassed the executor's
+        // `state_store` chokepoints and were removed in #5637 (see
+        // `DelegateCallEnv::local_contract_state`). The import keeps its
+        // `get_contract_state` name because freenet-stdlib's public
+        // `DelegateCtx::get_contract_state` links against it; core names the
+        // function `local_contract_state` internally, which is what it does.
+        // A delegate module that still
+        // imports one of the removed names fails to instantiate; pinned by
+        // `removed_delegate_contract_imports_are_refused_at_instantiation`.
         linker
-            .func_wrap_async(
+            .func_wrap(
                 "freenet_delegate_contracts",
                 "__frnt__delegate__get_contract_state",
                 |mut caller: Caller<'_, HostState>,
-                 (id_ptr, id_len, out_ptr, out_len): (i64, i32, i64, i64)| {
+                 id_ptr: i64,
+                 id_len: i32,
+                 out_ptr: i64,
+                 out_len: i64|
+                 -> i64 {
                     let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
                     refresh_mem_addr_from_caller(&mut caller, id);
-                    Box::new(async move {
-                        native_api::delegate_contracts::get_contract_state_impl(
-                            id_ptr, id_len, out_ptr, out_len,
-                        )
-                    })
+                    native_api::delegate_contracts::local_contract_state_impl(
+                        id_ptr, id_len, out_ptr, out_len,
+                    )
                 },
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         linker
-            .func_wrap_async(
+            .func_wrap(
                 "freenet_delegate_contracts",
                 "__frnt__delegate__get_contract_state_len",
-                |mut caller: Caller<'_, HostState>, (id_ptr, id_len): (i64, i32)| {
+                |mut caller: Caller<'_, HostState>, id_ptr: i64, id_len: i32| -> i64 {
                     let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
                     refresh_mem_addr_from_caller(&mut caller, id);
-                    Box::new(async move {
-                        native_api::delegate_contracts::get_contract_state_len_impl(id_ptr, id_len)
-                    })
-                },
-            )
-            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
-
-        linker
-            .func_wrap_async(
-                "freenet_delegate_contracts",
-                "__frnt__delegate__put_contract_state",
-                |mut caller: Caller<'_, HostState>,
-                 (id_ptr, id_len, state_ptr, state_len): (i64, i32, i64, i64)| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
-                    Box::new(async move {
-                        native_api::delegate_contracts::put_contract_state_impl(
-                            id_ptr, id_len, state_ptr, state_len,
-                        )
-                    })
-                },
-            )
-            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
-
-        linker
-            .func_wrap_async(
-                "freenet_delegate_contracts",
-                "__frnt__delegate__update_contract_state",
-                |mut caller: Caller<'_, HostState>,
-                 (id_ptr, id_len, state_ptr, state_len): (i64, i32, i64, i64)| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
-                    Box::new(async move {
-                        native_api::delegate_contracts::update_contract_state_impl(
-                            id_ptr, id_len, state_ptr, state_len,
-                        )
-                    })
-                },
-            )
-            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
-
-        linker
-            .func_wrap_async(
-                "freenet_delegate_contracts",
-                "__frnt__delegate__subscribe_contract",
-                |mut caller: Caller<'_, HostState>, (id_ptr, id_len): (i64, i32)| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
-                    Box::new(async move {
-                        native_api::delegate_contracts::subscribe_contract_impl(id_ptr, id_len)
-                    })
+                    native_api::delegate_contracts::local_contract_state_len_impl(id_ptr, id_len)
                 },
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
@@ -2097,6 +2026,17 @@ impl WasmtimeEngine {
         // ============================================================
         // freenet_delegate_management namespace — delegate creation
         // ============================================================
+        //
+        // Registered with `func_wrap_async`, which is why the engine keeps
+        // `async_support(true)`, but the body has no `.await`: it runs
+        // `create_delegate_impl` synchronously inside the async block.
+        //
+        // SAFETY of refreshing before the async block: the refresh below runs
+        // OUTSIDE the block, which is sound only because nothing inside it
+        // yields back to the guest, so no `memory.grow` can relocate linear
+        // memory between the refresh and the impl's pointer use. If this ever
+        // gains an `.await`, the refresh must move inside the block, using a
+        // mechanism that can reach the `Store` (#3248).
         linker
             .func_wrap_async(
                 "freenet_delegate_management",
@@ -2735,7 +2675,7 @@ mod tests {
     /// cannot be cancelled, so the abandoned guest thread outlives this call
     /// (exactly as it already does for contracts). A finite epoch deadline means
     /// it still terminates instead of spinning for the life of the test binary.
-    fn assert_delegate_entry_has_wall_clock_backstop(async_imports: bool) {
+    fn assert_delegate_entry_has_wall_clock_backstop() {
         let config = RuntimeConfig {
             enable_metering: false,
             ..RuntimeConfig::default()
@@ -2746,8 +2686,7 @@ mod tests {
         // be the epoch trap.
         engine.epoch_deadline_ticks = 100;
 
-        // R2 (#5480 review): NOT a low hard-coded constant, and NOT shared
-        // between the two entry points.
+        // R2 (#5480 review): NOT a low hard-coded constant.
         //
         // `create_instance` draws ids from `next_instance_id()`, a monotonic
         // counter starting at 0, and one test in this binary calls it 10,001
@@ -2767,11 +2706,7 @@ mod tests {
         // test and never sees it; plain `cargo test` shares one process and
         // does. CI uses nextest, so CI would stay green while the contributor
         // following AGENTS.md hits it.
-        let id: i64 = if async_imports {
-            i64::MAX - 54803
-        } else {
-            i64::MAX - 54804
-        };
+        let id: i64 = i64::MAX - 54804;
         // Instantiate directly into the engine's own store so the entry point
         // finds the instance, without needing the `__frnt_set_id` / memory
         // exports that `create_instance` requires of a real contract.
@@ -2783,17 +2718,9 @@ mod tests {
         engine.instances.insert(id, instance);
 
         let handle = InstanceHandle { id };
-        let entry = if async_imports {
-            "call_3i64_async_imports"
-        } else {
-            "call_3i64"
-        };
+        let entry = "call_3i64";
         let start = std::time::Instant::now();
-        let result = if async_imports {
-            engine.call_3i64_async_imports(&handle, "spin", 0, 0, 0)
-        } else {
-            engine.call_3i64(&handle, "spin", 0, 0, 0)
-        };
+        let result = engine.call_3i64(&handle, "spin", 0, 0, 0);
         let elapsed = start.elapsed();
 
         let err = result.expect_err("a guest that never returns must not return Ok");
@@ -2840,18 +2767,11 @@ mod tests {
         );
     }
 
-    /// REGRESSION (#5480): the V1 delegate entry must have the wall-clock
+    /// REGRESSION (#5480): the delegate entry must have the wall-clock
     /// backstop that contract execution already had.
     #[test]
-    fn delegate_v1_entry_has_wall_clock_backstop() {
-        run_abandoning_guest_test(|| assert_delegate_entry_has_wall_clock_backstop(false));
-    }
-
-    /// REGRESSION (#5480): same for the V2 delegate entry, which additionally
-    /// has the larger async host-function surface.
-    #[test]
-    fn delegate_v2_entry_has_wall_clock_backstop() {
-        run_abandoning_guest_test(|| assert_delegate_entry_has_wall_clock_backstop(true));
+    fn delegate_entry_has_wall_clock_backstop() {
+        run_abandoning_guest_test(assert_delegate_entry_has_wall_clock_backstop);
     }
 
     /// WAT whose exported entry immediately calls an imported host function.
@@ -3173,7 +3093,7 @@ mod tests {
             "fn instantiate_and_init(",
             "fn initiate_buffer(",
             "fn call_void(",
-            // #5480: the single shared body for all four contract/delegate
+            // #5480: the single shared body for all three contract/delegate
             // entry points.
             "fn call_typed_blocking<",
         ];
@@ -3181,7 +3101,6 @@ mod tests {
         // The public entry points, which must NOT enter the guest themselves.
         const DELEGATING_ENTRY_FNS: &[&str] = &[
             "fn call_3i64(",
-            "fn call_3i64_async_imports(",
             "fn call_2i64_blocking(",
             "fn call_3i64_blocking(",
         ];
@@ -3407,7 +3326,7 @@ mod tests {
     #[test]
     fn blocking_paths_arm_epoch_inside_the_closure() {
         let src = include_str!("wasmtime_engine.rs");
-        // #5480: all four entry points share ONE body, so this scrapes that
+        // #5480: all three entry points share ONE body, so this scrapes that
         // body rather than the per-entry-point copies it replaced.
         let fn_name = "fn call_typed_blocking<";
         let body = scrape_body(src, fn_name);
@@ -3794,21 +3713,12 @@ mod tests {
           ;; remove_secret(key_ptr: i64, key_len: i32) -> i32
           (import "freenet_delegate_secrets" "__frnt__delegate__remove_secret"
             (func $remove_secret (param i64 i32) (result i32)))
-          ;; get_contract_state_impl(id_ptr: i64, id_len: i32, out_ptr: i64, out_len: i64) -> i64
+          ;; local_contract_state_impl(id_ptr: i64, id_len: i32, out_ptr: i64, out_len: i64) -> i64
           (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state"
-            (func $get_state (param i64 i32 i64 i64) (result i64)))
-          ;; get_contract_state_len_impl(id_ptr: i64, id_len: i32) -> i64
+            (func $local_state (param i64 i32 i64 i64) (result i64)))
+          ;; local_contract_state_len_impl(id_ptr: i64, id_len: i32) -> i64
           (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
-            (func $get_state_len (param i64 i32) (result i64)))
-          ;; put_contract_state_impl(id_ptr: i64, id_len: i32, state_ptr: i64, state_len: i64) -> i64
-          (import "freenet_delegate_contracts" "__frnt__delegate__put_contract_state"
-            (func $put_state (param i64 i32 i64 i64) (result i64)))
-          ;; update_contract_state_impl(id_ptr: i64, id_len: i32, state_ptr: i64, state_len: i64) -> i64
-          (import "freenet_delegate_contracts" "__frnt__delegate__update_contract_state"
-            (func $update_state (param i64 i32 i64 i64) (result i64)))
-          ;; subscribe_contract_impl(id_ptr: i64, id_len: i32) -> i64
-          (import "freenet_delegate_contracts" "__frnt__delegate__subscribe_contract"
-            (func $subscribe (param i64 i32) (result i64)))
+            (func $local_state_len (param i64 i32) (result i64)))
           (memory (export "memory") 1)
           (func (export "answer") (result i32) i32.const 42)
         )
@@ -3970,55 +3880,23 @@ mod tests {
         }
     }
 
+    /// A delegate's `process()` can call the contract-state host function,
+    /// through the one delegate entry point (`call_3i64`).
+    ///
+    /// Before #5637 a module importing `freenet_delegate_contracts` was routed
+    /// through a separate `call_3i64_async_imports`; the two had become
+    /// identical, and the split is gone. This keeps the end-to-end coverage the
+    /// old test gave: import resolution, `refresh_mem_addr_from_caller`, and a
+    /// host call made from inside the guest.
     #[test]
-    fn test_module_without_async_imports_detected_as_v1() {
-        let config = RuntimeConfig::default();
-        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
-
-        let wat = r#"
-        (module
-          (memory (export "memory") 1)
-          (func (export "process") (param i64 i64 i64) (result i64)
-            i64.const 0))
-        "#;
-        let module = engine.compile(wat.as_bytes()).unwrap();
-        assert!(
-            !engine.module_has_async_imports(&module),
-            "V1 module should not have freenet_delegate_contracts imports"
-        );
-    }
-
-    #[test]
-    fn test_module_with_async_imports_detected_as_v2() {
-        let config = RuntimeConfig::default();
-        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
-
-        let wat = r#"
-        (module
-          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state"
-            (func $get_state (param i64 i32 i64 i64) (result i64)))
-          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
-            (func $get_state_len (param i64 i32) (result i64)))
-          (memory (export "memory") 1)
-          (func (export "process") (param i64 i64 i64) (result i64)
-            i64.const 0))
-        "#;
-        let module = engine.compile(wat.as_bytes()).unwrap();
-        assert!(
-            engine.module_has_async_imports(&module),
-            "V2 module should have freenet_delegate_contracts imports"
-        );
-    }
-
-    #[test]
-    fn test_v2_async_call_path_end_to_end() {
+    fn delegate_process_calls_local_contract_state() {
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
 
         let wat = r#"
         (module
           (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
-            (func $get_state_len (param i64 i32) (result i64)))
+            (func $local_state_len (param i64 i32) (result i64)))
           (memory (export "memory") 1)
           (global $instance_id (mut i64) (i64.const 0))
           (func (export "__frnt_set_id") (param i64)
@@ -4029,27 +3907,104 @@ mod tests {
           (func (export "process") (param i64 i64 i64) (result i64)
             i64.const 0
             i32.const 0
-            call $get_state_len))
+            call $local_state_len))
         "#;
 
         let module = engine.compile(wat.as_bytes()).unwrap();
-        assert!(
-            engine.module_has_async_imports(&module),
-            "module should be detected as V2"
-        );
-
         let handle = engine
             .create_instance(&module, 1024)
             .expect("create instance");
 
-        let result = engine.call_3i64_async_imports(&handle, "process", 0, 0, 0);
+        let result = engine.call_3i64(&handle, "process", 0, 0, 0);
         assert!(
             result.is_ok(),
-            "V2 async call path should succeed, got: {:?}",
-            result
+            "a delegate calling local_contract_state from process() must run, got: {result:?}"
         );
 
         engine.drop_instance(&handle);
+    }
+
+    /// #5637: the delegate host functions that wrote contract state, or
+    /// subscribed to it, are GONE, and a module that imports one must fail to
+    /// instantiate rather than link to something that silently does nothing.
+    ///
+    /// Two properties, both of which the removal depends on:
+    ///
+    ///  1. The linker does not define them. Re-registering `put_contract_state`
+    ///     (or any of the others) turns this test red, which is the point: the
+    ///     write path bypassed the executor's `state_store` chokepoints and
+    ///     dropped side effects twice in production (#4683, #5479). A write
+    ///     belongs on the message path.
+    ///  2. Unknown imports are an instantiation ERROR, not a trap stub. If the
+    ///     linker were ever switched to `define_unknown_imports_as_traps`, a
+    ///     delegate built against the old names would instantiate and only fail
+    ///     when it called one, which is much harder to diagnose.
+    ///
+    /// The positive control instantiates the SAME module shape against the
+    /// surviving read, so a failure below is attributable to the import name
+    /// and not to a malformed module. The read keeps its original import
+    /// name, `__frnt__delegate__get_contract_state`, because freenet-stdlib's
+    /// public `DelegateCtx::get_contract_state` links against it: renaming it
+    /// would make every SDK delegate that reads state fail to load.
+    #[test]
+    fn removed_delegate_contract_imports_are_refused_at_instantiation() {
+        fn module_importing(name: &str, sig: &str) -> String {
+            format!(
+                r#"
+                (module
+                  (import "freenet_delegate_contracts" "{name}" (func {sig}))
+                  (memory (export "memory") 1)
+                  (func (export "__frnt_set_id") (param i64))
+                  (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+                    i64.const 100))
+                "#
+            )
+        }
+
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+
+        let control = engine
+            .compile(
+                module_importing(
+                    "__frnt__delegate__get_contract_state",
+                    "(param i64 i32 i64 i64) (result i64)",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let handle = engine
+            .create_instance(&control, 1024)
+            .expect("positive control: the surviving read must instantiate");
+        engine.drop_instance(&handle);
+
+        for (name, sig) in [
+            (
+                "__frnt__delegate__put_contract_state",
+                "(param i64 i32 i64 i64) (result i64)",
+            ),
+            (
+                "__frnt__delegate__update_contract_state",
+                "(param i64 i32 i64 i64) (result i64)",
+            ),
+            (
+                "__frnt__delegate__subscribe_contract",
+                "(param i64 i32) (result i64)",
+            ),
+        ] {
+            let module = engine
+                .compile(module_importing(name, sig).as_bytes())
+                .unwrap();
+            let result = engine.create_instance(&module, 1024);
+            if let Ok(handle) = &result {
+                engine.drop_instance(handle);
+            }
+            assert!(
+                result.is_err(),
+                "`{name}` was removed in #5637 and must not be defined by the linker; \
+                 a delegate importing it has to fail at instantiation"
+            );
+        }
     }
 
     /// Regression test for #4213 / #5023: instance ids are a PROCESS-GLOBAL
@@ -4068,7 +4023,8 @@ mod tests {
     /// `ERR_NOT_IN_PROCESS`, which the stdlib collapses into "not found":
     /// `SecretResult(None)` from `test_large_secret_data` and
     /// `test_store_and_retrieve_secret`, `error_code: -1` from
-    /// `test_v2_delegate_update_existing_state`.
+    /// a delegate contract-write test (since removed with the write host
+    /// functions, #5637).
     ///
     /// Ids now come from `native_api::next_instance_id`, so a `create_instance`
     /// CALLER can no longer pass one -- that surface is closed by the signature.

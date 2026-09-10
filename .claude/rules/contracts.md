@@ -21,49 +21,43 @@ Engine type alias    → engine.rs          (selected by feature flag)
 **All `wasmtime::` imports MUST stay in `engine/wasmtime_engine.rs`.**
 Other wasm_runtime files use the `Engine` type alias and `WasmEngine` trait.
 
-### Delegate API Versioning (`wasm_runtime/delegate_api.rs`)
+### Delegate contract access (`wasm_runtime/native_api.rs`, `delegate_api.rs`)
 
 ```
-V1: Synchronous process() — delegates use request/response for contract access
-V2: Async host functions — delegates call contract methods directly:
-    - ctx.get_contract_state(id)       → read state (two-step: len + read)
-    - ctx.put_contract_state(id, data) → write state (bypasses validate_state)
-    - ctx.update_contract_state(id, data) → conditional write (requires existing state)
-    - ctx.subscribe_contract(id)       → register interest (delivery works: see
-                                         Executor::finalize_state_commit; the
-                                         subscription does NOT register demand, #4669)
-    Backend implementation: func_wrap_async (wasmtime native async support)
-    Selected when state_store_db is configured on Runtime
-    NOTE (updated by #5479): V2 PUT/UPDATE now queue a network fan-out, so a
-    content-CHANGING write propagates to peers already interested in the
-    contract. The queued event (NodeEvent::V2DelegateStateChanged) carries the
-    contract id and NO state; the handler re-reads current state when it drains,
-    so the queue cost does not scale with state size and repeat writes to one
-    contract coalesce into a single fan-out carrying the newest value.
-    Bookkeeping (generation bump, meters, cache invalidation) runs on EVERY
-    committed write; only the fan-out is skipped when the bytes did not change.
-    Three caveats remain, and they matter:
-      - the write still bypasses the contract's own validate_state/update_state
-        merge on the writing node (receivers do merge it);
-      - it writes no hosting metadata, so `should_summarize_or_broadcast` drops
-        the broadcast for a contract this node holds ONLY because a delegate
-        wrote it (#4669 — a delegate subscription does not register demand);
-      - it does not reach this node's OWN WebSocket clients or other locally
-        subscribed delegates (#5486).
+A delegate reaches contract state through OUTBOUND MESSAGES:
+    GetContractRequest / PutContractRequest / UpdateContractRequest /
+    SubscribeContractRequest — served by the contract-handling loop through
+    the executor's normal path (the state_store chokepoints).
+The ONE host-function exception is read-only:
+    __frnt__delegate__get_contract_state(_len) — the state THIS NODE already
+    holds. ERR_CONTRACT_NOT_FOUND means "not held here", NOT "does not exist".
+    It never reaches the network.
+
+There is no "V2" delegate API. freenet-stdlib's DelegateWasmAPIVersion has one
+variant (V1). Core used to call delegates that imported contract host
+functions "V2"; that split, and the host functions that WROTE contract state
+(put/update_contract_state) or subscribed (subscribe_contract), were removed
+in #5637.
+
+DO NOT re-add a contract WRITE host function. The removed ones wrote the raw
+Storage, bypassing state_store.{store,update}, so every chokepoint side effect
+had to be copied by hand, and two omissions reached production (disk-budget
+gate #4683, network propagation #5479). Route writes through the message path.
+A module importing a removed name fails to instantiate; pinned by
+removed_delegate_contract_imports_are_refused_at_instantiation.
 ```
 
 ### WASM Call Modes
 
-All four guest entry points share ONE body, `call_typed_blocking` in
+All three guest entry points share ONE body, `call_typed_blocking` in
 `engine/wasmtime_engine.rs`. Delegates ran "sync, on the calling thread" until
 #5480; they no longer do, and nothing should reintroduce a per-entry-point copy.
 
 ```
-call_3i64()               — delegates V1
-call_3i64_async_imports() — delegates V2 (modules with async host-function imports)
+call_3i64()               — delegates
 call_2i64_blocking()      — contracts
 call_3i64_blocking()      — contracts
-        ↓ all four
+        ↓ all three
 call_typed_blocking()     — spawn_blocking + wall-clock backstop + panic capture
 ```
 
