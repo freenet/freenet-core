@@ -1,7 +1,6 @@
 use super::{
     RuntimeResult,
     contract_store::ContractStore,
-    delegate_api::DelegateApiVersion,
     delegate_store::DelegateStore,
     engine::{BackendEngine, Engine, InstanceHandle, WasmEngine},
     error::RuntimeInnerError,
@@ -959,80 +958,6 @@ impl Default for RuntimeConfig {
     }
 }
 
-/// Callback invoked after a successful state write from a V2 delegate host
-/// function (`put_contract_state_sync` or `update_contract_state_sync`).
-///
-/// V2 delegate writes go through `db.store_state_sync` / `db.update_state_sync`
-/// directly and bypass the executor's `state_store.{store,update}` chokepoints
-/// where the bump+refresh+report sites live — and, until #5479, where the
-/// NETWORK PROPAGATION happened. Without this callback those side effects never
-/// fire on a V2 delegate write: the EvictContract re-host race stays open,
-/// StateBytesWritten is undercounted in the topology meter, and the write is
-/// never seen off this node even though the host function returned success. The
-/// wiring lives outside `wasm_runtime/` (Ring lives in `crates/core/src/ring.rs`)
-/// so the callback is plumbed via a trait object owned by `Runtime` to keep
-/// `wasm_runtime` independent of the ring.
-///
-/// The closure receives the newly-written state itself rather than a separately
-/// computed length, so the byte count it meters is measured from the value that
-/// was ACTUALLY written. A `usize` parameter can drift from the write it
-/// describes under refactoring — the failure mode `.claude/rules/
-/// bug-prevention-patterns.md` calls "manually-inlined originator side effects"
-/// — and that drift is silent, because an undercounted meter looks like light
-/// traffic. `WrappedState` is `Arc<Vec<u8>>` internally, so passing it is a
-/// refcount bump, not a state copy. The pins in `delegate_api.rs` assert the
-/// callback receives the exact bytes written, which is what makes this
-/// enforceable rather than merely intended.
-///
-/// (An earlier version of this note justified the wider parameter by the state
-/// VALUE being needed for the emitted `BroadcastStateChange`. That stopped
-/// being true when the propagation event became key-only; the reason above is
-/// the one that still holds.)
-///
-/// The `bool` is `content_changed`: whether the write altered the stored bytes.
-/// The callback runs on EVERY successful write, changed or not — a V2 write
-/// commits to storage before this hook, so the bookkeeping legs are owed
-/// regardless — and uses the flag to skip only the network fan-out, which is
-/// the one leg an idempotent rewrite genuinely does not need.
-///
-/// See `contract::executor::runtime::install_v2_delegate_state_write_hooks` for
-/// the single production installer.
-pub type StateWriteCallback = Arc<
-    dyn Fn(&freenet_stdlib::prelude::ContractKey, &freenet_stdlib::prelude::WrappedState, bool)
-        + Send
-        + Sync
-        + 'static,
->;
-
-/// Pre-write admission gate for V2 delegate state writes (#4683, PR 3).
-///
-/// V2 `put_contract_state_sync` / `update_contract_state_sync` bypass the
-/// executor's `state_store.{store,update}` chokepoints, so the disk-budget
-/// admission gate the executor applies there does not run for them. This
-/// callback restores it: invoked with `(key, new_state_size)` BEFORE the raw
-/// `Storage` write, it returns `Err(cause)` when the write would push aggregate
-/// disk past the budget, and the native-API method aborts without writing (no
-/// rollback needed — nothing landed). The wiring lives outside `wasm_runtime/`
-/// (Ring is in `crates/core/src/ring.rs`), so — like [`StateWriteCallback`] —
-/// it is plumbed via a trait object to keep `wasm_runtime` ring-independent.
-/// The `Err` payload is a human-readable cause string surfaced to the delegate
-/// caller.
-///
-/// The `is_update` flag selects the admission semantics (#4683): `false` for a
-/// V2 PUT (`put_contract_state_sync`) applies the HARD gate (any write that
-/// would push the aggregate over budget is rejected); `true` for a V2 UPDATE
-/// (`update_contract_state_sync`) applies the GROWTH-ONLY gate (a shrinking or
-/// size-holding write is always admitted, even over budget, so a CRDT merge
-/// never blocks convergence — only genuine growth is bounded). This mirrors the
-/// executor-side split between `admit_state_write` (PUT) and
-/// `admit_state_update` (UPDATE / re-PUT merge).
-pub type StateAdmitCallback = Arc<
-    dyn Fn(&freenet_stdlib::prelude::ContractKey, usize, bool) -> Result<(), String>
-        + Send
-        + Sync
-        + 'static,
->;
-
 pub struct Runtime {
     /// The WASM engine backend (wasmtime).
     pub(super) engine: Engine,
@@ -1065,21 +990,9 @@ pub struct Runtime {
     /// [`SharedModuleCache`] and `prepare_contract_call_inner`.
     pub(super) contract_modules: SharedModuleCache<CodeHash>,
 
-    /// Optional state storage backend for V2 delegate contract access.
+    /// Optional state storage backend, read by the delegate
+    /// `local_contract_state` host function.
     pub(crate) state_store_db: Option<crate::contract::storages::Storage>,
-
-    /// Optional callback invoked after a successful V2 delegate state write.
-    /// Bumps the per-contract generation token, refreshes the hosting-cache
-    /// snapshot, and propagates the write to the network — all of which the
-    /// V2 path would otherwise skip, because it bypasses the executor
-    /// chokepoints where they normally happen. See `StateWriteCallback`.
-    pub(crate) state_write_callback: Option<StateWriteCallback>,
-
-    /// Optional pre-write disk-budget admission gate for V2 delegate state
-    /// writes (#4683, PR 3). Installed alongside `state_write_callback`; when
-    /// present it runs BEFORE the raw `Storage` write and can abort it. See
-    /// [`StateAdmitCallback`].
-    pub(crate) state_admit_callback: Option<StateAdmitCallback>,
 }
 
 impl Runtime {
@@ -1093,26 +1006,10 @@ impl Runtime {
         self.engine.clone_backend_engine()
     }
 
-    /// Set the state storage backend for V2 delegate contract access.
+    /// Set the state storage backend read by the delegate
+    /// `local_contract_state` host function.
     pub fn set_state_store_db(&mut self, db: crate::contract::storages::Storage) {
         self.state_store_db = Some(db);
-    }
-
-    /// Install a callback invoked after each successful V2 delegate state
-    /// write. See `StateWriteCallback`. Without this, V2 PUT/UPDATE bypass
-    /// the executor's bump+refresh chokepoints — the EvictContract re-host
-    /// race stays open, and the write never propagates to the network
-    /// (#5479).
-    pub fn set_state_write_callback(&mut self, cb: StateWriteCallback) {
-        self.state_write_callback = Some(cb);
-    }
-
-    /// Install a pre-write disk-budget admission gate for V2 delegate state
-    /// writes (#4683, PR 3). See [`StateAdmitCallback`]. Without it, V2
-    /// PUT/UPDATE bypass the executor's admission gate and can overflow the
-    /// aggregate disk budget.
-    pub fn set_state_admit_callback(&mut self, cb: StateAdmitCallback) {
-        self.state_admit_callback = Some(cb);
     }
 
     /// Export every secret under `scope` from this runtime's secrets store into
@@ -1273,8 +1170,6 @@ impl Runtime {
             created_delegates_count: super::native_api::new_delegate_counter(),
             inherited_origins: super::native_api::new_inherited_origins(),
             state_store_db: None,
-            state_write_callback: None,
-            state_admit_callback: None,
         })
     }
 
@@ -1342,8 +1237,6 @@ impl Runtime {
             created_delegates_count,
             inherited_origins,
             state_store_db: None,
-            state_write_callback: None,
-            state_admit_callback: None,
         })
     }
 
@@ -1666,17 +1559,13 @@ impl Runtime {
         )
     }
 
-    /// Prepare a delegate for execution and detect its API version.
-    ///
-    /// Returns the running instance and the detected API version (V1 or V2).
-    /// V2 is detected by inspecting whether the WASM module imports the
-    /// `freenet_delegate_contracts` namespace (async host functions).
+    /// Prepare a delegate for execution.
     pub(super) fn prepare_delegate_call(
         &mut self,
         params: &Parameters,
         key: &DelegateKey,
         req_bytes: usize,
-    ) -> RuntimeResult<(RunningInstance, DelegateApiVersion)> {
+    ) -> RuntimeResult<RunningInstance> {
         // Same defect and same fix as the contract cache above (#5268):
         // `prepare_delegate_call` compiles `delegate.code()` alone, but
         // `DelegateKey`'s identity covers `key = BLAKE3(code_hash ‖ params)`, so
@@ -1721,19 +1610,12 @@ impl Runtime {
             }
         };
 
-        let api_version = if self.engine.module_has_async_imports(&module) {
-            DelegateApiVersion::V2
-        } else {
-            DelegateApiVersion::V1
-        };
-
-        let running = RunningInstance::new(
+        RunningInstance::new(
             &mut self.engine,
             &module,
             Key::Delegate(key.clone()),
             req_bytes,
-        )?;
-        Ok((running, api_version))
+        )
     }
 }
 

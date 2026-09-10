@@ -1,130 +1,19 @@
-//! Delegate API versioning and async context definitions.
+//! Error codes, and tests, for the delegate contract-state and
+//! delegate-management host functions.
 //!
-//! # Versioning
+//! A delegate has exactly one contract-state host function pair,
+//! `__frnt__delegate__local_contract_state` / `..._len` (see
+//! `native_api::DelegateCallEnv::local_contract_state`). It reports the state
+//! THIS NODE already holds and never reaches the network. For anything else a
+//! delegate emits an outbound message (`GetContractRequest`,
+//! `PutContractRequest`, `UpdateContractRequest`, `SubscribeContractRequest`),
+//! which the contract-handling loop serves through the executor's normal path.
 //!
-//! The delegate API has evolved through two major versions:
-//!
-//! ## V1 (Current — request/response pattern)
-//!
-//! Delegates implement a synchronous `process()` function. To perform async
-//! operations like fetching contract state, delegates must:
-//! 1. Return an `OutboundDelegateMsg::GetContractRequest` from `process()`
-//! 2. Encode their continuation state in `DelegateContext`
-//! 3. Wait for the runtime to call `process()` again with a `GetContractResponse`
-//! 4. Decode context and resume logic
-//!
-//! This round-trip pattern works but is cumbersome. Each async operation requires
-//! managing serialization/deserialization of intermediate state and handling
-//! multiple message types.
-//!
-//! ## V2 (New — async host functions for contract access)
-//!
-//! Delegates still implement `process()`, but the `DelegateCtx` gains new
-//! **async host functions** for contract access, registered via
-//! `func_wrap_async` in the wasmtime backend:
-//!
-//! ```text
-//! ctx.get_contract_state(contract_id)  → Option<Vec<u8>>
-//! ```
-//!
-//! From the WASM delegate's perspective, these calls appear synchronous — the
-//! delegate simply calls the function and gets the result back immediately.
-//! Behind the scenes, the host functions are registered as async and the
-//! `process()` call uses `call_async`.
-//!
-//! Currently the host function implementations are synchronous internally
-//! (direct ReDb reads), but because they're registered as async, the
-//! infrastructure is ready for truly async operations (network fetches,
-//! PUT operations, subscriptions) that will genuinely yield in the future.
-//!
-//! ### Example: V1 vs V2
-//!
-//! **V1 (request/response):**
-//! ```text
-//! fn process(ctx, params, origin, msg) -> Vec<OutboundDelegateMsg> {
-//!     match msg {
-//!         ApplicationMessage(app_msg) => {
-//!             // Can't get contract state inline — must return a request
-//!             let state = DelegateState { pending_contract: contract_id };
-//!             let context = DelegateContext::new(serialize(&state));
-//!             vec![GetContractRequest { contract_id, context, processed: false }]
-//!         }
-//!         GetContractResponse(resp) => {
-//!             // Resume: decode context, use state
-//!             let state: DelegateState = deserialize(resp.context);
-//!             let contract_state = resp.state;
-//!             // ... finally do the real work ...
-//!             vec![ApplicationMessage { payload, processed: true }]
-//!         }
-//!     }
-//! }
-//! ```
-//!
-//! **V2 (host function):**
-//! ```text
-//! fn process(ctx, params, origin, msg) -> Vec<OutboundDelegateMsg> {
-//!     match msg {
-//!         ApplicationMessage(app_msg) => {
-//!             // Get contract state inline — no round-trip!
-//!             let contract_state = ctx.get_contract_state(contract_id);
-//!             // ... do the real work immediately ...
-//!             vec![ApplicationMessage { payload, processed: true }]
-//!         }
-//!     }
-//! }
-//! ```
-//!
-//! ### Detection
-//!
-//! The runtime detects V2 delegates by inspecting the compiled WASM
-//! module's imports for the `freenet_delegate_contracts` namespace.
-//! Only delegates that actually import the contract access host functions
-//! use the async call path (`call_async`).
-//! V1 delegates continue to use the synchronous call path unchanged.
-
-use std::fmt;
-
-/// Delegate API version.
-///
-/// Used by the runtime to select the correct execution path and
-/// determine which host functions are available to a delegate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DelegateApiVersion {
-    /// V1: Request/response pattern for contract access.
-    ///
-    /// Delegates emit `GetContractRequest` / `PutContractRequest` outbound
-    /// messages and receive responses via `GetContractResponse` /
-    /// `PutContractResponse` inbound messages. State must be manually
-    /// encoded in `DelegateContext` across round-trips.
-    V1,
-
-    /// V2: Async host function-based contract access.
-    ///
-    /// Delegates call `ctx.get_contract_state()` directly during `process()`.
-    /// The runtime uses `call_async` so async host functions can yield.
-    /// Currently the contract access functions resolve synchronously (ReDb reads),
-    /// but the infrastructure supports future async operations (network, subscriptions).
-    /// No round-trip, no manual context encoding.
-    V2,
-}
-
-#[allow(dead_code)] // Public API — version query methods
-impl DelegateApiVersion {
-    /// Returns true if this version supports direct contract state access
-    /// via host functions (no request/response round-trip needed).
-    pub fn has_contract_host_functions(&self) -> bool {
-        matches!(self, DelegateApiVersion::V2)
-    }
-}
-
-impl fmt::Display for DelegateApiVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DelegateApiVersion::V1 => write!(f, "v1"),
-            DelegateApiVersion::V2 => write!(f, "v2"),
-        }
-    }
-}
+//! This module used to define a `DelegateApiVersion` enum separating "V1"
+//! (message-based) from "V2" (host-function) delegates. That was never an API
+//! version: freenet-stdlib's `DelegateWasmAPIVersion` has one variant, `V1`.
+//! The split only chose between two call paths that had become identical, and
+//! it went away with the contract write host functions in #5637.
 
 /// Error codes for contract state host functions.
 ///
@@ -163,9 +52,9 @@ pub mod contract_error_codes {
     /// attempts to access memory outside its allocated linear memory region via
     /// host function calls.
     pub const ERR_MEMORY_BOUNDS: i32 = -9;
-    /// Contract code not registered in the ContractStore index.
-    /// The delegate passed a contract instance ID whose CodeHash cannot be resolved.
-    pub const ERR_CONTRACT_CODE_NOT_REGISTERED: i32 = -10;
+    // -10 was ERR_CONTRACT_CODE_NOT_REGISTERED, returned only by the delegate
+    // write and subscribe host functions removed in #5637. Do not reuse it: a
+    // delegate built against the old ABI may still branch on it.
 }
 
 /// Error codes for delegate management host functions (create_delegate, etc.).
@@ -195,30 +84,13 @@ pub mod delegate_mgmt_error_codes {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::wasm_runtime::native_api::DelegateEnvError;
-
-    #[test]
-    fn test_version_display() {
-        assert_eq!(DelegateApiVersion::V1.to_string(), "v1");
-        assert_eq!(DelegateApiVersion::V2.to_string(), "v2");
-    }
-
-    #[test]
-    fn test_v1_no_contract_host_functions() {
-        assert!(!DelegateApiVersion::V1.has_contract_host_functions());
-    }
-
-    #[test]
-    fn test_v2_has_contract_host_functions() {
-        assert!(DelegateApiVersion::V2.has_contract_host_functions());
-    }
 
     // ============ ReDb synchronous state access tests ============
 
     use crate::contract::storages::Storage;
     use crate::util::tests::get_temp_dir;
-    use crate::wasm_runtime::{StateStorage, StateStore};
+    use crate::wasm_runtime::StateStorage;
     use freenet_stdlib::prelude::*;
 
     fn make_contract_key(seed: u8) -> (ContractKey, ContractInstanceId, CodeHash) {
@@ -400,111 +272,9 @@ mod tests {
                     &mut self.secret_store,
                     &self.contract_store,
                     Some(self.db.clone()),
-                    None,
-                    None,
                     delegate_key,
                     &mut self.delegate_store,
                     depth,
-                    vec![],
-                    None,
-                    self.created_delegates_count.clone(),
-                    self.inherited_origins.clone(),
-                )
-            }
-        }
-
-        /// Create a DelegateCallEnv wired to an arbitrary state-write callback.
-        ///
-        /// # Safety
-        /// Caller must ensure the returned env does not outlive `self`.
-        unsafe fn make_env_with_callback(
-            &mut self,
-            cb: super::super::runtime::StateWriteCallback,
-        ) -> DelegateCallEnv {
-            let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
-            // SAFETY: The caller guarantees the returned env does not outlive `self`,
-            // which keeps the borrowed `secret_store` and `contract_store` alive.
-            unsafe {
-                DelegateCallEnv::new(
-                    vec![],
-                    &mut self.secret_store,
-                    &self.contract_store,
-                    Some(self.db.clone()),
-                    Some(cb),
-                    None,
-                    delegate_key,
-                    &mut self.delegate_store,
-                    0,
-                    vec![],
-                    None,
-                    self.created_delegates_count.clone(),
-                    self.inherited_origins.clone(),
-                )
-            }
-        }
-
-        /// Create a DelegateCallEnv wired to an arbitrary admit callback
-        /// (#4683). The callback receives `(key, state_size, is_update)` and its
-        /// `Err(cause)` aborts the V2 write with
-        /// `DelegateEnvError::DiskBudgetExceeded(cause)`.
-        ///
-        /// # Safety
-        /// Caller must ensure the returned env does not outlive `self`.
-        unsafe fn make_env_with_admit(
-            &mut self,
-            admit: super::super::runtime::StateAdmitCallback,
-        ) -> DelegateCallEnv {
-            let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
-            // SAFETY: The caller guarantees the returned env does not outlive `self`,
-            // which keeps the borrowed `secret_store` and `contract_store` alive.
-            unsafe {
-                DelegateCallEnv::new(
-                    vec![],
-                    &mut self.secret_store,
-                    &self.contract_store,
-                    Some(self.db.clone()),
-                    None,
-                    Some(admit),
-                    delegate_key,
-                    &mut self.delegate_store,
-                    0,
-                    vec![],
-                    None,
-                    self.created_delegates_count.clone(),
-                    self.inherited_origins.clone(),
-                )
-            }
-        }
-
-        /// Create a DelegateCallEnv wired with BOTH the post-write callback and
-        /// the pre-write admission gate.
-        ///
-        /// The single-hook builders above cannot express a test that observes
-        /// how the two INTERACT — which of them runs first, and whether one
-        /// short-circuiting suppresses the other. See
-        /// `test_env_unchanged_rewrite_still_consults_the_disk_budget_gate`.
-        ///
-        /// # Safety
-        /// Caller must ensure the returned env does not outlive `self`.
-        unsafe fn make_env_with_callback_and_admit(
-            &mut self,
-            cb: super::super::runtime::StateWriteCallback,
-            admit: super::super::runtime::StateAdmitCallback,
-        ) -> DelegateCallEnv {
-            let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
-            // SAFETY: The caller guarantees the returned env does not outlive `self`,
-            // which keeps the borrowed `secret_store` and `contract_store` alive.
-            unsafe {
-                DelegateCallEnv::new(
-                    vec![],
-                    &mut self.secret_store,
-                    &self.contract_store,
-                    Some(self.db.clone()),
-                    Some(cb),
-                    Some(admit),
-                    delegate_key,
-                    &mut self.delegate_store,
-                    0,
                     vec![],
                     None,
                     self.created_delegates_count.clone(),
@@ -530,8 +300,6 @@ mod tests {
                     &mut self.secret_store,
                     &self.contract_store,
                     Some(self.db.clone()),
-                    None,
-                    None,
                     delegate_key,
                     &mut self.delegate_store,
                     0,
@@ -544,9 +312,9 @@ mod tests {
         }
     }
 
-    /// V2 delegate can read contract state synchronously.
+    /// `local_contract_state` returns the state this node holds.
     #[tokio::test]
-    async fn test_env_get_contract_state_found() {
+    async fn test_env_local_contract_state_found() {
         let mut env_holder = TestEnv::new().await;
         let state_data = vec![100, 200, 255];
         let contract_id = env_holder.store_contract(50, &state_data).await;
@@ -554,42 +322,42 @@ mod tests {
         // SAFETY: `env_holder` is alive for the duration of this test, ensuring
         // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
-        let result = env.get_contract_state_sync(&contract_id);
+        let result = env.local_contract_state(&contract_id);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some(state_data));
     }
 
-    /// V2 delegate gets None for a contract that isn't stored locally.
+    /// `local_contract_state` is `None` for a contract this node does not hold.
     #[tokio::test]
-    async fn test_env_get_contract_state_not_found() {
+    async fn test_env_local_contract_state_not_found() {
         let mut env_holder = TestEnv::new().await;
 
         // SAFETY: `env_holder` is alive for the duration of this test, ensuring
         // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
         let missing_id = ContractInstanceId::new([77u8; 32]);
-        let result = env.get_contract_state_sync(&missing_id);
+        let result = env.local_contract_state(&missing_id);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None);
     }
 
-    /// V2 delegate can read empty state.
+    /// `local_contract_state` can return an empty state.
     #[tokio::test]
-    async fn test_env_get_contract_state_empty() {
+    async fn test_env_local_contract_state_empty() {
         let mut env_holder = TestEnv::new().await;
         let contract_id = env_holder.store_contract(60, &[]).await;
 
         // SAFETY: `env_holder` is alive for the duration of this test, ensuring
         // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
-        let result = env.get_contract_state_sync(&contract_id);
+        let result = env.local_contract_state(&contract_id);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some(vec![]));
     }
 
-    /// V2 delegate can read multiple different contracts.
+    /// `local_contract_state` keeps contracts apart.
     #[tokio::test]
-    async fn test_env_get_multiple_contracts() {
+    async fn test_env_local_contract_state_multiple_contracts() {
         let mut env_holder = TestEnv::new().await;
         let id1 = env_holder.store_contract(10, &[1, 1, 1]).await;
         let id2 = env_holder.store_contract(20, &[2, 2, 2]).await;
@@ -599,23 +367,14 @@ mod tests {
         // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
 
-        assert_eq!(
-            env.get_contract_state_sync(&id1).unwrap(),
-            Some(vec![1, 1, 1])
-        );
-        assert_eq!(
-            env.get_contract_state_sync(&id2).unwrap(),
-            Some(vec![2, 2, 2])
-        );
-        assert_eq!(
-            env.get_contract_state_sync(&id3).unwrap(),
-            Some(vec![3, 3, 3])
-        );
+        assert_eq!(env.local_contract_state(&id1).unwrap(), Some(vec![1, 1, 1]));
+        assert_eq!(env.local_contract_state(&id2).unwrap(), Some(vec![2, 2, 2]));
+        assert_eq!(env.local_contract_state(&id3).unwrap(), Some(vec![3, 3, 3]));
     }
 
-    /// V2 delegate gets an error if state store isn't configured.
+    /// `local_contract_state` errors when no state store is configured.
     #[tokio::test]
-    async fn test_env_get_contract_state_no_store() {
+    async fn test_env_local_contract_state_no_store() {
         let mut env_holder = TestEnv::new().await;
 
         let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
@@ -627,8 +386,6 @@ mod tests {
                 &mut env_holder.secret_store,
                 &env_holder.contract_store,
                 None, // No state store
-                None,
-                None,
                 delegate_key,
                 &mut env_holder.delegate_store,
                 0,
@@ -639,13 +396,13 @@ mod tests {
             )
         };
 
-        let result = env.get_contract_state_sync(&ContractInstanceId::new([1u8; 32]));
+        let result = env.local_contract_state(&ContractInstanceId::new([1u8; 32]));
         assert!(matches!(result, Err(DelegateEnvError::StoreNotConfigured)));
     }
 
-    /// V2 delegate can read large contract state (1 MB).
+    /// `local_contract_state` can return a large (1 MB) state.
     #[tokio::test]
-    async fn test_env_get_large_contract_state() {
+    async fn test_env_local_contract_state_large() {
         let mut env_holder = TestEnv::new().await;
         let large_state: Vec<u8> = (0..1_000_000u32).map(|i| (i % 256) as u8).collect();
         let contract_id = env_holder.store_contract(70, &large_state).await;
@@ -653,7 +410,7 @@ mod tests {
         // SAFETY: `env_holder` is alive for the duration of this test, ensuring
         // the returned references in `DelegateCallEnv` are valid.
         let env = unsafe { env_holder.make_env() };
-        let result = env.get_contract_state_sync(&contract_id).unwrap().unwrap();
+        let result = env.local_contract_state(&contract_id).unwrap().unwrap();
         assert_eq!(result.len(), 1_000_000);
         assert_eq!(result, large_state);
     }
@@ -694,758 +451,6 @@ mod tests {
 
         let result = db.get_state_sync(&key).unwrap().unwrap();
         assert_eq!(result.as_ref(), &[9, 9, 9]);
-    }
-
-    // ============ DelegateCallEnv PUT/UPDATE/SUBSCRIBE tests ============
-
-    /// PUT fails when state store is not configured.
-    #[tokio::test]
-    async fn test_env_put_contract_state_no_store() {
-        let mut env_holder = TestEnv::new().await;
-
-        let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
-        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
-        // the raw pointers to `secret_store` and `contract_store` remain valid.
-        let env = unsafe {
-            DelegateCallEnv::new(
-                vec![],
-                &mut env_holder.secret_store,
-                &env_holder.contract_store,
-                None,
-                None,
-                None,
-                delegate_key,
-                &mut env_holder.delegate_store,
-                0,
-                vec![],
-                None,
-                env_holder.created_delegates_count.clone(),
-                env_holder.inherited_origins.clone(),
-            )
-        };
-
-        let result =
-            env.put_contract_state_sync(&ContractInstanceId::new([1u8; 32]), vec![1, 2, 3]);
-        assert!(matches!(result, Err(DelegateEnvError::StoreNotConfigured)));
-    }
-
-    /// UPDATE fails when state store is not configured.
-    #[tokio::test]
-    async fn test_env_update_contract_state_no_store() {
-        let mut env_holder = TestEnv::new().await;
-
-        let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
-        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
-        // the raw pointers to `secret_store` and `contract_store` remain valid.
-        let env = unsafe {
-            DelegateCallEnv::new(
-                vec![],
-                &mut env_holder.secret_store,
-                &env_holder.contract_store,
-                None,
-                None,
-                None,
-                delegate_key,
-                &mut env_holder.delegate_store,
-                0,
-                vec![],
-                None,
-                env_holder.created_delegates_count.clone(),
-                env_holder.inherited_origins.clone(),
-            )
-        };
-
-        let result =
-            env.update_contract_state_sync(&ContractInstanceId::new([1u8; 32]), vec![1, 2, 3]);
-        assert!(matches!(result, Err(DelegateEnvError::StoreNotConfigured)));
-    }
-
-    /// V2 delegate can PUT contract state.
-    #[tokio::test]
-    async fn test_env_put_contract_state() {
-        let mut env_holder = TestEnv::new().await;
-        // store_contract registers the code hash + stores initial state
-        let contract_id = env_holder.store_contract(80, &[1, 2, 3]).await;
-
-        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
-        // the returned references in `DelegateCallEnv` are valid.
-        let env = unsafe { env_holder.make_env() };
-        // PUT new state
-        let result = env.put_contract_state_sync(&contract_id, vec![4, 5, 6]);
-        assert!(result.is_ok(), "put should succeed: {:?}", result);
-
-        // Verify the new state
-        let state = env.get_contract_state_sync(&contract_id).unwrap();
-        assert_eq!(state, Some(vec![4, 5, 6]));
-    }
-
-    /// V2 delegate PUT fails for unregistered contract code.
-    #[tokio::test]
-    async fn test_env_put_contract_state_unregistered() {
-        let mut env_holder = TestEnv::new().await;
-
-        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
-        // the returned references in `DelegateCallEnv` are valid.
-        let env = unsafe { env_holder.make_env() };
-        let missing_id = ContractInstanceId::new([88u8; 32]);
-        let result = env.put_contract_state_sync(&missing_id, vec![1, 2, 3]);
-        assert!(matches!(
-            result,
-            Err(DelegateEnvError::ContractCodeNotRegistered)
-        ));
-    }
-
-    /// V2 delegate can UPDATE existing contract state.
-    #[tokio::test]
-    async fn test_env_update_contract_state() {
-        let mut env_holder = TestEnv::new().await;
-        let contract_id = env_holder.store_contract(81, &[10, 20, 30]).await;
-
-        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
-        // the returned references in `DelegateCallEnv` are valid.
-        let env = unsafe { env_holder.make_env() };
-        let result = env.update_contract_state_sync(&contract_id, vec![40, 50, 60]);
-        assert!(result.is_ok(), "update should succeed: {:?}", result);
-
-        let state = env.get_contract_state_sync(&contract_id).unwrap();
-        assert_eq!(state, Some(vec![40, 50, 60]));
-    }
-
-    /// V2 delegate PUT must fire the `state_write_callback` (which the
-    /// executor wires to `bump_state_generation` + `refresh_cache_generation`)
-    /// AFTER a successful write. Without this hook the V2 delegate write
-    /// path bypasses the executor's `state_store.store` chokepoint and the
-    /// per-contract generation counter never advances on V2 delegate writes,
-    /// leaving the EvictContract re-host race open.
-    ///
-    /// Regression test for PR #4212 review round D (skeptical r3 #1).
-    #[tokio::test]
-    async fn test_env_put_contract_state_fires_write_callback() {
-        let mut env_holder = TestEnv::new().await;
-        let contract_id = env_holder.store_contract(120, &[1, 2, 3]).await;
-
-        let observed =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
-        let observed_for_cb = observed.clone();
-        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey,
-                  new_state: &freenet_stdlib::prelude::WrappedState,
-                  _changed: bool| {
-                observed_for_cb
-                    .lock()
-                    .unwrap()
-                    .push((*k, new_state.as_ref().to_vec()));
-            },
-        );
-
-        // SAFETY: `env_holder` is alive for the duration of this test.
-        let env = unsafe { env_holder.make_env_with_callback(cb) };
-        env.put_contract_state_sync(&contract_id, vec![4, 5, 6])
-            .expect("V2 PUT should succeed");
-
-        let calls = observed.lock().unwrap();
-        assert_eq!(
-            calls.len(),
-            1,
-            "callback must fire exactly once per successful V2 PUT"
-        );
-        assert_eq!(
-            calls[0].0.id(),
-            &contract_id,
-            "callback must receive the written contract key"
-        );
-        assert_eq!(
-            calls[0].1,
-            vec![4, 5, 6],
-            "callback must receive the state that was actually written. This pins BOTH the \
-             StateBytesWritten attribution (derived from its length) and the payload of the \
-             BroadcastStateChange the production callback emits (#5479), so a refactor that \
-             reconstructs or re-reads the state instead of passing the written one fails here"
-        );
-    }
-
-    /// V2 delegate UPDATE must also fire `state_write_callback` after a
-    /// successful update. Mirrors `test_env_put_contract_state_fires_write_callback`
-    /// for the UPDATE path — same race rationale.
-    #[tokio::test]
-    async fn test_env_update_contract_state_fires_write_callback() {
-        let mut env_holder = TestEnv::new().await;
-        let contract_id = env_holder.store_contract(121, &[10, 20, 30]).await;
-
-        let observed =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
-        let observed_for_cb = observed.clone();
-        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey,
-                  new_state: &freenet_stdlib::prelude::WrappedState,
-                  _changed: bool| {
-                observed_for_cb
-                    .lock()
-                    .unwrap()
-                    .push((*k, new_state.as_ref().to_vec()));
-            },
-        );
-
-        // SAFETY: `env_holder` is alive for the duration of this test.
-        let env = unsafe { env_holder.make_env_with_callback(cb) };
-        env.update_contract_state_sync(&contract_id, vec![40, 50, 60])
-            .expect("V2 UPDATE should succeed");
-
-        let calls = observed.lock().unwrap();
-        assert_eq!(
-            calls.len(),
-            1,
-            "callback must fire exactly once per successful V2 UPDATE"
-        );
-        assert_eq!(
-            calls[0].0.id(),
-            &contract_id,
-            "callback must receive the updated contract key"
-        );
-        assert_eq!(
-            calls[0].1,
-            vec![40, 50, 60],
-            "callback must receive the state that was actually written — see the PUT sibling"
-        );
-    }
-
-    /// #5479: a byte-identical rewrite must report `content_changed = false`,
-    /// which is what suppresses the network fan-out.
-    ///
-    /// The hook itself still RUNS — that is deliberate and is the fix for the
-    /// eviction race. A V2 write commits to the raw `Storage` before the hook,
-    /// so the bookkeeping legs (notably `Ring::commit_state_write`, whose
-    /// generation bump tells a scheduled `EvictContract` the contract was
-    /// written after it was queued) are owed for a byte-identical rewrite too.
-    /// Only the fan-out is skipped, and the flag is how the hook knows.
-    ///
-    /// The V1 `UpsertResult::NoChange` short-circuit is not a precedent for
-    /// skipping the hook: V1 short-circuits BEFORE writing, so nothing
-    /// committed and nothing is owed.
-    ///
-    /// Every OTHER V2 test in this module writes each contract exactly once,
-    /// and `state_content_changed` returns `true` when no prior state exists —
-    /// so with the filter gutted to `true` the whole suite stayed green. Two
-    /// writes of the same bytes is the smallest shape that observes it.
-    #[tokio::test]
-    async fn test_env_identical_rewrite_reports_no_content_change() {
-        let mut env_holder = TestEnv::new().await;
-        let contract_id = env_holder.store_contract(122, &[1, 2, 3]).await;
-
-        // Record (bytes, content_changed) per invocation.
-        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(Vec<u8>, bool)>::new()));
-        let observed_for_cb = observed.clone();
-        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |_k: &ContractKey,
-                  new_state: &freenet_stdlib::prelude::WrappedState,
-                  content_changed: bool| {
-                observed_for_cb
-                    .lock()
-                    .unwrap()
-                    .push((new_state.as_ref().to_vec(), content_changed));
-            },
-        );
-
-        // SAFETY: `env_holder` is alive for the duration of this test.
-        let env = unsafe { env_holder.make_env_with_callback(cb) };
-
-        // First write: no stored state matches, so this is a real change.
-        env.put_contract_state_sync(&contract_id, vec![7, 8, 9])
-            .expect("first V2 PUT should succeed");
-        // Second write, same bytes.
-        env.put_contract_state_sync(&contract_id, vec![7, 8, 9])
-            .expect("a byte-identical V2 PUT must still report success");
-        // Third write, changed again — the flag must not latch.
-        env.put_contract_state_sync(&contract_id, vec![7, 8, 10])
-            .expect("a changing V2 PUT after a no-op should succeed");
-
-        let calls = observed.lock().unwrap();
-        assert_eq!(
-            calls.len(),
-            3,
-            "the post-write hook must run for EVERY committed write, including a \
-             byte-identical one: the write has already landed in storage, so the \
-             generation bump that guards against an in-flight EvictContract reclaiming \
-             it is owed regardless of whether the content changed"
-        );
-        assert_eq!(
-            calls[0],
-            (vec![7, 8, 9], true),
-            "a first write of new content is a change"
-        );
-        assert_eq!(
-            calls[1],
-            (vec![7, 8, 9], false),
-            "a byte-identical rewrite must report content_changed = false — this is what \
-             suppresses the fan-out, and without it an idempotent delegate becomes one \
-             full network fan-out per message (#5479). If this reads true, \
-             `state_content_changed` has been gutted or bypassed"
-        );
-        assert_eq!(
-            calls[2],
-            (vec![7, 8, 10], true),
-            "a real change following a no-op must report true again — the filter \
-             suppresses, it does not latch"
-        );
-    }
-
-    /// #5479: a V2 write above `MAX_STATE_SIZE` must be rejected, and nothing
-    /// may land.
-    ///
-    /// `StateStore::{store,update}` enforce this ceiling and the V1 commit path
-    /// enforces it again before broadcasting, but the V2 bypass writes through
-    /// the raw `Storage`, which does not. Before #5479 an oversized V2 write was
-    /// a local-disk problem; now the same uncapped `WrappedState` would be cloned
-    /// into a `BroadcastStateChange` and put on the wire, where every recipient
-    /// rejects it at its own guard AFTER paying for the transfer.
-    #[tokio::test]
-    async fn test_env_oversized_state_is_rejected_and_nothing_is_written() {
-        let mut env_holder = TestEnv::new().await;
-        let contract_id = env_holder.store_contract(123, &[1, 2, 3]).await;
-
-        // A callback that would panic if it ever ran: an oversized write must be
-        // refused BEFORE any post-write side effect, so this is unreachable.
-        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            |_k: &ContractKey, _s: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
-                panic!(
-                    "the post-write hook must not run for a state rejected by \
-                     check_state_size — the broadcast it emits is exactly what \
-                     the size ceiling exists to keep off the wire"
-                );
-            },
-        );
-
-        // SAFETY: `env_holder` is alive for the duration of this test.
-        let env = unsafe { env_holder.make_env_with_callback(cb) };
-
-        let oversized = vec![0u8; super::super::MAX_STATE_SIZE + 1];
-        let result = env.put_contract_state_sync(&contract_id, oversized);
-
-        match result {
-            Err(DelegateEnvError::StateTooLarge { size, limit }) => {
-                assert_eq!(size, super::super::MAX_STATE_SIZE + 1);
-                assert_eq!(limit, super::super::MAX_STATE_SIZE);
-            }
-            other => {
-                panic!("a V2 PUT over MAX_STATE_SIZE must fail with StateTooLarge, got {other:?}")
-            }
-        }
-
-        // `TestEnv::store_contract` seeded this contract with `[1, 2, 3]`, so
-        // asserting that exact value back is stronger than asserting `None`: it
-        // proves the rejected write did not partially overwrite existing state,
-        // not merely that it failed to create new state.
-        assert_eq!(
-            env.get_contract_state_sync(&contract_id).unwrap(),
-            Some(vec![1, 2, 3]),
-            "a rejected oversized V2 PUT must leave the previously-stored state \
-             untouched — the check runs before the raw `Storage` write, so \
-             nothing should have landed"
-        );
-
-        // The delegate-visible outcome, not just the Rust error. An oversized
-        // state is a CALLER error, so it maps to ERR_INVALID_PARAM rather than
-        // the ERR_STORE_ERROR the disk-budget rejection uses — a delegate
-        // branching on the code must be able to tell "you sent me something
-        // impossible" from "my disk is full".
-        assert_eq!(
-            super::super::native_api::delegate_contracts::delegate_env_error_to_code(
-                &DelegateEnvError::StateTooLarge {
-                    size: super::super::MAX_STATE_SIZE + 1,
-                    limit: super::super::MAX_STATE_SIZE,
-                }
-            ),
-            contract_error_codes::ERR_INVALID_PARAM as i64,
-        );
-    }
-
-    /// Gate interaction: a content-UNCHANGED rewrite must still be admitted by
-    /// the disk-budget gate, and suppressing the post-write hook must not
-    /// suppress the gate.
-    ///
-    /// `put_contract_state_sync` runs five sequenced steps — wrap,
-    /// `check_state_size`, `state_content_changed` (a DB read), the
-    /// disk-budget admit callback, `store_state_sync`, then the conditional
-    /// `after_state_write`. Each is covered on its own; nothing pins the
-    /// ORDER, so a reorder that moved the admit gate behind the no-change
-    /// short-circuit would silently stop metering identical rewrites and no
-    /// existing test would notice.
-    #[tokio::test]
-    async fn test_env_unchanged_rewrite_still_consults_the_disk_budget_gate() {
-        let mut env_holder = TestEnv::new().await;
-        let contract_id = env_holder.store_contract(124, &[1, 2, 3]).await;
-
-        let admit_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let admit_calls_for_cb = admit_calls.clone();
-        let admit: super::super::runtime::StateAdmitCallback =
-            std::sync::Arc::new(move |_k: &ContractKey, _size: usize, _is_update: bool| {
-                admit_calls_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(())
-            });
-
-        let write_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let write_calls_for_cb = write_calls.clone();
-        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |_k: &ContractKey, _s: &freenet_stdlib::prelude::WrappedState, _changed: bool| {
-                write_calls_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            },
-        );
-
-        // SAFETY: `env_holder` is alive for the duration of this test.
-        let env = unsafe { env_holder.make_env_with_callback_and_admit(cb, admit) };
-
-        // Rewrite the seeded bytes verbatim: unchanged content, so the
-        // post-write hook is suppressed — but the write still happens.
-        env.put_contract_state_sync(&contract_id, vec![1, 2, 3])
-            .expect("an unchanged V2 PUT should still succeed");
-
-        assert_eq!(
-            admit_calls.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the disk-budget gate must run even for a content-unchanged \
-             rewrite: the raw `Storage` write still happens, so the write \
-             the gate exists to admit is still being made. A reorder that \
-             skipped it here would stop metering identical rewrites"
-        );
-        assert_eq!(
-            write_calls.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the post-write hook must still RUN for unchanged content — the write \
-             committed, so its bookkeeping is owed. What the unchanged case skips is \
-             the fan-out, and the hook decides that from its `content_changed` \
-             argument; see test_env_identical_rewrite_reports_no_content_change"
-        );
-    }
-
-    /// Gate interaction: a state of EXACTLY `MAX_STATE_SIZE` must be admitted.
-    ///
-    /// `check_state_size` rejects `size > MAX_STATE_SIZE`, so the boundary
-    /// value itself is legal. An off-by-one to `>=` would be invisible to the
-    /// oversized test above, which uses `MAX_STATE_SIZE + 1`.
-    #[tokio::test]
-    async fn test_env_state_at_exactly_max_size_is_admitted() {
-        let mut env_holder = TestEnv::new().await;
-        let contract_id = env_holder.store_contract(125, &[1, 2, 3]).await;
-
-        // SAFETY: `env_holder` is alive for the duration of this test.
-        let env = unsafe { env_holder.make_env() };
-
-        let at_limit = vec![0u8; super::super::MAX_STATE_SIZE];
-        let result = env.put_contract_state_sync(&contract_id, at_limit);
-        assert!(
-            result.is_ok(),
-            "a state of exactly MAX_STATE_SIZE is within the ceiling and must \
-             be accepted — `check_state_size` rejects `> MAX_STATE_SIZE`, not \
-             `>=`. Got {result:?}"
-        );
-        assert_eq!(
-            env.get_contract_state_sync(&contract_id)
-                .unwrap()
-                .map(|s| s.len()),
-            Some(super::super::MAX_STATE_SIZE),
-            "the boundary-size state must actually have landed"
-        );
-    }
-
-    /// #4683 finding #2 regression: a V2 delegate PUT that the admit callback
-    /// REJECTS (disk over budget) must return `DiskBudgetExceeded`, map to
-    /// `ERR_STORE_ERROR`, and leave the write un-landed (state unchanged). This
-    /// exercises the V2 accept-with-callback plumbing and the error mapping that
-    /// every other delegate_api test skips by passing `None`.
-    #[tokio::test]
-    async fn test_env_v2_put_rejected_when_over_budget() {
-        let mut env_holder = TestEnv::new().await;
-        let contract_id = env_holder.store_contract(200, &[1, 2, 3]).await;
-
-        // Admit callback that rejects every PUT (is_update == false). It also
-        // asserts the flag it receives so a future refactor that swaps the PUT
-        // and UPDATE flags is caught.
-        let admit: super::super::runtime::StateAdmitCallback =
-            std::sync::Arc::new(|_k: &ContractKey, _size: usize, is_update: bool| {
-                assert!(
-                    !is_update,
-                    "put_contract_state_sync must pass is_update=false"
-                );
-                Err("disk budget exceeded (test)".to_string())
-            });
-
-        // SAFETY: `env_holder` is alive for the duration of this test.
-        let env = unsafe { env_holder.make_env_with_admit(admit) };
-        let result = env.put_contract_state_sync(&contract_id, vec![4, 5, 6, 7]);
-        assert!(
-            matches!(result, Err(DelegateEnvError::DiskBudgetExceeded(_))),
-            "over-budget V2 PUT must return DiskBudgetExceeded, got {result:?}"
-        );
-        // The rejected write must NOT have landed: state is still the original.
-        let state = env.get_contract_state_sync(&contract_id).unwrap();
-        assert_eq!(
-            state,
-            Some(vec![1, 2, 3]),
-            "rejected V2 PUT must leave state unchanged"
-        );
-        // DiskBudgetExceeded maps to the store-error contract code.
-        assert_eq!(
-            super::super::native_api::delegate_contracts::delegate_env_error_to_code(
-                &DelegateEnvError::DiskBudgetExceeded("x".into())
-            ),
-            contract_error_codes::ERR_STORE_ERROR as i64,
-        );
-    }
-
-    /// #4683 finding #2 regression: the V2 UPDATE path uses the GROWTH-ONLY gate,
-    /// so a shrinking / size-holding V2 UPDATE must be admitted even when the
-    /// aggregate is over budget. We prove the plumbing carries `is_update=true`
-    /// (so the executor installs the growth-only branch) and that an admitting
-    /// callback lets the UPDATE land. Correctness of the growth-only decision
-    /// itself is covered by the tracker/manager tests; here we pin that the V2
-    /// UPDATE site routes to the update branch, not the hard PUT branch.
-    #[tokio::test]
-    async fn test_env_v2_update_uses_growth_only_gate() {
-        let mut env_holder = TestEnv::new().await;
-        let contract_id = env_holder.store_contract(201, &[10, 20, 30, 40, 50]).await;
-
-        // The admit callback records the flag it was called with and admits.
-        let seen_update = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let seen_for_cb = seen_update.clone();
-        let admit: super::super::runtime::StateAdmitCallback =
-            std::sync::Arc::new(move |_k: &ContractKey, _size: usize, is_update: bool| {
-                seen_for_cb.store(is_update, std::sync::atomic::Ordering::SeqCst);
-                Ok(())
-            });
-
-        // SAFETY: `env_holder` is alive for the duration of this test.
-        let env = unsafe { env_holder.make_env_with_admit(admit) };
-        // Shrinking UPDATE (5 bytes -> 2 bytes).
-        env.update_contract_state_sync(&contract_id, vec![1, 2])
-            .expect("shrinking V2 UPDATE must be admitted");
-        assert!(
-            seen_update.load(std::sync::atomic::Ordering::SeqCst),
-            "update_contract_state_sync must pass is_update=true so the executor \
-             routes to the growth-only admit_state_update branch"
-        );
-        let state = env.get_contract_state_sync(&contract_id).unwrap();
-        assert_eq!(state, Some(vec![1, 2]), "admitted V2 UPDATE must land");
-    }
-
-    /// END-TO-END: a REAL V2 delegate PUT, driven through the PRODUCTION
-    /// `StateStore::cache_invalidator()` wired as the `state_write_callback`,
-    /// must CLEAR the summarize/delta change-detector for the written contract
-    /// (so the next summarize/delta recomputes fresh) AND drop the moka
-    /// state-bytes cache (so a read-after-write observes the new bytes).
-    ///
-    /// This closes the wrong-key / wrong-store-instance seam that the
-    /// source-pin (`v2_delegate_state_write_paths_invoke_callback_with_state_size`)
-    /// and the observer-only unit tests cannot catch: it drives the actual
-    /// production invalidator from a real `put_contract_state_sync` and asserts
-    /// the effect on the actual detector the fast path reads. If the callback
-    /// were ever wired to a different `StateStore` instance, or invalidated a
-    /// mis-derived key, the detector assertion below would fail.
-    #[tokio::test]
-    async fn test_v2_put_through_production_invalidator_clears_detector() {
-        let mut env_holder = TestEnv::new().await;
-        let contract_id = env_holder.store_contract(123, &[1, 2, 3]).await;
-
-        // Build a StateStore over the SAME backing storage the V2 write path
-        // writes through. In production the V2 delegate write bypasses StateStore
-        // entirely (it writes straight to the raw `Storage`); the ONLY thing that
-        // keeps StateStore's caches coherent is the `state_write_callback` this
-        // test installs. Cached mode mirrors `Executor::from_config`.
-        let state_store = StateStore::new(env_holder.db.clone(), 10_000_000).unwrap();
-
-        // Resolve the contract key EXACTLY as the V2 write path does
-        // (`resolve_contract_key` → `code_hash_from_id` → `from_id_and_code`),
-        // so the detector is keyed under the SAME ContractKey the callback will
-        // invalidate. This is what closes the wrong-key seam.
-        let code_hash = env_holder
-            .contract_store
-            .code_hash_from_id(&contract_id)
-            .expect("contract code must be indexed");
-        let key = ContractKey::from_id_and_code(contract_id, code_hash);
-
-        // Warm BOTH StateStore caches against the OLD state, exactly as a prior
-        // read + summarize slow-path would: the moka state-bytes cache via get()
-        // and the change-detector hash via cache_state_hash().
-        let old_state = state_store.get(&key).await.expect("initial state present");
-        assert_eq!(old_state.as_ref(), &[1, 2, 3]);
-        state_store.cache_state_hash(key, crate::wasm_runtime::state_hash(&old_state));
-        assert!(
-            state_store.cached_state_hash(&key).is_some(),
-            "detector must be populated before the write"
-        );
-
-        // Wire the PRODUCTION invalidator as the callback — the exact shape used
-        // in `Executor::from_config` / `from_config_with_shared_modules`.
-        let invalidator = state_store.cache_invalidator();
-        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey,
-                  _new_state: &freenet_stdlib::prelude::WrappedState,
-                  _changed: bool| {
-                invalidator.invalidate(k);
-            },
-        );
-
-        {
-            // SAFETY: `env_holder` is alive for the duration of this test. The
-            // env is scoped so it (and its borrow) drop before the async get()
-            // below — DelegateCallEnv is not Send, so it must not be held across
-            // an await on the default multi-thread test runtime.
-            let env = unsafe { env_holder.make_env_with_callback(cb) };
-            env.put_contract_state_sync(&contract_id, vec![4, 5, 6])
-                .expect("V2 PUT should succeed");
-        }
-
-        // Detector cleared → the next summarize/delta recomputes against the
-        // fresh state instead of serving a stale cached summary/delta.
-        assert_eq!(
-            state_store.cached_state_hash(&key),
-            None,
-            "a real V2 PUT through the production invalidator must clear the \
-             change-detector so the next summarize/delta is fresh"
-        );
-        // moka state-bytes cache dropped → a read-after-write observes the
-        // freshly-written bytes rather than the stale cached copy (the
-        // pre-existing read-after-write staleness this callback also fixes).
-        assert_eq!(
-            state_store.get(&key).await.expect("state present").as_ref(),
-            &[4, 5, 6],
-            "after the V2 PUT, get() must reload the freshly-written bytes"
-        );
-    }
-
-    /// UPDATE sibling of `test_v2_put_through_production_invalidator_clears_detector`:
-    /// a REAL V2 delegate UPDATE through the production invalidator must clear
-    /// the detector and unmask the new state bytes, same as PUT.
-    #[tokio::test]
-    async fn test_v2_update_through_production_invalidator_clears_detector() {
-        let mut env_holder = TestEnv::new().await;
-        let contract_id = env_holder.store_contract(124, &[10, 20, 30]).await;
-
-        let state_store = StateStore::new(env_holder.db.clone(), 10_000_000).unwrap();
-
-        let code_hash = env_holder
-            .contract_store
-            .code_hash_from_id(&contract_id)
-            .expect("contract code must be indexed");
-        let key = ContractKey::from_id_and_code(contract_id, code_hash);
-
-        let old_state = state_store.get(&key).await.expect("initial state present");
-        assert_eq!(old_state.as_ref(), &[10, 20, 30]);
-        state_store.cache_state_hash(key, crate::wasm_runtime::state_hash(&old_state));
-        assert!(state_store.cached_state_hash(&key).is_some());
-
-        let invalidator = state_store.cache_invalidator();
-        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey,
-                  _new_state: &freenet_stdlib::prelude::WrappedState,
-                  _changed: bool| {
-                invalidator.invalidate(k);
-            },
-        );
-
-        {
-            // SAFETY: see the PUT sibling test above (scoped to drop before the
-            // async get()).
-            let env = unsafe { env_holder.make_env_with_callback(cb) };
-            env.update_contract_state_sync(&contract_id, vec![40, 50, 60])
-                .expect("V2 UPDATE should succeed");
-        }
-
-        assert_eq!(
-            state_store.cached_state_hash(&key),
-            None,
-            "a real V2 UPDATE through the production invalidator must clear the \
-             change-detector so the next summarize/delta is fresh"
-        );
-        assert_eq!(
-            state_store.get(&key).await.expect("state present").as_ref(),
-            &[40, 50, 60],
-            "after the V2 UPDATE, get() must reload the freshly-written bytes"
-        );
-    }
-
-    /// A failed V2 delegate UPDATE (no existing state) must NOT fire the
-    /// callback — the write didn't happen, so no generation bump is owed.
-    #[tokio::test]
-    async fn test_env_update_contract_state_failure_does_not_fire_callback() {
-        let mut env_holder = TestEnv::new().await;
-        // Register contract code but do NOT store any state — UPDATE will fail.
-        let code = ContractCode::from(vec![122, 123, 124]);
-        let params = Parameters::from(vec![132, 133]);
-        let key = ContractKey::from_params_and_code(&params, &code);
-        let contract_id = *key.id();
-        env_holder.contract_store.ensure_key_indexed(&key).unwrap();
-
-        let observed =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, Vec<u8>)>::new()));
-        let observed_for_cb = observed.clone();
-        let cb: super::super::runtime::StateWriteCallback = std::sync::Arc::new(
-            move |k: &ContractKey,
-                  new_state: &freenet_stdlib::prelude::WrappedState,
-                  _changed: bool| {
-                observed_for_cb
-                    .lock()
-                    .unwrap()
-                    .push((*k, new_state.as_ref().to_vec()));
-            },
-        );
-
-        // SAFETY: `env_holder` is alive for the duration of this test.
-        let env = unsafe { env_holder.make_env_with_callback(cb) };
-        let result = env.update_contract_state_sync(&contract_id, vec![1, 2, 3]);
-        assert!(matches!(result, Err(DelegateEnvError::NoExistingState)));
-
-        let calls = observed.lock().unwrap();
-        assert!(
-            calls.is_empty(),
-            "callback must NOT fire when the V2 UPDATE returns NoExistingState"
-        );
-    }
-
-    /// V2 delegate UPDATE fails when there's no existing state.
-    #[tokio::test]
-    async fn test_env_update_contract_state_nonexistent() {
-        let mut env_holder = TestEnv::new().await;
-        // Register contract code but don't store any state
-        let code = ContractCode::from(vec![82, 83, 84]);
-        let params = Parameters::from(vec![92, 93]);
-        let key = ContractKey::from_params_and_code(&params, &code);
-        let contract_id = *key.id();
-        env_holder.contract_store.ensure_key_indexed(&key).unwrap();
-
-        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
-        // the returned references in `DelegateCallEnv` are valid.
-        let env = unsafe { env_holder.make_env() };
-        let result = env.update_contract_state_sync(&contract_id, vec![1, 2, 3]);
-        assert!(matches!(result, Err(DelegateEnvError::NoExistingState)));
-    }
-
-    /// V2 delegate can subscribe to a known contract.
-    #[tokio::test]
-    async fn test_env_subscribe_known() {
-        let mut env_holder = TestEnv::new().await;
-        let contract_id = env_holder.store_contract(90, &[1]).await;
-
-        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
-        // the returned references in `DelegateCallEnv` are valid.
-        let env = unsafe { env_holder.make_env() };
-        let result = env.subscribe_contract_sync(&contract_id);
-        assert!(result.is_ok());
-    }
-
-    /// V2 delegate subscribe fails for unknown contract.
-    #[tokio::test]
-    async fn test_env_subscribe_unknown() {
-        let mut env_holder = TestEnv::new().await;
-
-        // SAFETY: `env_holder` is alive for the duration of this test, ensuring
-        // the returned references in `DelegateCallEnv` are valid.
-        let env = unsafe { env_holder.make_env() };
-        let missing_id = ContractInstanceId::new([99u8; 32]);
-        let result = env.subscribe_contract_sync(&missing_id);
-        assert!(matches!(
-            result,
-            Err(DelegateEnvError::ContractCodeNotRegistered)
-        ));
     }
 
     // ============ Wasmtime async host function integration tests ============

@@ -51,17 +51,16 @@
 //! > **At most one delegate `process()` executes node-wide at any instant, and
 //! > it always executes on the `contract_handling` loop.**
 //!
-//! Two separate properties depend on it:
+//! What depends on it:
 //!
 //! * `DelegateContextCache` needs one `process()` **per delegate** — that is
 //!   the narrower guarantee, and it is the one [`DelegateParkCtx`]'s exclusion
 //!   supplies, because parking genuinely does let a delegate's round-trip span
 //!   loop iterations.
-//! * `native_api::state_content_changed` (V2 delegate writes, #5490) needs one
-//!   write **per contract**. Its read-then-write pair is not atomic, and its
-//!   racing pair is two DIFFERENT delegates writing the SAME contract — which
-//!   per-delegate exclusion permits by construction. It is safe only because of
-//!   the global property above, not because of anything in this module.
+//!
+//! A second dependent, the V2 delegate write path's non-atomic read-then-write
+//! (#5490), needed the full node-wide property. It went with the delegate write
+//! host functions in #5637.
 //!
 //! Why the global property still holds after #5544, by construction rather than
 //! by convention:
@@ -99,14 +98,12 @@
 //!    channel; it never runs the continuation itself.
 //!
 //! So the window parking opens is a window in which a *different* delegate may
-//! **start**, not one in which two may **run**. #5490's TOCTOU stays
-//! unreachable, and its atomic compare-and-write (folding the comparison into
-//! the same ReDb write transaction as the store, the way `update_state_sync`
-//! already does) is a follow-up rather than a prerequisite for this change.
+//! **start**, not one in which two may **run**.
 //!
 //! **What would break it.** Spawning any work that holds the
 //! `ContractHandler`, or resuming a continuation anywhere other than the loop.
-//! If you are about to do either, #5490's gate must become atomic first. The
+//! If you are about to do either, give `DelegateContextCache` its own
+//! per-delegate exclusion first. The
 //! nearest existing precedent is deliberately NOT a counter-example: #4531's
 //! hosted-secret export does run off-loop holding a pooled executor, but it
 //! enumerates and seals secrets and never invokes a delegate.
@@ -695,8 +692,8 @@ pub(super) enum ContractOpKind {
 /// upsert, nothing has to be re-run on the loop afterwards - the response is
 /// pure data - but the SUBSCRIBE registry insert is still done there, so this
 /// path writes the subscription registry from exactly one place. (The registry
-/// as a whole has three writers - this one, the V1 local-state arm and the V2
-/// host function - all of which go through
+/// as a whole has two writers - this one and the local-state arm - both of
+/// which go through
 /// `wasm_runtime::delegate_subscriptions::subscribe`.)
 pub(super) struct PendingContractOp {
     /// Unique per request, for the lifetime of the process.

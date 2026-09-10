@@ -2354,8 +2354,8 @@ impl<T: TimeSource> HostingCache<T> {
     /// Update the cached `write_generation` snapshot for `key` to `new_gen`.
     ///
     /// Called paired with `HostingManager::bump_state_generation` from
-    /// every state-write chokepoint (executor PUT/UPDATE and V2 delegate
-    /// PUT/UPDATE). Without this refresh, an UPDATE (or re-PUT) to an
+    /// every state-write chokepoint (the executor's PUT/UPDATE paths).
+    /// Without this refresh, an UPDATE (or re-PUT) to an
     /// already-hosted contract would leave the cached snapshot stuck at
     /// its `record_access`-time value while the `state_generation` counter
     /// kept advancing; a later eviction would carry the stale snapshot,

@@ -6,8 +6,6 @@ use freenet_stdlib::prelude::{
     UpdateContractRequest,
 };
 
-use crate::wasm_runtime::delegate_api::DelegateApiVersion;
-
 use super::super::engine::{InstanceHandle, WasmEngine};
 use super::super::native_api::{
     CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, DelegateEnvSlot, InstanceId,
@@ -110,7 +108,6 @@ impl Runtime {
         context: Vec<u8>,
         handle: &InstanceHandle,
         instance_id: i64,
-        api_version: DelegateApiVersion,
     ) -> RuntimeResult<(Vec<OutboundDelegateMsg>, Vec<u8>)> {
         // Set up the delegate call environment with context, secret store, and
         // contract store access.
@@ -152,8 +149,6 @@ impl Runtime {
                 &mut self.secret_store,
                 &self.contract_store,
                 self.state_store_db.clone(),
-                self.state_write_callback.clone(),
-                self.state_admit_callback.clone(),
                 delegate_key.clone(),
                 &mut self.delegate_store,
                 0, // creation_depth: always 0 for top-level calls
@@ -220,9 +215,7 @@ impl Runtime {
         let _guard = DelegateEnvGuard::new(instance_id);
 
         // Execute the WASM process function.
-        // V2 delegates use call_async (async host functions for contract access).
-        // V1 delegates use synchronous call.
-        let result = self.exec_inbound(params, origin, msg, handle, api_version);
+        let result = self.exec_inbound(params, origin, msg, handle);
 
         // Propagate the error BEFORE reading the context back. The `?` is
         // deliberately ahead of the read, not behind it (#5480).
@@ -273,7 +266,6 @@ impl Runtime {
         origin: Option<&MessageOrigin>,
         msg: &InboundDelegateMsg,
         handle: &InstanceHandle,
-        api_version: DelegateApiVersion,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
         let param_buf_ptr = {
             let mut param_buf = self.init_buf(handle, params)?;
@@ -313,36 +305,15 @@ impl Runtime {
             // them as "Unknown" affects logs only, not delivery.
             _ => "Unknown",
         };
-        tracing::debug!(
-            inbound_msg_name,
-            api_version = %api_version,
-            "Calling delegate with inbound message"
-        );
+        tracing::debug!(inbound_msg_name, "Calling delegate with inbound message");
 
-        let res = match api_version {
-            DelegateApiVersion::V1 => {
-                // V1: synchronous call — no async host functions involved.
-                // Must stay on calling thread for thread-local env.
-                self.engine.call_3i64(
-                    handle,
-                    "process",
-                    param_buf_ptr as i64,
-                    origin_buf_ptr as i64,
-                    msg_ptr as i64,
-                )?
-            }
-            DelegateApiVersion::V2 => {
-                // V2: async call — contract host functions are async.
-                // Uses Store::into_async() + call_async() under the hood.
-                self.engine.call_3i64_async_imports(
-                    handle,
-                    "process",
-                    param_buf_ptr as i64,
-                    origin_buf_ptr as i64,
-                    msg_ptr as i64,
-                )?
-            }
-        };
+        let res = self.engine.call_3i64(
+            handle,
+            "process",
+            param_buf_ptr as i64,
+            origin_buf_ptr as i64,
+            msg_ptr as i64,
+        )?;
 
         let linear_mem = self.linear_mem(handle)?;
         // SAFETY: `res` is the return value from the WASM `process` call and

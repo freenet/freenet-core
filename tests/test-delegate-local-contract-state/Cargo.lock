@@ -842,7 +842,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "test-delegate-v2-contracts"
+name = "test-delegate-local-contract-state"
 version = "0.1.0"
 dependencies = [
  "bincode",

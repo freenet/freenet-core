@@ -1179,25 +1179,22 @@ impl ReDb {
         })
     }
 
-    /// Store a contract's state synchronously.
+    /// Store a contract's state synchronously. Test-only.
     ///
     /// This is the same as `StateStorage::store` but without the async wrapper
-    /// and **without hosting metadata updates**. States written through this path
-    /// will not have `last_access_ms`, `access_type`, `state_size`, or `code_hash`
-    /// metadata tracked, meaning they won't be part of the hosting cache on restart.
+    /// and **without hosting metadata updates**: `last_access_ms`,
+    /// `access_type`, `state_size` and `code_hash` are not recorded, so a state
+    /// written this way is not part of the hosting cache on restart. Tests use
+    /// it to seed on-disk state in exactly that shape.
     ///
-    /// Used by V2 delegate host functions that need synchronous writes during
-    /// WASM `process()` execution. Hosting metadata integration is a follow-up.
-    ///
-    /// CHANGE-DETECTOR INVARIANT (future writers, read before using this): any
-    /// contract-state write that BYPASSES `StateStore` (as this raw sync write
-    /// does) MUST invalidate `StateStore`'s change-detector via
-    /// `StateCacheInvalidator` (and the moka state-bytes cache), or the
+    /// Its production caller was the delegate `put_contract_state` host
+    /// function, removed in #5637 because a write through here bypasses
+    /// `StateStore` and so skips the executor chokepoints' side effects. Before
+    /// giving this a production caller again: such a write MUST also invalidate
+    /// `StateStore`'s change-detector and moka state-bytes cache, or the
     /// summarize/delta fast path can serve a STALE summary/delta against the
-    /// new state → peer state divergence (#4621). The V2 delegate callers
-    /// (`put_contract_state_sync` / `update_contract_state_sync`) do this via
-    /// the runtime's `state_write_callback`. A new caller of this method (e.g.
-    /// the #4592 live-import work) must wire the same invalidation.
+    /// new state → peer state divergence (#4621).
+    #[cfg(test)]
     pub fn store_state_sync(
         &self,
         key: &ContractKey,
@@ -1211,42 +1208,11 @@ impl ReDb {
         Self::commit_guarded(txn)
     }
 
-    /// Atomically update a contract's state, failing if no prior state exists.
-    ///
-    /// Performs the existence check and write in a single write transaction to
-    /// eliminate the TOCTOU window that would exist with separate read + write.
-    /// Used by V2 delegate UPDATE host function.
-    ///
-    /// **Does not update hosting metadata** (same caveat as `store_state_sync`).
-    ///
-    /// CHANGE-DETECTOR INVARIANT: like `store_state_sync`, this bypasses
-    /// `StateStore`, so any caller MUST invalidate the `StateStore`
-    /// change-detector via `StateCacheInvalidator` or summarize/delta can serve
-    /// a stale result → peer state divergence (#4621). See `store_state_sync`.
-    pub fn update_state_sync(
-        &self,
-        key: &ContractKey,
-        state: WrappedState,
-    ) -> Result<bool, redb::Error> {
-        let txn = self.begin_write()?;
-        {
-            let mut tbl = txn.open_table(STATE_TABLE)?;
-            // Check existence within the same write transaction
-            let exists = tbl.get(key.as_bytes())?.is_some();
-            if !exists {
-                return Ok(false);
-            }
-            tbl.insert(key.as_bytes(), state.as_ref())?;
-        }
-        Self::commit_guarded(txn)?;
-        Ok(true)
-    }
-
     /// Read a contract's state synchronously.
     ///
     /// This is the same as `StateStorage::get` but without the async wrapper.
-    /// Used by V2 delegate host functions that need synchronous access during
-    /// WASM `process()` execution.
+    /// Used by the delegate `local_contract_state` host function, which runs
+    /// synchronously inside WASM `process()` execution.
     pub fn get_state_sync(&self, key: &ContractKey) -> Result<Option<WrappedState>, redb::Error> {
         self.read_guarded(|txn| {
             let tbl = txn.open_table(STATE_TABLE)?;

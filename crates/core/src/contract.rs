@@ -969,8 +969,7 @@ where
         //
         // Recorded HERE and nowhere else, because this is the only site that
         // takes a refcount: a subscribe answered from the local store takes
-        // none, and neither does the V2 `subscribe_contract_sync` host
-        // function. Driving release from the record rather than from the
+        // none. Driving release from the record rather than from the
         // subscription set is what makes over-release impossible — a decrement
         // for a pair that never incremented would fall on interest a real
         // client holds, which is strictly worse than the leak.
@@ -2012,11 +2011,10 @@ where
         }
 
         // Process SUBSCRIBE requests
-        // There are two registration paths that converge on the delegate
-        // subscription registry (`wasm_runtime::delegate_subscriptions`):
-        // 1. V2 delegates: subscribe_contract() host function (native_api.rs) registers
-        //    during WASM execution and returns success/error synchronously.
-        // 2. V1 delegates: emit SubscribeContractRequest in process() outbound, handled here.
+        // A delegate subscribes by emitting SubscribeContractRequest from
+        // process(); this message path is the only way into the delegate
+        // subscription registry (`wasm_runtime::delegate_subscriptions`) since
+        // #5637 removed the `subscribe_contract` host function.
         // Re-asserting an ESTABLISHED subscription is idempotent: `already_subscribed`
         // short-circuits it and the registry insert is a no-op. Two subscribes for the
         // same NOT-yet-established contract in ONE invocation are not: the first is
@@ -2624,8 +2622,8 @@ where
                         // prompter, an OpManager handle and plain data. That is
                         // what keeps delegate `process()` globally serial on the
                         // loop even though the loop is now released mid-
-                        // round-trip, which #5490's non-atomic
-                        // `state_content_changed` gate depends on. Do not hand
+                        // round-trip, which `DelegateContextCache`'s
+                        // last-write-wins keying depends on. Do not hand
                         // this task the handler. See `delegate_park`'s module
                         // docs, "What parking does NOT relax".
                         GlobalExecutor::spawn(async move {
@@ -3991,8 +3989,7 @@ async fn handle_delegate_notification<CH, P>(
     // `DelegateContextCache` entry.
     //
     // That combination is not exotic: holding a durable subscription while
-    // prompting the user is the shape the delegate epic is heading for, and a
-    // V2 delegate registers its subscription with `ctx.subscribe_contract()`.
+    // prompting the user is the shape the delegate epic is heading for.
     //
     // Note this hazard is about INTERLEAVING, not simultaneity: this path also
     // runs on the serial loop, so nothing runs concurrently, and the global
@@ -4195,18 +4192,16 @@ async fn dispatch_delegate_request<CH, P>(
     //   * A resume re-enters the delegate from `handle_delegate_resume`, ON the
     //     loop. The spawned task only ships a result back down a channel.
     //
-    // Who depends on this, and why per-delegate exclusion is NOT enough:
-    // `native_api::state_content_changed` (V2 delegate writes, #5490) does a
-    // read-then-write that is not atomic. Its racing pair is two DIFFERENT
-    // delegates writing the SAME contract — per-CONTRACT, which the per-delegate
-    // exclusion below permits by construction. It is safe only because of the
-    // global property above. The durable fix is on #5490's side: fold the
-    // comparison into the same ReDb write transaction as the store, as
-    // `update_state_sync` already does.
+    // Who depends on this: `DelegateContextCache`'s last-write-wins keying,
+    // which is safe only while one `process()` per delegate is in flight. The
+    // V2 delegate write path's non-atomic read-then-write (#5490) needed the
+    // stronger node-wide property as well; it went with the delegate write
+    // host functions in #5637.
     //
     // BREAKING IT: spawning any work that holds the `ContractHandler`, or
-    // resuming a continuation anywhere other than the loop. Do either and
-    // #5490's gate must become atomic first. (#4531's off-loop secret export is
+    // resuming a continuation anywhere other than the loop. Do either and the
+    // context cache needs its own per-delegate exclusion first. (#4531's
+    // off-loop secret export is
     // not a counter-example — it holds a pooled executor but never invokes a
     // delegate.) See `delegate_park`'s module docs for the full argument.
     let Some(park) = park else {
@@ -5745,18 +5740,15 @@ mod tests {
     /// PIN: the NODE-WIDE "one delegate `process()` at a time" invariant, held
     /// by the shape of the call graph and by nothing else.
     ///
-    /// Three separate things now rest on this property:
-    ///  1. `DelegateContextCache`'s last-write-wins keying (per-delegate, and
-    ///     `DelegateParkCtx`'s exclusion supplies that half — see
-    ///     `a_parked_delegate_is_not_re_entered_until_it_resumes`);
-    ///  2. `queue_v2_delegate_broadcast`'s non-atomic marker insert/enqueue/
-    ///     rollback triple (#5490);
-    ///  3. `native_api::state_content_changed`'s non-atomic read-then-write,
-    ///     whose racing pair is two DIFFERENT delegates writing the SAME
-    ///     contract — per-CONTRACT, which per-delegate exclusion permits by
-    ///     construction, so only the node-wide property covers it.
+    /// What rests on this property: `DelegateContextCache`'s last-write-wins
+    /// keying (per-delegate, and `DelegateParkCtx`'s exclusion supplies that
+    /// half — see `a_parked_delegate_is_not_re_entered_until_it_resumes`).
     ///
-    /// The third is the reason this pin exists. There is **no lock**: no
+    /// Two more used to: the V2 delegate write path's non-atomic
+    /// read-then-write and its broadcast marker (#5490). Both went with the
+    /// delegate write host functions in #5637.
+    ///
+    /// There is **no lock**: no
     /// per-delegate mutex, no executor affinity, nothing in
     /// `wasm_runtime::delegate` enforcing it. The property is supplied entirely
     /// by every route to `process()` being awaited from the one
@@ -5840,8 +5832,8 @@ mod tests {
                  functions known to be awaited from the serial `contract_handling` \
                  loop: {allowed:?}. At most one delegate `process()` may execute \
                  node-wide at any instant; a call from a spawned task, a pooled \
-                 executor or a second loop breaks that, and with it #5490's \
-                 broadcast marker and `state_content_changed`'s read-then-write. \
+                 executor or a second loop breaks that, and with it the \
+                 `DelegateContextCache` keying. \
                  If this caller IS on the loop, add it here with the reason."
             );
         }
@@ -5881,9 +5873,8 @@ mod tests {
                     "`{needle}` appears inside a SPAWNED task body. Whatever \
                      top-level function encloses the spawn, the spawned block \
                      does not run on the serial loop, so this breaks the \
-                     node-wide one-`process()`-at-a-time invariant that #5490's \
-                     broadcast marker and `state_content_changed`'s \
-                     read-then-write both rest on. Body: {body}"
+                     node-wide one-`process()`-at-a-time invariant that the \
+                     `DelegateContextCache` keying rests on. Body: {body}"
                 );
             }
         }
