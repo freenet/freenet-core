@@ -3927,7 +3927,10 @@ mod tests {
     /// own refusals plus two from siblings also reads as 201. The lock keeps the
     /// exact equality, which is the assertion that can tell a throttle that went
     /// SILENT from one that is merely quiet.
-    static CAP_REFUSAL_COUNTER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// A tokio mutex, not a std one: these are `#[tokio::test]` bodies that
+    /// await `ReDb::new`, and a std guard held across an await is both a clippy
+    /// error and a real hazard on a multi-thread runtime.
+    static CAP_REFUSAL_COUNTER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn stamp_test_delegate(seed: u8) -> DelegateKey {
         DelegateKey::new([seed; 32], CodeHash::from_code(&[seed]))
@@ -4047,9 +4050,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_cap_refusals_do_not_log_every_time() {
         // Shares the process-global refusal counter; see `CAP_REFUSAL_COUNTER`.
-        let _counter = CAP_REFUSAL_COUNTER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _counter = CAP_REFUSAL_COUNTER.lock().await;
         let dir = TempDir::new().unwrap();
         let store = ReDb::new(dir.path()).await.unwrap();
 
@@ -4340,9 +4341,7 @@ mod tests {
     #[tokio::test]
     async fn one_delegate_cannot_grow_the_table_past_the_node_ceiling() {
         // Shares the process-global refusal counter; see `CAP_REFUSAL_COUNTER`.
-        let _counter = CAP_REFUSAL_COUNTER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _counter = CAP_REFUSAL_COUNTER.lock().await;
         let dir = TempDir::new().unwrap();
         let store = ReDb::new(dir.path()).await.unwrap();
 
@@ -4562,9 +4561,7 @@ mod tests {
     #[tokio::test]
     async fn reaffirming_an_existing_row_is_not_refused_at_the_cap() {
         // Shares the process-global refusal counter; see `CAP_REFUSAL_COUNTER`.
-        let _counter = CAP_REFUSAL_COUNTER
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _counter = CAP_REFUSAL_COUNTER.lock().await;
         let dir = TempDir::new().unwrap();
         let store = ReDb::new(dir.path()).await.unwrap();
 
