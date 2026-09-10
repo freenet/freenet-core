@@ -874,9 +874,29 @@ impl ParkGuard {
             contract_ops,
         } = p;
 
-        let mut inbound = std::mem::take(&mut *answers.lock().unwrap());
-        let upserts = std::mem::take(&mut *fetches.lock().unwrap());
-        let contract_ops = std::mem::take(&mut *contract_ops.lock().unwrap());
+        // NEVER `.unwrap()` HERE. `deliver` runs from `Drop`, `Drop` runs while
+        // the off-loop task is UNWINDING from a panic, and that task holds these
+        // very locks across the expressions it pushes into them — so the mutex
+        // it panicked under is poisoned. `.unwrap()` on a poisoned mutex panics,
+        // and a panic in `Drop` during unwinding ABORTS THE PROCESS: no
+        // unwinding, no other delegate's park resumed, no client answered.
+        //
+        // The poison flag carries no information this path can act on. The data
+        // is a plain `Vec` of already-built results; a writer that died
+        // mid-push leaves it structurally intact, and delivering what is there
+        // is exactly what every other exit does. Take the inner value.
+        //
+        // All three converted together on purpose. Poison-tolerance is a
+        // property of the WHOLE Drop path, not of one lock in it: leaving any
+        // one as `.unwrap()` leaves the abort reachable, so a partial
+        // conversion reads as fixed while the failure mode is unchanged.
+        // (#5606 is converting the first two for this same reason; #5615 added
+        // the third. Whichever lands second must confirm all three, not just
+        // its own.)
+        let mut inbound = std::mem::take(&mut *answers.lock().unwrap_or_else(|e| e.into_inner()));
+        let upserts = std::mem::take(&mut *fetches.lock().unwrap_or_else(|e| e.into_inner()));
+        let contract_ops =
+            std::mem::take(&mut *contract_ops.lock().unwrap_or_else(|e| e.into_inner()));
 
         // TERMINAL RESULTS ARE PRODUCED HERE, not in the task body, so that
         // EVERY exit produces them — including a panic or a cancellation, which

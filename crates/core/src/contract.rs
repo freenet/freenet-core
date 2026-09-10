@@ -2612,10 +2612,9 @@ where
                                             pending.missing.clone(),
                                         )
                                         .await;
-                                        sink.lock().unwrap().push(delegate_park::ResolvedUpsert {
-                                            pending,
-                                            fetched,
-                                        });
+                                        sink.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                            delegate_park::ResolvedUpsert { pending, fetched },
+                                        );
                                     }
                                 }))
                                 .await;
@@ -2644,7 +2643,7 @@ where
                                             // when `can_reach_network`. Recorded
                                             // as a failure rather than dropped,
                                             // so the delegate is told either way.
-                                            sink.lock().unwrap().push(
+                                            sink.lock().unwrap_or_else(|e| e.into_inner()).push(
                                                 delegate_park::ResolvedContractOp {
                                                     outcome:
                                                         delegate_park::ContractOpOutcome::Failed(
@@ -2658,7 +2657,7 @@ where
                                         };
                                         let outcome =
                                             run_contract_op_off_loop(op_manager, &pending).await;
-                                        sink.lock().unwrap().push(
+                                        sink.lock().unwrap_or_else(|e| e.into_inner()).push(
                                             delegate_park::ResolvedContractOp { pending, outcome },
                                         );
                                     }
@@ -8721,6 +8720,100 @@ mod hol_4391_tests {
             task_monitor,
         ));
         (op_manager, guards)
+    }
+
+    /// #5542. The SUBSCRIBE arm's `already_subscribed` gate must be tested
+    /// BEFORE the local-state branch, and this pins that ordering.
+    ///
+    /// The ordering is load-bearing and looks stylistic, which is the worst
+    /// case in this class: the regression and the correct code are textually
+    /// identical, so a reviewer sees a rearrangement rather than a defect.
+    /// Before M4 the local branch took no refcount, so testing the gate second
+    /// was harmless. M4 made that branch call `add_local_client`, and
+    /// `add_local_client` is a per-contract refcount that is explicitly NOT
+    /// idempotent — so with the arms in the other order a delegate
+    /// re-subscribing to a contract this node HOLDS takes a fresh refcount on
+    /// every repeat, which is the unbounded-demand failure the gate exists to
+    /// prevent, arriving on the branch nobody was watching.
+    ///
+    /// Asserts the CONSEQUENCE rather than a counter: subscribe twice, release
+    /// once through the ordinary `UnregisterDelegate` path, and require the
+    /// interest to be gone. Two refcounts for one logical subscriber survive a
+    /// single release, and nothing in the tree can ever discharge the excess —
+    /// which is the harm, not the count.
+    #[tokio::test]
+    async fn re_subscribing_to_a_local_contract_takes_no_further_demand() {
+        use freenet_stdlib::prelude::{ContractCode, Parameters, WrappedContract};
+
+        let _guard = TEST_GUARD.lock().await;
+        let (op_manager, _guards) = build_op_manager("d5542-resub").await;
+        let (send, rcv_halve, _wait) = handler::contract_handler_channel();
+        let mut handler =
+            MockWasmContractHandler::new_test(rcv_halve, Some(op_manager.clone()), "d5542_resub")
+                .await;
+
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![0xD4u8; 32])),
+            Parameters::from(vec![]),
+        )));
+        let key = contract.key();
+
+        // The SAME contract, subscribed twice in one round trip.
+        let script = handler.runtime_mut().delegate_script.clone();
+        for _ in 0..2 {
+            script.lock().unwrap().push_back(
+                vec![OutboundDelegateMsg::SubscribeContractRequest(
+                    freenet_stdlib::prelude::SubscribeContractRequest::new(*key.id()),
+                )]
+                .into(),
+            );
+        }
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            },
+        ));
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            put_local(&send, contract, WrappedState::new(vec![7u8; 8])),
+        )
+        .await
+        .expect("PUT must not hang");
+        assert!(
+            matches!(resp, ContractHandlerEvent::PutResponse { .. }),
+            "expected a PutResponse, got {resp}"
+        );
+
+        let dkey = test_delegate_key();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            send.send_to_handler(delegate_event(&dkey)),
+        )
+        .await
+        .expect("the round trip must terminate");
+
+        assert!(
+            op_manager.interest_manager.has_local_interest(&key),
+            "the first subscribe must have registered demand, or this test \
+             proves nothing about the second"
+        );
+
+        // The ordinary removal path, exactly once.
+        crate::wasm_runtime::delegate_interest::release_delegate(&dkey);
+
+        assert!(
+            !op_manager.interest_manager.has_local_interest(&key),
+            "two subscribes to one local contract must hold ONE refcount, so a \
+             single release discharges it. Interest still standing means the \
+             repeat took a second refcount that nothing can ever give back — \
+             `already_subscribed` is being tested AFTER the local branch"
+        );
+
+        handle.abort();
+        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(key.id());
     }
 
     /// #5542 findings M4 and N2, together, because they are two halves of one
