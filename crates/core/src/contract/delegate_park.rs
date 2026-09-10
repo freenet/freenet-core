@@ -2498,16 +2498,6 @@ mod tests {
         }
     }
 
-    fn resolved_net_op(contract: u8, kind: ContractOpKind) -> ResolvedContractOp {
-        ResolvedContractOp {
-            pending: net_op(contract, kind),
-            outcome: match kind {
-                ContractOpKind::Get => ContractOpOutcome::Fetched(None),
-                ContractOpKind::Subscribe => ContractOpOutcome::Subscribed,
-            },
-        }
-    }
-
     /// #5542. Every delegate network operation a park owes must produce a
     /// terminal outcome on EVERY exit, including the `Drop` path a panic or a
     /// cancellation takes. Without this the delegate waits forever for a
