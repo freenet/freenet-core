@@ -990,7 +990,7 @@ where
                     delegate_key.clone(),
                     key,
                     delegate_interest_release_closure(&op_manager),
-                    std::sync::Arc::as_ptr(&op_manager) as usize,
+                    op_manager.node_identity,
                 );
             }
             None => {
@@ -1207,6 +1207,12 @@ struct RunSeed {
     /// found and fixed once in this file under #5544 S1. Declared as a loop
     /// local it reset on every one of up to `MAX_CONTRACT_REQUEST_ITERATIONS`
     /// iterations, so the real ceiling was 100x the documented one.
+    ///
+    /// Scope boundary, the same one `iterations` carries and for the same
+    /// reason: this bounds a ROUND-TRIP, including across parks. A contract
+    /// NOTIFICATION is a genuinely new invocation and starts a fresh budget,
+    /// which is correct — and is also why #5558, a delegate notified of its own
+    /// writes, is a separate unbounded loop that this does not close.
     self_heal_fetches_started: usize,
 }
 
@@ -2032,6 +2038,33 @@ where
                 // to a LOCAL contract take a fresh refcount on every repeat —
                 // the unbounded-demand failure this gate exists to prevent,
                 // reintroduced on the other branch.
+                // Computed ONCE for the whole arm, and consulted before the
+                // local branch as well as the network one (#5542 finding N2).
+                //
+                // B2 gated the three paths that reach the network. M4 then added
+                // an interest registration to the LOCAL branch, which emitted
+                // nothing when B2 was written, and it inherited no gate. That
+                // branch calls `broadcast_change_interests`, which is a real
+                // outbound wire effect: `operations.rs` -> `p2p_protoc.rs` ->
+                // `broadcast.rs` builds an `InterestSync { ChangeInterests }`
+                // and sends it to every connected peer, who then record this
+                // node as interested and add it to their UPDATE and
+                // summary/delta fan-out targets. The node would be soliciting
+                // inbound traffic for a contract it has banned, which is the
+                // narrow claim `contract_ban_list.rs` makes in as many words
+                // ("refuse to register interest").
+                //
+                // `add_local_client` also outlives the message: it is the
+                // refcount subscriber-primary eviction ranks on (hosting
+                // invariant 3), so leaving it ungated lets a delegate pin a
+                // banned contract resident indefinitely — against the strongest
+                // signal the node has that it wants the contract gone.
+                //
+                // Gated HERE and not downstream because by
+                // `handle_broadcast_change_interests` the payload is
+                // `Vec<u32>` interest hashes and the `ContractInstanceId` is
+                // gone.
+                let banned = delegate_network_op_banned(contract_handler, &contract_id);
                 let result = if already_subscribed(&contract_id, delegate_key) {
                     // ALREADY HELD, so re-asserting it must be a no-op.
                     //
@@ -2048,6 +2081,17 @@ where
                     // growing without bound, on the exact path #5467 exists to
                     // make trustworthy.
                     Ok(())
+                } else if banned {
+                    // Every subscribe path refuses a banned contract, local or
+                    // network. Before this the local branch answered `Ok` and
+                    // advertised interest for it.
+                    tracing::warn!(
+                        contract = %contract_id,
+                        delegate_key = %delegate_key,
+                        "Refusing a delegate SUBSCRIBE for a contract this node \
+                         has banned (#5542 finding N2)"
+                    );
+                    Err("this node has banned this contract (#5542)".to_string())
                 } else if let Some(full_key) = local_key {
                     // Contract is local, WITH state. Register the notification
                     // hook — and register DEMAND, which this branch did not do
@@ -2087,7 +2131,7 @@ where
                                 delegate_key.clone(),
                                 full_key,
                                 delegate_interest_release_closure(&op_manager),
-                                std::sync::Arc::as_ptr(&op_manager) as usize,
+                                op_manager.node_identity,
                             );
                             true
                         }
@@ -2109,7 +2153,7 @@ where
                     Ok(())
                 } else if parking.is_some()
                     && can_reach_network
-                    && !delegate_network_op_banned(contract_handler, &contract_id)
+                    && !banned
                     && pending_contract_ops.len() + self_heal_fetches_started
                         < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
                     && !pending_contract_ops.iter().any(|op| {
@@ -2164,8 +2208,6 @@ where
                         "this node has no network handle"
                     } else if parking.is_none() {
                         "delegate parking is unavailable on this executor"
-                    } else if delegate_network_op_banned(contract_handler, &contract_id) {
-                        "this node has banned this contract (#5542 finding B2)"
                     } else if pending_contract_ops.iter().any(|op| {
                         op.contract_id == contract_id
                             && op.kind == delegate_park::ContractOpKind::Subscribe
@@ -8571,6 +8613,74 @@ mod hol_4391_tests {
     /// Build a real `OpManager` backed by a temp-dir `Config`, mirroring
     /// `client_events::tests::build_op_manager`. The returned guard bundle
     /// holds the channel endpoints open — drop it only when the test ends.
+    /// Like [`build_op_manager`] but hands back the event-loop notification
+    /// RECEIVER, so a test can assert on what the node actually emitted.
+    ///
+    /// That distinction matters for the ban gate: asserting the gate's source
+    /// text proves only that a call exists. `broadcast_change_interests` emits
+    /// `NodeEvent::BroadcastChangeInterests`, which `p2p_protoc` turns into an
+    /// `InterestSync { ChangeInterests }` sent to every connected peer, so the
+    /// event is the observable that corresponds to the wire effect.
+    async fn build_op_manager_with_events(
+        id: &str,
+    ) -> (
+        Arc<crate::node::OpManager>,
+        tokio::sync::mpsc::Receiver<
+            either::Either<crate::message::NetMessage, crate::message::NodeEvent>,
+        >,
+        Box<dyn std::any::Any>,
+    ) {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::dev_tool::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        let guards: Box<dyn std::any::Any> =
+            Box::new((ch_channel, wait_for_event, result_router_rx, task_monitor));
+        (op_manager, notification_rx.notifications_receiver, guards)
+    }
+
+    /// Whether a `BroadcastChangeInterests` was emitted, draining what is there.
+    fn emitted_change_interests(
+        rx: &mut tokio::sync::mpsc::Receiver<
+            either::Either<crate::message::NetMessage, crate::message::NodeEvent>,
+        >,
+    ) -> bool {
+        let mut seen = false;
+        while let Ok(item) = rx.try_recv() {
+            if matches!(
+                item,
+                either::Either::Right(crate::message::NodeEvent::BroadcastChangeInterests { .. })
+            ) {
+                seen = true;
+            }
+        }
+        seen
+    }
+
     async fn build_op_manager(id: &str) -> (Arc<crate::node::OpManager>, Box<dyn std::any::Any>) {
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
@@ -8611,6 +8721,140 @@ mod hol_4391_tests {
             task_monitor,
         ));
         (op_manager, guards)
+    }
+
+    /// #5542 findings M4 and N2, together, because they are two halves of one
+    /// branch and neither was covered.
+    ///
+    /// M4 made the local-state SUBSCRIBE branch register DEMAND, without which
+    /// the copy is zero-subscriber and is the first eviction victim under
+    /// hosting invariant 3 — the delegate's subscription dies silently. N2 is
+    /// that M4's registration inherited no ban gate, on the PR that added one
+    /// to the three sibling paths.
+    ///
+    /// The negative asserts the EMISSION does not happen, not that the gate's
+    /// source text exists. `broadcast_change_interests` emits
+    /// `BroadcastChangeInterests`, which `p2p_protoc` turns into an
+    /// `InterestSync { ChangeInterests }` sent to every connected peer, who then
+    /// record this node as interested and add it to their UPDATE fan-out. A
+    /// source-text assertion cannot tell whether that reaches the wire.
+    #[tokio::test]
+    async fn a_banned_local_contract_registers_no_demand_and_advertises_nothing() {
+        use freenet_stdlib::prelude::{ContractCode, Parameters, WrappedContract};
+
+        let _guard = TEST_GUARD.lock().await;
+        let (op_manager, mut events, _guards) =
+            build_op_manager_with_events("d5542-n2-local").await;
+        let (send, rcv_halve, _wait) = handler::contract_handler_channel();
+        let mut handler = MockWasmContractHandler::new_test(
+            rcv_halve,
+            Some(op_manager.clone()),
+            "d5542_n2_local",
+        )
+        .await;
+
+        // Two contracts this node will HOLD, one of them banned. The keys are
+        // needed before the loop starts (to script the delegate), the PUTs need
+        // the loop running (they go through the handler channel), so build the
+        // contracts first and store them after the spawn.
+        let contracts: Vec<ContractContainer> = [0xC1u8, 0xC2u8]
+            .into_iter()
+            .map(|seed| {
+                ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+                    Arc::new(ContractCode::from(vec![seed; 32])),
+                    Parameters::from(vec![]),
+                )))
+            })
+            .collect();
+        let allowed_key = contracts[0].key();
+        let banned_key = contracts[1].key();
+        op_manager.ring.contract_ban_list.ban(
+            *banned_key.id(),
+            tokio::time::Instant::now() + Duration::from_secs(3600),
+            crate::ring::contract_ban_list::BanReason::AutoMad,
+        );
+
+        let script = handler.runtime_mut().delegate_script.clone();
+        for key in [banned_key, allowed_key] {
+            script.lock().unwrap().push_back(
+                vec![OutboundDelegateMsg::SubscribeContractRequest(
+                    freenet_stdlib::prelude::SubscribeContractRequest::new(*key.id()),
+                )]
+                .into(),
+            );
+            crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+        }
+
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            },
+        ));
+
+        // Store both, so `lookup_key` resolves and `fetch_contract` returns
+        // state — which is what puts the SUBSCRIBE arm on the LOCAL branch, the
+        // branch this test is about.
+        for (seed, contract) in [0xC1u8, 0xC2u8].into_iter().zip(contracts) {
+            let resp = tokio::time::timeout(
+                Duration::from_secs(10),
+                put_local(&send, contract, WrappedState::new(vec![seed; 8])),
+            )
+            .await
+            .expect("PUT must not hang");
+            assert!(
+                matches!(resp, ContractHandlerEvent::PutResponse { .. }),
+                "expected a PutResponse, got {resp}"
+            );
+        }
+        // The PUTs themselves emit interest changes; drain so the assertion
+        // below is about the SUBSCRIBE and not about them.
+        let _ = emitted_change_interests(&mut events);
+
+        let dkey = test_delegate_key();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            send.send_to_handler(delegate_event(&dkey)),
+        )
+        .await
+        .expect("the round trip must terminate");
+
+        // The BANNED contract: no demand, and nothing advertised.
+        assert!(
+            !op_manager.interest_manager.has_local_interest(&banned_key),
+            "a delegate must not register demand for a contract this node has \
+             banned; `add_local_client` is the refcount subscriber-primary \
+             eviction ranks on, so it pins the contract against the strongest \
+             signal the node has that it wants it gone (#5542 N2)"
+        );
+        assert!(
+            !already_subscribed(banned_key.id(), &dkey),
+            "and it must not install a notification hook for it either"
+        );
+
+        // The ALLOWED contract: demand registered AND advertised, so the
+        // negatives above are the ban and not a broken branch.
+        assert!(
+            op_manager.interest_manager.has_local_interest(&allowed_key),
+            "an unbanned local contract MUST register demand, or the copy is \
+             zero-subscriber and is evicted out from under the subscription \
+             (#5542 M4)"
+        );
+        assert!(
+            already_subscribed(allowed_key.id(), &dkey),
+            "and it must install the notification hook"
+        );
+        assert!(
+            emitted_change_interests(&mut events),
+            "registering demand must advertise it — this is the emission that \
+             becomes an InterestSync ChangeInterests on the wire, and if it \
+             never fires the positive assertions above prove less than they look"
+        );
+
+        handle.abort();
+        for key in [banned_key, allowed_key] {
+            crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+        }
     }
 
     /// #5542 finding B2. A delegate must not be able to originate a network
@@ -8660,30 +8904,51 @@ mod hol_4391_tests {
         );
     }
 
-    /// #5542 finding B2, wiring half. Both delegate network-op admission sites
-    /// must consult the egress ban gate.
+    /// #5542 findings B2 and N2. Every delegate side effect that reaches the
+    /// network or registers demand must sit behind the egress ban gate.
     ///
-    /// The gate function being correct is worth nothing if an arm does not call
-    /// it, and that is the half that rots: a future arm is added, copies the
-    /// budget conjunct, and omits this one. Anchored on the call itself.
+    /// Counts the SIDE EFFECTS rather than the gates, which is the correction
+    /// N2 asked for. The previous version asserted an absolute number of gate
+    /// calls, so it could not notice the thing that actually went wrong: M4
+    /// added an `add_local_client` plus a `broadcast_change_interests` to a
+    /// branch that previously emitted nothing, and inherited no gate. A pin on
+    /// the gate count is blind to a new ungated side effect; a pin on the side
+    /// effects is not.
+    ///
+    /// This is a count-based approximation and is stated as one — it cannot
+    /// prove a given side effect is dominated by a given check. Its job is to
+    /// stop a fourth site being added without anyone revisiting the gating, and
+    /// the behavioural tests
+    /// (`a_banned_contract_refuses_delegate_originated_network_ops`,
+    /// `a_banned_local_contract_registers_no_demand_and_advertises_nothing`)
+    /// are what prove the gates actually fire.
     #[test]
-    fn both_delegate_network_admission_sites_consult_the_ban_gate() {
+    fn every_delegate_interest_side_effect_sits_behind_the_ban_gate() {
         let code = super::tests::production_code();
         let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        let gates = flat
-            .matches("< delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK")
-            .count();
-        let banned_checks = flat
-            .matches("!delegate_network_op_banned(contract_handler, &contract_id)")
-            .count();
+        let registers_demand = flat.matches("interest_manager.add_local_client(").count();
+        let starts_network_op = flat.matches("pending_contract_ops.push(").count();
+        let side_effects = registers_demand + starts_network_op;
         assert_eq!(
-            banned_checks, 2,
-            "the GET and SUBSCRIBE admission gates must each refuse a banned \
-             contract before parking a network operation for it; found \
-             {banned_checks} of the 2 required (there are {gates} fan-out gates \
-             in total, the third being the UPDATE self-heal, which is gated \
-             inside `try_self_heal_fetch_for_local_originator` instead)"
+            side_effects, 3,
+            "expected exactly three delegate-originated interest side effects in \
+             this file — the GET and SUBSCRIBE network admissions, and the \
+             local-state SUBSCRIBE branch's demand registration. Found \
+             {side_effects} ({registers_demand} demand registrations, \
+             {starts_network_op} network admissions). A NEW one must be gated by \
+             `delegate_network_op_banned` before it registers interest or \
+             advertises it, and must then update this count deliberately rather \
+             than by reflex — that is the whole point of it being pinned."
+        );
+
+        let gate_calls = flat.matches("delegate_network_op_banned(").count();
+        assert!(
+            gate_calls >= 2,
+            "the GET arm and the SUBSCRIBE arm must each consult the gate; found \
+             {gate_calls}. The SUBSCRIBE arm's single check covers both its \
+             local and its network branch, so this is a floor rather than an \
+             equality."
         );
     }
 

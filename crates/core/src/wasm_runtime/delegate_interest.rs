@@ -80,15 +80,21 @@ struct Hold {
     release: InterestRelease,
 }
 
-/// In-process identity of the node that took a hold: the address of its
-/// `Arc<OpManager>` (#5542 finding M3/F4).
+/// In-process identity of the node that took a hold (#5542 findings M3/F4 and
+/// C): `OpManager::node_identity`, a monotonic per-process counter.
 ///
-/// The map is process-global, so its key has to be too, and "which node" is
-/// exactly "which `OpManager` instance" — there is no stable node id on
-/// `OpManager` to use instead. In production this is always a single value,
-/// because production runs one node per process; it earns its place in the
-/// in-process multi-node harness, which is the environment the module's own
-/// per-hold-closure design was written for.
+/// The hold map is process-global, so "which node" has to be represented
+/// explicitly, and it means exactly "which `OpManager` instance". In production
+/// there is only ever one; it earns its place in the in-process multi-node
+/// harness, which is the environment this module's per-hold-closure design was
+/// written for in the first place.
+///
+/// NOT the `Arc<OpManager>` address, which was the first implementation and is
+/// unsound here. `OpManager` has no `Drop`, and glibc's tcache reuses freed
+/// allocations LIFO, so a second `OpManager` can land on a dropped one's
+/// address and inherit its identity — its `record` is then discarded as a
+/// duplicate and its refcount leaks. Reachable under `cargo test`, which does
+/// not use the binary's jemalloc.
 pub(crate) type NodeIdentity = usize;
 
 /// Outstanding local-interest refcounts taken on behalf of delegate
@@ -390,9 +396,20 @@ mod tests {
             .split("fn apply_resolved_contract_op<CH>(")
             .nth(1)
             .expect("apply_resolved_contract_op must exist");
-        let body = &body[..body
-            .find("\nfn ")
-            .expect("apply_resolved_contract_op must be followed by another fn")];
+        // BOUNDED BY THE NEXT FUNCTION'S ACTUAL NAME, not by `"\nfn "`.
+        //
+        // `"\nfn "` does not match `async fn`, so the previous bound skipped
+        // past `run_contract_op_off_loop` and landed 1,848 lines later at
+        // `try_recv_delegate_notification`. The window then contained the
+        // LOCAL-branch `record` call added by M4, so deleting the call this pin
+        // exists to guard left it green. That is the same vacuity the sibling
+        // pin above was repaired for in the same commit; this one did not get
+        // the fix, which is why the region helper is used here too.
+        let body = &body[..body.find("async fn run_contract_op_off_loop(").expect(
+            "apply_resolved_contract_op must be followed by \
+                 run_contract_op_off_loop; if that moved, re-anchor this pin \
+                 rather than widening it",
+        )];
         assert!(
             body.contains("delegate_interest::record("),
             "the site that installs the DELEGATE_SUBSCRIPTIONS hook after a \

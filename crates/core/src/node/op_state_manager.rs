@@ -282,6 +282,23 @@ pub(crate) struct OpManager {
     /// Maps contract instance ID to the timestamp (ms since epoch via GlobalSimulationTime)
     /// when the fetch was initiated, with a cooldown to avoid repeated fetch attempts.
     pub(crate) pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>>,
+    /// Identity of this `OpManager` instance, unique for the life of the
+    /// process (#5542 finding C).
+    ///
+    /// Used as the node component of a key in the process-global
+    /// `wasm_runtime::delegate_interest` hold map, which has to distinguish two
+    /// nodes running in ONE process — the in-process multi-node test harness.
+    ///
+    /// A MONOTONIC COUNTER, not `Arc::as_ptr`. The pointer was the obvious
+    /// choice and is wrong: `OpManager` has no `Drop`, and glibc's tcache
+    /// reuses freed allocations LIFO, so a second `OpManager` can land on a
+    /// dropped one's address and silently inherit its identity — at which point
+    /// its `record` is discarded as a duplicate and its refcount leaks. That is
+    /// reachable only under `cargo test`, because the binary uses jemalloc and
+    /// the test harness does not; `cargo test` is the runner `AGENTS.md` tells
+    /// contributors to use, and the one where cross-test interference is
+    /// observable at all (#5314).
+    pub(crate) node_identity: crate::wasm_runtime::delegate_interest::NodeIdentity,
     /// Transactions with an active driver relay-GET driver at this
     /// node. Populated by `start_relay_get` before spawn and removed by
     /// an RAII guard on the driver task. Consulted by the dispatch gate
@@ -373,6 +390,9 @@ impl Clone for OpManager {
             blocked_addresses: self.blocked_addresses.clone(),
             configured_gateways: self.configured_gateways.clone(),
             pending_contract_fetches: self.pending_contract_fetches.clone(),
+            // The SAME node, so the same identity. A fresh id here would make
+            // one node look like two to the delegate-interest hold map.
+            node_identity: self.node_identity,
             active_relay_get_txs: self.active_relay_get_txs.clone(),
             active_relay_update_txs: self.active_relay_update_txs.clone(),
             active_relay_put_txs: self.active_relay_put_txs.clone(),
@@ -566,6 +586,11 @@ impl OpManager {
         result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
         task_monitor: &super::background_task_monitor::BackgroundTaskMonitor,
     ) -> anyhow::Result<Self> {
+        // Monotonic per-process instance id. `Relaxed` is sufficient: the only
+        // requirement is uniqueness, not ordering against other memory.
+        static NEXT_NODE_IDENTITY: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(1);
+        let node_identity = NEXT_NODE_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ring = Ring::new(
             config,
             notification_channel.clone(),
@@ -724,6 +749,7 @@ impl OpManager {
                     .collect(),
             ),
             pending_contract_fetches,
+            node_identity,
             active_relay_get_txs,
             active_relay_update_txs,
             active_relay_put_txs,
