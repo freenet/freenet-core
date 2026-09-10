@@ -360,12 +360,22 @@ pub(crate) fn subscribe(contract: ContractInstanceId, delegate: &DelegateKey) ->
     }
 
     owned.insert(contract, now);
-    drop(owned);
-
+    // Under the SAME guard as the reverse-index insert above, not after it.
+    //
+    // Dropping the guard first leaves a window in which another task
+    // subscribing for this delegate can reach the cap, pick this very contract
+    // as its coldest victim, and call `drop_from_contract_map` for a forward
+    // entry that has not been written yet — a no-op — before this task writes
+    // it. The reverse index would then have lost the contract while the forward
+    // index gained it: the split-brain state again, in a third direction, and
+    // one that leaves the delegate on the delivery path for a subscription it
+    // is not counted as holding. This is not hypothetical; the concurrency test
+    // below caught it on its first run.
     BY_CONTRACT
         .entry(contract)
         .or_default()
         .insert(delegate.clone());
+    drop(owned);
 
     match evicted {
         Some(id) => {
@@ -759,6 +769,87 @@ mod tests {
         assert_eq!(subscription_count(&victim), 1);
         cleanup(&victim);
         cleanup(&hog);
+    }
+
+    /// The cap must hold under genuine concurrent contention, which is the one
+    /// thing every other test in this file cannot show.
+    ///
+    /// `subscribe` holds the `BY_DELEGATE` entry write guard across the whole
+    /// check-evict-insert sequence, and the comment at that site names the race
+    /// it exists to prevent: two concurrent subscribes for the same delegate
+    /// both observing `len() == cap - 1` and both inserting. Every other test
+    /// here calls `subscribe` sequentially from one task, so **the guard could
+    /// be deleted and all of them would still pass** — the mechanism the
+    /// implementation was built to survive would be the one nothing drives.
+    ///
+    /// Multi-threaded on purpose: a current-thread runtime interleaves at await
+    /// points, and `subscribe` is synchronous, so on one worker the sequence is
+    /// atomic for free and the test would prove nothing. The barrier makes the
+    /// tasks start together rather than trickling in.
+    ///
+    /// Deliberately over-subscribes by 2x the cap so eviction, which is the part
+    /// that reads and mutates under the same guard, is contended rather than
+    /// incidental.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_subscribes_never_exceed_the_cap() {
+        use std::sync::Arc;
+
+        const TASKS: u16 = 8;
+        const PER_TASK: u16 = 64;
+        const BASE: u16 = 20000;
+
+        let d = dkey(16);
+        let barrier = Arc::new(tokio::sync::Barrier::new(TASKS as usize));
+        let mut handles = Vec::new();
+        for t in 0..TASKS {
+            let delegate = d.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                for i in 0..PER_TASK {
+                    subscribe(cid(BASE + t * PER_TASK + i), &delegate);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("no subscribing task may panic");
+        }
+
+        let held = subscription_count(&d);
+        assert!(
+            held <= MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE,
+            "the cap must hold under concurrency: {TASKS} tasks x {PER_TASK} \
+             subscribes left {held} held against a cap of \
+             {MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE}. Exceeding it means \
+             check-evict-insert was not atomic and two subscribes both admitted \
+             against the same free slot"
+        );
+        assert_eq!(
+            held,
+            MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE,
+            "and it must be exactly full: {} subscribes for distinct contracts \
+             cannot leave the delegate under its cap",
+            TASKS * PER_TASK
+        );
+
+        // The two indexes must still agree afterwards. A racing evict that
+        // cleared one half and not the other would leave the count right and
+        // the registry wrong, which the count assertions above cannot see.
+        let mut listed = 0;
+        for t in 0..TASKS {
+            for i in 0..PER_TASK {
+                if is_subscribed(&cid(BASE + t * PER_TASK + i), &d) {
+                    listed += 1;
+                }
+            }
+        }
+        assert_eq!(
+            listed, held,
+            "every contract the reverse index counts must also be listed in the \
+             forward index; a mismatch is the split-brain state under a race"
+        );
+
+        cleanup(&d);
     }
 
     /// The two indexes can disagree, and a re-subscribe must repair it rather
