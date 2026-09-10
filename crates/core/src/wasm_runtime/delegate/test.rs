@@ -2591,8 +2591,8 @@ mod local_contract_state_messages {
 }
 
 /// End-to-end: a real compiled WASM delegate reads the state this node holds
-/// through `__frnt__delegate__local_contract_state_len` and
-/// `__frnt__delegate__local_contract_state`, called from inside `process()`
+/// through `__frnt__delegate__get_contract_state_len` and
+/// `__frnt__delegate__get_contract_state`, called from inside `process()`
 /// and served from the ReDb state store.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_delegate_reads_local_contract_state() -> Result<(), Box<dyn std::error::Error>> {

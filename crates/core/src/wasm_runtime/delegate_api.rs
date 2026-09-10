@@ -2,7 +2,7 @@
 //! delegate-management host functions.
 //!
 //! A delegate has exactly one contract-state host function pair,
-//! `__frnt__delegate__local_contract_state` / `..._len` (see
+//! `__frnt__delegate__get_contract_state` / `..._len` (see
 //! `native_api::DelegateCallEnv::local_contract_state`). It reports the state
 //! THIS NODE already holds and never reaches the network. For anything else a
 //! delegate emits an outbound message (`GetContractRequest`,

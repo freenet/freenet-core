@@ -193,16 +193,16 @@ Contracts/delegates call into the host via registered functions:
 
 ### Namespaces
 
-| Namespace | Purpose | Version |
-|-----------|---------|---------|
-| `freenet_log` | Logging | V1, V2 |
-| `freenet_rand` | RNG | V1, V2 |
-| `freenet_time` | UTC timestamp (**delegates only; deprecated for contracts**, see below) | V1, V2 |
-| `freenet_contract_io` | Buffer fill for contract/delegate I/O | V1, V2 |
-| `freenet_delegate_ctx` | Delegate state | V1, V2 |
-| `freenet_delegate_secrets` | Secret storage | V1, V2 |
-| `freenet_delegate_contracts` | Contract access from a delegate | V2 only |
-| `freenet_delegate_management` | Delegate creation from a delegate | V2 only |
+| Namespace | Purpose |
+|-----------|---------|
+| `freenet_log` | Logging |
+| `freenet_rand` | RNG |
+| `freenet_time` | UTC timestamp (**delegates only; deprecated for contracts**, see below) |
+| `freenet_contract_io` | Buffer fill for contract/delegate I/O |
+| `freenet_delegate_ctx` | Delegate state |
+| `freenet_delegate_secrets` | Secret storage |
+| `freenet_delegate_contracts` | Read-only lookup of contract state this node holds (`__frnt__delegate__get_contract_state`, `_len`); no writes, see below |
+| `freenet_delegate_management` | Delegate creation from a delegate |
 
 These are the names the linker registers
 (`crates/core/src/wasm_runtime/engine/wasmtime_engine.rs`); import resolution is
@@ -313,7 +313,7 @@ Delegates reach contract state through outbound messages (`GetContractRequest`,
 `PutContractRequest`, `UpdateContractRequest`, `SubscribeContractRequest`),
 which the contract-handling loop serves through the executor's normal path.
 The one exception is a read-only host function pair,
-`__frnt__delegate__local_contract_state` / `..._len`, which returns the state
+`__frnt__delegate__get_contract_state` / `..._len`, which returns the state
 this node already holds and never reaches the network.
 
 There is no separate "V2" delegate API. Host functions that wrote contract

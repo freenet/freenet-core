@@ -2622,8 +2622,9 @@ where
                         // prompter, an OpManager handle and plain data. That is
                         // what keeps delegate `process()` globally serial on the
                         // loop even though the loop is now released mid-
-                        // round-trip, which `DelegateContextCache`'s
-                        // last-write-wins keying depends on. Do not hand
+                        // round-trip, which is how `DelegateContextCache`'s
+                        // one-`process()`-per-delegate requirement is met
+                        // without a lock. Do not hand
                         // this task the handler. See `delegate_park`'s module
                         // docs, "What parking does NOT relax".
                         GlobalExecutor::spawn(async move {
@@ -5740,13 +5741,18 @@ mod tests {
     /// PIN: the NODE-WIDE "one delegate `process()` at a time" invariant, held
     /// by the shape of the call graph and by nothing else.
     ///
-    /// What rests on this property: `DelegateContextCache`'s last-write-wins
-    /// keying (per-delegate, and `DelegateParkCtx`'s exclusion supplies that
-    /// half — see `a_parked_delegate_is_not_re_entered_until_it_resumes`).
+    /// What rests on it today: `DelegateContextCache`'s last-write-wins keying,
+    /// which needs only one `process()` per DELEGATE (`DelegateParkCtx`'s
+    /// exclusion supplies the parked half — see
+    /// `a_parked_delegate_is_not_re_entered_until_it_resumes`).
     ///
-    /// Two more used to: the V2 delegate write path's non-atomic
-    /// read-then-write and its broadcast marker (#5490). Both went with the
-    /// delegate write host functions in #5637.
+    /// Nothing documented needs the full NODE-wide property any more. Two
+    /// things did: the V2 delegate write path's non-atomic read-then-write and
+    /// its broadcast marker (#5490), both removed with the delegate write host
+    /// functions in #5637. The pin is kept as a deliberate defensive margin:
+    /// the property costs nothing to hold, and code written while it held may
+    /// still assume it. Relax it on purpose, updating this doc, never as a side
+    /// effect of a performance change.
     ///
     /// There is **no lock**: no
     /// per-delegate mutex, no executor affinity, nothing in

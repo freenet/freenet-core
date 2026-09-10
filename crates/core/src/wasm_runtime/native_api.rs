@@ -1153,6 +1153,11 @@ impl DelegateCallEnv {
     /// `OutboundDelegateMsg::GetContractRequest`, which does reach the network
     /// (#5615).
     ///
+    /// Exposed to WASM as `__frnt__delegate__get_contract_state(_len)`, the
+    /// names freenet-stdlib's `DelegateCtx::get_contract_state` links
+    /// against. The honest name lives here and should reach delegate authors
+    /// through a stdlib rename, not an ABI break.
+    ///
     /// This is the only contract-state host function a delegate has, on
     /// purpose. The host functions that WROTE contract state
     /// (`put_contract_state`, `update_contract_state`) and the one that
@@ -2183,10 +2188,10 @@ pub(super) mod delegate_secrets {
 ///
 /// ## Usage Pattern (from WASM)
 ///
-/// 1. Call `__frnt__delegate__local_contract_state_len(id_ptr, 32)` to get the
+/// 1. Call `__frnt__delegate__get_contract_state_len(id_ptr, 32)` to get the
 ///    state size
 /// 2. Allocate a buffer of that size
-/// 3. Call `__frnt__delegate__local_contract_state(id_ptr, 32, out_ptr, out_len)`
+/// 3. Call `__frnt__delegate__get_contract_state(id_ptr, 32, out_ptr, out_len)`
 ///    to read the state
 ///
 /// ## Error Codes
@@ -2201,7 +2206,7 @@ pub(super) mod delegate_contracts {
     use super::*;
     use crate::wasm_runtime::delegate_api::contract_error_codes;
 
-    /// Implementation of `__frnt__delegate__local_contract_state_len`.
+    /// Implementation of `__frnt__delegate__get_contract_state_len`.
     pub(crate) fn local_contract_state_len_impl(id_ptr: i64, id_len: i32) -> i64 {
         let id = current_instance_id();
         if id == -1 {
@@ -2272,7 +2277,7 @@ pub(super) mod delegate_contracts {
         }
     }
 
-    /// Implementation of `__frnt__delegate__local_contract_state`.
+    /// Implementation of `__frnt__delegate__get_contract_state`.
     pub(crate) fn local_contract_state_impl(
         id_ptr: i64,
         id_len: i32,

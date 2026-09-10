@@ -1985,13 +1985,17 @@ impl WasmtimeEngine {
         // deliberately no write or subscribe beside it: the write host
         // functions that used to live here bypassed the executor's
         // `state_store` chokepoints and were removed in #5637 (see
-        // `DelegateCallEnv::local_contract_state`). A delegate module that still
+        // `DelegateCallEnv::local_contract_state`). The import keeps its
+        // `get_contract_state` name because freenet-stdlib's public
+        // `DelegateCtx::get_contract_state` links against it; core names the
+        // function `local_contract_state` internally, which is what it does.
+        // A delegate module that still
         // imports one of the removed names fails to instantiate; pinned by
         // `removed_delegate_contract_imports_are_refused_at_instantiation`.
         linker
             .func_wrap(
                 "freenet_delegate_contracts",
-                "__frnt__delegate__local_contract_state",
+                "__frnt__delegate__get_contract_state",
                 |mut caller: Caller<'_, HostState>,
                  id_ptr: i64,
                  id_len: i32,
@@ -2010,7 +2014,7 @@ impl WasmtimeEngine {
         linker
             .func_wrap(
                 "freenet_delegate_contracts",
-                "__frnt__delegate__local_contract_state_len",
+                "__frnt__delegate__get_contract_state_len",
                 |mut caller: Caller<'_, HostState>, id_ptr: i64, id_len: i32| -> i64 {
                     let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
                     refresh_mem_addr_from_caller(&mut caller, id);
@@ -2022,6 +2026,17 @@ impl WasmtimeEngine {
         // ============================================================
         // freenet_delegate_management namespace — delegate creation
         // ============================================================
+        //
+        // Registered with `func_wrap_async`, which is why the engine keeps
+        // `async_support(true)`, but the body has no `.await`: it runs
+        // `create_delegate_impl` synchronously inside the async block.
+        //
+        // SAFETY of refreshing before the async block: the refresh below runs
+        // OUTSIDE the block, which is sound only because nothing inside it
+        // yields back to the guest, so no `memory.grow` can relocate linear
+        // memory between the refresh and the impl's pointer use. If this ever
+        // gains an `.await`, the refresh must move inside the block, using a
+        // mechanism that can reach the `Store` (#3248).
         linker
             .func_wrap_async(
                 "freenet_delegate_management",
@@ -3699,10 +3714,10 @@ mod tests {
           (import "freenet_delegate_secrets" "__frnt__delegate__remove_secret"
             (func $remove_secret (param i64 i32) (result i32)))
           ;; local_contract_state_impl(id_ptr: i64, id_len: i32, out_ptr: i64, out_len: i64) -> i64
-          (import "freenet_delegate_contracts" "__frnt__delegate__local_contract_state"
+          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state"
             (func $local_state (param i64 i32 i64 i64) (result i64)))
           ;; local_contract_state_len_impl(id_ptr: i64, id_len: i32) -> i64
-          (import "freenet_delegate_contracts" "__frnt__delegate__local_contract_state_len"
+          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
             (func $local_state_len (param i64 i32) (result i64)))
           (memory (export "memory") 1)
           (func (export "answer") (result i32) i32.const 42)
@@ -3880,7 +3895,7 @@ mod tests {
 
         let wat = r#"
         (module
-          (import "freenet_delegate_contracts" "__frnt__delegate__local_contract_state_len"
+          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
             (func $local_state_len (param i64 i32) (result i64)))
           (memory (export "memory") 1)
           (global $instance_id (mut i64) (i64.const 0))
@@ -3926,8 +3941,11 @@ mod tests {
     ///     when it called one, which is much harder to diagnose.
     ///
     /// The positive control instantiates the SAME module shape against the
-    /// surviving name, so a failure below is attributable to the import name
-    /// and not to a malformed module.
+    /// surviving read, so a failure below is attributable to the import name
+    /// and not to a malformed module. The read keeps its original import
+    /// name, `__frnt__delegate__get_contract_state`, because freenet-stdlib's
+    /// public `DelegateCtx::get_contract_state` links against it: renaming it
+    /// would make every SDK delegate that reads state fail to load.
     #[test]
     fn removed_delegate_contract_imports_are_refused_at_instantiation() {
         fn module_importing(name: &str, sig: &str) -> String {
@@ -3949,7 +3967,7 @@ mod tests {
         let control = engine
             .compile(
                 module_importing(
-                    "__frnt__delegate__local_contract_state",
+                    "__frnt__delegate__get_contract_state",
                     "(param i64 i32 i64 i64) (result i64)",
                 )
                 .as_bytes(),
@@ -3971,15 +3989,6 @@ mod tests {
             ),
             (
                 "__frnt__delegate__subscribe_contract",
-                "(param i64 i32) (result i64)",
-            ),
-            // The read's old names, renamed to say what the function does.
-            (
-                "__frnt__delegate__get_contract_state",
-                "(param i64 i32 i64 i64) (result i64)",
-            ),
-            (
-                "__frnt__delegate__get_contract_state_len",
                 "(param i64 i32) (result i64)",
             ),
         ] {

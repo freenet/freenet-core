@@ -29,7 +29,7 @@ A delegate reaches contract state through OUTBOUND MESSAGES:
     SubscribeContractRequest — served by the contract-handling loop through
     the executor's normal path (the state_store chokepoints).
 The ONE host-function exception is read-only:
-    __frnt__delegate__local_contract_state(_len) — the state THIS NODE already
+    __frnt__delegate__get_contract_state(_len) — the state THIS NODE already
     holds. ERR_CONTRACT_NOT_FOUND means "not held here", NOT "does not exist".
     It never reaches the network.
 

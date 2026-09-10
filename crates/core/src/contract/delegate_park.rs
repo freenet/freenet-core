@@ -58,9 +58,10 @@
 //!   supplies, because parking genuinely does let a delegate's round-trip span
 //!   loop iterations.
 //!
-//! A second dependent, the V2 delegate write path's non-atomic read-then-write
-//! (#5490), needed the full node-wide property. It went with the delegate write
-//! host functions in #5637.
+//! Nothing documented needs the full NODE-wide property any more. The V2
+//! delegate write path's non-atomic read-then-write (#5490) did; it went with
+//! the delegate write host functions in #5637. The property is kept, and
+//! pinned in `contract.rs`, as a deliberate defensive margin.
 //!
 //! Why the global property still holds after #5544, by construction rather than
 //! by convention:
@@ -102,8 +103,9 @@
 //!
 //! **What would break it.** Spawning any work that holds the
 //! `ContractHandler`, or resuming a continuation anywhere other than the loop.
-//! If you are about to do either, give `DelegateContextCache` its own
-//! per-delegate exclusion first. The
+//! If you are about to do either, first make sure two `process()` calls for
+//! one delegate still cannot overlap (the `DelegateContextCache` requirement
+//! above), and update this section and the pin in `contract.rs`. The
 //! nearest existing precedent is deliberately NOT a counter-example: #4531's
 //! hosted-secret export does run off-loop holding a pooled executor, but it
 //! enumerates and seals secrets and never invokes a delegate.

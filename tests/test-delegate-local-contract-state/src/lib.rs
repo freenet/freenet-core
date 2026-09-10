@@ -1,5 +1,5 @@
 /// Test delegate that reads contract state through the
-/// `__frnt__delegate__local_contract_state` host functions.
+/// `__frnt__delegate__get_contract_state` host functions.
 ///
 /// That pair is the only contract-state host function a delegate has, and it
 /// only reports what THIS NODE already holds. The write and subscribe host
@@ -14,10 +14,10 @@ use serde::{Deserialize, Serialize};
 unsafe extern "C" {
     /// Returns the byte length of the state this node holds for the contract,
     /// or a negative error code.
-    fn __frnt__delegate__local_contract_state_len(id_ptr: i64, id_len: i32) -> i64;
+    fn __frnt__delegate__get_contract_state_len(id_ptr: i64, id_len: i32) -> i64;
     /// Copies that state into the buffer at out_ptr. Returns bytes written, or
     /// a negative error code.
-    fn __frnt__delegate__local_contract_state(
+    fn __frnt__delegate__get_contract_state(
         id_ptr: i64,
         id_len: i32,
         out_ptr: i64,
@@ -92,7 +92,7 @@ fn read_local_contract_state(contract_id: [u8; 32]) -> OutboundAppMessage {
         let id_ptr = contract_id.as_ptr() as i64;
         let id_len = 32i32;
 
-        let state_len = unsafe { __frnt__delegate__local_contract_state_len(id_ptr, id_len) };
+        let state_len = unsafe { __frnt__delegate__get_contract_state_len(id_ptr, id_len) };
 
         if state_len < 0 {
             return OutboundAppMessage::ContractNotFound {
@@ -103,7 +103,7 @@ fn read_local_contract_state(contract_id: [u8; 32]) -> OutboundAppMessage {
 
         let mut buf = vec![0u8; state_len as usize];
         let bytes_read = unsafe {
-            __frnt__delegate__local_contract_state(
+            __frnt__delegate__get_contract_state(
                 id_ptr,
                 id_len,
                 buf.as_mut_ptr() as i64,
