@@ -1,4 +1,4 @@
-FROM node:26-bullseye-slim
+FROM node:26-bookworm-slim
 
 # Install required dependencies
 RUN DEBIAN_FRONTEND=noninteractive \
@@ -35,8 +35,21 @@ RUN git clone https://github.com/freenet/freenet-core.git "$FREENET_DIR/freenet-
   && git submodule update --init --recursive
 
 # Build Freenet
+#
+# CARGO_BUILD_JOBS caps rustc/linker parallelism. Left unset, cargo defaults to
+# one job per logical core, and this workspace pulls in enough heavyweight
+# dependencies (wasmtime among them) that full-width parallelism can exceed
+# available memory on smaller build hosts and get the build OOM-killed. Left
+# as a build arg (default empty = cargo's own default) rather than a fixed
+# number, so CI and larger machines keep full parallelism unless a builder
+# opts into a cap.
 WORKDIR $FREENET_DIR/freenet-core/crates/core
-RUN cargo install --path .
+ARG CARGO_BUILD_JOBS=
+RUN if [ -n "$CARGO_BUILD_JOBS" ]; then \
+      cargo install --path . --jobs "$CARGO_BUILD_JOBS"; \
+    else \
+      cargo install --path .; \
+    fi
 
 # Copy the gateway startup script
 COPY freenet-gateway-startup.sh /usr/local/bin/freenet-gateway-startup.sh
