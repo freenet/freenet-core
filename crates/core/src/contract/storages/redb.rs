@@ -264,6 +264,18 @@ pub(crate) const DELEGATE_ORIGINS_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(crate) const RESERVED_MARKER_HASHES_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("delegate_reserved_marker_hashes");
 
+/// How many delegate-subscription rows have been refused by a cap.
+///
+/// Exists so the refusal WARNINGS can be throttled without going silent. Once a
+/// cap is full, a registered delegate can ask for the same absent subscription
+/// in a loop, and every attempt reaches the refusal, so an unthrottled `warn!`
+/// there makes the containment mechanism its own amplifier: the cheapest
+/// possible action produces one release-log line each. That shape has appeared
+/// three times in one release, so the throttle is the default rather than the
+/// afterthought.
+static DELEGATE_SUBSCRIPTION_CAP_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Durable record of which delegates have subscribed to which contracts
 /// (#4669 part 2 / #5467).
 ///
@@ -2135,6 +2147,23 @@ impl ReDb {
     /// avoid.
     pub(crate) const DELEGATE_SUBSCRIPTION_STAMP_GRANULARITY_MS: u64 = 60 * 60 * 1000;
 
+    /// Record a cap refusal and answer whether this one should be logged.
+    ///
+    /// The FIRST refusal is always reported, so a node that saturates once is
+    /// never silent, and the running total rides on every line that is emitted,
+    /// so the rate is recoverable from any two of them.
+    fn note_cap_refusal() -> Option<u64> {
+        let total = DELEGATE_SUBSCRIPTION_CAP_REFUSALS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        (total == 1 || total % 64 == 0).then_some(total)
+    }
+
+    /// Total delegate-subscription rows refused by a cap since start.
+    pub(crate) fn delegate_subscription_cap_refusals() -> u64 {
+        DELEGATE_SUBSCRIPTION_CAP_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Milliseconds since the UNIX epoch, saturating at 0 before it.
     pub(crate) fn now_ms() -> u64 {
         std::time::SystemTime::now()
@@ -2305,6 +2334,53 @@ impl ReDb {
             return Ok(true);
         }
 
+        // Refuse a KNOWN-full cap from the read transaction, before
+        // `begin_write()`.
+        //
+        // Dropping the write transaction without committing avoids the fsync
+        // and not the LOCK: `begin_write()` has already taken redb's single
+        // global writer lock by then. So a delegate parked at a full cap, which
+        // can ask in a loop, would contend with every unrelated contract-state
+        // and metadata write on the node for as long as it kept asking. The
+        // fsync was the visible half of that cost and the lock is the one that
+        // reaches other writers.
+        //
+        // This is a FAST PATH, not the bound. The authoritative checks stay
+        // inside the transaction below, because two callers can both read
+        // "space available" here and only one may win; that race can only
+        // ADMIT, never over-admit past the in-transaction check. What this
+        // removes is the uncontested case, which is the one an attacker drives.
+        let known_full =
+            self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
+                Ok(tbl) => {
+                    if tbl.get(row_key.as_slice())?.is_some() {
+                        // The row exists; this is a re-affirm, not an admission,
+                        // and no cap applies to it.
+                        return Ok(false);
+                    }
+                    if tbl.len()? >= Self::MAX_DELEGATE_SUBSCRIPTION_ROWS_PER_NODE {
+                        return Ok(true);
+                    }
+                    Ok(tbl.range(lo.as_slice()..=hi.as_slice())?.count()
+                        >= Self::MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT)
+                }
+                // No table means no rows, so no cap can be full.
+                Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+                Err(e) => Err(e.into()),
+            })?;
+        if known_full {
+            if let Some(total) = Self::note_cap_refusal() {
+                tracing::warn!(
+                    contract = %contract,
+                    delegate = %delegate.encode(),
+                    cap_refusals_total = total,
+                    "delegate-subscription cap is full; refusing without taking \
+                     the writer lock"
+                );
+            }
+            return Ok(false);
+        }
+
         let txn = self.begin_write()?;
         let admitted;
         {
@@ -2321,13 +2397,16 @@ impl ReDb {
             } else if tbl.len()? >= Self::MAX_DELEGATE_SUBSCRIPTION_ROWS_PER_NODE {
                 // Node-wide ceiling. Checked before the per-contract range
                 // count because it is O(1) and the range scan is not.
-                tracing::warn!(
-                    contract = %contract,
-                    delegate = %delegate.encode(),
-                    cap = Self::MAX_DELEGATE_SUBSCRIPTION_ROWS_PER_NODE,
-                    "node is at the delegate-subscription ROW ceiling; refusing \
-                     to record a further subscription"
-                );
+                if let Some(total) = Self::note_cap_refusal() {
+                    tracing::warn!(
+                        contract = %contract,
+                        delegate = %delegate.encode(),
+                        cap = Self::MAX_DELEGATE_SUBSCRIPTION_ROWS_PER_NODE,
+                        cap_refusals_total = total,
+                        "node is at the delegate-subscription ROW ceiling; refusing \
+                         to record a further subscription"
+                    );
+                }
                 admitted = false;
             } else {
                 let count = tbl.range(lo.as_slice()..=hi.as_slice())?.count();
@@ -2335,13 +2414,16 @@ impl ReDb {
                     tbl.insert(row_key.as_slice(), stamp.as_slice())?;
                     admitted = true;
                 } else {
-                    tracing::warn!(
-                        contract = %contract,
-                        delegate = %delegate.encode(),
-                        cap = Self::MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT,
-                        "contract is at the per-contract delegate-subscription cap; \
-                         refusing to record a further subscription"
-                    );
+                    if let Some(total) = Self::note_cap_refusal() {
+                        tracing::warn!(
+                            contract = %contract,
+                            delegate = %delegate.encode(),
+                            cap = Self::MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT,
+                            cap_refusals_total = total,
+                            "contract is at the per-contract delegate-subscription \
+                             cap; refusing to record a further subscription"
+                        );
+                    }
                     admitted = false;
                 }
             }
@@ -2506,15 +2588,94 @@ impl ReDb {
             let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
             // Collect first: `retain_in` would borrow the table mutably while
             // the range iterator is alive.
-            let doomed: Vec<Vec<u8>> = tbl
-                .range(lo.as_slice()..=hi.as_slice())?
-                .filter_map(|entry| entry.ok().map(|(k, _)| k.value().to_vec()))
-                .collect();
+            //
+            // `?` on each item rather than `entry.ok()`. Discarding an item
+            // error would delete the rows that read cleanly, commit, and report
+            // a successful cleanup, while the skipped row survives a contract
+            // removal that is supposed to have cleared it. Boot restore then
+            // preserves that row, because its contract no longer resolves, so
+            // it holds a durable cap slot for the life of the node. An error
+            // here must abort the transaction and reach the caller.
+            let mut doomed: Vec<Vec<u8>> = Vec::new();
+            for entry in tbl.range(lo.as_slice()..=hi.as_slice())? {
+                let (k, _) = entry?;
+                doomed.push(k.value().to_vec());
+            }
             for k in doomed {
                 tbl.remove(k.as_slice())?;
             }
         }
         Self::commit_guarded(txn)
+    }
+
+    /// Remove EVERY durable row for `delegate`, whatever contract it names.
+    ///
+    /// # WHY A REGISTRY WALK IS NOT ENOUGH
+    ///
+    /// `delegate_subscriptions::forget_delegate` discovers a delegate's rows by
+    /// walking the in-memory registry. That misses any row the registry does not
+    /// hold, and boot restore deliberately creates exactly those: a row whose
+    /// contract cannot be resolved is KEPT and NOT registered (see
+    /// `RestoreOutcome::unresolved_contract`, which explains why deleting it on
+    /// an unreliable lookup is worse). Such a row is therefore invisible to a
+    /// registry-only teardown: it survives `UnregisterDelegate`, holds a slot
+    /// against both caps, and survives a reinstall of the same delegate, since
+    /// the reinstalled one restores it and inherits a subscription its owner
+    /// never asked for.
+    ///
+    /// `AGENTS.md` requires a cleanup path to reach what it claims to clean.
+    /// This is a DIFFERENT instance of that rule from the horizon exemption in
+    /// #5622, and it is not covered by that decision.
+    ///
+    /// # Cost
+    ///
+    /// The table is contract-major, so selecting by delegate is a full scan.
+    /// That is acceptable precisely because this runs on `UnregisterDelegate`,
+    /// which is rare and already tears down a delegate's whole world. The
+    /// per-contract and per-delegate teardowns that run often are still prefix
+    /// scans and point deletes.
+    ///
+    /// # Errors
+    /// Returns `Err` if any redb transaction, table open, scan, remove or
+    /// commit fails. An item error aborts rather than skipping the row, for the
+    /// same reason as `remove_delegate_subscriptions_for_contract`.
+    pub(crate) fn remove_delegate_subscriptions_for_delegate(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Result<usize, redb::Error> {
+        let needle = Self::delegate_key64(delegate);
+
+        // Read first, so the overwhelmingly common case (a delegate with no
+        // unresolved rows) takes no writer lock at all.
+        let doomed =
+            self.read_guarded(|txn| match txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE) {
+                Ok(tbl) => {
+                    let mut doomed: Vec<Vec<u8>> = Vec::new();
+                    for entry in tbl.iter()? {
+                        let (k, _) = entry?;
+                        let key = k.value();
+                        if key.len() == 96 && key[32..] == needle {
+                            doomed.push(key.to_vec());
+                        }
+                    }
+                    Ok(doomed)
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
+                Err(e) => Err(e.into()),
+            })?;
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            for key in &doomed {
+                tbl.remove(key.as_slice())?;
+            }
+        }
+        Self::commit_guarded(txn)?;
+        Ok(doomed.len())
     }
 
     /// Every recorded `(contract, delegate)` subscription. Read once, at boot.
@@ -2674,6 +2835,23 @@ impl crate::wasm_runtime::delegate_subscriptions::DelegateSubscriptionPersistenc
                 "could not clear a delegate subscription from disk; boot \
                  reconciliation will drop it if the delegate or contract is gone"
             );
+        }
+    }
+
+    fn forget_delegate_subscriptions_for_delegate(&self, delegate: &DelegateKey) {
+        match self.remove_delegate_subscriptions_for_delegate(delegate) {
+            Ok(0) => {}
+            Ok(removed) => tracing::debug!(
+                delegate = %delegate,
+                removed,
+                "cleared delegate-subscription rows a registry walk could not see"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                delegate = %delegate,
+                "could not clear this delegate's subscription rows from disk; they \
+                 will hold slots against the caps until a later teardown succeeds"
+            ),
         }
     }
 
@@ -3747,6 +3925,151 @@ mod tests {
             .expect("read stamp")
     }
 
+    /// An UNRESOLVED row must not outlive its delegate.
+    ///
+    /// Boot restore keeps a row whose contract cannot be resolved and does NOT
+    /// register it, because the lookup behind that decision can fail silently
+    /// (see `RestoreOutcome::unresolved_contract`). The cost of that choice is
+    /// this: a registry walk cannot see the row, so `forget_delegate` alone
+    /// would leave it on disk after `UnregisterDelegate`, holding a slot against
+    /// both caps for the life of the node and being restored again if the same
+    /// delegate is ever reinstalled.
+    ///
+    /// The mutation that must redden this: delete the
+    /// `forget_delegate_subscriptions_for_delegate` call in `forget_delegate`.
+    #[tokio::test]
+    async fn unregistering_a_delegate_clears_rows_the_registry_cannot_see() {
+        let dir = TempDir::new().unwrap();
+        let store = ReDb::new(dir.path()).await.unwrap();
+
+        let delegate = stamp_test_delegate(31);
+        let seen = ContractInstanceId::new([31; 32]);
+        let unseen = ContractInstanceId::new([32; 32]);
+        let now = 1_700_000_000_000u64;
+
+        // Both rows on disk; only ONE of them in the registry, which is exactly
+        // the state boot restore leaves behind for an unresolvable contract.
+        assert!(
+            store
+                .add_delegate_subscription_at(&seen, &delegate, now)
+                .unwrap()
+        );
+        assert!(
+            store
+                .add_delegate_subscription_at(&unseen, &delegate, now)
+                .unwrap()
+        );
+        crate::wasm_runtime::delegate_subscriptions::test_support::clear_in_memory_for(&delegate);
+        crate::wasm_runtime::delegate_subscriptions::test_support::register_in_memory_only(
+            &seen, &delegate,
+        );
+        assert_eq!(
+            store.load_all_delegate_subscriptions().unwrap().len(),
+            2,
+            "precondition: two rows on disk"
+        );
+
+        crate::wasm_runtime::delegate_subscriptions::forget_delegate(Some(&store), &delegate);
+
+        assert!(
+            store.load_all_delegate_subscriptions().unwrap().is_empty(),
+            "BOTH rows must be gone. The registry held only one, so a teardown \
+             that walks the registry leaves the other behind, and it then holds \
+             a cap slot forever and is restored again if the delegate is \
+             reinstalled."
+        );
+    }
+
+    /// A refusal must not take redb's global writer lock.
+    ///
+    /// Dropping the write transaction avoids the fsync and not the LOCK:
+    /// `begin_write()` has already taken it. A delegate parked at a full cap can
+    /// ask in a loop, so the uncontested refusal path must not reach
+    /// `begin_write` at all, or every unrelated contract-state and metadata
+    /// write on the node contends with it.
+    ///
+    /// Source-scraped because "did not take a lock" is not observable from
+    /// outside, and a timing assertion for it passes on an idle box regardless.
+    #[test]
+    fn a_known_full_cap_refuses_without_taking_the_writer_lock() {
+        const SOURCE: &str = include_str!("redb.rs");
+        let start = SOURCE
+            .find("pub(crate) fn add_delegate_subscription_at(")
+            .expect("add_delegate_subscription_at must still exist");
+        let rel_end = SOURCE[start..]
+            .find("\n    }\n")
+            .expect("must still be a closed fn body");
+        let body = &crate::contract::tests::strip_comments(&SOURCE[start..start + rel_end]);
+
+        let write = body
+            .find("self.begin_write()")
+            .expect("the scraped window no longer reaches the write transaction. Widen it.");
+        let known_full = body
+            .find("if known_full {")
+            .expect("the read-side cap refusal must still exist");
+        let bail = body[known_full..]
+            .find("return Ok(false);")
+            .map(|i| known_full + i)
+            .expect("the read-side refusal must return");
+        assert!(
+            known_full < write && bail < write,
+            "the known-full refusal must be decided AND returned before \
+             `begin_write`. Got check at {known_full}, return at {bail}, \
+             begin_write at {write}."
+        );
+    }
+
+    /// Cap-refusal warnings must be throttled.
+    ///
+    /// A delegate parked at a full cap reaches the refusal on every attempt, so
+    /// an unthrottled `warn!` makes the containment mechanism its own
+    /// amplifier: the cheapest possible action produces one release-log line
+    /// each. Third instance of that shape in one release.
+    #[tokio::test]
+    async fn repeated_cap_refusals_do_not_log_every_time() {
+        let dir = TempDir::new().unwrap();
+        let store = ReDb::new(dir.path()).await.unwrap();
+
+        let contract = ContractInstanceId::new([33; 32]);
+        let now = 1_700_000_000_000u64;
+        let cap = ReDb::MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT;
+        let nth = |n: u16| {
+            let b = n.to_le_bytes();
+            DelegateKey::new([b[0]; 32], CodeHash::from_code(&[b[0], b[1]]))
+        };
+
+        // Fill this contract to its per-contract cap in one transaction.
+        {
+            let txn = store.begin_write().unwrap();
+            {
+                let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE).unwrap();
+                for n in 0..cap {
+                    let key = ReDb::delegate_subscription_row_key(&contract, &nth(n as u16));
+                    tbl.insert(key.as_slice(), now.to_be_bytes().as_slice())
+                        .unwrap();
+                }
+            }
+            ReDb::commit_guarded(txn).unwrap();
+        }
+
+        let before = ReDb::delegate_subscription_cap_refusals();
+        let overflow = nth(cap as u16);
+        for _ in 0..200 {
+            assert!(
+                !store
+                    .add_delegate_subscription_at(&contract, &overflow, now)
+                    .unwrap(),
+                "every attempt past the cap must be refused"
+            );
+        }
+        let refused = ReDb::delegate_subscription_cap_refusals() - before;
+        assert_eq!(
+            refused, 200,
+            "every refusal must be COUNTED, or the throttle has gone silent \
+             rather than quiet and a saturated node reports nothing at all"
+        );
+    }
+
     /// A refused subscribe must not commit a write transaction.
     ///
     /// A refusal writes nothing, so committing costs an fsync and an
@@ -3781,8 +4104,14 @@ mod tests {
         let guard = body
             .find("if !admitted {")
             .expect("the refusal must still be gated on `!admitted`, or this pin is                      asserting about text that no longer runs");
-        let bail = body
+        // Search AFTER the guard, not from the start. The read-side known-full
+        // refusal added its own earlier `return Ok(false);`, and a bare `find`
+        // picked that one up and reported the guard as coming after its own
+        // return. The pin failed loudly rather than passing on the wrong
+        // occurrence, which is the behaviour to keep.
+        let bail = body[guard..]
             .find("return Ok(false);")
+            .map(|i| guard + i)
             .expect("a refusal must return before the commit, not fall through to it");
         assert!(
             guard < bail && bail < commit,

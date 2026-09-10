@@ -154,6 +154,16 @@ pub(crate) fn forget_delegate<S: DelegateSubscriptionPersistence + ?Sized>(
     for contract in &affected {
         persist_remove_one(db, contract, delegate);
     }
+    // The registry walk above only reaches rows the registry HOLDS. Boot restore
+    // deliberately keeps a row whose contract does not resolve without
+    // registering it, so those are invisible here and would outlive the delegate
+    // that owns them, holding a slot against both caps and being restored again
+    // if the same delegate is ever reinstalled. Sweep the durable side by
+    // delegate as well, which is a full scan and affordable because
+    // `UnregisterDelegate` is rare.
+    if let Some(db) = db {
+        db.forget_delegate_subscriptions_for_delegate(delegate);
+    }
     affected
 }
 
@@ -264,6 +274,14 @@ pub trait DelegateSubscriptionPersistence: Send + Sync {
 
     /// Forget every row for `contract`. Idempotent.
     fn forget_delegate_subscriptions_for_contract(&self, _contract: &ContractInstanceId) {}
+
+    /// Forget every row for `delegate`, whatever contract it names. Idempotent.
+    ///
+    /// Distinct from removing the rows a registry walk can see: boot restore
+    /// keeps rows whose contract does not resolve and does NOT register them,
+    /// so a registry-only teardown cannot reach them and they would outlive the
+    /// delegate that owns them.
+    fn forget_delegate_subscriptions_for_delegate(&self, _delegate: &DelegateKey) {}
 
     /// Every recorded `(contract, delegate)` pair, for boot restore.
     ///
