@@ -152,12 +152,31 @@ actors (clients, network peers) can influence.
      implementation, which is how a second backend ships without the bound
      and nobody notices.
 
-     Three instances turned up in one night on the #5467 delegate work:
-     the delegate pin cap, `MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT` on
-     the durable subscription rows (#5493), and a transport stream cap
-     that was rejected for the same reason. None was a live defect on its
-     own. The class is worth naming because all three read as bounded and
-     none of them re-checks anything.
+     Four instances turned up in one night on the #5467 delegate work:
+     the delegate pin cap over `client_subscriptions`,
+     `MAX_DELEGATE_SUBSCRIPTIONS_PER_CONTRACT` over the durable rows
+     (#5493), `MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE` over `BY_DELEGATE`,
+     the reverse index counting distinct contracts one delegate holds
+     (#5623), and a transport stream cap that was rejected for the same
+     reason. None was a live defect on its own. The class is worth naming
+     because all of them read as bounded and none re-checks anything.
+
+     **Four caps over four DIFFERENT sets, in one subsystem.** A delegate
+     can sit at #5623's cap while nowhere near the pin cap, and the two
+     refusals mean different things to whoever reads them. #5493's test
+     `the_row_cap_and_the_pin_cap_count_different_sets` is an author
+     documenting that two of them cannot agree by construction.
+
+     When you find yourself adding the fourth cap over the fourth set, the
+     caps are not the problem. It means the thing being capped is not one
+     object: here "a delegate subscription" is an in-memory forward entry,
+     a reverse-index entry, a hosting pin and a durable row, each acquired
+     and released by different code with no type-level connection. That is
+     the "paired `Option` fields that must co-occur" row in
+     `bug-prevention-patterns.md` at a larger scale, and it has the same
+     remedy: make it ONE object whose construction acquires every part and
+     whose `Drop` releases every part, so a cap counts the one set that
+     exists and a teardown cannot discharge three of four.
 
      Note this interacts with the two branches above. Reject-at-cap is
      only correct for entries that age out, so a cap enforced once at
