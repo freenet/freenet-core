@@ -356,22 +356,29 @@ impl OpManager {
         }
 
         // A fetch that cannot possibly route must NOT burn the shared 5-minute
-        // slot, and must not be reported to the delegate as started (#5542,
-        // review finding 5B). `try_auto_fetch_contract` has the same discipline:
-        // it takes the slot, fails to resolve a first-hop peer, and RELEASES the
-        // slot before returning. This path routes untargeted, so it has no
-        // first-hop peer to resolve; the equivalent precondition is having any
-        // connection at all. Checked BEFORE the slot is taken rather than
-        // released after, because there is nothing to undo.
+        // slot, and must not be reported to the delegate as started (#5542
+        // finding 5B). `try_auto_fetch_contract` has the same discipline: it
+        // takes the slot, fails to resolve a first-hop peer, and RELEASES it.
         //
-        // Without this, a node with no connections told the delegate "a
-        // background fetch has been started, so retry shortly" and then refused
-        // every retry for five minutes — the opposite of the honesty this
-        // message exists to provide.
-        if self.ring.connection_manager.num_connections() == 0 {
+        // "CANNOT ROUTE" IS NOT "ZERO PROMOTED CONNECTIONS", and conflating the
+        // two disabled this path for the whole bootstrap window. A node that
+        // has joined but not yet promoted any connection still reaches the
+        // network through a configured gateway: `start_sub_op_get`'s drivers all
+        // consult `bootstrap_gateway_target` for exactly that case, and there is
+        // a pin in `get/op_ctx_task.rs` requiring them to. Checking
+        // `num_connections() == 0` here refused before the primitive could use
+        // the fallback it already has, so delegate UPDATE self-healing was off
+        // until ring promotion — on a path this PR exists to add.
+        //
+        // Ask the same question the driver asks: no promoted connections AND no
+        // usable configured gateway.
+        let can_route = self.ring.connection_manager.connection_count() > 0
+            || crate::operations::bootstrap::bootstrap_gateway_target(self, |_| false).is_some();
+        if !can_route {
             tracing::debug!(
                 contract = %instance_id,
-                "Not starting a delegate-originated self-heal fetch: no connections"
+                "Not starting a delegate-originated self-heal fetch: no promoted \
+                 connections and no usable configured gateway"
             );
             return false;
         }

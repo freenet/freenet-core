@@ -149,6 +149,31 @@ pub(crate) fn record(
         .or_insert(Hold { key, release });
 }
 
+/// Whether THIS node already holds an interest obligation for
+/// `(contract, delegate)` (#5542, Codex P2).
+///
+/// The subscription registry `DELEGATE_SUBSCRIPTIONS` is process-global and
+/// carries no node identity, so asking it "is this delegate already subscribed"
+/// answers for the PROCESS, not for this node. In an in-process multi-node run
+/// the second node to subscribe the same delegate to the same contract sees the
+/// first node's entry, short-circuits, and returns `Ok(())` without taking its
+/// own local-interest refcount or establishing its own network subscription —
+/// the first-arrival process-global pattern `testing.md` describes.
+///
+/// This map IS node-keyed, so it can answer the per-node question. It is the
+/// right source for the idempotency gate for the same reason it was the right
+/// source for release: an entry exists if and only if THIS node actually took
+/// the refcount.
+pub(crate) fn holds(
+    contract: &ContractInstanceId,
+    delegate: &DelegateKey,
+    node: NodeIdentity,
+) -> bool {
+    DELEGATE_INTEREST_HOLDS
+        .get(&(*contract, delegate.clone()))
+        .is_some_and(|holds| holds.contains_key(&node))
+}
+
 /// Release every hold taken for `delegate`, across all contracts.
 ///
 /// Called from `UnregisterDelegate`, which drops the delegate from every

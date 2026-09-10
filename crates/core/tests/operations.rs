@@ -4360,40 +4360,69 @@ async fn put_and_await(
 /// against, because it reports success while checking less.
 async fn a_node_without_the_contract(
     ctx: &mut TestContext,
-    contract: &ContractContainer,
+    contract_name: &str,
     state: WrappedState,
     candidates: &[&str],
-) -> anyhow::Result<WebApi> {
-    let contract_key = contract.key();
-
-    let publisher = ctx.node("node-a")?;
-    let (stream_a, _) = connect_async(&publisher.ws_url()).await?;
-    let mut client_a = WebApi::start(stream_a);
-    put_and_await(&mut client_a, contract, state).await?;
-
+) -> anyhow::Result<(WebApi, ContractContainer)> {
+    // RETRY WITH A FRESH KEY rather than failing on the first unlucky placement
+    // (#5542 F6). The precondition this helper establishes is not under the
+    // test's control: under every-hop placement a PUT stores at every hop, so
+    // every candidate holding the contract is a routine outcome rather than an
+    // anomaly, and failing on it makes a correct implementation look broken.
+    //
+    // Each attempt PUTs a DIFFERENT instance of the same code — the parameters
+    // change the instance id, so each is an independent draw against the same
+    // topology. Covering every candidate once is ordinary; covering every
+    // candidate on all four independent keys is not, so a failure after that is
+    // signal rather than luck.
+    //
+    // ATTEMPT 0 USES EMPTY PARAMETERS, byte-identical to what this test did
+    // before, so the path CI has already exercised is unchanged and the retry
+    // only runs in the case that previously failed outright.
+    const MAX_PLACEMENT_ATTEMPTS: u8 = 4;
     let mut placement = Vec::new();
-    for name in candidates {
-        let node = ctx.node(name)?;
-        let (stream, _) = connect_async(&node.ws_url()).await?;
-        let mut client = WebApi::start(stream);
-        let holds = node_has_contract_locally(&mut client, contract_key).await?;
-        tracing::info!(node = %name, holds, "#5542: local-presence probe");
-        if !holds {
-            return Ok(client);
+    for attempt in 0..MAX_PLACEMENT_ATTEMPTS {
+        let params = if attempt == 0 {
+            Parameters::from(vec![])
+        } else {
+            Parameters::from(vec![attempt])
+        };
+        let contract = load_contract(contract_name, params)?;
+        let contract_key = contract.key();
+
+        let publisher = ctx.node("node-a")?;
+        let (stream_a, _) = connect_async(&publisher.ws_url()).await?;
+        let mut client_a = WebApi::start(stream_a);
+        put_and_await(&mut client_a, &contract, state.clone()).await?;
+
+        placement.clear();
+        for name in candidates {
+            let node = ctx.node(name)?;
+            let (stream, _) = connect_async(&node.ws_url()).await?;
+            let mut client = WebApi::start(stream);
+            let holds = node_has_contract_locally(&mut client, contract_key).await?;
+            tracing::info!(node = %name, attempt, holds, "#5542: local-presence probe");
+            if !holds {
+                return Ok((client, contract));
+            }
+            placement.push(*name);
         }
-        placement.push(*name);
+        tracing::warn!(
+            attempt,
+            ?placement,
+            "#5542: every candidate holds this instance; retrying with a fresh key"
+        );
     }
     bail!(
-        "every candidate node {placement:?} already holds {contract_key} locally, so a \
-         delegate operation on any of them is answered from the local store and this run \
-         cannot observe #5542 at all. Failing rather than passing vacuously — the earlier \
-         version of this test did the latter and was green against unfixed main. NOTE \
-         (#5542 finding F6): this precondition is not under the test's control. Under \
-         every-hop placement a PUT stores at every hop, so all candidates holding the \
-         contract is a routine placement outcome rather than an anomaly, and this failure \
-         may be luck rather than a regression. Re-run before investigating; the durable \
-         fix is to select the probe node by ring distance from the contract key, so the \
-         precondition becomes a property of the topology the test builds."
+        "every candidate node {placement:?} holds all {MAX_PLACEMENT_ATTEMPTS} independently \
+         keyed instances of this contract, so a delegate operation on any of them is \
+         answered from the local store and this run cannot observe #5542 at all. Failing \
+         rather than passing vacuously: the earlier version of this test did the latter and \
+         was green against unfixed main. One unlucky placement is ordinary and is retried; \
+         {MAX_PLACEMENT_ATTEMPTS} in a row is not, so treat this as signal about placement \
+         rather than as flakiness. The fully deterministic fix is to select the probe node \
+         by ring distance from the contract key, which needs the multi-node harness to \
+         validate."
     )
 }
 
@@ -4425,16 +4454,18 @@ async fn test_delegate_get_reaches_the_network_for_an_unseen_contract(
     const TEST_DELEGATE: &str = "test-delegate-capabilities";
     const TEST_CONTRACT: &str = "test-contract-integration";
 
-    let contract = load_contract(TEST_CONTRACT, Parameters::from(vec![]))?;
-    let contract_id = *contract.key().id();
     let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
     let delegate_key = delegate.key().clone();
 
     let state = WrappedState::from(test_utils::create_todo_list_with_item(
         "Published by node-a",
     ));
-    let mut client =
-        a_node_without_the_contract(ctx, &contract, state, &["node-b", "node-c", "node-d"]).await?;
+    // The helper chooses the instance, because it may need several to find a
+    // node that does not hold one (#5542 F6).
+    let (mut client, contract) =
+        a_node_without_the_contract(ctx, TEST_CONTRACT, state, &["node-b", "node-c", "node-d"])
+            .await?;
+    let contract_id = *contract.key().id();
 
     register_delegate(&mut client, &delegate, &delegate_key).await?;
 
@@ -4504,16 +4535,18 @@ async fn test_delegate_subscribe_reaches_the_network_for_an_unseen_contract(
     const TEST_DELEGATE: &str = "test-delegate-capabilities";
     const TEST_CONTRACT: &str = "test-contract-integration";
 
-    let contract = load_contract(TEST_CONTRACT, Parameters::from(vec![]))?;
-    let contract_id = *contract.key().id();
     let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
     let delegate_key = delegate.key().clone();
 
     let state = WrappedState::from(test_utils::create_todo_list_with_item(
         "Published by node-a",
     ));
-    let mut client =
-        a_node_without_the_contract(ctx, &contract, state, &["node-b", "node-c", "node-d"]).await?;
+    // The helper chooses the instance, because it may need several to find a
+    // node that does not hold one (#5542 F6).
+    let (mut client, contract) =
+        a_node_without_the_contract(ctx, TEST_CONTRACT, state, &["node-b", "node-c", "node-d"])
+            .await?;
+    let contract_id = *contract.key().id();
 
     register_delegate(&mut client, &delegate, &delegate_key).await?;
 

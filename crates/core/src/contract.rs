@@ -687,10 +687,33 @@ where
 fn already_subscribed(
     contract_id: &freenet_stdlib::prelude::ContractInstanceId,
     delegate_key: &DelegateKey,
+    op_manager: Option<&std::sync::Arc<crate::node::OpManager>>,
 ) -> bool {
-    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-        .get(contract_id)
-        .is_some_and(|subs| subs.contains(delegate_key))
+    match op_manager {
+        // PER-NODE, because the question is "has THIS node established it"
+        // (#5542, Codex P2). `DELEGATE_SUBSCRIPTIONS` is process-global and
+        // carries no node identity, so consulting it alone answers for the
+        // PROCESS: in an in-process multi-node run the second node to subscribe
+        // the same delegate to the same contract saw the first node's entry,
+        // short-circuited, and returned `Ok(())` having taken no refcount of its
+        // own and established no network subscription. The first-arrival
+        // process-global pattern from `testing.md`.
+        //
+        // Note the node-keyed hold map alone could not fix that: it made the
+        // RELEASE side per-node while this gate, one level above it, still
+        // answered from another node's registration and returned before any
+        // hold was recorded.
+        Some(op_manager) => crate::wasm_runtime::delegate_interest::holds(
+            contract_id,
+            delegate_key,
+            op_manager.node_identity,
+        ),
+        // No `OpManager`: no refcount can have been taken, so the registry is
+        // the only record there is, and a mock executor has exactly one node.
+        None => crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+            .get(contract_id)
+            .is_some_and(|subs| subs.contains(delegate_key)),
+    }
 }
 
 /// Build the terminal inbound message for a delegate network operation (#5542).
@@ -1702,6 +1725,7 @@ where
                                 < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
                         {
                             pending_contract_ops.push(delegate_park::PendingContractOp {
+                                id: delegate_park::PendingContractOp::next_id(),
                                 contract_id,
                                 kind: delegate_park::ContractOpKind::Get,
                                 context,
@@ -2064,183 +2088,187 @@ where
                 // `handle_broadcast_change_interests` the payload is
                 // `Vec<u32>` interest hashes and the `ContractInstanceId` is
                 // gone.
+                let op_manager_for_gate = contract_handler.executor().op_manager_handle();
                 let banned = delegate_network_op_banned(contract_handler, &contract_id);
-                let result = if already_subscribed(&contract_id, delegate_key) {
-                    // ALREADY HELD, so re-asserting it must be a no-op.
-                    //
-                    // This gate is load-bearing and is not obvious from the
-                    // code it guards. Both the network path and (since M4) the
-                    // local path end in `InterestManager::add_local_client`,
-                    // which is a REFCOUNT and is explicitly NOT idempotent (see
-                    // the `!is_renewal` gate at `operations/subscribe.rs`).
-                    // `DELEGATE_SUBSCRIPTIONS` is a map keyed by delegate, so
-                    // the pre-#5542 arm was idempotent for free and a delegate
-                    // re-subscribing in a loop cost nothing. Without this gate
-                    // each repeat takes another interest refcount for one
-                    // logical subscriber: demand that is never released,
-                    // growing without bound, on the exact path #5467 exists to
-                    // make trustworthy.
-                    Ok(())
-                } else if banned {
-                    // Every subscribe path refuses a banned contract, local or
-                    // network. Before this the local branch answered `Ok` and
-                    // advertised interest for it.
-                    tracing::warn!(
-                        contract = %contract_id,
-                        delegate_key = %delegate_key,
-                        "Refusing a delegate SUBSCRIBE for a contract this node \
-                         has banned (#5542 finding N2)"
-                    );
-                    Err("this node has banned this contract (#5542)".to_string())
-                } else if let Some(full_key) = local_key {
-                    // Contract is local, WITH state. Register the notification
-                    // hook — and register DEMAND, which this branch did not do
-                    // before (#5542 finding M4/F3).
-                    //
-                    // Without demand the copy is a zero-subscriber cached
-                    // contract, so under subscriber-primary eviction (hosting
-                    // invariant 3) it is the FIRST victim once capacity binds.
-                    // Eviction reclaims disk through
-                    // `ContractStore::remove_contract`, which wipes the
-                    // registry entry and releases any hold — and the delegate is
-                    // never told. That is #5467's silent-on-both-sides failure
-                    // on the branch this PR left unchanged, and it is the COMMON
-                    // case, because any client that has ever touched the
-                    // contract puts the node on this branch.
-                    //
-                    // This is also what the PR's own argument demands. It says
-                    // three things have to happen together — bootstrap the body,
-                    // register demand so the contract is not evicted out from
-                    // under the subscription, and establish the subscription.
-                    // On this branch the body is already here and the node is
-                    // already in the mesh for it, so item 2 was the only one
-                    // missing.
-                    let interest_registered = match contract_handler.executor().op_manager_handle()
+                let result =
+                    if already_subscribed(&contract_id, delegate_key, op_manager_for_gate.as_ref())
                     {
-                        Some(op_manager) => {
-                            if op_manager.interest_manager.add_local_client(&full_key) {
-                                crate::operations::broadcast_change_interests(
-                                    &op_manager,
-                                    vec![full_key],
-                                    vec![],
-                                )
-                                .await;
-                            }
-                            crate::wasm_runtime::delegate_interest::record(
-                                contract_id,
-                                delegate_key.clone(),
-                                full_key,
-                                delegate_interest_release_closure(&op_manager),
-                                op_manager.node_identity,
-                            );
-                            true
-                        }
-                        // No `OpManager` means no eviction pressure worth
-                        // guarding against either: this is a mock/in-process
-                        // executor, so keep the pre-#5542 local-only answer.
-                        None => false,
-                    };
-                    tracing::debug!(
-                        contract = %contract_id,
-                        delegate_key = %delegate_key,
-                        interest_registered,
-                        "Delegate subscribed to a contract this node already holds"
-                    );
-                    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-                        .entry(contract_id)
-                        .or_default()
-                        .insert(delegate_key.clone());
-                    Ok(())
-                } else if parking.is_some()
-                    && can_reach_network
-                    && !banned
-                    && pending_contract_ops.len() + self_heal_fetches_started
-                        < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
-                    && !pending_contract_ops.iter().any(|op| {
-                        op.contract_id == contract_id
-                            && op.kind == delegate_park::ContractOpKind::Subscribe
-                    })
-                {
-                    // #5542. Subscribing to a contract this node has never seen
-                    // is the PRIMARY use case, not an edge case: a delegate that
-                    // wants to learn about a per-address contract after the tab
-                    // is closed has no other way to name it.
-                    //
-                    // OPENING THIS GATE ALONE WOULD SHIP THE FEATURE SILENT.
-                    // The arm above does one thing — insert into
-                    // `DELEGATE_SUBSCRIPTIONS` — which is a local notification
-                    // hook that nothing in `ring/` reads. It establishes no
-                    // network subscription, so a delegate would subscribe
-                    // successfully to a contract it has never seen and then
-                    // never hear anything, which is #5467's silent-on-both-sides
-                    // failure reintroduced one layer up. Three things have to
-                    // happen together, and `run_executor_subscribe` is chosen
-                    // because it is the one entry point that does all three:
-                    //
-                    //   1. bootstrap the contract body
-                    //      (`finalize_originator_subscribe` ->
-                    //      `fetch_contract_if_missing` -> `start_sub_op_get`),
-                    //   2. register demand (`interest_manager.add_local_client`,
-                    //      so the contract is kept alive rather than evicted out
-                    //      from under the subscription),
-                    //   3. establish the real network subscription.
-                    //
-                    // The notification hook (the `DELEGATE_SUBSCRIPTIONS`
-                    // insert) is then done on the loop when the park resumes, and
-                    // ONLY on success — so a failed subscribe leaves no hook
-                    // claiming a delivery path that does not exist.
-                    //
-                    // The last conjunct de-duplicates WITHIN this round trip;
-                    // `already_subscribed` covers repeats ACROSS round trips.
-                    // Both are needed for the refcount argument above to hold.
-                    pending_contract_ops.push(delegate_park::PendingContractOp {
-                        contract_id,
-                        kind: delegate_park::ContractOpKind::Subscribe,
-                        context,
-                    });
-                    continue;
-                } else {
-                    // REFUSED, never inline — same rule as the GET arm above.
-                    // Unlike GET, `SubscribeContractResponse.result` is a
-                    // `Result<(), String>`, so this refusal IS visible to the
-                    // delegate and says which of the three reasons it was.
-                    let why = if !can_reach_network {
-                        "this node has no network handle"
-                    } else if parking.is_none() {
-                        "delegate parking is unavailable on this executor"
-                    } else if pending_contract_ops.iter().any(|op| {
-                        op.contract_id == contract_id
-                            && op.kind == delegate_park::ContractOpKind::Subscribe
-                    }) {
-                        // #5542 finding M2. A delegate that emits two SUBSCRIBEs
-                        // for the same unseen contract in ONE invocation gets an
-                        // error for the second and a success for the first,
-                        // where the pre-#5542 `HashSet` arm was idempotent. The
-                        // duplicate cannot simply be answered `Ok`: nothing is
-                        // subscribed yet, and saying so before the network
-                        // subscribe exists is the lie #5263 removed from this
-                        // path. Nor can it be parked twice: two
-                        // `PendingContractOp`s for one pair would take two
-                        // interest refcounts for one logical subscriber. So it
-                        // is refused, but refused HONESTLY — the old text
-                        // blamed the fan-out cap, which was simply untrue.
-                        "a subscribe for this contract is already in flight in \
-                         this invocation; its response answers both"
+                        // ALREADY HELD, so re-asserting it must be a no-op.
+                        //
+                        // This gate is load-bearing and is not obvious from the
+                        // code it guards. Both the network path and (since M4) the
+                        // local path end in `InterestManager::add_local_client`,
+                        // which is a REFCOUNT and is explicitly NOT idempotent (see
+                        // the `!is_renewal` gate at `operations/subscribe.rs`).
+                        // `DELEGATE_SUBSCRIPTIONS` is a map keyed by delegate, so
+                        // the pre-#5542 arm was idempotent for free and a delegate
+                        // re-subscribing in a loop cost nothing. Without this gate
+                        // each repeat takes another interest refcount for one
+                        // logical subscriber: demand that is never released,
+                        // growing without bound, on the exact path #5467 exists to
+                        // make trustworthy.
+                        Ok(())
+                    } else if banned {
+                        // Every subscribe path refuses a banned contract, local or
+                        // network. Before this the local branch answered `Ok` and
+                        // advertised interest for it.
+                        tracing::warn!(
+                            contract = %contract_id,
+                            delegate_key = %delegate_key,
+                            "Refusing a delegate SUBSCRIBE for a contract this node \
+                             has banned (#5542 finding N2)"
+                        );
+                        Err("this node has banned this contract (#5542)".to_string())
+                    } else if let Some(full_key) = local_key {
+                        // Contract is local, WITH state. Register the notification
+                        // hook — and register DEMAND, which this branch did not do
+                        // before (#5542 finding M4/F3).
+                        //
+                        // Without demand the copy is a zero-subscriber cached
+                        // contract, so under subscriber-primary eviction (hosting
+                        // invariant 3) it is the FIRST victim once capacity binds.
+                        // Eviction reclaims disk through
+                        // `ContractStore::remove_contract`, which wipes the
+                        // registry entry and releases any hold — and the delegate is
+                        // never told. That is #5467's silent-on-both-sides failure
+                        // on the branch this PR left unchanged, and it is the COMMON
+                        // case, because any client that has ever touched the
+                        // contract puts the node on this branch.
+                        //
+                        // This is also what the PR's own argument demands. It says
+                        // three things have to happen together — bootstrap the body,
+                        // register demand so the contract is not evicted out from
+                        // under the subscription, and establish the subscription.
+                        // On this branch the body is already here and the node is
+                        // already in the mesh for it, so item 2 was the only one
+                        // missing.
+                        let interest_registered =
+                            match contract_handler.executor().op_manager_handle() {
+                                Some(op_manager) => {
+                                    if op_manager.interest_manager.add_local_client(&full_key) {
+                                        crate::operations::broadcast_change_interests(
+                                            &op_manager,
+                                            vec![full_key],
+                                            vec![],
+                                        )
+                                        .await;
+                                    }
+                                    crate::wasm_runtime::delegate_interest::record(
+                                        contract_id,
+                                        delegate_key.clone(),
+                                        full_key,
+                                        delegate_interest_release_closure(&op_manager),
+                                        op_manager.node_identity,
+                                    );
+                                    true
+                                }
+                                // No `OpManager` means no eviction pressure worth
+                                // guarding against either: this is a mock/in-process
+                                // executor, so keep the pre-#5542 local-only answer.
+                                None => false,
+                            };
+                        tracing::debug!(
+                            contract = %contract_id,
+                            delegate_key = %delegate_key,
+                            interest_registered,
+                            "Delegate subscribed to a contract this node already holds"
+                        );
+                        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+                            .entry(contract_id)
+                            .or_default()
+                            .insert(delegate_key.clone());
+                        Ok(())
+                    } else if parking.is_some()
+                        && can_reach_network
+                        && !banned
+                        && pending_contract_ops.len() + self_heal_fetches_started
+                            < delegate_park::MAX_NETWORK_CONTRACT_OPS_PER_PARK
+                        && !pending_contract_ops.iter().any(|op| {
+                            op.contract_id == contract_id
+                                && op.kind == delegate_park::ContractOpKind::Subscribe
+                        })
+                    {
+                        // #5542. Subscribing to a contract this node has never seen
+                        // is the PRIMARY use case, not an edge case: a delegate that
+                        // wants to learn about a per-address contract after the tab
+                        // is closed has no other way to name it.
+                        //
+                        // OPENING THIS GATE ALONE WOULD SHIP THE FEATURE SILENT.
+                        // The arm above does one thing — insert into
+                        // `DELEGATE_SUBSCRIPTIONS` — which is a local notification
+                        // hook that nothing in `ring/` reads. It establishes no
+                        // network subscription, so a delegate would subscribe
+                        // successfully to a contract it has never seen and then
+                        // never hear anything, which is #5467's silent-on-both-sides
+                        // failure reintroduced one layer up. Three things have to
+                        // happen together, and `run_executor_subscribe` is chosen
+                        // because it is the one entry point that does all three:
+                        //
+                        //   1. bootstrap the contract body
+                        //      (`finalize_originator_subscribe` ->
+                        //      `fetch_contract_if_missing` -> `start_sub_op_get`),
+                        //   2. register demand (`interest_manager.add_local_client`,
+                        //      so the contract is kept alive rather than evicted out
+                        //      from under the subscription),
+                        //   3. establish the real network subscription.
+                        //
+                        // The notification hook (the `DELEGATE_SUBSCRIPTIONS`
+                        // insert) is then done on the loop when the park resumes, and
+                        // ONLY on success — so a failed subscribe leaves no hook
+                        // claiming a delivery path that does not exist.
+                        //
+                        // The last conjunct de-duplicates WITHIN this round trip;
+                        // `already_subscribed` covers repeats ACROSS round trips.
+                        // Both are needed for the refcount argument above to hold.
+                        pending_contract_ops.push(delegate_park::PendingContractOp {
+                            id: delegate_park::PendingContractOp::next_id(),
+                            contract_id,
+                            kind: delegate_park::ContractOpKind::Subscribe,
+                            context,
+                        });
+                        continue;
                     } else {
-                        "too many delegate network operations already in flight \
+                        // REFUSED, never inline — same rule as the GET arm above.
+                        // Unlike GET, `SubscribeContractResponse.result` is a
+                        // `Result<(), String>`, so this refusal IS visible to the
+                        // delegate and says which of the three reasons it was.
+                        let why = if !can_reach_network {
+                            "this node has no network handle"
+                        } else if parking.is_none() {
+                            "delegate parking is unavailable on this executor"
+                        } else if pending_contract_ops.iter().any(|op| {
+                            op.contract_id == contract_id
+                                && op.kind == delegate_park::ContractOpKind::Subscribe
+                        }) {
+                            // #5542 finding M2. A delegate that emits two SUBSCRIBEs
+                            // for the same unseen contract in ONE invocation gets an
+                            // error for the second and a success for the first,
+                            // where the pre-#5542 `HashSet` arm was idempotent. The
+                            // duplicate cannot simply be answered `Ok`: nothing is
+                            // subscribed yet, and saying so before the network
+                            // subscribe exists is the lie #5263 removed from this
+                            // path. Nor can it be parked twice: two
+                            // `PendingContractOp`s for one pair would take two
+                            // interest refcounts for one logical subscriber. So it
+                            // is refused, but refused HONESTLY — the old text
+                            // blamed the fan-out cap, which was simply untrue.
+                            "a subscribe for this contract is already in flight in \
+                         this invocation; its response answers both"
+                        } else {
+                            "too many delegate network operations already in flight \
                          (MAX_NETWORK_CONTRACT_OPS_PER_PARK)"
+                        };
+                        tracing::warn!(
+                            contract = %contract_id,
+                            delegate_key = %delegate_key,
+                            why,
+                            "Refusing a delegate SUBSCRIBE for a contract this node \
+                             has not seen (#5542)"
+                        );
+                        Err(format!(
+                            "cannot subscribe to a contract this node has not seen: {why}"
+                        ))
                     };
-                    tracing::warn!(
-                        contract = %contract_id,
-                        delegate_key = %delegate_key,
-                        why,
-                        "Refusing a delegate SUBSCRIBE for a contract this node \
-                         has not seen (#5542)"
-                    );
-                    Err(format!(
-                        "cannot subscribe to a contract this node has not seen: {why}"
-                    ))
-                };
 
                 inbound_responses.push(InboundDelegateMsg::SubscribeContractResponse(
                     SubscribeContractResponse {
@@ -2538,12 +2566,13 @@ where
                         // EVERY exit — including a panic or cancellation, which
                         // reach `Drop` and never run the task's own cleanup.
                         let owed_contract_ops: Vec<(
+                            u64,
                             ContractInstanceId,
                             delegate_park::ContractOpKind,
                             DelegateContext,
                         )> = pending_contract_ops
                             .iter()
-                            .map(|op| (op.contract_id, op.kind, op.context.clone()))
+                            .map(|op| (op.id, op.contract_id, op.kind, op.context.clone()))
                             .collect();
                         // SINKS CREATED BEFORE THE GUARD, AND SHARED WITH IT
                         // (#5544 F2). They used to be created inside the
@@ -8575,6 +8604,7 @@ mod hol_4391_tests {
             &mut handler,
             ResolvedContractOp {
                 pending: PendingContractOp {
+                    id: delegate_park::PendingContractOp::next_id(),
                     contract_id: ok_id,
                     kind: ContractOpKind::Subscribe,
                     context: DelegateContext::default(),
@@ -8587,6 +8617,7 @@ mod hol_4391_tests {
             &mut handler,
             ResolvedContractOp {
                 pending: PendingContractOp {
+                    id: delegate_park::PendingContractOp::next_id(),
                     contract_id: bad_id,
                     kind: ContractOpKind::Subscribe,
                     context: DelegateContext::default(),
@@ -8597,11 +8628,11 @@ mod hol_4391_tests {
         );
 
         assert!(
-            already_subscribed(&ok_id, &dkey),
+            already_subscribed(&ok_id, &dkey, None),
             "a successful subscribe must install the notification hook"
         );
         assert!(
-            !already_subscribed(&bad_id, &dkey),
+            !already_subscribed(&bad_id, &dkey, None),
             "a FAILED subscribe must not install a hook: it would advertise a \
              delivery path that was never established"
         );
@@ -8921,7 +8952,7 @@ mod hol_4391_tests {
              signal the node has that it wants it gone (#5542 N2)"
         );
         assert!(
-            !already_subscribed(banned_key.id(), &dkey),
+            !already_subscribed(banned_key.id(), &dkey, None),
             "and it must not install a notification hook for it either"
         );
 
@@ -8934,7 +8965,7 @@ mod hol_4391_tests {
              (#5542 M4)"
         );
         assert!(
-            already_subscribed(allowed_key.id(), &dkey),
+            already_subscribed(allowed_key.id(), &dkey, None),
             "and it must install the notification hook"
         );
         assert!(
@@ -9108,6 +9139,7 @@ mod hol_4391_tests {
                 unresolved_upserts: Vec::new(),
                 contract_ops: vec![ResolvedContractOp {
                     pending: PendingContractOp {
+                        id: delegate_park::PendingContractOp::next_id(),
                         contract_id: id,
                         kind: ContractOpKind::Subscribe,
                         context: DelegateContext::default(),
@@ -9132,7 +9164,7 @@ mod hol_4391_tests {
              no hold was recorded (#5542 finding B3)"
         );
         assert!(
-            !already_subscribed(&id, &dkey),
+            !already_subscribed(&id, &dkey, None),
             "and it must NOT install a notification hook: the delegate may be \
              gone by now, and advertising a delivery path nothing will serve is \
              the failure this PR exists to prevent"
@@ -9339,6 +9371,7 @@ mod hol_4391_tests {
             &mut handler,
             ResolvedContractOp {
                 pending: PendingContractOp {
+                    id: delegate_park::PendingContractOp::next_id(),
                     contract_id: id,
                     kind: ContractOpKind::Subscribe,
                     context: DelegateContext::default(),

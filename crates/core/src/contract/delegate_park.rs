@@ -696,12 +696,37 @@ pub(super) enum ContractOpKind {
 /// pure data - but the SUBSCRIBE registry insert is still done there, so
 /// `DELEGATE_SUBSCRIPTIONS` is only ever written from one place.
 pub(super) struct PendingContractOp {
+    /// Unique per request, for the lifetime of the process.
+    ///
+    /// Reconciliation used to match owed against resolved by
+    /// `(contract_id, kind)` COUNT. That is enough to get the NUMBER of
+    /// unresolved operations right, and not enough to get their IDENTITY right:
+    /// two GETs naming the same contract with DIFFERENT `DelegateContext`s are
+    /// interchangeable under that key, so if only the second completes, the
+    /// count consumes the FIRST owed entry, the real response carries the
+    /// second's context, and the synthesized failure carries the second's
+    /// context too. One request gets two answers and the other gets none, and
+    /// the delegate's own correlation state is what is swapped.
+    ///
+    /// That only became reachable when the context was added to the owed
+    /// entries (#5542 F7). Before it, every synthesized failure carried
+    /// `DelegateContext::default()`, so there was no identity to mismatch.
+    pub id: u64,
     pub contract_id: ContractInstanceId,
     pub kind: ContractOpKind,
     /// Echoed back to the delegate so it can match the response to its request.
     /// This is the continuation state that survives the park: the delegate's
     /// own `DelegateContext` round-trips through the response.
     pub context: DelegateContext,
+}
+
+impl PendingContractOp {
+    /// Next request id. Monotonic per process; only ever compared for equality
+    /// within one park's owed/resolved reconciliation.
+    pub(super) fn next_id() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// What a [`PendingContractOp`]'s network work produced.
@@ -814,7 +839,7 @@ struct ParkGuardPayload {
     /// corrupts it instead of merely failing an operation. The obligation is
     /// outstanding for up to PARK_WORK_BUDGET (75 s), so this is not a
     /// vanishing window.
-    owed_contract_ops: Vec<(ContractInstanceId, ContractOpKind, DelegateContext)>,
+    owed_contract_ops: Vec<(u64, ContractInstanceId, ContractOpKind, DelegateContext)>,
     /// Where the off-loop task deposits finished network operations, shared with
     /// the task for the same reason as `answers` and `fetches`: so `Drop` can
     /// see work that completed before a panic or cancellation (#5544 F2).
@@ -831,7 +856,7 @@ impl ParkGuard {
         owed_upserts: Vec<(ContractInstanceId, bool)>,
         answers: std::sync::Arc<std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>>,
         fetches: std::sync::Arc<std::sync::Mutex<Vec<ResolvedUpsert>>>,
-        owed_contract_ops: Vec<(ContractInstanceId, ContractOpKind, DelegateContext)>,
+        owed_contract_ops: Vec<(u64, ContractInstanceId, ContractOpKind, DelegateContext)>,
         contract_ops: std::sync::Arc<std::sync::Mutex<Vec<ResolvedContractOp>>>,
     ) -> Self {
         Self {
@@ -965,19 +990,26 @@ impl ParkGuard {
             );
         }
 
-        // Same count-not-set reconciliation as the upserts above, for the same
-        // reason (#5544 F1/F3): `owed_contract_ops` is a multiset.
-        let mut resolved_ops: HashMap<(ContractInstanceId, ContractOpKind), usize> = HashMap::new();
-        for r in &contract_ops {
-            *resolved_ops
-                .entry((r.pending.contract_id, r.pending.kind))
-                .or_default() += 1;
-        }
+        // RECONCILED BY REQUEST IDENTITY, not by `(contract, kind)` count.
+        //
+        // A count gets the NUMBER of unresolved operations right and their
+        // IDENTITY wrong. Two GETs naming one contract are interchangeable
+        // under that key, so when only the second completes, the count consumes
+        // the FIRST owed entry while the real response and the synthesized
+        // failure both carry the SECOND's `DelegateContext` — one request
+        // answered twice, one never, and the delegate's correlation state
+        // swapped underneath it. Matching on `PendingContractOp::id` cannot
+        // confuse two requests, whatever they name.
+        //
+        // This subsumes the multiset reasoning that was here (#5544 F1/F3):
+        // distinct requests have distinct ids, so duplicates are handled by
+        // construction rather than by counting.
+        let resolved_ids: std::collections::HashSet<u64> =
+            contract_ops.iter().map(|r| r.pending.id).collect();
         let mut unresolved_contract_ops = Vec::new();
-        for (id, kind, context) in owed_contract_ops {
-            match resolved_ops.get_mut(&(id, kind)) {
-                Some(n) if *n > 0 => *n -= 1,
-                _ => unresolved_contract_ops.push((id, kind, context)),
+        for (op_id, id, kind, context) in owed_contract_ops {
+            if !resolved_ids.contains(&op_id) {
+                unresolved_contract_ops.push((id, kind, context));
             }
         }
         if !unresolved_contract_ops.is_empty() {
@@ -2447,10 +2479,22 @@ mod tests {
     }
 
     fn net_op(contract: u8, kind: ContractOpKind) -> PendingContractOp {
+        net_op_with(PendingContractOp::next_id(), contract, kind, Vec::new())
+    }
+
+    /// A pending op with an explicit id and context, so a test can express
+    /// TWO DISTINCT requests that look identical under `(contract, kind)`.
+    fn net_op_with(
+        id: u64,
+        contract: u8,
+        kind: ContractOpKind,
+        context: Vec<u8>,
+    ) -> PendingContractOp {
         PendingContractOp {
+            id,
             contract_id: ContractInstanceId::new([contract; 32]),
             kind,
-            context: DelegateContext::default(),
+            context: DelegateContext::new(context),
         }
     }
 
@@ -2483,11 +2527,13 @@ mod tests {
             fetches,
             vec![
                 (
+                    1,
                     ContractInstanceId::new([9; 32]),
                     ContractOpKind::Get,
                     DelegateContext::new(b"ctx-get".to_vec()),
                 ),
                 (
+                    2,
                     ContractInstanceId::new([8; 32]),
                     ContractOpKind::Subscribe,
                     DelegateContext::new(b"ctx-sub".to_vec()),
@@ -2528,10 +2574,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (answers, fetches) = sinks();
         let net_ops: std::sync::Arc<std::sync::Mutex<Vec<ResolvedContractOp>>> = Default::default();
-        net_ops
-            .lock()
-            .unwrap()
-            .push(resolved_net_op(9, ContractOpKind::Get));
+        // The SECOND request is the one that completed. Under the old
+        // count-based reconciliation this discharged the FIRST owed entry.
+        net_ops.lock().unwrap().push(ResolvedContractOp {
+            pending: net_op_with(12, 9, ContractOpKind::Get, b"second".to_vec()),
+            outcome: ContractOpOutcome::Fetched(None),
+        });
         drop(ParkGuard::new(
             tx,
             key(1),
@@ -2542,14 +2590,16 @@ mod tests {
             fetches,
             vec![
                 (
+                    11,
                     ContractInstanceId::new([9; 32]),
                     ContractOpKind::Get,
-                    DelegateContext::default(),
+                    DelegateContext::new(b"first".to_vec()),
                 ),
                 (
+                    12,
                     ContractInstanceId::new([9; 32]),
                     ContractOpKind::Get,
-                    DelegateContext::default(),
+                    DelegateContext::new(b"second".to_vec()),
                 ),
             ],
             net_ops,
@@ -2565,10 +2615,14 @@ mod tests {
             vec![(
                 ContractInstanceId::new([9; 32]),
                 ContractOpKind::Get,
-                DelegateContext::default()
+                DelegateContext::new(b"first".to_vec())
             )],
-            "one completion must discharge exactly ONE of two identical \
-             obligations, not both"
+            "one completion must discharge exactly ONE of two obligations that \
+             look identical under `(contract, kind)` — and it must discharge \
+             THE ONE THAT COMPLETED. Reconciling by count consumed the FIRST \
+             owed entry while the real response and the synthesized failure \
+             both carried the SECOND's context: one request answered twice, one \
+             never (#5542, Codex P2)"
         );
     }
 
@@ -2581,10 +2635,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (answers, fetches) = sinks();
         let net_ops: std::sync::Arc<std::sync::Mutex<Vec<ResolvedContractOp>>> = Default::default();
-        net_ops
-            .lock()
-            .unwrap()
-            .push(resolved_net_op(9, ContractOpKind::Get));
+        net_ops.lock().unwrap().push(ResolvedContractOp {
+            pending: net_op_with(21, 9, ContractOpKind::Get, Vec::new()),
+            outcome: ContractOpOutcome::Fetched(None),
+        });
         drop(ParkGuard::new(
             tx,
             key(1),
@@ -2595,11 +2649,13 @@ mod tests {
             fetches,
             vec![
                 (
+                    21,
                     ContractInstanceId::new([9; 32]),
                     ContractOpKind::Get,
                     DelegateContext::default(),
                 ),
                 (
+                    22,
                     ContractInstanceId::new([9; 32]),
                     ContractOpKind::Subscribe,
                     DelegateContext::default(),
