@@ -135,7 +135,7 @@ impl InMemoryContractStore {
         // standing. Not caught by
         // `delegate_interest::tests::every_subscription_removal_site_releases_its_interest`,
         // which scrapes the three sites it knows about and cannot see a fourth.
-        super::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+        super::delegate_subscriptions::remove_contract(key.id());
         super::delegate_interest::release_contract(key.id());
         let mut inner = self.inner.lock().unwrap();
         inner.instance_to_code.remove(key.id());

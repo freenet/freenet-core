@@ -681,7 +681,7 @@ where
 ///
 /// Extracted so the non-idempotency guard in the SUBSCRIBE arm has a name, and
 /// so it can be unit-tested without a running loop. See that call site for why
-/// the guard exists: `add_local_client` is a refcount, `DELEGATE_SUBSCRIPTIONS`
+/// the guard exists: `add_local_client` is a refcount, the subscription registry
 /// is a set, and wiring the network path in without this makes a re-subscribe
 /// leak demand.
 fn already_subscribed(
@@ -691,7 +691,7 @@ fn already_subscribed(
 ) -> bool {
     match op_manager {
         // PER-NODE, because the question is "has THIS node established it"
-        // (#5542, Codex P2). `DELEGATE_SUBSCRIPTIONS` is process-global and
+        // (#5542, Codex P2). The subscription registry is process-global and
         // carries no node identity, so consulting it alone answers for the
         // PROCESS: in an in-process multi-node run the second node to subscribe
         // the same delegate to the same contract saw the first node's entry,
@@ -710,9 +710,9 @@ fn already_subscribed(
         ),
         // No `OpManager`: no refcount can have been taken, so the registry is
         // the only record there is, and a mock executor has exactly one node.
-        None => crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-            .get(contract_id)
-            .is_some_and(|subs| subs.contains(delegate_key)),
+        None => {
+            crate::wasm_runtime::delegate_subscriptions::is_subscribed(contract_id, delegate_key)
+        }
     }
 }
 
@@ -865,7 +865,7 @@ where
 ///
 /// Releases only for `(Subscribe, Subscribed)`, the same evidence
 /// `delegate_interest::record` gates on, so it can never decrement interest a
-/// different subscriber holds. Installs no `DELEGATE_SUBSCRIPTIONS` hook: the
+/// different subscriber holds. Installs no subscription-registry hook: the
 /// delegate is not told it is subscribed, and nothing advertises a delivery
 /// path that will not be served.
 ///
@@ -925,10 +925,10 @@ fn release_stranded_subscribe_interest<CH>(
 /// Finish a resolved delegate network operation ON the loop (#5542).
 ///
 /// The network work happened off-loop; what is left is the part that must be
-/// serial. For a successful SUBSCRIBE that is the `DELEGATE_SUBSCRIPTIONS`
-/// insert — done HERE and only on success, so the registry never claims a
-/// delivery path that was not established, and so the registry has exactly one
-/// writer on this path.
+/// serial. For a successful SUBSCRIBE that is the subscription-registry insert
+/// — done HERE and only on success, so the registry never claims a delivery
+/// path that was not established, and so the registry has exactly one writer on
+/// this path.
 fn apply_resolved_contract_op<CH>(
     contract_handler: &mut CH,
     resolved: delegate_park::ResolvedContractOp,
@@ -945,10 +945,14 @@ where
             delegate_park::ContractOpOutcome::Subscribed
         )
     ) {
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-            .entry(pending.contract_id)
-            .or_default()
-            .insert(delegate_key.clone());
+        // Third of the three registration paths, and bounded like the other
+        // two: a cap enforced at some of them would be an opt-out rather than a
+        // cap. This is also the ONLY path that takes an interest refcount, so
+        // if admission evicts a colder subscription to make room, that
+        // subscription's hold has to be given back — `subscribe` does that
+        // itself (see `SubscribeOutcome::RegisteredEvicting`), because a caller
+        // that ignores the outcome compiles fine and two of the three do.
+        crate::wasm_runtime::delegate_subscriptions::subscribe(pending.contract_id, delegate_key);
         // RECORD THE OBLIGATION THIS SUBSCRIBE JUST INCURRED (#5542).
         //
         // `run_executor_subscribe` ended in
@@ -2008,7 +2012,8 @@ where
         }
 
         // Process SUBSCRIBE requests
-        // There are two registration paths that converge on DELEGATE_SUBSCRIPTIONS:
+        // There are two registration paths that converge on the delegate
+        // subscription registry (`wasm_runtime::delegate_subscriptions`):
         // 1. V2 delegates: subscribe_contract() host function (native_api.rs) registers
         //    during WASM execution and returns success/error synchronously.
         // 2. V1 delegates: emit SubscribeContractRequest in process() outbound, handled here.
@@ -2100,7 +2105,7 @@ where
                         // local path end in `InterestManager::add_local_client`,
                         // which is a REFCOUNT and is explicitly NOT idempotent (see
                         // the `!is_renewal` gate at `operations/subscribe.rs`).
-                        // `DELEGATE_SUBSCRIPTIONS` is a map keyed by delegate, so
+                        // the subscription registry is keyed by delegate, so
                         // the pre-#5542 arm was idempotent for free and a delegate
                         // re-subscribing in a loop cost nothing. Without this gate
                         // each repeat takes another interest refcount for one
@@ -2173,10 +2178,10 @@ where
                             interest_registered,
                             "Delegate subscribed to a contract this node already holds"
                         );
-                        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-                            .entry(contract_id)
-                            .or_default()
-                            .insert(delegate_key.clone());
+                        crate::wasm_runtime::delegate_subscriptions::subscribe(
+                            contract_id,
+                            delegate_key,
+                        );
                         Ok(())
                     } else if parking.is_some()
                         && can_reach_network
@@ -2195,7 +2200,7 @@ where
                         //
                         // OPENING THIS GATE ALONE WOULD SHIP THE FEATURE SILENT.
                         // The arm above does one thing — insert into
-                        // `DELEGATE_SUBSCRIPTIONS` — which is a local notification
+                        // the subscription registry — which is a local notification
                         // hook that nothing in `ring/` reads. It establishes no
                         // network subscription, so a delegate would subscribe
                         // successfully to a contract it has never seen and then
@@ -2212,7 +2217,7 @@ where
                         //      from under the subscription),
                         //   3. establish the real network subscription.
                         //
-                        // The notification hook (the `DELEGATE_SUBSCRIPTIONS`
+                        // The notification hook (the registry
                         // insert) is then done on the loop when the park resumes, and
                         // ONLY on success — so a failed subscribe leaves no hook
                         // claiming a delivery path that does not exist.
@@ -2458,7 +2463,7 @@ where
             // If
             // notification-driven inter-delegate messaging is ever wanted, it
             // must come back with the originating scope RECORDED ON THE
-            // SUBSCRIPTION (both `DELEGATE_SUBSCRIPTIONS` registration paths) and
+            // SUBSCRIPTION (both `delegate_subscriptions` registration paths) and
             // propagated here — never with a hardcoded `Local`.
             //
             // `info!`, not `debug!`: the crate sets `release_max_level_info`, so
@@ -4089,7 +4094,7 @@ fn route_notification_outbound(delegate_key: &DelegateKey, outbound: Vec<Outboun
     // the residual ApplicationMessages are the delegate's replies meant for
     // connected apps. A notification-driven invocation has no originating
     // client request to answer, so we fan them out via the delegate->apps
-    // registry (delegate_app_registry) — the mirror of DELEGATE_SUBSCRIPTIONS,
+    // registry (delegate_app_registry) — the mirror of delegate_subscriptions,
     // populated when an app talks to the delegate over its WS connection.
     let app_messages: Vec<OutboundDelegateMsg> = outbound
         .into_iter()
@@ -4492,7 +4497,7 @@ where
     }
     // Delegate network GET/SUBSCRIBE results (#5542). Nothing has to be re-run
     // on the loop for these — the network work is done — but a successful
-    // SUBSCRIBE installs its `DELEGATE_SUBSCRIPTIONS` hook here, on the loop and
+    // SUBSCRIBE installs its subscription-registry hook here, on the loop and
     // only on success, so the registry never advertises a delivery path that was
     // never established.
     for resolved in contract_ops {
@@ -8575,7 +8580,7 @@ mod hol_4391_tests {
         }
     }
 
-    /// #5542. The `DELEGATE_SUBSCRIPTIONS` hook is installed ONLY when the
+    /// #5542. The subscription-registry hook is installed ONLY when the
     /// network subscription actually succeeded.
     ///
     /// This is the concrete form of the warning on the issue: that map is a
@@ -8596,8 +8601,8 @@ mod hol_4391_tests {
         let bad_id = ContractInstanceId::new([23u8; 32]);
         // Global registry: use ids unique to this test so it does not race the
         // rest of the suite.
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&ok_id);
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&bad_id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(&ok_id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(&bad_id);
 
         let (mut handler, _send) = build_handler(vec![]).await;
         let _ = apply_resolved_contract_op(
@@ -8636,8 +8641,8 @@ mod hol_4391_tests {
             "a FAILED subscribe must not install a hook: it would advertise a \
              delivery path that was never established"
         );
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&ok_id);
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&bad_id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(&ok_id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(&bad_id);
     }
 
     /// Build a real `OpManager` backed by a temp-dir `Config`, mirroring
@@ -8799,7 +8804,7 @@ mod hol_4391_tests {
                 .into(),
             );
         }
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
 
         let handle = GlobalExecutor::spawn(contract_handling(
             handler,
@@ -8844,7 +8849,7 @@ mod hol_4391_tests {
         );
 
         handle.abort();
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
     }
 
     /// #5542 findings M4 and N2, together, because they are two halves of one
@@ -8906,7 +8911,7 @@ mod hol_4391_tests {
                 )]
                 .into(),
             );
-            crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+            crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
         }
 
         let handle = GlobalExecutor::spawn(contract_handling(
@@ -8977,7 +8982,7 @@ mod hol_4391_tests {
 
         handle.abort();
         for key in [banned_key, allowed_key] {
-            crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+            crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
         }
     }
 
@@ -9354,7 +9359,7 @@ mod hol_4391_tests {
         // The key `add_local_client` was called with: the FULL key, carrying the
         // real code hash, because the subscribe op knew it.
         let full_key = ContractKey::from_id_and_code(id, CodeHash::new([33u8; 32]));
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(&id);
 
         // Stand in for what `run_executor_subscribe` did before returning Ok.
         assert!(
@@ -9390,7 +9395,7 @@ mod hol_4391_tests {
              subscription is dropped, even though the contract body never \
              landed and the full `ContractKey` could not be resolved (#5542)"
         );
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(&id);
     }
 
     /// #5542. A delegate SUBSCRIBE that cannot reach the network must still get

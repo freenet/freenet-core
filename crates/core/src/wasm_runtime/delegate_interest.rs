@@ -3,10 +3,10 @@
 //!
 //! # Why this exists
 //!
-//! Before #5542 the V1 delegate SUBSCRIBE arm inserted into
-//! [`DELEGATE_SUBSCRIPTIONS`](super::DELEGATE_SUBSCRIPTIONS) and did nothing
-//! else. The registry is a `HashSet`, so a re-subscribe was idempotent for free
-//! and there was no accounting to get wrong.
+//! Before #5542 the V1 delegate SUBSCRIBE arm inserted into the subscription
+//! registry ([`super::delegate_subscriptions`]) and did nothing else. The
+//! registry is a set, so a re-subscribe was idempotent for free and there was
+//! no accounting to get wrong.
 //!
 //! #5542 routes a subscribe for a contract this node does not hold through
 //! `run_executor_subscribe`, which ends in
@@ -54,7 +54,7 @@
 //! **Only acquisitions this node actually made.** A subscribe answered from the
 //! local store takes no refcount, and neither does the V2
 //! `subscribe_contract_sync` host function — both only insert the registry
-//! hook. So this map is a strict subset of `DELEGATE_SUBSCRIPTIONS`, keyed by
+//! hook. So this map is a strict subset of the subscription registry, keyed by
 //! the same pair, and releasing is driven from HERE rather than from the
 //! registry. That is what makes over-release impossible: an entry exists if and
 //! only if `add_local_client` ran for that pair, so a decrement can never fall
@@ -152,7 +152,7 @@ pub(crate) fn record(
 /// Whether THIS node already holds an interest obligation for
 /// `(contract, delegate)` (#5542, Codex P2).
 ///
-/// The subscription registry `DELEGATE_SUBSCRIPTIONS` is process-global and
+/// The subscription registry is process-global and
 /// carries no node identity, so asking it "is this delegate already subscribed"
 /// answers for the PROCESS, not for this node. In an in-process multi-node run
 /// the second node to subscribe the same delegate to the same contract sees the
@@ -193,6 +193,52 @@ pub(crate) fn release_delegate(delegate: &DelegateKey) {
     });
     for (key, release) in discharged {
         release(&key);
+    }
+}
+
+/// Release the hold taken for exactly ONE `(contract, delegate)` pair, leaving
+/// every other delegate's hold on that contract and every other hold of that
+/// delegate alone.
+///
+/// The two functions above discharge a whole delegate or a whole contract,
+/// which is right for the three sites that drop subscriptions in bulk
+/// (`UnregisterDelegate`, contract removal, channel-closed cleanup). Neither
+/// fits a drop of a SINGLE pair: `release_delegate` would discharge holds on
+/// contracts the delegate still subscribes to, and `release_contract` would
+/// discharge holds belonging to OTHER delegates — over-release, which is
+/// strictly worse than the leak, because the decrement falls on interest a real
+/// subscriber holds.
+///
+/// The caller is the per-delegate subscription cap: when a delegate at its cap
+/// admits a new contract, the coldest subscription is evicted, and the refcount
+/// that subscription took has to come back with it. Without this, an evicted
+/// pair's `add_local_client` stands forever, `local_interests` never returns to
+/// zero and `cleanup_contract_if_no_interest` never fires — the leak this
+/// module exists to close, arriving through a door it did not have when it was
+/// written.
+///
+/// A no-op for a pair holding nothing, exactly like the other two: most pairs
+/// take no refcount at all (a subscribe answered from the local store, and the
+/// V2 host function).
+pub(crate) fn release_pair(contract: &ContractInstanceId, delegate: &DelegateKey) {
+    // Remove first and release afterwards, outside the shard guard: a release
+    // closure reaches into `InterestManager`, which takes its own locks, and
+    // doing that under a DashMap guard is how lock-order inversions get built.
+    // `remove` hands back the owned entry, so the guard is gone by the time the
+    // closure runs.
+    // EVERY node's hold under this pair, not the first. The value is a map
+    // keyed by node identity (#5542 M3), because two nodes in an in-process run
+    // each take their own refcount on their own `InterestManager`. Discharging
+    // one and dropping the entry would leave the other's interest standing with
+    // nothing left to release it, which is the leak this whole module exists to
+    // close, reintroduced by an eviction. #5615's
+    // `a_pair_keyed_lookup_discharges_every_node_holding_it` pins the same
+    // property from the other side.
+    let Some((_, holds)) = DELEGATE_INTEREST_HOLDS.remove(&(*contract, delegate.clone())) else {
+        return;
+    };
+    for hold in holds.into_values() {
+        (hold.release)(&hold.key);
     }
 }
 
@@ -484,7 +530,7 @@ mod tests {
         )];
         assert!(
             body.contains("delegate_interest::record("),
-            "the site that installs the DELEGATE_SUBSCRIPTIONS hook after a \
+            "the site that installs the subscription-registry hook after a \
              successful network subscribe is the site that took the \
              `add_local_client` refcount, so it must record the obligation to \
              release it (#5542)"

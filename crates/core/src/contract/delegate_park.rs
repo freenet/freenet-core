@@ -122,7 +122,7 @@
 //! process global. It holds this node's client responders and gates this
 //! node's loop, and an in-process multi-node simulation must not share either.
 //! Same reasoning as `client_events::user_op_rate_limit`, and deliberately
-//! unlike the older `DELEGATE_SUBSCRIPTIONS` global.
+//! unlike the older `delegate_subscriptions` global registry.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -693,8 +693,11 @@ pub(super) enum ContractOpKind {
 /// operation, and awaiting one on the serial `contract_handling` loop freezes
 /// every contract operation on the node for its whole duration. Unlike an
 /// upsert, nothing has to be re-run on the loop afterwards - the response is
-/// pure data - but the SUBSCRIBE registry insert is still done there, so
-/// `DELEGATE_SUBSCRIPTIONS` is only ever written from one place.
+/// pure data - but the SUBSCRIBE registry insert is still done there, so this
+/// path writes the subscription registry from exactly one place. (The registry
+/// as a whole has three writers - this one, the V1 local-state arm and the V2
+/// host function - all of which go through
+/// `wasm_runtime::delegate_subscriptions::subscribe`.)
 pub(super) struct PendingContractOp {
     /// Unique per request, for the lifetime of the process.
     ///

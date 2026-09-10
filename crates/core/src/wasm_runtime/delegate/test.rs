@@ -3509,7 +3509,7 @@ async fn test_contract_notification_delivered() -> Result<(), Box<dyn std::error
 ///
 /// Verifies the full pipeline:
 /// 1. Delegate subscribes to a contract via SubscribeContractRequest
-/// 2. Subscription is registered in DELEGATE_SUBSCRIPTIONS
+/// 2. Subscription is registered in the delegate subscription registry
 /// 3. ContractNotification is delivered to the delegate
 /// 4. Delegate responds with ContractNotificationReceived
 /// 5. Cleanup: unregister delegate removes subscription entries
@@ -3602,10 +3602,10 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
         .code_hash_from_id(&subscribe_req.contract_id)
         .is_some()
     {
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-            .entry(subscribe_req.contract_id)
-            .or_default()
-            .insert(delegate_key.clone());
+        crate::wasm_runtime::delegate_subscriptions::subscribe(
+            subscribe_req.contract_id,
+            &delegate_key,
+        );
         Ok(())
     } else {
         Err("Contract not found".to_string())
@@ -3663,10 +3663,11 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
 
     // --- Step 2: Verify registry is populated ---
     {
-        let entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&contract_instance_id);
-        let subscribers = entry.as_ref().unwrap();
         assert!(
-            subscribers.contains(&delegate_key),
+            crate::wasm_runtime::delegate_subscriptions::is_subscribed(
+                &contract_instance_id,
+                &delegate_key
+            ),
             "Delegate should be registered as subscriber"
         );
     }
@@ -3733,15 +3734,12 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
     }
 
     // --- Step 5: Cleanup on delegate unregister ---
-    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, subscribers| {
-        subscribers.remove(&delegate_key);
-        !subscribers.is_empty()
-    });
+    crate::wasm_runtime::delegate_subscriptions::remove_delegate(&delegate_key);
 
     // Verify cleanup
-    let entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&contract_instance_id);
     assert!(
-        entry.is_none() || entry.as_ref().unwrap().is_empty(),
+        crate::wasm_runtime::delegate_subscriptions::subscribers_of(&contract_instance_id)
+            .is_empty(),
         "Subscription should be cleaned up after delegate unregister"
     );
 
@@ -3830,10 +3828,10 @@ async fn test_notification_application_message_routed_to_registered_app()
         OutboundDelegateMsg::SubscribeContractRequest(req) => req.clone(),
         other => panic!("Expected SubscribeContractRequest, got {other:?}"),
     };
-    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-        .entry(subscribe_req.contract_id)
-        .or_default()
-        .insert(delegate_key.clone());
+    crate::wasm_runtime::delegate_subscriptions::subscribe(
+        subscribe_req.contract_id,
+        &delegate_key,
+    );
     // Feed the subscribe response back so the delegate finishes subscribing.
     let _ = runtime.inbound_app_message(
         &delegate_key,
@@ -3936,15 +3934,12 @@ async fn test_notification_application_message_routed_to_registered_app()
         "after disconnect no app should remain registered"
     );
 
-    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, subs| {
-        subs.remove(&delegate_key);
-        !subs.is_empty()
-    });
+    crate::wasm_runtime::delegate_subscriptions::remove_delegate(&delegate_key);
     std::mem::drop(temp_dir);
     Ok(())
 }
 
-/// Test: removing a contract cleans up DELEGATE_SUBSCRIPTIONS.
+/// Test: removing a contract cleans up its delegate subscriptions.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_contract_removal_cleans_subscriptions() -> Result<(), Box<dyn std::error::Error>> {
     use crate::contract::storages::Storage;
@@ -3975,19 +3970,13 @@ async fn test_contract_removal_cleans_subscriptions() -> Result<(), Box<dyn std:
     // Simulate delegate subscriptions
     let delegate_key_a = DelegateKey::new([1u8; 32], CodeHash::new([10u8; 32]));
     let delegate_key_b = DelegateKey::new([2u8; 32], CodeHash::new([20u8; 32]));
-    {
-        let mut entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-            .entry(contract_instance_id)
-            .or_default();
-        entry.insert(delegate_key_a);
-        entry.insert(delegate_key_b);
-    }
+    crate::wasm_runtime::delegate_subscriptions::subscribe(contract_instance_id, &delegate_key_a);
+    crate::wasm_runtime::delegate_subscriptions::subscribe(contract_instance_id, &delegate_key_b);
 
     // Verify subscriptions exist
-    assert!(
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-            .get(&contract_instance_id)
-            .is_some()
+    assert_eq!(
+        crate::wasm_runtime::delegate_subscriptions::subscribers_of(&contract_instance_id).len(),
+        2
     );
 
     // Remove the contract — should clean up subscriptions
@@ -3995,10 +3984,19 @@ async fn test_contract_removal_cleans_subscriptions() -> Result<(), Box<dyn std:
 
     // Verify subscriptions are cleaned up
     assert!(
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-            .get(&contract_instance_id)
-            .is_none(),
-        "DELEGATE_SUBSCRIPTIONS should be cleaned up when contract is removed"
+        crate::wasm_runtime::delegate_subscriptions::subscribers_of(&contract_instance_id)
+            .is_empty(),
+        "delegate subscriptions should be cleaned up when contract is removed"
+    );
+    // The reverse index must be cleared too, or the removed contract would keep
+    // holding cap budget for both delegates with nothing to age it out.
+    assert_eq!(
+        crate::wasm_runtime::delegate_subscriptions::subscription_count(&delegate_key_a),
+        0
+    );
+    assert_eq!(
+        crate::wasm_runtime::delegate_subscriptions::subscription_count(&delegate_key_b),
+        0
     );
 
     std::mem::drop(temp_dir);

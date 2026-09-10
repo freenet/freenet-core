@@ -33,7 +33,7 @@ use std::time::Duration;
 use crate::config::ConfigArgs;
 use crate::contract::executor::{ContractExecutor, Executor, OperationMode};
 use crate::node::OpManager;
-use crate::wasm_runtime::{DELEGATE_SUBSCRIPTIONS, MockStateStorage};
+use crate::wasm_runtime::MockStateStorage;
 
 use super::super::mock_runtime::test::create_test_contract as test_contract;
 
@@ -82,9 +82,9 @@ async fn build_op_manager(
 }
 
 /// Registers one delegate against one contract in the process-global
-/// `DELEGATE_SUBSCRIPTIONS` map and removes the entry on drop.
+/// subscription registry and removes the entry on drop.
 ///
-/// `DELEGATE_SUBSCRIPTIONS` is process-global (#4824), and CI runs
+/// the subscription registry is process-global (#4824), and CI runs
 /// `cargo nextest` (process per test) while contributors run plain
 /// `cargo test` (one process for all of them) — see
 /// `.claude/rules/testing.md`. So each test uses a contract key derived
@@ -97,10 +97,7 @@ struct SubscriptionGuard {
 
 impl SubscriptionGuard {
     fn register(instance_id: ContractInstanceId, delegate: DelegateKey) -> Self {
-        DELEGATE_SUBSCRIPTIONS
-            .entry(instance_id)
-            .or_default()
-            .insert(delegate.clone());
+        crate::wasm_runtime::delegate_subscriptions::subscribe(instance_id, &delegate);
         Self {
             instance_id,
             delegate,
@@ -115,12 +112,7 @@ impl Drop for SubscriptionGuard {
         // test's subscription if the keys ever collided, which is the shape
         // `.claude/rules/testing.md` warns about for shared globals. Mirrors
         // how production cleans up in `runtime/delegates.rs`.
-        DELEGATE_SUBSCRIPTIONS.retain(|id, subs| {
-            if id == &self.instance_id {
-                subs.remove(&self.delegate);
-            }
-            !subs.is_empty()
-        });
+        crate::wasm_runtime::delegate_subscriptions::unsubscribe(&self.instance_id, &self.delegate);
     }
 }
 
@@ -226,6 +218,73 @@ async fn initial_state_install_notifies_subscribed_delegates() {
         broadcast.as_ref(),
         state.as_ref(),
         "the broadcast must carry the installed state"
+    );
+}
+
+/// Delivering a notification must MARK the subscription as used, and this pins
+/// the production call rather than the helper.
+///
+/// `delegate_subscriptions::note_notified` is what orders cap eviction: the
+/// victim is the delegate's least-recently-NOTIFIED subscription, so a
+/// subscription that is actually delivering stays warm. The helper has unit
+/// coverage in its own module, but that coverage calls it directly — so
+/// deleting the call in `send_delegate_contract_notifications` leaves every
+/// stamp frozen at registration time and the whole suite still green. Eviction
+/// would then pick by subscription age, which for a delegate at its cap means
+/// evicting its BUSIEST subscription first: the exact inversion the ordering
+/// exists to prevent, arriving silently.
+///
+/// Behavioural rather than a source scrape, because the executor and the
+/// notification channel are both reachable here — a scrape would pass on a
+/// commented-out call.
+#[tokio::test(flavor = "current_thread")]
+async fn delivering_a_notification_marks_the_subscription_as_used() {
+    let (op_manager, _notifications, _guards) =
+        build_op_manager("delegate-notify-marks-used").await;
+    let contract = test_contract(b"delegate_notify_marks_used_contract");
+    let key = contract.key();
+    let state = WrappedState::new((1u8..=32).collect::<Vec<u8>>());
+
+    let delegate = test_delegate_key(9);
+    let _subscription = SubscriptionGuard::register(*key.id(), delegate.clone());
+
+    // The stamp as `subscribe` left it. Eviction compares these, so what
+    // matters is that delivery moves it, not its absolute value.
+    let at_registration =
+        crate::wasm_runtime::delegate_subscriptions::last_notified(key.id(), &delegate)
+            .expect("the subscription must be registered before the commit");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let mut executor = build_executor(&op_manager).await;
+    executor.set_delegate_notification_tx(tx);
+
+    executor
+        .upsert_contract_state(
+            key,
+            Either::Left(state.clone()),
+            RelatedContracts::default(),
+            Some(contract.clone()),
+        )
+        .await
+        .expect("initial install");
+
+    // Receiving first is what makes this deterministic rather than a race: the
+    // stamp is written on successful enqueue, which happens before the value
+    // can be received.
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a notification must be delivered for a subscribed delegate")
+        .expect("delegate notification channel closed");
+
+    let after_delivery =
+        crate::wasm_runtime::delegate_subscriptions::last_notified(key.id(), &delegate)
+            .expect("the subscription must still be registered after delivery");
+
+    assert!(
+        after_delivery > at_registration,
+        "delivering a notification must stamp the subscription as used; without \
+         that call, cap eviction orders by registration age instead of by use \
+         and evicts the delegate's busiest subscription first"
     );
 }
 
