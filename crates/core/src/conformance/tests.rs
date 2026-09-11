@@ -19,13 +19,14 @@ use freenet_stdlib::prelude::{
 };
 
 use super::evidence::{
-    ConformanceEvidence, EvidenceRejected, MAX_EVIDENCE_INPUT_BYTES, MAX_EVIDENCE_RELATED,
+    ConformanceEvidence, EvidenceError, EvidenceRejected, MAX_EVIDENCE_ENCODED_BYTES,
+    MAX_EVIDENCE_INPUT_BYTES, MAX_EVIDENCE_RELATED, MAX_EVIDENCE_TEXT_BYTES,
 };
 use super::generator::{Corpus, GeneratorConfig, generate_cases};
 use super::oracle::{ConformanceOracle, OracleError};
 use super::property::{
     ConformanceProperty, IdempotenceSettling, Inconclusive, OutputDigest, PremiseSource,
-    PropertyOutcome, Severity,
+    PropertyOutcome, Severity, Violation,
 };
 use super::verifier::{Bytes, ConformanceCase, verify_case};
 
@@ -2403,6 +2404,231 @@ fn oversized_evidence_is_rejected_before_any_execution() {
     ));
 }
 
+/// A `Violation` whose `detail` is `len` bytes. `detail` is free text the SENDER
+/// chooses, so this stands in for what a hostile peer can put there.
+fn violation_with_detail(len: usize) -> Violation {
+    Violation {
+        property: ConformanceProperty::StateIdempotence,
+        severity: ConformanceProperty::StateIdempotence.severity(),
+        left: OutputDigest::of(&[1]),
+        right: OutputDigest::of(&[2]),
+        detail: "x".repeat(len),
+        settling: None,
+    }
+}
+
+/// #5581. `observed.detail` is sender-chosen text that `input_bytes()` does not
+/// count, so the byte limit said nothing about it.
+///
+/// Every metered field is kept tiny on purpose. A fixture with large `states` would
+/// be rejected by the input-byte limit whether or not the text field were bounded,
+/// so it could not detect that bound being deleted.
+#[test]
+fn evidence_whose_only_large_field_is_the_observed_detail_is_rejected() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let mut evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    // Assigned on the struct rather than passed to `new`: a hostile sender writes the
+    // bytes directly and never runs our constructor.
+    evidence.observed = Some(violation_with_detail(1024 * 1024));
+    assert!(
+        evidence.input_bytes() < MAX_EVIDENCE_INPUT_BYTES,
+        "the fixture must be small in every metered field, or it tests the wrong limit"
+    );
+    assert!(matches!(
+        evidence.check_bounds(),
+        Err(EvidenceRejected::TextTooLong {
+            field: "observed.detail",
+            ..
+        })
+    ));
+}
+
+/// #5581. The second unmetered field: `runtime.core_version` is also a `String` the
+/// sender writes, and was not counted either.
+#[test]
+fn evidence_whose_only_large_field_is_the_runtime_version_is_rejected() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let mut evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    evidence.runtime.core_version = "9".repeat(1024 * 1024);
+    assert!(
+        evidence.input_bytes() < MAX_EVIDENCE_INPUT_BYTES,
+        "the fixture must be small in every metered field, or it tests the wrong limit"
+    );
+    assert!(matches!(
+        evidence.check_bounds(),
+        Err(EvidenceRejected::TextTooLong {
+            field: "runtime.core_version",
+            ..
+        })
+    ));
+}
+
+/// #5581. bincode 1.x's free `deserialize` allows trailing bytes, so a valid payload
+/// with anything appended decoded as though the appendix were not there.
+#[test]
+fn decode_refuses_bytes_after_a_complete_payload() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    let mut bytes = evidence.encode().expect("encode");
+    assert!(
+        ConformanceEvidence::decode(&bytes).is_ok(),
+        "control: the unmodified bytes must decode, or the refusal below proves nothing"
+    );
+    bytes.push(0);
+    assert!(matches!(
+        ConformanceEvidence::decode(&bytes),
+        Err(EvidenceError::Decode(_))
+    ));
+}
+
+/// #5581. The size gate has to run during DECODE, before bincode parses anything:
+/// `check_bounds` only ever sees an object that decoding has already built, so a
+/// limit applied there alone arrives after the cost it exists to prevent.
+///
+/// The fixture is deliberately NOT valid evidence. With a valid oversized payload,
+/// moving the length check to after a successful parse would still report
+/// `PayloadTooLarge`, and this test would pass. With a payload bincode cannot parse,
+/// only a check that runs first reports `PayloadTooLarge`; a check moved later never
+/// gets the chance, because the parse fails first.
+#[test]
+fn decode_refuses_a_payload_larger_than_any_evidence_check_bounds_accepts() {
+    let mut bytes = b"FRNTEVD1".to_vec();
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.resize(bytes.len() + MAX_EVIDENCE_ENCODED_BYTES + 1, 0xff);
+    match ConformanceEvidence::decode(&bytes) {
+        Err(EvidenceError::PayloadTooLarge { found, limit }) => {
+            assert_eq!(found, MAX_EVIDENCE_ENCODED_BYTES + 1);
+            assert_eq!(limit, MAX_EVIDENCE_ENCODED_BYTES);
+        }
+        other => panic!("expected PayloadTooLarge before any parse, got {other:?}"),
+    }
+}
+
+/// The counterpart: a payload of exactly `MAX_EVIDENCE_ENCODED_BYTES` passes the size
+/// gate. It is not valid evidence, so decoding still fails, but for a parse reason.
+/// Without this, `>` becoming `>=` in `decode_body` would pass every other test.
+#[test]
+fn a_payload_exactly_at_the_limit_passes_the_size_gate() {
+    let mut bytes = b"FRNTEVD1".to_vec();
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.resize(bytes.len() + MAX_EVIDENCE_ENCODED_BYTES, 0xff);
+    let result = ConformanceEvidence::decode(&bytes);
+    // All 0xff: the schema field reads 0xffff, the contract takes 32 bytes, then
+    // `parameters` declares u64::MAX bytes and runs out of input.
+    assert!(
+        matches!(result, Err(EvidenceError::Truncated { .. })),
+        "a payload exactly at the limit must pass the size gate and then fail to \
+         parse, got {result:?}"
+    );
+}
+
+/// The counterpart to the two text-field rejections: exactly at the limit passes.
+/// Without it, an off-by-one that refused every evidence object carrying a detail
+/// would still pass the tests above.
+#[test]
+fn evidence_text_exactly_at_the_limit_is_accepted() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let mut evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    evidence.observed = Some(violation_with_detail(MAX_EVIDENCE_TEXT_BYTES));
+    evidence.runtime.core_version = "9".repeat(MAX_EVIDENCE_TEXT_BYTES);
+    assert_eq!(evidence.check_bounds(), Ok(()));
+}
+
+/// `new` truncates an overlong detail rather than letting the writer's own
+/// `check_bounds` refuse it, and must not split a character doing so. `€` is three
+/// bytes and the limit is not a multiple of three, so the limit falls inside a
+/// character and the boundary search actually runs.
+#[test]
+fn new_truncates_an_overlong_detail_at_a_character_boundary() {
+    assert_ne!(
+        MAX_EVIDENCE_TEXT_BYTES % 3,
+        0,
+        "the fixture needs the limit to fall inside a character"
+    );
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let mut violation = violation_with_detail(0);
+    violation.detail = "€".repeat(MAX_EVIDENCE_TEXT_BYTES);
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, Some(violation));
+    let detail = &evidence.observed.as_ref().expect("observed is kept").detail;
+    assert!(detail.len() <= MAX_EVIDENCE_TEXT_BYTES);
+    assert!(
+        detail.len() > MAX_EVIDENCE_TEXT_BYTES - 3,
+        "truncated further than one character short of the limit"
+    );
+    assert!(detail.chars().all(|c| c == '€'));
+    assert_eq!(evidence.check_bounds(), Ok(()));
+
+    // Two ASCII bytes first put the character boundaries at 2 + 3k, so the limit sits
+    // two bytes into a character and the search must step back twice. A search that
+    // stepped back at most once would stop off a boundary, and `truncate` panics.
+    // Boundaries sit at 2 + 3k, so `MAX - 2` is one exactly when `MAX - 4` is a
+    // multiple of 3.
+    assert_eq!(
+        (MAX_EVIDENCE_TEXT_BYTES - 4) % 3,
+        0,
+        "the fixture needs a boundary two bytes below the limit"
+    );
+    let mut violation = violation_with_detail(0);
+    violation.detail = format!("ab{}", "€".repeat(MAX_EVIDENCE_TEXT_BYTES));
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, Some(violation));
+    let detail = &evidence.observed.as_ref().expect("observed is kept").detail;
+    assert_eq!(detail.len(), MAX_EVIDENCE_TEXT_BYTES - 2);
+    assert!(detail.starts_with("ab"));
+}
+
+/// Every object `check_bounds` accepts must also decode. If the decode limit were
+/// tighter than the bounds, the largest valid evidence would be written and then be
+/// unreadable. So this builds the maximum of everything `check_bounds` meters: inputs
+/// summing to exactly `MAX_EVIDENCE_INPUT_BYTES` spread over the property with the
+/// most states, the most related contracts, and both text fields at their limit.
+#[test]
+fn every_evidence_check_bounds_accepts_fits_the_decode_limit() {
+    let property = ConformanceProperty::StateAssociativity;
+    assert_eq!(
+        property.state_arity(),
+        3,
+        "the fixture assumes the property with the most states"
+    );
+    let side = 1024;
+    let states_total = MAX_EVIDENCE_INPUT_BYTES - side * (2 + MAX_EVIDENCE_RELATED);
+    let states: Vec<Bytes> = (0..3u8)
+        .map(|i| {
+            let len = states_total / 3 + usize::from(i == 2) * (states_total % 3);
+            Arc::from(vec![i; len].as_slice())
+        })
+        .collect();
+    let case = ConformanceCase::new(property, states);
+    let mut violation = violation_with_detail(MAX_EVIDENCE_TEXT_BYTES);
+    violation.property = property;
+    violation.severity = property.severity();
+    violation.settling = Some(IdempotenceSettling::SettledAfter(u32::MAX));
+    let mut evidence = ConformanceEvidence::new(instance(1), vec![7; side], &case, Some(violation));
+    evidence.summary = Some(vec![8; side]);
+    evidence.related = (0..MAX_EVIDENCE_RELATED)
+        .map(|i| (instance(i as u8 + 10), vec![9; side]))
+        .collect();
+    evidence.runtime.core_version = "9".repeat(MAX_EVIDENCE_TEXT_BYTES);
+    assert_eq!(
+        evidence.input_bytes(),
+        MAX_EVIDENCE_INPUT_BYTES,
+        "the fixture must sit exactly at the input limit"
+    );
+    assert_eq!(evidence.check_bounds(), Ok(()));
+
+    let bytes = evidence.encode().expect("encode");
+    // 8-byte magic plus 2-byte schema version precede the payload.
+    let body_len = bytes.len() - 10;
+    assert!(
+        body_len <= MAX_EVIDENCE_ENCODED_BYTES,
+        "the largest accepted evidence encodes to {body_len} bytes, over the \
+         {MAX_EVIDENCE_ENCODED_BYTES}-byte decode limit"
+    );
+    assert_eq!(
+        ConformanceEvidence::decode(&bytes).expect("decode"),
+        evidence
+    );
+}
+
 #[test]
 fn evidence_with_wrong_arity_is_rejected() {
     let case = ConformanceCase::new(
@@ -2897,18 +3123,19 @@ fn evidence_encode_decode_roundtrip() {
 
 #[test]
 fn legacy_unframed_schema_1_is_refused() {
-    use super::evidence::{ConformanceEvidence, EVIDENCE_SCHEMA_VERSION, EvidenceError};
-
     // Schema 1 legacy files: struct layout changed when `settling` was added, so
-    // deserializing them would silently produce garbage. Always refused.
+    // deserializing them would silently produce garbage. Always refused, and
+    // described as LOOKING like old evidence, since any file can begin `01 00`.
     let legacy_schema_1 = [1u8, 0u8, 0xff, 0xff, 0xff];
-    match ConformanceEvidence::decode(&legacy_schema_1) {
-        Err(EvidenceError::UnsupportedSchema { found, supported }) => {
-            assert_eq!(found, 1);
-            assert_eq!(supported, EVIDENCE_SCHEMA_VERSION);
-        }
-        other => panic!("expected schema 1 refusal for legacy file, got {other:?}"),
+    match ConformanceEvidence::decode_file(&legacy_schema_1) {
+        Err(EvidenceError::LegacyUnsupported { found }) => assert_eq!(found, 1),
+        other => panic!("expected the legacy schema-1 refusal, got {other:?}"),
     }
+    // The strict decoder does not recognise the unframed format at all.
+    assert!(matches!(
+        ConformanceEvidence::decode(&legacy_schema_1),
+        Err(EvidenceError::BadMagic)
+    ));
 }
 
 #[test]
@@ -2916,8 +3143,8 @@ fn legacy_unframed_schema_2_decodes_if_the_payload_is_valid() {
     use super::evidence::ConformanceEvidence;
 
     // v0.2.133 evidence: no framing header, raw bincode payload. The struct layout
-    // is byte-identical to the current schema 2, so decode must succeed rather than
-    // returning an error. This is the regression Ian's review caught.
+    // is byte-identical to the current schema 2, so a FILE decode must succeed rather
+    // than returning an error.
     let idem_case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
     let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &idem_case, None);
 
@@ -2929,23 +3156,290 @@ fn legacy_unframed_schema_2_decodes_if_the_payload_is_valid() {
         "first field must be schema_version = 2 in LE"
     );
 
-    let decoded = ConformanceEvidence::decode(&raw).expect("legacy schema 2 must decode cleanly");
+    let decoded =
+        ConformanceEvidence::decode_file(&raw).expect("legacy schema 2 must decode as a file");
     assert_eq!(decoded, evidence);
+
+    // #5581: the strict decoder, the one a receive path uses, refuses the same bytes.
+    // Accepting them there would make the unframed format a second wire format,
+    // recognised by two bytes instead of the 8-byte magic.
+    assert!(matches!(
+        ConformanceEvidence::decode(&raw),
+        Err(EvidenceError::BadMagic)
+    ));
 }
 
+/// #5578 review finding 3: a file that starts like v0.2.133 evidence but does not
+/// decode used to report `BadMagic`, "not conformance evidence", which is the
+/// misdiagnosis `Truncated` exists to prevent. It now says what it looks like and
+/// that it does not decode, so the owner of a damaged file is pointed at the file.
 #[test]
-fn legacy_sniff_02_00_with_garbage_payload_is_bad_magic() {
-    use super::evidence::{ConformanceEvidence, EvidenceError};
+fn a_file_starting_like_schema_2_evidence_that_does_not_decode_says_so() {
+    let looks_like_evidence = [2u8, 0u8, 0xff, 0xff, 0xff];
+    assert!(matches!(
+        ConformanceEvidence::decode_file(&looks_like_evidence),
+        Err(EvidenceError::LegacyUndecodable(_))
+    ));
+    assert!(matches!(
+        ConformanceEvidence::decode(&looks_like_evidence),
+        Err(EvidenceError::BadMagic)
+    ));
+}
 
-    // A file that happens to start with `02 00` but whose bincode deserialization fails
-    // is not evidence at all; fall through to BadMagic rather than a confusing decode error.
-    let not_evidence = [2u8, 0u8, 0xff, 0xff, 0xff];
+/// The realistic form of the case above: a real v0.2.133 file, cut short.
+#[test]
+fn a_truncated_v0_2_133_file_is_reported_as_damaged_not_as_foreign() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let raw = bincode::serialize(&evidence).expect("serialize");
     assert!(
-        matches!(
-            ConformanceEvidence::decode(&not_evidence),
-            Err(EvidenceError::BadMagic)
+        ConformanceEvidence::decode_file(&raw).is_ok(),
+        "control: the whole file must decode, or the refusal below proves nothing"
+    );
+    match ConformanceEvidence::decode_file(&raw[..raw.len() - 1]) {
+        Err(EvidenceError::LegacyUndecodable(detail)) => assert!(
+            detail.contains("ends before a complete payload"),
+            "expected the truncation reason, got: {detail}"
         ),
-        "a garbage file starting with 02 00 must not produce a decode error"
+        other => panic!("expected LegacyUndecodable, got {other:?}"),
+    }
+}
+
+/// The other failing arm of the legacy path: every length is intact, but the content
+/// does not decode. Told apart from truncation by its reason, so a change that merged
+/// the two arms fails one of these two tests.
+#[test]
+fn an_unframed_file_with_undecodable_content_reports_why() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let mut raw = bincode::serialize(&evidence).expect("serialize");
+    // The payload ends with `runtime`: an 8-byte length, the version string, then a
+    // 2-byte schema field. Make the version string invalid UTF-8, lengths intact.
+    let version_len = evidence.runtime.core_version.len();
+    let prefix_at = raw.len() - 2 - version_len - 8;
+    assert_eq!(
+        &raw[prefix_at..prefix_at + 8],
+        &(version_len as u64).to_le_bytes(),
+        "the fixture must be locating the version string's length prefix"
+    );
+    raw[prefix_at + 8..prefix_at + 8 + version_len].fill(0xff);
+    match ConformanceEvidence::decode_file(&raw) {
+        Err(EvidenceError::LegacyUndecodable(detail)) => assert!(
+            detail.contains("does not decode as it"),
+            "expected the content reason, got: {detail}"
+        ),
+        other => panic!("expected LegacyUndecodable, got {other:?}"),
+    }
+}
+
+/// #5578 review finding 4: `Truncated` promised the disk-full case but covered only
+/// a cut inside the 10-byte header. A cut inside the payload now reports it too.
+#[test]
+fn a_framed_file_cut_inside_its_payload_reports_truncated() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let bytes = evidence.encode().expect("encode");
+    let cut = &bytes[..bytes.len() - 5];
+    assert!(
+        cut.len() > 10,
+        "the cut must fall inside the payload, not the header"
+    );
+    match ConformanceEvidence::decode(cut) {
+        Err(EvidenceError::Truncated { len }) => assert_eq!(len, cut.len()),
+        other => panic!("expected Truncated for a cut payload, got {other:?}"),
+    }
+}
+
+/// Encode evidence and return it with the offset of the length prefix of its last
+/// string, `runtime.core_version`. The payload ends with `runtime`: an 8-byte
+/// length, the version string, then a 2-byte schema field.
+fn encoded_with_version_prefix_offset() -> (Vec<u8>, usize, usize) {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let bytes = evidence.encode().expect("encode");
+    let version_len = evidence.runtime.core_version.len();
+    let prefix_at = bytes.len() - 2 - version_len - 8;
+    assert_eq!(
+        &bytes[prefix_at..prefix_at + 8],
+        &(version_len as u64).to_le_bytes(),
+        "the fixture must be locating the version string's length prefix"
+    );
+    (bytes, prefix_at, version_len)
+}
+
+/// #5578 review finding 6: a valid header followed by a payload that bincode
+/// rejects for a reason other than running out of bytes, which nothing tested. The
+/// fixture keeps every length intact and makes the last string in the payload
+/// invalid UTF-8.
+#[test]
+fn a_framed_file_with_an_undecodable_payload_reports_decode() {
+    let (mut bytes, prefix_at, version_len) = encoded_with_version_prefix_offset();
+    bytes[prefix_at + 8..prefix_at + 8 + version_len].fill(0xff);
+    assert!(matches!(
+        ConformanceEvidence::decode(&bytes),
+        Err(EvidenceError::Decode(_))
+    ));
+}
+
+/// A length prefix claiming more bytes than the payload holds is reported as
+/// truncation: the payload ends before what it declares. Pinned because the
+/// opposite was assumed while writing this module. bincode 1.3 ignores a configured
+/// size limit when decoding a slice, so no size-limit error can come from it here,
+/// and a test expecting one failed with exactly this `Truncated`.
+#[test]
+fn a_payload_declaring_more_than_it_holds_reports_truncated() {
+    let (mut bytes, prefix_at, _) = encoded_with_version_prefix_offset();
+    bytes[prefix_at..prefix_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    match ConformanceEvidence::decode(&bytes) {
+        Err(EvidenceError::Truncated { len }) => assert_eq!(len, bytes.len()),
+        other => panic!("expected Truncated, got {other:?}"),
+    }
+}
+
+/// `decode_file` on input too short to carry a schema version, and on an unframed
+/// file whose first two bytes are not a schema this build knows, reports that it is
+/// not evidence. The length guard matters beyond the message: without it an empty or
+/// one-byte file would index past its end and panic `fdev verify-merge`.
+#[test]
+fn decode_file_refuses_short_input_and_unknown_legacy_versions_as_not_evidence() {
+    for input in [&[][..], &[0u8][..], &[2u8][..]] {
+        assert!(
+            matches!(
+                ConformanceEvidence::decode_file(input),
+                Err(EvidenceError::BadMagic)
+            ),
+            "{input:?} must be refused as not evidence, not panic or be misread"
+        );
+    }
+    for version in [0u16, 3, u16::MAX] {
+        let mut input = version.to_le_bytes().to_vec();
+        input.extend_from_slice(&[0xff; 16]);
+        assert!(
+            matches!(
+                ConformanceEvidence::decode_file(&input),
+                Err(EvidenceError::BadMagic)
+            ),
+            "legacy version {version} must be refused as not evidence"
+        );
+    }
+}
+
+/// An oversized unframed file that begins `02 00` is refused before it is parsed,
+/// and hedged like the other legacy refusals: beginning with those two bytes does
+/// not make a file evidence.
+#[test]
+fn decode_file_refuses_an_oversized_unframed_file_without_calling_it_evidence() {
+    let mut input = 2u16.to_le_bytes().to_vec();
+    input.resize(MAX_EVIDENCE_ENCODED_BYTES + 1, 0xff);
+    match ConformanceEvidence::decode_file(&input) {
+        Err(EvidenceError::LegacyUndecodable(detail)) => assert!(
+            detail.contains("more than any evidence this build accepts"),
+            "expected the size refusal, got: {detail}"
+        ),
+        other => panic!("expected a hedged size refusal, got {other:?}"),
+    }
+}
+
+/// `encode` writes the header from `schema_version`, so it must refuse any value
+/// `decode` would then reject, instead of producing a file nothing can read.
+#[test]
+fn encode_refuses_a_schema_version_this_build_does_not_write() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let mut evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    evidence.schema_version = 999;
+    assert!(matches!(evidence.encode(), Err(EvidenceError::Encode(_))));
+}
+
+/// The size half of the same rule: `encode` refuses a payload that `decode` would
+/// refuse as too large, rather than writing a file nothing can read. Found by the
+/// external review of #5641.
+#[test]
+fn encode_refuses_a_payload_that_decode_would_refuse_as_too_large() {
+    let big = vec![0u8; MAX_EVIDENCE_ENCODED_BYTES + 1];
+    let case = ConformanceCase::new(
+        ConformanceProperty::StateIdempotence,
+        vec![Arc::from(big.as_slice())],
+    );
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    match evidence.encode() {
+        Err(EvidenceError::Encode(detail)) => assert!(
+            detail.contains("that decode accepts"),
+            "expected the size refusal, got: {detail}"
+        ),
+        other => panic!("expected an encode refusal, got {other:?}"),
+    }
+}
+
+/// Both size guards at the exact boundary: evidence whose payload is exactly
+/// `MAX_EVIDENCE_ENCODED_BYTES` encodes, and decodes back to itself. Pins `>`
+/// against `>=` in `encode()`, as `a_payload_exactly_at_the_limit_passes_the_size_gate`
+/// does for `decode_body`. bincode is fixint, so the payload is the state's length
+/// plus a constant; the fixture measures that constant rather than assuming it.
+#[test]
+fn evidence_whose_payload_is_exactly_the_limit_encodes_and_decodes() {
+    let build = |len: usize| {
+        let case = ConformanceCase::new(
+            ConformanceProperty::StateIdempotence,
+            vec![Arc::from(vec![0u8; len].as_slice())],
+        );
+        ConformanceEvidence::new(instance(1), vec![], &case, None)
+    };
+    // 8-byte magic plus 2-byte schema version precede the payload.
+    let header = 10;
+    let overhead = build(0).encode().expect("encode").len() - header;
+    let evidence = build(MAX_EVIDENCE_ENCODED_BYTES - overhead);
+    let bytes = evidence
+        .encode()
+        .expect("a payload exactly at the limit must encode");
+    assert_eq!(
+        bytes.len() - header,
+        MAX_EVIDENCE_ENCODED_BYTES,
+        "the fixture must land exactly on the limit"
+    );
+    assert_eq!(
+        ConformanceEvidence::decode(&bytes).expect("and must decode"),
+        evidence
+    );
+}
+
+/// The delta half of `check_bounds`' exact-arity check. Every other arity test
+/// supplies a wrong number of STATES; this one supplies the right number of states
+/// and the wrong number of deltas, so deleting the deltas comparison fails here.
+#[test]
+fn evidence_with_the_right_states_but_the_wrong_deltas_is_rejected() {
+    let property = ConformanceProperty::DeltaIdempotence;
+    assert!(
+        property.is_self_verifying(),
+        "the fixture needs a shippable property, or check_bounds refuses it earlier"
+    );
+    assert_eq!((property.state_arity(), property.delta_arity()), (1, 1));
+    let case = case(property, &[&[1]]);
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    assert!(
+        evidence.deltas.is_empty(),
+        "the fixture must carry no deltas"
+    );
+    assert!(matches!(
+        evidence.check_bounds(),
+        Err(EvidenceRejected::Arity {
+            want_deltas: 1,
+            got_deltas: 0,
+            ..
+        })
+    ));
+}
+
+/// `decode_file` decodes a framed file exactly as `decode` does. Without the
+/// delegation, framed input would fall through to the legacy sniff, read `FR` as a
+/// schema number, and be refused as not evidence.
+#[test]
+fn decode_file_decodes_framed_evidence_as_decode_does() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let bytes = evidence.encode().expect("encode");
+    assert_eq!(
+        ConformanceEvidence::decode_file(&bytes).expect("decode_file"),
+        evidence
     );
 }
 

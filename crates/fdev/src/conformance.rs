@@ -475,7 +475,9 @@ fn parse_properties(names: &[String]) -> anyhow::Result<Vec<ConformanceProperty>
 /// differ, and both are worth knowing.
 async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::Result<()> {
     let bytes = read_file(path)?;
-    let evidence = ConformanceEvidence::decode(&bytes)
+    // A file the operator chose, so evidence written before framing existed is
+    // accepted here. A path receiving bytes from a peer must use the strict `decode`.
+    let evidence = ConformanceEvidence::decode_file(&bytes)
         .with_context(|| format!("decoding evidence {}", path.display()))?;
 
     // Bounds-check with the same function a receiving peer uses, so this command
@@ -3213,6 +3215,28 @@ mod tests {
         assert!(
             msg.contains("not conformance evidence (bad magic)"),
             "error should indicate bad magic; got: {msg}"
+        );
+    }
+
+    /// `--evidence` reads files, which may predate framing, so it uses `decode_file`
+    /// rather than the strict `decode`, and recognises a pre-framing file as old
+    /// evidence instead of calling it foreign. Switching `verify_evidence` back to
+    /// `decode` makes this fail: the same file then reads as bad magic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_evidence_recognises_a_file_written_before_framing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let evidence_path = dir.path().join("evidence.bin");
+        // An unframed schema-1 payload, as v0.2.129 to v0.2.132 wrote.
+        std::fs::write(&evidence_path, [1u8, 0, 0xff, 0xff, 0xff]).expect("write file");
+
+        let config = wasm_only_config(None);
+        let err = verify_evidence(&config, &evidence_path)
+            .await
+            .expect_err("a schema-1 file must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("written by an older build"),
+            "a pre-framing file must be recognised as old evidence; got: {msg}"
         );
     }
 
