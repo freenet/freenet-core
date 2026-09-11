@@ -3081,18 +3081,19 @@ fn evidence_encode_decode_roundtrip() {
 
 #[test]
 fn legacy_unframed_schema_1_is_refused() {
-    use super::evidence::{ConformanceEvidence, EVIDENCE_SCHEMA_VERSION, EvidenceError};
-
     // Schema 1 legacy files: struct layout changed when `settling` was added, so
-    // deserializing them would silently produce garbage. Always refused.
+    // deserializing them would silently produce garbage. Always refused, and
+    // described as LOOKING like old evidence, since any file can begin `01 00`.
     let legacy_schema_1 = [1u8, 0u8, 0xff, 0xff, 0xff];
-    match ConformanceEvidence::decode(&legacy_schema_1) {
-        Err(EvidenceError::UnsupportedSchema { found, supported }) => {
-            assert_eq!(found, 1);
-            assert_eq!(supported, EVIDENCE_SCHEMA_VERSION);
-        }
-        other => panic!("expected schema 1 refusal for legacy file, got {other:?}"),
+    match ConformanceEvidence::decode_file(&legacy_schema_1) {
+        Err(EvidenceError::LegacyUnsupported { found }) => assert_eq!(found, 1),
+        other => panic!("expected the legacy schema-1 refusal, got {other:?}"),
     }
+    // The strict decoder does not recognise the unframed format at all.
+    assert!(matches!(
+        ConformanceEvidence::decode(&legacy_schema_1),
+        Err(EvidenceError::BadMagic)
+    ));
 }
 
 #[test]
@@ -3100,8 +3101,8 @@ fn legacy_unframed_schema_2_decodes_if_the_payload_is_valid() {
     use super::evidence::ConformanceEvidence;
 
     // v0.2.133 evidence: no framing header, raw bincode payload. The struct layout
-    // is byte-identical to the current schema 2, so decode must succeed rather than
-    // returning an error. This is the regression Ian's review caught.
+    // is byte-identical to the current schema 2, so a FILE decode must succeed rather
+    // than returning an error.
     let idem_case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
     let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &idem_case, None);
 
@@ -3113,24 +3114,124 @@ fn legacy_unframed_schema_2_decodes_if_the_payload_is_valid() {
         "first field must be schema_version = 2 in LE"
     );
 
-    let decoded = ConformanceEvidence::decode(&raw).expect("legacy schema 2 must decode cleanly");
+    let decoded =
+        ConformanceEvidence::decode_file(&raw).expect("legacy schema 2 must decode as a file");
     assert_eq!(decoded, evidence);
+
+    // #5581: the strict decoder, the one a receive path uses, refuses the same bytes.
+    // Accepting them there would make the unframed format a second wire format,
+    // recognised by two bytes instead of the 8-byte magic.
+    assert!(matches!(
+        ConformanceEvidence::decode(&raw),
+        Err(EvidenceError::BadMagic)
+    ));
 }
 
+/// #5578 review finding 3: a file that starts like v0.2.133 evidence but does not
+/// decode used to report `BadMagic`, "not conformance evidence", which is the
+/// misdiagnosis `Truncated` exists to prevent. It now says what it looks like and
+/// that it does not decode, so the owner of a damaged file is pointed at the file.
 #[test]
-fn legacy_sniff_02_00_with_garbage_payload_is_bad_magic() {
-    use super::evidence::{ConformanceEvidence, EvidenceError};
+fn a_file_starting_like_schema_2_evidence_that_does_not_decode_says_so() {
+    let looks_like_evidence = [2u8, 0u8, 0xff, 0xff, 0xff];
+    assert!(matches!(
+        ConformanceEvidence::decode_file(&looks_like_evidence),
+        Err(EvidenceError::LegacyUndecodable(_))
+    ));
+    assert!(matches!(
+        ConformanceEvidence::decode(&looks_like_evidence),
+        Err(EvidenceError::BadMagic)
+    ));
+}
 
-    // A file that happens to start with `02 00` but whose bincode deserialization fails
-    // is not evidence at all; fall through to BadMagic rather than a confusing decode error.
-    let not_evidence = [2u8, 0u8, 0xff, 0xff, 0xff];
+/// The realistic form of the case above: a real v0.2.133 file, cut short.
+#[test]
+fn a_truncated_v0_2_133_file_is_reported_as_damaged_not_as_foreign() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let raw = bincode::serialize(&evidence).expect("serialize");
     assert!(
-        matches!(
-            ConformanceEvidence::decode(&not_evidence),
-            Err(EvidenceError::BadMagic)
-        ),
-        "a garbage file starting with 02 00 must not produce a decode error"
+        ConformanceEvidence::decode_file(&raw).is_ok(),
+        "control: the whole file must decode, or the refusal below proves nothing"
     );
+    assert!(matches!(
+        ConformanceEvidence::decode_file(&raw[..raw.len() - 1]),
+        Err(EvidenceError::LegacyUndecodable(_))
+    ));
+}
+
+/// #5578 review finding 4: `Truncated` promised the disk-full case but covered only
+/// a cut inside the 10-byte header. A cut inside the payload now reports it too.
+#[test]
+fn a_framed_file_cut_inside_its_payload_reports_truncated() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let bytes = evidence.encode().expect("encode");
+    let cut = &bytes[..bytes.len() - 5];
+    assert!(
+        cut.len() > 10,
+        "the cut must fall inside the payload, not the header"
+    );
+    match ConformanceEvidence::decode(cut) {
+        Err(EvidenceError::Truncated { len }) => assert_eq!(len, cut.len()),
+        other => panic!("expected Truncated for a cut payload, got {other:?}"),
+    }
+}
+
+/// Encode evidence and return it with the offset of the length prefix of its last
+/// string, `runtime.core_version`. The payload ends with `runtime`: an 8-byte
+/// length, the version string, then a 2-byte schema field.
+fn encoded_with_version_prefix_offset() -> (Vec<u8>, usize, usize) {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let bytes = evidence.encode().expect("encode");
+    let version_len = evidence.runtime.core_version.len();
+    let prefix_at = bytes.len() - 2 - version_len - 8;
+    assert_eq!(
+        &bytes[prefix_at..prefix_at + 8],
+        &(version_len as u64).to_le_bytes(),
+        "the fixture must be locating the version string's length prefix"
+    );
+    (bytes, prefix_at, version_len)
+}
+
+/// #5578 review finding 6: a valid header followed by a payload that bincode
+/// rejects for a reason other than running out of bytes, which nothing tested. The
+/// fixture keeps every length intact and makes the last string in the payload
+/// invalid UTF-8.
+#[test]
+fn a_framed_file_with_an_undecodable_payload_reports_decode() {
+    let (mut bytes, prefix_at, version_len) = encoded_with_version_prefix_offset();
+    bytes[prefix_at + 8..prefix_at + 8 + version_len].fill(0xff);
+    assert!(matches!(
+        ConformanceEvidence::decode(&bytes),
+        Err(EvidenceError::Decode(_))
+    ));
+}
+
+/// A length prefix claiming more bytes than the payload holds is reported as
+/// truncation: the payload ends before what it declares. Pinned because the
+/// opposite was assumed while writing this module. bincode 1.3 ignores a configured
+/// size limit when decoding a slice, so no size-limit error can come from it here,
+/// and a test expecting one failed with exactly this `Truncated`.
+#[test]
+fn a_payload_declaring_more_than_it_holds_reports_truncated() {
+    let (mut bytes, prefix_at, _) = encoded_with_version_prefix_offset();
+    bytes[prefix_at..prefix_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    match ConformanceEvidence::decode(&bytes) {
+        Err(EvidenceError::Truncated { len }) => assert_eq!(len, bytes.len()),
+        other => panic!("expected Truncated, got {other:?}"),
+    }
+}
+
+/// `encode` writes the header from `schema_version`, so it must refuse any value
+/// `decode` would then reject, instead of producing a file nothing can read.
+#[test]
+fn encode_refuses_a_schema_version_this_build_does_not_write() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let mut evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    evidence.schema_version = 999;
+    assert!(matches!(evidence.encode(), Err(EvidenceError::Encode(_))));
 }
 
 #[test]

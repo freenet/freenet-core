@@ -49,12 +49,27 @@ pub enum EvidenceError {
     #[error("not conformance evidence (bad magic)")]
     BadMagic,
     #[error(
-        "evidence file is truncated: magic matched but the 10-byte framing header is incomplete \
-         ({len} byte(s)); the file was likely cut off mid-write and should be regenerated"
+        "evidence is truncated: it ends after {len} byte(s), before it is complete; the \
+         file was likely cut off mid-write and should be regenerated"
     )]
     Truncated { len: usize },
     #[error("evidence uses schema version {found}, this build understands {supported}")]
     UnsupportedSchema { found: u16, supported: u16 },
+    /// An unframed file whose first two bytes read as a schema version this build
+    /// cannot decode. Worded as "looks like" because any binary file can begin with
+    /// the same two bytes.
+    #[error(
+        "this looks like unframed evidence written by an older build (schema {found}), \
+         which this build cannot read; re-capture it with this build"
+    )]
+    LegacyUnsupported { found: u16 },
+    /// An unframed file that starts like pre-framing schema-2 evidence but does not
+    /// decode as it.
+    #[error(
+        "this starts like unframed schema-2 evidence from v0.2.133 but does not decode \
+         as it ({0}); if it is evidence, the file is damaged or truncated"
+    )]
+    LegacyUndecodable(String),
     #[error(
         "evidence framing header specifies schema {header}, but deserialized payload specifies {body}"
     )]
@@ -437,6 +452,14 @@ impl ConformanceEvidence {
     /// Encode with framing: 8-byte magic (`FRNTEVD1`), 2-byte schema version (LE),
     /// followed by the bincode-serialized payload.
     pub fn encode(&self) -> Result<Vec<u8>, EvidenceError> {
+        // The header is written from this field, so any other value would produce a
+        // file that `decode` then refuses as an unsupported schema.
+        if self.schema_version != EVIDENCE_SCHEMA_VERSION {
+            return Err(EvidenceError::Encode(format!(
+                "schema_version is {}, but this build writes only schema {EVIDENCE_SCHEMA_VERSION}",
+                self.schema_version
+            )));
+        }
         let mut out = Vec::with_capacity(self.input_bytes() + 128);
         out.extend_from_slice(EVIDENCE_MAGIC);
         out.extend_from_slice(&self.schema_version.to_le_bytes());
@@ -445,115 +468,155 @@ impl ConformanceEvidence {
         Ok(out)
     }
 
-    /// Decode an evidence file, verifying magic and schema version *before*
-    /// attempting bincode deserialization.
+    /// Decode evidence from an untrusted source: framed evidence only.
     ///
-    /// The check order matters:
-    /// 1. Magic first — so a truncated framed file (`b"FRNTEVD1"` with nothing after)
-    ///    reports [`EvidenceError::Truncated`] rather than [`EvidenceError::BadMagic`].
-    ///    A disk that fills mid-write produces a partial file; telling the user "not
-    ///    conformance evidence" sends them hunting for the wrong problem.
-    /// 2. Length second — once the magic matches, a short header is a truncation.
-    /// 3. Legacy sniff — if the magic did not match and the first two bytes look like
-    ///    a schema version, try to decode the raw bincode payload (v0.2.129–v0.2.133
-    ///    wrote evidence without the header). Schema 2 files from those releases are
-    ///    byte-compatible with the current struct, so a successful decode is returned
-    ///    rather than an error. Schema 1 is refused: the struct changed between 1 and 2.
+    /// This is the decoder for anything a peer could have written. It accepts only
+    /// the framed format (8-byte magic, 2-byte schema version, payload), so every
+    /// input must match the full magic first. Files written before framing existed
+    /// are read by [`Self::decode_file`], which is for files an operator points at
+    /// and must never see bytes from a peer.
     ///
-    /// Both payload paths go through [`decode_body`], which refuses a payload larger
-    /// than [`MAX_EVIDENCE_ENCODED_BYTES`] or followed by trailing bytes.
+    /// The check order matters. Magic first, so a file cut short inside its header
+    /// reports [`EvidenceError::Truncated`] rather than claiming it is not evidence:
+    /// a disk that fills mid-write produces exactly that, and "not conformance
+    /// evidence" sends its owner looking for the wrong problem. The payload then goes
+    /// through [`decode_body`], which refuses one larger than
+    /// [`MAX_EVIDENCE_ENCODED_BYTES`] or followed by trailing bytes, and a payload
+    /// that ends early is reported as truncated as well.
     pub fn decode(bytes: &[u8]) -> Result<Self, EvidenceError> {
         const HEADER_LEN: usize = EVIDENCE_MAGIC.len() + 2;
+        if !bytes.starts_with(EVIDENCE_MAGIC) {
+            return Err(EvidenceError::BadMagic);
+        }
+        if bytes.len() < HEADER_LEN {
+            return Err(EvidenceError::Truncated { len: bytes.len() });
+        }
+        let version =
+            u16::from_le_bytes([bytes[EVIDENCE_MAGIC.len()], bytes[EVIDENCE_MAGIC.len() + 1]]);
+        if version != EVIDENCE_SCHEMA_VERSION {
+            return Err(EvidenceError::UnsupportedSchema {
+                found: version,
+                supported: EVIDENCE_SCHEMA_VERSION,
+            });
+        }
+        let evidence = decode_body(&bytes[HEADER_LEN..]).map_err(|error| match error {
+            BodyError::TooLarge { found } => EvidenceError::TooLarge {
+                found,
+                limit: MAX_EVIDENCE_ENCODED_BYTES,
+            },
+            BodyError::EndedEarly => EvidenceError::Truncated { len: bytes.len() },
+            BodyError::Malformed(detail) => EvidenceError::Decode(detail),
+        })?;
+        if evidence.schema_version != version {
+            return Err(EvidenceError::MismatchedBodySchema {
+                header: version,
+                body: evidence.schema_version,
+            });
+        }
+        Ok(evidence)
+    }
 
-        // Check magic FIRST so a truncated framed file is recognized as such rather
-        // than misreported as "not conformance evidence".
+    /// Decode an evidence FILE, also accepting the unframed format that builds
+    /// v0.2.129 to v0.2.133 wrote.
+    ///
+    /// For files an operator chose, such as `fdev verify-merge --evidence`. Never
+    /// pass it bytes from a peer: the unframed format is recognised by two bytes
+    /// rather than the 8-byte magic, and a receive path that accepted it would
+    /// accept a second wire format permanently. [`Self::decode`] is the decoder for
+    /// untrusted input.
+    ///
+    /// A framed file is decoded exactly as [`Self::decode`] would decode it. An
+    /// unframed one is raw bincode whose first field is `schema_version` (LE `u16`).
+    /// Schema 2 is byte-compatible with the current struct and is decoded, through
+    /// the same bounded [`decode_body`]. Schema 1 is not, because `settling` was
+    /// added to `Violation` when the schema moved to 2.
+    pub fn decode_file(bytes: &[u8]) -> Result<Self, EvidenceError> {
         if bytes.starts_with(EVIDENCE_MAGIC) {
-            if bytes.len() < HEADER_LEN {
-                return Err(EvidenceError::Truncated { len: bytes.len() });
-            }
-            let version =
-                u16::from_le_bytes([bytes[EVIDENCE_MAGIC.len()], bytes[EVIDENCE_MAGIC.len() + 1]]);
-            if version != EVIDENCE_SCHEMA_VERSION {
-                return Err(EvidenceError::UnsupportedSchema {
-                    found: version,
-                    supported: EVIDENCE_SCHEMA_VERSION,
-                });
-            }
-            let evidence = decode_body(&bytes[HEADER_LEN..])?;
-            if evidence.schema_version != version {
-                return Err(EvidenceError::MismatchedBodySchema {
-                    header: version,
-                    body: evidence.schema_version,
-                });
-            }
-            return Ok(evidence);
+            return Self::decode(bytes);
         }
-
-        // Legacy sniff: pre-0.2.134 builds wrote raw bincode without the framing header.
-        // The first field is `schema_version: u16` in LE, so a real legacy file begins
-        // `01 00` (schema 1) or `02 00` (schema 2).
-        //
-        // Schema 1 is refused: the struct layout changed when `settling` was added.
-        // Schema 2 is byte-compatible with the current struct, so we attempt a direct
-        // bincode decode and return it if it succeeds. Failure (e.g. a random file that
-        // happens to start with `02 00`) falls through to BadMagic rather than exposing
-        // a decode error for input that is almost certainly not evidence at all.
-        if bytes.len() >= 2 {
-            let legacy_version = u16::from_le_bytes([bytes[0], bytes[1]]);
-            if legacy_version == 1 {
-                return Err(EvidenceError::UnsupportedSchema {
-                    found: 1,
-                    supported: EVIDENCE_SCHEMA_VERSION,
-                });
-            }
-            if legacy_version == 2 {
-                if let Ok(evidence) = decode_body(bytes) {
-                    return Ok(evidence);
+        if bytes.len() < 2 {
+            return Err(EvidenceError::BadMagic);
+        }
+        let legacy_version = u16::from_le_bytes([bytes[0], bytes[1]]);
+        if legacy_version == 2 {
+            return decode_body(bytes).map_err(|error| match error {
+                BodyError::TooLarge { found } => EvidenceError::TooLarge {
+                    found,
+                    limit: MAX_EVIDENCE_ENCODED_BYTES,
+                },
+                BodyError::EndedEarly => {
+                    EvidenceError::LegacyUndecodable("it ends early".to_string())
                 }
-                // Not a real legacy evidence file; fall through to BadMagic.
-            }
+                BodyError::Malformed(detail) => EvidenceError::LegacyUndecodable(detail),
+            });
         }
-
+        if legacy_version == 1 {
+            return Err(EvidenceError::LegacyUnsupported {
+                found: legacy_version,
+            });
+        }
         Err(EvidenceError::BadMagic)
     }
 }
+
+// `decode_file` decodes an unframed schema-2 payload with the CURRENT struct, which
+// is right only while the current schema is 2. Bumping the schema has to revisit
+// that branch, so the build refuses to compile until someone has.
+const _: () = assert!(
+    EVIDENCE_SCHEMA_VERSION == 2,
+    "EVIDENCE_SCHEMA_VERSION changed: decide what decode_file does with unframed schema-2 files"
+);
 
 /// The bincode configuration evidence is decoded with.
 ///
 /// Byte-compatible with `bincode::serialize`, which [`ConformanceEvidence::encode`]
 /// uses: fixint and little-endian, like bincode 1.x's free functions. It differs
-/// from `bincode::deserialize` in the two ways #5581 asks for. Bytes are counted
-/// against [`MAX_EVIDENCE_ENCODED_BYTES`], so a length prefix claiming more than that
-/// is refused before anything is allocated for it. And bytes left over after a
-/// complete payload are an error instead of being ignored.
+/// from `bincode::deserialize` in refusing bytes left over after a complete
+/// payload, instead of ignoring them.
+///
+/// It deliberately sets no size limit, because bincode would ignore one:
+/// deserializing from a slice replaces the configured limit with `Infinite`
+/// (`internal::deserialize_seed` in bincode 1.3), so `.with_limit(..)` here would
+/// read as a bound and bound nothing. The bound is the length check at the top of
+/// [`decode_body`], which runs before bincode reads a byte. Allocation stays within
+/// the input regardless: a slice reader refuses a byte string longer than the input
+/// that remains before allocating it, and serde caps a sequence's up-front capacity.
 fn evidence_bincode() -> impl bincode::Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
-        .with_limit(MAX_EVIDENCE_ENCODED_BYTES as u64)
         .reject_trailing_bytes()
 }
 
+/// Why a payload failed to decode, before the caller decides how to report it.
+///
+/// The two callers report the same failure differently: a framed file that ends
+/// early is [`EvidenceError::Truncated`], while an unframed one that fails is
+/// [`EvidenceError::LegacyUndecodable`], since it may not be evidence at all.
+enum BodyError {
+    /// Larger than [`MAX_EVIDENCE_ENCODED_BYTES`]; not parsed at all.
+    TooLarge { found: usize },
+    /// The bytes ran out before a complete payload.
+    EndedEarly,
+    /// Anything else, with bincode's description of it.
+    Malformed(String),
+}
+
 /// Decode an evidence payload, refusing an oversized one before bincode reads it.
-fn decode_body(body: &[u8]) -> Result<ConformanceEvidence, EvidenceError> {
+fn decode_body(body: &[u8]) -> Result<ConformanceEvidence, BodyError> {
     if body.len() > MAX_EVIDENCE_ENCODED_BYTES {
-        return Err(EvidenceError::TooLarge {
-            found: body.len(),
-            limit: MAX_EVIDENCE_ENCODED_BYTES,
-        });
+        return Err(BodyError::TooLarge { found: body.len() });
     }
     evidence_bincode().deserialize(body).map_err(|error| {
-        // A length prefix inside the payload claimed more than the limit. The
-        // payload itself is within it, so this is malformed rather than
-        // oversized, and says which limit it hit.
-        let detail = if matches!(*error, bincode::ErrorKind::SizeLimit) {
-            format!(
-                "a length inside the payload claims more than the \
-                     {MAX_EVIDENCE_ENCODED_BYTES}-byte evidence limit"
-            )
+        if matches!(
+            &*error,
+            bincode::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof
+        ) {
+            // Includes a length prefix claiming more bytes than the payload holds:
+            // the payload ends before what it declares.
+            BodyError::EndedEarly
         } else {
-            error.to_string()
-        };
-        EvidenceError::Decode(detail)
+            BodyError::Malformed(error.to_string())
+        }
     })
 }
 
