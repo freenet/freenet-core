@@ -204,14 +204,34 @@ failure`, `Upload freenet binary => skipped`, `Upload fdev binary => skipped`.)
 **If this job fails at signing, the failure is Azure-side and cannot be fixed
 from the repo.** Unlike every other release secret, Windows signing is
 fail-closed: the `Verify signatures` step throws if either binary is unsigned,
-invalid, or missing its RFC3161 timestamp, and `attach-to-release` needs this
-job, so the release stops as a draft rather than shipping unsigned binaries.
+invalid, missing its RFC3161 timestamp, or signed by a publisher other than
+`CN=Freenet Project Inc`, and `attach-to-release` needs this job, so the
+release stops as a draft rather than shipping unsigned binaries.
 Read the `Verify signatures` step output first — it prints each binary's status
 and signer subject. Expect:
 
 ```
 CN=Freenet Project Inc, O=Freenet Project Inc, L=Austin, S=Texas, C=US
 ```
+
+**If the failure is `Unexpected signer`** rather than unsigned/untimestamped,
+the binary WAS signed, just not by us. Three possibilities, in the order worth
+checking: the Azure certificate profile was repointed (misconfiguration); the
+certificate was legitimately reissued under a changed name (e.g. the company
+name changed) — in which case update the expected CN deliberately and in a
+reviewed PR, in BOTH the comparison and the thrown message in the `Verify
+signatures` step, and in its pin in
+`crates/core/tests/windows_signing_order.rs`; or, least likely and most
+serious, someone else signed it. Never delete the check to get a release out:
+that is the one action that converts a blocked release into an unsigned one
+shipped to users whose Windows auto-update has no canary (#5341).
+
+Note that a repoint is not guaranteed to surface as `Unexpected signer`. If the
+profile it was repointed to does not chain to a root the runner trusts — an
+Azure Trusted Signing *test* profile, or a private-trust profile — then
+`$sig.Status` is not `Valid` and the step throws `Unsigned or invalid` first, on
+an earlier line. A repoint is therefore worth checking under either message,
+not only this one.
 
 Common causes, in the order worth checking: the `release` environment or the
 `AZURE_*` secrets were changed (the Entra federated credential is pinned to the
@@ -540,9 +560,66 @@ If you need to rollback a release:
 ```bash
 ./scripts/release-rollback.sh --version 0.1.X
 
-# To also yank from crates.io (cannot be undone!)
+# To also yank from crates.io
 ./scripts/release-rollback.sh --version 0.1.X --yank-crates
 ```
+
+A yank is reversible — `cargo yank --undo --version X.Y.Z <crate>` puts the
+version back — but while it stands it breaks dependency resolution for everyone
+building against it, and yanking the WRONG version does that to a good release.
+So the script is deliberately strict about where the fdev version comes from.
+
+`--yank-crates` yanks BOTH crates, and the fdev version is read from
+`crates/fdev/Cargo.toml` **at the release tag on ORIGIN** — fdev's version is
+independent of freenet's (0.3.x against 0.2.x), and the working tree has usually
+bumped it again by the time anyone is rolling a release back.
+
+**Only origin's tag, or your own `--fdev-version`, is good enough to yank on.**
+A local tag of the same name is read as a HINT and never acted on:
+`release.sh` skips tag creation when a local tag already exists, so an aborted
+run leaves a stale one pointing at a different release, and adjacent fdev patch
+versions all exist on crates.io — so a near-miss succeeds and takes a good
+release's fdev down. When origin's tag and a local one disagree, origin wins and
+the disagreement is printed. When origin cannot be read at all, the script stops
+and asks, quoting the local tag's number only as something to check.
+
+For the same reason `origin` must actually BE `freenet/freenet-core`. Steps 2
+and 3 delete from whatever origin points at (and from a hardcoded
+`--repo freenet/freenet-core`), but `cargo yank` always reaches the real
+crates.io — so with origin on a fork, its tag could name a version that belongs
+to a live release. The script refuses to use a non-freenet origin as a version
+source and says so.
+
+If the tag is gone both locally and on origin — or it is readable only locally,
+or the manifest at it cannot be parsed — the script stops **before deleting
+anything** and asks for the version:
+
+```bash
+./scripts/release-rollback.sh --version 0.1.X --yank-crates --fdev-version 0.Y.Z
+```
+
+That is also why a run **without** `--yank-crates` prints the fdev version in
+its follow-up suggestion: the run has just deleted the tag (and the release
+page) the number would have been read from, so the second invocation needs it
+passed in. It prints a ready-to-paste command only when the number came from
+origin or from you — never a local-tag reading, which pasted would become an
+"explicit" `--fdev-version` and silence the very check that questioned it. When
+there is no such number it names the lookup and an `X.Y.Z` placeholder instead
+of a bare `--yank-crates` re-run, which would only stop with the same error.
+
+The script exits **non-zero** if any step fails, and says which. A yank is
+attempted only for a version crates.io reports as published (200); a 404 is
+reported as "not published, skipping" and is not a failure, while any other
+status is UNKNOWN and IS a failure — the 403-without-a-User-Agent trap
+described in the Quick Reference, which a two-state check reads as "not
+published" for every version ever released. There is deliberately no override
+for that: if crates.io is rate-limiting or down and the yank has to happen now,
+run it by hand once you have confirmed the version's state (`cargo yank
+--version X.Y.Z freenet`, `cargo yank --version 0.Y.Z fdev`).
+
+`--dry-run` resolves and prints the fdev version and asks crates.io whether both
+versions are actually published, without yanking or deleting anything. Worth
+running first.
 
 ## Verification Checklist
 

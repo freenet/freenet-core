@@ -1046,15 +1046,57 @@ fn get_update_failure_count() -> u32 {
 /// directory.
 ///
 /// * Missing file → `0` (legitimate "no failures yet").
-/// * Present but unparseable → `MAX_UPDATE_FAILURES` (defensive: if the
-///   counter file has been truncated or corrupted we must NOT silently
-///   reset the lockout — that would be an amplification vector for any
-///   process that can partially overwrite the file, defeating the
-///   #3934 fix. Users can recover by explicitly deleting the file).
+/// * Present but unparseable, OR unreadable for any reason other than being
+///   absent → `MAX_UPDATE_FAILURES` (defensive: a truncated, corrupted or
+///   unreadable counter must not READ as zero, because that would silently
+///   reset the #3934 lockout on the strength of damage to the file).
+///
+/// Note the asymmetry with [`next_failure_count`], which is deliberate and was
+/// easy to mistake for an inconsistency, so it is written down here too: this
+/// function makes an unparseable counter read as fully-failed, while recording
+/// the next failure REWRITES an unparseable counter as `1` rather than as
+/// `MAX + 1`.
+///
+/// Both directions are the safe one for their own side:
+///
+/// * Reading MAX keeps the gate shut while the file is damaged, and heals by
+///   itself because the gate re-reads every time.
+/// * Writing `1` bounds the damage. `fs::write` is not atomic, so a power cut
+///   during [`record_update_failure_at`] can leave a truncated — hence
+///   unparseable — counter. Persisting `MAX + 1` for that would turn one
+///   ill-timed crash into a PERMANENT auto-update lockout needing manual file
+///   deletion, which is the failure this whole subsystem exists to avoid.
+///   Rewriting it as `1` costs at most two extra attempts before the gate
+///   closes again.
+///
+/// This is not an amplification vector, which is the objection it invites. To
+/// reach the rewrite at all something must record a failure, and that requires
+/// an update attempt; while the counter is unparseable the gate is shut, so no
+/// automatic attempt happens. And a process that can choose the file's contents
+/// does not need any of this — it writes `0`. Corruption alone only ever shuts
+/// the gate.
 pub(crate) fn get_update_failure_count_at(dir: &std::path::Path) -> u32 {
     match fs::read_to_string(dir.join("update_failures")) {
         Ok(s) => s.trim().parse().unwrap_or(MAX_UPDATE_FAILURES),
-        Err(_) => 0,
+        // Genuinely absent: no failures yet.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        // Present but unreadable (EACCES, EIO, a directory in its place) is the
+        // same situation as unparseable, and gets the same defensive answer.
+        // Reading it as zero would silently RESET the lockout — a fail-OPEN on
+        // the mechanism that bounds the #3934 restart loop, and an easier way to
+        // defeat it than the partial-overwrite this function's doc already
+        // guards against.
+        //
+        // Note this is NOT the read-only/full state dir case: EROFS and ENOSPC
+        // break writes, while reads still succeed or report NotFound, which is
+        // handled above. The states that land here are anomalous ones — a
+        // chmod'd or wrong-owner file, a directory in its place, a failing mount
+        // — and treating them as fully-failed is self-healing, because the gate
+        // re-reads every time and recovers the moment the file is readable again.
+        //
+        // `read_github_poll_bucket_at` in this file makes the same distinction
+        // for the same reason.
+        Err(_) => MAX_UPDATE_FAILURES,
     }
 }
 
@@ -1073,10 +1115,38 @@ pub fn record_update_failure() {
 
 /// Testable variant of [`record_update_failure`] that writes into an
 /// explicit directory. Missing directories are created on demand.
+/// What to persist after an install failure, given the raw read of the existing
+/// counter — or `None` to write nothing at all.
+///
+/// Split out from [`record_update_failure_at`] so the decision is testable
+/// without contriving a filesystem that reads one way and writes another.
+///
+/// The subtle case is the unreadable one. [`get_update_failure_count_at`]
+/// deliberately reports an unreadable counter as [`MAX_UPDATE_FAILURES`] so the
+/// GATE stays closed while the file cannot be read — that is transient and
+/// self-healing, because the gate re-reads every time. Feeding that defensive
+/// answer back into the file would be neither: it would bake `MAX + 1` into
+/// disk and lock the node out of auto-update PERMANENTLY on one transient read
+/// error (a flaky network mount, an EIO). That is a worse failure than the
+/// fail-open it replaced, so an unreadable counter writes nothing.
+///
+/// The unparseable-but-readable case is different and is answered differently:
+/// it restarts the count at `1`. See [`get_update_failure_count_at`] for why
+/// the two functions disagree about the same damaged file on purpose.
+fn next_failure_count(existing: std::io::Result<String>) -> Option<u32> {
+    match existing {
+        Ok(s) => Some(s.trim().parse::<u32>().unwrap_or(0).saturating_add(1)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(1),
+        Err(_) => None,
+    }
+}
+
 pub(crate) fn record_update_failure_at(dir: &std::path::Path) {
     let _mkdir = fs::create_dir_all(dir);
-    let count = get_update_failure_count_at(dir) + 1;
-    let _write = fs::write(dir.join("update_failures"), count.to_string());
+    let path = dir.join("update_failures");
+    if let Some(count) = next_failure_count(fs::read_to_string(&path)) {
+        let _write = fs::write(&path, count.to_string());
+    }
 }
 
 /// Clear the update failure count. Called from the update command after a
@@ -1632,6 +1702,136 @@ pub fn jittered_repoll_interval(base: Duration, jitter_fraction: f64, rand_unit:
 
 #[cfg(test)]
 mod tests {
+    /// A transient read error must not be persisted as a permanent lockout.
+    ///
+    /// `get_update_failure_count_at` answers MAX_UPDATE_FAILURES when the
+    /// counter cannot be read, which keeps the GATE closed while the condition
+    /// lasts and heals by itself. Recording a failure used to feed that answer
+    /// straight back through `+ 1`, so one transient EIO would write 4 to disk
+    /// and lock auto-update off forever — turning the fail-CLOSED read into a
+    /// permanent brick, which is worse than the fail-open it replaced (#5244).
+    #[test]
+    fn an_unreadable_counter_is_never_persisted_as_a_count() {
+        use std::io::{Error, ErrorKind};
+
+        assert_eq!(
+            super::next_failure_count(Err(Error::from(ErrorKind::PermissionDenied))),
+            None,
+            "an unreadable counter must write NOTHING: we cannot know the real count, and \
+             inventing MAX+1 makes a transient error permanent"
+        );
+        assert_eq!(
+            super::next_failure_count(Err(Error::from(ErrorKind::NotFound))),
+            Some(1),
+            "a genuinely absent counter is the first failure"
+        );
+        assert_eq!(
+            super::next_failure_count(Ok("2".to_string())),
+            Some(3),
+            "the ordinary case still increments"
+        );
+        assert_eq!(
+            super::next_failure_count(Ok("garbage".to_string())),
+            Some(1),
+            "an unparseable counter restarts the count rather than inventing a lockout"
+        );
+    }
+
+    /// An unreadable counter file must NOT read as "no failures".
+    ///
+    /// `Err(_) => 0` caught every read error, not just `NotFound`, so a counter
+    /// made unreadable (EACCES, EIO, a directory in its place) silently reset
+    /// the #3934 lockout — a fail-OPEN on the mechanism that bounds the
+    /// exit-42 → failed-install → restart loop. The doc comment above the
+    /// function promised the opposite and named the threat; only the parse path
+    /// was actually defended. See #5244.
+    ///
+    /// A directory is used rather than a chmod because it fails for root too,
+    /// so this cannot quietly degrade into a no-op in a container.
+    #[test]
+    fn an_unreadable_failure_counter_does_not_reset_the_lockout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("update_failures")).unwrap();
+
+        assert_eq!(
+            super::get_update_failure_count_at(dir.path()),
+            super::MAX_UPDATE_FAILURES,
+            "an unreadable counter must be treated as fully-failed, not as zero: reading it as \
+             zero re-enables the update loop the counter exists to stop"
+        );
+        assert!(
+            !super::should_attempt_update_at(dir.path()),
+            "and the lockout it feeds must stay engaged"
+        );
+    }
+
+    /// The legitimate case still reads as zero, so a fresh node is not born
+    /// locked out.
+    #[test]
+    fn an_absent_failure_counter_reads_as_no_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(super::get_update_failure_count_at(dir.path()), 0);
+        assert!(super::should_attempt_update_at(dir.path()));
+    }
+
+    /// Pins the deliberate asymmetry between READING and REWRITING a damaged
+    /// counter, end to end, because it reads as a bug and was filed as one:
+    /// the read reports `MAX_UPDATE_FAILURES` (gate shut) while recording the
+    /// next failure rewrites the file as `1` (gate open again).
+    ///
+    /// The property that makes the rewrite safe is not that the gate stays
+    /// shut — it does not — but that reopening it is BOUNDED. So this asserts
+    /// the bound, not the reopening: after the rewrite, `MAX` further failures
+    /// put the lockout back. Without that, "resets to 1" really would be a way
+    /// to get unlimited attempts out of a corrupted file.
+    ///
+    /// `fs::write` is not atomic, so the truncated counter this covers is
+    /// reachable from an ordinary power cut mid-write, not only from tampering
+    /// — which is why persisting `MAX + 1` here would be the worse choice: it
+    /// would turn one ill-timed crash into a permanent lockout.
+    #[test]
+    fn a_corrupt_counter_shuts_the_gate_and_reopens_it_only_boundedly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update_failures");
+
+        // A truncated write is the realistic corruption; an empty file does
+        // not parse as a u32.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(
+            super::get_update_failure_count_at(dir.path()),
+            super::MAX_UPDATE_FAILURES,
+            "a damaged counter must read as fully-failed, never as zero"
+        );
+        assert!(
+            !super::should_attempt_update_at(dir.path()),
+            "so the gate is shut while the file is damaged"
+        );
+
+        super::record_update_failure_at(dir.path());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            "1",
+            "an unparseable counter restarts the count; persisting MAX + 1 would make a \
+             truncated write a permanent lockout that only manual deletion clears"
+        );
+        assert_eq!(super::get_update_failure_count_at(dir.path()), 1);
+        assert!(super::should_attempt_update_at(dir.path()));
+
+        // ...and the reopening is bounded: the lockout re-engages on schedule.
+        for _ in 1..super::MAX_UPDATE_FAILURES {
+            super::record_update_failure_at(dir.path());
+        }
+        assert_eq!(
+            super::get_update_failure_count_at(dir.path()),
+            super::MAX_UPDATE_FAILURES
+        );
+        assert!(
+            !super::should_attempt_update_at(dir.path()),
+            "corruption must not buy unlimited attempts — the gate closes again \
+             after MAX_UPDATE_FAILURES"
+        );
+    }
+
     use super::*;
     use freenet::transport::{
         set_open_connection_count, signal_version_mismatch, version_mismatch_generation,

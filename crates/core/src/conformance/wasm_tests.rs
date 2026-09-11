@@ -486,3 +486,89 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
 
     Ok(())
 }
+
+/// The contract-visible clock is controllable end to end, through real wasmtime.
+///
+/// This asserts on what the PIPELINE emits — the bytes a real compiled contract
+/// produces — not on the helper that was edited. A unit test of `contract_now()`
+/// would pass even if the host binding never called it, which is the exact shape
+/// of guard this project has repeatedly written and then found unable to fail.
+///
+/// Mode 4 (`NONDETERMINISTIC_SUMMARY`) appends the host clock's nanosecond
+/// timestamp to its summary, so its output is a direct readout of what the
+/// contract believes the time to be.
+///
+/// This is also a regression test for a real dead end: an earlier attempt
+/// overrode a thread-local read directly by `utc_now`, which never worked
+/// because contract WASM executes on a dedicated blocking thread
+/// (`execute_wasm_blocking`), never on the calling thread — measured: the guard
+/// installed on one `ThreadId` while the contract call ran on another. The fix
+/// carries the override across that boundary explicitly; this test would fail
+/// against the broken thread-local-only version.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contract_sees_the_overridden_clock_through_real_wasm()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Duration;
+
+    use super::oracle::ConformanceOracle;
+    use crate::util::time_source::{DynTimeSource, SharedMockTimeSource};
+    use crate::wasm_runtime::override_contract_clock;
+
+    let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+    let mut oracle = RuntimeOracle::standalone(wasm, vec![NONDETERMINISTIC_SUMMARY]).await?;
+    let state = [1u8, 2, 3];
+
+    // CONTROL, and it is load-bearing: with no override this contract reads the
+    // real clock, so two summaries must DIFFER. Without this the assertions below
+    // would also pass against a contract that ignored the clock entirely, and the
+    // test would be measuring nothing.
+    let real_a = oracle.summarize_state(&state)?;
+    let real_b = oracle.summarize_state(&state)?;
+    assert_ne!(
+        real_a, real_b,
+        "control failed: mode 4 is supposed to read the host clock, so two \
+         summaries should differ. Every assertion below is vacuous if this holds."
+    );
+
+    let clock = SharedMockTimeSource::new();
+
+    // Pinned clock: the same two calls must now AGREE. This is what proves the
+    // override actually reaches the contract through the linker and host binding.
+    let (pinned_a, pinned_b) = {
+        let _guard = override_contract_clock(Arc::new(clock.clone()) as DynTimeSource);
+        (
+            oracle.summarize_state(&state)?,
+            oracle.summarize_state(&state)?,
+        )
+    };
+    assert_eq!(
+        pinned_a, pinned_b,
+        "two summaries taken under a pinned clock differ, so the contract is \
+         still reading the real clock and the override is not reaching it"
+    );
+
+    // Advancing the mock must move what the contract sees. A pin that only ever
+    // freezes could be satisfied by a stuck clock; this shows the value tracks
+    // the source, which is what `update_determinism` will need in order to place
+    // two merges an hour apart deliberately.
+    let advanced = {
+        let _guard = override_contract_clock(Arc::new(clock.clone()) as DynTimeSource);
+        clock.advance_time(Duration::from_secs(3600));
+        oracle.summarize_state(&state)?
+    };
+    assert_ne!(
+        pinned_a, advanced,
+        "advancing the injected clock did not change what the contract saw"
+    );
+
+    // The guard must restore the real clock, or one test would silently pin the
+    // clock for everything that ran after it on this thread.
+    let restored_a = oracle.summarize_state(&state)?;
+    let restored_b = oracle.summarize_state(&state)?;
+    assert_ne!(
+        restored_a, restored_b,
+        "the real clock was not restored when the guard dropped"
+    );
+
+    Ok(())
+}

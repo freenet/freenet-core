@@ -21,30 +21,68 @@ Engine type alias    → engine.rs          (selected by feature flag)
 **All `wasmtime::` imports MUST stay in `engine/wasmtime_engine.rs`.**
 Other wasm_runtime files use the `Engine` type alias and `WasmEngine` trait.
 
-### Delegate API Versioning (`wasm_runtime/delegate_api.rs`)
+### Delegate contract access (`wasm_runtime/native_api.rs`, `delegate_api.rs`)
 
 ```
-V1: Synchronous process() — delegates use request/response for contract access
-V2: Async host functions — delegates call contract methods directly:
-    - ctx.get_contract_state(id)       → read state (two-step: len + read)
-    - ctx.put_contract_state(id, data) → write state (bypasses validate_state)
-    - ctx.update_contract_state(id, data) → conditional write (requires existing state)
-    - ctx.subscribe_contract(id)       → register interest (delivery works: see
-                                         Executor::finalize_state_commit; the
-                                         subscription does NOT register demand, #4669)
-    Backend implementation: func_wrap_async (wasmtime native async support)
-    Selected when state_store_db is configured on Runtime
-    NOTE: V2 PUT/UPDATE are local-only, bypass contract validation, and skip
-    hosting metadata. Network propagation is separate.
+A delegate reaches contract state through OUTBOUND MESSAGES:
+    GetContractRequest / PutContractRequest / UpdateContractRequest /
+    SubscribeContractRequest — served by the contract-handling loop through
+    the executor's normal path (the state_store chokepoints).
+The ONE host-function exception is read-only:
+    __frnt__delegate__get_contract_state(_len) — the state THIS NODE already
+    holds. ERR_CONTRACT_NOT_FOUND means "not held here", NOT "does not exist".
+    It never reaches the network.
+
+There is no "V2" delegate API. freenet-stdlib's DelegateWasmAPIVersion has one
+variant (V1). Core used to call delegates that imported contract host
+functions "V2"; that split, and the host functions that WROTE contract state
+(put/update_contract_state) or subscribed (subscribe_contract), were removed
+in #5637.
+
+DO NOT re-add a contract WRITE host function. The removed ones wrote the raw
+Storage, bypassing state_store.{store,update}, so every chokepoint side effect
+had to be copied by hand, and two omissions reached production (disk-budget
+gate #4683, network propagation #5479). Route writes through the message path.
+A module importing a removed name fails to instantiate; pinned by
+removed_delegate_contract_imports_are_refused_at_instantiation.
 ```
 
 ### WASM Call Modes
 
+All three guest entry points share ONE body, `call_typed_blocking` in
+`engine/wasmtime_engine.rs`. Delegates ran "sync, on the calling thread" until
+#5480; they no longer do, and nothing should reintroduce a per-entry-point copy.
+
 ```
-call_3i64()              — Sync, same thread (delegates V1)
-call_3i64_async_imports() — For modules with async host function imports (delegates V2)
-call_*_blocking()        — spawn_blocking + timeout (contracts)
+call_3i64()               — delegates
+call_2i64_blocking()      — contracts
+call_3i64_blocking()      — contracts
+        ↓ all three
+call_typed_blocking()     — spawn_blocking + wall-clock backstop + panic capture
 ```
+
+Two consequences for anything touching the delegate path:
+
+- **A delegate guest can outlive its call.** On the wall-clock-timeout path
+  `exec_inbound_with_env` returns while the guest is still running, because
+  `JoinHandle::abort()` cannot stop a `spawn_blocking` closure that has started.
+  Ask "is a guest still running", not "is its env still registered" — those are
+  different facts (`native_api::LIVE_DELEGATE_GUESTS`).
+- **During `process()`, delegate host functions run on a blocking-pool thread**,
+  so they find their env through a thread-local installed on THAT thread by
+  `GuestDelegateInstance`, not on the caller's.
+
+  Scope that to `process()` and no further. Buffer setup and instantiation —
+  `initiate_buffer`, `call_void`, `instantiate_and_init` — still enter the guest
+  with `block_on_async(func.call_async(...))` INLINE on the calling thread, with
+  no `execute_wasm_blocking` and no `GuestDelegateInstance`. That is why
+  `exec_inbound_with_env` still sets `CURRENT_DELEGATE_INSTANCE` on the calling
+  thread at all, as `DelegateEnvGuard`'s rustdoc explains. "Nothing
+  delegate-related runs on the calling thread" is false and would produce a wrong
+  call about exactly those paths.
+
+The pins `every_guest_entry_is_preceded_by_arm_epoch_deadline` and
+`blocking_paths_arm_epoch_inside_the_closure` enforce the single-body structure.
 
 ## WASM Execution Rules
 
@@ -289,10 +327,23 @@ MUST:
 
 - Off-loop deferral (#4391): there are now TWO entry points into the
   bridged upsert.
-  * The NON-deferrable path (`upsert_contract_state`, used by
-    delegate-driven PUTs and direct callers) keeps the INLINE
+  * The NON-deferrable path (`upsert_contract_state`) keeps the INLINE
     `start_sub_op_get` escalation described above — it awaits the
     network GET in place, bounded by RELATED_FETCH_TIMEOUT.
+    Used by direct callers, and as a FALLBACK only: the delegate path
+    reaches it when there is no parking context (direct unit-test calls)
+    or when a park was refused at the node-wide cap. Falling back means
+    accepting the loop stall the deferral exists to remove, which is the
+    deliberate trade at that cap — losing a user's prompt or a delegate's
+    write would be worse.
+  * DELEGATE-DRIVEN PUTs AND UPDATEs USE THE DEFERRABLE PATH (#5544).
+    They used to be listed above as non-deferrable, and were: the delegate
+    arms called `upsert_contract_state` directly, so a related-contract
+    miss awaited a network GET on the serial loop for up to
+    RELATED_FETCH_TIMEOUT. That was one of the two stalls #5544 removes.
+    Past `MAX_DEFERRED_UPSERTS_PER_PARK` the excess REFUSES with
+    `MissingRelated` rather than falling back inline, because nothing caps
+    how many upserts one `process()` may emit.
   * The DEFERRABLE path (`upsert_contract_state_deferrable`, used by the
     serial `contract_handling` loop) resolves related contracts
     LOCAL-ONLY first. On a local miss it does NOT await the network GET

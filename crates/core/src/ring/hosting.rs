@@ -812,7 +812,7 @@ impl HostingManager {
 
     /// Update the hosting-cache snapshot of `key`'s state-write generation
     /// to `new_gen`. Paired with `bump_state_generation` at every state-write
-    /// chokepoint (executor PUT/UPDATE and V2 delegate PUT/UPDATE) so a
+    /// chokepoint (the executor's PUT/UPDATE paths) so a
     /// later eviction's snapshot reflects the current generation and the
     /// deletion-time guard in `RuntimePool::remove_contract` does not
     /// permanently skip reclamation after an UPDATE-then-evict. No-op when
@@ -1110,7 +1110,7 @@ impl HostingManager {
 
     /// Apply a state-write delta to the disk tracker at a state-write chokepoint.
     /// Wired from `Ring::commit_state_write` (the single infallible post-write
-    /// funnel for all four executor chokepoints + the V2 delegate callback), so
+    /// funnel for all four executor chokepoints), so
     /// the counter only moves after the bytes actually landed.
     ///
     /// Calls through even when the tracker is not yet seeded (only skipping when

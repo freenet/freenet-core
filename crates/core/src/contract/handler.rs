@@ -818,7 +818,11 @@ pub(crate) enum ContractHandlerEvent {
         /// `Debug` impl redacts the secret, so logging this event is safe.
         user_context: Option<UserSecretContext>,
     },
-    DelegateResponse(Vec<OutboundDelegateMsg>),
+    /// `Err` on a genuine delegate execution failure (#5263 — previously
+    /// every failure here silently became an empty successful
+    /// `DelegateResponse`, so the client had no way to distinguish
+    /// "the delegate answered nothing" from "the delegate failed").
+    DelegateResponse(Result<Vec<OutboundDelegateMsg>, ExecutorError>),
     /// Export a hosted user's per-user delegate secrets into an encrypted
     /// bundle (hosted-mode export, P3-live of #4381). Carries the
     /// connection-derived `user_context` (the forge-proof per-user namespace,

@@ -2378,7 +2378,7 @@ where
 
     /// Send notifications to delegates subscribed to a contract's state changes.
     ///
-    /// Checks the global `DELEGATE_SUBSCRIPTIONS` registry and sends a
+    /// Checks the global `delegate_subscriptions` registry and sends a
     /// `DelegateNotification` for each subscribed delegate through the channel.
     ///
     /// This is a **best-effort, lossy** notification path: if the bounded channel
@@ -2392,14 +2392,12 @@ where
         };
 
         let instance_id = *key.id();
-        // Snapshot subscribers and release the DashMap read-lock before sending
-        let subscribers: Vec<DelegateKey> = {
-            let entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&instance_id);
-            match entry {
-                Some(ref s) if !s.is_empty() => s.iter().cloned().collect(),
-                _ => return,
-            }
-        };
+        // Snapshot subscribers; the registry returns an owned Vec so no shard
+        // lock is held across the sends below.
+        let subscribers = crate::wasm_runtime::delegate_subscriptions::subscribers_of(&instance_id);
+        if subscribers.is_empty() {
+            return;
+        }
 
         tracing::debug!(
             contract = %key,
@@ -2416,7 +2414,18 @@ where
                 contract_id: instance_id,
                 new_state: Arc::clone(&shared_state),
             }) {
-                Ok(()) => {}
+                Ok(()) => {
+                    // Ordinary use, which is what orders cap eviction: a
+                    // subscription that is actually delivering stays warm, so
+                    // the one dropped under pressure is whichever this delegate
+                    // has heard about least recently. Stamped on successful
+                    // enqueue only — a notification dropped by a full channel is
+                    // not evidence the delegate is using the subscription.
+                    crate::wasm_runtime::delegate_subscriptions::note_notified(
+                        &instance_id,
+                        &delegate_key,
+                    );
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     static DROPPED: AtomicUsize = AtomicUsize::new(0);
                     let total = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2433,8 +2442,10 @@ where
                         "Delegate notification channel closed — removing stale subscriptions"
                     );
                     // Receiver is gone; clean up all subscriptions for this contract
-                    // to prevent repeated failed sends on future state updates.
-                    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&instance_id);
+                    // to prevent repeated failed sends on future state updates,
+                    // and release the interest they took (#5542).
+                    crate::wasm_runtime::delegate_subscriptions::remove_contract(&instance_id);
+                    crate::wasm_runtime::delegate_interest::release_contract(&instance_id);
                     return;
                 }
             }

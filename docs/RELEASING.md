@@ -86,6 +86,51 @@ To validate `FREENET_RELEASE_SIGNING_KEY` without cutting a release, run the
 `verify-signing-key` job derives the public key from the secret, asserts it
 matches the key baked into the binary, and does a sign/verify round-trip.
 
+### One-time setup: GHCR package visibility
+
+`docker-publish.yml` pushes `ghcr.io/freenet/freenet-core`. GitHub creates a new
+package as **private**, so until its visibility is set to public once, every
+`docker pull` in the Docker README fails for everyone except maintainers, and
+the error reads as a missing image rather than a permissions problem.
+
+This is needed once, not per release, and it cannot be automated: there is no
+REST API for it (`PATCH` on the package route returns 404), so it is a manual
+change in the web UI.
+
+    https://github.com/orgs/freenet/packages/container/package/freenet-core
+    -> package settings -> visibility -> Public
+
+**This happened on v0.2.133**, the release that introduced the workflow. The
+image published correctly and the `smoke` job failed with
+
+    Head "https://ghcr.io/v2/freenet/freenet-core/manifests/v0.2.133": unauthorized
+
+which looks like a broken image and is actually the package being private. The
+smoke job now authenticates its pull, so it tests whether the image runs rather
+than whether the package is public.
+
+Public-ness is a separate job, `public-pull`, and what it actually tests is an
+anonymous `docker manifest inspect` — the thing a user does — rather than the
+package's `visibility` field, because `GITHUB_TOKEN` cannot always read org
+package metadata and a lookup that fails must read as "could not tell", never
+as "not public". It is a separate job rather than a step of `smoke` so that
+"the image is broken" and "a registry setting is wrong" stay distinguishable:
+the dev-room alert for a `smoke` failure says `latest` is now stale, which is
+true of the first and false of the second.
+
+The anonymous fetch is retried three times before failing. It is one
+unauthenticated call from a shared runner IP moments after a push, and a
+release gate that goes red on a network blip stops being read. If the
+`visibility` field says `public` but the anonymous fetch still fails, the job
+says so specifically rather than telling you to set a flag that is already
+set.
+
+After changing it, re-run the publish for that tag:
+
+```bash
+gh workflow run docker-publish.yml --field tag=vX.Y.Z
+```
+
 ### Windows code signing (Authenticode)
 
 `freenet.exe` and `fdev.exe` are Authenticode-signed in
@@ -110,7 +155,11 @@ CN=Freenet Project Inc, O=Freenet Project Inc, L=Austin, S=Texas, C=US
 
 **Unlike every other secret in the table above, this path is fail-closed.** The
 `Verify signatures` step runs `Get-AuthenticodeSignature` on the runner and
-throws if a binary is unsigned, invalid, or missing its RFC3161 timestamp. A
+throws if a binary is unsigned, invalid, missing its RFC3161 timestamp, or
+**signed by a publisher other than `CN=Freenet Project Inc`**. That last check
+matters because `Valid` on its own only means "chains to a trusted root and is
+timestamped" — it says nothing about who signed it, so without an explicit
+subject assertion a binary signed by a different certificate profile would pass. A
 broken Azure configuration therefore fails `build-x86_64-windows`, and because
 `attach-to-release` needs that job, the release stops as a draft rather than
 shipping unsigned binaries. That is deliberate — but it means Azure-side
@@ -299,12 +348,15 @@ Current wire-gated floors:
   gateway, and the release cascade upgrades the gateways FIRST.
 
   Guarded by a marker exactly like `HASH_FIRST_SHIPPED_IN`:
-  `ACK_VERSION_SHIPPED_IN: Option<(u8, u8, u16)>`, currently `None`, checked by
+  `ACK_VERSION_SHIPPED_IN: Option<(u8, u8, u16)>`, now `Some((0, 2, 120))`
+  (this feature shipped in 0.2.120), checked by
   `version_cmp.rs::ack_version_floor_tracks_the_shipping_release`. When a
-  release bump raises `CARGO_PKG_VERSION` to `(0, 2, 120)`, that test fails
+  release bump raises `CARGO_PKG_VERSION` to a new floor, that test fails
   until the releaser consciously either sets
   `ACK_VERSION_SHIPPED_IN = Some(GATEWAY_ACK_VERSION_MIN_VERSION)` (this release
   carries it) or raises the floor (it does not).
+  `ack_version_floor_stays_above_every_release_without_the_variants` is the
+  companion that catches the floor being *lowered*.
 
   Note the emission gate reads the peer's version from the intro packet it just
   parsed, never from a cached value, so unlike the floors above there is no
@@ -327,10 +379,10 @@ Current wire-gated floors:
   did nothing.
 
   Guarded by a marker exactly like `HASH_FIRST_SHIPPED_IN`:
-  `BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)>`, currently `None`,
-  checked by
+  `BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)>`, now
+  `Some((0, 2, 120))` (this feature shipped in 0.2.120), checked by
   `connection_manager.rs::broadcast_target_list_floor_tracks_the_shipping_release`.
-  When a release bump raises `CARGO_PKG_VERSION` to `(0, 2, 120)`, that test
+  When a release bump raises `CARGO_PKG_VERSION` to a new floor, that test
   fails until the releaser consciously either sets
   `BROADCAST_TARGET_LIST_SHIPPED_IN = Some(BROADCAST_TARGET_LIST_MIN_VERSION)`
   (this release carries it) or raises the floor (it does not).

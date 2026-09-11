@@ -39,6 +39,15 @@ pub enum InboundAppMessage {
     WriteLargeContext(usize),
     /// New: Store large secret (for stress testing)
     StoreLargeSecret { key: Vec<u8>, size: usize },
+    /// Read `key`, overwrite it with `value`, then read it again — all inside
+    /// ONE `process()` call. Returns what the SECOND read saw.
+    ///
+    /// The host memoises a decrypted secret for the duration of a `process()`
+    /// call, so the first read populates that memo and the write must clear
+    /// it. Nothing else reaches that path: `exec_inbound_with_env` builds one
+    /// `DelegateCallEnv` per inbound message, so two messages get two memos
+    /// and cannot observe a stale one. It has to happen in a single call.
+    ReadWriteRead { key: Vec<u8>, value: Vec<u8> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -188,6 +197,25 @@ impl DelegateInterface for Delegate {
 
                         let response_msg_content = OutboundAppMessage::SecretResult(result);
                         let payload = bincode::serialize(&response_msg_content)
+                            .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        let response = ApplicationMessage::new(payload).processed(true);
+                        Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
+                    }
+
+                    InboundAppMessage::ReadWriteRead { key, value } => {
+                        // Populate the host's per-call secret memo.
+                        let _first = ctx.get_secret(&key);
+                        if !ctx.set_secret(&key, &value) {
+                            let payload =
+                                bincode::serialize(&OutboundAppMessage::SecretStoreFailed)
+                                    .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                            let response = ApplicationMessage::new(payload).processed(true);
+                            return Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)]);
+                        }
+                        // Must observe the write, not the memoised pre-write value.
+                        let second = ctx.get_secret(&key);
+
+                        let payload = bincode::serialize(&OutboundAppMessage::SecretResult(second))
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
                         let response = ApplicationMessage::new(payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])

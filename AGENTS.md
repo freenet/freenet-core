@@ -25,6 +25,8 @@ When unsure which bucket a change is in, open an issue first.
 1. Is this in crates/core/?
    → Check .claude/rules/testing.md for DST requirements
    → Verify: TimeSource for time, GlobalRng for randomness
+   → Check .claude/rules/bug-prevention-patterns.md — patterns that have
+     already caused repeat production bugs in this crate
 
 2. Which module are you modifying?
    → ring/router/     → Check .claude/rules/ring.md
@@ -229,6 +231,7 @@ docs/architecture/    # Design docs
 | Transport | `.claude/rules/transport.md` |
 | Contracts | `.claude/rules/contracts.md` |
 | Browser assets (injected JS + its HTML/CSP wrappers) | `.claude/rules/browser-assets.md` |
+| All of `crates/core/` and `scripts/` | `.claude/rules/bug-prevention-patterns.md` |
 
 ### General Rules
 
@@ -307,8 +310,11 @@ human has to intervene. `release.yml` emits a GitHub `::warning::`
 on every run that's missing the secret, so the gap is visible
 early.
 
-`.github/workflows/check-token-coalesce.yml` runs on every PR and
-fails if any new event-emitting step regresses to bare
+`.github/workflows/check-token-coalesce.yml` runs on every PR that
+touches a workflow file — it is path-filtered to
+`.github/workflows/**.yml` and `**.yaml`, which is safe here because it
+is not a required check (a path-filtered *required* check is #5451) —
+and fails if any new event-emitting step regresses to bare
 `GITHUB_TOKEN` / `github.token` — see issue #4118 for the regression
 class this guard prevents.
 

@@ -63,6 +63,38 @@ Registered in `tracing/otel.rs::register_metrics`.
 | `freenet.contract.queue.depth.high_water` | gauge | — | `FairQueueStats` |
 | `freenet.contract.queue.rejected` | counter | `reason` | `FairQueueStats` |
 | `freenet.contract.queue.background_shed` | counter | — | `FairQueueStats` |
+| `freenet.bootstrap.churn` | counter | `event` | `NetworkStatus::bootstrap_churn_stats` (#4787) |
+| `freenet.bootstrap.time_to_min_connections_seconds` | gauge | — | `NetworkStatus::bootstrap_churn_stats` (#4787) |
+| `freenet.bootstrap.completed` | gauge | — | `NetworkStatus::bootstrap_churn_stats` (#4787) |
+| `freenet.bootstrap.startup_rounds` | counter | `outcome` | `NetworkStatus::bootstrap_churn_stats` (#4787) |
+
+`freenet.bootstrap.startup_rounds`'s `outcome` label takes
+`connect_issued_gateway`, `connect_issued_routed`, `backoff_blocked` and
+`no_target`. A joiner that never bootstraps shows up as sustained
+`connect_issued_routed` growth while `freenet.bootstrap.completed` stays 0 —
+that branch is the one it takes when its gateway transports are all up but it
+is still far below `min_connections`.
+
+That pair is **necessary but not sufficient** for the #4787 acceptance-churn
+stall. A network with fewer than `min_connections` reachable peers, a node
+behind restrictive NAT, and a node whose peers keep refusing for capacity all
+match it permanently and identically, so an alert built on it alone fires
+forever on every node of a small network, gets muted, and hides the stall it
+was meant to catch. **`freenet.bootstrap.churn` is the discriminator:** a high
+`event=transient_expired` : `event=promoted_to_ring` ratio alongside climbing
+`connect_issued_routed` is acceptance churn (#4787); churn near zero means the
+CONNECTs are simply not finding acceptable peers. Same counter, different fix.
+
+Rounds arrive every ~3-5s once the node holds any connection, so a stuck joiner
+emits on the order of 900 routed rounds per hour without bound, while a healthy
+one emits a few tens over its first minute or two and then stops — reaching
+`min_connections` ends the counting. Alert on more than a few minutes of
+continued growth.
+
+`no_target` is the "nothing to do this round" case (all gateways connected and
+the node within `gateways.len()` of the threshold) and stays flat during that
+stall — but it is not benign: sustained growth there means a joiner parked a
+few connections short of the threshold and no longer issuing anything.
 
 Everything but the two histograms is an observable callback over state that
 already existed for the local dashboard.

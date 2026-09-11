@@ -121,7 +121,8 @@
 //!
 //! **CRITICAL: With `async_support(true)`, ALL function calls must use `call_async()`**
 //!
-//! We enable async support for V2 delegate async host functions:
+//! We enable async support because the `create_delegate` host function is
+//! registered with `func_wrap_async`:
 //!
 //! ```rust,ignore
 //! wasmtime_config.async_support(true);
@@ -918,19 +919,14 @@ impl WasmEngine for WasmtimeEngine {
         compiled_module_size(module)
     }
 
-    fn module_has_async_imports(&self, module: &Module) -> bool {
-        module.imports().any(|import| {
-            import.module() == "freenet_delegate_contracts"
-                || import.module() == "freenet_delegate_management"
-        })
-    }
-
     fn create_instance(
         &mut self,
         module: &Module,
-        id: i64,
         req_bytes: usize,
     ) -> Result<InstanceHandle, WasmError> {
+        // Ids come from the one process-global allocator, never from the
+        // caller. See `native_api::NEXT_INSTANCE_ID` for why (#4213 / #5023).
+        let id = native_api::next_instance_id();
         {
             let store = self
                 .store
@@ -1110,57 +1106,14 @@ impl WasmEngine for WasmtimeEngine {
         b: i64,
         c: i64,
     ) -> Result<i64, WasmError> {
-        let enabled_metering = self.enabled_metering;
-        let epoch_ticks = self.epoch_deadline_ticks;
-        let store = self
-            .store
-            .as_mut()
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-        let instance = self
-            .instances
-            .get(&handle.id)
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("instance {} not found", handle.id)))?;
-        let func = instance
-            .get_typed_func::<(i64, i64, i64), i64>(&mut *store, name)
-            .map_err(|e| WasmError::Export(e.to_string()))?;
-        arm_epoch_deadline(store, epoch_ticks);
-        // Use call_async because async_support(true) is enabled in the engine Config
-        block_on_async(func.call_async(&mut *store, (a, b, c)))
-            .map_err(|e| classify_runtime_error(enabled_metering, store, e))
-    }
-
-    fn call_3i64_async_imports(
-        &mut self,
-        handle: &InstanceHandle,
-        name: &str,
-        a: i64,
-        b: i64,
-        c: i64,
-    ) -> Result<i64, WasmError> {
-        // Wasmtime's async host functions work seamlessly with call_async on the same Store.
-        //
-        // The async host functions (delegate_contracts) are registered via func_wrap_async,
-        // so we use call_async here. The closures complete synchronously (ReDb reads) but
-        // are registered as async to establish the pattern for future async operations.
-
-        let store = self
-            .store
-            .as_mut()
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-
-        let instance = self
-            .instances
-            .get(&handle.id)
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("instance {} not found", handle.id)))?;
-
-        let func = instance
-            .get_typed_func::<(i64, i64, i64), i64>(&mut *store, name)
-            .map_err(|e| WasmError::Export(e.to_string()))?;
-
-        arm_epoch_deadline(store, self.epoch_deadline_ticks);
-        // Call the async-aware function using block_on_async
-        let result = block_on_async(func.call_async(&mut *store, (a, b, c)));
-        result.map_err(|e| classify_runtime_error(self.enabled_metering, store, e))
+        // Delegate `process()`. Routed through the SAME blocking helper as
+        // contract execution (#5480). Before that this ran `block_on_async`
+        // directly on the calling thread, so a delegate got the epoch trap and
+        // nothing else: no wall-clock backstop (so #4864's dead-ticker case left
+        // it with no preemption at all) and no panic capture. `Some(handle.id)`
+        // carries the delegate instance id onto the thread that runs the guest —
+        // see `GuestDelegateInstance`.
+        self.call_typed_blocking(handle, name, (a, b, c), Some(handle.id))
     }
 
     fn call_2i64_blocking(
@@ -1170,76 +1123,7 @@ impl WasmEngine for WasmtimeEngine {
         a: i64,
         b: i64,
     ) -> Result<i64, WasmError> {
-        let enabled_metering = self.enabled_metering;
-        let mut store = self
-            .store
-            .take()
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-
-        let instance = match self.instances.get(&handle.id) {
-            Some(i) => i,
-            None => {
-                self.store = Some(store);
-                return Err(WasmError::Other(anyhow::anyhow!(
-                    "instance {} not found",
-                    handle.id
-                )));
-            }
-        };
-
-        let func = match instance.get_typed_func::<(i64, i64), i64>(&mut store, name) {
-            Ok(f) => f,
-            Err(e) => {
-                self.store = Some(store);
-                return Err(WasmError::Export(e.to_string()));
-            }
-        };
-
-        // #4864 round-7: arm the epoch deadline INSIDE the blocking closure, as
-        // the guest's first act — NOT here, before the closure is enqueued.
-        // Arming before enqueue let the queue wait on a saturated blocking pool
-        // consume the epoch budget, so a queued job would insta-trap on start and
-        // a HEALTHY contract would be quarantined (contract-wide Timeout). Arming
-        // at guest-start makes the epoch budget (and the wall-clock backstop in
-        // execute_wasm_blocking) measure from when the guest actually runs. The
-        // wall-clock poll is a backstop; the epoch trap is what actually stops a
-        // runaway synchronous guest. Capture the tick budget by value since the
-        // closure can't borrow `self`.
-        let epoch_ticks = self.epoch_deadline_ticks;
-
-        let result = execute_wasm_blocking(
-            move || {
-                arm_epoch_deadline(&mut store, epoch_ticks);
-                // Use call_async because async_support(true) is enabled in the engine Config
-                let r = block_on_async(func.call_async(&mut store, (a, b)));
-                (r, store)
-            },
-            self.max_execution_seconds,
-        );
-
-        match result {
-            BlockingResult::Ok(value, store) => {
-                self.store = Some(store);
-                Ok(value)
-            }
-            BlockingResult::WasmError(err, mut store) => {
-                let wasm_err = classify_runtime_error(enabled_metering, &mut store, err);
-                self.store = Some(store);
-                Err(wasm_err)
-            }
-            BlockingResult::Timeout => {
-                self.recover_store();
-                Err(WasmError::Timeout)
-            }
-            BlockingResult::QueuedTimeout => {
-                self.recover_store();
-                Err(WasmError::SchedulerOverloaded)
-            }
-            BlockingResult::Panic(err) => {
-                self.recover_store();
-                Err(WasmError::Other(err))
-            }
-        }
+        self.call_typed_blocking(handle, name, (a, b), None)
     }
 
     fn call_3i64_blocking(
@@ -1250,73 +1134,7 @@ impl WasmEngine for WasmtimeEngine {
         b: i64,
         c: i64,
     ) -> Result<i64, WasmError> {
-        let enabled_metering = self.enabled_metering;
-        let mut store = self
-            .store
-            .take()
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-
-        let instance = match self.instances.get(&handle.id) {
-            Some(i) => i,
-            None => {
-                self.store = Some(store);
-                return Err(WasmError::Other(anyhow::anyhow!(
-                    "instance {} not found",
-                    handle.id
-                )));
-            }
-        };
-
-        let func = match instance.get_typed_func::<(i64, i64, i64), i64>(&mut store, name) {
-            Ok(f) => f,
-            Err(e) => {
-                self.store = Some(store);
-                return Err(WasmError::Export(e.to_string()));
-            }
-        };
-
-        // #4864 round-7: arm the epoch deadline INSIDE the blocking closure, as
-        // the guest's first act — NOT here, before the closure is enqueued (see
-        // call_2i64_blocking for the full rationale). This is the primary contract
-        // merge/validate path, so a pre-enqueue arm consumed by queue wait would
-        // quarantine a healthy contract under blocking-pool saturation. The wall-
-        // clock poll only aborts the tokio task; the epoch trap is what actually
-        // stops a runaway synchronous guest that ignores the timeout.
-        let epoch_ticks = self.epoch_deadline_ticks;
-
-        let result = execute_wasm_blocking(
-            move || {
-                arm_epoch_deadline(&mut store, epoch_ticks);
-                // Use call_async because async_support(true) is enabled in the engine Config
-                let r = block_on_async(func.call_async(&mut store, (a, b, c)));
-                (r, store)
-            },
-            self.max_execution_seconds,
-        );
-
-        match result {
-            BlockingResult::Ok(value, store) => {
-                self.store = Some(store);
-                Ok(value)
-            }
-            BlockingResult::WasmError(err, mut store) => {
-                let wasm_err = classify_runtime_error(enabled_metering, &mut store, err);
-                self.store = Some(store);
-                Err(wasm_err)
-            }
-            BlockingResult::Timeout => {
-                self.recover_store();
-                Err(WasmError::Timeout)
-            }
-            BlockingResult::QueuedTimeout => {
-                self.recover_store();
-                Err(WasmError::SchedulerOverloaded)
-            }
-            BlockingResult::Panic(err) => {
-                self.recover_store();
-                Err(WasmError::Other(err))
-            }
-        }
+        self.call_typed_blocking(handle, name, (a, b, c), None)
     }
 }
 
@@ -1368,6 +1186,137 @@ fn refresh_mem_addr_from_caller(caller: &mut Caller<'_, HostState>, instance_id:
 }
 
 impl WasmtimeEngine {
+    /// Shared body for EVERY guest entry point that runs contract or delegate
+    /// code: resolve the typed export, then run the call under
+    /// [`execute_wasm_blocking`] so it gets all three safeguards at once —
+    /// `spawn_blocking` (a stuck guest occupies a pool thread, not the caller's),
+    /// the wall-clock backstop that aborts the task when the epoch trap cannot,
+    /// and panic capture that turns a host-side panic into a `Result` instead of
+    /// unwinding into the calling task.
+    ///
+    /// The wall-clock backstop is not redundant with the epoch trap. The epoch
+    /// interrupt only fires at a guest instruction boundary, so it cannot cut off
+    /// a blocking HOST function in flight (a ReDb read/write, a secret-store
+    /// fsync) — see [`arm_epoch_deadline`] — and if the epoch ticker thread dies
+    /// (#4864) it does not fire at all.
+    ///
+    /// **Every entry point routes through here rather than hand-rolling a copy.**
+    /// Delegate execution reaching `block_on_async` directly on the calling
+    /// thread, with none of the three safeguards, is precisely the drift a fifth
+    /// near-copy would reproduce (#5480), so
+    /// `blocking_paths_arm_epoch_inside_the_closure` pins that every entry point
+    /// delegates here and that the epoch arm lives inside this closure.
+    ///
+    /// `delegate_instance` is `Some(handle.id)` for a delegate `process()` call
+    /// and `None` for a contract. Delegate host functions locate their
+    /// `native_api::DelegateCallEnv` through the `CURRENT_DELEGATE_INSTANCE`
+    /// THREAD-LOCAL, so a guest running on a blocking-pool thread needs that id
+    /// installed on the thread that actually executes it — see
+    /// [`GuestDelegateInstance`].
+    fn call_typed_blocking<P>(
+        &mut self,
+        handle: &InstanceHandle,
+        name: &str,
+        args: P,
+        delegate_instance: Option<i64>,
+    ) -> Result<i64, WasmError>
+    where
+        // `Sync` is REQUIRED and is not an over-claim, despite this change
+        // being about not over-claiming `Sync` elsewhere. It is wasmtime's own
+        // bound: `TypedFunc::<Params, Results>::call_async` requires
+        // `Params: Sync` (wasmtime-47.0.3 `runtime/func/typed.rs:135`).
+        // Removing it fails to compile at the `func.call_async` below —
+        // verified, not assumed. Do not "tidy" it away.
+        P: wasmtime::WasmParams + Send + Sync + 'static,
+    {
+        let enabled_metering = self.enabled_metering;
+        let mut store = self
+            .store
+            .take()
+            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
+
+        let instance = match self.instances.get(&handle.id) {
+            Some(i) => i,
+            None => {
+                self.store = Some(store);
+                return Err(WasmError::Other(anyhow::anyhow!(
+                    "instance {} not found",
+                    handle.id
+                )));
+            }
+        };
+
+        let func = match instance.get_typed_func::<P, i64>(&mut store, name) {
+            Ok(f) => f,
+            Err(e) => {
+                self.store = Some(store);
+                return Err(WasmError::Export(e.to_string()));
+            }
+        };
+
+        // #4864 round-7: arm the epoch deadline INSIDE the blocking closure, as
+        // the guest's first act — NOT here, before the closure is enqueued.
+        // Arming before enqueue let the queue wait on a saturated blocking pool
+        // consume the epoch budget, so a queued job would insta-trap on start and
+        // a HEALTHY contract would be quarantined (contract-wide Timeout). Arming
+        // at guest-start makes the epoch budget (and the wall-clock backstop in
+        // execute_wasm_blocking) measure from when the guest actually runs. The
+        // wall-clock poll is a backstop; the epoch trap is what actually stops a
+        // runaway synchronous guest. Capture the tick budget by value since the
+        // closure can't borrow `self`.
+        let epoch_ticks = self.epoch_deadline_ticks;
+
+        // Registered HERE, on the calling thread, not inside the closure: see
+        // `native_api::LIVE_DELEGATE_GUESTS`. Registering inside would leave a
+        // window on the `QueuedTimeout` path, where the abort can lose the race
+        // and the closure runs after this call has already returned.
+        let live_guest = delegate_instance.map(LiveGuestRegistration::register);
+
+        let result = execute_wasm_blocking(
+            move || {
+                // MOVED into the closure so it drops when the guest finishes,
+                // and equally when the closure is dropped UNRUN by `abort()`.
+                // The binding is load-bearing: an unmentioned capture would not
+                // be moved in at all under Rust 2021 disjoint capture, and the
+                // registration would clear on the calling thread instead.
+                let _live_guest = live_guest;
+                // Installed BEFORE the guest runs and cleared by its `Drop` on
+                // every exit path (including a panic), so a reused blocking-pool
+                // thread never carries a stale delegate id into the next job.
+                let _delegate = delegate_instance.map(GuestDelegateInstance::install);
+                arm_epoch_deadline(&mut store, epoch_ticks);
+                // Use call_async because async_support(true) is enabled in the engine Config
+                let r = block_on_async(func.call_async(&mut store, args));
+                (r, store)
+            },
+            self.max_execution_seconds,
+        );
+
+        match result {
+            BlockingResult::Ok(value, store) => {
+                self.store = Some(store);
+                Ok(value)
+            }
+            BlockingResult::WasmError(err, mut store) => {
+                let wasm_err = classify_runtime_error(enabled_metering, &mut store, err);
+                self.store = Some(store);
+                Err(wasm_err)
+            }
+            BlockingResult::Timeout => {
+                self.recover_store();
+                Err(WasmError::Timeout)
+            }
+            BlockingResult::QueuedTimeout => {
+                self.recover_store();
+                Err(WasmError::SchedulerOverloaded)
+            }
+            BlockingResult::Panic(err) => {
+                self.recover_store();
+                Err(WasmError::Other(err))
+            }
+        }
+    }
+
     /// Check if a compiled module imports the streaming buffer host function.
     /// Contracts compiled against freenet-stdlib >= 0.3.4 import `freenet_contract_io`;
     /// older contracts do not and must use the legacy one-shot buffer protocol.
@@ -2029,93 +1978,47 @@ impl WasmtimeEngine {
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
-        // Delegate contracts namespace (async host functions for V2 delegates)
-        // These are registered as async to support future async operations,
-        // but currently complete synchronously (ReDb reads).
+        // Delegate contracts namespace: ONE read-only host function pair.
         //
-        // SAFETY of refreshing before the async block: The _impl functions
-        // (e.g. get_contract_state_impl) are synchronous ReDb reads that
-        // complete immediately inside the async block — no .await points
-        // exist that could yield back to the WASM guest and allow further
-        // memory.grow calls. If these ever become truly async with .await
-        // points, the refresh must move inside the async block using a
-        // mechanism that can access the Store (e.g. wasmtime's
-        // `Caller`-based async pattern).
+        // `local_contract_state` answers "what state does THIS NODE hold for
+        // this contract" from the local store. It is not a GET, and there is
+        // deliberately no write or subscribe beside it: the write host
+        // functions that used to live here bypassed the executor's
+        // `state_store` chokepoints and were removed in #5637 (see
+        // `DelegateCallEnv::local_contract_state`). The import keeps its
+        // `get_contract_state` name because freenet-stdlib's public
+        // `DelegateCtx::get_contract_state` links against it; core names the
+        // function `local_contract_state` internally, which is what it does.
+        // A delegate module that still
+        // imports one of the removed names fails to instantiate; pinned by
+        // `removed_delegate_contract_imports_are_refused_at_instantiation`.
         linker
-            .func_wrap_async(
+            .func_wrap(
                 "freenet_delegate_contracts",
                 "__frnt__delegate__get_contract_state",
                 |mut caller: Caller<'_, HostState>,
-                 (id_ptr, id_len, out_ptr, out_len): (i64, i32, i64, i64)| {
+                 id_ptr: i64,
+                 id_len: i32,
+                 out_ptr: i64,
+                 out_len: i64|
+                 -> i64 {
                     let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
                     refresh_mem_addr_from_caller(&mut caller, id);
-                    Box::new(async move {
-                        native_api::delegate_contracts::get_contract_state_impl(
-                            id_ptr, id_len, out_ptr, out_len,
-                        )
-                    })
+                    native_api::delegate_contracts::local_contract_state_impl(
+                        id_ptr, id_len, out_ptr, out_len,
+                    )
                 },
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         linker
-            .func_wrap_async(
+            .func_wrap(
                 "freenet_delegate_contracts",
                 "__frnt__delegate__get_contract_state_len",
-                |mut caller: Caller<'_, HostState>, (id_ptr, id_len): (i64, i32)| {
+                |mut caller: Caller<'_, HostState>, id_ptr: i64, id_len: i32| -> i64 {
                     let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
                     refresh_mem_addr_from_caller(&mut caller, id);
-                    Box::new(async move {
-                        native_api::delegate_contracts::get_contract_state_len_impl(id_ptr, id_len)
-                    })
-                },
-            )
-            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
-
-        linker
-            .func_wrap_async(
-                "freenet_delegate_contracts",
-                "__frnt__delegate__put_contract_state",
-                |mut caller: Caller<'_, HostState>,
-                 (id_ptr, id_len, state_ptr, state_len): (i64, i32, i64, i64)| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
-                    Box::new(async move {
-                        native_api::delegate_contracts::put_contract_state_impl(
-                            id_ptr, id_len, state_ptr, state_len,
-                        )
-                    })
-                },
-            )
-            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
-
-        linker
-            .func_wrap_async(
-                "freenet_delegate_contracts",
-                "__frnt__delegate__update_contract_state",
-                |mut caller: Caller<'_, HostState>,
-                 (id_ptr, id_len, state_ptr, state_len): (i64, i32, i64, i64)| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
-                    Box::new(async move {
-                        native_api::delegate_contracts::update_contract_state_impl(
-                            id_ptr, id_len, state_ptr, state_len,
-                        )
-                    })
-                },
-            )
-            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
-
-        linker
-            .func_wrap_async(
-                "freenet_delegate_contracts",
-                "__frnt__delegate__subscribe_contract",
-                |mut caller: Caller<'_, HostState>, (id_ptr, id_len): (i64, i32)| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
-                    Box::new(async move {
-                        native_api::delegate_contracts::subscribe_contract_impl(id_ptr, id_len)
-                    })
+                    native_api::delegate_contracts::local_contract_state_len_impl(id_ptr, id_len)
                 },
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
@@ -2123,6 +2026,17 @@ impl WasmtimeEngine {
         // ============================================================
         // freenet_delegate_management namespace — delegate creation
         // ============================================================
+        //
+        // Registered with `func_wrap_async`, which is why the engine keeps
+        // `async_support(true)`, but the body has no `.await`: it runs
+        // `create_delegate_impl` synchronously inside the async block.
+        //
+        // SAFETY of refreshing before the async block: the refresh below runs
+        // OUTSIDE the block, which is sound only because nothing inside it
+        // yields back to the guest, so no `memory.grow` can relocate linear
+        // memory between the refresh and the impl's pointer use. If this ever
+        // gains an `.await`, the refresh must move inside the block, using a
+        // mechanism that can reach the `Store` (#3248).
         linker
             .func_wrap_async(
                 "freenet_delegate_management",
@@ -2247,6 +2161,67 @@ fn classify_runtime_error(
     WasmError::Runtime(error.to_string())
 }
 
+/// Installs the executing delegate's instance id in the CURRENT thread's
+/// `CURRENT_DELEGATE_INSTANCE` thread-local for the duration of one guest call,
+/// clearing it on every exit path including a panic.
+///
+/// Every delegate host function — the `freenet_delegate_ctx`,
+/// `freenet_delegate_secrets`, `freenet_delegate_contracts` and
+/// `freenet_delegate_management` namespaces — reads that thread-local to find
+/// its entry in `native_api::DELEGATE_ENV`. Delegate guests now run on a
+/// blocking-pool thread (#5480) rather than the caller's, so the id must be
+/// installed on the thread that actually executes the guest; without it every
+/// delegate host function reads the default `-1` and fails.
+///
+/// The `Drop` is load-bearing, not tidiness: blocking-pool threads are reused,
+/// and the wall-clock backstop can return while the guest is still running, so
+/// an uncleared id would outlive its `DELEGATE_ENV` entry on a thread that later
+/// serves an unrelated job.
+struct GuestDelegateInstance;
+
+impl GuestDelegateInstance {
+    fn install(instance_id: i64) -> Self {
+        native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.set(instance_id));
+        Self
+    }
+}
+
+impl Drop for GuestDelegateInstance {
+    fn drop(&mut self) {
+        native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+    }
+}
+
+/// Marks an instance id as having a delegate guest that may still be executing,
+/// for as long as this value is alive.
+///
+/// Created on the CALLING thread and moved into the guest closure, so it clears
+/// on both outcomes: the closure running to completion (or unwinding), and the
+/// closure being dropped UNRUN when `abort()` beats it off the blocking-pool
+/// queue. See [`native_api::LIVE_DELEGATE_GUESTS`] for why neither half can move.
+///
+/// Distinct from [`GuestDelegateInstance`] on purpose. That one installs a
+/// THREAD-LOCAL and so must be constructed on the worker thread; this one is a
+/// process-global registration and must be constructed BEFORE the worker starts,
+/// or a `QueuedTimeout` whose abort loses the race leaves a window where the
+/// next message sees no live guest.
+struct LiveGuestRegistration {
+    instance_id: i64,
+}
+
+impl LiveGuestRegistration {
+    fn register(instance_id: i64) -> Self {
+        native_api::LIVE_DELEGATE_GUESTS.insert(instance_id);
+        Self { instance_id }
+    }
+}
+
+impl Drop for LiveGuestRegistration {
+    fn drop(&mut self) {
+        native_api::LIVE_DELEGATE_GUESTS.remove(&self.instance_id);
+    }
+}
+
 // =============================================================================
 // Blocking execution with timeout
 // =============================================================================
@@ -2356,12 +2331,21 @@ where
     let started_at_ms = Arc::new(AtomicU64::new(0));
     let started_for_guest = Arc::clone(&started);
     let started_at_for_guest = Arc::clone(&started_at_ms);
+    // Contract WASM runs on a dedicated blocking thread (spawn_blocking, or a
+    // plain std::thread — see the match below), never on the calling thread, so
+    // a contract-clock override set by a test on the CALLER's thread would not
+    // otherwise be visible to `native_api::time::utc_now`. Capture it here, on
+    // the calling thread, and re-install it for the guest's thread only, for
+    // the duration of this one call. Production never overrides the clock, so
+    // this reads and forwards `None` — a no-op.
+    let clock_override = native_api::time::current_contract_clock_override();
     let f = move || {
         // Record started_at BEFORE flipping `started`, so the poll loop that
         // observes started==true (SeqCst) is guaranteed to read a valid
         // started_at.
         started_at_for_guest.store(start.elapsed().as_millis() as u64, Ordering::SeqCst);
         started_for_guest.store(true, Ordering::SeqCst);
+        let _clock_guard = clock_override.map(native_api::time::override_contract_clock);
         f()
     };
 
@@ -2557,7 +2541,7 @@ mod tests {
         let module = engine
             .compile(SIMPLE_WASM)
             .expect("offloaded compile should succeed");
-        let handle = engine.create_instance(&module, 0, 1024).unwrap();
+        let handle = engine.create_instance(&module, 1024).unwrap();
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
     }
@@ -2576,7 +2560,7 @@ mod tests {
         let module = engine
             .compile(SIMPLE_WASM)
             .expect("inline compile should succeed");
-        let handle = engine.create_instance(&module, 0, 1024).unwrap();
+        let handle = engine.create_instance(&module, 1024).unwrap();
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
     }
@@ -2652,6 +2636,200 @@ mod tests {
                 WasmError::Timeout
             ),
             "epoch-deadline trap must classify as WasmError::Timeout"
+        );
+    }
+
+    /// Run a test body that deliberately leaves a guest spinning on an abandoned
+    /// blocking-pool thread, WITHOUT waiting for that thread at teardown.
+    ///
+    /// `#[tokio::test]` drops its runtime at the end, and `Runtime::drop` waits
+    /// for blocking tasks that have already started. Since the whole point of
+    /// these tests is that the wall-clock backstop returns while the guest runs
+    /// on, that wait would (a) add the full epoch budget to every run and, worse,
+    /// (b) HANG FOREVER instead of failing if the epoch ticker thread were dead
+    /// -- which is exactly the #4864 scenario these tests exist to cover. A
+    /// zero-timeout shutdown detaches the thread instead; the epoch trap still
+    /// reaps it in the background.
+    fn run_abandoning_guest_test(body: impl FnOnce()) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime must build");
+        rt.block_on(async { body() });
+        rt.shutdown_timeout(Duration::from_millis(0));
+    }
+
+    /// Drive ONE delegate entry point with a guest that never returns, under a
+    /// SHORT wall clock and a deliberately LONG epoch deadline, and assert it
+    /// still comes back promptly.
+    ///
+    /// The two deadlines are separated on purpose — a 0.5s wall clock against a
+    /// ~10s epoch budget — so only ONE mechanism can possibly return the call.
+    /// Before #5480 the delegate entries ran `block_on_async` directly on the
+    /// caller's thread and had NO wall-clock backstop, so this would hang until
+    /// the epoch fired; and #4864 exists because the epoch ticker thread dying
+    /// is a real scenario, which left delegates with no preemption at all.
+    ///
+    /// The epoch budget is long but FINITE on purpose: `spawn_blocking` closures
+    /// cannot be cancelled, so the abandoned guest thread outlives this call
+    /// (exactly as it already does for contracts). A finite epoch deadline means
+    /// it still terminates instead of spinning for the life of the test binary.
+    fn assert_delegate_entry_has_wall_clock_backstop() {
+        let config = RuntimeConfig {
+            enable_metering: false,
+            ..RuntimeConfig::default()
+        };
+        let mut engine = WasmtimeEngine::new(&config, false).expect("engine must build");
+        engine.max_execution_seconds = 0.5;
+        // ~10s of ticks: far beyond the wall clock, so a prompt return CANNOT
+        // be the epoch trap.
+        engine.epoch_deadline_ticks = 100;
+
+        // R2 (#5480 review): NOT a low hard-coded constant.
+        //
+        // `create_instance` draws ids from `next_instance_id()`, a monotonic
+        // counter starting at 0, and one test in this binary calls it 10,001
+        // times. Since #5480 the id here is registered in the PROCESS-GLOBAL
+        // `LIVE_DELEGATE_GUESTS`, and the assertion at the end of this function
+        // is precisely that it is STILL registered when the call returns —
+        // because the abandoned guest holds it for the rest of its ~10s epoch
+        // budget, after this test has finished. A low id would therefore sit in
+        // that set waiting to collide with an allocator-issued one.
+        //
+        // The collision is the one case that would make a retained id a false
+        // positive rather than a harmless leak: ids are never recycled, so a
+        // retained id can otherwise only refuse re-entry to the instance whose
+        // guest is genuinely wedged, which is the correct answer.
+        //
+        // And it would be near-invisible. `cargo nextest` runs a process per
+        // test and never sees it; plain `cargo test` shares one process and
+        // does. CI uses nextest, so CI would stay green while the contributor
+        // following AGENTS.md hits it.
+        let id: i64 = i64::MAX - 54804;
+        // Instantiate directly into the engine's own store so the entry point
+        // finds the instance, without needing the `__frnt_set_id` / memory
+        // exports that `create_instance` requires of a real contract.
+        let store = engine.store.as_mut().expect("engine store present");
+        let eng = store.engine().clone();
+        let module = Module::new(&eng, INFINITE_LOOP_WAT.as_bytes()).expect("WAT must compile");
+        let instance = block_on_async(Linker::new(&eng).instantiate_async(&mut *store, &module))
+            .expect("instantiation must succeed");
+        engine.instances.insert(id, instance);
+
+        let handle = InstanceHandle { id };
+        let entry = "call_3i64";
+        let start = std::time::Instant::now();
+        let result = engine.call_3i64(&handle, "spin", 0, 0, 0);
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("a guest that never returns must not return Ok");
+        assert!(
+            matches!(err, WasmError::Timeout),
+            "`{entry}`: the wall-clock backstop must surface as WasmError::Timeout, got {err:?}"
+        );
+        // 5s is comfortably above the 0.5s wall clock and comfortably below the
+        // ~10s epoch budget, so a pass here can ONLY be the wall-clock backstop.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "`{entry}` took {elapsed:?}: the 0.5s wall-clock backstop did not fire, and the \
+             epoch budget (~10s) is too far out to have returned this (#5480)"
+        );
+
+        // R1 (#5480 review): the registration must OUTLIVE this call.
+        //
+        // The guest is still running on an abandoned blocking thread right now,
+        // and that is the entire basis of the re-entry guard in
+        // `exec_inbound_with_env`: if the registration cleared when this call
+        // returned, the guard would read false in exactly the scenario it exists
+        // for, which is the F1 defect this PR fixed.
+        //
+        // This pins the one link nothing else covered. Both source pins and both
+        // re-entry tests pass with `let _live_guest = live_guest;` DELETED from
+        // `call_typed_blocking`, because those tests populate the set by hand and
+        // so never exercise the registration path at all. Under Rust 2021
+        // disjoint capture an unmentioned capture is not moved into the closure,
+        // so deleting that binding drops the guard on the CALLING thread and
+        // restores F1 exactly — silently, and with no `unsafe` at the edit site.
+        //
+        // KNOWN GAP, not covered here: registering INSIDE the closure instead of
+        // moving the guard in leaves the `QueuedTimeout` window described at
+        // `native_api::LIVE_DELEGATE_GUESTS`, and this assertion still passes
+        // under that variant. Catching it deterministically needs control over
+        // blocking-pool scheduling, which the test harness does not offer.
+        assert!(
+            native_api::LIVE_DELEGATE_GUESTS.contains(&id),
+            "`{entry}`: the abandoned guest is still running, so its \
+             LIVE_DELEGATE_GUESTS registration must still be present after the \
+             wall-clock backstop returns. If this fails, the registration guard \
+             is being dropped on the calling thread instead of being moved into \
+             the guest closure (#5480 review R1)"
+        );
+    }
+
+    /// REGRESSION (#5480): the delegate entry must have the wall-clock
+    /// backstop that contract execution already had.
+    #[test]
+    fn delegate_entry_has_wall_clock_backstop() {
+        run_abandoning_guest_test(assert_delegate_entry_has_wall_clock_backstop);
+    }
+
+    /// WAT whose exported entry immediately calls an imported host function.
+    /// Paired below with a linker that panics inside that import, this is a
+    /// HOST-side panic during delegate execution — which is the case #5480
+    /// actually covers, since a WASM trap (unreachable, OOB, div-by-zero) is
+    /// already an `Err` and never a Rust panic.
+    const HOST_PANIC_WAT: &str = r#"
+        (module
+          (import "freenet_test" "boom" (func $boom))
+          (func (export "process") (param i64 i64 i64) (result i64)
+            (call $boom)
+            (i64.const 0)))
+    "#;
+
+    /// REGRESSION (#5480): a panic in a host function called during delegate
+    /// execution must come back as an `Err`, not unwind into the calling task.
+    /// There is no `catch_unwind` on the delegate path; the capture comes
+    /// entirely from routing through `execute_wasm_blocking`, whose
+    /// `spawn_blocking` join turns a panic into `BlockingResult::Panic`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_entry_captures_host_panic() {
+        let config = RuntimeConfig {
+            enable_metering: false,
+            ..RuntimeConfig::default()
+        };
+        let mut engine = WasmtimeEngine::new(&config, false).expect("engine must build");
+
+        // Same convention as the backstop tests above (R2): keep test ids far
+        // above anything `next_instance_id()` allocates. This one is cleared on
+        // the panic-unwind path rather than retained, but the collision risk
+        // while the test runs is identical.
+        const ID: i64 = i64::MAX - 54805;
+        let store = engine.store.as_mut().expect("engine store present");
+        let eng = store.engine().clone();
+        let module = Module::new(&eng, HOST_PANIC_WAT.as_bytes()).expect("WAT must compile");
+        let mut linker: Linker<HostState> = Linker::new(&eng);
+        // A named fn, not a closure: a closure whose body diverges infers `!`
+        // as its return type, and wasmtime's `IntoFunc` has no `WasmTy` impl for
+        // `!`. An elided `()` return resolves it, and unlike an explicit `-> ()`
+        // it does not trip `clippy::unused_unit`.
+        fn boom(_: Caller<'_, HostState>) {
+            panic!("deliberate host-function panic (#5480 panic-capture test)");
+        }
+        linker
+            .func_wrap("freenet_test", "boom", boom)
+            .expect("registering the panicking host fn must succeed");
+        let instance = block_on_async(linker.instantiate_async(&mut *store, &module))
+            .expect("instantiation must succeed");
+        engine.instances.insert(ID, instance);
+
+        let handle = InstanceHandle { id: ID };
+        let err = engine
+            .call_3i64(&handle, "process", 0, 0, 0)
+            .expect_err("a host panic must surface as an Err, not unwind into the caller");
+        assert!(
+            matches!(err, WasmError::Other(_)),
+            "a captured panic must surface as WasmError::Other, got {err:?}"
         );
     }
 
@@ -2793,7 +2971,7 @@ mod tests {
         let start = std::time::Instant::now();
         // create_instance runs the start function via instantiate_async; the
         // global epoch ticker preempts it once the armed 3-tick deadline elapses.
-        let result = engine.create_instance(&module, 1, 0);
+        let result = engine.create_instance(&module, 0);
         let elapsed = start.elapsed();
 
         // `InstanceHandle` is not Debug, so match rather than `{result:?}`.
@@ -2812,50 +2990,133 @@ mod tests {
         );
     }
 
-    /// Source-scrape pin (#4864 review, fix 8 + round-4 P2): EVERY guest-entry
-    /// call site (`instantiate_async` / `call_async`) — not just the first — MUST
-    /// be preceded by an `arm_epoch_deadline(` since the previous guest entry in
-    /// the same function. The store is reused across calls, so a SECOND guest
-    /// call that is not re-armed inherits the first call's remaining epoch budget
-    /// (the `__frnt_set_id` case). This also future-proofs against a refactor
-    /// adding a guest-entry path without arming the deadline.
+    /// Bound a scraped method body: from `fn_name` to whichever comes first of
+    /// the next method or the end of the impl block.
+    fn scrape_body<'a>(src: &'a str, fn_name: &str) -> &'a str {
+        // These pins scrape the file that CONTAINS them, and the fn names they
+        // look for also appear here as string literals. If the search key misses
+        // the real definition, `find` silently lands on this module's own source
+        // and the pin then measures itself. That is how the first version of this
+        // pin failed: the definition is `fn call_typed_blocking<P>(`, so the
+        // `fn call_typed_blocking(` form never matched it. Fail loudly instead.
+        let tests_start = src.find("\nmod tests {").unwrap_or(src.len());
+        let start = src
+            .find(fn_name)
+            .unwrap_or_else(|| panic!("method `{fn_name}` not found"));
+        assert!(
+            start < tests_start,
+            "`{fn_name}` matched inside the test module rather than at its \
+             definition — this pin is scraping its own source. Check for a generic \
+             parameter (`fn foo<P>(`), which makes the `(` form miss."
+        );
+        let rest = &src[start + fn_name.len()..];
+        let end = [
+            "\n    fn ",
+            "\n    pub(crate) fn ",
+            "\n    pub(super) fn ",
+            "\n}",
+        ]
+        .iter()
+        .filter_map(|needle| rest.find(needle))
+        .min()
+        .map(|off| start + fn_name.len() + off)
+        .unwrap_or(src.len());
+        let body = &src[start..end];
+
+        // Fail closed if the window was TRUNCATED. `scrape_body` bounds a window
+        // at BOTH ends, and an item added inside a method (or a `}` at column 0
+        // inside a string or macro) moves the end delimiter earlier. Every
+        // "this must be ABSENT" assertion then passes vacuously over the
+        // shortened window while the thing it forbids sits just past the new
+        // boundary.
+        //
+        // A delete-mutation cannot catch this: it validates the assertion while
+        // ASSUMING the window, so it reports the pin healthy in exactly the case
+        // where the window is intact. The structural check has to be separate.
+        // A complete method body has balanced braces; a truncated one does not.
+        let opens = body.matches('{').count();
+        let closes = body.matches('}').count();
+        assert_eq!(
+            opens, closes,
+            "`{fn_name}`: scraped body has {opens} `{{` but {closes} `}}` — the \
+             window is truncated, so any \"must be absent\" assertion over it is \
+             vacuous. Widen the end delimiters in `scrape_body`; do NOT delete \
+             the check."
+        );
+
+        body
+    }
+
+    /// Positions of every guest-entry call in a scraped body. Matches the
+    /// method-call syntax (leading dot + open paren) so a prose mention of
+    /// "call_async" in a doc comment is not counted as an entry.
+    fn guest_entries(body: &str) -> Vec<usize> {
+        let mut entries: Vec<usize> = body
+            .match_indices(".call_async(")
+            .chain(body.match_indices(".instantiate_async("))
+            .map(|(i, _)| i)
+            .collect();
+        entries.sort_unstable();
+        entries
+    }
+
+    /// Source-scrape pin (#4864 review, fix 8 + round-4 P2; extended by #5480):
+    /// EVERY guest-entry call site (`instantiate_async` / `call_async`) — not
+    /// just the first — MUST be preceded by an `arm_epoch_deadline(` since the
+    /// previous guest entry in the same function. The store is reused across
+    /// calls, so a SECOND guest call that is not re-armed inherits the first
+    /// call's remaining epoch budget (the `__frnt_set_id` case). This also
+    /// future-proofs against a refactor adding a guest-entry path without arming
+    /// the deadline.
+    ///
+    /// #5480 made this pin's original form VACUOUS for half its list. Once the
+    /// four public entry points became thin wrappers around
+    /// `call_typed_blocking`, their bodies no longer contain `.call_async(`, and
+    /// the old `if entries.is_empty() { continue }` silently skipped them — the
+    /// pin would have stayed green with every safeguard deleted. So the list is
+    /// now split, and NEITHER half can pass by being empty:
+    ///
+    /// - `GUEST_ENTRY_FNS` really do enter the guest: each must contain at least
+    ///   one entry, and every entry must be armed.
+    /// - `DELEGATING_ENTRY_FNS` must contain NO guest entry of their own and
+    ///   must hand off to `call_typed_blocking`, which is what keeps the
+    ///   safeguards on one mechanism instead of a fifth hand-rolled near-copy.
     #[test]
     fn every_guest_entry_is_preceded_by_arm_epoch_deadline() {
         let src = include_str!("wasmtime_engine.rs");
-        for fn_name in [
+
+        // Functions that legitimately contain a guest entry.
+        const GUEST_ENTRY_FNS: &[&str] = &[
             // #4864 round-9 item 2: create_instance's guest entries moved into
             // instantiate_and_init so the store can be recovered on a guest-entry
             // timeout; scrape the new home of those entries.
             "fn instantiate_and_init(",
             "fn initiate_buffer(",
             "fn call_void(",
+            // #5480: the single shared body for all three contract/delegate
+            // entry points.
+            "fn call_typed_blocking<",
+        ];
+
+        // The public entry points, which must NOT enter the guest themselves.
+        const DELEGATING_ENTRY_FNS: &[&str] = &[
             "fn call_3i64(",
-            "fn call_3i64_async_imports(",
             "fn call_2i64_blocking(",
             "fn call_3i64_blocking(",
-        ] {
-            let start = src
-                .find(fn_name)
-                .unwrap_or_else(|| panic!("guest-entry method `{fn_name}` not found"));
-            let after = &src[start..];
-            let end = after
-                .find("\n    fn ")
-                .or_else(|| after.find("\n    pub(crate) fn "))
-                .unwrap_or(after.len());
-            let body = &after[..end];
+        ];
 
-            // Every guest-entry occurrence (both call kinds), sorted. Match the
-            // method-call syntax (leading dot + open paren) so a prose mention of
-            // "call_async" in a doc comment is not treated as an entry.
-            let mut entries: Vec<usize> = body
-                .match_indices(".call_async(")
-                .chain(body.match_indices(".instantiate_async("))
-                .map(|(i, _)| i)
-                .collect();
-            entries.sort_unstable();
-            if entries.is_empty() {
-                continue;
-            }
+        for fn_name in GUEST_ENTRY_FNS {
+            let body = scrape_body(src, fn_name);
+            let entries = guest_entries(body);
+            // NOT `continue` — an empty list here means the scrape has drifted
+            // off the real guest entry and the pin is measuring nothing.
+            assert!(
+                !entries.is_empty(),
+                "`{fn_name}` is listed as a guest-entry method but contains no \
+                 `.call_async(`/`.instantiate_async(` — either it stopped entering \
+                 the guest (move it to DELEGATING_ENTRY_FNS) or this pin has gone \
+                 vacuous (#5480)"
+            );
             // Real arm CALLS only (`arm_epoch_deadline(`), not prose/identifier
             // mentions like this pin's own name.
             let arms: Vec<usize> = body
@@ -2879,6 +3140,75 @@ mod tests {
                 prev = entry_pos;
             }
         }
+
+        for fn_name in DELEGATING_ENTRY_FNS {
+            let body = scrape_body(src, fn_name);
+            let entries = guest_entries(body);
+            assert!(
+                entries.is_empty(),
+                "`{fn_name}` enters the guest directly (`.call_async(` / \
+                 `.instantiate_async(` at {entries:?}). Every entry point must go \
+                 through `call_typed_blocking` so it gets spawn_blocking, the \
+                 wall-clock backstop and panic capture — a hand-rolled copy is how \
+                 delegates drifted without them (#5480)"
+            );
+            assert!(
+                body.contains("self.call_typed_blocking("),
+                "`{fn_name}` must delegate to `call_typed_blocking` (#5480)"
+            );
+        }
+    }
+
+    /// Source pin (#4213 / #5023): `create_instance` MUST allocate its instance
+    /// id from the one process-global allocator.
+    ///
+    /// The signature stops a CALLER passing an id, but nothing stops this
+    /// method itself from reverting to a per-engine counter, which is exactly
+    /// the shape that made ids collide across engines in one process. The
+    /// bounded-region scrape follows the `fn_body` convention used by
+    /// `create_instance_recovers_store_on_guest_entry_failure` below, including
+    /// the test-module cutoff that keeps either pin from scraping its own
+    /// source.
+    #[test]
+    fn create_instance_allocates_its_own_instance_id() {
+        // Cut the test module off BEFORE scraping. `include_str!` pulls in the
+        // whole file, this module included, and the needle below occurs here as
+        // a string literal. Without the cut, renaming `create_instance` would
+        // not panic: `find` would fall through to this function's own source,
+        // and the region would then be this test's tail -- whose assertion
+        // message contains `native_api::next_instance_id()`, so the pin would
+        // scrape its own error string and PASS while guarding nothing.
+        // Same remedy as `contract_ops.rs::production_source`; see #5450.
+        let full = include_str!("wasmtime_engine.rs");
+        let cutoff = full
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("wasmtime_engine.rs must have a top-level #[cfg(test)] mod tests");
+        let src = &full[..cutoff];
+        let start = src
+            .find("    fn create_instance(")
+            .expect("create_instance not found");
+        let body = &src[start..];
+        // `+ 1` because this `find` searches `body[1..]`, so its index is one
+        // short of the position in `body`. Without it the slice drops the byte
+        // before the next method -- harmless today (it is the ASCII newline
+        // closing this method), but `&body[..end]` would then slice at an
+        // arbitrary byte, and this file is full of multi-byte em dashes: one
+        // landing there turns the pin into a "byte index is not a char
+        // boundary" panic that says nothing about what it guards. Matches
+        // `create_instance_recovers_store_on_guest_entry_failure` below, which
+        // this test's rustdoc claims to follow.
+        let end = body[1..]
+            .find("\n    fn ")
+            .map(|i| i + 1)
+            .expect("create_instance body must end at the next method");
+        let body = &body[..end];
+        assert!(
+            body.contains("native_api::next_instance_id()"),
+            "create_instance must draw its instance id from \
+             native_api::next_instance_id(); a per-engine counter lets two \
+             engines in one process issue the same id, and drop_instance then \
+             evicts the other engine's live MEM_ADDR entry (#4213 / #5023)"
+        );
     }
 
     /// #4864 round-9 item 2 pin: `create_instance` MUST recover the store on a
@@ -2889,7 +3219,16 @@ mod tests {
     /// memory that never triggers a count-based refresh.
     #[test]
     fn create_instance_recovers_store_on_guest_entry_failure() {
-        let src = include_str!("wasmtime_engine.rs");
+        // Same cutoff as `create_instance_allocates_its_own_instance_id` above,
+        // and for the same reason: `include_str!` pulls in this test module,
+        // whose source contains `fn create_instance(` as a string literal. With
+        // the whole file in scope, renaming the production method would let
+        // `find` fall through into the test module rather than panicking.
+        let full = include_str!("wasmtime_engine.rs");
+        let cutoff = full
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("wasmtime_engine.rs must have a top-level #[cfg(test)] mod tests");
+        let src = &full[..cutoff];
         let start = src
             .find("fn create_instance(")
             .expect("create_instance not found");
@@ -2987,33 +3326,43 @@ mod tests {
     #[test]
     fn blocking_paths_arm_epoch_inside_the_closure() {
         let src = include_str!("wasmtime_engine.rs");
-        for fn_name in ["fn call_2i64_blocking(", "fn call_3i64_blocking("] {
-            let start = src
-                .find(fn_name)
-                .unwrap_or_else(|| panic!("`{fn_name}` not found"));
-            let rest = &src[start + fn_name.len()..];
-            // Bound the body at the next method or the impl close.
-            let end = ["\n    fn ", "\n}"]
-                .iter()
-                .filter_map(|needle| rest.find(needle))
-                .min()
-                .map(|i| start + fn_name.len() + i)
-                .unwrap_or(src.len());
-            let body = &src[start..end];
+        // #5480: all three entry points share ONE body, so this scrapes that
+        // body rather than the per-entry-point copies it replaced.
+        let fn_name = "fn call_typed_blocking<";
+        let body = scrape_body(src, fn_name);
 
-            let ewb = body
-                .find("execute_wasm_blocking(")
-                .unwrap_or_else(|| panic!("`{fn_name}` must call execute_wasm_blocking"));
-            let arm = body
-                .find("arm_epoch_deadline(")
-                .unwrap_or_else(|| panic!("`{fn_name}` must arm the epoch deadline"));
-            assert!(
-                arm > ewb,
-                "`{fn_name}`: arm_epoch_deadline must be INSIDE the execute_wasm_blocking \
-                 closure (after the call), not before it — else queue wait consumes the \
-                 epoch budget and a healthy contract is quarantined (#4864 round-7)"
-            );
-        }
+        let ewb = body
+            .find("execute_wasm_blocking(")
+            .unwrap_or_else(|| panic!("`{fn_name}` must call execute_wasm_blocking"));
+        let arm = body
+            .find("arm_epoch_deadline(")
+            .unwrap_or_else(|| panic!("`{fn_name}` must arm the epoch deadline"));
+        assert!(
+            arm > ewb,
+            "`{fn_name}`: arm_epoch_deadline must be INSIDE the execute_wasm_blocking \
+             closure (after the call), not before it — else queue wait consumes the \
+             epoch budget and a healthy contract is quarantined (#4864 round-7)"
+        );
+
+        // #5480: the delegate instance id must be installed on the thread that
+        // actually runs the guest, i.e. INSIDE the same closure. Installed
+        // outside it, it lands on the caller's thread and every delegate host
+        // function reads the default -1.
+        let install = body
+            .find("GuestDelegateInstance::install")
+            .unwrap_or_else(|| panic!("`{fn_name}` must install the delegate instance id (#5480)"));
+        assert!(
+            install > ewb,
+            "`{fn_name}`: GuestDelegateInstance::install must be INSIDE the \
+             execute_wasm_blocking closure — on the blocking-pool thread that runs \
+             the guest, not the caller's thread (#5480)"
+        );
+        assert!(
+            install < arm,
+            "`{fn_name}`: install the delegate instance id BEFORE arming the epoch \
+             deadline, so a guest that traps immediately still had its env reachable \
+             (#5480)"
+        );
     }
 
     /// REGRESSION (issue #4441 fix-up): with `offload_compilation = true` on a
@@ -3038,7 +3387,7 @@ mod tests {
             .compile(SIMPLE_WASM)
             .expect("compile under current_thread+offload must succeed (no panic)");
         let handle = engine
-            .create_instance(&module, 0, 1024)
+            .create_instance(&module, 1024)
             .expect("module must be instantiable");
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
@@ -3088,7 +3437,7 @@ mod tests {
             .compile(SIMPLE_WASM)
             .expect("compile with no runtime + offload must succeed inline");
         let handle = engine
-            .create_instance(&module, 0, 1024)
+            .create_instance(&module, 1024)
             .expect("module must be instantiable");
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
@@ -3258,7 +3607,7 @@ mod tests {
         // default 10,000 limit. Without our ResourceLimiter override this would fail.
         for i in 0..10_001 {
             let handle = engine
-                .create_instance(&module, i, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -3364,21 +3713,12 @@ mod tests {
           ;; remove_secret(key_ptr: i64, key_len: i32) -> i32
           (import "freenet_delegate_secrets" "__frnt__delegate__remove_secret"
             (func $remove_secret (param i64 i32) (result i32)))
-          ;; get_contract_state_impl(id_ptr: i64, id_len: i32, out_ptr: i64, out_len: i64) -> i64
+          ;; local_contract_state_impl(id_ptr: i64, id_len: i32, out_ptr: i64, out_len: i64) -> i64
           (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state"
-            (func $get_state (param i64 i32 i64 i64) (result i64)))
-          ;; get_contract_state_len_impl(id_ptr: i64, id_len: i32) -> i64
+            (func $local_state (param i64 i32 i64 i64) (result i64)))
+          ;; local_contract_state_len_impl(id_ptr: i64, id_len: i32) -> i64
           (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
-            (func $get_state_len (param i64 i32) (result i64)))
-          ;; put_contract_state_impl(id_ptr: i64, id_len: i32, state_ptr: i64, state_len: i64) -> i64
-          (import "freenet_delegate_contracts" "__frnt__delegate__put_contract_state"
-            (func $put_state (param i64 i32 i64 i64) (result i64)))
-          ;; update_contract_state_impl(id_ptr: i64, id_len: i32, state_ptr: i64, state_len: i64) -> i64
-          (import "freenet_delegate_contracts" "__frnt__delegate__update_contract_state"
-            (func $update_state (param i64 i32 i64 i64) (result i64)))
-          ;; subscribe_contract_impl(id_ptr: i64, id_len: i32) -> i64
-          (import "freenet_delegate_contracts" "__frnt__delegate__subscribe_contract"
-            (func $subscribe (param i64 i32) (result i64)))
+            (func $local_state_len (param i64 i32) (result i64)))
           (memory (export "memory") 1)
           (func (export "answer") (result i32) i32.const 42)
         )
@@ -3540,55 +3880,23 @@ mod tests {
         }
     }
 
+    /// A delegate's `process()` can call the contract-state host function,
+    /// through the one delegate entry point (`call_3i64`).
+    ///
+    /// Before #5637 a module importing `freenet_delegate_contracts` was routed
+    /// through a separate `call_3i64_async_imports`; the two had become
+    /// identical, and the split is gone. This keeps the end-to-end coverage the
+    /// old test gave: import resolution, `refresh_mem_addr_from_caller`, and a
+    /// host call made from inside the guest.
     #[test]
-    fn test_module_without_async_imports_detected_as_v1() {
-        let config = RuntimeConfig::default();
-        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
-
-        let wat = r#"
-        (module
-          (memory (export "memory") 1)
-          (func (export "process") (param i64 i64 i64) (result i64)
-            i64.const 0))
-        "#;
-        let module = engine.compile(wat.as_bytes()).unwrap();
-        assert!(
-            !engine.module_has_async_imports(&module),
-            "V1 module should not have freenet_delegate_contracts imports"
-        );
-    }
-
-    #[test]
-    fn test_module_with_async_imports_detected_as_v2() {
-        let config = RuntimeConfig::default();
-        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
-
-        let wat = r#"
-        (module
-          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state"
-            (func $get_state (param i64 i32 i64 i64) (result i64)))
-          (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
-            (func $get_state_len (param i64 i32) (result i64)))
-          (memory (export "memory") 1)
-          (func (export "process") (param i64 i64 i64) (result i64)
-            i64.const 0))
-        "#;
-        let module = engine.compile(wat.as_bytes()).unwrap();
-        assert!(
-            engine.module_has_async_imports(&module),
-            "V2 module should have freenet_delegate_contracts imports"
-        );
-    }
-
-    #[test]
-    fn test_v2_async_call_path_end_to_end() {
+    fn delegate_process_calls_local_contract_state() {
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
 
         let wat = r#"
         (module
           (import "freenet_delegate_contracts" "__frnt__delegate__get_contract_state_len"
-            (func $get_state_len (param i64 i32) (result i64)))
+            (func $local_state_len (param i64 i32) (result i64)))
           (memory (export "memory") 1)
           (global $instance_id (mut i64) (i64.const 0))
           (func (export "__frnt_set_id") (param i64)
@@ -3599,27 +3907,183 @@ mod tests {
           (func (export "process") (param i64 i64 i64) (result i64)
             i64.const 0
             i32.const 0
-            call $get_state_len))
+            call $local_state_len))
         "#;
 
         let module = engine.compile(wat.as_bytes()).unwrap();
-        assert!(
-            engine.module_has_async_imports(&module),
-            "module should be detected as V2"
-        );
-
         let handle = engine
-            .create_instance(&module, 999, 1024)
+            .create_instance(&module, 1024)
             .expect("create instance");
 
-        let result = engine.call_3i64_async_imports(&handle, "process", 0, 0, 0);
+        let result = engine.call_3i64(&handle, "process", 0, 0, 0);
         assert!(
             result.is_ok(),
-            "V2 async call path should succeed, got: {:?}",
-            result
+            "a delegate calling local_contract_state from process() must run, got: {result:?}"
         );
 
         engine.drop_instance(&handle);
+    }
+
+    /// #5637: the delegate host functions that wrote contract state, or
+    /// subscribed to it, are GONE, and a module that imports one must fail to
+    /// instantiate rather than link to something that silently does nothing.
+    ///
+    /// Two properties, both of which the removal depends on:
+    ///
+    ///  1. The linker does not define them. Re-registering `put_contract_state`
+    ///     (or any of the others) turns this test red, which is the point: the
+    ///     write path bypassed the executor's `state_store` chokepoints and
+    ///     dropped side effects twice in production (#4683, #5479). A write
+    ///     belongs on the message path.
+    ///  2. Unknown imports are an instantiation ERROR, not a trap stub. If the
+    ///     linker were ever switched to `define_unknown_imports_as_traps`, a
+    ///     delegate built against the old names would instantiate and only fail
+    ///     when it called one, which is much harder to diagnose.
+    ///
+    /// The positive control instantiates the SAME module shape against the
+    /// surviving read, so a failure below is attributable to the import name
+    /// and not to a malformed module. The read keeps its original import
+    /// name, `__frnt__delegate__get_contract_state`, because freenet-stdlib's
+    /// public `DelegateCtx::get_contract_state` links against it: renaming it
+    /// would make every SDK delegate that reads state fail to load.
+    #[test]
+    fn removed_delegate_contract_imports_are_refused_at_instantiation() {
+        fn module_importing(name: &str, sig: &str) -> String {
+            format!(
+                r#"
+                (module
+                  (import "freenet_delegate_contracts" "{name}" (func {sig}))
+                  (memory (export "memory") 1)
+                  (func (export "__frnt_set_id") (param i64))
+                  (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+                    i64.const 100))
+                "#
+            )
+        }
+
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+
+        let control = engine
+            .compile(
+                module_importing(
+                    "__frnt__delegate__get_contract_state",
+                    "(param i64 i32 i64 i64) (result i64)",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let handle = engine
+            .create_instance(&control, 1024)
+            .expect("positive control: the surviving read must instantiate");
+        engine.drop_instance(&handle);
+
+        for (name, sig) in [
+            (
+                "__frnt__delegate__put_contract_state",
+                "(param i64 i32 i64 i64) (result i64)",
+            ),
+            (
+                "__frnt__delegate__update_contract_state",
+                "(param i64 i32 i64 i64) (result i64)",
+            ),
+            (
+                "__frnt__delegate__subscribe_contract",
+                "(param i64 i32) (result i64)",
+            ),
+        ] {
+            let module = engine
+                .compile(module_importing(name, sig).as_bytes())
+                .unwrap();
+            let result = engine.create_instance(&module, 1024);
+            if let Ok(handle) = &result {
+                engine.drop_instance(handle);
+            }
+            assert!(
+                result.is_err(),
+                "`{name}` was removed in #5637 and must not be defined by the linker; \
+                 a delegate importing it has to fail at instantiation"
+            );
+        }
+    }
+
+    /// Regression test for #4213 / #5023: instance ids are a PROCESS-GLOBAL
+    /// namespace, so one engine's instance churn must never disturb another
+    /// engine's LIVE instance.
+    ///
+    /// `MEM_ADDR` (and `DELEGATE_ENV`, `CONTRACT_IO`) are process-global maps
+    /// keyed by instance id, and `drop_instance` removes the entry for the id
+    /// it is handed. While `create_instance` took a caller-supplied id, the
+    /// engine tests in this module passed hand-picked ones: `0..10_001` in
+    /// `test_instance_limit_override_allows_many_instances`, and
+    /// `0..STORE_REFRESH_THRESHOLD` in the store-refresh tests. Their
+    /// `drop_instance` calls removed the `MEM_ADDR` entry of whatever LIVE
+    /// delegate or contract instance in a concurrently-running test had been
+    /// issued the same id. Every host function on the victim then returned
+    /// `ERR_NOT_IN_PROCESS`, which the stdlib collapses into "not found":
+    /// `SecretResult(None)` from `test_large_secret_data` and
+    /// `test_store_and_retrieve_secret`, `error_code: -1` from
+    /// a delegate contract-write test (since removed with the write host
+    /// functions, #5637).
+    ///
+    /// Ids now come from `native_api::next_instance_id`, so a `create_instance`
+    /// CALLER can no longer pass one -- that surface is closed by the signature.
+    /// It is not closed everywhere: `InstanceHandle.id` is `pub(super)`, so code
+    /// inside `wasm_runtime` can still hand `drop_instance` a fabricated handle
+    /// (`delegate/test.rs` builds `InstanceHandle { id: 0 }` twice today, inert
+    /// only because `process_outbound` ignores it). What this test pins is the
+    /// one property still expressible at runtime, and the one a future change
+    /// could quietly break: the allocator is process-global, not per-engine. Two
+    /// live engines are never issued the same id, so B's churn leaves A's entry
+    /// intact.
+    #[test]
+    fn instance_ids_are_globally_unique_across_engines() {
+        use crate::wasm_runtime::runtime::{InstanceInfo, Key};
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let config = RuntimeConfig::default();
+
+        let mut engine_a = WasmtimeEngine::new(&config, false).unwrap();
+        let module_a = engine_a.compile(SIMPLE_WASM).unwrap();
+        let live = engine_a
+            .create_instance(&module_a, 1024)
+            .expect("engine A instance");
+        // `RunningInstance::new` is what records the MEM_ADDR entry in
+        // production; stand in for it so an eviction would be observable.
+        let (ptr, size) = engine_a.memory_info(&live).unwrap();
+        MEM_ADDR.insert(
+            live.id,
+            InstanceInfo::new(
+                ptr as i64,
+                size,
+                Key::Contract(ContractInstanceId::new([0u8; 32])),
+            ),
+        );
+
+        // A second engine churns instances the way the store-refresh and
+        // instance-limit tests do, while A's instance stays live.
+        let mut engine_b = WasmtimeEngine::new(&config, false).unwrap();
+        let module_b = engine_b.compile(SIMPLE_WASM).unwrap();
+        for _ in 0..64 {
+            let churn = engine_b
+                .create_instance(&module_b, 1024)
+                .expect("engine B instance");
+            assert_ne!(
+                churn.id, live.id,
+                "engine B was issued engine A's LIVE instance id; instance ids \
+                 must come from the one process-global allocator"
+            );
+            engine_b.drop_instance(&churn);
+        }
+
+        assert!(
+            MEM_ADDR.get(&live.id).is_some(),
+            "another engine's instance churn evicted a LIVE instance's MEM_ADDR \
+             entry; every host function on that instance would now return \
+             ERR_NOT_IN_PROCESS"
+        );
+
+        engine_a.drop_instance(&live);
     }
 
     /// Deterministic regression test for #3248: stale memory base pointer.
@@ -3658,10 +4122,12 @@ mod tests {
         "#;
 
         let module = engine.compile(wat.as_bytes()).unwrap();
-        let instance_id: i64 = 42_000;
         let handle = engine
-            .create_instance(&module, instance_id, 1024)
+            .create_instance(&module, 1024)
             .expect("create instance");
+        // The engine issues the id; `RunningInstance::new` is what normally
+        // records the MEM_ADDR entry, so stand in for it here.
+        let instance_id = handle.id;
 
         let (init_ptr, init_size) = engine.memory_info(&handle).unwrap();
         MEM_ADDR.insert(
@@ -3737,7 +4203,7 @@ mod tests {
 
         // Charge one instance to learn what the arena actually retains per
         // instance, then set a budget only a few instances wide.
-        let handle = engine.create_instance(&module, 0, 1024).unwrap();
+        let handle = engine.create_instance(&module, 1024).unwrap();
         engine.drop_instance(&handle);
         let per_instance = engine.retired_instance_bytes;
         assert!(
@@ -3753,8 +4219,8 @@ mod tests {
         // here is attributable to the byte bound alone.
         let creations = 40;
         assert!(creations < STORE_REFRESH_THRESHOLD);
-        for i in 1..=creations {
-            let handle = engine.create_instance(&module, i as i64, 1024).unwrap();
+        for _ in 1..=creations {
+            let handle = engine.create_instance(&module, 1024).unwrap();
             engine.drop_instance(&handle);
             if engine.lifetime_instances <= previous {
                 refreshes += 1;
@@ -3780,7 +4246,7 @@ mod tests {
             "engine must stay healthy across byte-budget refreshes"
         );
         let handle = engine
-            .create_instance(&module, 999_999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after byte-budget refresh");
         engine.drop_instance(&handle);
     }
@@ -3813,7 +4279,7 @@ mod tests {
 
         for i in 0..12 {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} must still be creatable: {e}"));
             assert_eq!(
                 engine.lifetime_instances, 1,
@@ -3896,7 +4362,7 @@ mod tests {
         // The last drop_instance should trigger a store refresh.
         for i in 0..STORE_REFRESH_THRESHOLD {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -3913,7 +4379,7 @@ mod tests {
             "engine should be healthy after refresh"
         );
         let handle = engine
-            .create_instance(&module, 999_999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after refresh");
         engine.drop_instance(&handle);
     }
@@ -3935,7 +4401,7 @@ mod tests {
         let burn = STORE_REFRESH_THRESHOLD - 3;
         for i in 0..burn {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -3945,7 +4411,7 @@ mod tests {
         let mut handles = Vec::new();
         for i in burn..STORE_REFRESH_THRESHOLD {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             handles.push(handle);
         }
@@ -3981,9 +4447,9 @@ mod tests {
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
         // Create some instances to bump the counter
-        for i in 0..10 {
+        for _ in 0..10 {
             let handle = engine
-                .create_instance(&module, i, 1024)
+                .create_instance(&module, 1024)
                 .expect("should succeed");
             engine.drop_instance(&handle);
         }
@@ -3998,7 +4464,7 @@ mod tests {
 
         // Engine should still work after recovery
         let handle = engine
-            .create_instance(&module, 999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after recovery");
         engine.drop_instance(&handle);
     }
@@ -4021,7 +4487,7 @@ mod tests {
         // Create and drop enough instances to trigger refresh
         for i in 0..STORE_REFRESH_THRESHOLD {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -4031,7 +4497,7 @@ mod tests {
         // Verify that instance creation and WASM execution still work after
         // refresh — the replacement store must have fuel set correctly.
         let handle = engine
-            .create_instance(&module, 999_999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after metered refresh");
         engine.drop_instance(&handle);
     }
@@ -4099,7 +4565,7 @@ mod tests {
         // Create and drop instances just below the threshold (no refresh yet).
         for i in 0..STORE_REFRESH_THRESHOLD - 1 {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -4114,7 +4580,7 @@ mod tests {
 
         // One more instance hits the threshold and triggers refresh.
         let handle = engine
-            .create_instance(&module, STORE_REFRESH_THRESHOLD as i64, 1024)
+            .create_instance(&module, 1024)
             .expect("final instance should succeed");
         engine.drop_instance(&handle);
 
@@ -4209,7 +4675,7 @@ mod tests {
         "#;
         let module = engine.compile(wat.as_bytes()).unwrap();
 
-        let result = engine.create_instance(&module, 0, 1024);
+        let result = engine.create_instance(&module, 1024);
         assert!(
             result.is_err(),
             "Module declaring 5000 initial pages (>cap of 4096) must be \
@@ -4290,7 +4756,7 @@ mod tests {
         // taking the baseline so they don't get charged to the per-instance
         // measurement.
         {
-            let h = engine.create_instance(&module, -1, 1024).unwrap();
+            let h = engine.create_instance(&module, 1024).unwrap();
             engine.drop_instance(&h);
         }
         let baseline = read_vm_size_bytes();
@@ -4300,15 +4766,13 @@ mod tests {
         const N_INSTANCES: i64 = 4;
         let mut handles = Vec::with_capacity(N_INSTANCES as usize);
         for i in 0..N_INSTANCES {
-            let h = engine
-                .create_instance(&module, i, 1024)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "instance {i} should succeed (regression: wasmtime memory \
+            let h = engine.create_instance(&module, 1024).unwrap_or_else(|e| {
+                panic!(
+                    "instance {i} should succeed (regression: wasmtime memory \
                      reservation may be too large for the host's overcommit \
                      limit, see #3986): {e}"
-                    )
-                });
+                )
+            });
             handles.push(h);
         }
         let after = read_vm_size_bytes();

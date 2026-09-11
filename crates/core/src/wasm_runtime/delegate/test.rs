@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::os::unix::fs::PermissionsExt;
 
 use crate::util::tests::get_temp_dir;
-use crate::wasm_runtime::delegate_api::DelegateApiVersion;
 
 use super::super::{
     ContractStore, Runtime, RuntimeResult, SecretsStore, delegate_store::DelegateStore,
@@ -37,6 +36,7 @@ mod delegate2_messages {
         RemoveSecret(Vec<u8>),
         WriteLargeContext(usize),
         StoreLargeSecret { key: Vec<u8>, size: usize },
+        ReadWriteRead { key: Vec<u8>, value: Vec<u8> },
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -57,6 +57,57 @@ mod delegate2_messages {
     }
 }
 
+/// Execution budget for the delegate test fixtures.
+///
+/// `RuntimeConfig::max_execution_seconds` defaults to 5.0, which is a
+/// PRODUCTION policy — how long a delegate may occupy an executor — and it is
+/// enforced as WALL CLOCK: `epoch_deadline_ticks` turns it into 51 ticks of a
+/// 100 ms process-global epoch ticker. That clock keeps running while the guest
+/// is blocked inside a HOST call, and the epoch trap cannot fire until control
+/// returns to the guest, so the budget is spent on the node's own file I/O and
+/// XChaCha20-Poly1305 as much as on delegate code.
+///
+/// These fixtures assert functional behaviour, not that policy, and one of them
+/// sits on the boundary by construction: `test_large_secret_data` drives ~2 MiB
+/// of AEAD through host calls for a single 1 MiB secret, in a build where that
+/// crypto is monomorphised into `crates/core` at opt-level 0 — the
+/// `[profile.dev.package."*"] opt-level = 3` override in the workspace manifest
+/// covers dependency PACKAGES, not generic code instantiated in the local
+/// crate. On a loaded machine, or a CI runner running the suite in parallel
+/// under nextest, that legitimately exceeds 5 s of wall clock and the guest is
+/// epoch-trapped as `WasmError::Timeout` — a failure that says nothing about
+/// the code under test. Measured on a 16-core box: 0 failures in 28 runs below
+/// load average 50, and failures on BOTH `main` and a feature branch above it.
+///
+/// So `setup_runtime` sets the budget explicitly instead of inheriting the
+/// production one. NOT a completed sweep: `setup_runtime_with_params`,
+/// `bare_runtime` and the tests that build a
+/// `Runtime` inline still inherit the production 5.0 s. They are not known to
+/// flake on it, and widening this to every delegate fixture is a larger change
+/// than the one flake in hand justified, so it was left deliberately rather
+/// than overlooked. Point them here if the same timeout shows up in them.
+///
+/// 60 s is generous but still bounded, so a delegate test that genuinely wedges
+/// fails rather than hanging forever.
+///
+/// Nothing here weakens timeout coverage. The real epoch-trap coverage — a
+/// guest actually being interrupted — lives in `engine::wasmtime_engine`'s own
+/// tests, which drive WASM directly and set their own budgets.
+/// `wasm_runtime::tests::execution_handling` also asserts timeout behaviour,
+/// but it simulates a polling loop and never runs WASM, so it is untouched by
+/// this constant for a different reason than I first wrote here.
+///
+/// This does not make the wall-clock accounting correct — a real delegate
+/// storing a large secret on a busy node can still be charged for the host's
+/// crypto and I/O. That is tracked separately; this constant only stops a unit
+/// test from being gated on it.
+fn delegate_fixture_config() -> super::super::runtime::RuntimeConfig {
+    super::super::runtime::RuntimeConfig {
+        max_execution_seconds: 60.0,
+        ..Default::default()
+    }
+}
+
 async fn setup_runtime(
     name: &str,
 ) -> Result<(DelegateContainer, Runtime, tempfile::TempDir), Box<dyn std::error::Error>> {
@@ -71,7 +122,14 @@ async fn setup_runtime(
     let delegate_store = DelegateStore::new(delegates_dir, 10_000, db.clone())?;
     let secret_store = SecretsStore::new(secrets_dir, Default::default(), db)?;
 
-    let mut runtime = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+    let mut runtime = Runtime::build_with_config(
+        contract_store,
+        delegate_store,
+        secret_store,
+        false,
+        delegate_fixture_config(),
+    )
+    .unwrap();
 
     let delegate = {
         let bytes = super::super::tests::get_test_module(name)?;
@@ -195,6 +253,7 @@ async fn test_get_contract_request_response() -> Result<(), Box<dyn std::error::
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected GetContractRequest, got {:?}", other)
         }
@@ -221,6 +280,7 @@ async fn test_get_contract_request_response() -> Result<(), Box<dyn std::error::
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -278,6 +338,7 @@ async fn test_get_contract_not_found() -> Result<(), Box<dyn std::error::Error>>
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected GetContractRequest, got {:?}", other)
         }
@@ -300,6 +361,7 @@ async fn test_get_contract_not_found() -> Result<(), Box<dyn std::error::Error>>
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -359,6 +421,7 @@ async fn test_multiple_contract_requests() -> Result<(), Box<dyn std::error::Err
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected GetContractRequest, got {:?}", other)
         }
@@ -383,6 +446,7 @@ async fn test_multiple_contract_requests() -> Result<(), Box<dyn std::error::Err
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected GetContractRequest for contract2, got {:?}", other)
         }
@@ -407,6 +471,7 @@ async fn test_multiple_contract_requests() -> Result<(), Box<dyn std::error::Err
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected GetContractRequest for contract3, got {:?}", other)
         }
@@ -431,6 +496,7 @@ async fn test_multiple_contract_requests() -> Result<(), Box<dyn std::error::Err
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -500,6 +566,7 @@ async fn test_message_accumulation() -> Result<(), Box<dyn std::error::Error>> {
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | OutboundDelegateMsg::SendDelegateMessage(_) => None,
         })
         .expect("Expected a GetContractRequest");
@@ -515,6 +582,7 @@ async fn test_message_accumulation() -> Result<(), Box<dyn std::error::Error>> {
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | OutboundDelegateMsg::SendDelegateMessage(_) => None,
         })
         .expect("Expected an ApplicationMessage (Echo)");
@@ -559,6 +627,7 @@ async fn test_message_accumulation() -> Result<(), Box<dyn std::error::Error>> {
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -666,6 +735,7 @@ async fn test_context_persistence_within_call() -> Result<(), Box<dyn std::error
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -680,6 +750,7 @@ async fn test_context_persistence_within_call() -> Result<(), Box<dyn std::error
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -750,6 +821,7 @@ async fn test_context_persists_between_calls() -> Result<(), Box<dyn std::error:
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -777,6 +849,7 @@ async fn test_context_persists_between_calls() -> Result<(), Box<dyn std::error:
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1341,6 +1414,7 @@ async fn test_has_secret_host_function() -> Result<(), Box<dyn std::error::Error
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1378,6 +1452,7 @@ async fn test_has_secret_host_function() -> Result<(), Box<dyn std::error::Error
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1418,6 +1493,7 @@ async fn test_get_nonexistent_secret() -> Result<(), Box<dyn std::error::Error>>
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1463,6 +1539,7 @@ async fn test_store_and_retrieve_secret() -> Result<(), Box<dyn std::error::Erro
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1487,6 +1564,7 @@ async fn test_store_and_retrieve_secret() -> Result<(), Box<dyn std::error::Erro
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1553,6 +1631,7 @@ async fn test_set_secret_failure_returns_secret_store_failed()
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1598,6 +1677,7 @@ async fn test_read_empty_context() -> Result<(), Box<dyn std::error::Error>> {
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1666,6 +1746,7 @@ async fn test_context_clear() -> Result<(), Box<dyn std::error::Error>> {
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1690,6 +1771,7 @@ async fn test_context_clear() -> Result<(), Box<dyn std::error::Error>> {
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1750,6 +1832,7 @@ async fn test_context_shared_across_batch() -> Result<(), Box<dyn std::error::Er
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
@@ -1823,6 +1906,7 @@ async fn test_remove_secret_host_function() -> Result<(), Box<dyn std::error::Er
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1846,6 +1930,7 @@ async fn test_remove_secret_host_function() -> Result<(), Box<dyn std::error::Er
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1869,6 +1954,7 @@ async fn test_remove_secret_host_function() -> Result<(), Box<dyn std::error::Er
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1915,6 +2001,7 @@ async fn test_large_context_data() -> Result<(), Box<dyn std::error::Error>> {
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -1956,6 +2043,7 @@ async fn test_large_context_data() -> Result<(), Box<dyn std::error::Error>> {
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -2026,6 +2114,7 @@ async fn test_large_context_within_batch() -> Result<(), Box<dyn std::error::Err
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -2064,6 +2153,116 @@ async fn test_large_context_within_batch() -> Result<(), Box<dyn std::error::Err
 /// `refresh_mem_addr_from_caller`, the subsequent read uses a stale pointer
 /// and returns garbage data. Under full parallel test suite runs (~1600 tests)
 /// the relocation is more likely due to memory pressure.
+/// A write must invalidate the host's per-`process()` secret memo, observed
+/// through a real WASM guest rather than asserted about the source.
+///
+/// `get_secret_len` + `get_secret` both decrypt, so the host memoises the
+/// plaintext for the duration of one `process()` call. `set_secret` and
+/// `remove_secret` therefore have to clear it, or a read after a write in the
+/// same call is served the PRE-WRITE bytes.
+///
+/// This replaces a source-scrape pin that asserted both host functions
+/// contained `invalidate_secret_memo()`. That pin was defeatable by prose: the
+/// mutation review deleted both real calls, left the string in a trailing `//`
+/// comment, and the whole suite stayed green — the comment filter only
+/// stripped lines that BEGIN with `//`, not comment tails. Worse, deleting
+/// both calls killed exactly one test, the pin itself, so a string in a
+/// comment was the entire protection for the invariant.
+///
+/// Nothing reached these call sites behaviourally before, and the reason is
+/// narrow enough to be worth recording: `exec_inbound_with_env` builds one
+/// `DelegateCallEnv` per inbound message, so batching two messages gives two
+/// memos and cannot observe a stale one. The read, the write and the re-read
+/// all have to happen inside a single `process()`, which needs a guest
+/// handler — hence `ReadWriteRead` in `tests/test-delegate-2`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_invalidates_the_secret_memo_within_one_process_call()
+-> Result<(), Box<dyn std::error::Error>> {
+    use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+    let key = b"memo-invalidation".to_vec();
+
+    let send = |runtime: &mut Runtime,
+                msg: &InboundAppMessage|
+     -> Result<OutboundAppMessage, Box<dyn std::error::Error>> {
+        let payload = bincode::serialize(msg)?;
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        )?;
+        match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => Ok(bincode::deserialize(&m.payload)?),
+            other @ OutboundDelegateMsg::RequestUserInput(_)
+            | other @ OutboundDelegateMsg::ContextUpdated(_)
+            | other @ OutboundDelegateMsg::GetContractRequest(_)
+            | other @ OutboundDelegateMsg::PutContractRequest(_)
+            | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+            | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
+            | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
+                panic!("Expected ApplicationMessage, got {other:?}")
+            }
+        }
+    };
+
+    // Seed the key in an EARLIER call, so the read-write-read call below finds
+    // something to memoise on its first read.
+    let stored = send(
+        &mut runtime,
+        &InboundAppMessage::StoreSecret {
+            key: key.clone(),
+            value: b"before".to_vec(),
+        },
+    )?;
+    assert!(
+        matches!(stored, OutboundAppMessage::SecretStored),
+        "seeding the secret must succeed, got {stored:?}"
+    );
+
+    // One process() call: read (populates the memo), write, read again.
+    let observed = send(
+        &mut runtime,
+        &InboundAppMessage::ReadWriteRead {
+            key: key.clone(),
+            value: b"after".to_vec(),
+        },
+    )?;
+
+    match observed {
+        OutboundAppMessage::SecretResult(Some(bytes)) => assert_eq!(
+            bytes,
+            b"after".to_vec(),
+            "the read AFTER the write must see the written bytes. Reading \
+             `before` means set_secret did not invalidate the per-process() \
+             secret memo, so the guest was served the pre-write plaintext"
+        ),
+        other @ OutboundAppMessage::SecretResult(None)
+        | other @ OutboundAppMessage::CreateInboxResponse(_)
+        | other @ OutboundAppMessage::MessageSigned(_)
+        | other @ OutboundAppMessage::ContextData(_)
+        | other @ OutboundAppMessage::CounterValue(_)
+        | other @ OutboundAppMessage::SecretExists(_)
+        | other @ OutboundAppMessage::ContextWritten
+        | other @ OutboundAppMessage::ContextCleared
+        | other @ OutboundAppMessage::SecretStored
+        | other @ OutboundAppMessage::SecretRemoved
+        | other @ OutboundAppMessage::LargeContextWritten(_)
+        | other @ OutboundAppMessage::LargeSecretStored(_)
+        | other @ OutboundAppMessage::SecretStoreFailed => panic!(
+            "expected SecretResult(Some(..)) from the post-write read, got {other:?}. \
+             SecretResult(None) means the write or the re-read failed outright"
+        ),
+    }
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_large_secret_data() -> Result<(), Box<dyn std::error::Error>> {
     use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
@@ -2098,6 +2297,7 @@ async fn test_large_secret_data() -> Result<(), Box<dyn std::error::Error>> {
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -2139,6 +2339,7 @@ async fn test_large_secret_data() -> Result<(), Box<dyn std::error::Error>> {
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage")
         }
@@ -2246,6 +2447,7 @@ async fn test_concurrent_delegate_execution() -> Result<(), Box<dyn std::error::
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
@@ -2326,6 +2528,7 @@ async fn test_concurrent_delegate_execution() -> Result<(), Box<dyn std::error::
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | OutboundDelegateMsg::SendDelegateMessage(_) => {
                 panic!("Expected ApplicationMessage")
             }
@@ -2361,106 +2564,17 @@ async fn test_concurrent_delegate_execution() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Verify that V1 delegates are correctly detected as V1 even when
-/// state_store_db is configured. This ensures backward compatibility —
-/// V2 detection is based on module imports, not runtime configuration.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_v1_delegate_detected_as_v1_with_state_store() -> Result<(), Box<dyn std::error::Error>>
-{
-    use crate::contract::storages::Storage;
-    use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+const TEST_DELEGATE_LOCAL_CONTRACT_STATE: &str = "test_delegate_local_contract_state";
 
-    let temp_dir = get_temp_dir();
-    let contracts_dir = temp_dir.path().join("contracts");
-    let delegates_dir = temp_dir.path().join("delegates");
-    let secrets_dir = temp_dir.path().join("secrets");
-
-    let db = Storage::new(temp_dir.path()).await?;
-    let contract_store = ContractStore::new(contracts_dir, 10_000, db.clone())?;
-    let delegate_store = DelegateStore::new(delegates_dir, 10_000, db.clone())?;
-    let secret_store = SecretsStore::new(secrets_dir, Default::default(), db.clone())?;
-
-    let mut runtime = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
-
-    // Configure state_store_db — V1 delegates should STILL be detected as V1
-    runtime.set_state_store_db(db);
-
-    let delegate = {
-        let bytes = super::super::tests::get_test_module(TEST_DELEGATE_2)?;
-        DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
-            &bytes.into(),
-            &vec![].into(),
-        ))))
-    };
-    runtime
-        .delegate_store
-        .store_delegate(delegate.clone())
-        .expect("fixture delegate must store: Delegate::from derives its key");
-
-    let key = XChaCha20Poly1305::generate_key(&mut OsRng);
-    let cipher = XChaCha20Poly1305::new(&key);
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let _registered = runtime
-        .secret_store
-        .register_delegate(delegate.key().clone(), cipher, nonce);
-
-    // Verify API version detection: V1 delegate should be V1
-    let (mut running, api_version) =
-        runtime.prepare_delegate_call(&vec![].into(), delegate.key(), 4096)?;
-    assert_eq!(
-        api_version,
-        DelegateApiVersion::V1,
-        "V1 delegate should be detected as V1 even with state_store_db configured"
-    );
-    runtime.drop_running_instance(&mut running);
-
-    // Verify the delegate still works normally via the V1 path
-    let contract = WrappedContract::new(
-        Arc::new(ContractCode::from(vec![1])),
-        Parameters::from(vec![]),
-    );
-    let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
-
-    let payload: Vec<u8> = bincode::serialize(&InboundAppMessage::CreateInboxRequest).unwrap();
-    let create_msg = ApplicationMessage::new(payload);
-    let inbound = InboundDelegateMsg::ApplicationMessage(create_msg);
-    let outbound =
-        runtime.inbound_app_message(delegate.key(), &vec![].into(), None, None, vec![inbound])?;
-
-    let expected_payload =
-        bincode::serialize(&OutboundAppMessage::CreateInboxResponse(vec![1])).unwrap();
-    assert_eq!(outbound.len(), 1);
-    assert!(matches!(
-        outbound.first(),
-        Some(OutboundDelegateMsg::ApplicationMessage(msg)) if *msg.payload == expected_payload
-    ));
-
-    std::mem::drop(temp_dir);
-    Ok(())
-}
-
-const TEST_DELEGATE_V2_CONTRACTS: &str = "test_delegate_v2_contracts";
-
-/// Message types for test-delegate-v2-contracts (must match the delegate's types)
-mod v2_contracts_messages {
+/// Message types for `tests/test-delegate-local-contract-state`. They are
+/// bincode'd across the WASM boundary, so they must match the fixture's own
+/// definitions variant for variant.
+mod local_contract_state_messages {
     use super::*;
 
     #[derive(Debug, Serialize, Deserialize)]
     pub enum InboundAppMessage {
-        GetContractState {
-            contract_id: [u8; 32],
-        },
-        PutContractState {
-            contract_id: [u8; 32],
-            state: Vec<u8>,
-        },
-        UpdateContractState {
-            contract_id: [u8; 32],
-            state: Vec<u8>,
-        },
-        SubscribeContract {
-            contract_id: [u8; 32],
-        },
+        GetContractState { contract_id: [u8; 32] },
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -2473,29 +2587,18 @@ mod v2_contracts_messages {
             contract_id: [u8; 32],
             error_code: i64,
         },
-        Success {
-            contract_id: [u8; 32],
-        },
-        Failed {
-            contract_id: [u8; 32],
-            error_code: i64,
-        },
     }
 }
 
-/// V2 delegate end-to-end test: a real compiled WASM delegate that reads
-/// contract state via host functions from the `freenet_delegate_contracts`
-/// namespace. This exercises the full V2 async call path:
-///
-/// 1. Module is detected as V2 (imports `freenet_delegate_contracts`)
-/// 2. `call_3i64_async_imports` is used instead of `call_3i64`
-/// 3. Host functions `get_contract_state_len` and `get_contract_state`
-///    read from the ReDb state store
+/// End-to-end: a real compiled WASM delegate reads the state this node holds
+/// through `__frnt__delegate__get_contract_state_len` and
+/// `__frnt__delegate__get_contract_state`, called from inside `process()`
+/// and served from the ReDb state store.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_v2_delegate_reads_contract_state() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_delegate_reads_local_contract_state() -> Result<(), Box<dyn std::error::Error>> {
     use crate::contract::storages::Storage;
     use crate::wasm_runtime::StateStorage;
-    use v2_contracts_messages::*;
+    use local_contract_state_messages::*;
 
     let temp_dir = get_temp_dir();
     let contracts_dir = temp_dir.path().join("contracts");
@@ -2510,7 +2613,7 @@ async fn test_v2_delegate_reads_contract_state() -> Result<(), Box<dyn std::erro
     let mut runtime = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
     runtime.set_state_store_db(db.clone());
 
-    // Store contract state in the DB so the V2 delegate can read it
+    // Store contract state in the DB so the delegate can read it
     let contract_instance_id = ContractInstanceId::new([42u8; 32]);
     let contract_code = ContractCode::from(vec![1, 2, 3]);
     let contract_key = ContractKey::from_id_and_code(contract_instance_id, *contract_code.hash());
@@ -2520,9 +2623,9 @@ async fn test_v2_delegate_reads_contract_state() -> Result<(), Box<dyn std::erro
     // Index the contract so code_hash_from_id() works
     runtime.contract_store.ensure_key_indexed(&contract_key)?;
 
-    // Load the V2 delegate
+    // Load the fixture delegate
     let delegate = {
-        let bytes = super::super::tests::get_test_module(TEST_DELEGATE_V2_CONTRACTS)?;
+        let bytes = super::super::tests::get_test_module(TEST_DELEGATE_LOCAL_CONTRACT_STATE)?;
         DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
             &bytes.into(),
             &vec![].into(),
@@ -2539,16 +2642,6 @@ async fn test_v2_delegate_reads_contract_state() -> Result<(), Box<dyn std::erro
     let _registered = runtime
         .secret_store
         .register_delegate(delegate.key().clone(), cipher, nonce);
-
-    // Verify the module is detected as V2
-    let (mut running, api_version) =
-        runtime.prepare_delegate_call(&vec![].into(), delegate.key(), 4096)?;
-    assert_eq!(
-        api_version,
-        DelegateApiVersion::V2,
-        "V2 delegate should be detected as V2 (imports freenet_delegate_contracts)"
-    );
-    runtime.drop_running_instance(&mut running);
 
     // Send a message asking the delegate to read the contract state
     let _app_id = ContractInstanceId::new([1u8; 32]);
@@ -2575,6 +2668,7 @@ async fn test_v2_delegate_reads_contract_state() -> Result<(), Box<dyn std::erro
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -2587,13 +2681,11 @@ async fn test_v2_delegate_reads_contract_state() -> Result<(), Box<dyn std::erro
             assert_eq!(contract_id, [42u8; 32]);
             assert_eq!(
                 state, expected_state,
-                "V2 delegate should read contract state via host functions"
+                "the delegate should read the state this node holds"
             );
         }
-        other @ OutboundAppMessage::ContractNotFound { .. }
-        | other @ OutboundAppMessage::Success { .. }
-        | other @ OutboundAppMessage::Failed { .. } => {
-            panic!("V2 delegate returned {other:?} — expected ContractState");
+        other @ OutboundAppMessage::ContractNotFound { .. } => {
+            panic!("delegate returned {other:?} — expected ContractState");
         }
     }
 
@@ -2601,11 +2693,11 @@ async fn test_v2_delegate_reads_contract_state() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// V2 delegate: contract not found returns error code.
+/// A contract this node does not hold comes back as a negative error code.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_v2_delegate_contract_not_found() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_delegate_local_contract_state_not_found() -> Result<(), Box<dyn std::error::Error>> {
     use crate::contract::storages::Storage;
-    use v2_contracts_messages::*;
+    use local_contract_state_messages::*;
 
     let temp_dir = get_temp_dir();
     let contracts_dir = temp_dir.path().join("contracts");
@@ -2620,9 +2712,9 @@ async fn test_v2_delegate_contract_not_found() -> Result<(), Box<dyn std::error:
     let mut runtime = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
     runtime.set_state_store_db(db);
 
-    // Load the V2 delegate (no contract state stored — should get not-found)
+    // Load the fixture delegate (no contract state stored — should get not-found)
     let delegate = {
-        let bytes = super::super::tests::get_test_module(TEST_DELEGATE_V2_CONTRACTS)?;
+        let bytes = super::super::tests::get_test_module(TEST_DELEGATE_LOCAL_CONTRACT_STATE)?;
         DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
             &bytes.into(),
             &vec![].into(),
@@ -2665,6 +2757,7 @@ async fn test_v2_delegate_contract_not_found() -> Result<(), Box<dyn std::error:
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -2678,275 +2771,12 @@ async fn test_v2_delegate_contract_not_found() -> Result<(), Box<dyn std::error:
                 "Expected negative error code for not-found, got {error_code}"
             );
         }
-        other @ OutboundAppMessage::ContractState { .. }
-        | other @ OutboundAppMessage::Success { .. }
-        | other @ OutboundAppMessage::Failed { .. } => {
+        other @ OutboundAppMessage::ContractState { .. } => {
             panic!("Expected ContractNotFound for non-existent contract, got {other:?}");
         }
     }
 
     std::mem::drop(temp_dir);
-    Ok(())
-}
-
-/// Helper: set up a V2 delegate runtime with a registered contract.
-async fn setup_v2_runtime_with_contract(
-    contract_id_byte: u8,
-    initial_state: Option<&[u8]>,
-) -> Result<
-    (
-        DelegateContainer,
-        Runtime,
-        ContractInstanceId,
-        tempfile::TempDir,
-    ),
-    Box<dyn std::error::Error>,
-> {
-    use crate::contract::storages::Storage;
-    use crate::wasm_runtime::StateStorage;
-
-    let temp_dir = get_temp_dir();
-    let contracts_dir = temp_dir.path().join("contracts");
-    let delegates_dir = temp_dir.path().join("delegates");
-    let secrets_dir = temp_dir.path().join("secrets");
-
-    let db = Storage::new(temp_dir.path()).await?;
-    let contract_store = ContractStore::new(contracts_dir, 10_000, db.clone())?;
-    let delegate_store = DelegateStore::new(delegates_dir, 10_000, db.clone())?;
-    let secret_store = SecretsStore::new(secrets_dir, Default::default(), db.clone())?;
-
-    let mut runtime = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
-    runtime.set_state_store_db(db.clone());
-
-    // Register the contract
-    let contract_instance_id = ContractInstanceId::new([contract_id_byte; 32]);
-    let contract_code = ContractCode::from(vec![contract_id_byte, 2, 3]);
-    let contract_key = ContractKey::from_id_and_code(contract_instance_id, *contract_code.hash());
-    runtime.contract_store.ensure_key_indexed(&contract_key)?;
-
-    if let Some(state) = initial_state {
-        db.store(contract_key, WrappedState::new(state.to_vec()))
-            .await?;
-    }
-
-    // Load the V2 delegate
-    let delegate = {
-        let bytes = super::super::tests::get_test_module(TEST_DELEGATE_V2_CONTRACTS)?;
-        DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
-            &bytes.into(),
-            &vec![].into(),
-        ))))
-    };
-    runtime
-        .delegate_store
-        .store_delegate(delegate.clone())
-        .expect("fixture delegate must store: Delegate::from derives its key");
-
-    let key = XChaCha20Poly1305::generate_key(&mut OsRng);
-    let cipher = XChaCha20Poly1305::new(&key);
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let _registered = runtime
-        .secret_store
-        .register_delegate(delegate.key().clone(), cipher, nonce);
-
-    Ok((delegate, runtime, contract_instance_id, temp_dir))
-}
-
-/// Helper: send a message to the V2 delegate and deserialize the response.
-fn send_v2_message(
-    runtime: &mut Runtime,
-    delegate: &DelegateContainer,
-    message: &v2_contracts_messages::InboundAppMessage,
-) -> Result<v2_contracts_messages::OutboundAppMessage, Box<dyn std::error::Error>> {
-    let _app_id = ContractInstanceId::new([1u8; 32]);
-    let payload = bincode::serialize(message)?;
-    let app_msg = ApplicationMessage::new(payload);
-
-    let outbound = runtime.inbound_app_message(
-        delegate.key(),
-        &vec![].into(),
-        None,
-        None,
-        vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
-    )?;
-
-    assert_eq!(outbound.len(), 1, "Expected exactly one outbound message");
-    let response_msg = match &outbound[0] {
-        OutboundDelegateMsg::ApplicationMessage(msg) => msg,
-        other @ OutboundDelegateMsg::RequestUserInput(_)
-        | other @ OutboundDelegateMsg::ContextUpdated(_)
-        | other @ OutboundDelegateMsg::GetContractRequest(_)
-        | other @ OutboundDelegateMsg::PutContractRequest(_)
-        | other @ OutboundDelegateMsg::UpdateContractRequest(_)
-        | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
-        | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
-            panic!("Expected ApplicationMessage, got {:?}", other)
-        }
-    };
-    assert!(response_msg.processed);
-
-    Ok(bincode::deserialize(&response_msg.payload)?)
-}
-
-/// V2 E2E: PUT state via delegate, then GET it back.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_v2_delegate_put_then_get() -> Result<(), Box<dyn std::error::Error>> {
-    use v2_contracts_messages::*;
-
-    let (delegate, mut runtime, contract_instance_id, _temp_dir) =
-        setup_v2_runtime_with_contract(50, None).await?;
-    let cid: [u8; 32] = contract_instance_id.as_bytes().try_into().unwrap();
-
-    // PUT state
-    let put_response = send_v2_message(
-        &mut runtime,
-        &delegate,
-        &InboundAppMessage::PutContractState {
-            contract_id: cid,
-            state: vec![100, 200, 150],
-        },
-    )?;
-    match put_response {
-        OutboundAppMessage::Success { contract_id } => {
-            assert_eq!(contract_id, cid);
-        }
-        other @ OutboundAppMessage::ContractState { .. }
-        | other @ OutboundAppMessage::ContractNotFound { .. }
-        | other @ OutboundAppMessage::Failed { .. } => {
-            panic!("Expected Success from PUT, got {:?}", other)
-        }
-    }
-
-    // GET it back
-    let get_response = send_v2_message(
-        &mut runtime,
-        &delegate,
-        &InboundAppMessage::GetContractState { contract_id: cid },
-    )?;
-    match get_response {
-        OutboundAppMessage::ContractState { contract_id, state } => {
-            assert_eq!(contract_id, cid);
-            assert_eq!(state, vec![100, 200, 150]);
-        }
-        other @ OutboundAppMessage::ContractNotFound { .. }
-        | other @ OutboundAppMessage::Success { .. }
-        | other @ OutboundAppMessage::Failed { .. } => {
-            panic!("Expected ContractState from GET, got {:?}", other)
-        }
-    }
-
-    Ok(())
-}
-
-/// V2 E2E: UPDATE existing state via delegate.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_v2_delegate_update_existing_state() -> Result<(), Box<dyn std::error::Error>> {
-    use v2_contracts_messages::*;
-
-    let (delegate, mut runtime, contract_instance_id, _temp_dir) =
-        setup_v2_runtime_with_contract(51, Some(&[1, 2, 3])).await?;
-    let cid: [u8; 32] = contract_instance_id.as_bytes().try_into().unwrap();
-
-    // UPDATE the existing state
-    let update_response = send_v2_message(
-        &mut runtime,
-        &delegate,
-        &InboundAppMessage::UpdateContractState {
-            contract_id: cid,
-            state: vec![7, 8, 9],
-        },
-    )?;
-    match update_response {
-        OutboundAppMessage::Success { contract_id } => {
-            assert_eq!(contract_id, cid);
-        }
-        other @ OutboundAppMessage::ContractState { .. }
-        | other @ OutboundAppMessage::ContractNotFound { .. }
-        | other @ OutboundAppMessage::Failed { .. } => {
-            panic!("Expected Success from UPDATE, got {:?}", other)
-        }
-    }
-
-    // Verify via GET
-    let get_response = send_v2_message(
-        &mut runtime,
-        &delegate,
-        &InboundAppMessage::GetContractState { contract_id: cid },
-    )?;
-    match get_response {
-        OutboundAppMessage::ContractState { state, .. } => {
-            assert_eq!(state, vec![7, 8, 9]);
-        }
-        other @ OutboundAppMessage::ContractNotFound { .. }
-        | other @ OutboundAppMessage::Success { .. }
-        | other @ OutboundAppMessage::Failed { .. } => {
-            panic!("Expected ContractState, got {:?}", other)
-        }
-    }
-
-    Ok(())
-}
-
-/// V2 E2E: UPDATE non-existent state returns error.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_v2_delegate_update_nonexistent_fails() -> Result<(), Box<dyn std::error::Error>> {
-    use v2_contracts_messages::*;
-
-    let (delegate, mut runtime, contract_instance_id, _temp_dir) =
-        setup_v2_runtime_with_contract(52, None).await?;
-    let cid: [u8; 32] = contract_instance_id.as_bytes().try_into().unwrap();
-
-    let response = send_v2_message(
-        &mut runtime,
-        &delegate,
-        &InboundAppMessage::UpdateContractState {
-            contract_id: cid,
-            state: vec![1, 2, 3],
-        },
-    )?;
-    match response {
-        OutboundAppMessage::Failed { error_code, .. } => {
-            assert!(
-                error_code < 0,
-                "Expected negative error code, got {error_code}"
-            );
-        }
-        other @ OutboundAppMessage::ContractState { .. }
-        | other @ OutboundAppMessage::ContractNotFound { .. }
-        | other @ OutboundAppMessage::Success { .. } => panic!(
-            "Expected Failed from UPDATE on non-existent, got {:?}",
-            other
-        ),
-    }
-
-    Ok(())
-}
-
-/// V2 E2E: SUBSCRIBE to a known contract succeeds.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_v2_delegate_subscribe_known() -> Result<(), Box<dyn std::error::Error>> {
-    use v2_contracts_messages::*;
-
-    let (delegate, mut runtime, contract_instance_id, _temp_dir) =
-        setup_v2_runtime_with_contract(53, Some(&[1])).await?;
-    let cid: [u8; 32] = contract_instance_id.as_bytes().try_into().unwrap();
-
-    let response = send_v2_message(
-        &mut runtime,
-        &delegate,
-        &InboundAppMessage::SubscribeContract { contract_id: cid },
-    )?;
-    match response {
-        OutboundAppMessage::Success { contract_id } => {
-            assert_eq!(contract_id, cid);
-        }
-        other @ OutboundAppMessage::ContractState { .. }
-        | other @ OutboundAppMessage::ContractNotFound { .. }
-        | other @ OutboundAppMessage::Failed { .. } => {
-            panic!("Expected Success from SUBSCRIBE, got {:?}", other)
-        }
-    }
-
     Ok(())
 }
 
@@ -2988,6 +2818,7 @@ async fn test_put_contract_request_response() -> Result<(), Box<dyn std::error::
         | other @ OutboundDelegateMsg::GetContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected PutContractRequest, got {:?}", other)
         }
@@ -3017,6 +2848,7 @@ async fn test_put_contract_request_response() -> Result<(), Box<dyn std::error::
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -3077,6 +2909,7 @@ async fn test_update_contract_request_response() -> Result<(), Box<dyn std::erro
         | other @ OutboundDelegateMsg::GetContractRequest(_)
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected UpdateContractRequest, got {:?}", other)
         }
@@ -3106,6 +2939,7 @@ async fn test_update_contract_request_response() -> Result<(), Box<dyn std::erro
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -3168,6 +3002,7 @@ async fn test_subscribe_contract_request_response() -> Result<(), Box<dyn std::e
         | other @ OutboundDelegateMsg::GetContractRequest(_)
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected SubscribeContractRequest, got {:?}", other)
         }
@@ -3197,6 +3032,7 @@ async fn test_subscribe_contract_request_response() -> Result<(), Box<dyn std::e
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -3261,6 +3097,7 @@ async fn test_contract_notification_delivered() -> Result<(), Box<dyn std::error
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -3295,7 +3132,7 @@ async fn test_contract_notification_delivered() -> Result<(), Box<dyn std::error
 ///
 /// Verifies the full pipeline:
 /// 1. Delegate subscribes to a contract via SubscribeContractRequest
-/// 2. Subscription is registered in DELEGATE_SUBSCRIPTIONS
+/// 2. Subscription is registered in the delegate subscription registry
 /// 3. ContractNotification is delivered to the delegate
 /// 4. Delegate responds with ContractNotificationReceived
 /// 5. Cleanup: unregister delegate removes subscription entries
@@ -3374,6 +3211,7 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
         | other @ OutboundDelegateMsg::GetContractRequest(_)
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected SubscribeContractRequest, got {:?}", other)
         }
@@ -3387,10 +3225,10 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
         .code_hash_from_id(&subscribe_req.contract_id)
         .is_some()
     {
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-            .entry(subscribe_req.contract_id)
-            .or_default()
-            .insert(delegate_key.clone());
+        crate::wasm_runtime::delegate_subscriptions::subscribe(
+            subscribe_req.contract_id,
+            &delegate_key,
+        );
         Ok(())
     } else {
         Err("Contract not found".to_string())
@@ -3440,6 +3278,7 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -3447,10 +3286,11 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
 
     // --- Step 2: Verify registry is populated ---
     {
-        let entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&contract_instance_id);
-        let subscribers = entry.as_ref().unwrap();
         assert!(
-            subscribers.contains(&delegate_key),
+            crate::wasm_runtime::delegate_subscriptions::is_subscribed(
+                &contract_instance_id,
+                &delegate_key
+            ),
             "Delegate should be registered as subscriber"
         );
     }
@@ -3489,6 +3329,7 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
         | other @ OutboundDelegateMsg::PutContractRequest(_)
         | other @ OutboundDelegateMsg::UpdateContractRequest(_)
         | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
+        | other @ OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", other)
         }
@@ -3516,15 +3357,12 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
     }
 
     // --- Step 5: Cleanup on delegate unregister ---
-    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, subscribers| {
-        subscribers.remove(&delegate_key);
-        !subscribers.is_empty()
-    });
+    crate::wasm_runtime::delegate_subscriptions::remove_delegate(&delegate_key);
 
     // Verify cleanup
-    let entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&contract_instance_id);
     assert!(
-        entry.is_none() || entry.as_ref().unwrap().is_empty(),
+        crate::wasm_runtime::delegate_subscriptions::subscribers_of(&contract_instance_id)
+            .is_empty(),
         "Subscription should be cleaned up after delegate unregister"
     );
 
@@ -3613,10 +3451,10 @@ async fn test_notification_application_message_routed_to_registered_app()
         OutboundDelegateMsg::SubscribeContractRequest(req) => req.clone(),
         other => panic!("Expected SubscribeContractRequest, got {other:?}"),
     };
-    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-        .entry(subscribe_req.contract_id)
-        .or_default()
-        .insert(delegate_key.clone());
+    crate::wasm_runtime::delegate_subscriptions::subscribe(
+        subscribe_req.contract_id,
+        &delegate_key,
+    );
     // Feed the subscribe response back so the delegate finishes subscribing.
     let _ = runtime.inbound_app_message(
         &delegate_key,
@@ -3719,15 +3557,12 @@ async fn test_notification_application_message_routed_to_registered_app()
         "after disconnect no app should remain registered"
     );
 
-    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, subs| {
-        subs.remove(&delegate_key);
-        !subs.is_empty()
-    });
+    crate::wasm_runtime::delegate_subscriptions::remove_delegate(&delegate_key);
     std::mem::drop(temp_dir);
     Ok(())
 }
 
-/// Test: removing a contract cleans up DELEGATE_SUBSCRIPTIONS.
+/// Test: removing a contract cleans up its delegate subscriptions.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_contract_removal_cleans_subscriptions() -> Result<(), Box<dyn std::error::Error>> {
     use crate::contract::storages::Storage;
@@ -3758,19 +3593,13 @@ async fn test_contract_removal_cleans_subscriptions() -> Result<(), Box<dyn std:
     // Simulate delegate subscriptions
     let delegate_key_a = DelegateKey::new([1u8; 32], CodeHash::new([10u8; 32]));
     let delegate_key_b = DelegateKey::new([2u8; 32], CodeHash::new([20u8; 32]));
-    {
-        let mut entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-            .entry(contract_instance_id)
-            .or_default();
-        entry.insert(delegate_key_a);
-        entry.insert(delegate_key_b);
-    }
+    crate::wasm_runtime::delegate_subscriptions::subscribe(contract_instance_id, &delegate_key_a);
+    crate::wasm_runtime::delegate_subscriptions::subscribe(contract_instance_id, &delegate_key_b);
 
     // Verify subscriptions exist
-    assert!(
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-            .get(&contract_instance_id)
-            .is_some()
+    assert_eq!(
+        crate::wasm_runtime::delegate_subscriptions::subscribers_of(&contract_instance_id).len(),
+        2
     );
 
     // Remove the contract — should clean up subscriptions
@@ -3778,10 +3607,19 @@ async fn test_contract_removal_cleans_subscriptions() -> Result<(), Box<dyn std:
 
     // Verify subscriptions are cleaned up
     assert!(
-        crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
-            .get(&contract_instance_id)
-            .is_none(),
-        "DELEGATE_SUBSCRIPTIONS should be cleaned up when contract is removed"
+        crate::wasm_runtime::delegate_subscriptions::subscribers_of(&contract_instance_id)
+            .is_empty(),
+        "delegate subscriptions should be cleaned up when contract is removed"
+    );
+    // The reverse index must be cleared too, or the removed contract would keep
+    // holding cap budget for both delegates with nothing to age it out.
+    assert_eq!(
+        crate::wasm_runtime::delegate_subscriptions::subscription_count(&delegate_key_a),
+        0
+    );
+    assert_eq!(
+        crate::wasm_runtime::delegate_subscriptions::subscription_count(&delegate_key_b),
+        0
     );
 
     std::mem::drop(temp_dir);
@@ -3908,7 +3746,8 @@ async fn test_delegate_emits_send_delegate_message() -> Result<(), Box<dyn std::
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_) => None,
         })
         .expect("Expected SendDelegateMessage in outbound");
 
@@ -3964,6 +3803,7 @@ async fn test_delegate_receives_delegate_message() -> Result<(), Box<dyn std::er
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!("Expected ApplicationMessage, got {:?}", &outbound[0])
         }
@@ -4097,7 +3937,8 @@ async fn test_delegate_to_delegate_roundtrip() -> Result<(), Box<dyn std::error:
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_) => None,
         })
         .expect("Expected SendDelegateMessage from delegate A");
 
@@ -4123,6 +3964,7 @@ async fn test_delegate_to_delegate_roundtrip() -> Result<(), Box<dyn std::error:
         | OutboundDelegateMsg::PutContractRequest(_)
         | OutboundDelegateMsg::UpdateContractRequest(_)
         | OutboundDelegateMsg::SubscribeContractRequest(_)
+        | OutboundDelegateMsg::UnsubscribeContractRequest(_)
         | OutboundDelegateMsg::SendDelegateMessage(_) => {
             panic!(
                 "Expected ApplicationMessage from B, got {:?}",
@@ -4211,7 +4053,8 @@ async fn test_multiple_send_delegate_messages_all_attested()
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_) => None,
         })
         .collect();
 
@@ -4307,7 +4150,8 @@ async fn test_drain_behind_application_message_reattests_sender()
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_) => None,
         })
         .expect("SendDelegateMessage should be drained into results");
 
@@ -4368,7 +4212,8 @@ async fn test_drain_behind_get_contract_request_reattests_sender()
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
-            | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_) => None,
         })
         .expect("SendDelegateMessage should be drained into results");
 
@@ -4750,4 +4595,318 @@ mod hosted_user_secrets {
         std::mem::drop(temp_dir);
         Ok(())
     }
+}
+
+/// REGRESSION (#5480): re-entering an instance id whose `DelegateCallEnv` is
+/// still live must FAIL CLOSED, in release builds too.
+///
+/// This is the release-visible half of the change that promoted a
+/// `debug_assert!` to a hard `Err`. The assert compiled out in release, so
+/// before #5480 the only thing preventing re-entry was the batch loop in
+/// `interface.rs` aborting on the first error — control flow, not a guarantee.
+///
+/// It became memory safety when the guest moved off the calling thread. One
+/// `RunningInstance` id is shared by every message in a batch, and on the
+/// wall-clock-timeout path the previous message's guest is still running on an
+/// abandoned `spawn_blocking` thread (`abort()` cannot stop one). Inserting a
+/// new env under that id would make the abandoned guest's
+/// `DELEGATE_ENV.get(&id)` resolve to the NEW env and dereference its raw store
+/// pointers while this thread holds `&mut` to the very same stores — aliasing
+/// UB across two threads, with no `unsafe` at the edit site that caused it.
+///
+/// Unreachable today. That is exactly why it needs a test: an edit making the
+/// batch loop error-tolerant ("collect errors and continue", "retry the
+/// message") would reintroduce it silently, and nothing else would object.
+#[tokio::test]
+async fn reentering_a_live_instance_id_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+    use super::super::engine::InstanceHandle;
+    use super::super::native_api::{DELEGATE_ENV, DelegateCallEnv, DelegateEnvSlot};
+
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+
+    // Far above anything `next_instance_id` will hand out: it is a monotonic
+    // counter starting at 0, incremented once per instance.
+    const LIVE_ID: i64 = i64::MAX - 5480;
+
+    let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::ReadContext)?;
+    let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload));
+    let handle = InstanceHandle { id: LIVE_ID };
+    let params: Parameters = vec![].into();
+
+    // CONTROL: with LIVE_ID unoccupied the guard must not fire. This call fails
+    // for an unrelated reason (no engine instance under that handle), which is
+    // the point — it proves the assertion below distinguishes the re-entry
+    // guard from "this call failed somehow", rather than passing on any error.
+    let control = runtime.exec_inbound_with_env(
+        delegate.key(),
+        &params,
+        None,
+        None,
+        &msg,
+        Vec::new(),
+        &handle,
+        LIVE_ID,
+    );
+    let control_msg = format!("{:?}", control.err());
+    assert!(
+        !control_msg.contains("already active"),
+        "control call must not trip the re-entry guard, got: {control_msg}"
+    );
+
+    // Occupy LIVE_ID exactly as an abandoned guest's env would.
+    // SAFETY: the env is removed below before `runtime` (which owns the stores
+    // these pointers address) is dropped, and no guest ever runs against it.
+    let env = unsafe {
+        DelegateCallEnv::new(
+            Vec::new(),
+            &mut runtime.secret_store,
+            &runtime.contract_store,
+            runtime.state_store_db.clone(),
+            delegate.key().clone(),
+            &mut runtime.delegate_store,
+            0,
+            Vec::new(),
+            None,
+            runtime.created_delegates_count.clone(),
+            runtime.inherited_origins.clone(),
+        )
+    };
+    DELEGATE_ENV.insert(LIVE_ID, DelegateEnvSlot::new(env));
+
+    let result = runtime.exec_inbound_with_env(
+        delegate.key(),
+        &params,
+        None,
+        None,
+        &msg,
+        Vec::new(),
+        &handle,
+        LIVE_ID,
+    );
+
+    // Remove before asserting: a panicking assert would otherwise leave a stale
+    // env in the process-global map for every later test in this binary.
+    DELEGATE_ENV.remove(&LIVE_ID);
+
+    let err = result.expect_err(
+        "re-entering an instance id with a live env must fail closed, not proceed (#5480)",
+    );
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("already active"),
+        "expected the re-entry guard's error, got: {rendered}"
+    );
+
+    Ok(())
+}
+
+/// REGRESSION (#5480 review, F1): re-entry must be refused while a guest is
+/// still running, EVEN THOUGH its `DELEGATE_ENV` entry has already been removed.
+///
+/// This is the case the first version of the guard could not see.
+/// `DelegateEnvGuard::drop` removes the env on every exit path of
+/// `exec_inbound_with_env`, including the wall-clock-timeout `Err` — and on that
+/// path the guest is still running on an abandoned `spawn_blocking` thread,
+/// since `abort()` cannot stop a closure that has started. So by the time the
+/// batch loop sees the error, `DELEGATE_ENV.contains_key(id)` is already false
+/// while the dangerous condition — a live guest holding raw pointers to this
+/// runtime's stores — is still true.
+///
+/// A check on `DELEGATE_ENV` alone therefore reads false in exactly the
+/// scenario the guard exists for. `LIVE_DELEGATE_GUESTS` tracks the guest's own
+/// lifetime instead, which is the fact that matters.
+///
+/// Simulated by registering the id directly: reproducing it through a real
+/// abandoned guest would need an error-tolerant batch loop, which is precisely
+/// the future edit this guard is here to catch and which does not exist yet.
+#[tokio::test]
+async fn reentering_an_id_with_a_live_guest_fails_closed_even_with_no_env()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::super::engine::InstanceHandle;
+    use super::super::native_api::{DELEGATE_ENV, LIVE_DELEGATE_GUESTS};
+
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+
+    const LIVE_ID: i64 = i64::MAX - 54801;
+
+    let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::ReadContext)?;
+    let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload));
+    let handle = InstanceHandle { id: LIVE_ID };
+    let params: Parameters = vec![].into();
+
+    // The env is absent, exactly as `DelegateEnvGuard::drop` leaves it after a
+    // wall-clock timeout. Only the guest registration remains.
+    assert!(
+        !DELEGATE_ENV.contains_key(&LIVE_ID),
+        "precondition: no env under LIVE_ID, so a DELEGATE_ENV-only check would pass"
+    );
+    LIVE_DELEGATE_GUESTS.insert(LIVE_ID);
+
+    let result = runtime.exec_inbound_with_env(
+        delegate.key(),
+        &params,
+        None,
+        None,
+        &msg,
+        Vec::new(),
+        &handle,
+        LIVE_ID,
+    );
+
+    // Clear before asserting so a failure cannot strand a live-guest marker in
+    // the process-global set for every later test in this binary.
+    LIVE_DELEGATE_GUESTS.remove(&LIVE_ID);
+
+    let err = result.expect_err(
+        "re-entry must be refused while a guest is still live, even with the env already \
+         removed (#5480 review F1)",
+    );
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("already active"),
+        "expected the re-entry guard's error, got: {rendered}"
+    );
+
+    Ok(())
+}
+
+/// REGRESSION (#5480 review): `exec_inbound_with_env` must have finished its
+/// cleanup by the time it RETURNS — on the error path as much as the success
+/// path — not merely "eventually".
+///
+/// This pins the fact that makes the #5554 interaction safe, and which nothing
+/// else states. #5554 parks delegates off the serial `contract_handling` loop,
+/// so a delegate's round trip can now span two loop iterations; its own comment
+/// notes that the serial loop was the ONLY thing guaranteeing one `process()`
+/// per delegate. What keeps that sound is ordering: `_guard` is a local of
+/// `exec_inbound_with_env`, so `DELEGATE_ENV` is cleared strictly before the
+/// `Err` reaches `inbound_app_message`, before `DelegateRunOutcome::Failed`, and
+/// therefore before a park can release a queued run for the same delegate.
+///
+/// That is the placement of one local variable, load-bearing across two merged
+/// changes, and until this test nothing checked it. A `std::mem::forget(_guard)`
+/// — or hoisting the guard into the caller to "clean up once per batch" — would
+/// leave the entry live past the return with no other alarm.
+#[tokio::test]
+async fn env_cleanup_completes_before_the_call_returns() -> Result<(), Box<dyn std::error::Error>> {
+    use super::super::engine::InstanceHandle;
+    use super::super::native_api::{DELEGATE_ENV, LIVE_DELEGATE_GUESTS};
+
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+
+    const ID: i64 = i64::MAX - 54802;
+
+    let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::ReadContext)?;
+    let msg = InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload));
+    let handle = InstanceHandle { id: ID };
+    let params: Parameters = vec![].into();
+
+    // Fails inside `exec_inbound` (no engine instance under this handle), which
+    // is the path that matters: the guard must still have run.
+    let result = runtime.exec_inbound_with_env(
+        delegate.key(),
+        &params,
+        None,
+        None,
+        &msg,
+        Vec::new(),
+        &handle,
+        ID,
+    );
+    assert!(
+        result.is_err(),
+        "fixture precondition: this call is expected to fail, so the assertions \
+         below are about the ERROR path"
+    );
+
+    assert!(
+        !DELEGATE_ENV.contains_key(&ID),
+        "`exec_inbound_with_env` returned with its DELEGATE_ENV entry still \
+         present. `_guard` must drop inside this function, before the error \
+         reaches `inbound_app_message` and before #5554's park can release a \
+         queued run for the same delegate"
+    );
+    assert!(
+        !LIVE_DELEGATE_GUESTS.contains(&ID),
+        "no guest ever started for this call, so nothing may be left registered \
+         as live — a stale entry here would refuse every later call on this id"
+    );
+
+    Ok(())
+}
+
+/// A delegate that emits `UnsubscribeContractRequest` must FAIL the run, not
+/// have the request silently dropped.
+///
+/// freenet-stdlib 0.10.0 added the variant (freenet/freenet-stdlib#98); core
+/// has no unsubscribe path behind it yet (#5600). The choice of an explicit
+/// error over a quiet drop is the load-bearing decision here, and the two are
+/// indistinguishable from the delegate's side unless something pins it:
+///
+/// - a DROP returns `Ok` with the request absent from `results`, so the
+///   delegate waits forever for an `UnsubscribeContractResponse` nobody will
+///   send, and every observer reads the unsubscribe as having succeeded while
+///   the subscription is still live;
+/// - the ERROR reaches the client as a delegate execution failure naming
+///   #5600.
+///
+/// Asserting `results` stayed empty as well as `Err` is what makes this a real
+/// pin: a regression that forwarded the request onward as if it were handled
+/// would produce a non-empty `results`, and one that dropped it would produce
+/// `Ok`. Both `processed` states are covered, because core cannot honour either
+/// — it never sets `processed` on this variant, since it errors first.
+#[tokio::test(flavor = "multi_thread")]
+async fn unsubscribe_contract_request_fails_the_run_rather_than_being_dropped()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::VecDeque;
+
+    for processed in [false, true] {
+        let (mut runtime, _temp_dir) = bare_runtime().await;
+
+        let delegate_key = DelegateKey::new([11u8; 32], CodeHash::new([12u8; 32]));
+        let contract_id = ContractInstanceId::new([13u8; 32]);
+
+        let mut req = UnsubscribeContractRequest::new(contract_id);
+        req.processed = processed;
+
+        let mut outbound: VecDeque<OutboundDelegateMsg> = VecDeque::new();
+        outbound.push_back(OutboundDelegateMsg::UnsubscribeContractRequest(req));
+
+        let handle = InstanceHandle { id: 0 };
+        let params: Parameters = vec![].into();
+        let mut context = Vec::new();
+        let mut results = Vec::new();
+        let outcome = runtime.process_outbound(
+            &delegate_key,
+            &handle,
+            0,
+            &params,
+            None,
+            &mut outbound,
+            &mut context,
+            &mut results,
+        );
+
+        let Err(err) = outcome else {
+            panic!(
+                "an unsubscribe core cannot serve must FAIL the run; returning Ok \
+                 strands the delegate on a response that will never arrive \
+                 (processed={processed})"
+            );
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("UnsubscribeContractRequest") && rendered.contains("5600"),
+            "the failure must name the request and its tracking issue so an operator \
+             can tell it from a delegate bug, got: {rendered}"
+        );
+        assert!(
+            results.is_empty(),
+            "a request core cannot serve must not be forwarded onward as though it \
+             had been handled, got {} result(s)",
+            results.len()
+        );
+    }
+
+    Ok(())
 }

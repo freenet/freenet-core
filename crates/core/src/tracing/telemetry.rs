@@ -2034,6 +2034,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     fragments_received,
                     total_fragments,
                     stream_abort_cause,
+                    exhaustion_reason,
                     elapsed_ms,
                     timestamp,
                 } => {
@@ -2065,6 +2066,12 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     if let Some(cause) = stream_abort_cause {
                         json["stream_abort_cause"] =
                             serde_json::Value::String(cause.as_str().to_string());
+                    }
+                    // Candidate-exhaustion discriminator (#5252): only present
+                    // on the RetryLoopOutcome::Exhausted path.
+                    if let Some(reason) = exhaustion_reason {
+                        json["exhaustion_reason"] =
+                            serde_json::Value::String(reason.as_str().to_string());
                     }
                     json
                 }
@@ -3174,9 +3181,51 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     ("relayed_updates_total", snapshot.relayed_updates_total),
                     ("connect_accepts_emitted", snapshot.connect_accepts_emitted),
                     ("connect_rejects_emitted", snapshot.connect_rejects_emitted),
+                    (
+                        "bootstrap_transient_registered",
+                        snapshot.bootstrap_transient_registered,
+                    ),
+                    (
+                        "bootstrap_transient_expired",
+                        snapshot.bootstrap_transient_expired,
+                    ),
+                    (
+                        "bootstrap_promoted_to_ring",
+                        snapshot.bootstrap_promoted_to_ring,
+                    ),
+                    (
+                        "bootstrap_startup_rounds_connect_issued_gateway",
+                        snapshot.bootstrap_startup_rounds_connect_issued_gateway,
+                    ),
+                    (
+                        "bootstrap_startup_rounds_connect_issued_routed",
+                        snapshot.bootstrap_startup_rounds_connect_issued_routed,
+                    ),
+                    (
+                        "bootstrap_startup_rounds_backoff_blocked",
+                        snapshot.bootstrap_startup_rounds_backoff_blocked,
+                    ),
+                    (
+                        "bootstrap_startup_rounds_no_target",
+                        snapshot.bootstrap_startup_rounds_no_target,
+                    ),
                 ] {
                     obj.insert(key.to_string(), serde_json::json!(value));
                 }
+                // Bootstrap-acceptance-churn time-to-bootstrap gauge (#4787):
+                // an `Option<f64>`, so it can't join the `Option<u64>` loop
+                // above. Pinned by
+                // `router_snapshot_json_includes_bootstrap_churn_counters`.
+                obj.insert(
+                    "bootstrap_time_to_min_connections_secs".to_string(),
+                    serde_json::json!(snapshot.bootstrap_time_to_min_connections_secs),
+                );
+                // Disambiguates the `null` above: `false` = this node has never
+                // reached min_connections, absent = the field wasn't reported.
+                obj.insert(
+                    "bootstrap_completed".to_string(),
+                    serde_json::json!(snapshot.bootstrap_completed),
+                );
                 // Computed-upstream vs. stored-flag divergence counters (piece D,
                 // #4642 / #4671) — same hand-mirror footgun: a new
                 // `RouterSnapshotInfo` field is invisible to the collector unless
@@ -4097,6 +4146,58 @@ mod tests {
         assert_eq!(json["connect_rejects_emitted"], 42);
     }
 
+    /// Pin: the bootstrap-acceptance-churn counters (#4787 instrumentation)
+    /// must reach the hand-mirrored OTLP body — same hand-mirror footgun as
+    /// the connect-emit counters above.
+    #[test]
+    fn router_snapshot_json_includes_bootstrap_churn_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.bootstrap_transient_registered = Some(10);
+        info.bootstrap_transient_expired = Some(9);
+        info.bootstrap_promoted_to_ring = Some(1);
+        info.bootstrap_time_to_min_connections_secs = Some(12.5);
+        info.bootstrap_completed = Some(true);
+        info.bootstrap_startup_rounds_connect_issued_gateway = Some(4);
+        info.bootstrap_startup_rounds_connect_issued_routed = Some(5);
+        info.bootstrap_startup_rounds_backoff_blocked = Some(3);
+        info.bootstrap_startup_rounds_no_target = Some(2);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        assert_eq!(json["bootstrap_transient_registered"], 10);
+        assert_eq!(json["bootstrap_transient_expired"], 9);
+        assert_eq!(json["bootstrap_promoted_to_ring"], 1);
+        assert_eq!(json["bootstrap_time_to_min_connections_secs"], 12.5);
+        assert_eq!(json["bootstrap_completed"], true);
+        assert_eq!(json["bootstrap_startup_rounds_connect_issued_gateway"], 4);
+        assert_eq!(json["bootstrap_startup_rounds_connect_issued_routed"], 5);
+        assert_eq!(json["bootstrap_startup_rounds_backoff_blocked"], 3);
+        assert_eq!(json["bootstrap_startup_rounds_no_target"], 2);
+    }
+
+    /// Pin the "never bootstrapped" vs "no data" distinction (#4787 finding 3):
+    /// a node that has not reached `min_connections` must emit
+    /// `bootstrap_completed: false` alongside the null latency, so a
+    /// permanently-stuck joiner is visible instead of indistinguishable from a
+    /// build that doesn't report the field.
+    #[test]
+    fn router_snapshot_json_distinguishes_never_bootstrapped_from_no_data() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.bootstrap_time_to_min_connections_secs = None;
+        info.bootstrap_completed = Some(false);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        assert!(json["bootstrap_time_to_min_connections_secs"].is_null());
+        assert_eq!(
+            json["bootstrap_completed"], false,
+            "a stuck joiner must report bootstrap_completed=false, not merely a \
+             null latency that also means 'field not reported'"
+        );
+    }
+
     /// Pin: the computed-upstream vs. stored-flag divergence counters (piece D,
     /// #4642 / #4671) must also reach the hand-mirrored OTLP body — same footgun
     /// as the terminal-consult counters above. These give production field
@@ -4917,6 +5018,7 @@ mod tests {
             fragments_received: Some(8),
             total_fragments: Some(8),
             stream_abort_cause: None,
+            exhaustion_reason: None,
             elapsed_ms: 1234,
             timestamp: 99999,
         });
@@ -4971,6 +5073,7 @@ mod tests {
             fragments_received: Some(3),
             total_fragments: Some(10),
             stream_abort_cause: Some(StreamAbortCause::InactivityTimeout),
+            exhaustion_reason: None,
             elapsed_ms: 4321,
             timestamp: 7,
         });
@@ -5011,6 +5114,7 @@ mod tests {
             fragments_received: None,
             total_fragments: None,
             stream_abort_cause: None,
+            exhaustion_reason: None,
             elapsed_ms: 60000,
             timestamp: 1,
         });
@@ -5026,6 +5130,126 @@ mod tests {
         assert!(json.get("fragments_received").is_none());
         assert!(json.get("total_fragments").is_none());
         assert!(json.get("stream_abort_cause").is_none());
+    }
+
+    /// #5252: a retry-loop exhaustion carries WHY it gave up — out of
+    /// distinct routing candidates, vs. having hit the retry budget with
+    /// candidates still available. Before this, that distinction existed
+    /// only in a `debug!` log line compiled out of release builds
+    /// (`release_max_level_info`) and never wired to an `EventKind` at all.
+    #[test]
+    fn test_event_kind_to_json_get_terminal_exhaustion_reason() {
+        use crate::message::Transaction;
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::{GetEvent, GetExhaustionReason, GetTerminalOutcome};
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        let instance_id = ContractInstanceId::new([8u8; 32]);
+
+        let event = EventKind::Get(GetEvent::ClientTerminal {
+            id: tx,
+            requester: PeerKeyLocation::random(),
+            instance_id,
+            key: None,
+            outcome: GetTerminalOutcome::TimeoutExhausted,
+            streamed: false,
+            is_sub_op: false,
+            attempts: 2,
+            hop_count: None,
+            fragments_received: None,
+            total_fragments: None,
+            stream_abort_cause: None,
+            exhaustion_reason: Some(GetExhaustionReason::NoRoutingCandidates),
+            elapsed_ms: 500,
+            timestamp: 1,
+        });
+
+        assert_eq!(event_kind_to_string(&event), "get_terminal");
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["outcome"], "timeout_exhausted");
+        assert_eq!(json["exhaustion_reason"], "no_routing_candidates");
+        // `attempts` is REQUESTS SENT (driver.requests_sent), NOT a peer
+        // count — the infra-retry arm re-sends to the same peer without an
+        // advance, so it over-reports peers. See the field's doc comment on
+        // GetEvent::ClientTerminal; a retries-derived `peer_advancements`
+        // field was dropped in review for the mirror-image bias.
+        assert_eq!(json["attempts"], 2);
+    }
+
+    /// The addressless-candidate exhaustion is a DIFFERENT cause from an
+    /// empty candidate set — the ring returned a peer, it just had no wire
+    /// address (a local ring defect, `warn!`-logged) — so it must export its
+    /// own string rather than collapsing into `no_routing_candidates`.
+    /// Without the split, a spike of ring defects is indistinguishable from
+    /// a genuine topology dead-end in the collector.
+    #[test]
+    fn test_event_kind_to_json_get_terminal_addressless_candidate() {
+        use crate::message::Transaction;
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::{GetEvent, GetExhaustionReason, GetTerminalOutcome};
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        let event = EventKind::Get(GetEvent::ClientTerminal {
+            id: tx,
+            requester: PeerKeyLocation::random(),
+            instance_id: ContractInstanceId::new([9u8; 32]),
+            key: None,
+            outcome: GetTerminalOutcome::TimeoutExhausted,
+            streamed: false,
+            is_sub_op: false,
+            attempts: 1,
+            hop_count: None,
+            fragments_received: None,
+            total_fragments: None,
+            stream_abort_cause: None,
+            exhaustion_reason: Some(GetExhaustionReason::AddresslessCandidate),
+            elapsed_ms: 500,
+            timestamp: 1,
+        });
+
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["exhaustion_reason"], "addressless_candidate");
+    }
+
+    /// A terminal that reached a real reply (success) never carries an
+    /// exhaustion reason — that field is specific to the
+    /// `RetryLoopOutcome::Exhausted` path and must not leak into other JSON
+    /// bodies.
+    #[test]
+    fn test_event_kind_to_json_get_terminal_omits_exhaustion_fields_on_success() {
+        use crate::message::Transaction;
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::{GetEvent, GetTerminalOutcome};
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([1u8; 32]),
+            CodeHash::new([2u8; 32]),
+        );
+
+        let event = EventKind::Get(GetEvent::ClientTerminal {
+            id: tx,
+            requester: PeerKeyLocation::random(),
+            instance_id: ContractInstanceId::new([1u8; 32]),
+            key: Some(key),
+            outcome: GetTerminalOutcome::Success,
+            streamed: false,
+            is_sub_op: false,
+            attempts: 1,
+            hop_count: Some(1),
+            fragments_received: None,
+            total_fragments: None,
+            stream_abort_cause: None,
+            exhaustion_reason: None,
+            elapsed_ms: 5,
+            timestamp: 1,
+        });
+
+        let json = event_kind_to_json(&event);
+        assert!(json.get("exhaustion_reason").is_none());
     }
 
     /// A local-cache-hit client GET emits a `ClientTerminal` with
@@ -5058,6 +5282,7 @@ mod tests {
             fragments_received: None,
             total_fragments: None,
             stream_abort_cause: None,
+            exhaustion_reason: None,
             elapsed_ms: 1,
             timestamp: 1,
         });

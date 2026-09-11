@@ -1,8 +1,6 @@
 ---
 paths:
-  - "crates/core/src/bin/**"
-  - "crates/core/src/conformance/**"
-  - "crates/core/src/contract/**"
+  - "crates/core/**"
   - "scripts/**"
 ---
 

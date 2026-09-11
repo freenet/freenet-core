@@ -70,6 +70,16 @@ filter = "test(graceful_shutdown_on_sigterm_exits_zero)"
 retries = 0
 slow-timeout = { period = "300s", terminate-after = 2 }
 
+# #5176: three simulation tests run 138-147s on CI against the default 240s
+# cap (~1.6x headroom, measured over nine runs). Their spread is 1-16%, so they
+# are stable rather than erratic — the risk is a systematically slower runner
+# breaching the cap for all of them at once, not intermittent flakiness. The
+# `Simulation` job runs on `merge_group` as well as `pull_request`, so a
+# breach stalls the whole merge queue, not just one PR.
+[[profile.ci.overrides]]
+filter = "test(test_placement_migration_at_scale_renewal_load_stays_bounded) | test(test_connection_growth_plateau_diagnostic) | test(test_connection_growth_stall_regression)"
+slow-timeout = { period = "150s", terminate-after = 2 }
+
 [profile.nightly]
 # Nightly tests run longer by design; no retries since failures need investigation.
 retries = 0

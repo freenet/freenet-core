@@ -127,6 +127,16 @@ impl InMemoryContractStore {
 
     /// Remove a contract by key.
     pub fn remove_contract(&self, key: &ContractKey) -> Result<(), anyhow::Error> {
+        // Conform to `ContractStore::remove_contract`: removing a contract drops
+        // its delegate subscriptions, and those subscriptions may own
+        // `InterestManager` refcounts that must be given back (#5542). This
+        // backend diverged silently, so a simulation or mock-executor run that
+        // removed a contract left both the registry entry and the interest
+        // standing. Not caught by
+        // `delegate_interest::tests::every_subscription_removal_site_releases_its_interest`,
+        // which scrapes the three sites it knows about and cannot see a fourth.
+        super::delegate_subscriptions::remove_contract(key.id());
+        super::delegate_interest::release_contract(key.id());
         let mut inner = self.inner.lock().unwrap();
         inner.instance_to_code.remove(key.id());
         // Only remove code if no other instances reference it

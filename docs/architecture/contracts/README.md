@@ -193,16 +193,16 @@ Contracts/delegates call into the host via registered functions:
 
 ### Namespaces
 
-| Namespace | Purpose | Version |
-|-----------|---------|---------|
-| `freenet_log` | Logging | V1, V2 |
-| `freenet_rand` | RNG | V1, V2 |
-| `freenet_time` | UTC timestamp (**delegates only; deprecated for contracts**, see below) | V1, V2 |
-| `freenet_contract_io` | Buffer fill for contract/delegate I/O | V1, V2 |
-| `freenet_delegate_ctx` | Delegate state | V1, V2 |
-| `freenet_delegate_secrets` | Secret storage | V1, V2 |
-| `freenet_delegate_contracts` | Contract access from a delegate | V2 only |
-| `freenet_delegate_management` | Delegate creation from a delegate | V2 only |
+| Namespace | Purpose |
+|-----------|---------|
+| `freenet_log` | Logging |
+| `freenet_rand` | RNG |
+| `freenet_time` | UTC timestamp (**delegates only; deprecated for contracts**, see below) |
+| `freenet_contract_io` | Buffer fill for contract/delegate I/O |
+| `freenet_delegate_ctx` | Delegate state |
+| `freenet_delegate_secrets` | Secret storage |
+| `freenet_delegate_contracts` | Read-only lookup of contract state this node holds (`__frnt__delegate__get_contract_state`, `_len`); no writes, see below |
+| `freenet_delegate_management` | Delegate creation from a delegate |
 
 These are the names the linker registers
 (`crates/core/src/wasm_runtime/engine/wasmtime_engine.rs`); import resolution is
@@ -307,27 +307,19 @@ contract-vs-delegate parameter to consult. Enforcing at the *call* moves the
 decision to where the host already knows which instance is calling, so one
 linker still serves both.
 
-### Delegate API Versions
+### Delegate contract access
 
-**V1 (Synchronous):**
-- Delegates use request/response pattern for contract access
-- All host functions are synchronous
-- Thread-local state via `CURRENT_DELEGATE_INSTANCE`
+Delegates reach contract state through outbound messages (`GetContractRequest`,
+`PutContractRequest`, `UpdateContractRequest`, `SubscribeContractRequest`),
+which the contract-handling loop serves through the executor's normal path.
+The one exception is a read-only host function pair,
+`__frnt__delegate__get_contract_state` / `..._len`, which returns the state
+this node already holds and never reaches the network.
 
-**V2 (Async Host Functions):**
-- Delegates call `ctx.get_contract_state()` directly
-- Host functions registered as async (via `func_wrap_async`)
-- ReDb reads wrapped in async blocks
-- Requires wasmtime's `async_support(true)`
-
-**Detection:**
-```rust
-if module.imports().any(|i| i.module() == "freenet_delegate_contracts") {
-    // V2 delegate - use call_3i64_async_imports()
-} else {
-    // V1 delegate - use call_3i64()
-}
-```
+There is no separate "V2" delegate API. Host functions that wrote contract
+state directly were removed in #5637: they bypassed the executor's state-store
+chokepoints, so their side effects had to be copied by hand, and two copies
+were missed in production (#4683, #5479).
 
 ## Async Execution
 
@@ -335,7 +327,7 @@ if module.imports().any(|i| i.module() == "freenet_delegate_contracts") {
 
 **Configuration:**
 ```rust
-wasmtime_config.async_support(true);  // Required for V2 delegates
+wasmtime_config.async_support(true);  // Required by `func_wrap_async` host functions
 ```
 
 **Implication:**
@@ -411,9 +403,6 @@ pub(crate) trait WasmEngine: Send {
     // Compilation
     fn compile(&mut self, code: &[u8]) -> Result<Self::Module, WasmError>;
 
-    // Module inspection
-    fn module_has_async_imports(&self, module: &Self::Module) -> bool;
-
     // Instance lifecycle
     fn create_instance(...) -> Result<InstanceHandle, WasmError>;
     fn drop_instance(&mut self, handle: &InstanceHandle);
@@ -425,7 +414,6 @@ pub(crate) trait WasmEngine: Send {
     // Execution
     fn call_void(&mut self, handle: &InstanceHandle, name: &str) -> Result<(), WasmError>;
     fn call_3i64(&mut self, ...) -> Result<i64, WasmError>;
-    fn call_3i64_async_imports(&mut self, ...) -> Result<i64, WasmError>;
     fn call_2i64_blocking(&mut self, ...) -> Result<i64, WasmError>;
     fn call_3i64_blocking(&mut self, ...) -> Result<i64, WasmError>;
 }

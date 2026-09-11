@@ -219,22 +219,23 @@ pub(crate) const MIGRATION_MARKER_TABLE: TableDefinition<&[u8], &[u8]> =
 
 /// Durable record of the web-app contract origins under which each delegate has
 /// been registered (#4117 H1 same-origin gate). Written on EVERY successful
-/// delegate registration (both `RegisterDelegate` and
-/// `RegisterDelegateWithPredecessors`). Copy-forward consults it: a predecessor's
-/// Local secrets are copied into a successor ONLY when the registering request's
-/// origin is among the predecessor's recorded origins (or both are the Admin/None
-/// class).
+/// delegate registration. `SecretsStore::migrate_secrets` consults it: a
+/// predecessor's Local secrets are copied into a successor ONLY when the
+/// registering request's origin is among the predecessor's recorded origins (or
+/// both are the Admin/None class).
 ///
 /// **This gate alone is NOT sufficient protection (GHSA-824h-7x5x-wfmf).**
 /// The registering request's `origin_contract` is itself forgeable by any HTTP
 /// client (see GHSA-824h-7x5x-wfmf for the exploit chain), so a malicious web-app CAN obtain
 /// a value that matches an unrelated victim delegate's recorded origin. The
-/// actual protection today is that the copy-forward's sole caller
-/// (`RegisterDelegateWithPredecessors`'s handler) is unconditionally disabled —
-/// this gate is not currently invoked in production at all. Do not treat this
-/// table as a sufficient authorization control if the copy-forward is ever
-/// re-wired; `origin_contract` attestation needs hardening first. See
-/// `SecretsStore::delegate_origins` and `SecretsStore::migrate_secrets`.
+/// actual protection today is that `migrate_secrets` has NO caller at all: its
+/// only network-reachable one was `DelegateRequest::RegisterDelegateWithPredecessors`,
+/// which #5199 disabled and freenet-stdlib 0.9.0 then removed from the wire
+/// entirely (freenet/freenet-stdlib#91) — so this gate is not invoked in
+/// production. Do not treat this table as a sufficient authorization control if
+/// a copy-forward is ever re-wired; `origin_contract` attestation needs
+/// hardening first. See `SecretsStore::delegate_origins` and
+/// `SecretsStore::migrate_secrets`.
 ///
 /// Key: DelegateKey (64 bytes)
 /// Value: `[has_admin_none: 1][N × ContractInstanceId(32)]` — `has_admin_none`
@@ -1178,25 +1179,22 @@ impl ReDb {
         })
     }
 
-    /// Store a contract's state synchronously.
+    /// Store a contract's state synchronously. Test-only.
     ///
     /// This is the same as `StateStorage::store` but without the async wrapper
-    /// and **without hosting metadata updates**. States written through this path
-    /// will not have `last_access_ms`, `access_type`, `state_size`, or `code_hash`
-    /// metadata tracked, meaning they won't be part of the hosting cache on restart.
+    /// and **without hosting metadata updates**: `last_access_ms`,
+    /// `access_type`, `state_size` and `code_hash` are not recorded, so a state
+    /// written this way is not part of the hosting cache on restart. Tests use
+    /// it to seed on-disk state in exactly that shape.
     ///
-    /// Used by V2 delegate host functions that need synchronous writes during
-    /// WASM `process()` execution. Hosting metadata integration is a follow-up.
-    ///
-    /// CHANGE-DETECTOR INVARIANT (future writers, read before using this): any
-    /// contract-state write that BYPASSES `StateStore` (as this raw sync write
-    /// does) MUST invalidate `StateStore`'s change-detector via
-    /// `StateCacheInvalidator` (and the moka state-bytes cache), or the
+    /// Its production caller was the delegate `put_contract_state` host
+    /// function, removed in #5637 because a write through here bypasses
+    /// `StateStore` and so skips the executor chokepoints' side effects. Before
+    /// giving this a production caller again: such a write MUST also invalidate
+    /// `StateStore`'s change-detector and moka state-bytes cache, or the
     /// summarize/delta fast path can serve a STALE summary/delta against the
-    /// new state → peer state divergence (#4621). The V2 delegate callers
-    /// (`put_contract_state_sync` / `update_contract_state_sync`) do this via
-    /// the runtime's `state_write_callback`. A new caller of this method (e.g.
-    /// the #4592 live-import work) must wire the same invalidation.
+    /// new state → peer state divergence (#4621).
+    #[cfg(test)]
     pub fn store_state_sync(
         &self,
         key: &ContractKey,
@@ -1210,42 +1208,11 @@ impl ReDb {
         Self::commit_guarded(txn)
     }
 
-    /// Atomically update a contract's state, failing if no prior state exists.
-    ///
-    /// Performs the existence check and write in a single write transaction to
-    /// eliminate the TOCTOU window that would exist with separate read + write.
-    /// Used by V2 delegate UPDATE host function.
-    ///
-    /// **Does not update hosting metadata** (same caveat as `store_state_sync`).
-    ///
-    /// CHANGE-DETECTOR INVARIANT: like `store_state_sync`, this bypasses
-    /// `StateStore`, so any caller MUST invalidate the `StateStore`
-    /// change-detector via `StateCacheInvalidator` or summarize/delta can serve
-    /// a stale result → peer state divergence (#4621). See `store_state_sync`.
-    pub fn update_state_sync(
-        &self,
-        key: &ContractKey,
-        state: WrappedState,
-    ) -> Result<bool, redb::Error> {
-        let txn = self.begin_write()?;
-        {
-            let mut tbl = txn.open_table(STATE_TABLE)?;
-            // Check existence within the same write transaction
-            let exists = tbl.get(key.as_bytes())?.is_some();
-            if !exists {
-                return Ok(false);
-            }
-            tbl.insert(key.as_bytes(), state.as_ref())?;
-        }
-        Self::commit_guarded(txn)?;
-        Ok(true)
-    }
-
     /// Read a contract's state synchronously.
     ///
     /// This is the same as `StateStorage::get` but without the async wrapper.
-    /// Used by V2 delegate host functions that need synchronous access during
-    /// WASM `process()` execution.
+    /// Used by the delegate `local_contract_state` host function, which runs
+    /// synchronously inside WASM `process()` execution.
     pub fn get_state_sync(&self, key: &ContractKey) -> Result<Option<WrappedState>, redb::Error> {
         self.read_guarded(|txn| {
             let tbl = txn.open_table(STATE_TABLE)?;

@@ -67,6 +67,19 @@ mod wasm_runtime;
 /// Deterministic simulation testing framework.
 pub mod simulation;
 
+/// Pin the process-start anchor used by the bootstrap-latency metric
+/// (`freenet.bootstrap.time_to_min_connections_seconds`, issue #4787).
+///
+/// `Instant` cannot be constructed for "when this process started", so the
+/// earliest instant available is whenever something first asks. Call this on
+/// the first line of `main` and the metric genuinely measures from process
+/// start — including config load, storage open, and every other startup step
+/// that can delay CONNECT. Without it the anchor falls back to
+/// `network_status::init()`, i.e. node start.
+pub fn mark_process_start() {
+    node::network_status::mark_process_start();
+}
+
 /// Exports to build a running local node.
 pub mod local_node {
     use super::*;

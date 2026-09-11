@@ -6,19 +6,34 @@ use freenet_stdlib::prelude::{
     UpdateContractRequest,
 };
 
-use crate::wasm_runtime::delegate_api::DelegateApiVersion;
-
 use super::super::engine::{InstanceHandle, WasmEngine};
 use super::super::native_api::{
-    CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, InstanceId,
+    CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, DelegateEnvSlot, InstanceId,
+    LIVE_DELEGATE_GUESTS,
 };
 use super::super::secrets_store::UserSecretContext;
 use super::super::{Runtime, RuntimeResult};
 use super::error::DelegateExecError;
 
-/// RAII guard that ensures cleanup of delegate environment state.
-/// When dropped, it clears the thread-local instance ID and removes the
-/// entry from the global DELEGATE_ENV map.
+/// RAII guard that removes the instance's entry from the global `DELEGATE_ENV`
+/// map on every exit path, including a panic.
+///
+/// That removal is the load-bearing half, and it is what bounds the lifetime of
+/// the raw store pointers the env holds: `DashMap::remove` takes the shard WRITE
+/// lock, so it waits for any host call still holding a `Ref` before returning.
+///
+/// It also clears `CURRENT_DELEGATE_INSTANCE`, but note what that does and does
+/// not do since #5480. The thread-local a delegate host function actually reads
+/// is the one on the BLOCKING-POOL thread running the guest, installed and
+/// cleared by `GuestDelegateInstance` in `wasmtime_engine.rs`. This clear (and
+/// the matching `set` in `exec_inbound_with_env`) touches the CALLING thread's
+/// copy, which no host function consults on the delegate path.
+///
+/// They are kept rather than deleted because they cost nothing and keep the
+/// calling thread's thread-local honest for any path that ever runs a guest
+/// inline. Do not read them as the mechanism that makes host-function dispatch
+/// work — that is `GuestDelegateInstance`, and a change there is what would
+/// break dispatch.
 pub(super) struct DelegateEnvGuard {
     instance_id: InstanceId,
 }
@@ -71,6 +86,7 @@ fn drain_remaining_with_attestation(
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)
             | OutboundDelegateMsg::SendDelegateMessage(_)) => results.push(msg),
         }
     }
@@ -92,7 +108,6 @@ impl Runtime {
         context: Vec<u8>,
         handle: &InstanceHandle,
         instance_id: i64,
-        api_version: DelegateApiVersion,
     ) -> RuntimeResult<(Vec<OutboundDelegateMsg>, Vec<u8>)> {
         // Set up the delegate call environment with context, secret store, and
         // contract store access.
@@ -134,8 +149,6 @@ impl Runtime {
                 &mut self.secret_store,
                 &self.contract_store,
                 self.state_store_db.clone(),
-                self.state_write_callback.clone(),
-                self.state_admit_callback.clone(),
                 delegate_key.clone(),
                 &mut self.delegate_store,
                 0, // creation_depth: always 0 for top-level calls
@@ -155,29 +168,95 @@ impl Runtime {
             )
         };
 
-        debug_assert!(
-            !DELEGATE_ENV.contains_key(&instance_id),
-            "Instance ID {instance_id} already exists in DELEGATE_ENV - this indicates a bug"
-        );
+        // HARD check, deliberately not `debug_assert!`: since #5480 this is a
+        // MEMORY-SAFETY invariant, not a tidiness one, and it must hold in
+        // release builds.
+        //
+        // A delegate guest now runs on a `spawn_blocking` worker, and on the
+        // wall-clock timeout path it KEEPS RUNNING after this function returns
+        // (`JoinHandle::abort()` cannot stop a `spawn_blocking` closure). One
+        // `RunningInstance` id is shared by every message in a batch (see
+        // `interface.rs`), so this insert runs once per message under the SAME
+        // id. If an env were inserted while a previous message's guest were
+        // still abandoned and running, that guest's `DELEGATE_ENV.get(&id)`
+        // would resolve to the NEW env and dereference its raw store pointers
+        // while this thread holds `&mut` to the very same stores -- aliasing UB
+        // across two threads.
+        //
+        // Today the batch loop aborts on the first error, so this is
+        // unreachable. That is an accident of control flow, not a guarantee: an
+        // edit making the loop error-tolerant ("collect errors and continue",
+        // "retry the message") would silently reintroduce it. Fail closed so
+        // such an edit gets an error instead of undefined behaviour.
+        //
+        // BOTH halves are needed, and `DELEGATE_ENV` alone is the WRONG test.
+        // `DelegateEnvGuard::drop` removes the env on every exit path of this
+        // function INCLUDING the wall-clock-timeout `Err`, so by the time a
+        // caller sees that error the entry is already gone while the guest is
+        // still running on an abandoned blocking thread. `contains_key` asks
+        // "is an env registered"; the question that matters is "is a guest
+        // running", and those diverged the moment the guest could outlive the
+        // call. `LIVE_DELEGATE_GUESTS` answers the second one — without it this
+        // check would read false in precisely the scenario its own comment
+        // above describes.
+        if DELEGATE_ENV.contains_key(&instance_id) || LIVE_DELEGATE_GUESTS.contains(&instance_id) {
+            return Err(anyhow::anyhow!(
+                "delegate instance {instance_id} is already active (env registered, or a \
+                 guest still running on an abandoned blocking thread); refusing to \
+                 re-enter it (#5480)"
+            )
+            .into());
+        }
 
-        DELEGATE_ENV.insert(instance_id, env);
+        DELEGATE_ENV.insert(instance_id, DelegateEnvSlot::new(env));
         CURRENT_DELEGATE_INSTANCE.with(|c| c.set(instance_id));
 
         // Create RAII guard to ensure cleanup on all exit paths (including panic)
         let _guard = DelegateEnvGuard::new(instance_id);
 
         // Execute the WASM process function.
-        // V2 delegates use call_async (async host functions for contract access).
-        // V1 delegates use synchronous call.
-        let result = self.exec_inbound(params, origin, msg, handle, api_version);
+        let result = self.exec_inbound(params, origin, msg, handle);
 
-        // Read back the (possibly mutated) context before guard drops
+        // Propagate the error BEFORE reading the context back. The `?` is
+        // deliberately ahead of the read, not behind it (#5480).
+        //
+        // On the wall-clock-timeout path this thread returns while the guest is
+        // STILL RUNNING on an abandoned blocking-pool thread, because
+        // `JoinHandle::abort()` cannot stop a `spawn_blocking` closure. Reading
+        // `context` here would therefore be a genuinely concurrent access to a
+        // field the abandoned guest can still write through `context_write`.
+        //
+        // That IS a data race if the read happens above the `?`, and it became
+        // one in #5593: `context` is now a `RefCell<Vec<u8>>` and
+        // `context_write` mutates it through `DELEGATE_ENV.get` -- a shard READ
+        // lock -- plus `borrow_mut()`. Shard read locks are SHARED, so nothing
+        // separates the two threads any more. `RefCell`'s borrow flag is a
+        // non-atomic `Cell<isize>`, so its own runtime check cannot detect the
+        // overlap; and `to_vec()` reallocating the `Vec` while `clone()` reads
+        // it is a use-after-free of the old buffer. `RefCell` is `!Sync`, but
+        // the `unsafe impl Sync for DelegateCallEnv` overrides that, so the
+        // compiler says nothing and there is no `unsafe` at either edit site.
+        //
+        // Before #5593 the mutator took `get_mut`, a shard WRITE lock, and the
+        // ordering here did not matter. That was one call site's habit rather
+        // than an invariant, which is exactly why it stopped holding. Do not
+        // restore the habit as the defence; keep the read below the `?`.
+        //
+        // The read is pure waste on every error path regardless: `result?` used
+        // to discard it a line later. Skipping it costs nothing, removes the
+        // only concurrent touch of the env from this thread, and lets the
+        // SAFETY argument rest on "the guest thread alone reaches the env"
+        // rather than on a per-field exception.
+        let outbound = result?;
+
+        // Reached only on success, which means `execute_wasm_blocking` joined
+        // the guest closure: the guest has finished and nothing else can be
+        // touching the env.
         let updated_context = DELEGATE_ENV
             .get(&instance_id)
-            .map(|env| env.context.clone())
+            .map(|env| env.context.borrow().clone())
             .unwrap_or_default();
 
-        let outbound = result?;
         Ok((outbound, updated_context))
     }
 
@@ -187,7 +266,6 @@ impl Runtime {
         origin: Option<&MessageOrigin>,
         msg: &InboundDelegateMsg,
         handle: &InstanceHandle,
-        api_version: DelegateApiVersion,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
         let param_buf_ptr = {
             let mut param_buf = self.init_buf(handle, params)?;
@@ -218,42 +296,24 @@ impl Runtime {
             InboundDelegateMsg::SubscribeContractResponse(_) => "SubscribeContractResponse",
             InboundDelegateMsg::ContractNotification(_) => "ContractNotification",
             InboundDelegateMsg::DelegateMessage(_) => "DelegateMessage",
+            // Appended in stdlib 0.10.0.
+            InboundDelegateMsg::UnsubscribeContractResponse(_) => "UnsubscribeContractResponse",
+            InboundDelegateMsg::WakeupFired { .. } => "WakeupFired",
             // `InboundDelegateMsg` is `#[non_exhaustive]` (stdlib 0.6.0+).
             // Future variants land here for tracing only — they still flow
             // through the wasm boundary as raw bincode below; classifying
             // them as "Unknown" affects logs only, not delivery.
             _ => "Unknown",
         };
-        tracing::debug!(
-            inbound_msg_name,
-            api_version = %api_version,
-            "Calling delegate with inbound message"
-        );
+        tracing::debug!(inbound_msg_name, "Calling delegate with inbound message");
 
-        let res = match api_version {
-            DelegateApiVersion::V1 => {
-                // V1: synchronous call — no async host functions involved.
-                // Must stay on calling thread for thread-local env.
-                self.engine.call_3i64(
-                    handle,
-                    "process",
-                    param_buf_ptr as i64,
-                    origin_buf_ptr as i64,
-                    msg_ptr as i64,
-                )?
-            }
-            DelegateApiVersion::V2 => {
-                // V2: async call — contract host functions are async.
-                // Uses Store::into_async() + call_async() under the hood.
-                self.engine.call_3i64_async_imports(
-                    handle,
-                    "process",
-                    param_buf_ptr as i64,
-                    origin_buf_ptr as i64,
-                    msg_ptr as i64,
-                )?
-            }
-        };
+        let res = self.engine.call_3i64(
+            handle,
+            "process",
+            param_buf_ptr as i64,
+            origin_buf_ptr as i64,
+            msg_ptr as i64,
+        )?;
 
         let linear_mem = self.linear_mem(handle)?;
         // SAFETY: `res` is the return value from the WASM `process` call and
@@ -296,6 +356,9 @@ impl Runtime {
                     }
                     OutboundDelegateMsg::SubscribeContractRequest(req) => {
                         format!("SubscribeContractRequest(contract={})", req.contract_id)
+                    }
+                    OutboundDelegateMsg::UnsubscribeContractRequest(req) => {
+                        format!("UnsubscribeContractRequest(contract={})", req.contract_id)
                     }
                     OutboundDelegateMsg::SendDelegateMessage(msg) => {
                         format!(
@@ -341,6 +404,7 @@ impl Runtime {
                         OutboundDelegateMsg::PutContractRequest(r) => format!("PutContractReq({})", r.contract.key()),
                         OutboundDelegateMsg::UpdateContractRequest(r) => format!("UpdateContractReq({})", r.contract_id),
                         OutboundDelegateMsg::SubscribeContractRequest(r) => format!("SubscribeContractReq({})", r.contract_id),
+                        OutboundDelegateMsg::UnsubscribeContractRequest(r) => format!("UnsubscribeContractReq({})", r.contract_id),
                         OutboundDelegateMsg::SendDelegateMessage(m) => format!("SendDelegateMsg(target={})", m.target),
                     }
                 }).collect::<Vec<_>>()
@@ -463,6 +527,26 @@ impl Runtime {
                     context.clear();
                     context.extend_from_slice(ctx.as_ref());
                 }
+                // freenet-stdlib 0.10.0 added this variant (freenet/freenet-stdlib#98);
+                // core has no unsubscribe path behind it yet (tracked in #5600).
+                // Fail LOUDLY rather than drop it: silently swallowing the
+                // request would leave the delegate blocked forever on an
+                // `UnsubscribeContractResponse` that no one is going to send,
+                // and would make "unsubscribed" look successful while the
+                // subscription is still live.
+                OutboundDelegateMsg::UnsubscribeContractRequest(req) => {
+                    tracing::warn!(
+                        delegate_key = %delegate_key,
+                        contract_id = %req.contract_id,
+                        "Delegate requested UnsubscribeContractRequest, which this node does not \
+                         implement yet (see #5600); failing the delegate execution"
+                    );
+                    return Err(DelegateExecError::UnexpectedMessage(
+                        "UnsubscribeContractRequest is not implemented by this node yet (#5600)",
+                    )
+                    .into());
+                }
+
                 OutboundDelegateMsg::SendDelegateMessage(mut msg) if !msg.processed => {
                     tracing::debug!(
                         target_delegate = %msg.target,
@@ -486,5 +570,136 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pins {
+    /// Bound `exec_inbound_with_env`'s body, failing closed if the window is
+    /// truncated.
+    ///
+    /// Shared by the pins below so they cannot drift apart, and so a truncated
+    /// window fails ONE place loudly rather than making each pin vacuous
+    /// independently. A "must be present" lookup over a shortened window misses
+    /// and reports the property violated; a "must be absent" one passes over
+    /// nothing. Both are wrong, and balanced braces is the cheap structural
+    /// check that catches either.
+    fn scrape_exec_inbound_with_env(src: &str) -> &str {
+        let start = src
+            .find("fn exec_inbound_with_env(")
+            .expect("`exec_inbound_with_env` not found — this pin has drifted");
+        // Bound at the next method so a later occurrence cannot satisfy an
+        // assertion about this one.
+        let rest = &src[start..];
+        let end = ["\n    pub(super) fn ", "\n    fn ", "\n}"]
+            .iter()
+            .filter_map(|needle| rest.find(needle))
+            .min()
+            .map(|off| start + off)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+
+        let opens = body.matches('{').count();
+        let closes = body.matches('}').count();
+        assert_eq!(
+            opens, closes,
+            "`exec_inbound_with_env`: scraped window is truncated ({opens} `{{` vs \
+             {closes} `}}`), so any pin over it is unreliable. Widen the end \
+             delimiters; do NOT delete the check."
+        );
+
+        body
+    }
+
+    /// Source-scrape pin (#5480): in `exec_inbound_with_env`, the `?` that
+    /// propagates the call's result MUST come BEFORE the `context` read-back.
+    ///
+    /// This is an ordering the compiler cannot enforce and that reads as a
+    /// harmless rearrangement. It is not. On the wall-clock-timeout path the
+    /// creating thread returns while the guest is still running on an abandoned
+    /// `spawn_blocking` thread, so a read placed above the `?` runs concurrently
+    /// with `native_api`'s `context_write`. Since #5593 both sides take only a
+    /// SHARED `DELEGATE_ENV.get` and reach the `Vec` through a `RefCell`, whose
+    /// borrow flag is a non-atomic `Cell<isize>` — a data race that `RefCell`'s
+    /// own check cannot detect, that `!Sync` would normally catch, and that the
+    /// `unsafe impl Sync for DelegateCallEnv` suppresses. Neither edit site
+    /// needs `unsafe`, so nothing else would flag the change.
+    ///
+    /// Below the `?` the read is reached only on success, which means
+    /// `execute_wasm_blocking` joined the guest closure and the guest is
+    /// provably finished.
+    /// Source-scrape pin (#5480 review): `DelegateEnvGuard` must be constructed
+    /// as a LOCAL of `exec_inbound_with_env`.
+    ///
+    /// This is the fact that makes the merged #5554 safe, and until this pin
+    /// nothing checked it. #5554 parks delegates off the serial
+    /// `contract_handling` loop, so a delegate's round trip can span two loop
+    /// iterations; its own comment notes the serial loop was the ONLY thing
+    /// guaranteeing one `process()` per delegate. What keeps that sound is that
+    /// the guard drops HERE, inside this function, so `DELEGATE_ENV` is cleared
+    /// before the `Err` reaches `inbound_app_message`, before
+    /// `DelegateRunOutcome::Failed`, and therefore before a park can release a
+    /// queued run for the same delegate.
+    ///
+    /// The realistic regression is not deletion but HOISTING: moving the guard
+    /// up into `inbound_app_message` so one guard spans the whole batch reads
+    /// like an efficiency win — one insert/remove per batch instead of per
+    /// message — and would put an abandoned guest's writes back within reach of
+    /// a queued run.
+    ///
+    /// `LIVE_DELEGATE_GUESTS` does NOT cover this. It is keyed by instance id,
+    /// and a fresh run for the same delegate gets a fresh `RunningInstance` with
+    /// a fresh id, so the set never observes the overlap. The scope of one local
+    /// variable is the whole protection.
+    #[test]
+    fn the_env_guard_is_constructed_inside_exec_inbound_with_env() {
+        let src = include_str!("execution.rs");
+        let body = scrape_exec_inbound_with_env(src);
+
+        assert!(
+            body.contains("let _guard = DelegateEnvGuard::new(instance_id);"),
+            "`exec_inbound_with_env` must construct its `DelegateEnvGuard` \
+             itself. If this guard has been hoisted into `inbound_app_message` \
+             so one covers a whole batch, the env now outlives the call that \
+             created it and #5554's park can release a queued run for the same \
+             delegate while an abandoned guest is still writing (#5480, #5554)"
+        );
+
+        // The construction must also precede the guest call it protects —
+        // present but below `exec_inbound` would clean up an env that was never
+        // guarded during execution.
+        let guard = body
+            .find("let _guard = DelegateEnvGuard::new(instance_id);")
+            .expect("checked above");
+        let call = body
+            .find("self.exec_inbound(")
+            .expect("`exec_inbound_with_env` must call `exec_inbound`");
+        assert!(
+            guard < call,
+            "the `DelegateEnvGuard` must be constructed BEFORE `exec_inbound`, \
+             so it covers the guest call rather than trailing it"
+        );
+    }
+
+    #[test]
+    fn context_readback_happens_after_the_result_is_propagated() {
+        let src = include_str!("execution.rs");
+        let body = scrape_exec_inbound_with_env(src);
+
+        let propagate = body
+            .find("let outbound = result?;")
+            .expect("`exec_inbound_with_env` must propagate the call result with `?`");
+        let readback = body
+            .find("DELEGATE_ENV\n            .get(&instance_id)")
+            .expect("`exec_inbound_with_env` must read the context back from DELEGATE_ENV");
+
+        assert!(
+            propagate < readback,
+            "the `context` read-back must sit AFTER `let outbound = result?;`. Above \
+             it, the read runs on the wall-clock-timeout path while the guest is \
+             still live on an abandoned blocking thread, racing `context_write` on \
+             a `RefCell` that `unsafe impl Sync` has stripped the protection from \
+             (#5480, #5593). Nothing but this pin would catch the move."
+        );
     }
 }

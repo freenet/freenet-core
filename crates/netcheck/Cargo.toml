@@ -17,6 +17,8 @@ rand = { workspace = true }
 # Version-stable RNG for the run-order shuffle: StdRng's algorithm is
 # explicitly not reproducible across rand releases.
 rand_chacha = { workspace = true }
+# rand_chacha 0.10 implements rand_core 0.10 traits; workspace `rand` is 0.9.
+rand_core10 = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

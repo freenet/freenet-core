@@ -66,10 +66,14 @@ pub(crate) fn state_hash(state: &WrappedState) -> u64 {
 }
 
 /// A cheap, cloneable handle that drops a [`StateStore`]'s cached view of a
-/// contract, for the write paths that BYPASS `StateStore` and write straight to
-/// the raw `Storage` — specifically the V2 delegate writes
-/// (`put_contract_state_sync` / `update_contract_state_sync`), which never call
-/// `StateStore::{store,update}`.
+/// contract, as a write made outside `StateStore` would have to.
+///
+/// Test-only since #5637. Its production user was the callback that re-synced
+/// these caches after a delegate wrote contract state through the raw
+/// `Storage`; those delegate write host functions no longer exist, so no
+/// production write bypasses `StateStore`. Tests still use it to drop the
+/// change-detector without touching the stored state (the restart/eviction
+/// shape).
 ///
 /// It invalidates BOTH read-caches the store keeps for a key:
 ///   * the moka state-bytes cache (`state_mem_cache`) — otherwise a later
@@ -78,15 +82,17 @@ pub(crate) fn state_hash(state: &WrappedState) -> u64 {
 ///   * the change-detector hash (`state_hash_cache`) — otherwise the fast path
 ///     would serve a stale summary/delta.
 ///
-/// Obtained via [`StateStore::cache_invalidator`] and wired into the runtime's
-/// `state_write_callback`. Cloning shares the underlying caches (moka is
-/// internally `Arc`), so an invalidation is observed by every executor.
+/// Obtained via [`StateStore::cache_invalidator`]. Cloning shares the
+/// underlying caches (moka is internally `Arc`), so an invalidation is observed
+/// by every executor.
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct StateCacheInvalidator {
     state_cache: Option<MokaCache<ContractKey, WrappedState>>,
     hash_cache: MokaCache<ContractKey, u64>,
 }
 
+#[cfg(test)]
 impl StateCacheInvalidator {
     /// Drop the store's cached state bytes AND change-detector hash for `key`
     /// after a state write made outside `StateStore`, so the next read reloads
@@ -138,13 +144,12 @@ pub trait StateStorage {
     /// CHANGE-DETECTOR INVARIANT (future writers): a contract-state write made
     /// DIRECTLY through this trait, bypassing the [`StateStore`] wrapper that
     /// owns the summarize/delta change-detector, MUST invalidate that detector
-    /// via [`StateCacheInvalidator`] (and the moka state-bytes cache) — e.g.
-    /// via the runtime's `state_write_callback`. Otherwise the summarize/delta
-    /// fast path can serve a STALE summary/delta against the new state → peer
-    /// state divergence (#4621). Writes that go through `StateStore::{store,
-    /// update, delete}` already do this; raw-`Storage` writers (V2 delegate
-    /// `store_state_sync`/`update_state_sync`, and any new bypass writer such as
-    /// the #4592 live-import work) must not skip it.
+    /// (and the moka state-bytes cache). Otherwise the summarize/delta fast
+    /// path can serve a STALE summary/delta against the new state → peer state
+    /// divergence (#4621). Writes that go through `StateStore::{store, update,
+    /// delete}` already do this. No production write bypasses `StateStore`
+    /// today (the delegate host functions that did were removed in #5637); a
+    /// new bypass writer, such as the #4592 live-import work, must not skip it.
     fn store(
         &self,
         key: ContractKey,
@@ -170,7 +175,7 @@ pub trait StateStorage {
     ///
     /// CHANGE-DETECTOR INVARIANT: a removal made DIRECTLY through this trait
     /// (bypassing [`StateStore::delete`]) must also invalidate the
-    /// summarize/delta change-detector via [`StateCacheInvalidator`], or the
+    /// summarize/delta change-detector, or the
     /// fast path could keep certifying a hash for state that is now gone (#4621).
     fn remove(&self, key: &ContractKey) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
@@ -193,19 +198,10 @@ pub struct StateStore<S: StateStorage> {
     ///
     ///   the entry is either ABSENT or equal to `state_hash(state on disk)`.
     ///
-    /// It is maintained by three kinds of operation:
+    /// It is maintained by two kinds of operation:
     ///   * any write through this `StateStore` — [`store`](Self::store),
     ///     [`update`](Self::update), [`delete`](Self::delete) — INVALIDATES the
     ///     entry, so a changed state can never be served against a stale hash.
-    ///   * V2 delegate state writes (`put_contract_state_sync` /
-    ///     `update_contract_state_sync`) write directly through the raw
-    ///     `Storage`, BYPASSING `StateStore`, so they invalidate this entry (and
-    ///     the moka state-bytes cache) via a [`StateCacheInvalidator`] handle
-    ///     wired into the runtime's `state_write_callback` (see
-    ///     `Runtime::set_state_write_callback` and the callback installers in
-    ///     `executor/runtime.rs`). Without this a V2 write would leave a stale
-    ///     detector hash → stale summary/delta → divergence (caught by Codex
-    ///     review).
     ///   * the summarize/delta slow path re-POPULATES it after loading the
     ///     current state (via [`cache_state_hash`](Self::cache_state_hash)).
     ///
@@ -281,10 +277,9 @@ where
             .build()
     }
 
-    /// A cloneable handle that drops this store's cached view of a contract, for
-    /// the V2 delegate write path which bypasses `StateStore` (see
-    /// [`StateCacheInvalidator`]). Wired into the runtime's
-    /// `state_write_callback`.
+    /// A cloneable handle that drops this store's cached view of a contract.
+    /// Test-only; see [`StateCacheInvalidator`].
+    #[cfg(test)]
     pub(crate) fn cache_invalidator(&self) -> StateCacheInvalidator {
         StateCacheInvalidator {
             state_cache: self.state_mem_cache.clone(),
@@ -1246,7 +1241,7 @@ mod tests {
         );
     }
 
-    /// The V2-bypass handle ([`StateCacheInvalidator`]) clears the same
+    /// The out-of-band handle ([`StateCacheInvalidator`]) clears the same
     /// change-detector the summarize/delta fast path reads.
     #[tokio::test]
     async fn cache_invalidator_clears_detector_hash() {
@@ -1268,8 +1263,8 @@ mod tests {
         );
     }
 
-    /// CORRECTNESS of the V2-bypass fix: a write that lands in the backing store
-    /// WITHOUT going through `StateStore` (as V2 delegate writes do) would
+    /// A write that lands in the backing store WITHOUT going through
+    /// `StateStore` would
     /// otherwise be masked by the moka state cache — `get` would keep returning
     /// the stale cached bytes. The [`StateCacheInvalidator`] must drop BOTH the
     /// state-bytes cache and the detector so the next read reloads fresh bytes.
@@ -1289,7 +1284,7 @@ mod tests {
         // Pretend the summarize slow path recorded A's hash.
         store.cache_state_hash(key, state_hash(&state_a));
 
-        // Simulate a V2 delegate write: B lands in the BACKING store directly,
+        // Simulate an out-of-band write: B lands in the BACKING store directly,
         // bypassing StateStore (so moka still holds A).
         mock_storage.seed_state(key, state_b.clone());
 
