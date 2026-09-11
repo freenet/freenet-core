@@ -25,7 +25,7 @@ use super::generator::{Corpus, GeneratorConfig, generate_cases};
 use super::oracle::{ConformanceOracle, OracleError};
 use super::property::{
     ConformanceProperty, IdempotenceSettling, Inconclusive, OutputDigest, PremiseSource,
-    PropertyOutcome, Severity,
+    PropertyOutcome, Severity, Violation,
 };
 use super::verifier::{Bytes, ConformanceCase, verify_case};
 
@@ -2401,6 +2401,83 @@ fn oversized_evidence_is_rejected_before_any_execution() {
         evidence.check_bounds(),
         Err(EvidenceRejected::TooLarge { .. })
     ));
+}
+
+/// A `Violation` whose `detail` is `len` bytes. `detail` is free text the SENDER
+/// chooses, so this stands in for what a hostile peer can put there.
+fn violation_with_detail(len: usize) -> Violation {
+    Violation {
+        property: ConformanceProperty::StateIdempotence,
+        severity: ConformanceProperty::StateIdempotence.severity(),
+        left: OutputDigest::of(&[1]),
+        right: OutputDigest::of(&[2]),
+        detail: "x".repeat(len),
+        settling: None,
+    }
+}
+
+/// #5581. `observed.detail` is sender-chosen text that `input_bytes()` does not
+/// count, so the byte limit said nothing about it.
+///
+/// Every metered field is kept tiny on purpose. A fixture with large `states` would
+/// be rejected by the input-byte limit whether or not the text field were bounded,
+/// so it could not detect that bound being deleted.
+#[test]
+fn evidence_whose_only_large_field_is_the_observed_detail_is_rejected() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let mut evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    // Assigned on the struct rather than passed to `new`: a hostile sender writes the
+    // bytes directly and never runs our constructor.
+    evidence.observed = Some(violation_with_detail(1024 * 1024));
+    assert!(
+        evidence.input_bytes() < MAX_EVIDENCE_INPUT_BYTES,
+        "the fixture must be small in every metered field, or it tests the wrong limit"
+    );
+    assert!(evidence.check_bounds().is_err());
+}
+
+/// #5581. The second unmetered field: `runtime.core_version` is also a `String` the
+/// sender writes, and was not counted either.
+#[test]
+fn evidence_whose_only_large_field_is_the_runtime_version_is_rejected() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let mut evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    evidence.runtime.core_version = "9".repeat(1024 * 1024);
+    assert!(
+        evidence.input_bytes() < MAX_EVIDENCE_INPUT_BYTES,
+        "the fixture must be small in every metered field, or it tests the wrong limit"
+    );
+    assert!(evidence.check_bounds().is_err());
+}
+
+/// #5581. bincode 1.x's free `deserialize` allows trailing bytes, so a valid payload
+/// with anything appended decoded as though the appendix were not there.
+#[test]
+fn decode_refuses_bytes_after_a_complete_payload() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    let mut bytes = evidence.encode().expect("encode");
+    assert!(
+        ConformanceEvidence::decode(&bytes).is_ok(),
+        "control: the unmodified bytes must decode, or the refusal below proves nothing"
+    );
+    bytes.push(0);
+    assert!(ConformanceEvidence::decode(&bytes).is_err());
+}
+
+/// #5581. The size gate has to run during DECODE. `check_bounds` only ever sees an
+/// object that decoding has already allocated, so a limit applied there alone
+/// arrives after the cost it exists to prevent.
+#[test]
+fn decode_refuses_a_payload_larger_than_any_evidence_check_bounds_accepts() {
+    let big = vec![0u8; MAX_EVIDENCE_INPUT_BYTES * 4];
+    let case = ConformanceCase::new(
+        ConformanceProperty::StateIdempotence,
+        vec![Arc::from(big.as_slice())],
+    );
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    let bytes = evidence.encode().expect("encode");
+    assert!(ConformanceEvidence::decode(&bytes).is_err());
 }
 
 #[test]
