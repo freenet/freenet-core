@@ -2824,6 +2824,17 @@ fn a_foreign_file_is_not_mistaken_for_evidence() {
         ConformanceEvidence::decode(b""),
         Err(EvidenceError::BadMagic)
     ));
+    // A file whose magic matched but was cut off mid-write is Truncated, not BadMagic.
+    // The distinction matters: a user seeing "not conformance evidence" hunts for the
+    // wrong file; "truncated" tells them to regenerate.
+    assert!(matches!(
+        ConformanceEvidence::decode(b"FRNTEVD1"),
+        Err(EvidenceError::Truncated { len: 8 })
+    ));
+    assert!(matches!(
+        ConformanceEvidence::decode(b"FRNTEVD1\x02"),
+        Err(EvidenceError::Truncated { len: 9 })
+    ));
 }
 
 #[test]
@@ -2861,11 +2872,102 @@ fn an_evidence_from_an_unsupported_schema_is_refused_before_bincode() {
 #[test]
 fn evidence_encode_decode_roundtrip() {
     use super::evidence::ConformanceEvidence;
-    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
-    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let idem_case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &idem_case, None);
     let bytes = evidence.encode().expect("encode");
+
+    // Golden wire-format pin: exactly 10 bytes framing (8 bytes magic + LE u16 schema_version 2)
+    assert_eq!(&bytes[..10], b"FRNTEVD1\x02\x00");
+
     let decoded = ConformanceEvidence::decode(&bytes).expect("decode");
     assert_eq!(decoded, evidence);
+
+    // Also roundtrip with observed: Some(..) - the motivating case from #5520
+    let comm_case = case(ConformanceProperty::StateCommutativity, &[&[1, 2], &[2, 3]]);
+    let mut fake = Fake::conforming().merging(|_a, b| Ok(b.to_vec()));
+    let observed = verify_case(&mut fake, &comm_case).violation().cloned();
+    assert!(observed.is_some());
+    let annotated = ConformanceEvidence::new(instance(42), vec![7, 8], &comm_case, observed);
+    let bytes_annotated = annotated.encode().expect("encode annotated");
+    assert_eq!(&bytes_annotated[..10], b"FRNTEVD1\x02\x00");
+    let decoded_annotated =
+        ConformanceEvidence::decode(&bytes_annotated).expect("decode annotated");
+    assert_eq!(decoded_annotated, annotated);
+}
+
+#[test]
+fn legacy_unframed_schema_1_is_refused() {
+    use super::evidence::{ConformanceEvidence, EVIDENCE_SCHEMA_VERSION, EvidenceError};
+
+    // Schema 1 legacy files: struct layout changed when `settling` was added, so
+    // deserializing them would silently produce garbage. Always refused.
+    let legacy_schema_1 = [1u8, 0u8, 0xff, 0xff, 0xff];
+    match ConformanceEvidence::decode(&legacy_schema_1) {
+        Err(EvidenceError::UnsupportedSchema { found, supported }) => {
+            assert_eq!(found, 1);
+            assert_eq!(supported, EVIDENCE_SCHEMA_VERSION);
+        }
+        other => panic!("expected schema 1 refusal for legacy file, got {other:?}"),
+    }
+}
+
+#[test]
+fn legacy_unframed_schema_2_decodes_if_the_payload_is_valid() {
+    use super::evidence::ConformanceEvidence;
+
+    // v0.2.133 evidence: no framing header, raw bincode payload. The struct layout
+    // is byte-identical to the current schema 2, so decode must succeed rather than
+    // returning an error. This is the regression Ian's review caught.
+    let idem_case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &idem_case, None);
+
+    // Encode as raw bincode (no framing header) — exactly what pre-0.2.134 wrote.
+    let raw = bincode::serialize(&evidence).expect("serialize");
+    assert_eq!(
+        &raw[..2],
+        &[2u8, 0u8],
+        "first field must be schema_version = 2 in LE"
+    );
+
+    let decoded = ConformanceEvidence::decode(&raw).expect("legacy schema 2 must decode cleanly");
+    assert_eq!(decoded, evidence);
+}
+
+#[test]
+fn legacy_sniff_02_00_with_garbage_payload_is_bad_magic() {
+    use super::evidence::{ConformanceEvidence, EvidenceError};
+
+    // A file that happens to start with `02 00` but whose bincode deserialization fails
+    // is not evidence at all; fall through to BadMagic rather than a confusing decode error.
+    let not_evidence = [2u8, 0u8, 0xff, 0xff, 0xff];
+    assert!(
+        matches!(
+            ConformanceEvidence::decode(&not_evidence),
+            Err(EvidenceError::BadMagic)
+        ),
+        "a garbage file starting with 02 00 must not produce a decode error"
+    );
+}
+
+#[test]
+fn decode_rejects_mismatched_body_schema() {
+    use super::evidence::{ConformanceEvidence, EvidenceError};
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let mut bytes = evidence.encode().expect("encode");
+
+    // Body begins at byte 10. The first field in ConformanceEvidence bincode payload
+    // is schema_version (LE u16). Change the body's schema_version to 999 while keeping
+    // header's schema_version as 2.
+    bytes[10..12].copy_from_slice(&999u16.to_le_bytes());
+
+    match ConformanceEvidence::decode(&bytes) {
+        Err(EvidenceError::MismatchedBodySchema { header, body }) => {
+            assert_eq!(header, 2);
+            assert_eq!(body, 999);
+        }
+        other => panic!("expected MismatchedBodySchema, got {other:?}"),
+    }
 }
 
 // ----------------------------------------------------------------------- generator

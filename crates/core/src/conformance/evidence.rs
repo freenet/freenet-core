@@ -47,8 +47,19 @@ pub const EVIDENCE_MAGIC: &[u8; 8] = b"FRNTEVD1";
 pub enum EvidenceError {
     #[error("not conformance evidence (bad magic)")]
     BadMagic,
+    #[error(
+        "evidence file is truncated: magic matched but the 10-byte framing header is incomplete \
+         ({len} byte(s)); the file was likely cut off mid-write and should be regenerated"
+    )]
+    Truncated { len: usize },
     #[error("evidence uses schema version {found}, this build understands {supported}")]
     UnsupportedSchema { found: u16, supported: u16 },
+    #[error(
+        "evidence framing header specifies schema {header}, but deserialized payload specifies {body}"
+    )]
+    MismatchedBodySchema { header: u16, body: u16 },
+    #[error("encode: {0}")]
+    Encode(String),
     #[error("decode: {0}")]
     Decode(String),
 }
@@ -376,27 +387,79 @@ impl ConformanceEvidence {
         let mut out = Vec::with_capacity(self.input_bytes() + 128);
         out.extend_from_slice(EVIDENCE_MAGIC);
         out.extend_from_slice(&self.schema_version.to_le_bytes());
-        let body = bincode::serialize(self).map_err(|e| EvidenceError::Decode(e.to_string()))?;
+        let body = bincode::serialize(self).map_err(|e| EvidenceError::Encode(e.to_string()))?;
         out.extend_from_slice(&body);
         Ok(out)
     }
 
     /// Decode an evidence file, verifying magic and schema version *before*
     /// attempting bincode deserialization.
+    ///
+    /// The check order matters:
+    /// 1. Magic first — so a truncated framed file (`b"FRNTEVD1"` with nothing after)
+    ///    reports [`EvidenceError::Truncated`] rather than [`EvidenceError::BadMagic`].
+    ///    A disk that fills mid-write produces a partial file; telling the user "not
+    ///    conformance evidence" sends them hunting for the wrong problem.
+    /// 2. Length second — once the magic matches, a short header is a truncation.
+    /// 3. Legacy sniff — if the magic did not match and the first two bytes look like
+    ///    a schema version, try to decode the raw bincode payload (v0.2.129–v0.2.133
+    ///    wrote evidence without the header). Schema 2 files from those releases are
+    ///    byte-compatible with the current struct, so a successful decode is returned
+    ///    rather than an error. Schema 1 is refused: the struct changed between 1 and 2.
     pub fn decode(bytes: &[u8]) -> Result<Self, EvidenceError> {
-        if bytes.len() < EVIDENCE_MAGIC.len() + 2
-            || &bytes[..EVIDENCE_MAGIC.len()] != EVIDENCE_MAGIC
-        {
-            return Err(EvidenceError::BadMagic);
+        const HEADER_LEN: usize = EVIDENCE_MAGIC.len() + 2;
+
+        // Check magic FIRST so a truncated framed file is recognized as such rather
+        // than misreported as "not conformance evidence".
+        if bytes.starts_with(EVIDENCE_MAGIC) {
+            if bytes.len() < HEADER_LEN {
+                return Err(EvidenceError::Truncated { len: bytes.len() });
+            }
+            let version =
+                u16::from_le_bytes([bytes[EVIDENCE_MAGIC.len()], bytes[EVIDENCE_MAGIC.len() + 1]]);
+            if version != EVIDENCE_SCHEMA_VERSION {
+                return Err(EvidenceError::UnsupportedSchema {
+                    found: version,
+                    supported: EVIDENCE_SCHEMA_VERSION,
+                });
+            }
+            let evidence: Self = bincode::deserialize(&bytes[HEADER_LEN..])
+                .map_err(|e| EvidenceError::Decode(e.to_string()))?;
+            if evidence.schema_version != version {
+                return Err(EvidenceError::MismatchedBodySchema {
+                    header: version,
+                    body: evidence.schema_version,
+                });
+            }
+            return Ok(evidence);
         }
-        let version = u16::from_le_bytes([bytes[8], bytes[9]]);
-        if version != EVIDENCE_SCHEMA_VERSION {
-            return Err(EvidenceError::UnsupportedSchema {
-                found: version,
-                supported: EVIDENCE_SCHEMA_VERSION,
-            });
+
+        // Legacy sniff: pre-0.2.134 builds wrote raw bincode without the framing header.
+        // The first field is `schema_version: u16` in LE, so a real legacy file begins
+        // `01 00` (schema 1) or `02 00` (schema 2).
+        //
+        // Schema 1 is refused: the struct layout changed when `settling` was added.
+        // Schema 2 is byte-compatible with the current struct, so we attempt a direct
+        // bincode decode and return it if it succeeds. Failure (e.g. a random file that
+        // happens to start with `02 00`) falls through to BadMagic rather than exposing
+        // a decode error for input that is almost certainly not evidence at all.
+        if bytes.len() >= 2 {
+            let legacy_version = u16::from_le_bytes([bytes[0], bytes[1]]);
+            if legacy_version == 1 {
+                return Err(EvidenceError::UnsupportedSchema {
+                    found: 1,
+                    supported: EVIDENCE_SCHEMA_VERSION,
+                });
+            }
+            if legacy_version == 2 {
+                if let Ok(evidence) = bincode::deserialize::<Self>(bytes) {
+                    return Ok(evidence);
+                }
+                // Not a real legacy evidence file; fall through to BadMagic.
+            }
         }
-        bincode::deserialize(&bytes[10..]).map_err(|e| EvidenceError::Decode(e.to_string()))
+
+        Err(EvidenceError::BadMagic)
     }
 }
 
