@@ -19,7 +19,8 @@ use freenet_stdlib::prelude::{
 };
 
 use super::evidence::{
-    ConformanceEvidence, EvidenceRejected, MAX_EVIDENCE_INPUT_BYTES, MAX_EVIDENCE_RELATED,
+    ConformanceEvidence, EvidenceError, EvidenceRejected, MAX_EVIDENCE_ENCODED_BYTES,
+    MAX_EVIDENCE_INPUT_BYTES, MAX_EVIDENCE_RELATED, MAX_EVIDENCE_TEXT_BYTES,
 };
 use super::generator::{Corpus, GeneratorConfig, generate_cases};
 use super::oracle::{ConformanceOracle, OracleError};
@@ -2433,7 +2434,13 @@ fn evidence_whose_only_large_field_is_the_observed_detail_is_rejected() {
         evidence.input_bytes() < MAX_EVIDENCE_INPUT_BYTES,
         "the fixture must be small in every metered field, or it tests the wrong limit"
     );
-    assert!(evidence.check_bounds().is_err());
+    assert!(matches!(
+        evidence.check_bounds(),
+        Err(EvidenceRejected::TextTooLong {
+            field: "observed.detail",
+            ..
+        })
+    ));
 }
 
 /// #5581. The second unmetered field: `runtime.core_version` is also a `String` the
@@ -2447,7 +2454,13 @@ fn evidence_whose_only_large_field_is_the_runtime_version_is_rejected() {
         evidence.input_bytes() < MAX_EVIDENCE_INPUT_BYTES,
         "the fixture must be small in every metered field, or it tests the wrong limit"
     );
-    assert!(evidence.check_bounds().is_err());
+    assert!(matches!(
+        evidence.check_bounds(),
+        Err(EvidenceRejected::TextTooLong {
+            field: "runtime.core_version",
+            ..
+        })
+    ));
 }
 
 /// #5581. bincode 1.x's free `deserialize` allows trailing bytes, so a valid payload
@@ -2462,7 +2475,10 @@ fn decode_refuses_bytes_after_a_complete_payload() {
         "control: the unmodified bytes must decode, or the refusal below proves nothing"
     );
     bytes.push(0);
-    assert!(ConformanceEvidence::decode(&bytes).is_err());
+    assert!(matches!(
+        ConformanceEvidence::decode(&bytes),
+        Err(EvidenceError::Decode(_))
+    ));
 }
 
 /// #5581. The size gate has to run during DECODE. `check_bounds` only ever sees an
@@ -2477,7 +2493,98 @@ fn decode_refuses_a_payload_larger_than_any_evidence_check_bounds_accepts() {
     );
     let evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
     let bytes = evidence.encode().expect("encode");
-    assert!(ConformanceEvidence::decode(&bytes).is_err());
+    assert!(matches!(
+        ConformanceEvidence::decode(&bytes),
+        Err(EvidenceError::TooLarge { .. })
+    ));
+}
+
+/// The counterpart to the two text-field rejections: exactly at the limit passes.
+/// Without it, an off-by-one that refused every evidence object carrying a detail
+/// would still pass the tests above.
+#[test]
+fn evidence_text_exactly_at_the_limit_is_accepted() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let mut evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    evidence.observed = Some(violation_with_detail(MAX_EVIDENCE_TEXT_BYTES));
+    evidence.runtime.core_version = "9".repeat(MAX_EVIDENCE_TEXT_BYTES);
+    assert_eq!(evidence.check_bounds(), Ok(()));
+}
+
+/// `new` truncates an overlong detail rather than letting the writer's own
+/// `check_bounds` refuse it, and must not split a character doing so. `€` is three
+/// bytes and the limit is not a multiple of three, so the limit falls inside a
+/// character and the boundary search actually runs.
+#[test]
+fn new_truncates_an_overlong_detail_at_a_character_boundary() {
+    assert_ne!(
+        MAX_EVIDENCE_TEXT_BYTES % 3,
+        0,
+        "the fixture needs the limit to fall inside a character"
+    );
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let mut violation = violation_with_detail(0);
+    violation.detail = "€".repeat(MAX_EVIDENCE_TEXT_BYTES);
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, Some(violation));
+    let detail = &evidence.observed.as_ref().expect("observed is kept").detail;
+    assert!(detail.len() <= MAX_EVIDENCE_TEXT_BYTES);
+    assert!(
+        detail.len() > MAX_EVIDENCE_TEXT_BYTES - 3,
+        "truncated further than one character short of the limit"
+    );
+    assert!(detail.chars().all(|c| c == '€'));
+    assert_eq!(evidence.check_bounds(), Ok(()));
+}
+
+/// Every object `check_bounds` accepts must also decode. If the decode limit were
+/// tighter than the bounds, the largest valid evidence would be written and then be
+/// unreadable. So this builds the maximum of everything `check_bounds` meters: inputs
+/// summing to exactly `MAX_EVIDENCE_INPUT_BYTES` spread over the property with the
+/// most states, the most related contracts, and both text fields at their limit.
+#[test]
+fn every_evidence_check_bounds_accepts_fits_the_decode_limit() {
+    let property = ConformanceProperty::StateAssociativity;
+    assert_eq!(
+        property.state_arity(),
+        3,
+        "the fixture assumes the property with the most states"
+    );
+    let side = 1024;
+    let states_total = MAX_EVIDENCE_INPUT_BYTES - side * (2 + MAX_EVIDENCE_RELATED);
+    let states: Vec<Bytes> = (0..3u8)
+        .map(|i| {
+            let len = states_total / 3 + usize::from(i == 2) * (states_total % 3);
+            Arc::from(vec![i; len].as_slice())
+        })
+        .collect();
+    let case = ConformanceCase::new(property, states);
+    let mut violation = violation_with_detail(MAX_EVIDENCE_TEXT_BYTES);
+    violation.settling = Some(IdempotenceSettling::SettledAfter(u32::MAX));
+    let mut evidence = ConformanceEvidence::new(instance(1), vec![7; side], &case, Some(violation));
+    evidence.summary = Some(vec![8; side]);
+    evidence.related = (0..MAX_EVIDENCE_RELATED)
+        .map(|i| (instance(i as u8 + 10), vec![9; side]))
+        .collect();
+    evidence.runtime.core_version = "9".repeat(MAX_EVIDENCE_TEXT_BYTES);
+    assert_eq!(
+        evidence.input_bytes(),
+        MAX_EVIDENCE_INPUT_BYTES,
+        "the fixture must sit exactly at the input limit"
+    );
+    assert_eq!(evidence.check_bounds(), Ok(()));
+
+    let bytes = evidence.encode().expect("encode");
+    // 8-byte magic plus 2-byte schema version precede the payload.
+    let body_len = bytes.len() - 10;
+    assert!(
+        body_len <= MAX_EVIDENCE_ENCODED_BYTES,
+        "the largest accepted evidence encodes to {body_len} bytes, over the \
+         {MAX_EVIDENCE_ENCODED_BYTES}-byte decode limit"
+    );
+    assert_eq!(
+        ConformanceEvidence::decode(&bytes).expect("decode"),
+        evidence
+    );
 }
 
 #[test]

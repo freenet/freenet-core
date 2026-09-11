@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bincode::Options as _;
 use freenet_stdlib::prelude::{ContractInstanceId, RelatedContracts, State};
 use serde::{Deserialize, Serialize};
 
@@ -60,20 +61,52 @@ pub enum EvidenceError {
     MismatchedBodySchema { header: u16, body: u16 },
     #[error("encode: {0}")]
     Encode(String),
+    #[error(
+        "evidence body is {found} bytes, more than any evidence this build accepts \
+         ({limit}); it was not decoded"
+    )]
+    TooLarge { found: usize, limit: usize },
     #[error("decode: {0}")]
     Decode(String),
 }
 
-/// Hard ceiling on one evidence object's input bytes.
+/// Hard ceiling on one evidence object's input bytes: the states, deltas, summary,
+/// related states and parameters that verifying it will execute.
 ///
 /// Chosen so that verifying evidence is unambiguously cheaper than the update
 /// traffic a non-converging contract already generates, and so an attacker cannot
 /// use evidence as an amplification vector. Operational tunable, not a protocol
 /// constant.
+///
+/// This counts execution inputs only. The two free-text fields are bounded
+/// separately by [`MAX_EVIDENCE_TEXT_BYTES`], and the encoded object as a whole by
+/// [`MAX_EVIDENCE_ENCODED_BYTES`] while it is decoded.
 pub const MAX_EVIDENCE_INPUT_BYTES: usize = 512 * 1024;
 
 /// Hard ceiling on how many related-contract states one evidence object may carry.
 pub const MAX_EVIDENCE_RELATED: usize = 8;
+
+/// Hard ceiling on each free-text field the sender writes: `observed.detail` and
+/// `runtime.core_version`.
+///
+/// Neither is an execution input, so [`ConformanceEvidence::input_bytes`] does not
+/// count them, and before #5581 they were the one part of an evidence object whose
+/// size the sender chose freely. Both are diagnostics that a recipient never acts
+/// on. A kilobyte is far more than this crate writes: its longest detail is a
+/// sentence containing two byte counts.
+pub const MAX_EVIDENCE_TEXT_BYTES: usize = 1024;
+
+/// Hard ceiling on the encoded body of one evidence object, enforced while decoding.
+///
+/// [`ConformanceEvidence::check_bounds`] can only inspect an object that decoding
+/// has already built, so a limit applied there arrives after the allocation it
+/// exists to prevent. This one is applied before bincode parses anything. It is
+/// sized to hold the largest object `check_bounds` accepts: [`MAX_EVIDENCE_INPUT_BYTES`]
+/// of inputs, two [`MAX_EVIDENCE_TEXT_BYTES`] fields, and the fixed-size fields and
+/// length prefixes around them, which come to a few kilobytes. The rest is slack.
+/// `every_evidence_check_bounds_accepts_fits_the_decode_limit` pins that the two
+/// limits agree.
+pub const MAX_EVIDENCE_ENCODED_BYTES: usize = MAX_EVIDENCE_INPUT_BYTES + 16 * 1024;
 
 /// A content hash identifying one reproducer, used for deduplication so a peer
 /// neither re-verifies nor re-forwards a case it has already seen.
@@ -121,6 +154,13 @@ pub enum EvidenceRejected {
     TooLarge { found: usize, limit: usize },
     #[error("evidence carries {found} related contracts, limit is {limit}")]
     TooManyRelated { found: usize, limit: usize },
+    /// A sender-written text field is longer than [`MAX_EVIDENCE_TEXT_BYTES`].
+    #[error("evidence field {field} is {found} bytes, limit is {limit}")]
+    TextTooLong {
+        field: &'static str,
+        found: usize,
+        limit: usize,
+    },
     /// The property is not self-verifying, so no amount of re-execution could
     /// establish its premise. See [`PremiseSource`].
     #[error(
@@ -176,7 +216,13 @@ impl ConformanceEvidence {
             deltas: case.deltas.iter().map(|d| d.to_vec()).collect(),
             summary: case.summary.as_ref().map(|s| s.to_vec()),
             related: related_to_pairs(&case.related),
-            observed,
+            // Truncated so that evidence this crate writes always passes its own
+            // `check_bounds`. fdev's writer skips evidence that fails it, so an
+            // overlong detail would otherwise drop the finding without a word.
+            observed: observed.map(|mut violation| {
+                truncate_text(&mut violation.detail, MAX_EVIDENCE_TEXT_BYTES);
+                violation
+            }),
             runtime: RuntimeIdentity::current(),
         }
     }
@@ -242,6 +288,12 @@ impl ConformanceEvidence {
                 limit: MAX_EVIDENCE_INPUT_BYTES,
             });
         }
+        // The two text fields are not execution inputs, so `input_bytes` does not
+        // count them. Without this the sender alone decides their size (#5581).
+        if let Some(observed) = &self.observed {
+            check_text_len("observed.detail", &observed.detail)?;
+        }
+        check_text_len("runtime.core_version", &self.runtime.core_version)?;
         if self.related.len() > MAX_EVIDENCE_RELATED {
             return Err(EvidenceRejected::TooManyRelated {
                 found: self.related.len(),
@@ -350,8 +402,9 @@ impl ConformanceEvidence {
     /// rebuild itself cannot fail. So an [`EvidenceRejected`] here means the evidence
     /// carries an unsupported [`EVIDENCE_SCHEMA_VERSION`], rests on provenance the
     /// bytes cannot carry ([`EvidenceRejected::NotSelfVerifying`]), exceeds
-    /// [`MAX_EVIDENCE_INPUT_BYTES`] or [`MAX_EVIDENCE_RELATED`], or does not carry
-    /// exactly the state and delta counts its property requires.
+    /// [`MAX_EVIDENCE_INPUT_BYTES`], [`MAX_EVIDENCE_RELATED`] or
+    /// [`MAX_EVIDENCE_TEXT_BYTES`], or does not carry exactly the state and delta
+    /// counts its property requires.
     ///
     /// Note for callers upgrading past the signature change: this returned
     /// `ConformanceCase` directly until the gate moved inside, so a caller that
@@ -406,6 +459,9 @@ impl ConformanceEvidence {
     ///    wrote evidence without the header). Schema 2 files from those releases are
     ///    byte-compatible with the current struct, so a successful decode is returned
     ///    rather than an error. Schema 1 is refused: the struct changed between 1 and 2.
+    ///
+    /// Both payload paths go through [`decode_body`], which refuses a payload larger
+    /// than [`MAX_EVIDENCE_ENCODED_BYTES`] or followed by trailing bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, EvidenceError> {
         const HEADER_LEN: usize = EVIDENCE_MAGIC.len() + 2;
 
@@ -423,8 +479,7 @@ impl ConformanceEvidence {
                     supported: EVIDENCE_SCHEMA_VERSION,
                 });
             }
-            let evidence: Self = bincode::deserialize(&bytes[HEADER_LEN..])
-                .map_err(|e| EvidenceError::Decode(e.to_string()))?;
+            let evidence = decode_body(&bytes[HEADER_LEN..])?;
             if evidence.schema_version != version {
                 return Err(EvidenceError::MismatchedBodySchema {
                     header: version,
@@ -452,7 +507,7 @@ impl ConformanceEvidence {
                 });
             }
             if legacy_version == 2 {
-                if let Ok(evidence) = bincode::deserialize::<Self>(bytes) {
+                if let Ok(evidence) = decode_body(bytes) {
                     return Ok(evidence);
                 }
                 // Not a real legacy evidence file; fall through to BadMagic.
@@ -461,6 +516,69 @@ impl ConformanceEvidence {
 
         Err(EvidenceError::BadMagic)
     }
+}
+
+/// The bincode configuration evidence is decoded with.
+///
+/// Byte-compatible with `bincode::serialize`, which [`ConformanceEvidence::encode`]
+/// uses: fixint and little-endian, like bincode 1.x's free functions. It differs
+/// from `bincode::deserialize` in the two ways #5581 asks for. Bytes are counted
+/// against [`MAX_EVIDENCE_ENCODED_BYTES`], so a length prefix claiming more than that
+/// is refused before anything is allocated for it. And bytes left over after a
+/// complete payload are an error instead of being ignored.
+fn evidence_bincode() -> impl bincode::Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(MAX_EVIDENCE_ENCODED_BYTES as u64)
+        .reject_trailing_bytes()
+}
+
+/// Decode an evidence payload, refusing an oversized one before bincode reads it.
+fn decode_body(body: &[u8]) -> Result<ConformanceEvidence, EvidenceError> {
+    if body.len() > MAX_EVIDENCE_ENCODED_BYTES {
+        return Err(EvidenceError::TooLarge {
+            found: body.len(),
+            limit: MAX_EVIDENCE_ENCODED_BYTES,
+        });
+    }
+    evidence_bincode().deserialize(body).map_err(|error| {
+        // A length prefix inside the payload claimed more than the limit. The
+        // payload itself is within it, so this is malformed rather than
+        // oversized, and says which limit it hit.
+        let detail = if matches!(*error, bincode::ErrorKind::SizeLimit) {
+            format!(
+                "a length inside the payload claims more than the \
+                     {MAX_EVIDENCE_ENCODED_BYTES}-byte evidence limit"
+            )
+        } else {
+            error.to_string()
+        };
+        EvidenceError::Decode(detail)
+    })
+}
+
+/// Refuse a sender-written text field longer than [`MAX_EVIDENCE_TEXT_BYTES`].
+fn check_text_len(field: &'static str, text: &str) -> Result<(), EvidenceRejected> {
+    if text.len() > MAX_EVIDENCE_TEXT_BYTES {
+        return Err(EvidenceRejected::TextTooLong {
+            field,
+            found: text.len(),
+            limit: MAX_EVIDENCE_TEXT_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Shorten `text` to at most `max` bytes without splitting a UTF-8 character.
+fn truncate_text(text: &mut String, max: usize) {
+    if text.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
 }
 
 /// Length-prefix each blob so `["ab", "c"]` and `["a", "bc"]` cannot collide.
