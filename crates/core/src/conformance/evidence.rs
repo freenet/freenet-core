@@ -48,9 +48,9 @@ pub const EVIDENCE_MAGIC: &[u8; 8] = b"FRNTEVD1";
 pub enum EvidenceError {
     #[error("not conformance evidence (bad magic)")]
     BadMagic,
-    /// The input ended before the payload it declares was complete. bincode reports
-    /// a hostile length prefix, one claiming more bytes than follow, the same way, so
-    /// this says nothing about whether the sender is honest.
+    /// The input ended before its header, or the payload the header declares, was
+    /// complete. bincode reports a hostile length prefix, one claiming more bytes than
+    /// follow, the same way, so this says nothing about whether the sender is honest.
     #[error(
         "evidence is truncated: it ends after {len} byte(s), before it is complete; the \
          file was likely cut off mid-write and should be regenerated"
@@ -490,8 +490,8 @@ impl ConformanceEvidence {
     ///
     /// The check order matters. Magic first, so a file whose 8-byte magic is intact
     /// but which is cut short after it reports [`EvidenceError::Truncated`] rather than
-    /// claiming it is not evidence (a cut inside the magic itself cannot be told apart
-    /// from a short foreign file, and reports [`EvidenceError::BadMagic`]):
+    /// claiming it is not evidence. (A cut inside the 8-byte magic itself is, by
+    /// choice, not recognised, and reports [`EvidenceError::BadMagic`].)
     /// a disk that fills mid-write produces exactly that, and "not conformance
     /// evidence" sends its owner looking for the wrong problem. The payload then goes
     /// through [`decode_body`], which refuses one larger than
@@ -558,11 +558,11 @@ impl ConformanceEvidence {
                 // `02 00` is not thereby evidence.
                 BodyError::TooLarge { found } => EvidenceError::LegacyUndecodable(format!(
                     "is {found} bytes, more than any evidence this build accepts \
-                     ({MAX_EVIDENCE_ENCODED_BYTES}), so it was not read"
+                     ({MAX_EVIDENCE_ENCODED_BYTES}), so it was not decoded"
                 )),
                 BodyError::EndedEarly => EvidenceError::LegacyUndecodable(
                     "ends before a complete payload; if it is evidence, the file is \
-                         truncated"
+                         truncated or damaged"
                         .to_string(),
                 ),
                 BodyError::Malformed(detail) => EvidenceError::LegacyUndecodable(format!(
@@ -611,16 +611,16 @@ const _: () = assert!(
 /// preallocates `min(declared, 1 MiB / element size)` before reading an element, so a
 /// few dozen hostile bytes can reserve about 2 MiB that is never filled. And each
 /// element of a `Vec<Vec<u8>>` costs 8 input bytes but a 24-byte header, grown by
-/// doubling. Reviewers estimated from the serde and bincode sources that a payload
-/// which decodes successfully can allocate about 4 to 7 times its own size.
+/// doubling, so a payload that decodes successfully can allocate up to about 6 times
+/// its own size.
 ///
-/// So allocation is linear in the input, but NOT bounded by it. What bounds a single
-/// decode is the length check: with the payload capped at
-/// [`MAX_EVIDENCE_ENCODED_BYTES`], one decode allocates at most a few MiB (on the
-/// order of 6 MiB at worst, by the same estimate). Tighter bounds, such as refusing a
-/// declared element count above what `check_bounds` allows before allocating, are
-/// recorded for the Phase 4 receive path on #5377, where decodes run concurrently and
-/// the multiplier starts to matter.
+/// So allocation is NOT bounded by the input: it is up to about 2 MiB of
+/// preallocation plus a small multiple of the input. What bounds a single decode is
+/// the length check. With the payload capped at [`MAX_EVIDENCE_ENCODED_BYTES`], the
+/// worst case worked out from the serde and bincode sources is about 4.6 MiB for one
+/// decode. Tighter bounds, such as refusing a declared element count above what
+/// `check_bounds` allows before allocating, are recorded for the Phase 4 receive path
+/// on #5377, where decodes run concurrently and the multiplier starts to matter.
 fn evidence_bincode() -> impl bincode::Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()

@@ -2513,9 +2513,12 @@ fn a_payload_exactly_at_the_limit_passes_the_size_gate() {
     bytes.extend_from_slice(&2u16.to_le_bytes());
     bytes.resize(bytes.len() + MAX_EVIDENCE_ENCODED_BYTES, 0xff);
     let result = ConformanceEvidence::decode(&bytes);
+    // All 0xff: the schema field reads 0xffff, the contract takes 32 bytes, then
+    // `parameters` declares u64::MAX bytes and runs out of input.
     assert!(
-        !matches!(result, Err(EvidenceError::PayloadTooLarge { .. })),
-        "a payload exactly at the limit must pass the size gate, got {result:?}"
+        matches!(result, Err(EvidenceError::Truncated { .. })),
+        "a payload exactly at the limit must pass the size gate and then fail to \
+         parse, got {result:?}"
     );
 }
 
@@ -3365,6 +3368,79 @@ fn encode_refuses_a_payload_that_decode_would_refuse_as_too_large() {
         ),
         other => panic!("expected an encode refusal, got {other:?}"),
     }
+}
+
+/// Both size guards at the exact boundary: evidence whose payload is exactly
+/// `MAX_EVIDENCE_ENCODED_BYTES` encodes, and decodes back to itself. Pins `>`
+/// against `>=` in `encode()`, as `a_payload_exactly_at_the_limit_passes_the_size_gate`
+/// does for `decode_body`. bincode is fixint, so the payload is the state's length
+/// plus a constant; the fixture measures that constant rather than assuming it.
+#[test]
+fn evidence_whose_payload_is_exactly_the_limit_encodes_and_decodes() {
+    let build = |len: usize| {
+        let case = ConformanceCase::new(
+            ConformanceProperty::StateIdempotence,
+            vec![Arc::from(vec![0u8; len].as_slice())],
+        );
+        ConformanceEvidence::new(instance(1), vec![], &case, None)
+    };
+    // 8-byte magic plus 2-byte schema version precede the payload.
+    let header = 10;
+    let overhead = build(0).encode().expect("encode").len() - header;
+    let evidence = build(MAX_EVIDENCE_ENCODED_BYTES - overhead);
+    let bytes = evidence
+        .encode()
+        .expect("a payload exactly at the limit must encode");
+    assert_eq!(
+        bytes.len() - header,
+        MAX_EVIDENCE_ENCODED_BYTES,
+        "the fixture must land exactly on the limit"
+    );
+    assert_eq!(
+        ConformanceEvidence::decode(&bytes).expect("and must decode"),
+        evidence
+    );
+}
+
+/// The delta half of `check_bounds`' exact-arity check. Every other arity test
+/// supplies a wrong number of STATES; this one supplies the right number of states
+/// and the wrong number of deltas, so deleting the deltas comparison fails here.
+#[test]
+fn evidence_with_the_right_states_but_the_wrong_deltas_is_rejected() {
+    let property = ConformanceProperty::DeltaIdempotence;
+    assert!(
+        property.is_self_verifying(),
+        "the fixture needs a shippable property, or check_bounds refuses it earlier"
+    );
+    assert_eq!((property.state_arity(), property.delta_arity()), (1, 1));
+    let case = case(property, &[&[1]]);
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    assert!(
+        evidence.deltas.is_empty(),
+        "the fixture must carry no deltas"
+    );
+    assert!(matches!(
+        evidence.check_bounds(),
+        Err(EvidenceRejected::Arity {
+            want_deltas: 1,
+            got_deltas: 0,
+            ..
+        })
+    ));
+}
+
+/// `decode_file` decodes a framed file exactly as `decode` does. Without the
+/// delegation, framed input would fall through to the legacy sniff, read `FR` as a
+/// schema number, and be refused as not evidence.
+#[test]
+fn decode_file_decodes_framed_evidence_as_decode_does() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let bytes = evidence.encode().expect("encode");
+    assert_eq!(
+        ConformanceEvidence::decode_file(&bytes).expect("decode_file"),
+        evidence
+    );
 }
 
 #[test]
