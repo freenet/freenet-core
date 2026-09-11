@@ -77,10 +77,10 @@ pub enum EvidenceError {
     #[error("encode: {0}")]
     Encode(String),
     #[error(
-        "evidence body is {found} bytes, more than any evidence this build accepts \
+        "evidence payload is {found} bytes, more than any evidence this build accepts \
          ({limit}); it was not decoded"
     )]
-    TooLarge { found: usize, limit: usize },
+    PayloadTooLarge { found: usize, limit: usize },
     #[error("decode: {0}")]
     Decode(String),
 }
@@ -111,7 +111,9 @@ pub const MAX_EVIDENCE_RELATED: usize = 8;
 /// sentence containing two byte counts.
 pub const MAX_EVIDENCE_TEXT_BYTES: usize = 1024;
 
-/// Hard ceiling on the encoded body of one evidence object, enforced while decoding.
+/// Hard ceiling on the encoded payload of one evidence object, enforced while
+/// decoding. It measures the payload after the 10-byte header (8-byte magic, 2-byte
+/// schema version), not the whole file.
 ///
 /// [`ConformanceEvidence::check_bounds`] can only inspect an object that decoding
 /// has already built, so a limit applied there arrives after the allocation it
@@ -500,7 +502,7 @@ impl ConformanceEvidence {
             });
         }
         let evidence = decode_body(&bytes[HEADER_LEN..]).map_err(|error| match error {
-            BodyError::TooLarge { found } => EvidenceError::TooLarge {
+            BodyError::TooLarge { found } => EvidenceError::PayloadTooLarge {
                 found,
                 limit: MAX_EVIDENCE_ENCODED_BYTES,
             },
@@ -540,10 +542,12 @@ impl ConformanceEvidence {
         let legacy_version = u16::from_le_bytes([bytes[0], bytes[1]]);
         if legacy_version == 2 {
             return decode_body(bytes).map_err(|error| match error {
-                BodyError::TooLarge { found } => EvidenceError::TooLarge {
-                    found,
-                    limit: MAX_EVIDENCE_ENCODED_BYTES,
-                },
+                // Hedged like the other two: an oversized file that happens to begin
+                // `02 00` is not thereby evidence.
+                BodyError::TooLarge { found } => EvidenceError::LegacyUndecodable(format!(
+                    "it is {found} bytes, more than any evidence this build accepts \
+                     ({MAX_EVIDENCE_ENCODED_BYTES})"
+                )),
                 BodyError::EndedEarly => {
                     EvidenceError::LegacyUndecodable("it ends early".to_string())
                 }
@@ -562,9 +566,14 @@ impl ConformanceEvidence {
 // `decode_file` decodes an unframed schema-2 payload with the CURRENT struct, which
 // is right only while the current schema is 2. Bumping the schema has to revisit
 // that branch, so the build refuses to compile until someone has.
+//
+// Editing the `2` below to match the new schema silences this without making the
+// decision it exists to force: `decode_file` would then decode old unframed files
+// with a struct they were never written with. The fix belongs in `decode_file`.
 const _: () = assert!(
     EVIDENCE_SCHEMA_VERSION == 2,
-    "EVIDENCE_SCHEMA_VERSION changed: decide what decode_file does with unframed schema-2 files"
+    "EVIDENCE_SCHEMA_VERSION changed: decide in decode_file what happens to unframed \
+     schema-2 files; changing the number in this assert is not that decision"
 );
 
 /// The bincode configuration evidence is decoded with.
@@ -578,9 +587,16 @@ const _: () = assert!(
 /// deserializing from a slice replaces the configured limit with `Infinite`
 /// (`internal::deserialize_seed` in bincode 1.3), so `.with_limit(..)` here would
 /// read as a bound and bound nothing. The bound is the length check at the top of
-/// [`decode_body`], which runs before bincode reads a byte. Allocation stays within
-/// the input regardless: a slice reader refuses a byte string longer than the input
-/// that remains before allocating it, and serde caps a sequence's up-front capacity.
+/// [`decode_body`], which runs before bincode reads a byte.
+///
+/// What that leaves for allocation, stated precisely because a receive path will
+/// rely on it: a `String` is bounded by the input, since the slice reader refuses a
+/// declared length longer than the input that remains before allocating. A `Vec` is
+/// not. serde preallocates `min(declared, 1 MiB / element size)` before reading a
+/// single element, so a few dozen hostile bytes declaring `u64::MAX` elements for a
+/// nested `Vec<Vec<u8>>` cost about 2 MiB of transient capacity before decoding
+/// fails. Allocation is therefore bounded by the input plus a small constant, not by
+/// the input alone.
 fn evidence_bincode() -> impl bincode::Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()

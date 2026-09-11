@@ -2481,22 +2481,27 @@ fn decode_refuses_bytes_after_a_complete_payload() {
     ));
 }
 
-/// #5581. The size gate has to run during DECODE. `check_bounds` only ever sees an
-/// object that decoding has already allocated, so a limit applied there alone
-/// arrives after the cost it exists to prevent.
+/// #5581. The size gate has to run during DECODE, before bincode parses anything:
+/// `check_bounds` only ever sees an object that decoding has already built, so a
+/// limit applied there alone arrives after the cost it exists to prevent.
+///
+/// The fixture is deliberately NOT valid evidence. With a valid oversized payload,
+/// moving the length check to after a successful parse would still report
+/// `PayloadTooLarge`, and this test would pass. With a payload bincode cannot parse,
+/// only a check that runs first reports `PayloadTooLarge`; a check moved later never
+/// gets the chance, because the parse fails first.
 #[test]
 fn decode_refuses_a_payload_larger_than_any_evidence_check_bounds_accepts() {
-    let big = vec![0u8; MAX_EVIDENCE_INPUT_BYTES * 4];
-    let case = ConformanceCase::new(
-        ConformanceProperty::StateIdempotence,
-        vec![Arc::from(big.as_slice())],
-    );
-    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
-    let bytes = evidence.encode().expect("encode");
-    assert!(matches!(
-        ConformanceEvidence::decode(&bytes),
-        Err(EvidenceError::TooLarge { .. })
-    ));
+    let mut bytes = b"FRNTEVD1".to_vec();
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.resize(bytes.len() + MAX_EVIDENCE_ENCODED_BYTES + 1, 0xff);
+    match ConformanceEvidence::decode(&bytes) {
+        Err(EvidenceError::PayloadTooLarge { found, limit }) => {
+            assert_eq!(found, MAX_EVIDENCE_ENCODED_BYTES + 1);
+            assert_eq!(limit, MAX_EVIDENCE_ENCODED_BYTES);
+        }
+        other => panic!("expected PayloadTooLarge before any parse, got {other:?}"),
+    }
 }
 
 /// The counterpart to the two text-field rejections: exactly at the limit passes.
@@ -2559,6 +2564,8 @@ fn every_evidence_check_bounds_accepts_fits_the_decode_limit() {
         .collect();
     let case = ConformanceCase::new(property, states);
     let mut violation = violation_with_detail(MAX_EVIDENCE_TEXT_BYTES);
+    violation.property = property;
+    violation.severity = property.severity();
     violation.settling = Some(IdempotenceSettling::SettledAfter(u32::MAX));
     let mut evidence = ConformanceEvidence::new(instance(1), vec![7; side], &case, Some(violation));
     evidence.summary = Some(vec![8; side]);
@@ -3221,6 +3228,50 @@ fn a_payload_declaring_more_than_it_holds_reports_truncated() {
     match ConformanceEvidence::decode(&bytes) {
         Err(EvidenceError::Truncated { len }) => assert_eq!(len, bytes.len()),
         other => panic!("expected Truncated, got {other:?}"),
+    }
+}
+
+/// `decode_file` on input too short to carry a schema version, and on an unframed
+/// file whose first two bytes are not a schema this build knows, reports that it is
+/// not evidence. The length guard matters beyond the message: without it an empty or
+/// one-byte file would index past its end and panic `fdev verify-merge`.
+#[test]
+fn decode_file_refuses_short_input_and_unknown_legacy_versions_as_not_evidence() {
+    for input in [&[][..], &[0u8][..], &[2u8][..]] {
+        assert!(
+            matches!(
+                ConformanceEvidence::decode_file(input),
+                Err(EvidenceError::BadMagic)
+            ),
+            "{input:?} must be refused as not evidence, not panic or be misread"
+        );
+    }
+    for version in [0u16, 3, u16::MAX] {
+        let mut input = version.to_le_bytes().to_vec();
+        input.extend_from_slice(&[0xff; 16]);
+        assert!(
+            matches!(
+                ConformanceEvidence::decode_file(&input),
+                Err(EvidenceError::BadMagic)
+            ),
+            "legacy version {version} must be refused as not evidence"
+        );
+    }
+}
+
+/// An oversized unframed file that begins `02 00` is refused before it is parsed,
+/// and hedged like the other legacy refusals: beginning with those two bytes does
+/// not make a file evidence.
+#[test]
+fn decode_file_refuses_an_oversized_unframed_file_without_calling_it_evidence() {
+    let mut input = 2u16.to_le_bytes().to_vec();
+    input.resize(MAX_EVIDENCE_ENCODED_BYTES + 1, 0xff);
+    match ConformanceEvidence::decode_file(&input) {
+        Err(EvidenceError::LegacyUndecodable(detail)) => assert!(
+            detail.contains("more than any evidence this build accepts"),
+            "expected the size refusal, got: {detail}"
+        ),
+        other => panic!("expected a hedged size refusal, got {other:?}"),
     }
 }
 
