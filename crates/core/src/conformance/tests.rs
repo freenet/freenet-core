@@ -2504,6 +2504,21 @@ fn decode_refuses_a_payload_larger_than_any_evidence_check_bounds_accepts() {
     }
 }
 
+/// The counterpart: a payload of exactly `MAX_EVIDENCE_ENCODED_BYTES` passes the size
+/// gate. It is not valid evidence, so decoding still fails, but for a parse reason.
+/// Without this, `>` becoming `>=` in `decode_body` would pass every other test.
+#[test]
+fn a_payload_exactly_at_the_limit_passes_the_size_gate() {
+    let mut bytes = b"FRNTEVD1".to_vec();
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.resize(bytes.len() + MAX_EVIDENCE_ENCODED_BYTES, 0xff);
+    let result = ConformanceEvidence::decode(&bytes);
+    assert!(
+        !matches!(result, Err(EvidenceError::PayloadTooLarge { .. })),
+        "a payload exactly at the limit must pass the size gate, got {result:?}"
+    );
+}
+
 /// The counterpart to the two text-field rejections: exactly at the limit passes.
 /// Without it, an off-by-one that refused every evidence object carrying a detail
 /// would still pass the tests above.
@@ -2539,6 +2554,23 @@ fn new_truncates_an_overlong_detail_at_a_character_boundary() {
     );
     assert!(detail.chars().all(|c| c == '€'));
     assert_eq!(evidence.check_bounds(), Ok(()));
+
+    // Two ASCII bytes first put the character boundaries at 2 + 3k, so the limit sits
+    // two bytes into a character and the search must step back twice. A search that
+    // stepped back at most once would stop off a boundary, and `truncate` panics.
+    // Boundaries sit at 2 + 3k, so `MAX - 2` is one exactly when `MAX - 4` is a
+    // multiple of 3.
+    assert_eq!(
+        (MAX_EVIDENCE_TEXT_BYTES - 4) % 3,
+        0,
+        "the fixture needs a boundary two bytes below the limit"
+    );
+    let mut violation = violation_with_detail(0);
+    violation.detail = format!("ab{}", "€".repeat(MAX_EVIDENCE_TEXT_BYTES));
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, Some(violation));
+    let detail = &evidence.observed.as_ref().expect("observed is kept").detail;
+    assert_eq!(detail.len(), MAX_EVIDENCE_TEXT_BYTES - 2);
+    assert!(detail.starts_with("ab"));
 }
 
 /// Every object `check_bounds` accepts must also decode. If the decode limit were
@@ -3161,10 +3193,40 @@ fn a_truncated_v0_2_133_file_is_reported_as_damaged_not_as_foreign() {
         ConformanceEvidence::decode_file(&raw).is_ok(),
         "control: the whole file must decode, or the refusal below proves nothing"
     );
-    assert!(matches!(
-        ConformanceEvidence::decode_file(&raw[..raw.len() - 1]),
-        Err(EvidenceError::LegacyUndecodable(_))
-    ));
+    match ConformanceEvidence::decode_file(&raw[..raw.len() - 1]) {
+        Err(EvidenceError::LegacyUndecodable(detail)) => assert!(
+            detail.contains("ends before a complete payload"),
+            "expected the truncation reason, got: {detail}"
+        ),
+        other => panic!("expected LegacyUndecodable, got {other:?}"),
+    }
+}
+
+/// The other failing arm of the legacy path: every length is intact, but the content
+/// does not decode. Told apart from truncation by its reason, so a change that merged
+/// the two arms fails one of these two tests.
+#[test]
+fn an_unframed_file_with_undecodable_content_reports_why() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1, 2, 3]]);
+    let evidence = ConformanceEvidence::new(instance(42), vec![7, 8], &case, None);
+    let mut raw = bincode::serialize(&evidence).expect("serialize");
+    // The payload ends with `runtime`: an 8-byte length, the version string, then a
+    // 2-byte schema field. Make the version string invalid UTF-8, lengths intact.
+    let version_len = evidence.runtime.core_version.len();
+    let prefix_at = raw.len() - 2 - version_len - 8;
+    assert_eq!(
+        &raw[prefix_at..prefix_at + 8],
+        &(version_len as u64).to_le_bytes(),
+        "the fixture must be locating the version string's length prefix"
+    );
+    raw[prefix_at + 8..prefix_at + 8 + version_len].fill(0xff);
+    match ConformanceEvidence::decode_file(&raw) {
+        Err(EvidenceError::LegacyUndecodable(detail)) => assert!(
+            detail.contains("does not decode as it"),
+            "expected the content reason, got: {detail}"
+        ),
+        other => panic!("expected LegacyUndecodable, got {other:?}"),
+    }
 }
 
 /// #5578 review finding 4: `Truncated` promised the disk-full case but covered only
@@ -3283,6 +3345,26 @@ fn encode_refuses_a_schema_version_this_build_does_not_write() {
     let mut evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
     evidence.schema_version = 999;
     assert!(matches!(evidence.encode(), Err(EvidenceError::Encode(_))));
+}
+
+/// The size half of the same rule: `encode` refuses a payload that `decode` would
+/// refuse as too large, rather than writing a file nothing can read. Found by the
+/// external review of #5641.
+#[test]
+fn encode_refuses_a_payload_that_decode_would_refuse_as_too_large() {
+    let big = vec![0u8; MAX_EVIDENCE_ENCODED_BYTES + 1];
+    let case = ConformanceCase::new(
+        ConformanceProperty::StateIdempotence,
+        vec![Arc::from(big.as_slice())],
+    );
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    match evidence.encode() {
+        Err(EvidenceError::Encode(detail)) => assert!(
+            detail.contains("that decode accepts"),
+            "expected the size refusal, got: {detail}"
+        ),
+        other => panic!("expected an encode refusal, got {other:?}"),
+    }
 }
 
 #[test]

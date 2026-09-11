@@ -48,6 +48,9 @@ pub const EVIDENCE_MAGIC: &[u8; 8] = b"FRNTEVD1";
 pub enum EvidenceError {
     #[error("not conformance evidence (bad magic)")]
     BadMagic,
+    /// The input ended before the payload it declares was complete. bincode reports
+    /// a hostile length prefix, one claiming more bytes than follow, the same way, so
+    /// this says nothing about whether the sender is honest.
     #[error(
         "evidence is truncated: it ends after {len} byte(s), before it is complete; the \
          file was likely cut off mid-write and should be regenerated"
@@ -65,10 +68,7 @@ pub enum EvidenceError {
     LegacyUnsupported { found: u16 },
     /// An unframed file that starts like pre-framing schema-2 evidence but does not
     /// decode as it.
-    #[error(
-        "this starts like unframed schema-2 evidence from v0.2.133 but does not decode \
-         as it ({0}); if it is evidence, the file is damaged or truncated"
-    )]
+    #[error("this starts like unframed schema-2 evidence from v0.2.133, but {0}")]
     LegacyUndecodable(String),
     #[error(
         "evidence framing header specifies schema {header}, but deserialized payload specifies {body}"
@@ -466,6 +466,16 @@ impl ConformanceEvidence {
         out.extend_from_slice(EVIDENCE_MAGIC);
         out.extend_from_slice(&self.schema_version.to_le_bytes());
         let body = bincode::serialize(self).map_err(|e| EvidenceError::Encode(e.to_string()))?;
+        // Same reasoning as the schema guard above: never write what `decode` refuses.
+        // Evidence that passed `check_bounds` always fits; this catches a caller that
+        // encodes without checking bounds first.
+        if body.len() > MAX_EVIDENCE_ENCODED_BYTES {
+            return Err(EvidenceError::Encode(format!(
+                "the payload is {} bytes, more than the {MAX_EVIDENCE_ENCODED_BYTES} that \
+                 decode accepts",
+                body.len()
+            )));
+        }
         out.extend_from_slice(&body);
         Ok(out)
     }
@@ -478,8 +488,10 @@ impl ConformanceEvidence {
     /// are read by [`Self::decode_file`], which is for files an operator points at
     /// and must never see bytes from a peer.
     ///
-    /// The check order matters. Magic first, so a file cut short inside its header
-    /// reports [`EvidenceError::Truncated`] rather than claiming it is not evidence:
+    /// The check order matters. Magic first, so a file whose 8-byte magic is intact
+    /// but which is cut short after it reports [`EvidenceError::Truncated`] rather than
+    /// claiming it is not evidence (a cut inside the magic itself cannot be told apart
+    /// from a short foreign file, and reports [`EvidenceError::BadMagic`]):
     /// a disk that fills mid-write produces exactly that, and "not conformance
     /// evidence" sends its owner looking for the wrong problem. The payload then goes
     /// through [`decode_body`], which refuses one larger than
@@ -545,13 +557,17 @@ impl ConformanceEvidence {
                 // Hedged like the other two: an oversized file that happens to begin
                 // `02 00` is not thereby evidence.
                 BodyError::TooLarge { found } => EvidenceError::LegacyUndecodable(format!(
-                    "it is {found} bytes, more than any evidence this build accepts \
-                     ({MAX_EVIDENCE_ENCODED_BYTES})"
+                    "is {found} bytes, more than any evidence this build accepts \
+                     ({MAX_EVIDENCE_ENCODED_BYTES}), so it was not read"
                 )),
-                BodyError::EndedEarly => {
-                    EvidenceError::LegacyUndecodable("it ends early".to_string())
-                }
-                BodyError::Malformed(detail) => EvidenceError::LegacyUndecodable(detail),
+                BodyError::EndedEarly => EvidenceError::LegacyUndecodable(
+                    "ends before a complete payload; if it is evidence, the file is \
+                         truncated"
+                        .to_string(),
+                ),
+                BodyError::Malformed(detail) => EvidenceError::LegacyUndecodable(format!(
+                    "does not decode as it ({detail}); if it is evidence, the file is damaged"
+                )),
             });
         }
         if legacy_version == 1 {
@@ -589,14 +605,22 @@ const _: () = assert!(
 /// read as a bound and bound nothing. The bound is the length check at the top of
 /// [`decode_body`], which runs before bincode reads a byte.
 ///
-/// What that leaves for allocation, stated precisely because a receive path will
-/// rely on it: a `String` is bounded by the input, since the slice reader refuses a
-/// declared length longer than the input that remains before allocating. A `Vec` is
-/// not. serde preallocates `min(declared, 1 MiB / element size)` before reading a
-/// single element, so a few dozen hostile bytes declaring `u64::MAX` elements for a
-/// nested `Vec<Vec<u8>>` cost about 2 MiB of transient capacity before decoding
-/// fails. Allocation is therefore bounded by the input plus a small constant, not by
-/// the input alone.
+/// What that leaves for allocation. A `String` costs no more than the input, since
+/// the slice reader refuses a declared length longer than what remains before
+/// allocating. A `Vec` costs more than the input it came from, in two ways. serde
+/// preallocates `min(declared, 1 MiB / element size)` before reading an element, so a
+/// few dozen hostile bytes can reserve about 2 MiB that is never filled. And each
+/// element of a `Vec<Vec<u8>>` costs 8 input bytes but a 24-byte header, grown by
+/// doubling. Reviewers estimated from the serde and bincode sources that a payload
+/// which decodes successfully can allocate about 4 to 7 times its own size.
+///
+/// So allocation is linear in the input, but NOT bounded by it. What bounds a single
+/// decode is the length check: with the payload capped at
+/// [`MAX_EVIDENCE_ENCODED_BYTES`], one decode allocates at most a few MiB (on the
+/// order of 6 MiB at worst, by the same estimate). Tighter bounds, such as refusing a
+/// declared element count above what `check_bounds` allows before allocating, are
+/// recorded for the Phase 4 receive path on #5377, where decodes run concurrently and
+/// the multiplier starts to matter.
 fn evidence_bincode() -> impl bincode::Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
