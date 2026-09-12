@@ -1113,10 +1113,27 @@ impl Clone for Router {
 /// Whether the residual correction replaces the legacy fixed-weight blend in
 /// live routing.
 ///
-/// Default **off**. The correction and the blend are both computed and both
-/// scored either way, so a node accumulates the evidence needed to decide this
-/// without its routing behaviour changing. Promoting the default is a separate
-/// decision on that evidence — see #4485.
+/// Default **ON**. The variable now selects the LEGACY path, not the new one.
+///
+/// The fixed-weight blend it replaces is unprincipled by construction — its
+/// weight tracks how much data exists globally rather than whether there is
+/// evidence for the query at hand — and measured on both nova gateways it has
+/// NEGATIVE skill: across a 200-prediction window it caught none of five real
+/// failures and raised two full-confidence false alarms, scoring worse than a
+/// forecast that simply assumes the base rate.
+///
+/// Keeping that as the default pending "production evidence" was the wrong
+/// call: the evidence already existed, and the thing being protected was the
+/// status quo rather than the network. What genuinely blocked the flip was a
+/// defect in the replacement — an uninformed query fell back to the global
+/// curve, discarding the per-peer EWMA — which `compose_with_prior` fixes. With
+/// that in place there is no regime where the new path is worse: with no
+/// evidence it IS the peer-adjusted estimate, and with evidence it is the
+/// correction.
+///
+/// Set `FREENET_ROUTING_RESIDUAL_CORRECTION=0` to restore the legacy blend.
+/// That is a revert path for an operator who sees a regression, not a
+/// configuration anyone is expected to set.
 ///
 /// Follows the `FREENET_*` convention already used for runtime toggles
 /// (`FREENET_DISABLE_LOGS` and friends); a restart-scoped switch here is
@@ -1141,12 +1158,34 @@ fn residual_correction_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("FREENET_ROUTING_RESIDUAL_CORRECTION")
-            .map(|value| {
-                let value = value.trim().to_ascii_lowercase();
-                value == "1" || value == "true" || value == "yes" || value == "on"
-            })
-            .unwrap_or(false)
+            .map(|value| parse_correction_flag(&value))
+            .unwrap_or(true)
     })
+}
+
+/// Parse the correction kill switch.
+///
+/// Enabled ONLY on an explicit affirmative. Anything else — the documented off
+/// values, but also a typo — disables.
+///
+/// The direction matters because this variable exists solely as a revert path.
+/// The only reason to set it at all is to turn the correction OFF, most likely
+/// mid-incident. If an unrecognised value kept the default,
+/// `FREENET_ROUTING_RESIDUAL_CORRECTION=flase` would silently do nothing at the
+/// one moment this switch has to work. Failing toward the revert costs a node
+/// that fat-fingers an "enable" nothing it did not already have.
+fn parse_correction_flag(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    let affirmative = value == "1" || value == "true" || value == "yes" || value == "on";
+    let recognised_off = value == "0" || value == "false" || value == "no" || value == "off";
+    if !affirmative && !recognised_off {
+        tracing::warn!(
+            value = %value,
+            "FREENET_ROUTING_RESIDUAL_CORRECTION is set to an unrecognised value; \
+             treating it as OFF and using the legacy routing blend"
+        );
+    }
+    affirmative
 }
 
 // Test-only override for `residual_correction_enabled`: 0 unset, 1 on, 2 off.
@@ -1881,12 +1920,17 @@ impl Router {
             distance,
             self.stage_modes(),
         );
-        // Scored against the GLOBAL base, matching how the correction is actually
-        // composed; scoring it against the peer-adjusted estimate would measure a
-        // predictor the router never forms.
-        let corrected = corrections.failure.map_or(global, |correction| {
-            (global + correction.value).clamp(0.0, 1.0)
-        });
+        // Scored exactly as the router composes it, EWMA prior included —
+        // scoring a composition the router never forms would measure a predictor
+        // that does not exist.
+        let corrected = residual::compose_with_prior(
+            self.failure_estimator.adjustment_mode(),
+            global,
+            adjusted,
+            corrections.failure.map_or(0.0, |c| c.lambda),
+            corrections.failure.map_or(0.0, |c| c.value),
+        )
+        .clamp(0.0, 1.0);
 
         self.failure_skill_global.record(global, actual_failure);
         self.failure_skill_adjusted.record(adjusted, actual_failure);
@@ -1937,9 +1981,17 @@ impl Router {
             .location()
             .map(|loc| target_location.distance(loc).as_f64())
             .unwrap_or(0.5);
-        let renegade = self
-            .renegade_predictor
-            .predict(peer, target_location, distance);
+        // The legacy absolute-target query is skipped when the correction is on:
+        // its result is overwritten below in every case where the correction
+        // applies, so computing it would be a k-NN query per candidate peer per
+        // routing decision whose output is discarded.
+        let correction_enabled = residual_correction_enabled();
+        let renegade = if correction_enabled {
+            routing_predictor::RoutingPredictionResult::default()
+        } else {
+            self.renegade_predictor
+                .predict(peer, target_location, distance)
+        };
 
         // Residual correction (#4485), computed ONLY when it will be used.
         //
@@ -1956,7 +2008,6 @@ impl Router {
         // The comparison the rationale wanted happens in `score_failure_layers`,
         // once per completed event rather than once per candidate, and is
         // unaffected by this gate. Flagged in review of #5642.
-        let correction_enabled = residual_correction_enabled();
         let corrections = if correction_enabled {
             self.renegade_predictor.predict_corrections(
                 peer,
@@ -2006,50 +2057,69 @@ impl Router {
         // that it can be scored against this, but it does not reach the estimate
         // the router acts on.
         if correction_enabled {
-            // The correction composes with the GLOBAL curve, matching the space
-            // its residuals were taken in (see `stage_residuals`). It therefore
-            // REPLACES the per-peer EWMA rather than stacking on it — #4485's B5
-            // question, settled by measurement rather than argument.
-            let global_failure = self
+            // The correction learns residuals of the GLOBAL curve, but composes
+            // with the per-peer EWMA as its LOW-EVIDENCE PRIOR. See
+            // `residual::compose_with_prior`: lambda arbitrates between two
+            // priors rather than between a prior and nothing, so an uninformed
+            // query falls back to the peer-adjusted estimate rather than to
+            // distance alone.
+            let modes = self.stage_modes();
+
+            // The peer-adjusted values are ALREADY computed above
+            // (`isotonic_failure`, `time_estimate`, `transfer_estimate`), so only
+            // the global curve is new here. Re-querying `estimate_retrieval_time`
+            // would triple this function's isotonic lookups per candidate peer
+            // for values already in hand — the same waste the comment on the
+            // correction query above warns about, reintroduced one block down.
+            if let Ok(global) = self
                 .failure_estimator
                 .estimate_global(peer, target_location)
-                .ok()
-                .map(|value| value.clamp(0.0, 1.0));
-            // Note the shape: the base is adopted whenever it EXISTS, and the
-            // correction is added only if the residual model has something to
-            // say. An earlier version required both, which quietly defeated the
-            // neutral-when-uninformed property this design rests on — when the
-            // correction abstained (post-restart warm-up, or a query whose
-            // kernel weights underflow) the estimate silently fell back to the
-            // legacy blend, i.e. to exactly the far-field behaviour the
-            // correction exists to replace. Abstention must mean "base plus
-            // nothing", not "revert to the old model".
-            if let Some(base) = global_failure {
-                let corrected =
-                    (base + corrections.failure.map_or(0.0, |c| c.value)).clamp(0.0, 1.0);
+            {
+                let correction = corrections.failure;
+                let corrected = residual::compose_with_prior(
+                    modes.failure,
+                    global.clamp(0.0, 1.0),
+                    isotonic_failure,
+                    correction.map_or(0.0, |c| c.lambda),
+                    correction.map_or(0.0, |c| c.value),
+                )
+                .clamp(0.0, 1.0);
                 if corrected.is_finite() {
                     failure_estimate = corrected;
                 }
             }
-            let modes = self.stage_modes();
-            let global_time = self
-                .response_start_time_estimator
-                .estimate_global(peer, target_location)
-                .ok();
-            let global_transfer = self
-                .transfer_rate_estimator
-                .estimate_global(peer, target_location)
-                .ok();
-            if let Some(base) = global_time {
-                let correction = corrections.response_time.map_or(0.0, |c| c.value);
-                let corrected = modes.response_time.apply(base, correction);
+
+            if let (Ok(global), Some(adjusted)) = (
+                self.response_start_time_estimator
+                    .estimate_global(peer, target_location),
+                time_estimate,
+            ) {
+                let correction = corrections.response_time;
+                let corrected = residual::compose_with_prior(
+                    modes.response_time,
+                    global,
+                    adjusted,
+                    correction.map_or(0.0, |c| c.lambda),
+                    correction.map_or(0.0, |c| c.value),
+                );
                 if corrected.is_finite() && corrected >= 0.0 {
                     time_to_response_start = corrected;
                 }
             }
-            if let Some(base) = global_transfer {
-                let correction = corrections.transfer_speed.map_or(0.0, |c| c.value);
-                let corrected = modes.transfer_speed.apply(base, correction);
+
+            if let (Ok(global), Some(adjusted)) = (
+                self.transfer_rate_estimator
+                    .estimate_global(peer, target_location),
+                transfer_estimate,
+            ) {
+                let correction = corrections.transfer_speed;
+                let corrected = residual::compose_with_prior(
+                    modes.transfer_speed,
+                    global,
+                    adjusted,
+                    correction.map_or(0.0, |c| c.lambda),
+                    correction.map_or(0.0, |c| c.value),
+                );
                 if corrected.is_finite() && corrected > 0.0 {
                     xfer_speed = corrected;
                 }
@@ -3121,6 +3191,36 @@ mod tests {
             snapshot.saturated, 25,
             "40 candidates cut to a 25-peer window discards 15 unscored every time"
         );
+    }
+
+    /// The kill switch must fail TOWARD the revert.
+    ///
+    /// This variable exists only to turn the correction off, most likely during
+    /// an incident. A typo that silently left it enabled would break it at the
+    /// one moment it has to work, so anything not explicitly affirmative
+    /// disables.
+    #[test]
+    fn correction_kill_switch_fails_toward_the_revert() {
+        for enable in ["1", "true", "yes", "on", "TRUE", " on "] {
+            assert!(
+                parse_correction_flag(enable),
+                "{enable:?} must enable the correction"
+            );
+        }
+        for disable in ["0", "false", "no", "off", "OFF", " 0 "] {
+            assert!(
+                !parse_correction_flag(disable),
+                "{disable:?} must disable the correction"
+            );
+        }
+        // The case that matters: a mistyped revert must still revert.
+        for typo in ["flase", "fasle", "nope", "disabled", "", "  ", "2", "maybe"] {
+            assert!(
+                !parse_correction_flag(typo),
+                "{typo:?} is not an explicit enable, so it must fall back to the \
+                 legacy blend rather than silently leaving the correction on"
+            );
+        }
     }
 
     #[test]
