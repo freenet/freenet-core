@@ -1,4 +1,5 @@
 mod isotonic_estimator;
+mod residual;
 mod routing_predictor;
 mod util;
 
