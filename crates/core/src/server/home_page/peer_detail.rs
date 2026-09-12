@@ -52,11 +52,11 @@ fn fmt_window_reading(share: Option<f64>) -> String {
     match share {
         None => "Not enough decisions against a full window to say yet.".to_string(),
         Some(share) if share >= WINDOW_TOO_NARROW_SHARE => format!(
-            "<strong>Worth investigating:</strong> {:.0}% of full-window decisions chose from              the farthest quarter, so the better peer may often be one the router never scored.",
+            "<strong>Worth investigating:</strong> {:.0}% of full-window decisions chose from the farthest quarter, so the better peer may often be one the router never scored.",
             share * 100.0
         ),
         Some(share) => format!(
-            "The limit looks comfortable: only {:.0}% of full-window decisions chose from the              farthest quarter, so widening it would rarely change the outcome.",
+            "The limit looks comfortable: only {:.0}% of full-window decisions chose from the farthest quarter, so widening it would rarely change the outcome.",
             share * 100.0
         ),
     }
@@ -159,7 +159,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">This peer: transfer rate</div><div class="info-value">{pt} events</div>
                 </div>
                 <h3 style="margin-top: 1em;">Renegade ML Predictor</h3>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;"><a href="https://github.com/sanity/renegade" target="_blank" rel="noopener noreferrer" class="ext-link">Renegade</a> is a zero-configuration k-nearest-neighbours model (it auto-selects K and learns which features matter). It learns from four features (peer, contract location, distance, time) what the distance-based estimate gets <em>wrong</em> for a particular peer and contract, and corrects it &mdash; catching patterns distance alone misses, such as a peer that drops requests for specific contracts. It corrects the <em>distance-only</em> estimate directly, taking over from the simpler per-peer offset rather than adding to it. How much of the correction is applied depends on how much nearby evidence supports it, so a query the model knows nothing about leaves the distance-only estimate untouched.</p>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;"><a href="https://github.com/sanity/renegade" target="_blank" rel="noopener noreferrer" class="ext-link">Renegade</a> is a zero-configuration k-nearest-neighbours model (it auto-selects K and learns which features matter). It learns from four features (peer, contract location, distance, time) what the distance-based estimate gets <em>wrong</em> for a particular peer and contract, and corrects it &mdash; catching patterns distance alone misses, such as a peer that drops requests for specific contracts. It corrects the <em>distance-only</em> estimate directly, taking over from the simpler per-peer offset only in proportion to the evidence it has &mdash; so a peer it knows nothing about still gets the per-peer offset, unchanged. How much of the correction is applied depends on how much nearby evidence supports it, so a query the model knows nothing about leaves the distance-only estimate untouched.</p>
                 <div class="info-grid">
                     <div class="info-label">Failure observations</div><div class="info-value">{rf}</div>
                     <div class="info-label">Response time observations</div><div class="info-value">{rr}</div>
@@ -172,12 +172,12 @@ pub fn peer_detail_html(address_str: &str) -> String {
 
                 <h3 style="margin-top: 1em;">Which layer is doing the work?</h3>
                 <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">Each layer&rsquo;s <strong>skill</strong> against simply assuming the average failure rate. <strong>0 means no better than that assumption; negative means worse.</strong> Skill rather than a raw score because failures are rare, and on a rare event a raw score mostly measures the rarity: at a {base_rate} failure rate, a forecast that never predicts failure at all scores {clim_brier} and looks excellent.</p>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">These are <strong>two routes from the same starting point</strong>, not one running total. Both begin at the distance-only estimate. The established route adds a per-peer offset and then the Renegade blend; the correction route instead learns what the distance-only estimate gets wrong for this exact peer and contract, and <strong>replaces</strong> the per-peer offset rather than stacking on it. Compare the two end points, not the rows in order.</p>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">These are <strong>two routes from the same starting point</strong>, not one running total. Both begin at the distance-only estimate. The established route adds a per-peer offset and then the Renegade blend. The correction route instead learns what the distance-only estimate gets wrong for this exact peer and contract, and <strong>hands over from the per-peer offset as evidence accumulates</strong> &mdash; with nothing nearby to go on it is the per-peer offset, and with plenty it is the learned correction. Compare the two end points, not the rows in order.</p>
                 <div class="info-grid">
                     <div class="info-label">Both routes start at: distance only</div><div class="info-value">{skill_global}</div>
                     <div class="info-label">&#8627; established: + per-peer offset</div><div class="info-value">{skill_adjusted}</div>
                     <div class="info-label">&#8627; established: + Renegade blend{blend_note}</div><div class="info-value">{skill_blended}</div>
-                    <div class="info-label">&#8627; correction: distance only + residual{corrected_note}</div><div class="info-value">{skill_corrected}</div>
+                    <div class="info-label">&#8627; correction: offset, handing over to residual{corrected_note}</div><div class="info-value">{skill_corrected}</div>
                     <div class="info-label">Scored predictions</div><div class="info-value">{layers_eval}</div>
                 </div>
 
@@ -651,6 +651,28 @@ mod tests {
         );
     }
 
+    /// Guards a defect that shipped once and that the substring assertions above
+    /// could not see: a `\`-continued string literal lost its continuation and
+    /// left fourteen literal spaces mid-sentence. Every existing test still
+    /// passed, because each only looked for a fragment.
+    #[test]
+    fn window_reading_contains_no_collapsed_whitespace() {
+        for share in [None, Some(0.0), Some(0.42), Some(1.0)] {
+            let reading = fmt_window_reading(share);
+            assert!(
+                !reading.contains("  "),
+                "rendered copy must not carry a run of spaces, got: {reading}"
+            );
+        }
+        for skill in [None, Some(-0.5), Some(0.0), Some(0.5)] {
+            let rendered = fmt_skill(skill);
+            assert!(
+                !rendered.contains("  "),
+                "rendered skill must not carry a run of spaces, got: {rendered}"
+            );
+        }
+    }
+
     #[test]
     fn window_reading_reports_the_share_it_judged() {
         // A verdict without its number is not checkable by the reader.
@@ -715,8 +737,10 @@ mod tests {
             "the panel must say the rows are alternative routes, not a running total"
         );
         assert!(
-            panel.contains("replaces"),
-            "the panel must say the correction REPLACES the per-peer offset"
+            panel.contains("hands over from the per-peer offset"),
+            "the panel must say the correction HANDS OVER FROM the per-peer offset \
+             as evidence accrues — it does not replace it outright, and saying so \
+             would misdescribe what a low-evidence query actually gets"
         );
         assert!(
             !panel.contains(r#"<div class="info-label">+ residual correction"#),

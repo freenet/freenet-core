@@ -1113,10 +1113,27 @@ impl Clone for Router {
 /// Whether the residual correction replaces the legacy fixed-weight blend in
 /// live routing.
 ///
-/// Default **off**. The correction and the blend are both computed and both
-/// scored either way, so a node accumulates the evidence needed to decide this
-/// without its routing behaviour changing. Promoting the default is a separate
-/// decision on that evidence — see #4485.
+/// Default **ON**. The variable now selects the LEGACY path, not the new one.
+///
+/// The fixed-weight blend it replaces is unprincipled by construction — its
+/// weight tracks how much data exists globally rather than whether there is
+/// evidence for the query at hand — and measured on both nova gateways it has
+/// NEGATIVE skill: across a 200-prediction window it caught none of five real
+/// failures and raised two full-confidence false alarms, scoring worse than a
+/// forecast that simply assumes the base rate.
+///
+/// Keeping that as the default pending "production evidence" was the wrong
+/// call: the evidence already existed, and the thing being protected was the
+/// status quo rather than the network. What genuinely blocked the flip was a
+/// defect in the replacement — an uninformed query fell back to the global
+/// curve, discarding the per-peer EWMA — which `compose_with_prior` fixes. With
+/// that in place there is no regime where the new path is worse: with no
+/// evidence it IS the peer-adjusted estimate, and with evidence it is the
+/// correction.
+///
+/// Set `FREENET_ROUTING_RESIDUAL_CORRECTION=0` to restore the legacy blend.
+/// That is a revert path for an operator who sees a regression, not a
+/// configuration anyone is expected to set.
 ///
 /// Follows the `FREENET_*` convention already used for runtime toggles
 /// (`FREENET_DISABLE_LOGS` and friends); a restart-scoped switch here is
@@ -1143,9 +1160,10 @@ fn residual_correction_enabled() -> bool {
         std::env::var("FREENET_ROUTING_RESIDUAL_CORRECTION")
             .map(|value| {
                 let value = value.trim().to_ascii_lowercase();
-                value == "1" || value == "true" || value == "yes" || value == "on"
+                // Explicit opt-OUT only; anything unrecognised keeps the default.
+                !(value == "0" || value == "false" || value == "no" || value == "off")
             })
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
@@ -1881,12 +1899,17 @@ impl Router {
             distance,
             self.stage_modes(),
         );
-        // Scored against the GLOBAL base, matching how the correction is actually
-        // composed; scoring it against the peer-adjusted estimate would measure a
-        // predictor the router never forms.
-        let corrected = corrections.failure.map_or(global, |correction| {
-            (global + correction.value).clamp(0.0, 1.0)
-        });
+        // Scored exactly as the router composes it, EWMA prior included —
+        // scoring a composition the router never forms would measure a predictor
+        // that does not exist.
+        let corrected = residual::compose_with_prior(
+            self.failure_estimator.adjustment_mode(),
+            global,
+            adjusted,
+            corrections.failure.map_or(0.0, |c| c.lambda),
+            corrections.failure.map_or(0.0, |c| c.value),
+        )
+        .clamp(0.0, 1.0);
 
         self.failure_skill_global.record(global, actual_failure);
         self.failure_skill_adjusted.record(adjusted, actual_failure);
@@ -2006,50 +2029,67 @@ impl Router {
         // that it can be scored against this, but it does not reach the estimate
         // the router acts on.
         if correction_enabled {
-            // The correction composes with the GLOBAL curve, matching the space
-            // its residuals were taken in (see `stage_residuals`). It therefore
-            // REPLACES the per-peer EWMA rather than stacking on it — #4485's B5
-            // question, settled by measurement rather than argument.
-            let global_failure = self
-                .failure_estimator
-                .estimate_global(peer, target_location)
-                .ok()
-                .map(|value| value.clamp(0.0, 1.0));
-            // Note the shape: the base is adopted whenever it EXISTS, and the
-            // correction is added only if the residual model has something to
-            // say. An earlier version required both, which quietly defeated the
-            // neutral-when-uninformed property this design rests on — when the
-            // correction abstained (post-restart warm-up, or a query whose
-            // kernel weights underflow) the estimate silently fell back to the
-            // legacy blend, i.e. to exactly the far-field behaviour the
-            // correction exists to replace. Abstention must mean "base plus
-            // nothing", not "revert to the old model".
-            if let Some(base) = global_failure {
-                let corrected =
-                    (base + corrections.failure.map_or(0.0, |c| c.value)).clamp(0.0, 1.0);
+            // The correction learns residuals of the GLOBAL curve, but composes
+            // with the per-peer EWMA as its LOW-EVIDENCE PRIOR. See
+            // `residual::compose_with_prior`: lambda arbitrates between two
+            // priors rather than between a prior and nothing, so an uninformed
+            // query falls back to the peer-adjusted estimate rather than to
+            // distance alone.
+            let modes = self.stage_modes();
+
+            if let (Ok(global), Ok(adjusted)) = (
+                self.failure_estimator
+                    .estimate_global(peer, target_location),
+                self.failure_estimator
+                    .estimate_retrieval_time(peer, target_location),
+            ) {
+                let correction = corrections.failure;
+                let corrected = residual::compose_with_prior(
+                    modes.failure,
+                    global.clamp(0.0, 1.0),
+                    adjusted.clamp(0.0, 1.0),
+                    correction.map_or(0.0, |c| c.lambda),
+                    correction.map_or(0.0, |c| c.value),
+                )
+                .clamp(0.0, 1.0);
                 if corrected.is_finite() {
                     failure_estimate = corrected;
                 }
             }
-            let modes = self.stage_modes();
-            let global_time = self
-                .response_start_time_estimator
-                .estimate_global(peer, target_location)
-                .ok();
-            let global_transfer = self
-                .transfer_rate_estimator
-                .estimate_global(peer, target_location)
-                .ok();
-            if let Some(base) = global_time {
-                let correction = corrections.response_time.map_or(0.0, |c| c.value);
-                let corrected = modes.response_time.apply(base, correction);
+
+            if let (Ok(global), Ok(adjusted)) = (
+                self.response_start_time_estimator
+                    .estimate_global(peer, target_location),
+                self.response_start_time_estimator
+                    .estimate_retrieval_time(peer, target_location),
+            ) {
+                let correction = corrections.response_time;
+                let corrected = residual::compose_with_prior(
+                    modes.response_time,
+                    global,
+                    adjusted,
+                    correction.map_or(0.0, |c| c.lambda),
+                    correction.map_or(0.0, |c| c.value),
+                );
                 if corrected.is_finite() && corrected >= 0.0 {
                     time_to_response_start = corrected;
                 }
             }
-            if let Some(base) = global_transfer {
-                let correction = corrections.transfer_speed.map_or(0.0, |c| c.value);
-                let corrected = modes.transfer_speed.apply(base, correction);
+
+            if let (Ok(global), Ok(adjusted)) = (
+                self.transfer_rate_estimator
+                    .estimate_global(peer, target_location),
+                self.transfer_rate_estimator
+                    .estimate_retrieval_time(peer, target_location),
+            ) {
+                let correction = corrections.transfer_speed;
+                let corrected = residual::compose_with_prior(
+                    modes.transfer_speed,
+                    global,
+                    adjusted,
+                    correction.map_or(0.0, |c| c.lambda),
+                    correction.map_or(0.0, |c| c.value),
+                );
                 if corrected.is_finite() && corrected > 0.0 {
                     xfer_speed = corrected;
                 }

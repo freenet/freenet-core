@@ -48,6 +48,8 @@
 //! selects by measured prequential loss, so the derivation fixes the *shape* and
 //! the data fixes the *value*.
 
+use super::isotonic_estimator::AdjustmentMode;
+
 /// Candidate `κ` values. Spans "trust a single nearby observation" (0.5) to
 /// "demand tens of observations before correcting much" (32).
 const KAPPA_GRID: [f64; 7] = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
@@ -379,6 +381,68 @@ impl ShrinkageSelector {
     }
 }
 
+/// Combine the learned correction with the per-peer EWMA acting as its
+/// low-evidence prior.
+///
+/// ```text
+/// prediction = global ⊕ [ (1−λ)·ewma + λ·r̂ ]
+/// ```
+///
+/// # Why the EWMA has to be here
+///
+/// The correction learns residuals of the GLOBAL curve, which is correct — the
+/// EWMA's own noise in the target is unlearnable and was measured to wreck
+/// recovery. But composing the *prediction* with the global curve alone made
+/// "neutral when uninformed" mean **fall back to distance only**, discarding a
+/// per-peer signal that works today.
+///
+/// That is not a tail case. The residual stages start empty on every node (the
+/// batch reload deliberately records no residuals, to avoid leaking future
+/// outcomes into past ones), so it is every node after a restart, and every
+/// unfamiliar (peer, contract) query forever.
+///
+/// Neutral should mean "fall back to the best estimate available WITHOUT the
+/// correction", and that is the peer-adjusted one. So λ now arbitrates between
+/// two priors rather than between a prior and nothing: the EWMA holds where
+/// there is no evidence, the correction takes over as evidence accrues. Same
+/// shrinkage logic, one level up.
+///
+/// The consequence that matters: there is no regime where this is worse than
+/// the current default. With no evidence it IS the current peer-adjusted
+/// estimate (minus the fixed-weight blend, which measured negative skill); with
+/// evidence it is the correction. That is what makes turning it on safe.
+pub(crate) fn compose_with_prior(
+    mode: AdjustmentMode,
+    global: f64,
+    peer_adjusted: f64,
+    lambda: f64,
+    correction: f64,
+) -> f64 {
+    // The EWMA's own adjustment, recovered in the mode's own space — additive
+    // offset or log-ratio — so this works for either without special-casing.
+    let prior = mode.residual(peer_adjusted, global).unwrap_or(0.0);
+    let lambda = if lambda.is_finite() {
+        lambda.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let correction = if correction.is_finite() {
+        correction
+    } else {
+        0.0
+    };
+    let combined = (1.0 - lambda) * prior + correction;
+    if !combined.is_finite() {
+        return peer_adjusted;
+    }
+    let composed = mode.apply(global, combined);
+    if composed.is_finite() {
+        composed
+    } else {
+        peer_adjusted
+    }
+}
+
 /// Prequential accuracy for one prediction layer, scored against the
 /// climatological base rate rather than an absolute threshold.
 ///
@@ -707,6 +771,63 @@ mod tests {
         record_uniform(&mut selector, 1.0, 0.0, f64::INFINITY);
         assert_eq!(selector.scored(), 0);
         assert_eq!(selector.residual_sigma(), None);
+    }
+
+    #[test]
+    fn no_evidence_composes_to_exactly_the_peer_adjusted_estimate() {
+        // The property that makes enabling this safe: with lambda 0 the result
+        // is today's peer-adjusted estimate, NOT the bare global curve.
+        for (global, adjusted) in [(0.10f64, 0.18f64), (0.02, 0.01), (0.5, 0.5)] {
+            let composed = compose_with_prior(AdjustmentMode::Additive, global, adjusted, 0.0, 0.0);
+            assert!(
+                (composed - adjusted).abs() < 1e-12,
+                "lambda=0 must fall back to the peer-adjusted estimate, got {composed} \
+                 for global {global} / adjusted {adjusted}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_evidence_composes_to_the_global_curve_plus_the_correction() {
+        let composed = compose_with_prior(AdjustmentMode::Additive, 0.10, 0.18, 1.0, 0.25);
+        assert!(
+            (composed - 0.35).abs() < 1e-12,
+            "lambda=1 must drop the prior entirely, got {composed}"
+        );
+    }
+
+    #[test]
+    fn partial_evidence_interpolates_between_the_two_priors() {
+        // global 0.10, ewma prior +0.08, correction 0.25 at lambda 0.5
+        // => 0.10 + 0.5*0.08 + 0.25 = 0.39
+        let composed = compose_with_prior(AdjustmentMode::Additive, 0.10, 0.18, 0.5, 0.25);
+        assert!((composed - 0.39).abs() < 1e-12, "got {composed}");
+    }
+
+    #[test]
+    fn composition_works_in_multiplicative_space() {
+        // global 100, adjusted 200 => log-ratio prior ln(2)
+        // lambda 0 must recover 200 exactly.
+        let composed = compose_with_prior(AdjustmentMode::Multiplicative, 100.0, 200.0, 0.0, 0.0);
+        assert!(
+            (composed - 200.0).abs() < 1e-9,
+            "multiplicative lambda=0 must recover the peer-adjusted value, got {composed}"
+        );
+        // lambda 1 with no correction returns to the global curve.
+        let composed = compose_with_prior(AdjustmentMode::Multiplicative, 100.0, 200.0, 1.0, 0.0);
+        assert!((composed - 100.0).abs() < 1e-9, "got {composed}");
+    }
+
+    #[test]
+    fn composition_survives_unusable_inputs() {
+        // A non-finite lambda or correction must degrade to the safe prior
+        // rather than propagate into the router's cost comparator.
+        for lambda in [f64::NAN, f64::INFINITY, -1.0] {
+            let composed = compose_with_prior(AdjustmentMode::Additive, 0.1, 0.18, lambda, 0.0);
+            assert!(composed.is_finite(), "lambda {lambda} produced {composed}");
+        }
+        let composed = compose_with_prior(AdjustmentMode::Additive, 0.1, 0.18, 0.5, f64::NAN);
+        assert!((composed - 0.14).abs() < 1e-12, "got {composed}");
     }
 
     #[test]
