@@ -132,7 +132,7 @@ impl AdjustmentMode {
     /// strictly-positive observation and global estimate (`ln` is undefined at or
     /// below zero); such events are skipped rather than corrupting the EWMA with
     /// `NaN`/`-inf`.
-    fn residual(self, observed: f64, global: f64) -> Option<f64> {
+    pub(crate) fn residual(self, observed: f64, global: f64) -> Option<f64> {
         match self {
             AdjustmentMode::Additive => Some(observed - global),
             AdjustmentMode::Multiplicative => {
@@ -556,12 +556,36 @@ impl IsotonicEstimator {
     }
 
     /// The per-peer adjustment mode this estimator was constructed with.
-    /// Test-only: used to pin each estimator's mode (see the router test
-    /// `estimators_use_intended_adjustment_modes`). When the dashboard is wired to
-    /// read the mode (the #4547 follow-up), drop the `cfg(test)` to make it real API.
-    #[cfg(test)]
+    ///
+    /// Was `cfg(test)` while only the router test `estimators_use_intended_adjustment_modes`
+    /// needed it. Now real API: the residual correction has to express its target
+    /// in the same space this estimator adjusts in, so it asks rather than
+    /// duplicating the per-target decision and letting the two drift apart.
     pub(crate) fn adjustment_mode(&self) -> AdjustmentMode {
         self.adjustment_mode
+    }
+
+    /// The global distance→outcome estimate, without this peer's EWMA adjustment.
+    ///
+    /// Exists so the dashboard can attribute a prediction across its layers
+    /// (distance only → peer-adjusted → corrected) and score each separately.
+    /// Without it there is no way to tell which layer is doing the work, which is
+    /// the question an operator actually has.
+    pub(crate) fn estimate_global(
+        &self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+    ) -> Result<f64, EstimationError> {
+        if self.global_regression.len() < MIN_POINTS_FOR_REGRESSION {
+            return Err(EstimationError::InsufficientData);
+        }
+        let peer_location = peer.location().ok_or(EstimationError::InsufficientData)?;
+        let distance: f64 = contract_location.distance(peer_location).as_f64();
+        let global_estimate = self
+            .global_regression
+            .interpolate(distance)
+            .ok_or(EstimationError::InsufficientData)?;
+        Ok(self.adjustment_mode.floor_base(global_estimate).max(0.0))
     }
 
     /// Return the x-range of actual regression data points, or (0, 0) if empty.

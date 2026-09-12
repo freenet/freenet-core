@@ -1000,6 +1000,21 @@ pub(crate) struct Router {
     /// and per-peer behavior that varies by contract location.
     #[serde(skip)]
     renegade_predictor: routing_predictor::RoutingPredictor,
+    /// Prequential skill of each failure-prediction layer, so the contribution of
+    /// each can be read off separately (#4485).
+    ///
+    /// Until this existed only the Renegade layer was scored, which made it
+    /// impossible to say which layer was doing the work — or whether the blend
+    /// was helping at all. All four are scored whatever the correction flag is
+    /// set to: measurement is the point, and it is what decides the flag.
+    #[serde(skip)]
+    failure_skill_global: residual::SkillTracker,
+    #[serde(skip)]
+    failure_skill_adjusted: residual::SkillTracker,
+    #[serde(skip)]
+    failure_skill_blended: residual::SkillTracker,
+    #[serde(skip)]
+    failure_skill_corrected: residual::SkillTracker,
 }
 
 impl Clone for Router {
@@ -1017,8 +1032,39 @@ impl Clone for Router {
             per_op_response_time: self.per_op_response_time.clone(),
             per_op_transfer_rate: self.per_op_transfer_rate.clone(),
             renegade_predictor: routing_predictor::RoutingPredictor::new(RENEGADE_MAX_OBSERVATIONS),
+            // Reset with the predictor: these score the predictor's output, so
+            // carrying them across a clone that discards it would attribute one
+            // model's accuracy to another.
+            failure_skill_global: residual::SkillTracker::new(),
+            failure_skill_adjusted: residual::SkillTracker::new(),
+            failure_skill_blended: residual::SkillTracker::new(),
+            failure_skill_corrected: residual::SkillTracker::new(),
         }
     }
+}
+
+/// Whether the residual correction replaces the legacy fixed-weight blend in
+/// live routing.
+///
+/// Default **off**. The correction and the blend are both computed and both
+/// scored either way, so a node accumulates the evidence needed to decide this
+/// without its routing behaviour changing. Promoting the default is a separate
+/// decision on that evidence — see #4485.
+///
+/// Follows the `FREENET_*` convention already used for runtime toggles
+/// (`FREENET_DISABLE_LOGS` and friends); a restart-scoped switch here is
+/// equivalent to a CLI flag and needs no plumbing through every `Router::new`
+/// call site, several of which are in unrelated tests.
+fn residual_correction_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FREENET_ROUTING_RESIDUAL_CORRECTION")
+            .map(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                value == "1" || value == "true" || value == "yes" || value == "on"
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Maximum observations to retain per renegade funnel stage.
@@ -1128,11 +1174,21 @@ impl Router {
 
             // Use index-based time: events are ordered, each ~1 minute apart
             let time_hours = idx as f64 / 60.0;
+            // No residuals from history, deliberately. A residual has to be taken
+            // against the base estimate AS IT STOOD when the event arrived, and
+            // this path builds the isotonic estimators wholesale from the whole
+            // history rather than incrementally — so no such "estimate as of event
+            // i" exists here. Using the final fitted curve instead would leak
+            // future outcomes into past residuals, training the correction on
+            // information it will never have in production. The residual stages
+            // therefore start empty and fill from live traffic, which costs a
+            // warm-up rather than correctness.
             renegade_predictor.record_at_time(
                 &event.peer,
                 event.contract_location,
                 distance,
                 outcome,
+                routing_predictor::StageResiduals::default(),
                 time_hours,
             );
         }
@@ -1230,6 +1286,13 @@ impl Router {
                 .map(|(k, v)| (k, IsotonicEstimator::new(v, EstimatorType::Negative)))
                 .collect(),
             renegade_predictor,
+            // Start empty on a reload for the same reason the residual stages do:
+            // the layers being scored are rebuilt here, so history carries no
+            // comparable measurement forward.
+            failure_skill_global: residual::SkillTracker::new(),
+            failure_skill_adjusted: residual::SkillTracker::new(),
+            failure_skill_blended: residual::SkillTracker::new(),
+            failure_skill_corrected: residual::SkillTracker::new(),
         }
     }
 
@@ -1252,11 +1315,21 @@ impl Router {
 
         let (renegade_outcome, _) =
             routing_predictor::RoutingOutcome::from_route_outcome(&event.outcome);
+        // Residual targets, captured against the base estimates as they stand
+        // right now — before the isotonic estimators below ingest this event.
+        let residuals =
+            self.stage_residuals(&event.peer, event.contract_location, &renegade_outcome);
+        self.score_failure_layers(
+            &event.peer,
+            event.contract_location,
+            if renegade_outcome.success { 0.0 } else { 1.0 },
+        );
         self.renegade_predictor.record(
             &event.peer,
             event.contract_location,
             distance,
             renegade_outcome,
+            residuals,
         );
 
         // Feed global isotonic estimators
@@ -1420,6 +1493,124 @@ impl Router {
         selected
     }
 
+    /// The adjustment space each estimator composes its per-peer correction in.
+    /// Read from the estimators so the residual correction cannot drift out of
+    /// step with them.
+    fn stage_modes(&self) -> routing_predictor::StageModes {
+        routing_predictor::StageModes {
+            failure: self.failure_estimator.adjustment_mode(),
+            response_time: self.response_start_time_estimator.adjustment_mode(),
+            transfer_speed: self.transfer_rate_estimator.adjustment_mode(),
+        }
+    }
+
+    /// Residual of each estimator's current prediction against what actually
+    /// happened, in that estimator's own adjustment space.
+    ///
+    /// MUST be called before the isotonic estimators ingest the event: a residual
+    /// taken after the base model has already fitted the point understates the
+    /// error, and the correction then learns to under-correct.
+    fn stage_residuals(
+        &self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+        outcome: &routing_predictor::RoutingOutcome,
+    ) -> routing_predictor::StageResiduals {
+        let actual_failure = if outcome.success { 0.0 } else { 1.0 };
+        let failure = self
+            .failure_estimator
+            .estimate_retrieval_time(peer, contract_location)
+            .ok()
+            .and_then(|base| {
+                self.failure_estimator
+                    .adjustment_mode()
+                    .residual(actual_failure, base.clamp(0.0, 1.0))
+            });
+
+        let response_time = outcome.time_to_response_start_secs.and_then(|actual| {
+            self.response_start_time_estimator
+                .estimate_retrieval_time(peer, contract_location)
+                .ok()
+                .and_then(|base| {
+                    self.response_start_time_estimator
+                        .adjustment_mode()
+                        .residual(actual, base)
+                })
+        });
+
+        let transfer_speed = outcome.transfer_speed_bps.and_then(|actual| {
+            self.transfer_rate_estimator
+                .estimate_retrieval_time(peer, contract_location)
+                .ok()
+                .and_then(|base| {
+                    self.transfer_rate_estimator
+                        .adjustment_mode()
+                        .residual(actual, base)
+                })
+        });
+
+        routing_predictor::StageResiduals {
+            failure,
+            response_time,
+            transfer_speed,
+        }
+    }
+
+    /// Score every failure-prediction layer against what actually happened.
+    ///
+    /// MUST be called before the isotonic estimators ingest the event, for the
+    /// same reason the residuals are: a layer graded after the base model has
+    /// fitted the outcome is grading itself on the answer.
+    fn score_failure_layers(
+        &mut self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+        actual_failure: f64,
+    ) {
+        let (Ok(global), Ok(adjusted)) = (
+            self.failure_estimator.estimate_global(peer, contract_location),
+            self.failure_estimator
+                .estimate_retrieval_time(peer, contract_location),
+        ) else {
+            return;
+        };
+        let global = global.clamp(0.0, 1.0);
+        let adjusted = adjusted.clamp(0.0, 1.0);
+
+        let distance = peer
+            .location()
+            .map(|loc| contract_location.distance(loc).as_f64())
+            .unwrap_or(0.5);
+
+        let renegade = self
+            .renegade_predictor
+            .predict(peer, contract_location, distance);
+        let blended = match renegade.failure_probability {
+            Some(probability) if probability.is_finite() => {
+                let weight = self.renegade_predictor.failure_weight();
+                (adjusted * (1.0 - weight) + probability.clamp(0.0, 1.0) * weight).clamp(0.0, 1.0)
+            }
+            _ => adjusted,
+        };
+
+        let corrections = self.renegade_predictor.predict_corrections(
+            peer,
+            contract_location,
+            distance,
+            self.stage_modes(),
+        );
+        let corrected = corrections
+            .failure
+            .map_or(adjusted, |correction| {
+                (adjusted + correction.value).clamp(0.0, 1.0)
+            });
+
+        self.failure_skill_global.record(global, actual_failure);
+        self.failure_skill_adjusted.record(adjusted, actual_failure);
+        self.failure_skill_blended.record(blended, actual_failure);
+        self.failure_skill_corrected.record(corrected, actual_failure);
+    }
+
     fn predict_routing_outcome(
         &self,
         peer: &PeerKeyLocation,
@@ -1466,6 +1657,24 @@ impl Router {
             .renegade_predictor
             .predict(peer, target_location, distance);
 
+        // Residual correction (#4485). Computed unconditionally so the two
+        // approaches can be scored against each other on live traffic, but only
+        // applied to the estimate the router acts on when explicitly enabled.
+        let corrections = self.renegade_predictor.predict_corrections(
+            peer,
+            target_location,
+            distance,
+            self.stage_modes(),
+        );
+        let correction_enabled = residual_correction_enabled();
+
+        let corrected_failure = corrections.failure.map(|correction| {
+            // Additive space, then clamped: the failure target is a probability,
+            // and `AdjustmentMode::Additive` is the same composition the per-peer
+            // EWMA already uses for it.
+            (isotonic_failure + correction.value).clamp(0.0, 1.0)
+        });
+
         let renegade_failure_adjustment =
             if let Some(renegade_failure) = renegade.failure_probability {
                 if renegade_failure.is_finite() {
@@ -1495,6 +1704,30 @@ impl Router {
             if transfer_estimate.is_some() && renegade_speed.is_finite() && renegade_speed > 0.0 {
                 let w = self.renegade_predictor.transfer_speed_weight();
                 xfer_speed = xfer_speed * (1.0 - w) + renegade_speed * w;
+            }
+        }
+
+        // When enabled, the correction REPLACES the legacy blend rather than
+        // composing with it. Both are corrections to the same base estimate, so
+        // applying both would double-count. The blend is still computed above so
+        // that it can be scored against this, but it does not reach the estimate
+        // the router acts on.
+        if correction_enabled {
+            if let Some(corrected) = corrected_failure {
+                failure_estimate = corrected;
+            }
+            let modes = self.stage_modes();
+            if let (Some(base), Some(correction)) = (time_estimate, corrections.response_time) {
+                let corrected = modes.response_time.apply(base, correction.value);
+                if corrected.is_finite() && corrected >= 0.0 {
+                    time_to_response_start = corrected;
+                }
+            }
+            if let (Some(base), Some(correction)) = (transfer_estimate, corrections.transfer_speed) {
+                let corrected = modes.transfer_speed.apply(base, correction.value);
+                if corrected.is_finite() && corrected > 0.0 {
+                    xfer_speed = corrected;
+                }
             }
         }
 

@@ -8,6 +8,8 @@
 //! Each stage uses the same features: (peer_id, contract_location, distance, time).
 //! Separate predictor instances are used per operation type (GET, PUT, etc.).
 
+use super::isotonic_estimator::AdjustmentMode;
+use super::residual;
 use crate::ring::{Location, PeerKeyLocation};
 use renegade_ml::{DataPoint, Renegade};
 use std::collections::{HashMap, VecDeque};
@@ -110,6 +112,17 @@ struct PredictionStage {
     model: Renegade<RoutingObservation>,
     max_observations: usize,
     count: usize,
+    /// Kernel bandwidth — the feature-space length scale at which "k neighbours"
+    /// stops being a local neighbourhood. `None` until the first training round
+    /// has enough data to estimate one, which keeps the correction inert rather
+    /// than guessing a scale.
+    bandwidth: Option<f64>,
+    /// Recently-added observations, used as query points when estimating the
+    /// bandwidth. Deliberately a recency window rather than a uniform sample of
+    /// the store: the observations are the same population queries land in, and
+    /// the time feature means recent points are where prediction actually
+    /// happens, so a recency-biased length scale is the relevant one.
+    bandwidth_samples: VecDeque<RoutingObservation>,
     /// Cached K from the last training. Used for immutable predictions.
     cached_k: usize,
     /// Number of observations when last trained (base for the retraining
@@ -133,6 +146,8 @@ impl PredictionStage {
             model: Renegade::new(),
             max_observations,
             count: 0,
+            bandwidth: None,
+            bandwidth_samples: VecDeque::new(),
             cached_k: DEFAULT_K,
             trained_at: 0,
             observations_since_train: 0,
@@ -144,6 +159,10 @@ impl PredictionStage {
         if !output.is_finite() {
             return;
         }
+        if self.bandwidth_samples.len() >= residual::BANDWIDTH_SAMPLE_POINTS {
+            self.bandwidth_samples.pop_front();
+        }
+        self.bandwidth_samples.push_back(obs.clone());
         self.model.add(obs, output);
         self.count += 1;
         self.observations_since_train += 1;
@@ -193,7 +212,65 @@ impl PredictionStage {
             self.cached_k = self.model.get_optimal_k();
             self.trained_at = self.model.len();
             self.observations_since_train = 0;
+            self.refresh_bandwidth();
         }
+    }
+
+    /// Re-estimate the kernel bandwidth as the median distance from a sampled
+    /// observation to its k-th nearest neighbour.
+    ///
+    /// Runs inside `train()` so it shares that cadence rather than adding another
+    /// one, and costs `O(S log n)` for `S` samples instead of `O(n log n)`.
+    fn refresh_bandwidth(&mut self) {
+        if self.bandwidth_samples.is_empty() {
+            return;
+        }
+        // `k + 1` because each sample is itself in the store at distance 0, so the
+        // k-th *other* neighbour is the (k+1)-th result.
+        let k = self.cached_k.max(1) + 1;
+        let mut kth_distances = Vec::with_capacity(self.bandwidth_samples.len());
+        for sample in &self.bandwidth_samples {
+            let neighbors = self.model.query_k(sample, k);
+            // `query_k` returns neighbours sorted nearest-first, so the last is
+            // the farthest of the k considered.
+            if let Some(farthest) = neighbors.neighbors.last() {
+                kth_distances.push(farthest.distance);
+            }
+        }
+        if let Some(bandwidth) = residual::estimate_bandwidth(&mut kth_distances) {
+            self.bandwidth = Some(bandwidth);
+        }
+    }
+
+    /// Kernel-weighted estimate of this stage's target at `query`, together with
+    /// the evidence mass supporting it.
+    ///
+    /// Deliberately has **no** minimum-observation gate. The old `predict()` needs
+    /// one because it returns an absolute value whose uninformed output is the
+    /// global mean — a real perturbation that has to be suppressed. Here an
+    /// uninformed query yields `n_eff ≈ 0`, and the caller's shrinkage turns that
+    /// into a correction of exactly zero, so a floor would be redundant: the
+    /// evidence measure already encodes "I have nothing to say about this".
+    fn predict_kernel(&self, query: &RoutingObservation) -> Option<residual::KernelEstimate> {
+        let bandwidth = self.bandwidth?;
+        if self.model.is_empty() {
+            return None;
+        }
+        let neighbors = self.model.query_k(query, self.cached_k);
+        if neighbors.neighbors.is_empty() {
+            return None;
+        }
+        let pairs: Vec<(f64, f64)> = neighbors
+            .neighbors
+            .iter()
+            .map(|neighbor| (neighbor.distance, neighbor.output))
+            .collect();
+        residual::kernel_estimate(&pairs, bandwidth)
+    }
+
+    #[cfg(test)]
+    fn bandwidth_for_test(&self) -> Option<f64> {
+        self.bandwidth
     }
 
     /// Predict using the pre-trained model (immutable access).
@@ -311,6 +388,23 @@ pub(crate) struct RoutingPredictor {
     failure_stage: PredictionStage,
     response_time_stage: PredictionStage,
     transfer_speed_stage: PredictionStage,
+    /// Residual-target counterparts of the three stages above.
+    ///
+    /// These are kept *alongside* the absolute-target stages rather than
+    /// replacing them, for two reasons. The absolute stages still drive the
+    /// legacy blend, so the old path stays bit-identical while the correction is
+    /// flag-gated; and running both is what lets the router score the two
+    /// approaches against each other on live traffic before the default flips.
+    /// The cost is one extra observation store per target — a few hundred KB at
+    /// the current cap — which is the price of being able to measure rather than
+    /// assume.
+    failure_residual_stage: PredictionStage,
+    response_time_residual_stage: PredictionStage,
+    transfer_speed_residual_stage: PredictionStage,
+    /// Online shrinkage selection per residual stage.
+    failure_shrinkage: residual::ShrinkageSelector,
+    response_time_shrinkage: residual::ShrinkageSelector,
+    transfer_speed_shrinkage: residual::ShrinkageSelector,
     /// Map from PeerKeyLocation to (numeric_id, lru_generation).
     /// Bounded by MAX_PEER_IDS via LRU eviction.
     peer_ids: HashMap<PeerKeyLocation, (u64, u64)>,
@@ -431,6 +525,106 @@ impl std::fmt::Debug for RoutingPredictor {
     }
 }
 
+/// Residuals of the isotonic base estimate for a single event, each expressed in
+/// its own estimator's adjustment space (additive for failure, log-ratio for the
+/// timing targets).
+///
+/// The caller computes these because it owns the estimators and therefore knows
+/// each one's space; this module only stores and kernel-weights them. Critically,
+/// they must be computed from the base estimate **as it stood before the
+/// isotonic estimators ingested this event**, or the residual is deflated by the
+/// base model having already fitted the point it is being scored on.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StageResiduals {
+    pub failure: Option<f64>,
+    pub response_time: Option<f64>,
+    pub transfer_speed: Option<f64>,
+}
+
+/// A shrunk correction for one stage, plus the diagnostics that explain it.
+///
+/// `lambda` and `n_eff` are carried out rather than kept internal because "how
+/// much of the correction is being applied, and on what evidence" is the single
+/// most useful thing the dashboard can tell an operator about the routing model.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Correction {
+    /// The correction to apply, in the stage's adjustment space, already shrunk.
+    pub value: f64,
+    /// Shrinkage factor applied — `0.0` means the base estimate stands untouched.
+    pub lambda: f64,
+    /// Effective observations supporting the underlying residual estimate.
+    pub n_eff: f64,
+}
+
+/// Corrections for all three stages at one query point.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RoutingCorrections {
+    pub failure: Option<Correction>,
+    pub response_time: Option<Correction>,
+    pub transfer_speed: Option<Correction>,
+}
+
+/// The adjustment space each stage's residual lives in.
+///
+/// Taken from the estimators rather than assumed, because the assumption is
+/// wrong: response time is multiplicative but **transfer rate is additive** in
+/// the current configuration. Deriving this from each estimator means the
+/// correction follows whatever those are set to, and keeps following them if
+/// #4547 changes one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StageModes {
+    pub failure: AdjustmentMode,
+    pub response_time: AdjustmentMode,
+    pub transfer_speed: AdjustmentMode,
+}
+
+/// Self-tuned model state, surfaced for the dashboard.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShrinkageDiagnostics {
+    pub failure_kappa: f64,
+    pub failure_bandwidth: Option<f64>,
+    pub failure_residual_events: usize,
+    pub failure_scored: u64,
+    pub response_time_residual_events: usize,
+    pub transfer_speed_residual_events: usize,
+}
+
+/// Shrink one stage's kernel estimate into an applicable correction.
+///
+/// Returns `None` when the stage has nothing to say — no bandwidth yet, no
+/// neighbours, or an unusable estimate — which the caller must treat as "leave
+/// the base estimate alone". A returned `Correction` may still carry
+/// `value == 0.0` when `λ` shrank it away entirely; that is the same outcome by a
+/// different route, and it is reported rather than hidden so the dashboard can
+/// distinguish "no model" from "model present but unconvinced".
+fn shrink(
+    stage: &PredictionStage,
+    selector: &residual::ShrinkageSelector,
+    query: &RoutingObservation,
+    mode: AdjustmentMode,
+) -> Option<Correction> {
+    let estimate = stage.predict_kernel(query)?;
+    let lambda = selector.lambda(estimate.n_eff);
+    let mut value = lambda * estimate.residual;
+    // Only a multiplicative stage needs a spread bound: it recombines as
+    // `base * exp(c)`, which is unbounded above, so one pathological residual
+    // could otherwise dominate a routing decision. An additive stage is bounded
+    // by its own target's range downstream, and bounding it here would cap a
+    // legitimately large correction -- reintroducing exactly the ceiling this
+    // change removes.
+    if matches!(mode, AdjustmentMode::Multiplicative) {
+        value = selector.clamp_log_correction(value);
+    }
+    if !value.is_finite() {
+        return None;
+    }
+    Some(Correction {
+        value,
+        lambda,
+        n_eff: estimate.n_eff,
+    })
+}
+
 impl RoutingPredictor {
     /// Create a new predictor.
     pub fn new(max_observations_per_stage: usize) -> Self {
@@ -438,6 +632,12 @@ impl RoutingPredictor {
             failure_stage: PredictionStage::new(max_observations_per_stage),
             response_time_stage: PredictionStage::new(max_observations_per_stage),
             transfer_speed_stage: PredictionStage::new(max_observations_per_stage),
+            failure_residual_stage: PredictionStage::new(max_observations_per_stage),
+            response_time_residual_stage: PredictionStage::new(max_observations_per_stage),
+            transfer_speed_residual_stage: PredictionStage::new(max_observations_per_stage),
+            failure_shrinkage: residual::ShrinkageSelector::new(),
+            response_time_shrinkage: residual::ShrinkageSelector::new(),
+            transfer_speed_shrinkage: residual::ShrinkageSelector::new(),
             peer_ids: HashMap::new(),
             lru_generation: 0,
             next_peer_id: 0,
@@ -464,9 +664,10 @@ impl RoutingPredictor {
         contract_location: Location,
         distance: f64,
         outcome: RoutingOutcome,
+        residuals: StageResiduals,
     ) {
         let time = wall_clock_hours() - self.reference_time_hours;
-        self.record_at_time(peer, contract_location, distance, outcome, time);
+        self.record_at_time(peer, contract_location, distance, outcome, residuals, time);
     }
 
     /// Record at a specific relative time (for batch loading with original timestamps
@@ -477,6 +678,7 @@ impl RoutingPredictor {
         contract_location: Location,
         distance: f64,
         outcome: RoutingOutcome,
+        residuals: StageResiduals,
         time: f64,
     ) {
         let actual_failure = if outcome.success { 0.0 } else { 1.0 };
@@ -503,9 +705,66 @@ impl RoutingPredictor {
                     }
                 }
             }
+
+            // Score the shrinkage candidates against the residual this event
+            // actually turned out to have. Same predict-before-add discipline as
+            // above: the kernel estimate is taken from the model as it stands,
+            // so no candidate is ever graded on data containing its own answer.
+            //
+            // A stage with no usable estimate still scores, with `n_eff = 0`.
+            // That matters: "no evidence, so no correction, and the residual was
+            // nonetheless large" is real evidence about how much to trust this
+            // layer, and dropping those samples would bias selection toward
+            // whichever kappa looks good only where the model happens to be
+            // confident.
+            let shrinkage_inputs = [
+                (
+                    residuals.failure,
+                    &self.failure_residual_stage,
+                    &mut self.failure_shrinkage,
+                ),
+                (
+                    residuals.response_time,
+                    &self.response_time_residual_stage,
+                    &mut self.response_time_shrinkage,
+                ),
+                (
+                    residuals.transfer_speed,
+                    &self.transfer_speed_residual_stage,
+                    &mut self.transfer_speed_shrinkage,
+                ),
+            ];
+            for (actual_residual, stage, selector) in shrinkage_inputs {
+                let Some(actual_residual) = actual_residual else {
+                    continue;
+                };
+                let (n_eff, predicted) = stage
+                    .predict_kernel(&query)
+                    .map_or((0.0, 0.0), |estimate| (estimate.n_eff, estimate.residual));
+                selector.record(n_eff, predicted, actual_residual);
+            }
         }
 
         let obs = self.make_observation(peer, contract_location, distance, time);
+
+        // Residual stages mirror their absolute counterparts' eligibility: the
+        // failure residual exists for every event, the timing residuals only for
+        // timed successes (a residual needs an observed value to subtract the
+        // base from).
+        if let Some(failure_residual) = residuals.failure {
+            self.failure_residual_stage
+                .add(obs.clone(), failure_residual);
+        }
+        if outcome.success {
+            if let Some(response_time_residual) = residuals.response_time {
+                self.response_time_residual_stage
+                    .add(obs.clone(), response_time_residual);
+            }
+            if let Some(transfer_speed_residual) = residuals.transfer_speed {
+                self.transfer_speed_residual_stage
+                    .add(obs.clone(), transfer_speed_residual);
+            }
+        }
 
         // Stage 1: all events
         self.failure_stage.add(obs.clone(), actual_failure);
@@ -542,6 +801,15 @@ impl RoutingPredictor {
             if self.transfer_speed_stage.should_train() {
                 self.transfer_speed_stage.train();
             }
+            if self.failure_residual_stage.should_train() {
+                self.failure_residual_stage.train();
+            }
+            if self.response_time_residual_stage.should_train() {
+                self.response_time_residual_stage.train();
+            }
+            if self.transfer_speed_residual_stage.should_train() {
+                self.transfer_speed_residual_stage.train();
+            }
         }
     }
 
@@ -551,6 +819,66 @@ impl RoutingPredictor {
         self.failure_stage.train();
         self.response_time_stage.train();
         self.transfer_speed_stage.train();
+        self.failure_residual_stage.train();
+        self.response_time_residual_stage.train();
+        self.transfer_speed_residual_stage.train();
+    }
+
+    /// Kernel-weighted, shrunk corrections for each stage at the current time.
+    pub(crate) fn predict_corrections(
+        &self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+        distance: f64,
+        modes: StageModes,
+    ) -> RoutingCorrections {
+        let time = wall_clock_hours() - self.reference_time_hours;
+        self.predict_corrections_at_time(peer, contract_location, distance, modes, time)
+    }
+
+    pub(crate) fn predict_corrections_at_time(
+        &self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+        distance: f64,
+        modes: StageModes,
+        time: f64,
+    ) -> RoutingCorrections {
+        let query = self.make_observation_immutable(peer, contract_location, distance, time);
+        RoutingCorrections {
+            failure: shrink(
+                &self.failure_residual_stage,
+                &self.failure_shrinkage,
+                &query,
+                modes.failure,
+            ),
+            response_time: shrink(
+                &self.response_time_residual_stage,
+                &self.response_time_shrinkage,
+                &query,
+                modes.response_time,
+            ),
+            transfer_speed: shrink(
+                &self.transfer_speed_residual_stage,
+                &self.transfer_speed_shrinkage,
+                &query,
+                modes.transfer_speed,
+            ),
+        }
+    }
+
+    /// Selected shrinkage parameters, for dashboard display. These are self-tuned,
+    /// so they say something real about what the model has concluded about this
+    /// network rather than echoing a constant back at the reader.
+    pub(crate) fn shrinkage_diagnostics(&self) -> ShrinkageDiagnostics {
+        ShrinkageDiagnostics {
+            failure_kappa: self.failure_shrinkage.kappa(),
+            failure_bandwidth: self.failure_residual_stage.bandwidth,
+            failure_residual_events: self.failure_residual_stage.len(),
+            failure_scored: self.failure_shrinkage.scored(),
+            response_time_residual_events: self.response_time_residual_stage.len(),
+            transfer_speed_residual_events: self.transfer_speed_residual_stage.len(),
+        }
     }
 
     /// Predict routing outcomes (immutable — training happens during record()).
