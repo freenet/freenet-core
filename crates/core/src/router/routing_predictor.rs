@@ -1951,6 +1951,19 @@ mod recoverability {
         /// evidence says "the residual is zero".
         mean_abs_correction: f64,
         scored: usize,
+        /// Squared error on the TARGETED events only — the events carrying the
+        /// peer x contract effect that only the correction can see.
+        ///
+        /// This is the split that answers the question the harness exists for.
+        /// The whole-population `captured` conflates two things: how good the
+        /// global isotonic fit is, and whether the correction learned the
+        /// interaction. Since the base scores WORSE than climatology here, the
+        /// correction is charged for the base's error on the ~92% of events it
+        /// was never meant to touch, and a large real improvement still reads as
+        /// a near-zero score.
+        targeted_mse_corrected: f64,
+        targeted_mse_base: f64,
+        targeted_scored: usize,
     }
 
     fn run(model: Model, events: usize, seed: u64) -> Recovery {
@@ -1972,6 +1985,9 @@ mod recoverability {
         let mut sum_lambda = 0.0;
         let mut sum_abs_correction = 0.0;
         let mut scored = 0usize;
+        let mut targeted_err_corrected = 0.0;
+        let mut targeted_err_base = 0.0;
+        let mut targeted_scored = 0usize;
 
         for index in 0..events {
             let (peer_index, contract_value) = scenario.draw(model, index);
@@ -2007,6 +2023,11 @@ mod recoverability {
                     sum_bayes += p_star * (1.0 - p_star);
                     sum_err_corrected += (corrected - p_star).powi(2);
                     sum_err_base += (base - p_star).powi(2);
+                    if scenario.is_targeted(peer_index, contract_value) {
+                        targeted_err_corrected += (corrected - p_star).powi(2);
+                        targeted_err_base += (base - p_star).powi(2);
+                        targeted_scored += 1;
+                    }
                     sum_lambda += correction.map_or(0.0, |c| c.lambda);
                     sum_abs_correction += correction.map_or(0.0, |c| c.value.abs());
                     scored += 1;
@@ -2054,18 +2075,32 @@ mod recoverability {
             mean_lambda: sum_lambda / n,
             mean_abs_correction: sum_abs_correction / n,
             scored,
+            targeted_mse_corrected: targeted_err_corrected / targeted_scored.max(1) as f64,
+            targeted_mse_base: targeted_err_base / targeted_scored.max(1) as f64,
+            targeted_scored,
         }
     }
 
     /// Average a metric over seeds, so a threshold is not riding on one draw.
+    const SEEDS: [u64; 5] = [
+        0x4485_0001,
+        0x4485_0002,
+        0x4485_0003,
+        0x4485_0004,
+        0x4485_0005,
+    ];
+
+    /// Per-seed values, so a threshold can be set clear of the SPREAD rather than
+    /// clear of the mean. A threshold inside the spread is a flaky test waiting
+    /// for an unrelated change to cross it.
+    fn per_seed(model: Model, events: usize, f: impl Fn(Recovery) -> f64) -> Vec<f64> {
+        SEEDS
+            .iter()
+            .map(|&seed| f(run(model, events, seed)))
+            .collect()
+    }
+
     fn over_seeds(model: Model, events: usize, f: impl Fn(Recovery) -> f64) -> f64 {
-        const SEEDS: [u64; 5] = [
-            0x4485_0001,
-            0x4485_0002,
-            0x4485_0003,
-            0x4485_0004,
-            0x4485_0005,
-        ];
         SEEDS
             .iter()
             .map(|&seed| f(run(model, events, seed)))
@@ -2130,6 +2165,72 @@ mod recoverability {
             captured > base + 0.3,
             "the correction must add substantial signal over its own base; \
              captured {captured:.3} vs base {base:.3}"
+        );
+    }
+
+    /// How much of the peer x contract effect does the correction actually
+    /// recover, measured ON THE EVENTS THAT CARRY IT?
+    ///
+    /// This is the question the harness exists to answer, and the
+    /// whole-population `captured` score cannot answer it. That score divides by
+    /// `Var(p*)` over all events, so it charges the correction for the global
+    /// isotonic fit's error on the ~92% of events the correction was never meant
+    /// to touch — and in this scenario that base is itself worse than
+    /// climatology, so the correction has to dig out of someone else's hole
+    /// before it registers at all.
+    ///
+    /// Recovered fraction is `1 - mse_corrected/mse_base` restricted to the
+    /// targeted events: 0 means the correction did nothing for them, 1 means it
+    /// predicted them perfectly. No denominator borrowed from anywhere else.
+    #[test]
+    fn recovers_most_of_the_targeted_effect_within_the_production_data_budget() {
+        let recovered = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            1.0 - r.targeted_mse_corrected / r.targeted_mse_base.max(f64::MIN_POSITIVE)
+        });
+        let corrected = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.targeted_mse_corrected
+        });
+        let base = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.targeted_mse_base
+        });
+        let samples = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.targeted_scored as f64
+        });
+
+        eprintln!(
+            "#4485 targeted recovery at {RECOVERY_BUDGET_EVENTS} events: \
+             recovered {recovered:.3} (mse {corrected:.4} vs base {base:.4}, \
+             n={samples:.0})"
+        );
+
+        let spread = per_seed(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            1.0 - r.targeted_mse_corrected / r.targeted_mse_base.max(f64::MIN_POSITIVE)
+        });
+        let worst = spread.iter().cloned().fold(f64::INFINITY, f64::min);
+        eprintln!("#4485 targeted recovery per seed: {spread:?} (worst {worst:.3})");
+
+        assert!(
+            samples > 50.0,
+            "the targeted subset must be large enough to mean something, got {samples:.0}"
+        );
+        // Thresholds set clear of the SPREAD, not of the mean. Measured 0.583
+        // mean over per-seed [0.44, 0.29, 0.77, 0.48, 0.80]. The mean is
+        // deterministic so this cannot flake run-to-run, but a bar at 0.5 sits
+        // 0.08 from the measurement and an unrelated change could cross it
+        // without the correction having regressed — the marginal-threshold trap
+        // this repo's testing rules name. 0.4 keeps a substantive claim with
+        // real headroom, and the worst-seed floor catches a single-scenario
+        // collapse that averaging would hide.
+        assert!(
+            worst >= 0.15,
+            "no individual scenario may collapse to near-zero recovery; per-seed \
+             {spread:?}"
+        );
+        assert!(
+            recovered >= 0.4,
+            "the correction must recover a substantial share of the peer x contract \
+             effect on the events carrying it, within the data volume a real gateway \
+             holds; recovered {recovered:.3} (mse {corrected:.4} vs base {base:.4})"
         );
     }
 
