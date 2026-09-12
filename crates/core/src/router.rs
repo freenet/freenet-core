@@ -1158,13 +1158,34 @@ fn residual_correction_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("FREENET_ROUTING_RESIDUAL_CORRECTION")
-            .map(|value| {
-                let value = value.trim().to_ascii_lowercase();
-                // Explicit opt-OUT only; anything unrecognised keeps the default.
-                !(value == "0" || value == "false" || value == "no" || value == "off")
-            })
+            .map(|value| parse_correction_flag(&value))
             .unwrap_or(true)
     })
+}
+
+/// Parse the correction kill switch.
+///
+/// Enabled ONLY on an explicit affirmative. Anything else — the documented off
+/// values, but also a typo — disables.
+///
+/// The direction matters because this variable exists solely as a revert path.
+/// The only reason to set it at all is to turn the correction OFF, most likely
+/// mid-incident. If an unrecognised value kept the default,
+/// `FREENET_ROUTING_RESIDUAL_CORRECTION=flase` would silently do nothing at the
+/// one moment this switch has to work. Failing toward the revert costs a node
+/// that fat-fingers an "enable" nothing it did not already have.
+fn parse_correction_flag(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    let affirmative = value == "1" || value == "true" || value == "yes" || value == "on";
+    let recognised_off = value == "0" || value == "false" || value == "no" || value == "off";
+    if !affirmative && !recognised_off {
+        tracing::warn!(
+            value = %value,
+            "FREENET_ROUTING_RESIDUAL_CORRECTION is set to an unrecognised value; \
+             treating it as OFF and using the legacy routing blend"
+        );
+    }
+    affirmative
 }
 
 // Test-only override for `residual_correction_enabled`: 0 unset, 1 on, 2 off.
@@ -1960,9 +1981,17 @@ impl Router {
             .location()
             .map(|loc| target_location.distance(loc).as_f64())
             .unwrap_or(0.5);
-        let renegade = self
-            .renegade_predictor
-            .predict(peer, target_location, distance);
+        // The legacy absolute-target query is skipped when the correction is on:
+        // its result is overwritten below in every case where the correction
+        // applies, so computing it would be a k-NN query per candidate peer per
+        // routing decision whose output is discarded.
+        let correction_enabled = residual_correction_enabled();
+        let renegade = if correction_enabled {
+            routing_predictor::RoutingPredictionResult::default()
+        } else {
+            self.renegade_predictor
+                .predict(peer, target_location, distance)
+        };
 
         // Residual correction (#4485), computed ONLY when it will be used.
         //
@@ -1979,7 +2008,6 @@ impl Router {
         // The comparison the rationale wanted happens in `score_failure_layers`,
         // once per completed event rather than once per candidate, and is
         // unaffected by this gate. Flagged in review of #5642.
-        let correction_enabled = residual_correction_enabled();
         let corrections = if correction_enabled {
             self.renegade_predictor.predict_corrections(
                 peer,
@@ -2037,17 +2065,21 @@ impl Router {
             // distance alone.
             let modes = self.stage_modes();
 
-            if let (Ok(global), Ok(adjusted)) = (
-                self.failure_estimator
-                    .estimate_global(peer, target_location),
-                self.failure_estimator
-                    .estimate_retrieval_time(peer, target_location),
-            ) {
+            // The peer-adjusted values are ALREADY computed above
+            // (`isotonic_failure`, `time_estimate`, `transfer_estimate`), so only
+            // the global curve is new here. Re-querying `estimate_retrieval_time`
+            // would triple this function's isotonic lookups per candidate peer
+            // for values already in hand — the same waste the comment on the
+            // correction query above warns about, reintroduced one block down.
+            if let Ok(global) = self
+                .failure_estimator
+                .estimate_global(peer, target_location)
+            {
                 let correction = corrections.failure;
                 let corrected = residual::compose_with_prior(
                     modes.failure,
                     global.clamp(0.0, 1.0),
-                    adjusted.clamp(0.0, 1.0),
+                    isotonic_failure,
                     correction.map_or(0.0, |c| c.lambda),
                     correction.map_or(0.0, |c| c.value),
                 )
@@ -2057,11 +2089,10 @@ impl Router {
                 }
             }
 
-            if let (Ok(global), Ok(adjusted)) = (
+            if let (Ok(global), Some(adjusted)) = (
                 self.response_start_time_estimator
                     .estimate_global(peer, target_location),
-                self.response_start_time_estimator
-                    .estimate_retrieval_time(peer, target_location),
+                time_estimate,
             ) {
                 let correction = corrections.response_time;
                 let corrected = residual::compose_with_prior(
@@ -2076,11 +2107,10 @@ impl Router {
                 }
             }
 
-            if let (Ok(global), Ok(adjusted)) = (
+            if let (Ok(global), Some(adjusted)) = (
                 self.transfer_rate_estimator
                     .estimate_global(peer, target_location),
-                self.transfer_rate_estimator
-                    .estimate_retrieval_time(peer, target_location),
+                transfer_estimate,
             ) {
                 let correction = corrections.transfer_speed;
                 let corrected = residual::compose_with_prior(
@@ -3161,6 +3191,36 @@ mod tests {
             snapshot.saturated, 25,
             "40 candidates cut to a 25-peer window discards 15 unscored every time"
         );
+    }
+
+    /// The kill switch must fail TOWARD the revert.
+    ///
+    /// This variable exists only to turn the correction off, most likely during
+    /// an incident. A typo that silently left it enabled would break it at the
+    /// one moment it has to work, so anything not explicitly affirmative
+    /// disables.
+    #[test]
+    fn correction_kill_switch_fails_toward_the_revert() {
+        for enable in ["1", "true", "yes", "on", "TRUE", " on "] {
+            assert!(
+                parse_correction_flag(enable),
+                "{enable:?} must enable the correction"
+            );
+        }
+        for disable in ["0", "false", "no", "off", "OFF", " 0 "] {
+            assert!(
+                !parse_correction_flag(disable),
+                "{disable:?} must disable the correction"
+            );
+        }
+        // The case that matters: a mistyped revert must still revert.
+        for typo in ["flase", "fasle", "nope", "disabled", "", "  ", "2", "maybe"] {
+            assert!(
+                !parse_correction_flag(typo),
+                "{typo:?} is not an explicit enable, so it must fall back to the \
+                 legacy blend rather than silently leaving the correction on"
+            );
+        }
     }
 
     #[test]

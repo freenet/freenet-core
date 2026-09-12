@@ -420,7 +420,15 @@ pub(crate) fn compose_with_prior(
 ) -> f64 {
     // The EWMA's own adjustment, recovered in the mode's own space — additive
     // offset or log-ratio — so this works for either without special-casing.
-    let prior = mode.residual(peer_adjusted, global).unwrap_or(0.0);
+    // A `None` means the mode cannot express this pair — multiplicative space
+    // with a non-positive value. Falling back to a prior of 0.0 would silently
+    // compose against the BARE GLOBAL curve, i.e. exactly the pre-correction
+    // behaviour this function exists to prevent, breaking the lambda=0
+    // guarantee in the one regime nobody tests. Return the peer-adjusted
+    // estimate: that IS the answer when no correction is expressible.
+    let Some(prior) = mode.residual(peer_adjusted, global) else {
+        return peer_adjusted;
+    };
     let lambda = if lambda.is_finite() {
         lambda.clamp(0.0, 1.0)
     } else {

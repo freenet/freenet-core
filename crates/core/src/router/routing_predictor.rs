@@ -349,7 +349,7 @@ impl PredictionStage {
 // ---------------------------------------------------------------------------
 
 /// Prediction result from the routing funnel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct RoutingPredictionResult {
     /// Predicted failure probability [0, 1]. Always available once enough data.
     pub failure_probability: Option<f64>,
@@ -2358,8 +2358,9 @@ mod recoverability {
         let ratio = over_seeds(Model::DistanceOnly, RECOVERY_BUDGET_EVENTS, |r| {
             r.mse_corrected / r.mse_peer_adjusted.max(f64::MIN_POSITIVE)
         });
+        eprintln!("#4485 distance-only ratio vs today: {ratio:.4}");
         assert!(
-            ratio <= 1.05,
+            ratio <= 1.0,
             "with nothing to learn the correction must not degrade what the \
              router already does; error ratio vs peer-adjusted {ratio:.3}"
         );
@@ -2372,8 +2373,9 @@ mod recoverability {
         let ratio = over_seeds(Model::PeerMarginal, RECOVERY_BUDGET_EVENTS, |r| {
             r.mse_corrected / r.mse_peer_adjusted.max(f64::MIN_POSITIVE)
         });
+        eprintln!("#4485 peer-marginal ratio vs today: {ratio:.4}");
         assert!(
-            ratio <= 1.05,
+            ratio <= 1.0,
             "the correction must compose with the per-peer EWMA rather than \
              fight it; error ratio vs peer-adjusted {ratio:.3}"
         );
