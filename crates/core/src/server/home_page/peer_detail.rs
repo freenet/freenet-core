@@ -130,7 +130,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">This peer: transfer rate</div><div class="info-value">{pt} events</div>
                 </div>
                 <h3 style="margin-top: 1em;">Renegade ML Predictor</h3>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;"><a href="https://github.com/sanity/renegade" target="_blank" rel="noopener noreferrer" class="ext-link">Renegade</a> is a zero-configuration k-nearest-neighbours model (it auto-selects K and learns which features matter). It learns from four features (peer, contract location, distance, time) what the distance-based estimate gets <em>wrong</em> for a particular peer and contract, and corrects it &mdash; catching patterns distance alone misses, such as a peer that drops requests for specific contracts. How much of that correction is applied depends on how much nearby evidence supports it, so a query the model knows nothing about leaves the distance-based estimate untouched.</p>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;"><a href="https://github.com/sanity/renegade" target="_blank" rel="noopener noreferrer" class="ext-link">Renegade</a> is a zero-configuration k-nearest-neighbours model (it auto-selects K and learns which features matter). It learns from four features (peer, contract location, distance, time) what the distance-based estimate gets <em>wrong</em> for a particular peer and contract, and corrects it &mdash; catching patterns distance alone misses, such as a peer that drops requests for specific contracts. It corrects the <em>distance-only</em> estimate directly, taking over from the simpler per-peer offset rather than adding to it. How much of the correction is applied depends on how much nearby evidence supports it, so a query the model knows nothing about leaves the distance-only estimate untouched.</p>
                 <div class="info-grid">
                     <div class="info-label">Failure observations</div><div class="info-value">{rf}</div>
                     <div class="info-label">Response time observations</div><div class="info-value">{rr}</div>
@@ -143,16 +143,17 @@ pub fn peer_detail_html(address_str: &str) -> String {
 
                 <h3 style="margin-top: 1em;">Which layer is doing the work?</h3>
                 <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">Each layer&rsquo;s <strong>skill</strong> against simply assuming the average failure rate. <strong>0 means no better than that assumption; negative means worse.</strong> Skill rather than a raw score because failures are rare, and on a rare event a raw score mostly measures the rarity: at a {base_rate} failure rate, a forecast that never predicts failure at all scores {clim_brier} and looks excellent.</p>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">These are <strong>two routes from the same starting point</strong>, not one running total. Both begin at the distance-only estimate. The established route adds a per-peer offset and then the Renegade blend; the correction route instead learns what the distance-only estimate gets wrong for this exact peer and contract, and <strong>replaces</strong> the per-peer offset rather than stacking on it. Compare the two end points, not the rows in order.</p>
                 <div class="info-grid">
-                    <div class="info-label">Distance only</div><div class="info-value">{skill_global}</div>
-                    <div class="info-label">+ per-peer adjustment</div><div class="info-value">{skill_adjusted}</div>
-                    <div class="info-label">+ blend (in use{blend_note})</div><div class="info-value">{skill_blended}</div>
-                    <div class="info-label">+ residual correction{corrected_note}</div><div class="info-value">{skill_corrected}</div>
+                    <div class="info-label">Both routes start at: distance only</div><div class="info-value">{skill_global}</div>
+                    <div class="info-label">&#8627; established: + per-peer offset</div><div class="info-value">{skill_adjusted}</div>
+                    <div class="info-label">&#8627; established: + Renegade blend{blend_note}</div><div class="info-value">{skill_blended}</div>
+                    <div class="info-label">&#8627; correction: distance only + residual{corrected_note}</div><div class="info-value">{skill_corrected}</div>
                     <div class="info-label">Scored predictions</div><div class="info-value">{layers_eval}</div>
                 </div>
 
                 <h3 style="margin-top: 1em;">Correction state</h3>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">These are learned from the data, not configured. <em>&kappa;</em> is how much evidence the correction demands before it applies half of itself; the bandwidth is the distance in feature space at which neighbouring observations stop counting as nearby.</p>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">These are learned from the data, not configured &mdash; both are chosen by scoring candidate values against what actually happened, and both will change as the network does. <em>&kappa;</em> is how much evidence the correction demands before it applies half of itself; the bandwidth is the distance in feature space beyond which neighbouring observations stop counting as nearby.</p>
                 <div class="info-grid">
                     <div class="info-label">Reaching routing decisions</div><div class="info-value">{corr_enabled}</div>
                     <div class="info-label">Selected &kappa;</div><div class="info-value">{kappa}</div>
@@ -185,14 +186,14 @@ pub fn peer_detail_html(address_str: &str) -> String {
             skill_blended = fmt_skill(rs.failure_skill_blended),
             skill_corrected = fmt_skill(rs.failure_skill_corrected),
             blend_note = if rs.residual_correction_enabled {
-                " until now"
+                " &mdash; superseded"
             } else {
-                ""
+                " &mdash; in use"
             },
             corrected_note = if rs.residual_correction_enabled {
-                ""
+                " &mdash; in use"
             } else {
-                " (measured, not applied)"
+                " &mdash; measured, not applied"
             },
             layers_eval = rs.failure_layers_evaluated,
             corr_enabled = if rs.residual_correction_enabled {
@@ -504,4 +505,101 @@ pub fn peer_detail_html(address_str: &str) -> String {
         renegade_chart = renegade_chart,
         prediction_card = prediction_card,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_rendering_names_the_sign_rather_than_leaving_it_to_the_reader() {
+        // The whole point of showing skill instead of a raw score is that the
+        // SIGN is the finding. A bare "-0.430" is exactly as easy to skim past
+        // as the "excellent" grade it replaces.
+        let worse = fmt_skill(Some(-0.43));
+        assert!(worse.contains("-0.430"), "got {worse}");
+        assert!(
+            worse.contains("worse than assuming nothing"),
+            "a negative skill must say so in words, got {worse}"
+        );
+
+        let none = fmt_skill(Some(0.0));
+        assert!(
+            none.contains("no better than assuming nothing"),
+            "zero skill must say so in words, got {none}"
+        );
+
+        let good = fmt_skill(Some(0.42));
+        assert!(good.contains("+0.420"), "got {good}");
+        assert!(
+            !good.contains("assuming nothing"),
+            "positive skill needs no caveat, got {good}"
+        );
+    }
+
+    #[test]
+    fn skill_rendering_distinguishes_undefined_from_zero() {
+        // An all-success window has no variation to score against, which is a
+        // different statement from "this model has no skill".
+        for undefined in [None, Some(f64::NAN), Some(f64::INFINITY)] {
+            let rendered = fmt_skill(undefined);
+            assert!(
+                rendered.contains("no failures yet"),
+                "undefined skill must not render as a number, got {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_events_marks_an_inactive_stage_at_the_boundary() {
+        // Both nova gateways sit below the floor for transfer speed
+        // permanently, so this is the normal case rather than an edge one.
+        assert!(fmt_stage_events(0).contains("inactive"));
+        assert!(fmt_stage_events(9).contains("inactive"));
+        assert!(
+            fmt_stage_events(9).contains("10"),
+            "an inactive stage must name the threshold it needs"
+        );
+        // Exactly at the floor the stage IS active — an off-by-one here would
+        // label a working stage broken.
+        assert_eq!(fmt_stage_events(10), "10");
+        assert_eq!(fmt_stage_events(4155), "4155");
+    }
+
+    /// Pins that the layer panel presents the correction as a BRANCH off the
+    /// distance-only estimate, not as another term stacked on the per-peer
+    /// offset.
+    ///
+    /// It is stacked in neither the code nor the copy, but it was in the copy
+    /// until the B5 change flipped the composition and this panel was not
+    /// updated with it. The label read "+ residual correction" directly beneath
+    /// "+ per-peer adjustment", which invites exactly the wrong comparison —
+    /// reading down the rows as a running total when the last row branches off
+    /// the first.
+    #[test]
+    fn layer_panel_does_not_present_the_correction_as_stacking() {
+        let source = include_str!("peer_detail.rs");
+        let panel_start = source
+            .find("Which layer is doing the work?")
+            .expect("the layer panel heading must exist");
+        let panel_end = source[panel_start..]
+            .find("Correction state")
+            .map(|offset| panel_start + offset)
+            .expect("the correction-state heading must follow the layer panel");
+        let panel = &source[panel_start..panel_end];
+
+        assert!(
+            panel.contains("two routes from the same starting point"),
+            "the panel must say the rows are alternative routes, not a running total"
+        );
+        assert!(
+            panel.contains("replaces"),
+            "the panel must say the correction REPLACES the per-peer offset"
+        );
+        assert!(
+            !panel.contains(r#"<div class="info-label">+ residual correction"#),
+            "the corrected row must not be labelled with a leading '+', which \
+             reads as another term added to the row above it"
+        );
+    }
 }
