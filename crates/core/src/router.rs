@@ -965,6 +965,50 @@ pub(crate) struct RouterSnapshotInfo {
     /// Number of transfer-speed predictions scored against actual outcomes.
     #[serde(default)]
     pub renegade_transfer_speed_evaluated: u64,
+    /// Brier SKILL of each failure-prediction layer against the climatological
+    /// base rate: `1 - brier/(p(1-p))`. Zero means "no better than assuming the
+    /// base rate", negative means worse than assuming nothing.
+    ///
+    /// Skill rather than raw Brier because raw Brier on a rare event is
+    /// dominated by how rare the event is, not by how good the forecast is — at
+    /// a 1% base rate a constant forecast scores 0.0099, which the dashboard's
+    /// old absolute scale graded "excellent". See #4485.
+    #[serde(default)]
+    pub failure_skill_global: Option<f64>,
+    #[serde(default)]
+    pub failure_skill_adjusted: Option<f64>,
+    #[serde(default)]
+    pub failure_skill_blended: Option<f64>,
+    #[serde(default)]
+    pub failure_skill_corrected: Option<f64>,
+    /// Brier score of the blended estimate, and the climatology it is scored
+    /// against, so the dashboard can show the baseline alongside the result.
+    #[serde(default)]
+    pub failure_brier_blended: Option<f64>,
+    #[serde(default)]
+    pub failure_climatology_brier: Option<f64>,
+    #[serde(default)]
+    pub failure_base_rate: Option<f64>,
+    /// Predictions scored across all four layers.
+    #[serde(default)]
+    pub failure_layers_evaluated: u64,
+    /// Whether the residual correction is reaching live routing decisions.
+    #[serde(default)]
+    pub residual_correction_enabled: bool,
+    /// Self-tuned correction state: the selected kappa, the kernel bandwidth,
+    /// and how much residual evidence each stage holds.
+    #[serde(default)]
+    pub residual_kappa: Option<f64>,
+    #[serde(default)]
+    pub residual_bandwidth: Option<f64>,
+    #[serde(default)]
+    pub residual_failure_events: usize,
+    #[serde(default)]
+    pub residual_response_time_events: usize,
+    #[serde(default)]
+    pub residual_transfer_speed_events: usize,
+    #[serde(default)]
+    pub residual_scored: u64,
 }
 
 /// Per-peer routing data for the dashboard detail page.
@@ -1886,6 +1930,7 @@ impl Router {
 
     /// Produce a snapshot of the router model state for telemetry.
     pub fn snapshot(&self) -> RouterSnapshotInfo {
+        let shrinkage = self.renegade_predictor.shrinkage_diagnostics();
         RouterSnapshotInfo {
             network_efficiency_v1: None,
             failure_events: self.failure_estimator.len(),
@@ -2166,6 +2211,21 @@ impl Router {
             renegade_transfer_speed_evaluated: self
                 .renegade_predictor
                 .transfer_speed_predictions_evaluated(),
+            failure_skill_global: self.failure_skill_global.skill(),
+            failure_skill_adjusted: self.failure_skill_adjusted.skill(),
+            failure_skill_blended: self.failure_skill_blended.skill(),
+            failure_skill_corrected: self.failure_skill_corrected.skill(),
+            failure_brier_blended: self.failure_skill_blended.brier(),
+            failure_climatology_brier: self.failure_skill_blended.climatology_brier(),
+            failure_base_rate: self.failure_skill_blended.base_rate(),
+            failure_layers_evaluated: self.failure_skill_blended.count(),
+            residual_correction_enabled: residual_correction_enabled(),
+            residual_kappa: Some(shrinkage.failure_kappa),
+            residual_bandwidth: shrinkage.failure_bandwidth,
+            residual_failure_events: shrinkage.failure_residual_events,
+            residual_response_time_events: shrinkage.response_time_residual_events,
+            residual_transfer_speed_events: shrinkage.transfer_speed_residual_events,
+            residual_scored: shrinkage.failure_scored,
         }
     }
 

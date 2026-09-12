@@ -813,6 +813,31 @@ impl RoutingPredictor {
         }
     }
 
+    /// Record with no residual targets — the pre-#4485 signature.
+    ///
+    /// Test-only. The existing stage tests exercise the absolute-target path and
+    /// say nothing about residuals; routing them through this keeps them
+    /// testing what they were written to test, rather than silently acquiring a
+    /// second subject.
+    #[cfg(test)]
+    pub(crate) fn record_at_time_absolute_only(
+        &mut self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+        distance: f64,
+        outcome: RoutingOutcome,
+        time: f64,
+    ) {
+        self.record_at_time(
+            peer,
+            contract_location,
+            distance,
+            outcome,
+            StageResiduals::default(),
+            time,
+        );
+    }
+
     /// Trigger training on all stages. Call after batch loading historical events.
     pub fn finish_batch(&mut self) {
         self.batch_mode = false;
@@ -1105,10 +1130,10 @@ mod tests {
         let base_time = 1.0; // relative hours
 
         for i in 0..10 {
-            predictor.record_at_time(&peer, contract, 0.1, failure(), base_time + i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(&peer, contract, 0.1, failure(), base_time + i as f64 * 0.01);
         }
         for i in 10..20 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &peer,
                 contract,
                 0.1,
@@ -1117,7 +1142,7 @@ mod tests {
             );
         }
         for i in 20..30 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &peer,
                 contract,
                 0.1,
@@ -1152,7 +1177,7 @@ mod tests {
             } else {
                 failure()
             };
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &good_peer,
                 contract,
                 0.1,
@@ -1167,7 +1192,7 @@ mod tests {
             } else {
                 failure()
             };
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &bad_peer,
                 contract,
                 0.1,
@@ -1210,7 +1235,7 @@ mod tests {
         let base_time = 1.0;
 
         for i in 0..100 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &fast_peer,
                 contract,
                 0.1,
@@ -1219,7 +1244,7 @@ mod tests {
             );
         }
         for i in 0..100 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &slow_peer,
                 contract,
                 0.1,
@@ -1261,7 +1286,7 @@ mod tests {
 
         for i in 0..100 {
             let loc = Location::try_from(i as f64 / 100.0).unwrap();
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &attacker,
                 loc,
                 0.1,
@@ -1270,7 +1295,7 @@ mod tests {
             );
         }
         for i in 0..50 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &attacker,
                 target_contract,
                 0.1,
@@ -1300,7 +1325,7 @@ mod tests {
         let contract = Location::try_from(0.5).unwrap();
 
         for i in 0..200 {
-            predictor.record_at_time(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
         }
 
         assert!(
@@ -1336,7 +1361,7 @@ mod tests {
         let mut peers = Vec::new();
         for i in 0..(MAX_PEER_IDS + 10) {
             let peer = make_peer();
-            predictor.record_at_time(&peer, contract, 0.1, success_untimed(), i as f64 * 0.001);
+            predictor.record_at_time_absolute_only(&peer, contract, 0.1, success_untimed(), i as f64 * 0.001);
             peers.push(peer);
         }
 
@@ -1355,7 +1380,7 @@ mod tests {
         let contract = Location::try_from(0.5).unwrap();
 
         // Record with Inf transfer speed (from zero-duration transfer)
-        predictor.record_at_time(
+        predictor.record_at_time_absolute_only(
             &peer,
             contract,
             0.1,
@@ -1391,13 +1416,13 @@ mod tests {
 
         // Add 20 events — should trigger initial training
         for i in 0..20 {
-            predictor.record_at_time(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
         }
         let _k_after_20 = predictor.failure_stage.cached_k;
 
         // Add 10 more (50% growth) — should trigger retrain
         for i in 20..30 {
-            predictor.record_at_time(&peer, contract, 0.1, failure(), i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(&peer, contract, 0.1, failure(), i as f64 * 0.01);
         }
         // Can't easily assert K changed, but trained_at should have updated
         assert!(
@@ -1535,12 +1560,12 @@ mod tests {
 
         // Add enough data to enable predictions
         for i in 0..50 {
-            predictor.record_at_time(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
         }
 
         // Now further events should be tracked for accuracy
         for i in 50..60 {
-            predictor.record_at_time(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
         }
 
         assert!(
@@ -1559,7 +1584,7 @@ mod tests {
         // Warm up the timing stages past MIN_OBSERVATIONS_FOR_PREDICTION so the
         // next timed successes produce a prediction that gets scored.
         for i in 0..50 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &peer,
                 contract,
                 0.1,
@@ -1568,7 +1593,7 @@ mod tests {
             );
         }
         for i in 50..60 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &peer,
                 contract,
                 0.1,
@@ -1604,7 +1629,7 @@ mod tests {
         // Failures carry no timing ground truth, so the regression stages must
         // never accumulate accuracy samples from them.
         for i in 0..60 {
-            predictor.record_at_time(&peer, contract, 0.1, failure(), i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(&peer, contract, 0.1, failure(), i as f64 * 0.01);
         }
 
         assert_eq!(predictor.response_time_predictions_evaluated(), 0);
@@ -1621,7 +1646,7 @@ mod tests {
 
         // Warm the timing stages with timed successes so predict() returns Some.
         for i in 0..60 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &peer,
                 contract,
                 0.1,
@@ -1637,7 +1662,7 @@ mod tests {
         // so it must NOT be scored even though the stages can now predict (guards
         // against recording a garbage/zero actual into the scatter).
         for i in 60..70 {
-            predictor.record_at_time(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
         }
         assert_eq!(predictor.response_time_predictions_evaluated(), rt_before);
         assert_eq!(predictor.transfer_speed_predictions_evaluated(), ts_before);

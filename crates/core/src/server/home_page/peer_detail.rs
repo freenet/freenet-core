@@ -9,6 +9,44 @@ use crate::router::AdjustmentMode;
 
 // ─── Peer detail page ────────────────────────────────────────────────────────
 
+/// Render a Brier skill score.
+///
+/// Skill is the reading that matters and the sign is the whole point, so a
+/// negative value is labelled rather than left for the reader to interpret:
+/// "worse than assuming nothing" is a specific, actionable statement, and a
+/// bare `-0.43` is not.
+fn fmt_skill(skill: Option<f64>) -> String {
+    match skill {
+        Some(value) if value.is_finite() => {
+            let label = if value < -0.01 {
+                " (worse than assuming nothing)"
+            } else if value < 0.01 {
+                " (no better than assuming nothing)"
+            } else {
+                ""
+            };
+            format!("{value:+.3}{label}")
+        }
+        // Undefined rather than zero: an all-success window has no variation to
+        // score against, which is a different statement from "no skill".
+        _ => "&mdash; (no failures yet to score against)".to_string(),
+    }
+}
+
+/// Render a stage's observation count, saying so when the stage is inactive.
+///
+/// A stage below the prediction floor rendered a bare `0` and an empty chart,
+/// which is indistinguishable from a broken stage. Both nova gateways sit here
+/// permanently for transfer speed, so this is the normal case, not an edge one.
+fn fmt_stage_events(count: usize) -> String {
+    const PREDICTION_FLOOR: usize = 10;
+    if count < PREDICTION_FLOOR {
+        format!("{count} &mdash; inactive, needs {PREDICTION_FLOOR}")
+    } else {
+        count.to_string()
+    }
+}
+
 pub fn peer_detail_html(address_str: &str) -> String {
     let snap = network_status::get_snapshot();
 
@@ -92,7 +130,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">This peer: transfer rate</div><div class="info-value">{pt} events</div>
                 </div>
                 <h3 style="margin-top: 1em;">Renegade ML Predictor</h3>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;"><a href="https://github.com/sanity/renegade" target="_blank" rel="noopener noreferrer" class="ext-link">Renegade</a> is a zero-configuration k-nearest-neighbours model (it auto-selects K and learns which features matter). It predicts per-peer, per-contract outcomes from four features (peer, contract location, distance, time); the router blends its prediction with the distance-based estimate (a weighted average, Renegade's share growing with data up to half) to catch patterns distance alone misses, such as a peer that drops requests for specific contracts.</p>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;"><a href="https://github.com/sanity/renegade" target="_blank" rel="noopener noreferrer" class="ext-link">Renegade</a> is a zero-configuration k-nearest-neighbours model (it auto-selects K and learns which features matter). It learns from four features (peer, contract location, distance, time) what the distance-based estimate gets <em>wrong</em> for a particular peer and contract, and corrects it &mdash; catching patterns distance alone misses, such as a peer that drops requests for specific contracts. How much of that correction is applied depends on how much nearby evidence supports it, so a query the model knows nothing about leaves the distance-based estimate untouched.</p>
                 <div class="info-grid">
                     <div class="info-label">Failure observations</div><div class="info-value">{rf}</div>
                     <div class="info-label">Response time observations</div><div class="info-value">{rr}</div>
@@ -102,7 +140,28 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">Brier score (overall)</div><div class="info-value">{brier}</div>
                     <div class="info-label">Brier score (recent)</div><div class="info-value">{recent_brier}</div>
                 </div>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.5em;">Brier score: 0 = perfect · &lt;0.05 excellent · &lt;0.1 good · &lt;0.15 fair · 0.25 = random coin flip</p>
+
+                <h3 style="margin-top: 1em;">Which layer is doing the work?</h3>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">Each layer&rsquo;s <strong>skill</strong> against simply assuming the average failure rate. <strong>0 means no better than that assumption; negative means worse.</strong> Skill rather than a raw score because failures are rare, and on a rare event a raw score mostly measures the rarity: at a {base_rate} failure rate, a forecast that never predicts failure at all scores {clim_brier} and looks excellent.</p>
+                <div class="info-grid">
+                    <div class="info-label">Distance only</div><div class="info-value">{skill_global}</div>
+                    <div class="info-label">+ per-peer adjustment</div><div class="info-value">{skill_adjusted}</div>
+                    <div class="info-label">+ blend (in use{blend_note})</div><div class="info-value">{skill_blended}</div>
+                    <div class="info-label">+ residual correction{corrected_note}</div><div class="info-value">{skill_corrected}</div>
+                    <div class="info-label">Scored predictions</div><div class="info-value">{layers_eval}</div>
+                </div>
+
+                <h3 style="margin-top: 1em;">Correction state</h3>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">These are learned from the data, not configured. <em>&kappa;</em> is how much evidence the correction demands before it applies half of itself; the bandwidth is the distance in feature space at which neighbouring observations stop counting as nearby.</p>
+                <div class="info-grid">
+                    <div class="info-label">Reaching routing decisions</div><div class="info-value">{corr_enabled}</div>
+                    <div class="info-label">Selected &kappa;</div><div class="info-value">{kappa}</div>
+                    <div class="info-label">Kernel bandwidth</div><div class="info-value">{bandwidth}</div>
+                    <div class="info-label">Residual observations: failure</div><div class="info-value">{res_f}</div>
+                    <div class="info-label">Residual observations: response time</div><div class="info-value">{res_r}</div>
+                    <div class="info-label">Residual observations: transfer speed</div><div class="info-value">{res_t}</div>
+                    <div class="info-label">Corrections scored</div><div class="info-value">{res_scored}</div>
+                </div>
             </div>"#,
             active = if rs.prediction_active { "Yes" } else { "No" },
             total = total_events,
@@ -110,9 +169,49 @@ pub fn peer_detail_html(address_str: &str) -> String {
             pr = peer_response_events,
             pt = peer_transfer_events,
             rf = rs.renegade_failure_events,
-            rr = rs.renegade_response_time_events,
-            rt = rs.renegade_transfer_speed_events,
+            rr = fmt_stage_events(rs.renegade_response_time_events),
+            rt = fmt_stage_events(rs.renegade_transfer_speed_events),
             rp = rs.renegade_known_peers,
+            base_rate = rs
+                .failure_base_rate
+                .map(|b| format!("{:.2}%", b * 100.0))
+                .unwrap_or_else(|| "the observed".to_string()),
+            clim_brier = rs
+                .failure_climatology_brier
+                .map(|b| format!("{:.4}", b))
+                .unwrap_or_else(|| "\u{2014}".to_string()),
+            skill_global = fmt_skill(rs.failure_skill_global),
+            skill_adjusted = fmt_skill(rs.failure_skill_adjusted),
+            skill_blended = fmt_skill(rs.failure_skill_blended),
+            skill_corrected = fmt_skill(rs.failure_skill_corrected),
+            blend_note = if rs.residual_correction_enabled {
+                " until now"
+            } else {
+                ""
+            },
+            corrected_note = if rs.residual_correction_enabled {
+                ""
+            } else {
+                " (measured, not applied)"
+            },
+            layers_eval = rs.failure_layers_evaluated,
+            corr_enabled = if rs.residual_correction_enabled {
+                "Yes"
+            } else {
+                "No \u{2014} measuring only"
+            },
+            kappa = rs
+                .residual_kappa
+                .map(|k| format!("{:.1}", k))
+                .unwrap_or_else(|| "\u{2014}".to_string()),
+            bandwidth = rs
+                .residual_bandwidth
+                .map(|b| format!("{:.4}", b))
+                .unwrap_or_else(|| "not yet estimated".to_string()),
+            res_f = rs.residual_failure_events,
+            res_r = rs.residual_response_time_events,
+            res_t = rs.residual_transfer_speed_events,
+            res_scored = rs.residual_scored,
             brier = rs
                 .renegade_brier_score
                 .map(|b| format!("{:.4}", b))
@@ -354,7 +453,12 @@ pub fn peer_detail_html(address_str: &str) -> String {
     let renegade_chart = if let Some(ref rs) = router_snapshot {
         build_renegade_accuracy_panel(
             &rs.renegade_accuracy_pairs,
-            rs.renegade_brier_score,
+            // The RECENT score, because the chart plots the recent pairs. It was
+            // passed the overall score while captioning itself with the recent
+            // window's `n`, so the chart read "Brier 0.009 · n=200" next to a
+            // panel reporting 0.0142 over those same 200 pairs — two different
+            // quantities presented as one.
+            rs.renegade_recent_brier_score,
             &rs.renegade_response_time_pairs,
             &rs.renegade_transfer_speed_pairs,
         )
