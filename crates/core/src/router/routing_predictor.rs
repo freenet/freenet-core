@@ -2127,6 +2127,51 @@ mod recoverability {
         );
     }
 
+    /// Pins the error floor that explains why `captured >= 0.8` is unreachable
+    /// in this scenario.
+    ///
+    /// That claim is load-bearing — it is the whole reason the headline test
+    /// asserts "beats climatology" instead of the published target — and this
+    /// repo has a documented history of load-bearing justifications rotting
+    /// into prose that nobody re-checks (see
+    /// `.claude/rules/bug-prevention-patterns.md`). So it is measured here
+    /// rather than asserted in a comment: if the base model's error floor ever
+    /// drops, this goes red and the 0.8 question should be reopened.
+    #[test]
+    fn the_base_models_own_error_floor_is_what_caps_recovery() {
+        let base_mse = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| r.mse_base);
+        let var_p_star = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.var_p_star
+        });
+
+        // Share of base error attributable to the targeted events themselves,
+        // which the correction CAN address; the remainder sits on the 91.7% of
+        // events where the base is simply misfitted, which it largely cannot.
+        let targeted_fraction = 1.0 / 12.0;
+        let targeted_contribution = targeted_fraction * 0.55f64.powi(2);
+        let untargeted_error = (base_mse - targeted_contribution) / (1.0 - targeted_fraction);
+        let untargeted_sd = untargeted_error.max(0.0).sqrt();
+
+        eprintln!(
+            "#4485 base error floor: base mse {base_mse:.5}, Var(p*) {var_p_star:.5}, \
+             untargeted sd {untargeted_sd:.3}"
+        );
+
+        assert!(
+            untargeted_sd > 0.08,
+            "the stated reason the 0.8 target is unreachable is that the global \
+             isotonic base is badly misfitted on untargeted events (sd ~ 0.13). \
+             Measured sd {untargeted_sd:.3}. If this has dropped, the base model \
+             improved and the 0.8 question should be REOPENED rather than left \
+             documented as unachievable."
+        );
+        assert!(
+            base_mse > var_p_star,
+            "the base must be worse than a climatology forecast for the floor \
+             argument to hold; base mse {base_mse:.5} vs Var(p*) {var_p_star:.5}"
+        );
+    }
+
     /// The no-regression gate: where there is no peer×contract structure, the
     /// correction must not make the estimate worse.
     #[test]
