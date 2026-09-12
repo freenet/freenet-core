@@ -1,0 +1,81 @@
+name: Nix
+
+# Nothing else in CI evaluates flake.nix, package.nix or the devShell, so the
+# weekly nixpkgs-unstable bump from dependabot would otherwise land with no
+# build signal behind it.
+#
+# NOT a required check: path-filtered workflows do not reliably produce a check
+# context for branch protection (see the note in playwright-shell.yml).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'package.nix'
+      - 'rust-toolchain.toml'
+      - 'Cargo.lock'
+      - 'crates/core/build.rs'
+      - '.github/workflows/nix.yml'
+  pull_request:
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'package.nix'
+      - 'rust-toolchain.toml'
+      - 'Cargo.lock'
+      - 'crates/core/build.rs'
+      - '.github/workflows/nix.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  nix-build:
+    name: Nix flake build
+    runs-on: ubicloud-standard-8
+    # A cold build compiles the whole dependency graph; no binary cache exists.
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Check flake outputs evaluate
+        run: nix flake check --no-build
+
+      - name: Build the freenet package
+        run: nix build .#freenet -L
+
+      # The devShell breaks independently of the package. `cargo metadata` runs
+      # cargo against the real workspace; a bare `cargo --version` would not.
+      - name: Check the devShell opens and cargo works inside it
+        run: |
+          nix develop --command rustc --version
+          nix develop --command cargo metadata --format-version 1 > /dev/null
+          # Asserted directly because `cargo metadata` runs no build script, so
+          # it passes in a shell where `cargo clippy --workspace` cannot compile.
+          nix develop --command pkg-config --exists openssl
+
+      # A shell whose rustc differs from the pin gives clippy and rustfmt results
+      # that disagree with CI.
+      - name: Verify the devShell matches rust-toolchain.toml
+        run: |
+          pinned="$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)"
+          actual="$(nix develop --command rustc --version | awk '{print $2}')"
+          if [ "$pinned" != "$actual" ]; then
+              echo "devShell rustc is $actual but rust-toolchain.toml pins $pinned" >&2
+              exit 1
+          fi
+          echo "devShell rustc matches the pin: $actual"
+
+      # writeShellApplication runs shellcheck at build time, so building the
+      # generated wrapper is the check.
+      - name: Build the auto-update wrapper
+        run: nix build .#freenet-autoupdate -L

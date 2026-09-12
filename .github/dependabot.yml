@@ -81,6 +81,16 @@ updates:
           - "minor"
           - "patch"
 
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    # Put all updates in one PR
+    groups:
+      nix:
+        patterns:
+          - "*"
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
