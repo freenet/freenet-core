@@ -1,0 +1,9 @@
+[Unit]
+Description=Freenet Gateway Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/freenet
+User=freenet
+WorkingDirectory=/var/lib/freenet
+Restart=always

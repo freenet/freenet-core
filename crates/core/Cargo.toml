@@ -15,6 +15,46 @@ readme = "README.md"
 # FREENET_MIN_COMPATIBLE_VERSION overrides this at build time.
 min-compatible-version = "0.2.64"
 
+# Packaging metadata for creating .deb packages for systems with the dpkg package manager.
+# We don't currently host the metadata for apt, but that may come later. This should be able
+# to create a package for any Linux architecture supported by dpkg.
+[package.metadata.deb]
+maintainer = "Freenet Team"
+copyright = "2026, Freenet Team"
+extended-description = "Freenet decentralised web."
+depends = "$auto"
+section = "net"
+priority = "optional"
+# This is where debian package pre/post scripts go for creating users, etc.
+maintainer-scripts = "scripts/debian/"
+# Automatically install systemd unit files, but don't automatically enable them. A user wanting
+# to enable or start the service can systemctl start freenet or systemd enable freenet.
+systemd-units = { enable = false }
+assets = [
+	["target/release/freenet", "usr/bin/freenet", "0755"],
+	]
+
+# Packaging metadata for RPM packages. Should work for any architectures supported by
+# by Rust and RPM.
+[package.metadata.generate-rpm]
+name = "freenet"
+license = "AGPL"
+assets = [
+    { source = "target/release/freenet", dest = "/usr/bin/freenet", mode = "0755" },
+    { source = "scripts/debian/freenet.service", dest = "/lib/systemd/system/freenet.service", mode = "0755" },
+    { source = "LICENSE.md", dest = "/usr/share/doc/freenet/LICENSE.md", doc = true, mode = "0644" },
+    { source = "README.md", dest = "/usr/share/doc/freenet/README.md", doc = true, mode = "0644" },
+]
+post_install_script = """
+# Create a freenet user to run the service as if it doesn't already exist.
+id -u freenet >/dev/null 2>&1 || useradd -r -s /bin/false -m -d /var/lib/freenet freenet
+"""
+
+pre_uninstall_script = """
+# Remove the user when the package is uninstalled
+userdel freenet
+"""
+
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/freenet-{ target }.tar.gz"
 pkg-fmt = "tgz"
