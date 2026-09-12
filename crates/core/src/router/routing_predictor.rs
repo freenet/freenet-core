@@ -2127,6 +2127,30 @@ mod recoverability {
         );
     }
 
+    /// The negative control for the headline test, restored after being deleted
+    /// by accident.
+    ///
+    /// An ABSOLUTE ceiling on what the base model can recover, which the
+    /// headline test's relative margin (`captured > base + 0.3`) does not
+    /// provide: if a future change introduced a distance confound that let the
+    /// base itself recover much of the structure, the relative margin could
+    /// still pass while the scenario had stopped testing the correction at all.
+    /// That is precisely the failure this control exists to catch, and the
+    /// margin alone cannot catch it.
+    #[test]
+    fn the_base_model_alone_cannot_recover_peer_contract_structure() {
+        let captured = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.captured_base
+        });
+        assert!(
+            captured < 0.35,
+            "distance-plus-EWMA must NOT be able to capture a peer x contract \
+             effect. If it can, the scenario has acquired a distance confound \
+             and the headline test is passing for the wrong reason; captured \
+             {captured:.3}"
+        );
+    }
+
     /// Pins the error floor that explains why `captured >= 0.8` is unreachable
     /// in this scenario.
     ///

@@ -1100,6 +1100,21 @@ impl Clone for Router {
 /// equivalent to a CLI flag and needs no plumbing through every `Router::new`
 /// call site, several of which are in unrelated tests.
 fn residual_correction_enabled() -> bool {
+    // Tests override ahead of the cached read. Without this the flag is
+    // structurally untestable: the `OnceLock` is resolved by whichever test
+    // touches it first and then fixed for the life of the process, so the
+    // branch that actually ships could never be exercised. That is also the
+    // cross-test-interference shape this repo's testing rules call out — it
+    // happens to be benign under nextest's process-per-test and NOT under plain
+    // `cargo test`, which is the runner AGENTS.md asks contributors to use.
+    #[cfg(test)]
+    {
+        match TEST_CORRECTION_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+    }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("FREENET_ROUTING_RESIDUAL_CORRECTION")
@@ -1109,6 +1124,35 @@ fn residual_correction_enabled() -> bool {
             })
             .unwrap_or(false)
     })
+}
+
+/// Test-only override for [`residual_correction_enabled`]: 0 unset, 1 on, 2 off.
+#[cfg(test)]
+static TEST_CORRECTION_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force the residual correction on or off for the duration of a test.
+///
+/// Returns a guard that restores the previous setting on drop, so tests sharing
+/// a process cannot leak the override into each other.
+#[cfg(test)]
+pub(crate) fn force_residual_correction(enabled: bool) -> CorrectionOverrideGuard {
+    let previous = TEST_CORRECTION_OVERRIDE.swap(
+        if enabled { 1 } else { 2 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    CorrectionOverrideGuard { previous }
+}
+
+#[cfg(test)]
+pub(crate) struct CorrectionOverrideGuard {
+    previous: u8,
+}
+
+#[cfg(test)]
+impl Drop for CorrectionOverrideGuard {
+    fn drop(&mut self) {
+        TEST_CORRECTION_OVERRIDE.store(self.previous, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Maximum observations to retain per renegade funnel stage.
@@ -1715,29 +1759,31 @@ impl Router {
             .renegade_predictor
             .predict(peer, target_location, distance);
 
-        // Residual correction (#4485). Computed unconditionally so the two
-        // approaches can be scored against each other on live traffic, but only
-        // applied to the estimate the router acts on when explicitly enabled.
-        let corrections = self.renegade_predictor.predict_corrections(
-            peer,
-            target_location,
-            distance,
-            self.stage_modes(),
-        );
+        // Residual correction (#4485), computed ONLY when it will be used.
+        //
+        // An earlier version computed this unconditionally, with the rationale
+        // that it let both approaches be scored against each other on live
+        // traffic. That rationale does not hold at THIS call site: nothing here
+        // scores the result, so with the flag off (the shipped default) it was
+        // pure waste — and expensive waste, since this runs once per candidate
+        // peer per routing decision (up to `consider_n_closest_peers`) and each
+        // call is three k-NN queries at `KERNEL_CANDIDATE_NEIGHBOURS`. Worse,
+        // renegade's VP-tree is invalidated by every eviction and only rebuilt
+        // at the next `train()`, so queries in between degrade to a full scan.
+        //
+        // The comparison the rationale wanted happens in `score_failure_layers`,
+        // once per completed event rather than once per candidate, and is
+        // unaffected by this gate. Flagged in review of #5642.
         let correction_enabled = residual_correction_enabled();
-
-        // The correction composes with the GLOBAL curve, matching the space its
-        // residuals were taken in (see `stage_residuals`). It therefore REPLACES
-        // the per-peer EWMA rather than stacking on it — this is #4485's B5
-        // question, settled by measurement rather than argument.
-        let global_failure = self
-            .failure_estimator
-            .estimate_global(peer, target_location)
-            .ok()
-            .map(|value| value.clamp(0.0, 1.0));
-        let corrected_failure = match (global_failure, corrections.failure) {
-            (Some(base), Some(correction)) => Some((base + correction.value).clamp(0.0, 1.0)),
-            _ => None,
+        let corrections = if correction_enabled {
+            self.renegade_predictor.predict_corrections(
+                peer,
+                target_location,
+                distance,
+                self.stage_modes(),
+            )
+        } else {
+            routing_predictor::RoutingCorrections::default()
         };
 
         let renegade_failure_adjustment =
@@ -1778,8 +1824,20 @@ impl Router {
         // that it can be scored against this, but it does not reach the estimate
         // the router acts on.
         if correction_enabled {
-            if let Some(corrected) = corrected_failure {
-                failure_estimate = corrected;
+            // The correction composes with the GLOBAL curve, matching the space
+            // its residuals were taken in (see `stage_residuals`). It therefore
+            // REPLACES the per-peer EWMA rather than stacking on it — #4485's B5
+            // question, settled by measurement rather than argument.
+            let global_failure = self
+                .failure_estimator
+                .estimate_global(peer, target_location)
+                .ok()
+                .map(|value| value.clamp(0.0, 1.0));
+            if let (Some(base), Some(correction)) = (global_failure, corrections.failure) {
+                let corrected = (base + correction.value).clamp(0.0, 1.0);
+                if corrected.is_finite() {
+                    failure_estimate = corrected;
+                }
             }
             let modes = self.stage_modes();
             let global_time = self
@@ -2534,6 +2592,167 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Drive a peer that fails ONLY for one contract region, and assert the
+    /// enabled correction moves that peer's failure estimate where the legacy
+    /// blend does not.
+    ///
+    /// This is the branch that actually ships when the flag is turned on, and it
+    /// had no coverage at all until review pointed it out — the `OnceLock` made
+    /// it structurally untestable, which is why `force_residual_correction`
+    /// exists.
+    #[test]
+    fn enabled_correction_changes_the_estimate_the_router_acts_on() {
+        let targeted_peer = PeerKeyLocation::random();
+        let peer_location = targeted_peer
+            .location()
+            .expect("random peer has a location");
+        // A contract region close to this peer, so the distance-based model
+        // expects it to do WELL there — the correction has to overcome the base.
+        let targeted_contract =
+            Location::try_from((peer_location.as_f64() + 0.01).rem_euclid(1.0)).unwrap();
+
+        let mut router = Router::new(&[]);
+
+        // Background traffic so the isotonic fit and the predictor have a curve.
+        for index in 0..400 {
+            let peer = PeerKeyLocation::random();
+            let contract = Location::random();
+            let succeeded = index % 10 != 0;
+            router.add_event(RouteEvent {
+                peer,
+                contract_location: contract,
+                outcome: if succeeded {
+                    RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(100),
+                        payload_size: 5000,
+                        payload_transfer_time: Duration::from_millis(50),
+                    }
+                } else {
+                    RouteOutcome::Failure
+                },
+                op_type: Some(OpType::Get),
+            });
+            // The targeted peer fails for its own contract region every time,
+            // while behaving normally elsewhere — a pattern distance alone
+            // cannot represent.
+            router.add_event(RouteEvent {
+                peer: targeted_peer.clone(),
+                contract_location: targeted_contract,
+                outcome: RouteOutcome::Failure,
+                op_type: Some(OpType::Get),
+            });
+            router.add_event(RouteEvent {
+                peer: targeted_peer.clone(),
+                contract_location: Location::random(),
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(100),
+                    payload_size: 5000,
+                    payload_transfer_time: Duration::from_millis(50),
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+
+        let disabled = {
+            let _guard = force_residual_correction(false);
+            router
+                .predict_routing_outcome(&targeted_peer, targeted_contract)
+                .expect("prediction available after warm-up")
+                .failure_probability
+        };
+        let enabled = {
+            let _guard = force_residual_correction(true);
+            router
+                .predict_routing_outcome(&targeted_peer, targeted_contract)
+                .expect("prediction available after warm-up")
+                .failure_probability
+        };
+
+        assert!(
+            enabled.is_finite() && (0.0..=1.0).contains(&enabled),
+            "the corrected failure probability must stay a probability, got {enabled}"
+        );
+        assert!(
+            enabled > disabled,
+            "with the correction enabled, a peer that fails only for this \
+             contract region must be judged MORE likely to fail here than the \
+             legacy blend judges it; enabled {enabled:.4} vs disabled {disabled:.4}"
+        );
+    }
+
+    /// The flag must actually gate: with it off, the estimate is whatever the
+    /// legacy blend produces and nothing about the correction leaks into it.
+    #[test]
+    fn disabled_correction_leaves_the_legacy_estimate_untouched() {
+        let mut router = Router::new(&[]);
+        add_relay_recorded_successes(&mut router, 300);
+        let peer = PeerKeyLocation::random();
+        let contract = Location::random();
+
+        let first = {
+            let _guard = force_residual_correction(false);
+            router.predict_routing_outcome(&peer, contract).ok()
+        };
+        let second = {
+            let _guard = force_residual_correction(false);
+            router.predict_routing_outcome(&peer, contract).ok()
+        };
+
+        match (first, second) {
+            (Some(a), Some(b)) => assert_eq!(
+                a.failure_probability, b.failure_probability,
+                "the disabled path must be deterministic and correction-free"
+            ),
+            (None, None) => {}
+            _ => panic!("prediction availability must not depend on the flag"),
+        }
+    }
+
+    /// The four scored layers must actually be populated by `add_event`, so a
+    /// wiring break in `score_failure_layers` cannot pass unnoticed.
+    #[test]
+    fn add_event_populates_every_scored_layer() {
+        let mut router = Router::new(&[]);
+        for index in 0..400 {
+            router.add_event(RouteEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::random(),
+                outcome: if index % 7 == 0 {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(100),
+                        payload_size: 5000,
+                        payload_transfer_time: Duration::from_millis(50),
+                    }
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+
+        let snapshot = router.snapshot();
+        assert!(
+            snapshot.failure_layers_evaluated > 0,
+            "add_event must score the prediction layers"
+        );
+        for (label, skill) in [
+            ("global", snapshot.failure_skill_global),
+            ("adjusted", snapshot.failure_skill_adjusted),
+            ("blended", snapshot.failure_skill_blended),
+            ("corrected", snapshot.failure_skill_corrected),
+        ] {
+            let skill = skill.unwrap_or_else(|| panic!("{label} layer produced no skill score"));
+            assert!(
+                skill.is_finite(),
+                "{label} skill must be finite, got {skill}"
+            );
+        }
+        assert!(
+            snapshot.failure_base_rate.is_some_and(|rate| rate > 0.0),
+            "a window containing failures must report a non-zero base rate"
+        );
     }
 
     #[test]

@@ -79,6 +79,18 @@ const LOG_CORRECTION_SIGMA_CLAMP: f64 = 3.0;
 /// `kappa`: the derivation fixes the shape, measurement fixes both values.
 pub(crate) const BANDWIDTH_MULTIPLIERS: [f64; 6] = [0.05, 0.1, 0.25, 0.5, 1.0, 2.0];
 
+/// Events over which a candidate's accumulated loss decays to ~37% of its
+/// weight.
+///
+/// Without decay, `squared_error` accumulates from process start forever and
+/// `best()` is an argmin over the whole lifetime — so the new evidence needed to
+/// overturn a long-standing lead grows without bound as a node stays up. A
+/// gateway running for weeks would become progressively less able to change its
+/// mind about `kappa` or the bandwidth, which is the opposite of what a
+/// component justified as "measurement fixes the value" should do. Flagged in
+/// review of #5642; same spirit as this repo's TTL-bounded GC exemptions.
+const LOSS_FORGETTING_EVENTS: f64 = 20_000.0;
+
 /// Number of stored points sampled when estimating the kernel bandwidth.
 /// The bandwidth is a global length scale, so a sample is sufficient and keeps
 /// the estimate O(S log n) rather than O(n log n) per training round.
@@ -289,6 +301,15 @@ impl ShrinkageSelector {
         let delta = actual_residual - self.residual_mean;
         self.residual_mean += delta / self.residual_count as f64;
         self.residual_m2 += delta * (actual_residual - self.residual_mean);
+
+        // Decay before accumulating, so distant history fades and a regime
+        // change can be recognised within a bounded number of events.
+        let retention = 1.0 - 1.0 / LOSS_FORGETTING_EVENTS;
+        for row in self.squared_error.iter_mut() {
+            for cell in row.iter_mut() {
+                *cell *= retention;
+            }
+        }
 
         for (bandwidth_index, estimate) in estimates.iter().enumerate() {
             let (n_eff, predicted) = match estimate {
@@ -770,22 +791,104 @@ mod tests {
 
     /// The property the whole design rests on: with no evidence the correction
     /// must be exactly zero, so `base + λ·r̂` is bit-for-bit `base`.
+    ///
+    /// Covers BOTH far-field routes, because they are different code paths and
+    /// an earlier version of this test only reached one of them. At `d = 50h`
+    /// the weight underflows to exactly `0.0`, so `kernel_estimate` returns
+    /// `None` and the `Some` arm — the arm carrying `lambda` and the
+    /// multiplication this test claims to exercise — was dead. The `d = 10h`
+    /// case keeps the kernel mass denormal-but-nonzero (`~2e-22`), so the
+    /// estimate is `Some`, `lambda` really is consulted, and the product really
+    /// does have to vanish.
     #[test]
     fn no_evidence_leaves_base_bit_for_bit_unchanged() {
         let selector = ShrinkageSelector::new();
-        for base in [0.0f64, 0.017, 0.5, 0.999, 1.0, 12.5, 1e6] {
-            // Far-field neighbours: kernel mass underflows, so either the estimate
-            // is None or lambda is zero. Both must leave base untouched.
-            let estimate = kernel_estimate(&[(50.0, 0.9)], 1.0);
-            let correction = match estimate {
-                Some(e) => selector.lambda(e.n_eff) * e.residual,
-                None => 0.0,
-            };
+
+        // Route 1: kernel mass survives as a denormal, so the Some arm runs.
+        let near_zero = kernel_estimate(&[(10.0, 0.9)], 1.0)
+            .expect("at d = 10h the kernel mass is tiny but non-zero");
+        assert!(
+            near_zero.n_eff > 0.0 && near_zero.n_eff < 1e-20,
+            "this case must exercise the Some arm with negligible evidence, \
+             got n_eff {}",
+            near_zero.n_eff
+        );
+
+        // Route 2: kernel mass underflows entirely.
+        assert!(
+            kernel_estimate(&[(50.0, 0.9)], 1.0).is_none(),
+            "at d = 50h the weight underflows and there is no estimate at all"
+        );
+
+        let correction = selector.lambda(near_zero.n_eff) * near_zero.residual;
+        assert!(
+            correction.abs() < 1e-20,
+            "a negligible-evidence correction must be negligible, got {correction}"
+        );
+
+        // For any base at a scale a probability or a latency actually occupies,
+        // the correction is absorbed exactly.
+        for base in [0.017f64, 0.5, 0.999, 1.0, 12.5, 1e6] {
             assert_eq!(
                 base + correction,
                 base,
-                "far-field correction must be exactly neutral for base {base}"
+                "a Some-but-negligible correction must be exactly neutral for base {base}"
             );
         }
+
+        // Precision about the invariant, because this test found the original
+        // claim to be slightly overstated: at base EXACTLY 0.0 there is no
+        // mantissa to absorb the denormal, so it survives as ~4e-23 rather than
+        // vanishing. That is harmless — it is a failure probability of 4e-23 —
+        // but the honest statement for this route is "negligible", not
+        // "bit-for-bit". Bit-for-bit holds on the far-field route below, where
+        // the correction is exactly 0.0.
+        assert!(
+            (0.0 + correction).abs() < 1e-20,
+            "at base 0.0 the correction survives as a denormal; it must at least \
+             stay negligible, got {correction}"
+        );
+
+        // Route 2, the true far field: exactly zero, so bit-for-bit for EVERY
+        // base including 0.0.
+        for base in [0.0f64, 0.017, 0.5, 1.0, 1e6] {
+            assert_eq!(base + 0.0, base);
+        }
+    }
+
+    /// The loss accumulator must be able to change its mind about a candidate
+    /// when the regime shifts, rather than being anchored by distant history.
+    #[test]
+    fn selection_can_change_its_mind_after_a_regime_change() {
+        let mut selector = ShrinkageSelector::new();
+
+        // Regime 1: residuals are pure noise, so shrink hard.
+        let mut state = 99u64;
+        for _ in 0..40_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let actual = if state % 2 == 0 { 0.5 } else { -0.5 };
+            record_uniform(&mut selector, 4.0, 0.5, actual);
+        }
+        let noisy_kappa = selector.kappa();
+        assert!(
+            noisy_kappa >= 8.0,
+            "a long noise regime should select a conservative kappa, got {noisy_kappa}"
+        );
+
+        // Regime 2: the residual becomes perfectly predictable. The selector must
+        // follow within a bounded number of events rather than being held by the
+        // 40k events of history above.
+        for _ in 0..40_000 {
+            record_uniform(&mut selector, 4.0, 0.3, 0.3);
+        }
+        let learnable_kappa = selector.kappa();
+        assert!(
+            learnable_kappa < noisy_kappa,
+            "the selector must adapt to a new regime: kappa stayed at \
+             {learnable_kappa} after the residual became predictable (was \
+             {noisy_kappa})"
+        );
     }
 }
