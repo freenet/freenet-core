@@ -452,13 +452,10 @@ pub fn peer_detail_html(address_str: &str) -> String {
     // Build the renegade prediction-accuracy panel (failure + timing models)
     let renegade_chart = if let Some(ref rs) = router_snapshot {
         build_renegade_accuracy_panel(
+            // The chart derives its own score from these pairs. Passing one in
+            // was the bug: every score available to pass describes a different
+            // window from the one drawn.
             &rs.renegade_accuracy_pairs,
-            // The RECENT score, because the chart plots the recent pairs. It was
-            // passed the overall score while captioning itself with the recent
-            // window's `n`, so the chart read "Brier 0.009 · n=200" next to a
-            // panel reporting 0.0142 over those same 200 pairs — two different
-            // quantities presented as one.
-            rs.renegade_recent_brier_score,
             &rs.renegade_response_time_pairs,
             &rs.renegade_transfer_speed_pairs,
         )

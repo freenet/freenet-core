@@ -248,10 +248,21 @@ impl ShrinkageSelector {
     /// too-large `kappa` only delays the correction whereas a too-small one
     /// applies it before it is earned.
     fn best(&self) -> (usize, usize) {
+        // Seeded with the cautious midpoint and improved on only STRICTLY, so a
+        // fully-tied grid keeps the default rather than collapsing to index
+        // (0, 0) — the narrowest bandwidth and smallest kappa, i.e. the most
+        // aggressive combination in the grid.
+        //
+        // Ties are not hypothetical. Before a stage has a bandwidth, every
+        // `record` scores an all-`None` estimate array, which adds the SAME loss
+        // to every candidate while still incrementing `scored`. Without a strict
+        // comparison the selector would leave warm-up already committed to the
+        // most aggressive settings, on the strength of evidence that
+        // distinguished nothing.
+        let mut best = (BANDWIDTH_MULTIPLIERS.len() / 2, KAPPA_GRID.len() / 2);
         if self.scored == 0 {
-            return (BANDWIDTH_MULTIPLIERS.len() / 2, KAPPA_GRID.len() / 2);
+            return best;
         }
-        let mut best = (0usize, 0usize);
         for bandwidth in 0..BANDWIDTH_MULTIPLIERS.len() {
             for kappa in 0..KAPPA_GRID.len() {
                 if self.squared_error[bandwidth][kappa] < self.squared_error[best.0][best.1] {

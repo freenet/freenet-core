@@ -1209,7 +1209,7 @@ mod tests {
 
     #[test]
     fn reliability_chart_empty_is_placeholder() {
-        let svg = build_reliability_chart(&[], None);
+        let svg = build_reliability_chart(&[]);
         assert!(svg.contains("collecting data"));
         assert!(svg.contains("<svg"));
     }
@@ -1220,9 +1220,23 @@ mod tests {
         let pairs: Vec<(f64, f64)> = (0..20)
             .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
             .collect();
-        let svg = build_reliability_chart(&pairs, Some(0.042));
+        let svg = build_reliability_chart(&pairs);
         assert!(svg.contains("Failure (calibration)"));
-        assert!(svg.contains("Brier 0.042"));
+        // The caption is now DERIVED from these pairs rather than supplied, so
+        // this asserts the derivation rather than echoing an argument back.
+        // Predicted i/20 against actual 0 for i<=10 and 1 for i>10:
+        let expected: f64 = (0..20)
+            .map(|i| {
+                let predicted = i as f64 / 20.0;
+                let actual = if i > 10 { 1.0 } else { 0.0 };
+                (predicted - actual).powi(2)
+            })
+            .sum::<f64>()
+            / 20.0;
+        assert!(
+            svg.contains(&format!("Brier {expected:.3}")),
+            "caption must carry the Brier of the plotted pairs ({expected:.3}), got: {svg}"
+        );
         assert!(svg.contains("n=20"));
         assert!(svg.contains("<circle"), "bins should render as points");
     }
@@ -1237,14 +1251,14 @@ mod tests {
             (0.7, 1.0),
         ];
         // Only 2 valid pairs survive the finite filter.
-        let svg = build_reliability_chart(&pairs, None);
+        let svg = build_reliability_chart(&pairs);
         assert!(svg.contains("n=2"));
     }
 
     #[test]
     fn reliability_chart_boundary_values_no_panic() {
         // p == 1.0 and p == 0.0 must clamp into a bin without panicking.
-        let svg = build_reliability_chart(&[(1.0, 0.0), (0.0, 1.0)], Some(0.5));
+        let svg = build_reliability_chart(&[(1.0, 0.0), (0.0, 1.0)]);
         assert!(svg.contains("<svg"));
         assert!(svg.contains("n=2"));
     }
@@ -1339,10 +1353,7 @@ mod tests {
 
     #[test]
     fn accuracy_panel_empty_when_no_data() {
-        assert_eq!(
-            build_renegade_accuracy_panel(&[], None, &[], &[]),
-            String::new()
-        );
+        assert_eq!(build_renegade_accuracy_panel(&[], &[], &[]), String::new());
     }
 
     #[test]
@@ -1350,7 +1361,7 @@ mod tests {
         let failure: Vec<(f64, f64)> = (0..20)
             .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
             .collect();
-        let svg = build_renegade_accuracy_panel(&failure, Some(0.05), &[], &[]);
+        let svg = build_renegade_accuracy_panel(&failure, &[], &[]);
         assert!(svg.contains("Prediction Accuracy"));
         assert!(svg.contains("Failure (calibration)"));
         // Timing models have no data yet -> their placeholders still appear.

@@ -1109,7 +1109,7 @@ fn residual_correction_enabled() -> bool {
     // `cargo test`, which is the runner AGENTS.md asks contributors to use.
     #[cfg(test)]
     {
-        match TEST_CORRECTION_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        match TEST_CORRECTION_OVERRIDE.with(|cell| cell.get()) {
             1 => return true,
             2 => return false,
             _ => {}
@@ -1126,9 +1126,19 @@ fn residual_correction_enabled() -> bool {
     })
 }
 
-/// Test-only override for [`residual_correction_enabled`]: 0 unset, 1 on, 2 off.
+// Test-only override for `residual_correction_enabled`: 0 unset, 1 on, 2 off.
+//
+// THREAD-LOCAL, not a process-global atomic. `cargo test` runs tests in
+// parallel threads within one process, so a shared cell lets one test's
+// override leak into an unrelated routing test, and two guards dropping in
+// either order can restore each other's stale value. That is the
+// process-global cross-test-interference shape this repo's testing rules
+// call out, and it is invisible under nextest's process-per-test isolation —
+// which is exactly what makes it worth avoiding rather than tolerating.
 #[cfg(test)]
-static TEST_CORRECTION_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+thread_local! {
+    static TEST_CORRECTION_OVERRIDE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
 
 /// Force the residual correction on or off for the duration of a test.
 ///
@@ -1136,10 +1146,11 @@ static TEST_CORRECTION_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic
 /// a process cannot leak the override into each other.
 #[cfg(test)]
 pub(crate) fn force_residual_correction(enabled: bool) -> CorrectionOverrideGuard {
-    let previous = TEST_CORRECTION_OVERRIDE.swap(
-        if enabled { 1 } else { 2 },
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    let previous = TEST_CORRECTION_OVERRIDE.with(|cell| {
+        let previous = cell.get();
+        cell.set(if enabled { 1 } else { 2 });
+        previous
+    });
     CorrectionOverrideGuard { previous }
 }
 
@@ -1151,7 +1162,7 @@ pub(crate) struct CorrectionOverrideGuard {
 #[cfg(test)]
 impl Drop for CorrectionOverrideGuard {
     fn drop(&mut self) {
-        TEST_CORRECTION_OVERRIDE.store(self.previous, std::sync::atomic::Ordering::Relaxed);
+        TEST_CORRECTION_OVERRIDE.with(|cell| cell.set(self.previous));
     }
 }
 
@@ -1833,8 +1844,18 @@ impl Router {
                 .estimate_global(peer, target_location)
                 .ok()
                 .map(|value| value.clamp(0.0, 1.0));
-            if let (Some(base), Some(correction)) = (global_failure, corrections.failure) {
-                let corrected = (base + correction.value).clamp(0.0, 1.0);
+            // Note the shape: the base is adopted whenever it EXISTS, and the
+            // correction is added only if the residual model has something to
+            // say. An earlier version required both, which quietly defeated the
+            // neutral-when-uninformed property this design rests on — when the
+            // correction abstained (post-restart warm-up, or a query whose
+            // kernel weights underflow) the estimate silently fell back to the
+            // legacy blend, i.e. to exactly the far-field behaviour the
+            // correction exists to replace. Abstention must mean "base plus
+            // nothing", not "revert to the old model".
+            if let Some(base) = global_failure {
+                let corrected =
+                    (base + corrections.failure.map_or(0.0, |c| c.value)).clamp(0.0, 1.0);
                 if corrected.is_finite() {
                     failure_estimate = corrected;
                 }
@@ -1848,14 +1869,16 @@ impl Router {
                 .transfer_rate_estimator
                 .estimate_global(peer, target_location)
                 .ok();
-            if let (Some(base), Some(correction)) = (global_time, corrections.response_time) {
-                let corrected = modes.response_time.apply(base, correction.value);
+            if let Some(base) = global_time {
+                let correction = corrections.response_time.map_or(0.0, |c| c.value);
+                let corrected = modes.response_time.apply(base, correction);
                 if corrected.is_finite() && corrected >= 0.0 {
                     time_to_response_start = corrected;
                 }
             }
-            if let (Some(base), Some(correction)) = (global_transfer, corrections.transfer_speed) {
-                let corrected = modes.transfer_speed.apply(base, correction.value);
+            if let Some(base) = global_transfer {
+                let correction = corrections.transfer_speed.map_or(0.0, |c| c.value);
+                let corrected = modes.transfer_speed.apply(base, correction);
                 if corrected.is_finite() && corrected > 0.0 {
                     xfer_speed = corrected;
                 }
