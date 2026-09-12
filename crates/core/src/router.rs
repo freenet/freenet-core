@@ -1216,19 +1216,42 @@ pub(crate) struct SelectionRankStats {
     /// Of the saturated decisions, those whose selection fell in the farthest
     /// quarter of the window — the reading that would justify widening it.
     saturated_far_quarter: std::sync::atomic::AtomicU64,
+    /// Exact sum of selected ranks, so the mean does not inherit the histogram's
+    /// ceiling.
+    ///
+    /// `SELECTION_RANK_BUCKETS` is fixed storage, but the window is
+    /// configurable via `considering_n_closest_peers`. Deriving the mean from
+    /// the buckets would understate the tail for any window wider than the
+    /// buckets — precisely the configuration someone would run while evaluating
+    /// whether a wider window helps, so the metric would mislead exactly when it
+    /// was being consulted.
+    rank_sum: std::sync::atomic::AtomicU64,
+    /// Largest rank ever selected, so a tail beyond the histogram is visible
+    /// rather than silently folded into the last bucket.
+    max_rank: std::sync::atomic::AtomicU64,
 }
 
 impl SelectionRankStats {
-    fn record(&self, selected_rank: usize, window: usize, window_limit: usize) {
+    /// `candidates_before_truncation` is how many peers were available to the
+    /// decision, and `window` how many survived the distance cut.
+    fn record(&self, selected_rank: usize, window: usize, candidates_before_truncation: usize) {
         use std::sync::atomic::Ordering::Relaxed;
         let bucket = selected_rank.min(SELECTION_RANK_BUCKETS - 1);
         self.rank[bucket].fetch_add(1, Relaxed);
         self.total.fetch_add(1, Relaxed);
+        // Exact, unbucketed, so the mean survives a window wider than the
+        // histogram. The histogram is for the SHAPE; this is for the number.
+        self.rank_sum.fetch_add(selected_rank as u64, Relaxed);
+        self.max_rank.fetch_max(selected_rank as u64, Relaxed);
 
-        // `>=` rather than `==`: a caller may configure a smaller window than
-        // the candidate list it passes, and either way a full window is one
-        // where truncation could have bitten.
-        if window >= window_limit && window > 0 {
+        // TRUNCATED, not merely full. A decision with exactly 25 candidates
+        // against a 25-peer window scored every one of them — nothing was
+        // discarded, so it is no evidence about the limit. Counting it would
+        // inflate the saturation rate with decisions the window never
+        // constrained, which is the precise false positive the qualifier exists
+        // to prevent: a node whose connection count happens to sit AT the limit
+        // would otherwise look starved on every decision.
+        if candidates_before_truncation > window && window > 0 {
             self.saturated.fetch_add(1, Relaxed);
             // Farthest quarter, rounded so that tiny windows still have one.
             let threshold = window - (window / 4).max(1);
@@ -1245,6 +1268,8 @@ impl SelectionRankStats {
             total: self.total.load(Relaxed),
             saturated: self.saturated.load(Relaxed),
             saturated_far_quarter: self.saturated_far_quarter.load(Relaxed),
+            rank_sum: self.rank_sum.load(Relaxed),
+            max_rank: self.max_rank.load(Relaxed),
         }
     }
 }
@@ -1257,6 +1282,10 @@ pub struct SelectionRankSnapshot {
     pub total: u64,
     pub saturated: u64,
     pub saturated_far_quarter: u64,
+    #[serde(default)]
+    pub rank_sum: u64,
+    #[serde(default)]
+    pub max_rank: u64,
 }
 
 impl SelectionRankSnapshot {
@@ -1267,17 +1296,10 @@ impl SelectionRankSnapshot {
     }
 
     /// Mean selected rank, for a one-number summary alongside the histogram.
+    ///
+    /// From the exact sum, NOT the buckets — see `rank_sum`.
     pub fn mean_rank(&self) -> Option<f64> {
-        if self.total == 0 {
-            return None;
-        }
-        let weighted: u64 = self
-            .rank
-            .iter()
-            .enumerate()
-            .map(|(bucket, count)| bucket as u64 * count)
-            .sum();
-        Some(weighted as f64 / self.total as f64)
+        (self.total > 0).then(|| self.rank_sum as f64 / self.total as f64)
     }
 }
 
@@ -1653,11 +1675,17 @@ impl Router {
         }
     }
 
+    /// The `consider_n_closest_peers` closest candidates, plus HOW MANY were
+    /// available before that cut.
+    ///
+    /// The second value is what distinguishes "the window was full" from "the
+    /// window actually discarded someone", and only the latter is evidence
+    /// about whether the limit is costing anything.
     fn select_closest_peers<'a>(
         &self,
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         target_location: &Location,
-    ) -> Vec<&'a PeerKeyLocation> {
+    ) -> (Vec<&'a PeerKeyLocation>, usize) {
         let mut peer_distances: Vec<_> = peers
             .into_iter()
             .map(|peer| {
@@ -1680,9 +1708,13 @@ impl Router {
         if k > 0 && k < peer_distances.len() {
             peer_distances.select_nth_unstable_by(k - 1, |a, b| a.1.cmp(&b.1));
         }
+        let available = peer_distances.len();
         peer_distances.truncate(k);
         peer_distances.sort_by_key(|&(_, distance)| distance);
-        peer_distances.into_iter().map(|(peer, _)| peer).collect()
+        (
+            peer_distances.into_iter().map(|(peer, _)| peer).collect(),
+            available,
+        )
     }
 
     pub fn select_peer<'a>(
@@ -2107,7 +2139,8 @@ impl Router {
             };
             (selected, decision)
         } else {
-            let closest = self.select_closest_peers(peers, &target_location);
+            let (closest, candidates_available) =
+                self.select_closest_peers(peers, &target_location);
             let mut fallback_count = 0;
 
             // `closest` is distance-sorted, so the enumerate index IS the
@@ -2144,11 +2177,8 @@ impl Router {
             // Record where the winner sat in distance order, so the cost of the
             // candidate-window truncation can be measured rather than guessed.
             if let Some((distance_rank, _, _, _)) = scored.first() {
-                self.selection_ranks.record(
-                    *distance_rank,
-                    closest.len(),
-                    self.consider_n_closest_peers,
-                );
+                self.selection_ranks
+                    .record(*distance_rank, closest.len(), candidates_available);
             }
 
             let strategy = if fallback_count == 0 {
@@ -2929,11 +2959,11 @@ mod tests {
     fn boundary_selections_only_count_against_a_full_window() {
         let stats = SelectionRankStats::default();
 
-        // A node with 8 connections and a 25-peer limit: the window was never
-        // full, so choosing the FARTHEST of the 8 says nothing about truncation
+        // A node with 8 connections and a 25-peer limit: 8 candidates, 8
+        // scored. Choosing the FARTHEST of the 8 says nothing about truncation
         // — there was nothing to truncate.
         for _ in 0..10 {
-            stats.record(7, 8, 25);
+            stats.record(7, 8, 8);
         }
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.total, 10);
@@ -2947,10 +2977,25 @@ mod tests {
             "with no truncated decisions there is no share to report"
         );
 
-        // Same choice against a FULL window is the reading that matters.
+        // Exactly at the limit: 25 candidates, 25 scored. STILL not evidence —
+        // the window was full but discarded nobody. This is the case the first
+        // implementation got wrong, counting it as saturated and so inflating
+        // the rate with decisions the limit never constrained.
         let stats = SelectionRankStats::default();
         for _ in 0..10 {
             stats.record(24, 25, 25);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(
+            snapshot.saturated, 0,
+            "a full window that discarded nobody is not evidence about the limit"
+        );
+
+        // 40 candidates cut to 25: now peers really were discarded unscored,
+        // and a far-quarter selection is the reading that matters.
+        let stats = SelectionRankStats::default();
+        for _ in 0..10 {
+            stats.record(24, 25, 40);
         }
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.saturated, 10);
@@ -2961,7 +3006,7 @@ mod tests {
     fn near_selections_against_a_full_window_read_as_comfortable() {
         let stats = SelectionRankStats::default();
         for _ in 0..100 {
-            stats.record(0, 25, 25);
+            stats.record(0, 25, 40);
         }
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.saturated, 100);
@@ -2977,7 +3022,7 @@ mod tests {
     fn selection_rank_histogram_and_mean_track_the_recorded_ranks() {
         let stats = SelectionRankStats::default();
         for rank in [0usize, 0, 2, 4] {
-            stats.record(rank, 25, 25);
+            stats.record(rank, 25, 40);
         }
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.rank[0], 2);
@@ -2990,7 +3035,7 @@ mod tests {
     #[test]
     fn selection_rank_beyond_the_buckets_is_collected_not_lost() {
         let stats = SelectionRankStats::default();
-        stats.record(10_000, 12_000, 25);
+        stats.record(10_000, 12_000, 20_000);
         let snapshot = stats.snapshot();
         assert_eq!(
             snapshot.rank[SELECTION_RANK_BUCKETS - 1],
@@ -2999,6 +3044,19 @@ mod tests {
              or be dropped"
         );
         assert_eq!(snapshot.total, 1);
+        // The MEAN must not inherit the histogram's ceiling. Bucketing would
+        // report 31 here; the exact sum reports the rank that actually happened,
+        // which matters most for a window wider than the buckets — exactly the
+        // configuration someone runs while evaluating whether to widen it.
+        assert_eq!(
+            snapshot.mean_rank(),
+            Some(10_000.0),
+            "the mean comes from the exact rank sum, not the buckets"
+        );
+        assert_eq!(
+            snapshot.max_rank, 10_000,
+            "a tail beyond the histogram must stay visible"
+        );
     }
 
     #[test]
@@ -3049,7 +3107,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.saturated, 25,
-            "40 candidates against a 25-peer window is saturated every time"
+            "40 candidates cut to a 25-peer window discards 15 unscored every time"
         );
     }
 
@@ -3269,6 +3327,7 @@ mod tests {
             Router::new(&[])
                 .considering_n_closest_peers(CAP)
                 .select_closest_peers(&create_peers(NUM_PEERS), &Location::random())
+                .0
                 .len()
         );
     }
@@ -3334,7 +3393,7 @@ mod tests {
                 .collect();
             let target = Location::random();
 
-            let window = router.select_closest_peers(&peers, &target);
+            let (window, _) = router.select_closest_peers(&peers, &target);
             if window.iter().any(|p| {
                 p.socket_addr()
                     .is_some_and(|a| subscriber_addrs.contains(&a))
@@ -3728,7 +3787,7 @@ mod tests {
         // Create a router with no historical data
         let router = Router::new(&[]).considering_n_closest_peers(CLOSEST_CAP);
         let asserted_closest: Vec<&PeerKeyLocation> =
-            router.select_closest_peers(&peers, &contract_location);
+            router.select_closest_peers(&peers, &contract_location).0;
 
         let mut expected_iter = expected_closest.iter();
         let mut asserted_iter = asserted_closest.iter();
@@ -3843,7 +3902,7 @@ mod tests {
         let empty_peers: Vec<PeerKeyLocation> = vec![];
         let target = Location::random();
 
-        let result = router.select_closest_peers(&empty_peers, &target);
+        let (result, _) = router.select_closest_peers(&empty_peers, &target);
         assert!(
             result.is_empty(),
             "select_closest_peers should return empty vec for empty candidates"

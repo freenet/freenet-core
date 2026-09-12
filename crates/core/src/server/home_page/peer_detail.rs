@@ -687,27 +687,23 @@ mod tests {
     #[test]
     fn layer_panel_does_not_present_the_correction_as_stacking() {
         let source = include_str!("peer_detail.rs");
-        // Depends on the production copy appearing BEFORE this test module, which
-        // it does because tests sit at the end of the file. If a second panel
-        // ever uses this heading earlier, `find` would relocate the region
-        // silently — the sliding-anchor failure this repo has hit before. The
-        // guard is the uniqueness assertion below rather than the ordering.
-        let test_module_start = source
+        // Scope to the RENDERING FUNCTION before searching for anything, so the
+        // scrape cannot anchor on this test's own literals, on a second panel
+        // introduced earlier in the file, or on text that is never rendered.
+        // Proving the match merely precedes the test module is weaker: it still
+        // permits the pin to validate dead copy while the real panel regresses.
+        let render_start = source
+            .find("pub fn peer_detail_html")
+            .expect("the rendering function must exist");
+        let render_end = source[render_start..]
             .find("\n#[cfg(test)]")
-            .expect("this file has a test module");
+            .map(|offset| render_start + offset)
+            .expect("the test module must follow the rendering function");
+        let source = &source[render_start..render_end];
+
         let panel_start = source
             .find("Which layer is doing the work?")
-            .expect("the layer panel heading must exist");
-        // Reject a match that landed inside the test module — that is this
-        // test's own literal, and scoping to it would validate the assertion
-        // strings against themselves. Position check rather than a count, so
-        // adding another reference to the heading cannot break the pin while
-        // moving the production copy still does.
-        assert!(
-            panel_start < test_module_start,
-            "the anchor matched inside the test module, so the production panel \
-             was not found — the pin would be validating its own literals"
-        );
+            .expect("the layer panel heading must exist inside peer_detail_html");
         let panel_end = source[panel_start..]
             .find("Correction state")
             .map(|offset| panel_start + offset)
