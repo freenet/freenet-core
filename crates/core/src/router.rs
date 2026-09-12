@@ -1561,9 +1561,20 @@ impl Router {
         outcome: &routing_predictor::RoutingOutcome,
     ) -> routing_predictor::StageResiduals {
         let actual_failure = if outcome.success { 0.0 } else { 1.0 };
+        // Residual of the GLOBAL curve, NOT the peer-adjusted estimate.
+        //
+        // Measured, and it reverses what the design proposal assumed. Correcting
+        // the peer-adjusted estimate puts the per-peer EWMA's own noise inside
+        // the residual target, and that component is a function of the EWMA's
+        // internal state at that instant rather than of (peer, contract,
+        // distance, time) — so it is unlearnable from the features, and the
+        // correction spends its capacity chasing it. On the recoverability
+        // harness this was the difference between `captured = -0.30` and
+        // `captured = +0.055`, i.e. between worse than assuming nothing and
+        // better than it for the first time. See #4485.
         let failure = self
             .failure_estimator
-            .estimate_retrieval_time(peer, contract_location)
+            .estimate_global(peer, contract_location)
             .ok()
             .and_then(|base| {
                 self.failure_estimator
@@ -1573,7 +1584,7 @@ impl Router {
 
         let response_time = outcome.time_to_response_start_secs.and_then(|actual| {
             self.response_start_time_estimator
-                .estimate_retrieval_time(peer, contract_location)
+                .estimate_global(peer, contract_location)
                 .ok()
                 .and_then(|base| {
                     self.response_start_time_estimator
@@ -1584,7 +1595,7 @@ impl Router {
 
         let transfer_speed = outcome.transfer_speed_bps.and_then(|actual| {
             self.transfer_rate_estimator
-                .estimate_retrieval_time(peer, contract_location)
+                .estimate_global(peer, contract_location)
                 .ok()
                 .and_then(|base| {
                     self.transfer_rate_estimator
@@ -1612,7 +1623,8 @@ impl Router {
         actual_failure: f64,
     ) {
         let (Ok(global), Ok(adjusted)) = (
-            self.failure_estimator.estimate_global(peer, contract_location),
+            self.failure_estimator
+                .estimate_global(peer, contract_location),
             self.failure_estimator
                 .estimate_retrieval_time(peer, contract_location),
         ) else {
@@ -1643,16 +1655,18 @@ impl Router {
             distance,
             self.stage_modes(),
         );
-        let corrected = corrections
-            .failure
-            .map_or(adjusted, |correction| {
-                (adjusted + correction.value).clamp(0.0, 1.0)
-            });
+        // Scored against the GLOBAL base, matching how the correction is actually
+        // composed; scoring it against the peer-adjusted estimate would measure a
+        // predictor the router never forms.
+        let corrected = corrections.failure.map_or(global, |correction| {
+            (global + correction.value).clamp(0.0, 1.0)
+        });
 
         self.failure_skill_global.record(global, actual_failure);
         self.failure_skill_adjusted.record(adjusted, actual_failure);
         self.failure_skill_blended.record(blended, actual_failure);
-        self.failure_skill_corrected.record(corrected, actual_failure);
+        self.failure_skill_corrected
+            .record(corrected, actual_failure);
     }
 
     fn predict_routing_outcome(
@@ -1712,12 +1726,19 @@ impl Router {
         );
         let correction_enabled = residual_correction_enabled();
 
-        let corrected_failure = corrections.failure.map(|correction| {
-            // Additive space, then clamped: the failure target is a probability,
-            // and `AdjustmentMode::Additive` is the same composition the per-peer
-            // EWMA already uses for it.
-            (isotonic_failure + correction.value).clamp(0.0, 1.0)
-        });
+        // The correction composes with the GLOBAL curve, matching the space its
+        // residuals were taken in (see `stage_residuals`). It therefore REPLACES
+        // the per-peer EWMA rather than stacking on it — this is #4485's B5
+        // question, settled by measurement rather than argument.
+        let global_failure = self
+            .failure_estimator
+            .estimate_global(peer, target_location)
+            .ok()
+            .map(|value| value.clamp(0.0, 1.0));
+        let corrected_failure = match (global_failure, corrections.failure) {
+            (Some(base), Some(correction)) => Some((base + correction.value).clamp(0.0, 1.0)),
+            _ => None,
+        };
 
         let renegade_failure_adjustment =
             if let Some(renegade_failure) = renegade.failure_probability {
@@ -1761,13 +1782,21 @@ impl Router {
                 failure_estimate = corrected;
             }
             let modes = self.stage_modes();
-            if let (Some(base), Some(correction)) = (time_estimate, corrections.response_time) {
+            let global_time = self
+                .response_start_time_estimator
+                .estimate_global(peer, target_location)
+                .ok();
+            let global_transfer = self
+                .transfer_rate_estimator
+                .estimate_global(peer, target_location)
+                .ok();
+            if let (Some(base), Some(correction)) = (global_time, corrections.response_time) {
                 let corrected = modes.response_time.apply(base, correction.value);
                 if corrected.is_finite() && corrected >= 0.0 {
                     time_to_response_start = corrected;
                 }
             }
-            if let (Some(base), Some(correction)) = (transfer_estimate, corrections.transfer_speed) {
+            if let (Some(base), Some(correction)) = (global_transfer, corrections.transfer_speed) {
                 let corrected = modes.transfer_speed.apply(base, correction.value);
                 if corrected.is_finite() && corrected > 0.0 {
                     xfer_speed = corrected;

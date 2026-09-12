@@ -58,6 +58,27 @@ const KAPPA_GRID: [f64; 7] = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 /// Three sigma is a data-derived bound rather than a magic absolute constant.
 const LOG_CORRECTION_SIGMA_CLAMP: f64 = 3.0;
 
+/// Multipliers applied to the estimated length scale to form bandwidth
+/// candidates.
+///
+/// A single bandwidth set to the data's typical spacing is NOT a safe default,
+/// and measuring it is the whole reason this grid exists. The median k-th
+/// neighbour distance makes the kernel exactly as coarse as the data is sparse,
+/// so `exp(-d^2/2h^2)` is ~1 for nearly every neighbour, `n_eff` is roughly
+/// constant everywhere, and the correction degenerates into a global smoother
+/// that can never localise to structure finer than the typical spacing.
+///
+/// Measured on the recoverability harness before this grid existed: a
+/// peer x contract effect scored `captured = -0.33` and the learning curve was
+/// FLAT from 500 to 4000 events. The correction helped slightly (14% error
+/// reduction) while recovering none of the structure it exists to find, which
+/// is exactly the failure a relative comparison against the old blend would
+/// have called a success.
+///
+/// So the bandwidth is selected by the same prequential loss that selects
+/// `kappa`: the derivation fixes the shape, measurement fixes both values.
+pub(crate) const BANDWIDTH_MULTIPLIERS: [f64; 6] = [0.05, 0.1, 0.25, 0.5, 1.0, 2.0];
+
 /// Number of stored points sampled when estimating the kernel bandwidth.
 /// The bandwidth is a global length scale, so a sample is sufficient and keeps
 /// the estimate O(S log n) rather than O(n log n) per training round.
@@ -84,10 +105,7 @@ pub(crate) struct KernelEstimate {
 /// Non-finite neighbours are skipped rather than allowed to poison the mean: a
 /// single NaN residual would otherwise make every downstream prediction NaN, and
 /// a NaN failure probability propagates into the router's cost comparator.
-pub(crate) fn kernel_estimate(
-    neighbors: &[(f64, f64)],
-    bandwidth: f64,
-) -> Option<KernelEstimate> {
+pub(crate) fn kernel_estimate(neighbors: &[(f64, f64)], bandwidth: f64) -> Option<KernelEstimate> {
     if neighbors.is_empty() || !bandwidth.is_finite() || bandwidth <= 0.0 {
         return None;
     }
@@ -108,7 +126,7 @@ pub(crate) fn kernel_estimate(
         value_sum += weight * residual;
     }
 
-    if !(weight_sum > 0.0) || !weight_sum.is_finite() {
+    if !weight_sum.is_finite() || weight_sum <= 0.0 {
         return None;
     }
 
@@ -164,8 +182,9 @@ pub(crate) fn estimate_bandwidth(samples: &mut Vec<f64>) -> Option<f64> {
 /// `(base + λr̂) − actual = λr̂ − (actual − base)`.
 #[derive(Debug, Clone)]
 pub(crate) struct ShrinkageSelector {
-    /// Accumulated squared error per candidate, parallel to [`KAPPA_GRID`].
-    squared_error: [f64; KAPPA_GRID.len()],
+    /// Accumulated squared error per (bandwidth, kappa) candidate, indexed
+    /// `[bandwidth][kappa]` over [`BANDWIDTH_MULTIPLIERS`] and [`KAPPA_GRID`].
+    squared_error: [[f64; KAPPA_GRID.len()]; BANDWIDTH_MULTIPLIERS.len()],
     /// Number of scored corrections.
     scored: u64,
     /// Welford accumulators for the spread of observed residuals, used to bound
@@ -184,7 +203,7 @@ impl Default for ShrinkageSelector {
 impl ShrinkageSelector {
     pub(crate) fn new() -> Self {
         Self {
-            squared_error: [0.0; KAPPA_GRID.len()],
+            squared_error: [[0.0; KAPPA_GRID.len()]; BANDWIDTH_MULTIPLIERS.len()],
             scored: 0,
             residual_mean: 0.0,
             residual_m2: 0.0,
@@ -197,16 +216,38 @@ impl ShrinkageSelector {
     /// deliberately cautious starting point, since a too-large `κ` only delays
     /// the correction whereas a too-small one applies it before it is earned.
     pub(crate) fn kappa(&self) -> f64 {
+        KAPPA_GRID[self.best().1]
+    }
+
+    /// Index of the currently-best bandwidth multiplier.
+    pub(crate) fn bandwidth_index(&self) -> usize {
+        self.best().0
+    }
+
+    /// The currently-best bandwidth multiplier.
+    pub(crate) fn bandwidth_multiplier(&self) -> f64 {
+        BANDWIDTH_MULTIPLIERS[self.best().0]
+    }
+
+    /// Best `(bandwidth index, kappa index)` by accumulated prequential loss.
+    ///
+    /// Before anything has been scored there is no evidence to choose on, so
+    /// this returns the middle of each grid — deliberately cautious, since a
+    /// too-large `kappa` only delays the correction whereas a too-small one
+    /// applies it before it is earned.
+    fn best(&self) -> (usize, usize) {
         if self.scored == 0 {
-            return KAPPA_GRID[KAPPA_GRID.len() / 2];
+            return (BANDWIDTH_MULTIPLIERS.len() / 2, KAPPA_GRID.len() / 2);
         }
-        let mut best_index = 0;
-        for index in 1..KAPPA_GRID.len() {
-            if self.squared_error[index] < self.squared_error[best_index] {
-                best_index = index;
+        let mut best = (0usize, 0usize);
+        for bandwidth in 0..BANDWIDTH_MULTIPLIERS.len() {
+            for kappa in 0..KAPPA_GRID.len() {
+                if self.squared_error[bandwidth][kappa] < self.squared_error[best.0][best.1] {
+                    best = (bandwidth, kappa);
+                }
             }
         }
-        KAPPA_GRID[best_index]
+        best
     }
 
     /// Shrinkage factor `λ = n_eff / (n_eff + κ)` for the given evidence mass.
@@ -228,7 +269,18 @@ impl ShrinkageSelector {
 
     /// Score every candidate `κ` against a realised residual, and fold that
     /// residual into the spread estimate.
-    pub(crate) fn record(&mut self, n_eff: f64, predicted_residual: f64, actual_residual: f64) {
+    /// Score every `(bandwidth, kappa)` candidate against a realised residual.
+    ///
+    /// `estimates` is parallel to [`BANDWIDTH_MULTIPLIERS`]; a `None` entry means
+    /// that bandwidth produced no usable estimate, which is scored as "no
+    /// correction" rather than skipped — a candidate that abstains still has to
+    /// answer for the residual it declined to predict, or abstaining would look
+    /// free.
+    pub(crate) fn record(
+        &mut self,
+        estimates: &[Option<KernelEstimate>; BANDWIDTH_MULTIPLIERS.len()],
+        actual_residual: f64,
+    ) {
         if !actual_residual.is_finite() {
             return;
         }
@@ -238,15 +290,23 @@ impl ShrinkageSelector {
         self.residual_mean += delta / self.residual_count as f64;
         self.residual_m2 += delta * (actual_residual - self.residual_mean);
 
-        if !n_eff.is_finite() || n_eff <= 0.0 || !predicted_residual.is_finite() {
-            return;
-        }
-
-        for (index, kappa) in KAPPA_GRID.iter().enumerate() {
-            let lambda = n_eff / (n_eff + kappa);
-            let error = lambda * predicted_residual - actual_residual;
-            if error.is_finite() {
-                self.squared_error[index] += error * error;
+        for (bandwidth_index, estimate) in estimates.iter().enumerate() {
+            let (n_eff, predicted) = match estimate {
+                Some(estimate) if estimate.n_eff.is_finite() && estimate.residual.is_finite() => {
+                    (estimate.n_eff, estimate.residual)
+                }
+                _ => (0.0, 0.0),
+            };
+            for (kappa_index, kappa) in KAPPA_GRID.iter().enumerate() {
+                let lambda = if n_eff > 0.0 {
+                    n_eff / (n_eff + kappa)
+                } else {
+                    0.0
+                };
+                let error = lambda * predicted - actual_residual;
+                if error.is_finite() {
+                    self.squared_error[bandwidth_index][kappa_index] += error * error;
+                }
             }
         }
         self.scored += 1;
@@ -375,6 +435,18 @@ mod tests {
 
     /// `h` such that the numbers below are easy to reason about.
     const H: f64 = 1.0;
+
+    /// Score one `(n_eff, predicted)` pair against every bandwidth candidate.
+    ///
+    /// These tests are about `kappa` selection, so they hold the bandwidth
+    /// dimension constant and let the grid collapse to a single row.
+    fn record_uniform(selector: &mut ShrinkageSelector, n_eff: f64, predicted: f64, actual: f64) {
+        let estimate = Some(KernelEstimate {
+            residual: predicted,
+            n_eff,
+        });
+        selector.record(&[estimate; BANDWIDTH_MULTIPLIERS.len()], actual);
+    }
 
     #[test]
     fn kernel_estimate_averages_coincident_neighbours_exactly() {
@@ -527,7 +599,7 @@ mod tests {
         // the correction aggressively, i.e. a small kappa.
         let mut selector = ShrinkageSelector::new();
         for _ in 0..2_000 {
-            selector.record(4.0, 0.3, 0.3);
+            record_uniform(&mut selector, 4.0, 0.3, 0.3);
         }
         assert!(
             selector.kappa() <= 1.0,
@@ -548,7 +620,7 @@ mod tests {
             state ^= state >> 7;
             state ^= state << 17;
             let actual = if state % 2 == 0 { 0.5 } else { -0.5 };
-            selector.record(4.0, 0.5, actual);
+            record_uniform(&mut selector, 4.0, 0.5, actual);
         }
         assert!(
             selector.kappa() >= 8.0,
@@ -561,10 +633,10 @@ mod tests {
     fn residual_sigma_tracks_spread() {
         let mut selector = ShrinkageSelector::new();
         assert_eq!(selector.residual_sigma(), None);
-        selector.record(1.0, 0.0, 1.0);
+        record_uniform(&mut selector, 1.0, 0.0, 1.0);
         assert_eq!(selector.residual_sigma(), None, "one sample has no spread");
         for value in [-1.0, 1.0, -1.0, 1.0, -1.0] {
-            selector.record(1.0, 0.0, value);
+            record_uniform(&mut selector, 1.0, 0.0, value);
         }
         let sigma = selector.residual_sigma().expect("spread after six samples");
         assert!(
@@ -577,7 +649,7 @@ mod tests {
     fn log_correction_clamp_bounds_to_three_sigma() {
         let mut selector = ShrinkageSelector::new();
         for value in [-1.0, 1.0, -1.0, 1.0, -1.0, 1.0] {
-            selector.record(1.0, 0.0, value);
+            record_uniform(&mut selector, 1.0, 0.0, value);
         }
         let sigma = selector.residual_sigma().unwrap();
         let clamped = selector.clamp_log_correction(1_000.0);
@@ -599,8 +671,8 @@ mod tests {
     #[test]
     fn record_ignores_non_finite_actuals() {
         let mut selector = ShrinkageSelector::new();
-        selector.record(1.0, 0.0, f64::NAN);
-        selector.record(1.0, 0.0, f64::INFINITY);
+        record_uniform(&mut selector, 1.0, 0.0, f64::NAN);
+        record_uniform(&mut selector, 1.0, 0.0, f64::INFINITY);
         assert_eq!(selector.scored(), 0);
         assert_eq!(selector.residual_sigma(), None);
     }
@@ -615,7 +687,9 @@ mod tests {
             let actual = if index < 10 { 1.0 } else { 0.0 };
             tracker.record(0.10, actual);
         }
-        let skill = tracker.skill().expect("skill is defined for a mixed window");
+        let skill = tracker
+            .skill()
+            .expect("skill is defined for a mixed window");
         assert!(
             skill.abs() < 1e-9,
             "a climatology forecast must score exactly zero skill, got {skill}"
@@ -671,7 +745,10 @@ mod tests {
         assert_eq!(tracker.base_rate(), Some(0.0));
         assert_eq!(tracker.climatology_brier(), None);
         assert_eq!(tracker.skill(), None);
-        assert!(tracker.brier().is_some(), "the Brier score is still defined");
+        assert!(
+            tracker.brier().is_some(),
+            "the Brier score is still defined"
+        );
     }
 
     #[test]
