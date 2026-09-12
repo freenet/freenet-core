@@ -1625,8 +1625,19 @@ impl Router {
         // distance, time) — so it is unlearnable from the features, and the
         // correction spends its capacity chasing it. On the recoverability
         // harness this was the difference between `captured = -0.30` and
-        // `captured = +0.055`, i.e. between worse than assuming nothing and
-        // better than it for the first time. See #4485.
+        // `captured = +0.055` for the CORRECTED estimate — between worse than
+        // assuming nothing and better than it for the first time. See #4485.
+        //
+        // Three different quantities get called "captured" around here, and a
+        // reviewer who ran the test read the wrong one off it, so naming them:
+        //   -0.438  the global curve UNCORRECTED — what the harness prints as
+        //           `base`, and what you will see if you run it today
+        //   -0.302  the CORRECTED estimate composing with the PEER-ADJUSTED
+        //           base, i.e. the design this comment argues against. Not
+        //           reproducible from the tree: that configuration is gone
+        //   +0.055  the CORRECTED estimate composing with the global curve,
+        //           i.e. what the code now does
+        // The comparison that settles B5 is the second against the third.
         let failure = self
             .failure_estimator
             .estimate_global(peer, contract_location)

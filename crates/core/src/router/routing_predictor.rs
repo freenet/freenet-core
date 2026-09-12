@@ -2094,6 +2094,12 @@ mod recoverability {
     /// the correction composed with the global curve it did not — it scored
     /// `captured = -0.30`, worse than assuming nothing.
     ///
+    /// That -0.30 is the CORRECTED estimate under the superseded
+    /// peer-adjusted-base design, and is not reproducible from this tree — the
+    /// configuration no longer exists. It is NOT the `base` figure this test
+    /// prints (currently ~-0.44), which is the global curve uncorrected. The
+    /// two were confused once in review, which is reason enough to say so here.
+    ///
     /// The measured figure is printed on every run so the gap stays visible
     /// rather than being quietly forgotten, and closing it is what gates turning
     /// `FREENET_ROUTING_RESIDUAL_CORRECTION` on by default.
