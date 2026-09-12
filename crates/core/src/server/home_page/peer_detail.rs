@@ -152,6 +152,16 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">Scored predictions</div><div class="info-value">{layers_eval}</div>
                 </div>
 
+                <h3 style="margin-top: 1em;">Is the candidate window too narrow?</h3>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">Routing only scores the <strong>{window} closest</strong> peers to the contract; anything further away is invisible for that hop. This measures whether that limit is costing anything. If the chosen peer is usually one of the nearest few, the limit is comfortably wide and removing it would change nothing. If choices pile up against the far edge <em>while the window was full</em>, the ordering is being cut off where the better peer plausibly sits.</p>
+                <div class="info-grid">
+                    <div class="info-label">Decisions measured</div><div class="info-value">{rank_total}</div>
+                    <div class="info-label">Mean position of the chosen peer</div><div class="info-value">{rank_mean}</div>
+                    <div class="info-label">Decisions against a full window</div><div class="info-value">{rank_saturated}</div>
+                    <div class="info-label">&#8627; chose from the farthest quarter</div><div class="info-value">{rank_far}</div>
+                </div>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.5em;">{rank_reading}</p>
+
                 <h3 style="margin-top: 1em;">Correction state</h3>
                 <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">These are learned from the data, not configured &mdash; both are chosen by scoring candidate values against what actually happened, and both will change as the network does. <em>&kappa;</em> is how much evidence the correction demands before it applies half of itself; the bandwidth is the distance in feature space beyond which neighbouring observations stop counting as nearby.</p>
                 <div class="info-grid">
@@ -213,6 +223,34 @@ pub fn peer_detail_html(address_str: &str) -> String {
             res_r = rs.residual_response_time_events,
             res_t = rs.residual_transfer_speed_events,
             res_scored = rs.residual_scored,
+            window = rs.consider_n_closest_peers,
+            rank_total = rs.selection_ranks.total,
+            rank_mean = rs
+                .selection_ranks
+                .mean_rank()
+                .map(|mean| format!("{mean:.1} (0 = closest)"))
+                .unwrap_or_else(|| "&mdash;".to_string()),
+            rank_saturated = rs.selection_ranks.saturated,
+            rank_far = rs
+                .selection_ranks
+                .far_quarter_share()
+                .map(|share| format!("{:.1}%", share * 100.0))
+                .unwrap_or_else(|| "&mdash;".to_string()),
+            rank_reading = match rs.selection_ranks.far_quarter_share() {
+                None => "Not enough decisions against a full window to say yet.".to_string(),
+                Some(share) if share >= 0.25 => format!(
+                    "<strong>Worth investigating:</strong> {:.0}% of full-window decisions \
+                     chose from the farthest quarter, so the better peer may often be one \
+                     the router never scored.",
+                    share * 100.0
+                ),
+                Some(share) => format!(
+                    "The limit looks comfortable: only {:.0}% of full-window decisions \
+                     chose from the farthest quarter, so widening it would rarely change \
+                     the outcome.",
+                    share * 100.0
+                ),
+            },
             brier = rs
                 .renegade_brier_score
                 .map(|b| format!("{:.4}", b))

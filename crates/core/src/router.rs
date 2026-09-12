@@ -1009,6 +1009,12 @@ pub(crate) struct RouterSnapshotInfo {
     pub residual_transfer_speed_events: usize,
     #[serde(default)]
     pub residual_scored: u64,
+    /// Where the router's chosen peer sits in distance order, and how often that
+    /// choice was made against a FULL candidate window. See
+    /// [`SelectionRankStats`] — this is the evidence for whether the
+    /// 25-of-`max_connections` truncation is costing anything.
+    #[serde(default)]
+    pub selection_ranks: SelectionRankSnapshot,
 }
 
 /// Per-peer routing data for the dashboard detail page.
@@ -1059,6 +1065,10 @@ pub(crate) struct Router {
     failure_skill_blended: residual::SkillTracker,
     #[serde(skip)]
     failure_skill_corrected: residual::SkillTracker,
+    /// Where the chosen peer sits in distance order — the censoring diagnostic
+    /// for the candidate-window size. See [`SelectionRankStats`].
+    #[serde(skip)]
+    selection_ranks: SelectionRankStats,
 }
 
 impl Clone for Router {
@@ -1083,6 +1093,7 @@ impl Clone for Router {
             failure_skill_adjusted: residual::SkillTracker::new(),
             failure_skill_blended: residual::SkillTracker::new(),
             failure_skill_corrected: residual::SkillTracker::new(),
+            selection_ranks: SelectionRankStats::default(),
         }
     }
 }
@@ -1163,6 +1174,110 @@ pub(crate) struct CorrectionOverrideGuard {
 impl Drop for CorrectionOverrideGuard {
     fn drop(&mut self) {
         TEST_CORRECTION_OVERRIDE.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Rank buckets for [`SelectionRankStats`]. Sized past the default window of 25
+/// so a node configured with a wider one still lands in a real bucket.
+const SELECTION_RANK_BUCKETS: usize = 32;
+
+/// Where, in distance order, does the router's chosen peer actually sit?
+///
+/// # What this is for
+///
+/// The router scores only the `consider_n_closest_peers` (25) geographically
+/// closest candidates; everything beyond that is invisible to routing for that
+/// hop. Production nodes run `max_connections = 200`, so a well-connected peer
+/// has ~175 peers it never scores. Whether that truncation costs anything is an
+/// open question (#4485 follow-up), and it is not answerable from the outside:
+/// nothing currently records where within the window the decision lands.
+///
+/// This is a **censoring diagnostic**. If selections cluster at the near ranks,
+/// the window is comfortably wider than the decision needs and widening it would
+/// change nothing. If they pile up against the far edge *while the window was
+/// full*, the ordering is being truncated where the real optimum plausibly lies,
+/// and widening is worth testing.
+///
+/// The saturation qualifier is load-bearing. On a node with 8 connections the
+/// window is 8, so a selection at rank 7 is "last of 8" and says nothing about
+/// truncation — only a selection at the edge of a FULL window is evidence that
+/// options were discarded. Counting boundary hits without that condition would
+/// make every sparsely-connected node look like it needs a wider window.
+#[derive(Debug, Default)]
+pub(crate) struct SelectionRankStats {
+    /// Distance-rank of the selected peer, 0 = closest. The final bucket
+    /// collects anything at or beyond `SELECTION_RANK_BUCKETS - 1`.
+    rank: [std::sync::atomic::AtomicU64; SELECTION_RANK_BUCKETS],
+    /// Prediction-based decisions recorded.
+    total: std::sync::atomic::AtomicU64,
+    /// Decisions where the window was full, so truncation could have discarded
+    /// candidates that were never scored.
+    saturated: std::sync::atomic::AtomicU64,
+    /// Of the saturated decisions, those whose selection fell in the farthest
+    /// quarter of the window — the reading that would justify widening it.
+    saturated_far_quarter: std::sync::atomic::AtomicU64,
+}
+
+impl SelectionRankStats {
+    fn record(&self, selected_rank: usize, window: usize, window_limit: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bucket = selected_rank.min(SELECTION_RANK_BUCKETS - 1);
+        self.rank[bucket].fetch_add(1, Relaxed);
+        self.total.fetch_add(1, Relaxed);
+
+        // `>=` rather than `==`: a caller may configure a smaller window than
+        // the candidate list it passes, and either way a full window is one
+        // where truncation could have bitten.
+        if window >= window_limit && window > 0 {
+            self.saturated.fetch_add(1, Relaxed);
+            // Farthest quarter, rounded so that tiny windows still have one.
+            let threshold = window - (window / 4).max(1);
+            if selected_rank >= threshold {
+                self.saturated_far_quarter.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> SelectionRankSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        SelectionRankSnapshot {
+            rank: self.rank.each_ref().map(|slot| slot.load(Relaxed)),
+            total: self.total.load(Relaxed),
+            saturated: self.saturated.load(Relaxed),
+            saturated_far_quarter: self.saturated_far_quarter.load(Relaxed),
+        }
+    }
+}
+
+/// Plain-data view of [`SelectionRankStats`] for the dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub struct SelectionRankSnapshot {
+    pub rank: [u64; SELECTION_RANK_BUCKETS],
+    pub total: u64,
+    pub saturated: u64,
+    pub saturated_far_quarter: u64,
+}
+
+impl SelectionRankSnapshot {
+    /// Share of truncated decisions whose selection landed in the farthest
+    /// quarter of the window. High means the window is plausibly too narrow.
+    pub fn far_quarter_share(&self) -> Option<f64> {
+        (self.saturated > 0).then(|| self.saturated_far_quarter as f64 / self.saturated as f64)
+    }
+
+    /// Mean selected rank, for a one-number summary alongside the histogram.
+    pub fn mean_rank(&self) -> Option<f64> {
+        if self.total == 0 {
+            return None;
+        }
+        let weighted: u64 = self
+            .rank
+            .iter()
+            .enumerate()
+            .map(|(bucket, count)| bucket as u64 * count)
+            .sum();
+        Some(weighted as f64 / self.total as f64)
     }
 }
 
@@ -1392,6 +1507,7 @@ impl Router {
             failure_skill_adjusted: residual::SkillTracker::new(),
             failure_skill_blended: residual::SkillTracker::new(),
             failure_skill_corrected: residual::SkillTracker::new(),
+            selection_ranks: SelectionRankStats::default(),
         }
     }
 
@@ -1994,29 +2110,46 @@ impl Router {
             let closest = self.select_closest_peers(peers, &target_location);
             let mut fallback_count = 0;
 
-            let mut scored: Vec<(&'a PeerKeyLocation, f64, Option<RoutingPrediction>)> = closest
-                .iter()
-                .map(|peer| {
-                    let distance = peer
-                        .location()
-                        .map(|loc| target_location.distance(loc).as_f64())
-                        .unwrap_or(0.5);
-                    match self.predict_routing_outcome(peer, target_location) {
-                        Ok(pred) => (*peer, distance, Some(pred)),
-                        Err(_) => {
-                            fallback_count += 1;
-                            (*peer, distance, None)
+            // `closest` is distance-sorted, so the enumerate index IS the
+            // distance rank. Carrying it through the re-sort is how the rank
+            // survives being reordered by predicted cost; recovering it
+            // afterwards would need peer equality and an O(n) search for
+            // information we already had.
+            let mut scored: Vec<(usize, &'a PeerKeyLocation, f64, Option<RoutingPrediction>)> =
+                closest
+                    .iter()
+                    .enumerate()
+                    .map(|(distance_rank, peer)| {
+                        let distance = peer
+                            .location()
+                            .map(|loc| target_location.distance(loc).as_f64())
+                            .unwrap_or(0.5);
+                        match self.predict_routing_outcome(peer, target_location) {
+                            Ok(pred) => (distance_rank, *peer, distance, Some(pred)),
+                            Err(_) => {
+                                fallback_count += 1;
+                                (distance_rank, *peer, distance, None)
+                            }
                         }
-                    }
-                })
-                .collect();
+                    })
+                    .collect();
 
             // Sort: peers with predictions by expected_total_time, others at the end
             scored.sort_by(|a, b| {
-                let time_a = a.2.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
-                let time_b = b.2.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
+                let time_a = a.3.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
+                let time_b = b.3.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
                 time_a.total_cmp(&time_b)
             });
+
+            // Record where the winner sat in distance order, so the cost of the
+            // candidate-window truncation can be measured rather than guessed.
+            if let Some((distance_rank, _, _, _)) = scored.first() {
+                self.selection_ranks.record(
+                    *distance_rank,
+                    closest.len(),
+                    self.consider_n_closest_peers,
+                );
+            }
 
             let strategy = if fallback_count == 0 {
                 RoutingStrategy::PredictionBased
@@ -2028,7 +2161,7 @@ impl Router {
             let candidates: Vec<RoutingCandidate> = scored
                 .iter()
                 .enumerate()
-                .map(|(i, (_, dist, pred))| RoutingCandidate {
+                .map(|(i, (_, _, dist, pred))| RoutingCandidate {
                     distance: *dist,
                     prediction: pred.map(RoutingPredictionInfo::from),
                     selected: i < k,
@@ -2037,7 +2170,7 @@ impl Router {
 
             scored.truncate(k);
             let selected: Vec<&'a PeerKeyLocation> =
-                scored.into_iter().map(|(peer, _, _)| peer).collect();
+                scored.into_iter().map(|(_, peer, _, _)| peer).collect();
 
             let decision = RoutingDecisionInfo {
                 target_location: target_location.as_f64(),
@@ -2347,6 +2480,7 @@ impl Router {
             residual_response_time_events: shrinkage.response_time_residual_events,
             residual_transfer_speed_events: shrinkage.transfer_speed_residual_events,
             residual_scored: shrinkage.failure_scored,
+            selection_ranks: self.selection_ranks.snapshot(),
         }
     }
 
@@ -2786,6 +2920,136 @@ mod tests {
         assert!(
             snapshot.failure_base_rate.is_some_and(|rate| rate > 0.0),
             "a window containing failures must report a non-zero base rate"
+        );
+    }
+
+    /// The saturation qualifier is what makes the boundary count mean anything,
+    /// so it gets its own test.
+    #[test]
+    fn boundary_selections_only_count_against_a_full_window() {
+        let stats = SelectionRankStats::default();
+
+        // A node with 8 connections and a 25-peer limit: the window was never
+        // full, so choosing the FARTHEST of the 8 says nothing about truncation
+        // — there was nothing to truncate.
+        for _ in 0..10 {
+            stats.record(7, 8, 25);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.total, 10);
+        assert_eq!(
+            snapshot.saturated, 0,
+            "an unfilled window cannot have discarded anyone"
+        );
+        assert_eq!(
+            snapshot.far_quarter_share(),
+            None,
+            "with no truncated decisions there is no share to report"
+        );
+
+        // Same choice against a FULL window is the reading that matters.
+        let stats = SelectionRankStats::default();
+        for _ in 0..10 {
+            stats.record(24, 25, 25);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.saturated, 10);
+        assert_eq!(snapshot.far_quarter_share(), Some(1.0));
+    }
+
+    #[test]
+    fn near_selections_against_a_full_window_read_as_comfortable() {
+        let stats = SelectionRankStats::default();
+        for _ in 0..100 {
+            stats.record(0, 25, 25);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.saturated, 100);
+        assert_eq!(
+            snapshot.far_quarter_share(),
+            Some(0.0),
+            "always picking the closest peer means the limit costs nothing"
+        );
+        assert_eq!(snapshot.mean_rank(), Some(0.0));
+    }
+
+    #[test]
+    fn selection_rank_histogram_and_mean_track_the_recorded_ranks() {
+        let stats = SelectionRankStats::default();
+        for rank in [0usize, 0, 2, 4] {
+            stats.record(rank, 25, 25);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.rank[0], 2);
+        assert_eq!(snapshot.rank[2], 1);
+        assert_eq!(snapshot.rank[4], 1);
+        // (0 + 0 + 2 + 4) / 4
+        assert_eq!(snapshot.mean_rank(), Some(1.5));
+    }
+
+    #[test]
+    fn selection_rank_beyond_the_buckets_is_collected_not_lost() {
+        let stats = SelectionRankStats::default();
+        stats.record(10_000, 12_000, 25);
+        let snapshot = stats.snapshot();
+        assert_eq!(
+            snapshot.rank[SELECTION_RANK_BUCKETS - 1],
+            1,
+            "an out-of-range rank must land in the final bucket rather than panic \
+             or be dropped"
+        );
+        assert_eq!(snapshot.total, 1);
+    }
+
+    #[test]
+    fn empty_selection_rank_stats_report_nothing_rather_than_zero() {
+        let snapshot = SelectionRankStats::default().snapshot();
+        assert_eq!(snapshot.total, 0);
+        assert_eq!(snapshot.mean_rank(), None);
+        assert_eq!(snapshot.far_quarter_share(), None);
+    }
+
+    /// The stats must actually be fed by real routing decisions, not merely
+    /// exist — a counter nothing increments is the same as no counter.
+    #[test]
+    fn routing_decisions_populate_the_selection_rank_stats() {
+        let mut router = Router::new(&[]);
+        for index in 0..400 {
+            router.add_event(RouteEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::random(),
+                outcome: if index % 9 == 0 {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(100),
+                        payload_size: 5000,
+                        payload_transfer_time: Duration::from_millis(50),
+                    }
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+
+        let candidates: Vec<PeerKeyLocation> = (0..40).map(|_| PeerKeyLocation::random()).collect();
+        for _ in 0..25 {
+            let _ = router.select_peer(candidates.iter(), Location::random());
+        }
+
+        let snapshot = router.snapshot().selection_ranks;
+        assert!(
+            snapshot.total >= 25,
+            "every prediction-based decision must be recorded, got {}",
+            snapshot.total
+        );
+        assert!(
+            snapshot.saturated >= 25,
+            "40 candidates against a 25-peer window is saturated every time, got {}",
+            snapshot.saturated
+        );
+        assert!(
+            snapshot.mean_rank().is_some_and(|mean| mean.is_finite()),
+            "a populated histogram must yield a finite mean rank"
         );
     }
 
