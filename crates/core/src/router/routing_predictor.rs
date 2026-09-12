@@ -1668,3 +1668,421 @@ mod tests {
         assert_eq!(predictor.transfer_speed_predictions_evaluated(), ts_before);
     }
 }
+/// Recoverability of a KNOWN generative model (#4485, Tier 2a).
+///
+/// These tests answer the question relative comparisons cannot: *does the
+/// correction actually learn the structure it exists to learn, on the data
+/// volume a real node has?*
+///
+/// # Scoring against the probability, not the outcome
+///
+/// Outcomes are generated from a known `p*`, and predictions are scored against
+/// `p*` rather than against the sampled 0/1. The decomposition is exact:
+///
+/// ```text
+/// E[(p̂ − y)²] = E[(p̂ − p*)²] + E[p*(1 − p*)]
+///                └─ learnable ┘  └─ irreducible ┘
+/// ```
+///
+/// Brier against *outcomes* is dominated by the second term — which is why a
+/// production Brier of 0.009 read as "excellent" for a model with negative
+/// skill. Scoring against `p*` isolates the learnable part, so convergence is
+/// measurable in hundreds of events instead of tens of thousands.
+///
+/// Two exact quantities follow, both computable here because `p*` is known:
+/// the **Bayes floor** `E[p*(1−p*)]`, which no predictor can beat, and the
+/// **learnable headroom**, which equals `Var(p*)` exactly (it is Jensen's gap).
+/// So the headline metric is
+///
+/// ```text
+/// captured = 1 − E[(p̂ − p*)²] / Var(p*)
+/// ```
+///
+/// `0` for a climatology forecast, `1` for the oracle — an absolute scale rather
+/// than "better than the variant we happened to compare against".
+#[cfg(test)]
+mod recoverability {
+    use super::*;
+    use crate::config::GlobalRng;
+    use crate::router::isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
+
+    /// Events before scoring starts, so the isotonic base has a curve to be
+    /// corrected and the comparison is not dominated by cold start.
+    const WARMUP_EVENTS: usize = 300;
+
+    /// Sized from production: nova's gateways hold 4,155 and 2,745 failure
+    /// observations. A mechanism that needs materially more than this cannot
+    /// work on a real node however elegant it is, so the budget is the
+    /// assertion, not an implementation detail.
+    const RECOVERY_BUDGET_EVENTS: usize = 2_000;
+
+    const PEER_COUNT: usize = 12;
+
+    /// What generated the outcomes. Each isolates one capability.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Model {
+        /// `p* = f(distance)` only. The isotonic base should capture this and
+        /// the correction should add ~nothing.
+        DistanceOnly,
+        /// `p* = f(distance) + g(peer)`. The per-peer EWMA should capture it.
+        PeerMarginal,
+        /// `p* = f(distance) + penalty` on specific (peer, contract) pairs.
+        /// ONLY the correction can capture this — the headline case.
+        PeerContract,
+        /// `p*` constant. Nothing to learn; the correction must not invent
+        /// structure. `Var(p*) = 0`, so `captured` is undefined here by
+        /// construction and the assertions are on error and λ instead.
+        Noise,
+    }
+
+    /// Targeted (peer, contract-offset) pairs for `PeerContract`.
+    ///
+    /// The offsets deliberately SPAN A RANGE OF DISTANCES. A single peer with a
+    /// single narrow contract band — as in the abandoned harness on
+    /// `rescue/dirty-residual-routing-correction` — puts every targeted event at
+    /// nearly one distance, where the GLOBAL isotonic curve can absorb part of
+    /// the effect. The test then passes for the wrong reason, or understates the
+    /// correction's contribution. Spreading the offsets makes the effect
+    /// genuinely inseparable from distance alone.
+    const TARGETED: [(usize, f64); 3] = [(0, 0.05), (1, 0.17), (2, 0.31)];
+
+    /// Half-width of a targeted contract band.
+    const BAND: f64 = 0.02;
+
+    struct Scenario {
+        peers: Vec<PeerKeyLocation>,
+    }
+
+    impl Scenario {
+        fn new() -> Self {
+            Scenario {
+                peers: (0..PEER_COUNT).map(|_| PeerKeyLocation::random()).collect(),
+            }
+        }
+
+        fn peer_location(&self, index: usize) -> f64 {
+            self.peers[index]
+                .location()
+                .expect("generated peers carry a location")
+                .as_f64()
+        }
+
+        /// Centre of the targeted band for a targeted peer, placed at a fixed
+        /// ring offset from that peer so its distance is controlled.
+        fn band_centre(&self, peer_index: usize, offset: f64) -> f64 {
+            (self.peer_location(peer_index) + offset).rem_euclid(1.0)
+        }
+
+        fn is_targeted(&self, peer_index: usize, contract: f64) -> bool {
+            TARGETED.iter().any(|&(target, offset)| {
+                target == peer_index && ring_distance(contract, self.band_centre(target, offset)) < BAND
+            })
+        }
+
+        /// The generating probability. Known exactly, which is the whole point.
+        fn true_probability(&self, model: Model, peer_index: usize, contract: f64, distance: f64) -> f64 {
+            let base = match model {
+                Model::Noise => 0.08,
+                // Concave rather than linear, so the monotone isotonic base is
+                // not trivially perfect and the test says something about fit.
+                _ => 0.03 + 0.45 * distance.sqrt(),
+            };
+            let extra = match model {
+                Model::DistanceOnly | Model::Noise => 0.0,
+                // A per-peer offset the EWMA can absorb.
+                Model::PeerMarginal => {
+                    if peer_index % 4 == 0 {
+                        0.30
+                    } else {
+                        0.0
+                    }
+                }
+                Model::PeerContract => {
+                    if self.is_targeted(peer_index, contract) {
+                        0.55
+                    } else {
+                        0.0
+                    }
+                }
+            };
+            (base + extra).clamp(0.01, 0.99)
+        }
+
+        /// Draw the next event, biased so targeted pairs are sampled often
+        /// enough to be learnable but stay a small minority of traffic.
+        fn draw(&self, model: Model, index: usize) -> (usize, f64) {
+            let targeted_turn = model == Model::PeerContract && index % 12 == 0;
+            if targeted_turn {
+                let (peer_index, offset) = TARGETED[(index / 12) % TARGETED.len()];
+                let centre = self.band_centre(peer_index, offset);
+                let jitter = GlobalRng::random_range(-BAND..BAND);
+                (peer_index, (centre + jitter).rem_euclid(1.0))
+            } else {
+                (
+                    GlobalRng::random_range(0..PEER_COUNT),
+                    GlobalRng::random_range(0.0..1.0),
+                )
+            }
+        }
+    }
+
+    /// What a run measured.
+    #[derive(Debug, Clone, Copy)]
+    struct Recovery {
+        /// `1 − E[(p̂−p*)²]/Var(p*)` for the corrected prediction.
+        captured_corrected: f64,
+        /// The same for the uncorrected base — the λ=0 counterfactual, and the
+        /// negative control: if the base captures the structure too, the
+        /// scenario is not testing what it claims to.
+        captured_base: f64,
+        mse_corrected: f64,
+        mse_base: f64,
+        var_p_star: f64,
+        bayes_floor: f64,
+        mean_lambda: f64,
+        scored: usize,
+    }
+
+    fn run(model: Model, events: usize, seed: u64) -> Recovery {
+        let _guard = GlobalRng::seed_guard(seed);
+        let scenario = Scenario::new();
+        let mut predictor = RoutingPredictor::new(10_000);
+        let mut isotonic = IsotonicEstimator::new(Vec::new(), EstimatorType::Positive);
+        let modes = StageModes {
+            failure: isotonic.adjustment_mode(),
+            response_time: AdjustmentMode::Multiplicative,
+            transfer_speed: AdjustmentMode::Additive,
+        };
+
+        let mut sum_p_star = 0.0;
+        let mut sum_p_star_sq = 0.0;
+        let mut sum_bayes = 0.0;
+        let mut sum_err_corrected = 0.0;
+        let mut sum_err_base = 0.0;
+        let mut sum_lambda = 0.0;
+        let mut scored = 0usize;
+
+        for index in 0..events {
+            let (peer_index, contract_value) = scenario.draw(model, index);
+            let peer = &scenario.peers[peer_index];
+            let contract = Location::try_from(contract_value).expect("contract within ring");
+            let distance = contract
+                .distance(peer.location().expect("peer has a location"))
+                .as_f64();
+            let time = index as f64 / 60.0;
+
+            let p_star = scenario.true_probability(model, peer_index, contract_value, distance);
+            let actual = if GlobalRng::random_range(0.0..1.0) < p_star {
+                1.0
+            } else {
+                0.0
+            };
+
+            // Predict BEFORE this event reaches either learner.
+            let base = isotonic
+                .estimate_retrieval_time(peer, contract)
+                .ok()
+                .map(|value| value.clamp(0.0, 1.0));
+
+            if let Some(base) = base {
+                let correction = predictor
+                    .predict_corrections_at_time(peer, contract, distance, modes, time)
+                    .failure;
+                let corrected =
+                    (base + correction.map_or(0.0, |c| c.value)).clamp(0.0, 1.0);
+
+                if index >= WARMUP_EVENTS {
+                    sum_p_star += p_star;
+                    sum_p_star_sq += p_star * p_star;
+                    sum_bayes += p_star * (1.0 - p_star);
+                    sum_err_corrected += (corrected - p_star).powi(2);
+                    sum_err_base += (base - p_star).powi(2);
+                    sum_lambda += correction.map_or(0.0, |c| c.lambda);
+                    scored += 1;
+                }
+
+                let residual = isotonic.adjustment_mode().residual(actual, base);
+                predictor.record_at_time(
+                    peer,
+                    contract,
+                    distance,
+                    RoutingOutcome {
+                        success: actual == 0.0,
+                        time_to_response_start_secs: None,
+                        transfer_speed_bps: None,
+                    },
+                    StageResiduals {
+                        failure: residual,
+                        response_time: None,
+                        transfer_speed: None,
+                    },
+                    time,
+                );
+            }
+
+            isotonic.add_event(IsotonicEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                result: actual,
+            });
+        }
+
+        let n = scored.max(1) as f64;
+        let mean_p_star = sum_p_star / n;
+        let var_p_star = (sum_p_star_sq / n) - mean_p_star * mean_p_star;
+        let mse_corrected = sum_err_corrected / n;
+        let mse_base = sum_err_base / n;
+
+        Recovery {
+            captured_corrected: 1.0 - mse_corrected / var_p_star,
+            captured_base: 1.0 - mse_base / var_p_star,
+            mse_corrected,
+            mse_base,
+            var_p_star,
+            bayes_floor: sum_bayes / n,
+            mean_lambda: sum_lambda / n,
+            scored,
+        }
+    }
+
+    /// Average a metric over seeds, so a threshold is not riding on one draw.
+    fn over_seeds(model: Model, events: usize, f: impl Fn(Recovery) -> f64) -> f64 {
+        const SEEDS: [u64; 5] = [0x4485_0001, 0x4485_0002, 0x4485_0003, 0x4485_0004, 0x4485_0005];
+        SEEDS.iter().map(|&seed| f(run(model, events, seed))).sum::<f64>() / SEEDS.len() as f64
+    }
+
+    /// The headline test: a peer×contract effect must be recovered within the
+    /// data volume a real gateway actually holds.
+    #[test]
+    fn recovers_peer_contract_structure_within_the_production_data_budget() {
+        let captured = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.captured_corrected
+        });
+        let base = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| r.captured_base);
+        let lambda = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| r.mean_lambda);
+        let var = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| r.var_p_star);
+        let mse_c = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| r.mse_corrected);
+        let mse_b = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| r.mse_base);
+        assert!(
+            captured >= 0.8,
+            "the correction must recover at least 80% of the learnable signal \
+             within {RECOVERY_BUDGET_EVENTS} events (nova's gateways hold 2.7k-4.2k); \
+             captured {captured:.3} (base {base:.3}, mean lambda {lambda:.3}, \
+             Var(p*) {var:.5}, mse corrected {mse_c:.5} vs base {mse_b:.5})"
+        );
+    }
+
+    /// The negative control for the test above. If the uncorrected base could
+    /// also recover this structure, the scenario would not be testing the
+    /// correction at all — it would be passing for a reason unrelated to the fix.
+    #[test]
+    fn the_base_model_alone_cannot_recover_peer_contract_structure() {
+        let captured = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.captured_base
+        });
+        assert!(
+            captured < 0.35,
+            "distance-plus-EWMA must NOT be able to capture a peer×contract \
+             effect — if it can, the scenario has a distance confound and the \
+             headline test passes for the wrong reason; captured {captured:.3}"
+        );
+    }
+
+    /// The no-regression gate: where there is no peer×contract structure, the
+    /// correction must not make the estimate worse.
+    #[test]
+    fn distance_only_structure_is_not_degraded_by_the_correction() {
+        let ratio = over_seeds(Model::DistanceOnly, RECOVERY_BUDGET_EVENTS, |r| {
+            r.mse_corrected / r.mse_base.max(f64::MIN_POSITIVE)
+        });
+        assert!(
+            ratio <= 1.05,
+            "with nothing to learn the correction must not degrade the base \
+             estimate; error ratio {ratio:.3}"
+        );
+    }
+
+    /// A peer-marginal effect is the EWMA's job. The correction must not fight
+    /// it or double-count it.
+    #[test]
+    fn peer_marginal_structure_is_not_degraded_by_the_correction() {
+        let ratio = over_seeds(Model::PeerMarginal, RECOVERY_BUDGET_EVENTS, |r| {
+            r.mse_corrected / r.mse_base.max(f64::MIN_POSITIVE)
+        });
+        assert!(
+            ratio <= 1.05,
+            "the correction must compose with the per-peer EWMA rather than \
+             fight it; error ratio {ratio:.3}"
+        );
+    }
+
+    /// The overfitting guard. Pure noise has no structure, so a learner that
+    /// "recovers" something here is inventing it.
+    #[test]
+    fn pure_noise_yields_no_correction_and_no_invented_structure() {
+        let events = RECOVERY_BUDGET_EVENTS;
+        let mean_lambda = over_seeds(Model::Noise, events, |r| r.mean_lambda);
+        let mse = over_seeds(Model::Noise, events, |r| r.mse_corrected);
+        let base_mse = over_seeds(Model::Noise, events, |r| r.mse_base);
+
+        assert!(
+            mse <= base_mse + 1e-3,
+            "on pure noise the correction must not degrade the base estimate; \
+             corrected {mse:.5} vs base {base_mse:.5}"
+        );
+        assert!(
+            mean_lambda < 0.5,
+            "shrinkage should stay modest where residuals carry no signal, \
+             got mean lambda {mean_lambda:.3}"
+        );
+    }
+
+    /// Records the learning curve, and pins that recovery IMPROVES with data
+    /// rather than arriving by luck at one budget.
+    #[test]
+    fn recovery_improves_monotonically_with_data() {
+        let checkpoints = [500usize, 1_000, 2_000, 4_000];
+        let captured: Vec<f64> = checkpoints
+            .iter()
+            .map(|&events| over_seeds(Model::PeerContract, events, |r| r.captured_corrected))
+            .collect();
+
+        eprintln!("learning curve (events -> captured): {checkpoints:?} -> {captured:?}");
+
+        assert!(
+            captured[captured.len() - 1] >= captured[0],
+            "recovery must improve with data, got {captured:?}"
+        );
+        assert!(
+            captured[captured.len() - 1] >= 0.8,
+            "recovery must reach 0.8 given ample data, got {captured:?}"
+        );
+    }
+
+    /// The identity the scoring rests on, verified rather than assumed:
+    /// learnable headroom equals `Var(p*)`, and the Bayes floor plus that
+    /// headroom is the climatology Brier.
+    #[test]
+    fn learnable_headroom_equals_variance_of_the_true_probability() {
+        let recovery = run(Model::PeerContract, 2_000, 0x4485_0001);
+        let mean_p = {
+            // climatology Brier = p̄(1−p̄) = bayes_floor + Var(p*)
+            recovery.bayes_floor + recovery.var_p_star
+        };
+        assert!(
+            recovery.var_p_star > 0.0,
+            "this scenario must carry learnable signal, got Var(p*)={}",
+            recovery.var_p_star
+        );
+        assert!(
+            mean_p > recovery.bayes_floor,
+            "climatology must be strictly worse than the Bayes floor whenever \
+             p* varies"
+        );
+        assert!(
+            recovery.scored > 1_000,
+            "expected a substantial scored window, got {}",
+            recovery.scored
+        );
+    }
+}
