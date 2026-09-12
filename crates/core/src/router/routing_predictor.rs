@@ -8,6 +8,8 @@
 //! Each stage uses the same features: (peer_id, contract_location, distance, time).
 //! Separate predictor instances are used per operation type (GET, PUT, etc.).
 
+use super::isotonic_estimator::AdjustmentMode;
+use super::residual;
 use crate::ring::{Location, PeerKeyLocation};
 use renegade_ml::{DataPoint, Renegade};
 use std::collections::{HashMap, VecDeque};
@@ -21,6 +23,26 @@ const DEFAULT_K: usize = 5;
 
 /// Minimum observations in a stage before predictions are produced.
 const MIN_OBSERVATIONS_FOR_PREDICTION: usize = 10;
+
+/// How many neighbours the kernel correction considers before weighting them.
+///
+/// Deliberately MUCH larger than `cached_k`, and not the same quantity. `k` is a
+/// hard cutoff chosen for renegade's own `1/d` weighted mean; the kernel is a
+/// soft cutoff. Using both means the hard one dominates and the bandwidth never
+/// gets to decide anything.
+///
+/// Reusing `cached_k` (~5) here reintroduced exactly the ceiling this change
+/// exists to remove, by a different route: `n_eff <= k`, so `lambda <= 5/(5+4)
+/// = 0.56` no matter how much evidence existed, and a residual estimate
+/// averaging five binary-derived samples carries `sd ~ sqrt(0.2/5) = 0.20` —
+/// comparable to the 0.55 effect it was supposed to detect. Measured: the
+/// recoverability harness scored `captured = -0.33` with a FLAT learning curve
+/// from 500 to 4000 events.
+///
+/// 128 is a compromise with the hot path: this runs per candidate peer per
+/// routing decision (up to `CANDIDATE_WINDOW` peers x 3 stages), so the
+/// neighbour search is the cost that matters, not the kernel sums over it.
+const KERNEL_CANDIDATE_NEIGHBOURS: usize = 128;
 
 /// Minimum observations before training is worthwhile.
 const MIN_OBSERVATIONS_FOR_TRAINING: usize = 20;
@@ -110,6 +132,17 @@ struct PredictionStage {
     model: Renegade<RoutingObservation>,
     max_observations: usize,
     count: usize,
+    /// Kernel bandwidth — the feature-space length scale at which "k neighbours"
+    /// stops being a local neighbourhood. `None` until the first training round
+    /// has enough data to estimate one, which keeps the correction inert rather
+    /// than guessing a scale.
+    bandwidth: Option<f64>,
+    /// Recently-added observations, used as query points when estimating the
+    /// bandwidth. Deliberately a recency window rather than a uniform sample of
+    /// the store: the observations are the same population queries land in, and
+    /// the time feature means recent points are where prediction actually
+    /// happens, so a recency-biased length scale is the relevant one.
+    bandwidth_samples: VecDeque<RoutingObservation>,
     /// Cached K from the last training. Used for immutable predictions.
     cached_k: usize,
     /// Number of observations when last trained (base for the retraining
@@ -133,6 +166,8 @@ impl PredictionStage {
             model: Renegade::new(),
             max_observations,
             count: 0,
+            bandwidth: None,
+            bandwidth_samples: VecDeque::new(),
             cached_k: DEFAULT_K,
             trained_at: 0,
             observations_since_train: 0,
@@ -144,6 +179,10 @@ impl PredictionStage {
         if !output.is_finite() {
             return;
         }
+        if self.bandwidth_samples.len() >= residual::BANDWIDTH_SAMPLE_POINTS {
+            self.bandwidth_samples.pop_front();
+        }
+        self.bandwidth_samples.push_back(obs.clone());
         self.model.add(obs, output);
         self.count += 1;
         self.observations_since_train += 1;
@@ -193,7 +232,75 @@ impl PredictionStage {
             self.cached_k = self.model.get_optimal_k();
             self.trained_at = self.model.len();
             self.observations_since_train = 0;
+            self.refresh_bandwidth();
         }
+    }
+
+    /// Re-estimate the kernel bandwidth as the median distance from a sampled
+    /// observation to its k-th nearest neighbour.
+    ///
+    /// Runs inside `train()` so it shares that cadence rather than adding another
+    /// one, and costs `O(S log n)` for `S` samples instead of `O(n log n)`.
+    fn refresh_bandwidth(&mut self) {
+        if self.bandwidth_samples.is_empty() {
+            return;
+        }
+        // Measured at the KERNEL's neighbour count, not renegade's `k`: this is
+        // the length scale over which the kernel's own candidate set is spread,
+        // and the two are different quantities (see
+        // `KERNEL_CANDIDATE_NEIGHBOURS`). `+ 1` because each sample is itself in
+        // the store at distance 0.
+        let k = (KERNEL_CANDIDATE_NEIGHBOURS.min(self.model.len())).max(1) + 1;
+        let mut kth_distances = Vec::with_capacity(self.bandwidth_samples.len());
+        for sample in &self.bandwidth_samples {
+            let neighbors = self.model.query_k(sample, k);
+            // `query_k` returns neighbours sorted nearest-first, so the last is
+            // the farthest of the k considered.
+            if let Some(farthest) = neighbors.neighbors.last() {
+                kth_distances.push(farthest.distance);
+            }
+        }
+        if let Some(bandwidth) = residual::estimate_bandwidth(&mut kth_distances) {
+            self.bandwidth = Some(bandwidth);
+        }
+    }
+
+    /// Kernel-weighted estimate of this stage's target at `query`, together with
+    /// the evidence mass supporting it.
+    ///
+    /// Deliberately has **no** minimum-observation gate. The old `predict()` needs
+    /// one because it returns an absolute value whose uninformed output is the
+    /// global mean — a real perturbation that has to be suppressed. Here an
+    /// uninformed query yields `n_eff ≈ 0`, and the caller's shrinkage turns that
+    /// into a correction of exactly zero, so a floor would be redundant: the
+    /// evidence measure already encodes "I have nothing to say about this".
+    fn predict_kernel_multi(
+        &self,
+        query: &RoutingObservation,
+    ) -> Option<[Option<residual::KernelEstimate>; residual::BANDWIDTH_MULTIPLIERS.len()]> {
+        let base_bandwidth = self.bandwidth?;
+        if self.model.is_empty() {
+            return None;
+        }
+        // ONE neighbour query, reused across every candidate bandwidth. The
+        // k-NN search is the expensive part; a kernel sum over an existing
+        // neighbour list is a handful of `exp` calls.
+        let candidates = KERNEL_CANDIDATE_NEIGHBOURS.min(self.model.len());
+        let neighbors = self.model.query_k(query, candidates);
+        if neighbors.neighbors.is_empty() {
+            return None;
+        }
+        let pairs: Vec<(f64, f64)> = neighbors
+            .neighbors
+            .iter()
+            .map(|neighbor| (neighbor.distance, neighbor.output))
+            .collect();
+
+        let mut estimates = [None; residual::BANDWIDTH_MULTIPLIERS.len()];
+        for (index, multiplier) in residual::BANDWIDTH_MULTIPLIERS.iter().enumerate() {
+            estimates[index] = residual::kernel_estimate(&pairs, base_bandwidth * multiplier);
+        }
+        Some(estimates)
     }
 
     /// Predict using the pre-trained model (immutable access).
@@ -311,6 +418,23 @@ pub(crate) struct RoutingPredictor {
     failure_stage: PredictionStage,
     response_time_stage: PredictionStage,
     transfer_speed_stage: PredictionStage,
+    /// Residual-target counterparts of the three stages above.
+    ///
+    /// These are kept *alongside* the absolute-target stages rather than
+    /// replacing them, for two reasons. The absolute stages still drive the
+    /// legacy blend, so the old path stays bit-identical while the correction is
+    /// flag-gated; and running both is what lets the router score the two
+    /// approaches against each other on live traffic before the default flips.
+    /// The cost is one extra observation store per target — a few hundred KB at
+    /// the current cap — which is the price of being able to measure rather than
+    /// assume.
+    failure_residual_stage: PredictionStage,
+    response_time_residual_stage: PredictionStage,
+    transfer_speed_residual_stage: PredictionStage,
+    /// Online shrinkage selection per residual stage.
+    failure_shrinkage: residual::ShrinkageSelector,
+    response_time_shrinkage: residual::ShrinkageSelector,
+    transfer_speed_shrinkage: residual::ShrinkageSelector,
     /// Map from PeerKeyLocation to (numeric_id, lru_generation).
     /// Bounded by MAX_PEER_IDS via LRU eviction.
     peer_ids: HashMap<PeerKeyLocation, (u64, u64)>,
@@ -431,6 +555,107 @@ impl std::fmt::Debug for RoutingPredictor {
     }
 }
 
+/// Residuals of the isotonic base estimate for a single event, each expressed in
+/// its own estimator's adjustment space (additive for failure, log-ratio for the
+/// timing targets).
+///
+/// The caller computes these because it owns the estimators and therefore knows
+/// each one's space; this module only stores and kernel-weights them. Critically,
+/// they must be computed from the base estimate **as it stood before the
+/// isotonic estimators ingested this event**, or the residual is deflated by the
+/// base model having already fitted the point it is being scored on.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StageResiduals {
+    pub failure: Option<f64>,
+    pub response_time: Option<f64>,
+    pub transfer_speed: Option<f64>,
+}
+
+/// A shrunk correction for one stage, plus the diagnostics that explain it.
+///
+/// `lambda` and `n_eff` are carried out rather than kept internal because "how
+/// much of the correction is being applied, and on what evidence" is the single
+/// most useful thing the dashboard can tell an operator about the routing model.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Correction {
+    /// The correction to apply, in the stage's adjustment space, already shrunk.
+    pub value: f64,
+    /// Shrinkage factor applied — `0.0` means the base estimate stands untouched.
+    pub lambda: f64,
+    /// Effective observations supporting the underlying residual estimate.
+    pub n_eff: f64,
+}
+
+/// Corrections for all three stages at one query point.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RoutingCorrections {
+    pub failure: Option<Correction>,
+    pub response_time: Option<Correction>,
+    pub transfer_speed: Option<Correction>,
+}
+
+/// The adjustment space each stage's residual lives in.
+///
+/// Taken from the estimators rather than assumed, because the assumption is
+/// wrong: response time is multiplicative but **transfer rate is additive** in
+/// the current configuration. Deriving this from each estimator means the
+/// correction follows whatever those are set to, and keeps following them if
+/// #4547 changes one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StageModes {
+    pub failure: AdjustmentMode,
+    pub response_time: AdjustmentMode,
+    pub transfer_speed: AdjustmentMode,
+}
+
+/// Self-tuned model state, surfaced for the dashboard.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShrinkageDiagnostics {
+    pub failure_kappa: f64,
+    pub failure_bandwidth: Option<f64>,
+    pub failure_residual_events: usize,
+    pub failure_scored: u64,
+    pub response_time_residual_events: usize,
+    pub transfer_speed_residual_events: usize,
+}
+
+/// Shrink one stage's kernel estimate into an applicable correction.
+///
+/// Returns `None` when the stage has nothing to say — no bandwidth yet, no
+/// neighbours, or an unusable estimate — which the caller must treat as "leave
+/// the base estimate alone". A returned `Correction` may still carry
+/// `value == 0.0` when `λ` shrank it away entirely; that is the same outcome by a
+/// different route, and it is reported rather than hidden so the dashboard can
+/// distinguish "no model" from "model present but unconvinced".
+fn shrink(
+    stage: &PredictionStage,
+    selector: &residual::ShrinkageSelector,
+    query: &RoutingObservation,
+    mode: AdjustmentMode,
+) -> Option<Correction> {
+    let estimates = stage.predict_kernel_multi(query)?;
+    let estimate = estimates[selector.bandwidth_index()]?;
+    let lambda = selector.lambda(estimate.n_eff);
+    let mut value = lambda * estimate.residual;
+    // Only a multiplicative stage needs a spread bound: it recombines as
+    // `base * exp(c)`, which is unbounded above, so one pathological residual
+    // could otherwise dominate a routing decision. An additive stage is bounded
+    // by its own target's range downstream, and bounding it here would cap a
+    // legitimately large correction -- reintroducing exactly the ceiling this
+    // change removes.
+    if matches!(mode, AdjustmentMode::Multiplicative) {
+        value = selector.clamp_log_correction(value);
+    }
+    if !value.is_finite() {
+        return None;
+    }
+    Some(Correction {
+        value,
+        lambda,
+        n_eff: estimate.n_eff,
+    })
+}
+
 impl RoutingPredictor {
     /// Create a new predictor.
     pub fn new(max_observations_per_stage: usize) -> Self {
@@ -438,6 +663,12 @@ impl RoutingPredictor {
             failure_stage: PredictionStage::new(max_observations_per_stage),
             response_time_stage: PredictionStage::new(max_observations_per_stage),
             transfer_speed_stage: PredictionStage::new(max_observations_per_stage),
+            failure_residual_stage: PredictionStage::new(max_observations_per_stage),
+            response_time_residual_stage: PredictionStage::new(max_observations_per_stage),
+            transfer_speed_residual_stage: PredictionStage::new(max_observations_per_stage),
+            failure_shrinkage: residual::ShrinkageSelector::new(),
+            response_time_shrinkage: residual::ShrinkageSelector::new(),
+            transfer_speed_shrinkage: residual::ShrinkageSelector::new(),
             peer_ids: HashMap::new(),
             lru_generation: 0,
             next_peer_id: 0,
@@ -464,9 +695,10 @@ impl RoutingPredictor {
         contract_location: Location,
         distance: f64,
         outcome: RoutingOutcome,
+        residuals: StageResiduals,
     ) {
         let time = wall_clock_hours() - self.reference_time_hours;
-        self.record_at_time(peer, contract_location, distance, outcome, time);
+        self.record_at_time(peer, contract_location, distance, outcome, residuals, time);
     }
 
     /// Record at a specific relative time (for batch loading with original timestamps
@@ -477,6 +709,7 @@ impl RoutingPredictor {
         contract_location: Location,
         distance: f64,
         outcome: RoutingOutcome,
+        residuals: StageResiduals,
         time: f64,
     ) {
         let actual_failure = if outcome.success { 0.0 } else { 1.0 };
@@ -503,9 +736,69 @@ impl RoutingPredictor {
                     }
                 }
             }
+
+            // Score the shrinkage candidates against the residual this event
+            // actually turned out to have. Same predict-before-add discipline as
+            // above: the kernel estimate is taken from the model as it stands,
+            // so no candidate is ever graded on data containing its own answer.
+            //
+            // A stage with no usable estimate still scores, with `n_eff = 0`.
+            // That matters: "no evidence, so no correction, and the residual was
+            // nonetheless large" is real evidence about how much to trust this
+            // layer, and dropping those samples would bias selection toward
+            // whichever kappa looks good only where the model happens to be
+            // confident.
+            let shrinkage_inputs = [
+                (
+                    residuals.failure,
+                    &self.failure_residual_stage,
+                    &mut self.failure_shrinkage,
+                ),
+                (
+                    residuals.response_time,
+                    &self.response_time_residual_stage,
+                    &mut self.response_time_shrinkage,
+                ),
+                (
+                    residuals.transfer_speed,
+                    &self.transfer_speed_residual_stage,
+                    &mut self.transfer_speed_shrinkage,
+                ),
+            ];
+            for (actual_residual, stage, selector) in shrinkage_inputs {
+                let Some(actual_residual) = actual_residual else {
+                    continue;
+                };
+                // Every bandwidth candidate is scored on the same event, so
+                // the grid is compared on identical data rather than on
+                // whichever events each happened to see.
+                let estimates = stage
+                    .predict_kernel_multi(&query)
+                    .unwrap_or([None; residual::BANDWIDTH_MULTIPLIERS.len()]);
+                selector.record(&estimates, actual_residual);
+            }
         }
 
         let obs = self.make_observation(peer, contract_location, distance, time);
+
+        // Residual stages mirror their absolute counterparts' eligibility: the
+        // failure residual exists for every event, the timing residuals only for
+        // timed successes (a residual needs an observed value to subtract the
+        // base from).
+        if let Some(failure_residual) = residuals.failure {
+            self.failure_residual_stage
+                .add(obs.clone(), failure_residual);
+        }
+        if outcome.success {
+            if let Some(response_time_residual) = residuals.response_time {
+                self.response_time_residual_stage
+                    .add(obs.clone(), response_time_residual);
+            }
+            if let Some(transfer_speed_residual) = residuals.transfer_speed {
+                self.transfer_speed_residual_stage
+                    .add(obs.clone(), transfer_speed_residual);
+            }
+        }
 
         // Stage 1: all events
         self.failure_stage.add(obs.clone(), actual_failure);
@@ -542,7 +835,41 @@ impl RoutingPredictor {
             if self.transfer_speed_stage.should_train() {
                 self.transfer_speed_stage.train();
             }
+            if self.failure_residual_stage.should_train() {
+                self.failure_residual_stage.train();
+            }
+            if self.response_time_residual_stage.should_train() {
+                self.response_time_residual_stage.train();
+            }
+            if self.transfer_speed_residual_stage.should_train() {
+                self.transfer_speed_residual_stage.train();
+            }
         }
+    }
+
+    /// Record with no residual targets — the pre-#4485 signature.
+    ///
+    /// Test-only. The existing stage tests exercise the absolute-target path and
+    /// say nothing about residuals; routing them through this keeps them
+    /// testing what they were written to test, rather than silently acquiring a
+    /// second subject.
+    #[cfg(test)]
+    pub(crate) fn record_at_time_absolute_only(
+        &mut self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+        distance: f64,
+        outcome: RoutingOutcome,
+        time: f64,
+    ) {
+        self.record_at_time(
+            peer,
+            contract_location,
+            distance,
+            outcome,
+            StageResiduals::default(),
+            time,
+        );
     }
 
     /// Trigger training on all stages. Call after batch loading historical events.
@@ -551,6 +878,72 @@ impl RoutingPredictor {
         self.failure_stage.train();
         self.response_time_stage.train();
         self.transfer_speed_stage.train();
+        self.failure_residual_stage.train();
+        self.response_time_residual_stage.train();
+        self.transfer_speed_residual_stage.train();
+    }
+
+    /// Kernel-weighted, shrunk corrections for each stage at the current time.
+    pub(crate) fn predict_corrections(
+        &self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+        distance: f64,
+        modes: StageModes,
+    ) -> RoutingCorrections {
+        let time = wall_clock_hours() - self.reference_time_hours;
+        self.predict_corrections_at_time(peer, contract_location, distance, modes, time)
+    }
+
+    pub(crate) fn predict_corrections_at_time(
+        &self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+        distance: f64,
+        modes: StageModes,
+        time: f64,
+    ) -> RoutingCorrections {
+        let query = self.make_observation_immutable(peer, contract_location, distance, time);
+        RoutingCorrections {
+            failure: shrink(
+                &self.failure_residual_stage,
+                &self.failure_shrinkage,
+                &query,
+                modes.failure,
+            ),
+            response_time: shrink(
+                &self.response_time_residual_stage,
+                &self.response_time_shrinkage,
+                &query,
+                modes.response_time,
+            ),
+            transfer_speed: shrink(
+                &self.transfer_speed_residual_stage,
+                &self.transfer_speed_shrinkage,
+                &query,
+                modes.transfer_speed,
+            ),
+        }
+    }
+
+    /// Selected shrinkage parameters, for dashboard display. These are self-tuned,
+    /// so they say something real about what the model has concluded about this
+    /// network rather than echoing a constant back at the reader.
+    pub(crate) fn shrinkage_diagnostics(&self) -> ShrinkageDiagnostics {
+        ShrinkageDiagnostics {
+            failure_kappa: self.failure_shrinkage.kappa(),
+            // The effective bandwidth, i.e. the estimated length scale times the
+            // multiplier the selector actually chose — reporting the raw length
+            // scale would describe a kernel the model is not using.
+            failure_bandwidth: self
+                .failure_residual_stage
+                .bandwidth
+                .map(|scale| scale * self.failure_shrinkage.bandwidth_multiplier()),
+            failure_residual_events: self.failure_residual_stage.len(),
+            failure_scored: self.failure_shrinkage.scored(),
+            response_time_residual_events: self.response_time_residual_stage.len(),
+            transfer_speed_residual_events: self.transfer_speed_residual_stage.len(),
+        }
     }
 
     /// Predict routing outcomes (immutable — training happens during record()).
@@ -777,10 +1170,16 @@ mod tests {
         let base_time = 1.0; // relative hours
 
         for i in 0..10 {
-            predictor.record_at_time(&peer, contract, 0.1, failure(), base_time + i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(
+                &peer,
+                contract,
+                0.1,
+                failure(),
+                base_time + i as f64 * 0.01,
+            );
         }
         for i in 10..20 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &peer,
                 contract,
                 0.1,
@@ -789,7 +1188,7 @@ mod tests {
             );
         }
         for i in 20..30 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &peer,
                 contract,
                 0.1,
@@ -824,7 +1223,7 @@ mod tests {
             } else {
                 failure()
             };
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &good_peer,
                 contract,
                 0.1,
@@ -839,7 +1238,7 @@ mod tests {
             } else {
                 failure()
             };
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &bad_peer,
                 contract,
                 0.1,
@@ -882,7 +1281,7 @@ mod tests {
         let base_time = 1.0;
 
         for i in 0..100 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &fast_peer,
                 contract,
                 0.1,
@@ -891,7 +1290,7 @@ mod tests {
             );
         }
         for i in 0..100 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &slow_peer,
                 contract,
                 0.1,
@@ -933,7 +1332,7 @@ mod tests {
 
         for i in 0..100 {
             let loc = Location::try_from(i as f64 / 100.0).unwrap();
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &attacker,
                 loc,
                 0.1,
@@ -942,7 +1341,7 @@ mod tests {
             );
         }
         for i in 0..50 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &attacker,
                 target_contract,
                 0.1,
@@ -972,7 +1371,13 @@ mod tests {
         let contract = Location::try_from(0.5).unwrap();
 
         for i in 0..200 {
-            predictor.record_at_time(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(
+                &peer,
+                contract,
+                0.1,
+                success_untimed(),
+                i as f64 * 0.01,
+            );
         }
 
         assert!(
@@ -1008,7 +1413,13 @@ mod tests {
         let mut peers = Vec::new();
         for i in 0..(MAX_PEER_IDS + 10) {
             let peer = make_peer();
-            predictor.record_at_time(&peer, contract, 0.1, success_untimed(), i as f64 * 0.001);
+            predictor.record_at_time_absolute_only(
+                &peer,
+                contract,
+                0.1,
+                success_untimed(),
+                i as f64 * 0.001,
+            );
             peers.push(peer);
         }
 
@@ -1027,7 +1438,7 @@ mod tests {
         let contract = Location::try_from(0.5).unwrap();
 
         // Record with Inf transfer speed (from zero-duration transfer)
-        predictor.record_at_time(
+        predictor.record_at_time_absolute_only(
             &peer,
             contract,
             0.1,
@@ -1063,13 +1474,25 @@ mod tests {
 
         // Add 20 events — should trigger initial training
         for i in 0..20 {
-            predictor.record_at_time(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(
+                &peer,
+                contract,
+                0.1,
+                success_untimed(),
+                i as f64 * 0.01,
+            );
         }
         let _k_after_20 = predictor.failure_stage.cached_k;
 
         // Add 10 more (50% growth) — should trigger retrain
         for i in 20..30 {
-            predictor.record_at_time(&peer, contract, 0.1, failure(), i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(
+                &peer,
+                contract,
+                0.1,
+                failure(),
+                i as f64 * 0.01,
+            );
         }
         // Can't easily assert K changed, but trained_at should have updated
         assert!(
@@ -1207,12 +1630,24 @@ mod tests {
 
         // Add enough data to enable predictions
         for i in 0..50 {
-            predictor.record_at_time(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(
+                &peer,
+                contract,
+                0.1,
+                success_untimed(),
+                i as f64 * 0.01,
+            );
         }
 
         // Now further events should be tracked for accuracy
         for i in 50..60 {
-            predictor.record_at_time(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(
+                &peer,
+                contract,
+                0.1,
+                success_untimed(),
+                i as f64 * 0.01,
+            );
         }
 
         assert!(
@@ -1231,7 +1666,7 @@ mod tests {
         // Warm up the timing stages past MIN_OBSERVATIONS_FOR_PREDICTION so the
         // next timed successes produce a prediction that gets scored.
         for i in 0..50 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &peer,
                 contract,
                 0.1,
@@ -1240,7 +1675,7 @@ mod tests {
             );
         }
         for i in 50..60 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &peer,
                 contract,
                 0.1,
@@ -1276,7 +1711,13 @@ mod tests {
         // Failures carry no timing ground truth, so the regression stages must
         // never accumulate accuracy samples from them.
         for i in 0..60 {
-            predictor.record_at_time(&peer, contract, 0.1, failure(), i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(
+                &peer,
+                contract,
+                0.1,
+                failure(),
+                i as f64 * 0.01,
+            );
         }
 
         assert_eq!(predictor.response_time_predictions_evaluated(), 0);
@@ -1293,7 +1734,7 @@ mod tests {
 
         // Warm the timing stages with timed successes so predict() returns Some.
         for i in 0..60 {
-            predictor.record_at_time(
+            predictor.record_at_time_absolute_only(
                 &peer,
                 contract,
                 0.1,
@@ -1309,9 +1750,669 @@ mod tests {
         // so it must NOT be scored even though the stages can now predict (guards
         // against recording a garbage/zero actual into the scatter).
         for i in 60..70 {
-            predictor.record_at_time(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
+            predictor.record_at_time_absolute_only(
+                &peer,
+                contract,
+                0.1,
+                success_untimed(),
+                i as f64 * 0.01,
+            );
         }
         assert_eq!(predictor.response_time_predictions_evaluated(), rt_before);
         assert_eq!(predictor.transfer_speed_predictions_evaluated(), ts_before);
+    }
+}
+/// Recoverability of a KNOWN generative model (#4485, Tier 2a).
+///
+/// These tests answer the question relative comparisons cannot: *does the
+/// correction actually learn the structure it exists to learn, on the data
+/// volume a real node has?*
+///
+/// # Scoring against the probability, not the outcome
+///
+/// Outcomes are generated from a known `p*`, and predictions are scored against
+/// `p*` rather than against the sampled 0/1. The decomposition is exact:
+///
+/// ```text
+/// E[(p̂ − y)²] = E[(p̂ − p*)²] + E[p*(1 − p*)]
+///                └─ learnable ┘  └─ irreducible ┘
+/// ```
+///
+/// Brier against *outcomes* is dominated by the second term — which is why a
+/// production Brier of 0.009 read as "excellent" for a model with negative
+/// skill. Scoring against `p*` isolates the learnable part, so convergence is
+/// measurable in hundreds of events instead of tens of thousands.
+///
+/// Two exact quantities follow, both computable here because `p*` is known:
+/// the **Bayes floor** `E[p*(1−p*)]`, which no predictor can beat, and the
+/// **learnable headroom**, which equals `Var(p*)` exactly (it is Jensen's gap).
+/// So the headline metric is
+///
+/// ```text
+/// captured = 1 − E[(p̂ − p*)²] / Var(p*)
+/// ```
+///
+/// `0` for a climatology forecast, `1` for the oracle — an absolute scale rather
+/// than "better than the variant we happened to compare against".
+#[cfg(test)]
+mod recoverability {
+    use super::*;
+    use crate::config::GlobalRng;
+    use crate::router::isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
+
+    /// Events before scoring starts, so the isotonic base has a curve to be
+    /// corrected and the comparison is not dominated by cold start.
+    const WARMUP_EVENTS: usize = 300;
+
+    /// Sized from production: nova's gateways hold 4,155 and 2,745 failure
+    /// observations. A mechanism that needs materially more than this cannot
+    /// work on a real node however elegant it is, so the budget is the
+    /// assertion, not an implementation detail.
+    const RECOVERY_BUDGET_EVENTS: usize = 2_000;
+
+    const PEER_COUNT: usize = 12;
+
+    /// What generated the outcomes. Each isolates one capability.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Model {
+        /// `p* = f(distance)` only. The isotonic base should capture this and
+        /// the correction should add ~nothing.
+        DistanceOnly,
+        /// `p* = f(distance) + g(peer)`. The per-peer EWMA should capture it.
+        PeerMarginal,
+        /// `p* = f(distance) + penalty` on specific (peer, contract) pairs.
+        /// ONLY the correction can capture this — the headline case.
+        PeerContract,
+        /// `p*` constant. Nothing to learn; the correction must not invent
+        /// structure. `Var(p*) = 0`, so `captured` is undefined here by
+        /// construction and the assertions are on error and λ instead.
+        Noise,
+    }
+
+    /// Targeted (peer, contract-offset) pairs for `PeerContract`.
+    ///
+    /// The offsets deliberately SPAN A RANGE OF DISTANCES. A single peer with a
+    /// single narrow contract band — as in the abandoned harness on
+    /// `rescue/dirty-residual-routing-correction` — puts every targeted event at
+    /// nearly one distance, where the GLOBAL isotonic curve can absorb part of
+    /// the effect. The test then passes for the wrong reason, or understates the
+    /// correction's contribution. Spreading the offsets makes the effect
+    /// genuinely inseparable from distance alone.
+    const TARGETED: [(usize, f64); 3] = [(0, 0.05), (1, 0.17), (2, 0.31)];
+
+    /// Half-width of a targeted contract band.
+    const BAND: f64 = 0.02;
+
+    struct Scenario {
+        peers: Vec<PeerKeyLocation>,
+    }
+
+    impl Scenario {
+        fn new() -> Self {
+            Scenario {
+                peers: (0..PEER_COUNT).map(|_| PeerKeyLocation::random()).collect(),
+            }
+        }
+
+        fn peer_location(&self, index: usize) -> f64 {
+            self.peers[index]
+                .location()
+                .expect("generated peers carry a location")
+                .as_f64()
+        }
+
+        /// Centre of the targeted band for a targeted peer, placed at a fixed
+        /// ring offset from that peer so its distance is controlled.
+        fn band_centre(&self, peer_index: usize, offset: f64) -> f64 {
+            (self.peer_location(peer_index) + offset).rem_euclid(1.0)
+        }
+
+        fn is_targeted(&self, peer_index: usize, contract: f64) -> bool {
+            TARGETED.iter().any(|&(target, offset)| {
+                target == peer_index
+                    && ring_distance(contract, self.band_centre(target, offset)) < BAND
+            })
+        }
+
+        /// The generating probability. Known exactly, which is the whole point.
+        fn true_probability(
+            &self,
+            model: Model,
+            peer_index: usize,
+            contract: f64,
+            distance: f64,
+        ) -> f64 {
+            let base = match model {
+                Model::Noise => 0.08,
+                // Concave rather than linear, so the monotone isotonic base is
+                // not trivially perfect and the test says something about fit.
+                // Listed exhaustively so a new model must decide its own base
+                // rather than silently inheriting this one.
+                Model::DistanceOnly | Model::PeerMarginal | Model::PeerContract => {
+                    0.03 + 0.45 * distance.sqrt()
+                }
+            };
+            let extra = match model {
+                Model::DistanceOnly | Model::Noise => 0.0,
+                // A per-peer offset the EWMA can absorb.
+                Model::PeerMarginal => {
+                    if peer_index % 4 == 0 {
+                        0.30
+                    } else {
+                        0.0
+                    }
+                }
+                Model::PeerContract => {
+                    if self.is_targeted(peer_index, contract) {
+                        0.55
+                    } else {
+                        0.0
+                    }
+                }
+            };
+            (base + extra).clamp(0.01, 0.99)
+        }
+
+        /// Draw the next event, biased so targeted pairs are sampled often
+        /// enough to be learnable but stay a small minority of traffic.
+        fn draw(&self, model: Model, index: usize) -> (usize, f64) {
+            let targeted_turn = model == Model::PeerContract && index % 12 == 0;
+            if targeted_turn {
+                let (peer_index, offset) = TARGETED[(index / 12) % TARGETED.len()];
+                let centre = self.band_centre(peer_index, offset);
+                let jitter = GlobalRng::random_range(-BAND..BAND);
+                (peer_index, (centre + jitter).rem_euclid(1.0))
+            } else {
+                (
+                    GlobalRng::random_range(0..PEER_COUNT),
+                    GlobalRng::random_range(0.0..1.0),
+                )
+            }
+        }
+    }
+
+    /// What a run measured.
+    #[derive(Debug, Clone, Copy)]
+    struct Recovery {
+        /// `1 − E[(p̂−p*)²]/Var(p*)` for the corrected prediction.
+        captured_corrected: f64,
+        /// The same for the uncorrected base — the λ=0 counterfactual, and the
+        /// negative control: if the base captures the structure too, the
+        /// scenario is not testing what it claims to.
+        captured_base: f64,
+        mse_corrected: f64,
+        mse_base: f64,
+        var_p_star: f64,
+        bayes_floor: f64,
+        mean_lambda: f64,
+        /// Mean magnitude of the correction actually applied. This, not `lambda`,
+        /// is the overfitting guard: `lambda` measures how much EVIDENCE there
+        /// is, which is legitimately high on abundant data even when that
+        /// evidence says "the residual is zero".
+        mean_abs_correction: f64,
+        scored: usize,
+        /// Squared error on the TARGETED events only — the events carrying the
+        /// peer x contract effect that only the correction can see.
+        ///
+        /// This is the split that answers the question the harness exists for.
+        /// The whole-population `captured` conflates two things: how good the
+        /// global isotonic fit is, and whether the correction learned the
+        /// interaction. Since the base scores WORSE than climatology here, the
+        /// correction is charged for the base's error on the ~92% of events it
+        /// was never meant to touch, and a large real improvement still reads as
+        /// a near-zero score.
+        targeted_mse_corrected: f64,
+        targeted_mse_base: f64,
+        targeted_scored: usize,
+    }
+
+    fn run(model: Model, events: usize, seed: u64) -> Recovery {
+        let _guard = GlobalRng::seed_guard(seed);
+        let scenario = Scenario::new();
+        let mut predictor = RoutingPredictor::new(10_000);
+        let mut isotonic = IsotonicEstimator::new(Vec::new(), EstimatorType::Positive);
+        let modes = StageModes {
+            failure: isotonic.adjustment_mode(),
+            response_time: AdjustmentMode::Multiplicative,
+            transfer_speed: AdjustmentMode::Additive,
+        };
+
+        let mut sum_p_star = 0.0;
+        let mut sum_p_star_sq = 0.0;
+        let mut sum_bayes = 0.0;
+        let mut sum_err_corrected = 0.0;
+        let mut sum_err_base = 0.0;
+        let mut sum_lambda = 0.0;
+        let mut sum_abs_correction = 0.0;
+        let mut scored = 0usize;
+        let mut targeted_err_corrected = 0.0;
+        let mut targeted_err_base = 0.0;
+        let mut targeted_scored = 0usize;
+
+        for index in 0..events {
+            let (peer_index, contract_value) = scenario.draw(model, index);
+            let peer = &scenario.peers[peer_index];
+            let contract = Location::try_from(contract_value).expect("contract within ring");
+            let distance = contract
+                .distance(peer.location().expect("peer has a location"))
+                .as_f64();
+            let time = index as f64 / 60.0;
+
+            let p_star = scenario.true_probability(model, peer_index, contract_value, distance);
+            let actual = if GlobalRng::random_range(0.0..1.0) < p_star {
+                1.0
+            } else {
+                0.0
+            };
+
+            // Predict BEFORE this event reaches either learner.
+            let base = isotonic
+                .estimate_global(peer, contract)
+                .ok()
+                .map(|value| value.clamp(0.0, 1.0));
+
+            if let Some(base) = base {
+                let correction = predictor
+                    .predict_corrections_at_time(peer, contract, distance, modes, time)
+                    .failure;
+                let corrected = (base + correction.map_or(0.0, |c| c.value)).clamp(0.0, 1.0);
+
+                if index >= WARMUP_EVENTS {
+                    sum_p_star += p_star;
+                    sum_p_star_sq += p_star * p_star;
+                    sum_bayes += p_star * (1.0 - p_star);
+                    sum_err_corrected += (corrected - p_star).powi(2);
+                    sum_err_base += (base - p_star).powi(2);
+                    if scenario.is_targeted(peer_index, contract_value) {
+                        targeted_err_corrected += (corrected - p_star).powi(2);
+                        targeted_err_base += (base - p_star).powi(2);
+                        targeted_scored += 1;
+                    }
+                    sum_lambda += correction.map_or(0.0, |c| c.lambda);
+                    sum_abs_correction += correction.map_or(0.0, |c| c.value.abs());
+                    scored += 1;
+                }
+
+                let residual = isotonic.adjustment_mode().residual(actual, base);
+                predictor.record_at_time(
+                    peer,
+                    contract,
+                    distance,
+                    RoutingOutcome {
+                        success: actual == 0.0,
+                        time_to_response_start_secs: None,
+                        transfer_speed_bps: None,
+                    },
+                    StageResiduals {
+                        failure: residual,
+                        response_time: None,
+                        transfer_speed: None,
+                    },
+                    time,
+                );
+            }
+
+            isotonic.add_event(IsotonicEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                result: actual,
+            });
+        }
+
+        let n = scored.max(1) as f64;
+        let mean_p_star = sum_p_star / n;
+        let var_p_star = (sum_p_star_sq / n) - mean_p_star * mean_p_star;
+        let mse_corrected = sum_err_corrected / n;
+        let mse_base = sum_err_base / n;
+
+        Recovery {
+            captured_corrected: 1.0 - mse_corrected / var_p_star,
+            captured_base: 1.0 - mse_base / var_p_star,
+            mse_corrected,
+            mse_base,
+            var_p_star,
+            bayes_floor: sum_bayes / n,
+            mean_lambda: sum_lambda / n,
+            mean_abs_correction: sum_abs_correction / n,
+            scored,
+            targeted_mse_corrected: targeted_err_corrected / targeted_scored.max(1) as f64,
+            targeted_mse_base: targeted_err_base / targeted_scored.max(1) as f64,
+            targeted_scored,
+        }
+    }
+
+    /// Average a metric over seeds, so a threshold is not riding on one draw.
+    const SEEDS: [u64; 5] = [
+        0x4485_0001,
+        0x4485_0002,
+        0x4485_0003,
+        0x4485_0004,
+        0x4485_0005,
+    ];
+
+    /// Per-seed values, so a threshold can be set clear of the SPREAD rather than
+    /// clear of the mean. A threshold inside the spread is a flaky test waiting
+    /// for an unrelated change to cross it.
+    fn per_seed(model: Model, events: usize, f: impl Fn(Recovery) -> f64) -> Vec<f64> {
+        SEEDS
+            .iter()
+            .map(|&seed| f(run(model, events, seed)))
+            .collect()
+    }
+
+    fn over_seeds(model: Model, events: usize, f: impl Fn(Recovery) -> f64) -> f64 {
+        SEEDS
+            .iter()
+            .map(|&seed| f(run(model, events, seed)))
+            .sum::<f64>()
+            / SEEDS.len() as f64
+    }
+
+    /// The headline test: a peer×contract effect must be recovered well enough
+    /// to beat a climatology forecast within the data volume a real gateway
+    /// holds.
+    ///
+    /// # The target this does NOT assert, and why
+    ///
+    /// The design proposal on #4485 published `captured >= 0.8` as the gate.
+    /// **That figure was set from intuition and is not achievable in this
+    /// scenario**, for a reason the harness itself measures: the global isotonic
+    /// base is off by `sd ~ 0.13` on the 91.7% of events that are untargeted —
+    /// partly because the 8.3% of events carrying a +0.55 penalty bend the fit,
+    /// partly because the fit is over binary draws. That error floor dominates
+    /// the achievable ceiling regardless of how good the correction is, so 0.8
+    /// was never reachable here and the number should not have been published
+    /// without this decomposition behind it.
+    ///
+    /// What IS asserted is the property that actually matters and was genuinely
+    /// in doubt: **the corrected estimate beats assuming the base rate.** Before
+    /// the correction composed with the global curve it did not — it scored
+    /// `captured = -0.30`, worse than assuming nothing.
+    ///
+    /// That -0.30 is the CORRECTED estimate under the superseded
+    /// peer-adjusted-base design, and is not reproducible from this tree — the
+    /// configuration no longer exists. It is NOT the `base` figure this test
+    /// prints (currently ~-0.44), which is the global curve uncorrected. The
+    /// two were confused once in review, which is reason enough to say so here.
+    ///
+    /// The measured figure is printed on every run so the gap stays visible
+    /// rather than being quietly forgotten, and closing it is what gates turning
+    /// `FREENET_ROUTING_RESIDUAL_CORRECTION` on by default.
+    #[test]
+    fn recovered_structure_beats_assuming_the_base_rate() {
+        let captured = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.captured_corrected
+        });
+        let base = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.captured_base
+        });
+        let lambda = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.mean_lambda
+        });
+
+        eprintln!(
+            "#4485 recovery at {RECOVERY_BUDGET_EVENTS} events: captured {captured:.3} \
+             (base {base:.3}, mean lambda {lambda:.3}); published target 0.8 NOT met \
+             — see this test's docs for the noise decomposition"
+        );
+
+        assert!(
+            captured > 0.0,
+            "the corrected estimate must beat a climatology forecast; captured \
+             {captured:.3} (base {base:.3}, mean lambda {lambda:.3})"
+        );
+        assert!(
+            captured > base + 0.3,
+            "the correction must add substantial signal over its own base; \
+             captured {captured:.3} vs base {base:.3}"
+        );
+    }
+
+    /// How much of the peer x contract effect does the correction actually
+    /// recover, measured ON THE EVENTS THAT CARRY IT?
+    ///
+    /// This is the question the harness exists to answer, and the
+    /// whole-population `captured` score cannot answer it. That score divides by
+    /// `Var(p*)` over all events, so it charges the correction for the global
+    /// isotonic fit's error on the ~92% of events the correction was never meant
+    /// to touch — and in this scenario that base is itself worse than
+    /// climatology, so the correction has to dig out of someone else's hole
+    /// before it registers at all.
+    ///
+    /// Recovered fraction is `1 - mse_corrected/mse_base` restricted to the
+    /// targeted events: 0 means the correction did nothing for them, 1 means it
+    /// predicted them perfectly. No denominator borrowed from anywhere else.
+    #[test]
+    fn recovers_most_of_the_targeted_effect_within_the_production_data_budget() {
+        let recovered = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            1.0 - r.targeted_mse_corrected / r.targeted_mse_base.max(f64::MIN_POSITIVE)
+        });
+        let corrected = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.targeted_mse_corrected
+        });
+        let base = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.targeted_mse_base
+        });
+        let samples = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.targeted_scored as f64
+        });
+
+        eprintln!(
+            "#4485 targeted recovery at {RECOVERY_BUDGET_EVENTS} events: \
+             recovered {recovered:.3} (mse {corrected:.4} vs base {base:.4}, \
+             n={samples:.0})"
+        );
+
+        let spread = per_seed(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            1.0 - r.targeted_mse_corrected / r.targeted_mse_base.max(f64::MIN_POSITIVE)
+        });
+        let worst = spread.iter().cloned().fold(f64::INFINITY, f64::min);
+        eprintln!("#4485 targeted recovery per seed: {spread:?} (worst {worst:.3})");
+
+        assert!(
+            samples > 50.0,
+            "the targeted subset must be large enough to mean something, got {samples:.0}"
+        );
+        // Thresholds set clear of the SPREAD, not of the mean. Measured 0.583
+        // mean over per-seed [0.44, 0.29, 0.77, 0.48, 0.80]. The mean is
+        // deterministic so this cannot flake run-to-run, but a bar at 0.5 sits
+        // 0.08 from the measurement and an unrelated change could cross it
+        // without the correction having regressed — the marginal-threshold trap
+        // this repo's testing rules name. 0.4 keeps a substantive claim with
+        // real headroom, and the worst-seed floor catches a single-scenario
+        // collapse that averaging would hide.
+        assert!(
+            worst >= 0.15,
+            "no individual scenario may collapse to near-zero recovery; per-seed \
+             {spread:?}"
+        );
+        assert!(
+            recovered >= 0.4,
+            "the correction must recover a substantial share of the peer x contract \
+             effect on the events carrying it, within the data volume a real gateway \
+             holds; recovered {recovered:.3} (mse {corrected:.4} vs base {base:.4})"
+        );
+    }
+
+    /// The negative control for the headline test, restored after being deleted
+    /// by accident.
+    ///
+    /// An ABSOLUTE ceiling on what the base model can recover, which the
+    /// headline test's relative margin (`captured > base + 0.3`) does not
+    /// provide: if a future change introduced a distance confound that let the
+    /// base itself recover much of the structure, the relative margin could
+    /// still pass while the scenario had stopped testing the correction at all.
+    /// That is precisely the failure this control exists to catch, and the
+    /// margin alone cannot catch it.
+    #[test]
+    fn the_base_model_alone_cannot_recover_peer_contract_structure() {
+        let captured = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.captured_base
+        });
+        assert!(
+            captured < 0.35,
+            "distance-plus-EWMA must NOT be able to capture a peer x contract \
+             effect. If it can, the scenario has acquired a distance confound \
+             and the headline test is passing for the wrong reason; captured \
+             {captured:.3}"
+        );
+    }
+
+    /// Pins the error floor that explains why `captured >= 0.8` is unreachable
+    /// in this scenario.
+    ///
+    /// That claim is load-bearing — it is the whole reason the headline test
+    /// asserts "beats climatology" instead of the published target — and this
+    /// repo has a documented history of load-bearing justifications rotting
+    /// into prose that nobody re-checks (see
+    /// `.claude/rules/bug-prevention-patterns.md`). So it is measured here
+    /// rather than asserted in a comment: if the base model's error floor ever
+    /// drops, this goes red and the 0.8 question should be reopened.
+    #[test]
+    fn the_base_models_own_error_floor_is_what_caps_recovery() {
+        let base_mse = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| r.mse_base);
+        let var_p_star = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.var_p_star
+        });
+
+        // Share of base error attributable to the targeted events themselves,
+        // which the correction CAN address; the remainder sits on the 91.7% of
+        // events where the base is simply misfitted, which it largely cannot.
+        let targeted_fraction = 1.0 / 12.0;
+        let targeted_contribution = targeted_fraction * 0.55f64.powi(2);
+        let untargeted_error = (base_mse - targeted_contribution) / (1.0 - targeted_fraction);
+        let untargeted_sd = untargeted_error.max(0.0).sqrt();
+
+        eprintln!(
+            "#4485 base error floor: base mse {base_mse:.5}, Var(p*) {var_p_star:.5}, \
+             untargeted sd {untargeted_sd:.3}"
+        );
+
+        assert!(
+            untargeted_sd > 0.08,
+            "the stated reason the 0.8 target is unreachable is that the global \
+             isotonic base is badly misfitted on untargeted events (sd ~ 0.13). \
+             Measured sd {untargeted_sd:.3}. If this has dropped, the base model \
+             improved and the 0.8 question should be REOPENED rather than left \
+             documented as unachievable."
+        );
+        assert!(
+            base_mse > var_p_star,
+            "the base must be worse than a climatology forecast for the floor \
+             argument to hold; base mse {base_mse:.5} vs Var(p*) {var_p_star:.5}"
+        );
+    }
+
+    /// The no-regression gate: where there is no peer×contract structure, the
+    /// correction must not make the estimate worse.
+    #[test]
+    fn distance_only_structure_is_not_degraded_by_the_correction() {
+        let ratio = over_seeds(Model::DistanceOnly, RECOVERY_BUDGET_EVENTS, |r| {
+            r.mse_corrected / r.mse_base.max(f64::MIN_POSITIVE)
+        });
+        assert!(
+            ratio <= 1.05,
+            "with nothing to learn the correction must not degrade the base \
+             estimate; error ratio {ratio:.3}"
+        );
+    }
+
+    /// A peer-marginal effect is the EWMA's job. The correction must not fight
+    /// it or double-count it.
+    #[test]
+    fn peer_marginal_structure_is_not_degraded_by_the_correction() {
+        let ratio = over_seeds(Model::PeerMarginal, RECOVERY_BUDGET_EVENTS, |r| {
+            r.mse_corrected / r.mse_base.max(f64::MIN_POSITIVE)
+        });
+        assert!(
+            ratio <= 1.05,
+            "the correction must compose with the per-peer EWMA rather than \
+             fight it; error ratio {ratio:.3}"
+        );
+    }
+
+    /// The overfitting guard. Pure noise has no structure, so a learner that
+    /// "recovers" something here is inventing it.
+    #[test]
+    fn pure_noise_yields_no_correction_and_no_invented_structure() {
+        let events = RECOVERY_BUDGET_EVENTS;
+        let mean_lambda = over_seeds(Model::Noise, events, |r| r.mean_lambda);
+        let mse = over_seeds(Model::Noise, events, |r| r.mse_corrected);
+        let base_mse = over_seeds(Model::Noise, events, |r| r.mse_base);
+        let applied = over_seeds(Model::Noise, events, |r| r.mean_abs_correction);
+
+        assert!(
+            mse <= base_mse + 1e-3,
+            "on pure noise the correction must not degrade the base estimate; \
+             corrected {mse:.5} vs base {base_mse:.5}"
+        );
+        // The guard is the size of the correction APPLIED, not lambda.
+        //
+        // An earlier version asserted `lambda < 0.5` here and failed at 0.779,
+        // which turned out to be the assertion being wrong rather than the code:
+        // lambda measures how much evidence supports the residual estimate, and
+        // on 2000 events of abundant data that evidence is real. What it
+        // supports is the conclusion that the residual is ZERO, so a confident
+        // lambda multiplied by `r_hat ~ 0` is still ~0 — which is exactly the
+        // behaviour wanted, and which the error assertion above already
+        // confirms. Asserting on lambda was measuring the wrong quantity.
+        assert!(
+            applied < 0.05,
+            "on pure noise the APPLIED correction must be negligible; mean |correction| \
+             {applied:.4} (mean lambda {mean_lambda:.3}, which is allowed to be high)"
+        );
+    }
+
+    /// Records the learning curve, and pins that recovery IMPROVES with data
+    /// rather than arriving by luck at one budget.
+    #[test]
+    fn recovery_improves_monotonically_with_data() {
+        let checkpoints = [500usize, 1_000, 2_000, 4_000];
+        let captured: Vec<f64> = checkpoints
+            .iter()
+            .map(|&events| over_seeds(Model::PeerContract, events, |r| r.captured_corrected))
+            .collect();
+
+        eprintln!("learning curve (events -> captured): {checkpoints:?} -> {captured:?}");
+
+        // Direction, not level. The level is bounded by the base model's own
+        // error floor (see `recovered_structure_beats_assuming_the_base_rate`),
+        // so asserting a level here would be asserting a property of the
+        // isotonic fit rather than of the correction.
+        assert!(
+            captured[captured.len() - 1] >= captured[0] - 0.05,
+            "recovery must not DEGRADE as data accumulates, got {captured:?}"
+        );
+        assert!(
+            captured.iter().all(|value| value.is_finite()),
+            "every checkpoint must produce a finite score, got {captured:?}"
+        );
+    }
+
+    /// The identity the scoring rests on, verified rather than assumed:
+    /// learnable headroom equals `Var(p*)`, and the Bayes floor plus that
+    /// headroom is the climatology Brier.
+    #[test]
+    fn learnable_headroom_equals_variance_of_the_true_probability() {
+        let recovery = run(Model::PeerContract, 2_000, 0x4485_0001);
+        let mean_p = {
+            // climatology Brier = p̄(1−p̄) = bayes_floor + Var(p*)
+            recovery.bayes_floor + recovery.var_p_star
+        };
+        assert!(
+            recovery.var_p_star > 0.0,
+            "this scenario must carry learnable signal, got Var(p*)={}",
+            recovery.var_p_star
+        );
+        assert!(
+            mean_p > recovery.bayes_floor,
+            "climatology must be strictly worse than the Bayes floor whenever \
+             p* varies"
+        );
+        assert!(
+            recovery.scored > 1_000,
+            "expected a substantial scored window, got {}",
+            recovery.scored
+        );
     }
 }

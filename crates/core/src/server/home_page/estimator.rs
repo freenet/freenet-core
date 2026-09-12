@@ -464,7 +464,6 @@ pub enum RegKind {
 /// empty card.
 pub fn build_renegade_accuracy_panel(
     failure_pairs: &[(f64, f64)],
-    brier: Option<f64>,
     response_time_pairs: &[(f64, f64)],
     transfer_speed_pairs: &[(f64, f64)],
 ) -> String {
@@ -473,7 +472,7 @@ pub fn build_renegade_accuracy_panel(
         return String::new();
     }
 
-    let failure = build_reliability_chart(failure_pairs, brier);
+    let failure = build_reliability_chart(failure_pairs);
     let response = build_regression_chart("Response time", RegKind::Time, response_time_pairs);
     let transfer = build_regression_chart("Transfer speed", RegKind::Speed, transfer_speed_pairs);
 
@@ -481,11 +480,14 @@ pub fn build_renegade_accuracy_panel(
         r#"<div class="card">
         <h2>Prediction Accuracy</h2>
         <p style="font-size:0.8em;color:var(--text-muted);">
-            How well the Renegade predictor's recent predictions matched reality (this scores
-            the Renegade k-NN layer, not the distance-only fit in Outcomes vs Distance above).
-            On the dashed diagonal predictions are perfect: for failure, predicted probability
-            equals the observed failure rate (calibration); for the timing models, predicted
-            equals actual.
+            How well the Renegade layer's recent predictions matched reality, in isolation —
+            for how each layer contributes to the estimate the router actually uses, see
+            "Which layer is doing the work?" above. On the dashed diagonal predictions are
+            perfect: for failure, predicted probability equals the observed failure rate
+            (calibration); for the timing models, predicted equals actual. A calibration
+            curve that collapses to the two far corners is a model that only ever says
+            "certainly fine" or "certainly broken", which is worth noticing even when its
+            raw score looks good.
         </p>
         <div style="display:flex;flex-wrap:wrap;gap:1rem;justify-content:flex-start;">
             {failure}
@@ -503,7 +505,7 @@ pub fn build_renegade_accuracy_panel(
 /// X = predicted failure probability, Y = observed failure rate within each
 /// predicted-probability bin. Dots on the diagonal mean the model is calibrated;
 /// above the line it under-predicts failure, below it over-predicts.
-pub fn build_reliability_chart(pairs: &[(f64, f64)], brier: Option<f64>) -> String {
+pub fn build_reliability_chart(pairs: &[(f64, f64)]) -> String {
     use std::fmt::Write;
 
     let valid: Vec<(f64, f64)> = pairs
@@ -550,9 +552,26 @@ pub fn build_reliability_chart(pairs: &[(f64, f64)], brier: Option<f64>) -> Stri
         x = pad_l,
     )
     .ok();
-    let headline = match brier {
-        Some(b) if b.is_finite() => format!("Brier {b:.3} · n={n}"),
-        _ => format!("n={n}"),
+    // Computed from the pairs THIS CHART PLOTS, not handed in.
+    //
+    // Both quantities previously available to pass here describe a different
+    // window from the one drawn: the overall Brier is lifetime, and
+    // `recent_brier_score` is an EWMA with alpha=0.01 over the whole run, which
+    // after any regime change weights observations the chart is not showing. So
+    // captioning "Brier x - n=200" with either one states a score and a sample
+    // size that do not belong to each other. Deriving it here makes the caption
+    // true by construction.
+    let headline = {
+        let brier = valid
+            .iter()
+            .map(|(predicted, actual)| (predicted - actual).powi(2))
+            .sum::<f64>()
+            / n as f64;
+        if brier.is_finite() {
+            format!("Brier {brier:.3} · n={n}")
+        } else {
+            format!("n={n}")
+        }
     };
     write!(
         svg,

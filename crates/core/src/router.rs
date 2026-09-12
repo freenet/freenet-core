@@ -1,4 +1,5 @@
 mod isotonic_estimator;
+mod residual;
 mod routing_predictor;
 mod util;
 
@@ -964,6 +965,56 @@ pub(crate) struct RouterSnapshotInfo {
     /// Number of transfer-speed predictions scored against actual outcomes.
     #[serde(default)]
     pub renegade_transfer_speed_evaluated: u64,
+    /// Brier SKILL of each failure-prediction layer against the climatological
+    /// base rate: `1 - brier/(p(1-p))`. Zero means "no better than assuming the
+    /// base rate", negative means worse than assuming nothing.
+    ///
+    /// Skill rather than raw Brier because raw Brier on a rare event is
+    /// dominated by how rare the event is, not by how good the forecast is — at
+    /// a 1% base rate a constant forecast scores 0.0099, which the dashboard's
+    /// old absolute scale graded "excellent". See #4485.
+    #[serde(default)]
+    pub failure_skill_global: Option<f64>,
+    #[serde(default)]
+    pub failure_skill_adjusted: Option<f64>,
+    #[serde(default)]
+    pub failure_skill_blended: Option<f64>,
+    #[serde(default)]
+    pub failure_skill_corrected: Option<f64>,
+    /// Brier score of the blended estimate, and the climatology it is scored
+    /// against, so the dashboard can show the baseline alongside the result.
+    #[serde(default)]
+    pub failure_brier_blended: Option<f64>,
+    #[serde(default)]
+    pub failure_climatology_brier: Option<f64>,
+    #[serde(default)]
+    pub failure_base_rate: Option<f64>,
+    /// Predictions scored across all four layers.
+    #[serde(default)]
+    pub failure_layers_evaluated: u64,
+    /// Whether the residual correction is reaching live routing decisions.
+    #[serde(default)]
+    pub residual_correction_enabled: bool,
+    /// Self-tuned correction state: the selected kappa, the kernel bandwidth,
+    /// and how much residual evidence each stage holds.
+    #[serde(default)]
+    pub residual_kappa: Option<f64>,
+    #[serde(default)]
+    pub residual_bandwidth: Option<f64>,
+    #[serde(default)]
+    pub residual_failure_events: usize,
+    #[serde(default)]
+    pub residual_response_time_events: usize,
+    #[serde(default)]
+    pub residual_transfer_speed_events: usize,
+    #[serde(default)]
+    pub residual_scored: u64,
+    /// Where the router's chosen peer sits in distance order, and how often that
+    /// choice was made against a FULL candidate window. See
+    /// [`SelectionRankStats`] — this is the evidence for whether the
+    /// 25-of-`max_connections` truncation is costing anything.
+    #[serde(default)]
+    pub selection_ranks: SelectionRankSnapshot,
 }
 
 /// Per-peer routing data for the dashboard detail page.
@@ -999,13 +1050,44 @@ pub(crate) struct Router {
     /// and per-peer behavior that varies by contract location.
     #[serde(skip)]
     renegade_predictor: routing_predictor::RoutingPredictor,
+    /// Prequential skill of each failure-prediction layer, so the contribution of
+    /// each can be read off separately (#4485).
+    ///
+    /// Until this existed only the Renegade layer was scored, which made it
+    /// impossible to say which layer was doing the work — or whether the blend
+    /// was helping at all. All four are scored whatever the correction flag is
+    /// set to: measurement is the point, and it is what decides the flag.
+    #[serde(skip)]
+    failure_skill_global: residual::SkillTracker,
+    #[serde(skip)]
+    failure_skill_adjusted: residual::SkillTracker,
+    #[serde(skip)]
+    failure_skill_blended: residual::SkillTracker,
+    #[serde(skip)]
+    failure_skill_corrected: residual::SkillTracker,
+    /// Where the chosen peer sits in distance order — the censoring diagnostic
+    /// for the candidate-window size. See [`SelectionRankStats`].
+    #[serde(skip)]
+    selection_ranks: SelectionRankStats,
 }
 
 impl Clone for Router {
     fn clone(&self) -> Self {
-        // RoutingPredictor is not cloneable. When Router is cloned (e.g., for
-        // batch reconstruction from history), the predictor starts empty and
-        // gets rebuilt as events are added.
+        // RoutingPredictor is not cloneable, so it and everything scored against
+        // it (the skill trackers, the selection-rank counters) start empty here
+        // and rebuild as events arrive. That is the right behaviour: carrying a
+        // measurement across a clone that discards the model it measured would
+        // attribute one model's accuracy to another.
+        //
+        // NOTE: this impl has **no production call site**. The
+        // `*router.write() = Router::new(&history)` batch-reconstruction pattern
+        // this used to serve was replaced by in-place `refit()` inside
+        // `add_event` (#4811), and the only `router.clone()` left in the tree is
+        // an `Arc` pointer clone (ring.rs), which never reaches here. The
+        // previous comment cited that reconstruction path as the live reason for
+        // the reset, which would have been cargo-culted as "this runs in prod".
+        // Kept because `Router` is still nominally `Clone`; if that is ever
+        // removed, this goes with it.
         Router {
             response_start_time_estimator: self.response_start_time_estimator.clone(),
             transfer_rate_estimator: self.transfer_rate_estimator.clone(),
@@ -1016,7 +1098,220 @@ impl Clone for Router {
             per_op_response_time: self.per_op_response_time.clone(),
             per_op_transfer_rate: self.per_op_transfer_rate.clone(),
             renegade_predictor: routing_predictor::RoutingPredictor::new(RENEGADE_MAX_OBSERVATIONS),
+            // Reset with the predictor: these score the predictor's output, so
+            // carrying them across a clone that discards it would attribute one
+            // model's accuracy to another.
+            failure_skill_global: residual::SkillTracker::new(),
+            failure_skill_adjusted: residual::SkillTracker::new(),
+            failure_skill_blended: residual::SkillTracker::new(),
+            failure_skill_corrected: residual::SkillTracker::new(),
+            selection_ranks: SelectionRankStats::default(),
         }
+    }
+}
+
+/// Whether the residual correction replaces the legacy fixed-weight blend in
+/// live routing.
+///
+/// Default **off**. The correction and the blend are both computed and both
+/// scored either way, so a node accumulates the evidence needed to decide this
+/// without its routing behaviour changing. Promoting the default is a separate
+/// decision on that evidence — see #4485.
+///
+/// Follows the `FREENET_*` convention already used for runtime toggles
+/// (`FREENET_DISABLE_LOGS` and friends); a restart-scoped switch here is
+/// equivalent to a CLI flag and needs no plumbing through every `Router::new`
+/// call site, several of which are in unrelated tests.
+fn residual_correction_enabled() -> bool {
+    // Tests override ahead of the cached read. Without this the flag is
+    // structurally untestable: the `OnceLock` is resolved by whichever test
+    // touches it first and then fixed for the life of the process, so the
+    // branch that actually ships could never be exercised. That is also the
+    // cross-test-interference shape this repo's testing rules call out — it
+    // happens to be benign under nextest's process-per-test and NOT under plain
+    // `cargo test`, which is the runner AGENTS.md asks contributors to use.
+    #[cfg(test)]
+    {
+        match TEST_CORRECTION_OVERRIDE.with(|cell| cell.get()) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FREENET_ROUTING_RESIDUAL_CORRECTION")
+            .map(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                value == "1" || value == "true" || value == "yes" || value == "on"
+            })
+            .unwrap_or(false)
+    })
+}
+
+// Test-only override for `residual_correction_enabled`: 0 unset, 1 on, 2 off.
+//
+// THREAD-LOCAL, not a process-global atomic. `cargo test` runs tests in
+// parallel threads within one process, so a shared cell lets one test's
+// override leak into an unrelated routing test, and two guards dropping in
+// either order can restore each other's stale value. That is the
+// process-global cross-test-interference shape this repo's testing rules
+// call out, and it is invisible under nextest's process-per-test isolation —
+// which is exactly what makes it worth avoiding rather than tolerating.
+#[cfg(test)]
+thread_local! {
+    static TEST_CORRECTION_OVERRIDE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Force the residual correction on or off for the duration of a test.
+///
+/// Returns a guard that restores the previous setting on drop, so tests sharing
+/// a process cannot leak the override into each other.
+#[cfg(test)]
+pub(crate) fn force_residual_correction(enabled: bool) -> CorrectionOverrideGuard {
+    let previous = TEST_CORRECTION_OVERRIDE.with(|cell| {
+        let previous = cell.get();
+        cell.set(if enabled { 1 } else { 2 });
+        previous
+    });
+    CorrectionOverrideGuard { previous }
+}
+
+#[cfg(test)]
+pub(crate) struct CorrectionOverrideGuard {
+    previous: u8,
+}
+
+#[cfg(test)]
+impl Drop for CorrectionOverrideGuard {
+    fn drop(&mut self) {
+        TEST_CORRECTION_OVERRIDE.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Rank buckets for [`SelectionRankStats`]. Sized past the default window of 25
+/// so a node configured with a wider one still lands in a real bucket.
+const SELECTION_RANK_BUCKETS: usize = 32;
+
+/// Where, in distance order, does the router's chosen peer actually sit?
+///
+/// # What this is for
+///
+/// The router scores only the `consider_n_closest_peers` (25) geographically
+/// closest candidates; everything beyond that is invisible to routing for that
+/// hop. Production nodes run `max_connections = 200`, so a well-connected peer
+/// has ~175 peers it never scores. Whether that truncation costs anything is an
+/// open question (#4485 follow-up), and it is not answerable from the outside:
+/// nothing currently records where within the window the decision lands.
+///
+/// This is a **censoring diagnostic**. If selections cluster at the near ranks,
+/// the window is comfortably wider than the decision needs and widening it would
+/// change nothing. If they pile up against the far edge *while the window was
+/// full*, the ordering is being truncated where the real optimum plausibly lies,
+/// and widening is worth testing.
+///
+/// The saturation qualifier is load-bearing. On a node with 8 connections the
+/// window is 8, so a selection at rank 7 is "last of 8" and says nothing about
+/// truncation — only a selection at the edge of a FULL window is evidence that
+/// options were discarded. Counting boundary hits without that condition would
+/// make every sparsely-connected node look like it needs a wider window.
+#[derive(Debug, Default)]
+pub(crate) struct SelectionRankStats {
+    /// Distance-rank of the selected peer, 0 = closest. The final bucket
+    /// collects anything at or beyond `SELECTION_RANK_BUCKETS - 1`.
+    rank: [std::sync::atomic::AtomicU64; SELECTION_RANK_BUCKETS],
+    /// Prediction-based decisions recorded.
+    total: std::sync::atomic::AtomicU64,
+    /// Decisions where the window was full, so truncation could have discarded
+    /// candidates that were never scored.
+    saturated: std::sync::atomic::AtomicU64,
+    /// Of the saturated decisions, those whose selection fell in the farthest
+    /// quarter of the window — the reading that would justify widening it.
+    saturated_far_quarter: std::sync::atomic::AtomicU64,
+    /// Exact sum of selected ranks, so the mean does not inherit the histogram's
+    /// ceiling.
+    ///
+    /// `SELECTION_RANK_BUCKETS` is fixed storage, but the window is
+    /// configurable via `considering_n_closest_peers`. Deriving the mean from
+    /// the buckets would understate the tail for any window wider than the
+    /// buckets — precisely the configuration someone would run while evaluating
+    /// whether a wider window helps, so the metric would mislead exactly when it
+    /// was being consulted.
+    rank_sum: std::sync::atomic::AtomicU64,
+    /// Largest rank ever selected, so a tail beyond the histogram is visible
+    /// rather than silently folded into the last bucket.
+    max_rank: std::sync::atomic::AtomicU64,
+}
+
+impl SelectionRankStats {
+    /// `candidates_before_truncation` is how many peers were available to the
+    /// decision, and `window` how many survived the distance cut.
+    fn record(&self, selected_rank: usize, window: usize, candidates_before_truncation: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bucket = selected_rank.min(SELECTION_RANK_BUCKETS - 1);
+        self.rank[bucket].fetch_add(1, Relaxed);
+        self.total.fetch_add(1, Relaxed);
+        // Exact, unbucketed, so the mean survives a window wider than the
+        // histogram. The histogram is for the SHAPE; this is for the number.
+        self.rank_sum.fetch_add(selected_rank as u64, Relaxed);
+        self.max_rank.fetch_max(selected_rank as u64, Relaxed);
+
+        // TRUNCATED, not merely full. A decision with exactly 25 candidates
+        // against a 25-peer window scored every one of them — nothing was
+        // discarded, so it is no evidence about the limit. Counting it would
+        // inflate the saturation rate with decisions the window never
+        // constrained, which is the precise false positive the qualifier exists
+        // to prevent: a node whose connection count happens to sit AT the limit
+        // would otherwise look starved on every decision.
+        if candidates_before_truncation > window && window > 0 {
+            self.saturated.fetch_add(1, Relaxed);
+            // Farthest quarter, rounded so that tiny windows still have one.
+            let threshold = window - (window / 4).max(1);
+            if selected_rank >= threshold {
+                self.saturated_far_quarter.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> SelectionRankSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        SelectionRankSnapshot {
+            rank: self.rank.each_ref().map(|slot| slot.load(Relaxed)),
+            total: self.total.load(Relaxed),
+            saturated: self.saturated.load(Relaxed),
+            saturated_far_quarter: self.saturated_far_quarter.load(Relaxed),
+            rank_sum: self.rank_sum.load(Relaxed),
+            max_rank: self.max_rank.load(Relaxed),
+        }
+    }
+}
+
+/// Plain-data view of [`SelectionRankStats`] for the dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub struct SelectionRankSnapshot {
+    pub rank: [u64; SELECTION_RANK_BUCKETS],
+    pub total: u64,
+    pub saturated: u64,
+    pub saturated_far_quarter: u64,
+    #[serde(default)]
+    pub rank_sum: u64,
+    #[serde(default)]
+    pub max_rank: u64,
+}
+
+impl SelectionRankSnapshot {
+    /// Share of truncated decisions whose selection landed in the farthest
+    /// quarter of the window. High means the window is plausibly too narrow.
+    pub fn far_quarter_share(&self) -> Option<f64> {
+        (self.saturated > 0).then(|| self.saturated_far_quarter as f64 / self.saturated as f64)
+    }
+
+    /// Mean selected rank, for a one-number summary alongside the histogram.
+    ///
+    /// From the exact sum, NOT the buckets — see `rank_sum`.
+    pub fn mean_rank(&self) -> Option<f64> {
+        (self.total > 0).then(|| self.rank_sum as f64 / self.total as f64)
     }
 }
 
@@ -1127,11 +1422,21 @@ impl Router {
 
             // Use index-based time: events are ordered, each ~1 minute apart
             let time_hours = idx as f64 / 60.0;
+            // No residuals from history, deliberately. A residual has to be taken
+            // against the base estimate AS IT STOOD when the event arrived, and
+            // this path builds the isotonic estimators wholesale from the whole
+            // history rather than incrementally — so no such "estimate as of event
+            // i" exists here. Using the final fitted curve instead would leak
+            // future outcomes into past residuals, training the correction on
+            // information it will never have in production. The residual stages
+            // therefore start empty and fill from live traffic, which costs a
+            // warm-up rather than correctness.
             renegade_predictor.record_at_time(
                 &event.peer,
                 event.contract_location,
                 distance,
                 outcome,
+                routing_predictor::StageResiduals::default(),
                 time_hours,
             );
         }
@@ -1229,6 +1534,14 @@ impl Router {
                 .map(|(k, v)| (k, IsotonicEstimator::new(v, EstimatorType::Negative)))
                 .collect(),
             renegade_predictor,
+            // Start empty on a reload for the same reason the residual stages do:
+            // the layers being scored are rebuilt here, so history carries no
+            // comparable measurement forward.
+            failure_skill_global: residual::SkillTracker::new(),
+            failure_skill_adjusted: residual::SkillTracker::new(),
+            failure_skill_blended: residual::SkillTracker::new(),
+            failure_skill_corrected: residual::SkillTracker::new(),
+            selection_ranks: SelectionRankStats::default(),
         }
     }
 
@@ -1251,11 +1564,21 @@ impl Router {
 
         let (renegade_outcome, _) =
             routing_predictor::RoutingOutcome::from_route_outcome(&event.outcome);
+        // Residual targets, captured against the base estimates as they stand
+        // right now — before the isotonic estimators below ingest this event.
+        let residuals =
+            self.stage_residuals(&event.peer, event.contract_location, &renegade_outcome);
+        self.score_failure_layers(
+            &event.peer,
+            event.contract_location,
+            if renegade_outcome.success { 0.0 } else { 1.0 },
+        );
         self.renegade_predictor.record(
             &event.peer,
             event.contract_location,
             distance,
             renegade_outcome,
+            residuals,
         );
 
         // Feed global isotonic estimators
@@ -1364,11 +1687,17 @@ impl Router {
         }
     }
 
+    /// The `consider_n_closest_peers` closest candidates, plus HOW MANY were
+    /// available before that cut.
+    ///
+    /// The second value is what distinguishes "the window was full" from "the
+    /// window actually discarded someone", and only the latter is evidence
+    /// about whether the limit is costing anything.
     fn select_closest_peers<'a>(
         &self,
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         target_location: &Location,
-    ) -> Vec<&'a PeerKeyLocation> {
+    ) -> (Vec<&'a PeerKeyLocation>, usize) {
         let mut peer_distances: Vec<_> = peers
             .into_iter()
             .map(|peer| {
@@ -1391,9 +1720,13 @@ impl Router {
         if k > 0 && k < peer_distances.len() {
             peer_distances.select_nth_unstable_by(k - 1, |a, b| a.1.cmp(&b.1));
         }
+        let available = peer_distances.len();
         peer_distances.truncate(k);
         peer_distances.sort_by_key(|&(_, distance)| distance);
-        peer_distances.into_iter().map(|(peer, _)| peer).collect()
+        (
+            peer_distances.into_iter().map(|(peer, _)| peer).collect(),
+            available,
+        )
     }
 
     pub fn select_peer<'a>(
@@ -1417,6 +1750,149 @@ impl Router {
         let (selected, _decision) =
             self.select_k_best_peers_with_telemetry(peers, target_location, k);
         selected
+    }
+
+    /// The adjustment space each estimator composes its per-peer correction in.
+    /// Read from the estimators so the residual correction cannot drift out of
+    /// step with them.
+    fn stage_modes(&self) -> routing_predictor::StageModes {
+        routing_predictor::StageModes {
+            failure: self.failure_estimator.adjustment_mode(),
+            response_time: self.response_start_time_estimator.adjustment_mode(),
+            transfer_speed: self.transfer_rate_estimator.adjustment_mode(),
+        }
+    }
+
+    /// Residual of each estimator's current prediction against what actually
+    /// happened, in that estimator's own adjustment space.
+    ///
+    /// MUST be called before the isotonic estimators ingest the event: a residual
+    /// taken after the base model has already fitted the point understates the
+    /// error, and the correction then learns to under-correct.
+    fn stage_residuals(
+        &self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+        outcome: &routing_predictor::RoutingOutcome,
+    ) -> routing_predictor::StageResiduals {
+        let actual_failure = if outcome.success { 0.0 } else { 1.0 };
+        // Residual of the GLOBAL curve, NOT the peer-adjusted estimate.
+        //
+        // Measured, and it reverses what the design proposal assumed. Correcting
+        // the peer-adjusted estimate puts the per-peer EWMA's own noise inside
+        // the residual target, and that component is a function of the EWMA's
+        // internal state at that instant rather than of (peer, contract,
+        // distance, time) — so it is unlearnable from the features, and the
+        // correction spends its capacity chasing it. On the recoverability
+        // harness this was the difference between `captured = -0.30` and
+        // `captured = +0.055` for the CORRECTED estimate — between worse than
+        // assuming nothing and better than it for the first time. See #4485.
+        //
+        // Three different quantities get called "captured" around here, and a
+        // reviewer who ran the test read the wrong one off it, so naming them:
+        //   -0.438  the global curve UNCORRECTED — what the harness prints as
+        //           `base`, and what you will see if you run it today
+        //   -0.302  the CORRECTED estimate composing with the PEER-ADJUSTED
+        //           base, i.e. the design this comment argues against. Not
+        //           reproducible from the tree: that configuration is gone
+        //   +0.055  the CORRECTED estimate composing with the global curve,
+        //           i.e. what the code now does
+        // The comparison that settles B5 is the second against the third.
+        let failure = self
+            .failure_estimator
+            .estimate_global(peer, contract_location)
+            .ok()
+            .and_then(|base| {
+                self.failure_estimator
+                    .adjustment_mode()
+                    .residual(actual_failure, base.clamp(0.0, 1.0))
+            });
+
+        let response_time = outcome.time_to_response_start_secs.and_then(|actual| {
+            self.response_start_time_estimator
+                .estimate_global(peer, contract_location)
+                .ok()
+                .and_then(|base| {
+                    self.response_start_time_estimator
+                        .adjustment_mode()
+                        .residual(actual, base)
+                })
+        });
+
+        let transfer_speed = outcome.transfer_speed_bps.and_then(|actual| {
+            self.transfer_rate_estimator
+                .estimate_global(peer, contract_location)
+                .ok()
+                .and_then(|base| {
+                    self.transfer_rate_estimator
+                        .adjustment_mode()
+                        .residual(actual, base)
+                })
+        });
+
+        routing_predictor::StageResiduals {
+            failure,
+            response_time,
+            transfer_speed,
+        }
+    }
+
+    /// Score every failure-prediction layer against what actually happened.
+    ///
+    /// MUST be called before the isotonic estimators ingest the event, for the
+    /// same reason the residuals are: a layer graded after the base model has
+    /// fitted the outcome is grading itself on the answer.
+    fn score_failure_layers(
+        &mut self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+        actual_failure: f64,
+    ) {
+        let (Ok(global), Ok(adjusted)) = (
+            self.failure_estimator
+                .estimate_global(peer, contract_location),
+            self.failure_estimator
+                .estimate_retrieval_time(peer, contract_location),
+        ) else {
+            return;
+        };
+        let global = global.clamp(0.0, 1.0);
+        let adjusted = adjusted.clamp(0.0, 1.0);
+
+        let distance = peer
+            .location()
+            .map(|loc| contract_location.distance(loc).as_f64())
+            .unwrap_or(0.5);
+
+        let renegade = self
+            .renegade_predictor
+            .predict(peer, contract_location, distance);
+        let blended = match renegade.failure_probability {
+            Some(probability) if probability.is_finite() => {
+                let weight = self.renegade_predictor.failure_weight();
+                (adjusted * (1.0 - weight) + probability.clamp(0.0, 1.0) * weight).clamp(0.0, 1.0)
+            }
+            _ => adjusted,
+        };
+
+        let corrections = self.renegade_predictor.predict_corrections(
+            peer,
+            contract_location,
+            distance,
+            self.stage_modes(),
+        );
+        // Scored against the GLOBAL base, matching how the correction is actually
+        // composed; scoring it against the peer-adjusted estimate would measure a
+        // predictor the router never forms.
+        let corrected = corrections.failure.map_or(global, |correction| {
+            (global + correction.value).clamp(0.0, 1.0)
+        });
+
+        self.failure_skill_global.record(global, actual_failure);
+        self.failure_skill_adjusted.record(adjusted, actual_failure);
+        self.failure_skill_blended.record(blended, actual_failure);
+        self.failure_skill_corrected
+            .record(corrected, actual_failure);
     }
 
     fn predict_routing_outcome(
@@ -1465,6 +1941,33 @@ impl Router {
             .renegade_predictor
             .predict(peer, target_location, distance);
 
+        // Residual correction (#4485), computed ONLY when it will be used.
+        //
+        // An earlier version computed this unconditionally, with the rationale
+        // that it let both approaches be scored against each other on live
+        // traffic. That rationale does not hold at THIS call site: nothing here
+        // scores the result, so with the flag off (the shipped default) it was
+        // pure waste — and expensive waste, since this runs once per candidate
+        // peer per routing decision (up to `consider_n_closest_peers`) and each
+        // call is three k-NN queries at `KERNEL_CANDIDATE_NEIGHBOURS`. Worse,
+        // renegade's VP-tree is invalidated by every eviction and only rebuilt
+        // at the next `train()`, so queries in between degrade to a full scan.
+        //
+        // The comparison the rationale wanted happens in `score_failure_layers`,
+        // once per completed event rather than once per candidate, and is
+        // unaffected by this gate. Flagged in review of #5642.
+        let correction_enabled = residual_correction_enabled();
+        let corrections = if correction_enabled {
+            self.renegade_predictor.predict_corrections(
+                peer,
+                target_location,
+                distance,
+                self.stage_modes(),
+            )
+        } else {
+            routing_predictor::RoutingCorrections::default()
+        };
+
         let renegade_failure_adjustment =
             if let Some(renegade_failure) = renegade.failure_probability {
                 if renegade_failure.is_finite() {
@@ -1494,6 +1997,62 @@ impl Router {
             if transfer_estimate.is_some() && renegade_speed.is_finite() && renegade_speed > 0.0 {
                 let w = self.renegade_predictor.transfer_speed_weight();
                 xfer_speed = xfer_speed * (1.0 - w) + renegade_speed * w;
+            }
+        }
+
+        // When enabled, the correction REPLACES the legacy blend rather than
+        // composing with it. Both are corrections to the same base estimate, so
+        // applying both would double-count. The blend is still computed above so
+        // that it can be scored against this, but it does not reach the estimate
+        // the router acts on.
+        if correction_enabled {
+            // The correction composes with the GLOBAL curve, matching the space
+            // its residuals were taken in (see `stage_residuals`). It therefore
+            // REPLACES the per-peer EWMA rather than stacking on it — #4485's B5
+            // question, settled by measurement rather than argument.
+            let global_failure = self
+                .failure_estimator
+                .estimate_global(peer, target_location)
+                .ok()
+                .map(|value| value.clamp(0.0, 1.0));
+            // Note the shape: the base is adopted whenever it EXISTS, and the
+            // correction is added only if the residual model has something to
+            // say. An earlier version required both, which quietly defeated the
+            // neutral-when-uninformed property this design rests on — when the
+            // correction abstained (post-restart warm-up, or a query whose
+            // kernel weights underflow) the estimate silently fell back to the
+            // legacy blend, i.e. to exactly the far-field behaviour the
+            // correction exists to replace. Abstention must mean "base plus
+            // nothing", not "revert to the old model".
+            if let Some(base) = global_failure {
+                let corrected =
+                    (base + corrections.failure.map_or(0.0, |c| c.value)).clamp(0.0, 1.0);
+                if corrected.is_finite() {
+                    failure_estimate = corrected;
+                }
+            }
+            let modes = self.stage_modes();
+            let global_time = self
+                .response_start_time_estimator
+                .estimate_global(peer, target_location)
+                .ok();
+            let global_transfer = self
+                .transfer_rate_estimator
+                .estimate_global(peer, target_location)
+                .ok();
+            if let Some(base) = global_time {
+                let correction = corrections.response_time.map_or(0.0, |c| c.value);
+                let corrected = modes.response_time.apply(base, correction);
+                if corrected.is_finite() && corrected >= 0.0 {
+                    time_to_response_start = corrected;
+                }
+            }
+            if let Some(base) = global_transfer {
+                let correction = corrections.transfer_speed.map_or(0.0, |c| c.value);
+                let corrected = modes.transfer_speed.apply(base, correction);
+                if corrected.is_finite() && corrected > 0.0 {
+                    xfer_speed = corrected;
+                }
             }
         }
 
@@ -1592,32 +2151,47 @@ impl Router {
             };
             (selected, decision)
         } else {
-            let closest = self.select_closest_peers(peers, &target_location);
+            let (closest, candidates_available) =
+                self.select_closest_peers(peers, &target_location);
             let mut fallback_count = 0;
 
-            let mut scored: Vec<(&'a PeerKeyLocation, f64, Option<RoutingPrediction>)> = closest
-                .iter()
-                .map(|peer| {
-                    let distance = peer
-                        .location()
-                        .map(|loc| target_location.distance(loc).as_f64())
-                        .unwrap_or(0.5);
-                    match self.predict_routing_outcome(peer, target_location) {
-                        Ok(pred) => (*peer, distance, Some(pred)),
-                        Err(_) => {
-                            fallback_count += 1;
-                            (*peer, distance, None)
+            // `closest` is distance-sorted, so the enumerate index IS the
+            // distance rank. Carrying it through the re-sort is how the rank
+            // survives being reordered by predicted cost; recovering it
+            // afterwards would need peer equality and an O(n) search for
+            // information we already had.
+            let mut scored: Vec<(usize, &'a PeerKeyLocation, f64, Option<RoutingPrediction>)> =
+                closest
+                    .iter()
+                    .enumerate()
+                    .map(|(distance_rank, peer)| {
+                        let distance = peer
+                            .location()
+                            .map(|loc| target_location.distance(loc).as_f64())
+                            .unwrap_or(0.5);
+                        match self.predict_routing_outcome(peer, target_location) {
+                            Ok(pred) => (distance_rank, *peer, distance, Some(pred)),
+                            Err(_) => {
+                                fallback_count += 1;
+                                (distance_rank, *peer, distance, None)
+                            }
                         }
-                    }
-                })
-                .collect();
+                    })
+                    .collect();
 
             // Sort: peers with predictions by expected_total_time, others at the end
             scored.sort_by(|a, b| {
-                let time_a = a.2.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
-                let time_b = b.2.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
+                let time_a = a.3.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
+                let time_b = b.3.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
                 time_a.total_cmp(&time_b)
             });
+
+            // Record where the winner sat in distance order, so the cost of the
+            // candidate-window truncation can be measured rather than guessed.
+            if let Some((distance_rank, _, _, _)) = scored.first() {
+                self.selection_ranks
+                    .record(*distance_rank, closest.len(), candidates_available);
+            }
 
             let strategy = if fallback_count == 0 {
                 RoutingStrategy::PredictionBased
@@ -1629,7 +2203,7 @@ impl Router {
             let candidates: Vec<RoutingCandidate> = scored
                 .iter()
                 .enumerate()
-                .map(|(i, (_, dist, pred))| RoutingCandidate {
+                .map(|(i, (_, _, dist, pred))| RoutingCandidate {
                     distance: *dist,
                     prediction: pred.map(RoutingPredictionInfo::from),
                     selected: i < k,
@@ -1638,7 +2212,7 @@ impl Router {
 
             scored.truncate(k);
             let selected: Vec<&'a PeerKeyLocation> =
-                scored.into_iter().map(|(peer, _, _)| peer).collect();
+                scored.into_iter().map(|(_, peer, _, _)| peer).collect();
 
             let decision = RoutingDecisionInfo {
                 target_location: target_location.as_f64(),
@@ -1652,6 +2226,7 @@ impl Router {
 
     /// Produce a snapshot of the router model state for telemetry.
     pub fn snapshot(&self) -> RouterSnapshotInfo {
+        let shrinkage = self.renegade_predictor.shrinkage_diagnostics();
         RouterSnapshotInfo {
             network_efficiency_v1: None,
             failure_events: self.failure_estimator.len(),
@@ -1932,6 +2507,22 @@ impl Router {
             renegade_transfer_speed_evaluated: self
                 .renegade_predictor
                 .transfer_speed_predictions_evaluated(),
+            failure_skill_global: self.failure_skill_global.skill(),
+            failure_skill_adjusted: self.failure_skill_adjusted.skill(),
+            failure_skill_blended: self.failure_skill_blended.skill(),
+            failure_skill_corrected: self.failure_skill_corrected.skill(),
+            failure_brier_blended: self.failure_skill_blended.brier(),
+            failure_climatology_brier: self.failure_skill_blended.climatology_brier(),
+            failure_base_rate: self.failure_skill_blended.base_rate(),
+            failure_layers_evaluated: self.failure_skill_blended.count(),
+            residual_correction_enabled: residual_correction_enabled(),
+            residual_kappa: Some(shrinkage.failure_kappa),
+            residual_bandwidth: shrinkage.failure_bandwidth,
+            residual_failure_events: shrinkage.failure_residual_events,
+            residual_response_time_events: shrinkage.response_time_residual_events,
+            residual_transfer_speed_events: shrinkage.transfer_speed_residual_events,
+            residual_scored: shrinkage.failure_scored,
+            selection_ranks: self.selection_ranks.snapshot(),
         }
     }
 
@@ -2213,6 +2804,325 @@ mod tests {
         }
     }
 
+    /// Drive a peer that fails ONLY for one contract region, and assert the
+    /// enabled correction moves that peer's failure estimate where the legacy
+    /// blend does not.
+    ///
+    /// This is the branch that actually ships when the flag is turned on, and it
+    /// had no coverage at all until review pointed it out — the `OnceLock` made
+    /// it structurally untestable, which is why `force_residual_correction`
+    /// exists.
+    #[test]
+    fn enabled_correction_changes_the_estimate_the_router_acts_on() {
+        let targeted_peer = PeerKeyLocation::random();
+        let peer_location = targeted_peer
+            .location()
+            .expect("random peer has a location");
+        // A contract region close to this peer, so the distance-based model
+        // expects it to do WELL there — the correction has to overcome the base.
+        let targeted_contract =
+            Location::try_from((peer_location.as_f64() + 0.01).rem_euclid(1.0)).unwrap();
+
+        let mut router = Router::new(&[]);
+
+        // Background traffic so the isotonic fit and the predictor have a curve.
+        for index in 0..400 {
+            let peer = PeerKeyLocation::random();
+            let contract = Location::random();
+            let succeeded = index % 10 != 0;
+            router.add_event(RouteEvent {
+                peer,
+                contract_location: contract,
+                outcome: if succeeded {
+                    RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(100),
+                        payload_size: 5000,
+                        payload_transfer_time: Duration::from_millis(50),
+                    }
+                } else {
+                    RouteOutcome::Failure
+                },
+                op_type: Some(OpType::Get),
+            });
+            // The targeted peer fails for its own contract region every time,
+            // while behaving normally elsewhere — a pattern distance alone
+            // cannot represent.
+            router.add_event(RouteEvent {
+                peer: targeted_peer.clone(),
+                contract_location: targeted_contract,
+                outcome: RouteOutcome::Failure,
+                op_type: Some(OpType::Get),
+            });
+            router.add_event(RouteEvent {
+                peer: targeted_peer.clone(),
+                contract_location: Location::random(),
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(100),
+                    payload_size: 5000,
+                    payload_transfer_time: Duration::from_millis(50),
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+
+        let disabled = {
+            let _guard = force_residual_correction(false);
+            router
+                .predict_routing_outcome(&targeted_peer, targeted_contract)
+                .expect("prediction available after warm-up")
+                .failure_probability
+        };
+        let enabled = {
+            let _guard = force_residual_correction(true);
+            router
+                .predict_routing_outcome(&targeted_peer, targeted_contract)
+                .expect("prediction available after warm-up")
+                .failure_probability
+        };
+
+        assert!(
+            enabled.is_finite() && (0.0..=1.0).contains(&enabled),
+            "the corrected failure probability must stay a probability, got {enabled}"
+        );
+        assert!(
+            enabled > disabled,
+            "with the correction enabled, a peer that fails only for this \
+             contract region must be judged MORE likely to fail here than the \
+             legacy blend judges it; enabled {enabled:.4} vs disabled {disabled:.4}"
+        );
+    }
+
+    /// The flag must actually gate: with it off, the estimate is whatever the
+    /// legacy blend produces and nothing about the correction leaks into it.
+    #[test]
+    fn disabled_correction_leaves_the_legacy_estimate_untouched() {
+        let mut router = Router::new(&[]);
+        add_relay_recorded_successes(&mut router, 300);
+        let peer = PeerKeyLocation::random();
+        let contract = Location::random();
+
+        let first = {
+            let _guard = force_residual_correction(false);
+            router.predict_routing_outcome(&peer, contract).ok()
+        };
+        let second = {
+            let _guard = force_residual_correction(false);
+            router.predict_routing_outcome(&peer, contract).ok()
+        };
+
+        match (first, second) {
+            (Some(a), Some(b)) => assert_eq!(
+                a.failure_probability, b.failure_probability,
+                "the disabled path must be deterministic and correction-free"
+            ),
+            (None, None) => {}
+            _ => panic!("prediction availability must not depend on the flag"),
+        }
+    }
+
+    /// The four scored layers must actually be populated by `add_event`, so a
+    /// wiring break in `score_failure_layers` cannot pass unnoticed.
+    #[test]
+    fn add_event_populates_every_scored_layer() {
+        let mut router = Router::new(&[]);
+        for index in 0..400 {
+            router.add_event(RouteEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::random(),
+                outcome: if index % 7 == 0 {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(100),
+                        payload_size: 5000,
+                        payload_transfer_time: Duration::from_millis(50),
+                    }
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+
+        let snapshot = router.snapshot();
+        assert!(
+            snapshot.failure_layers_evaluated > 0,
+            "add_event must score the prediction layers"
+        );
+        for (label, skill) in [
+            ("global", snapshot.failure_skill_global),
+            ("adjusted", snapshot.failure_skill_adjusted),
+            ("blended", snapshot.failure_skill_blended),
+            ("corrected", snapshot.failure_skill_corrected),
+        ] {
+            let skill = skill.unwrap_or_else(|| panic!("{label} layer produced no skill score"));
+            assert!(
+                skill.is_finite(),
+                "{label} skill must be finite, got {skill}"
+            );
+        }
+        assert!(
+            snapshot.failure_base_rate.is_some_and(|rate| rate > 0.0),
+            "a window containing failures must report a non-zero base rate"
+        );
+    }
+
+    /// The saturation qualifier is what makes the boundary count mean anything,
+    /// so it gets its own test.
+    #[test]
+    fn boundary_selections_only_count_against_a_full_window() {
+        let stats = SelectionRankStats::default();
+
+        // A node with 8 connections and a 25-peer limit: 8 candidates, 8
+        // scored. Choosing the FARTHEST of the 8 says nothing about truncation
+        // — there was nothing to truncate.
+        for _ in 0..10 {
+            stats.record(7, 8, 8);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.total, 10);
+        assert_eq!(
+            snapshot.saturated, 0,
+            "an unfilled window cannot have discarded anyone"
+        );
+        assert_eq!(
+            snapshot.far_quarter_share(),
+            None,
+            "with no truncated decisions there is no share to report"
+        );
+
+        // Exactly at the limit: 25 candidates, 25 scored. STILL not evidence —
+        // the window was full but discarded nobody. This is the case the first
+        // implementation got wrong, counting it as saturated and so inflating
+        // the rate with decisions the limit never constrained.
+        let stats = SelectionRankStats::default();
+        for _ in 0..10 {
+            stats.record(24, 25, 25);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(
+            snapshot.saturated, 0,
+            "a full window that discarded nobody is not evidence about the limit"
+        );
+
+        // 40 candidates cut to 25: now peers really were discarded unscored,
+        // and a far-quarter selection is the reading that matters.
+        let stats = SelectionRankStats::default();
+        for _ in 0..10 {
+            stats.record(24, 25, 40);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.saturated, 10);
+        assert_eq!(snapshot.far_quarter_share(), Some(1.0));
+    }
+
+    #[test]
+    fn near_selections_against_a_full_window_read_as_comfortable() {
+        let stats = SelectionRankStats::default();
+        for _ in 0..100 {
+            stats.record(0, 25, 40);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.saturated, 100);
+        assert_eq!(
+            snapshot.far_quarter_share(),
+            Some(0.0),
+            "always picking the closest peer means the limit costs nothing"
+        );
+        assert_eq!(snapshot.mean_rank(), Some(0.0));
+    }
+
+    #[test]
+    fn selection_rank_histogram_and_mean_track_the_recorded_ranks() {
+        let stats = SelectionRankStats::default();
+        for rank in [0usize, 0, 2, 4] {
+            stats.record(rank, 25, 40);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.rank[0], 2);
+        assert_eq!(snapshot.rank[2], 1);
+        assert_eq!(snapshot.rank[4], 1);
+        // (0 + 0 + 2 + 4) / 4
+        assert_eq!(snapshot.mean_rank(), Some(1.5));
+    }
+
+    #[test]
+    fn selection_rank_beyond_the_buckets_is_collected_not_lost() {
+        let stats = SelectionRankStats::default();
+        stats.record(10_000, 12_000, 20_000);
+        let snapshot = stats.snapshot();
+        assert_eq!(
+            snapshot.rank[SELECTION_RANK_BUCKETS - 1],
+            1,
+            "an out-of-range rank must land in the final bucket rather than panic \
+             or be dropped"
+        );
+        assert_eq!(snapshot.total, 1);
+        // The MEAN must not inherit the histogram's ceiling. Bucketing would
+        // report 31 here; the exact sum reports the rank that actually happened,
+        // which matters most for a window wider than the buckets — exactly the
+        // configuration someone runs while evaluating whether to widen it.
+        assert_eq!(
+            snapshot.mean_rank(),
+            Some(10_000.0),
+            "the mean comes from the exact rank sum, not the buckets"
+        );
+        assert_eq!(
+            snapshot.max_rank, 10_000,
+            "a tail beyond the histogram must stay visible"
+        );
+    }
+
+    #[test]
+    fn empty_selection_rank_stats_report_nothing_rather_than_zero() {
+        let snapshot = SelectionRankStats::default().snapshot();
+        assert_eq!(snapshot.total, 0);
+        assert_eq!(snapshot.mean_rank(), None);
+        assert_eq!(snapshot.far_quarter_share(), None);
+    }
+
+    /// The stats must actually be fed by real routing decisions, not merely
+    /// exist — a counter nothing increments is the same as no counter.
+    #[test]
+    fn routing_decisions_populate_the_selection_rank_stats() {
+        let mut router = Router::new(&[]);
+        for index in 0..400 {
+            router.add_event(RouteEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::random(),
+                outcome: if index % 9 == 0 {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(100),
+                        payload_size: 5000,
+                        payload_transfer_time: Duration::from_millis(50),
+                    }
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+
+        let candidates: Vec<PeerKeyLocation> = (0..40).map(|_| PeerKeyLocation::random()).collect();
+        for _ in 0..25 {
+            let _ = router.select_peer(candidates.iter(), Location::random());
+        }
+
+        let snapshot = router.snapshot().selection_ranks;
+        // EQUALITY, not `>=`. Each `select_peer` call should record exactly one
+        // decision, and `>=` would sail past a regression that recorded once per
+        // CANDIDATE instead of once per decision — 25 calls would report 1000
+        // and still satisfy the assertion, while every rate derived from these
+        // counters silently became garbage. The run is deterministic (25 calls,
+        // 40 fixed candidates against a 25-peer window), so equality is free.
+        assert_eq!(
+            snapshot.total, 25,
+            "each routing decision must be recorded exactly once"
+        );
+        assert_eq!(
+            snapshot.saturated, 25,
+            "40 candidates cut to a 25-peer window discards 15 unscored every time"
+        );
+    }
+
     #[test]
     fn estimators_use_intended_adjustment_modes() {
         // Pin the per-estimator adjustment modes so a future change can't silently
@@ -2429,6 +3339,7 @@ mod tests {
             Router::new(&[])
                 .considering_n_closest_peers(CAP)
                 .select_closest_peers(&create_peers(NUM_PEERS), &Location::random())
+                .0
                 .len()
         );
     }
@@ -2494,7 +3405,7 @@ mod tests {
                 .collect();
             let target = Location::random();
 
-            let window = router.select_closest_peers(&peers, &target);
+            let (window, _) = router.select_closest_peers(&peers, &target);
             if window.iter().any(|p| {
                 p.socket_addr()
                     .is_some_and(|a| subscriber_addrs.contains(&a))
@@ -2888,7 +3799,7 @@ mod tests {
         // Create a router with no historical data
         let router = Router::new(&[]).considering_n_closest_peers(CLOSEST_CAP);
         let asserted_closest: Vec<&PeerKeyLocation> =
-            router.select_closest_peers(&peers, &contract_location);
+            router.select_closest_peers(&peers, &contract_location).0;
 
         let mut expected_iter = expected_closest.iter();
         let mut asserted_iter = asserted_closest.iter();
@@ -3003,7 +3914,7 @@ mod tests {
         let empty_peers: Vec<PeerKeyLocation> = vec![];
         let target = Location::random();
 
-        let result = router.select_closest_peers(&empty_peers, &target);
+        let (result, _) = router.select_closest_peers(&empty_peers, &target);
         assert!(
             result.is_empty(),
             "select_closest_peers should return empty vec for empty candidates"
