@@ -1073,9 +1073,21 @@ pub(crate) struct Router {
 
 impl Clone for Router {
     fn clone(&self) -> Self {
-        // RoutingPredictor is not cloneable. When Router is cloned (e.g., for
-        // batch reconstruction from history), the predictor starts empty and
-        // gets rebuilt as events are added.
+        // RoutingPredictor is not cloneable, so it and everything scored against
+        // it (the skill trackers, the selection-rank counters) start empty here
+        // and rebuild as events arrive. That is the right behaviour: carrying a
+        // measurement across a clone that discards the model it measured would
+        // attribute one model's accuracy to another.
+        //
+        // NOTE: this impl has **no production call site**. The
+        // `*router.write() = Router::new(&history)` batch-reconstruction pattern
+        // this used to serve was replaced by in-place `refit()` inside
+        // `add_event` (#4811), and the only `router.clone()` left in the tree is
+        // an `Arc` pointer clone (ring.rs), which never reaches here. The
+        // previous comment cited that reconstruction path as the live reason for
+        // the reset, which would have been cargo-culted as "this runs in prod".
+        // Kept because `Router` is still nominally `Clone`; if that is ever
+        // removed, this goes with it.
         Router {
             response_start_time_estimator: self.response_start_time_estimator.clone(),
             transfer_rate_estimator: self.transfer_rate_estimator.clone(),
