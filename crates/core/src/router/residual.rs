@@ -107,6 +107,19 @@ pub(crate) struct KernelEstimate {
     /// `residual`. Zero means "no nearby evidence"; see the module docs for why
     /// this is kernel mass rather than Kish's ratio.
     pub n_eff: f64,
+    /// Kernel-weighted variance of the neighbours' residuals — how much they
+    /// DISAGREE.
+    ///
+    /// `n_eff` says how much evidence there is; this says whether that evidence
+    /// is telling one story. Both are needed, and using only the first was a
+    /// real defect: the peer feature is categorical, so a query pulls in every
+    /// observation for that peer regardless of contract. A peer that fails for
+    /// ONE contract band therefore produces a neighbourhood of a few residuals
+    /// near +0.55 and many near 0 — a large `n_eff` supporting a mean of ~0.12
+    /// that describes neither population. Measured: on ordinary traffic the
+    /// correction predicted |r̂| ≈ 0.12 and applied 78% of it, making that
+    /// traffic 27% worse than the plain distance curve.
+    pub variance: f64,
 }
 
 /// Kernel-weight a set of `(distance, residual)` neighbours.
@@ -149,9 +162,31 @@ pub(crate) fn kernel_estimate(neighbors: &[(f64, f64)], bandwidth: f64) -> Optio
         return None;
     }
 
+    // Second pass for the weighted dispersion. Cheap next to the k-NN query
+    // that produced these neighbours, and it is what tells the caller whether
+    // this mean is describing one population or straddling two.
+    let mut variance_sum = 0.0f64;
+    for &(distance, value) in neighbors {
+        if !distance.is_finite() || !value.is_finite() || distance < 0.0 {
+            continue;
+        }
+        let weight = (-(distance * distance) / two_h_squared).exp();
+        if !weight.is_finite() {
+            continue;
+        }
+        let deviation = value - residual;
+        variance_sum += weight * deviation * deviation;
+    }
+    let variance = variance_sum / weight_sum;
+
     Some(KernelEstimate {
         residual,
         n_eff: weight_sum,
+        variance: if variance.is_finite() && variance >= 0.0 {
+            variance
+        } else {
+            0.0
+        },
     })
 }
 
@@ -279,17 +314,55 @@ impl ShrinkageSelector {
     ///
     /// Guaranteed to land in `[0, 1]`, and to be exactly `0.0` for zero or
     /// non-finite evidence so that a caller can rely on `apply(base, 0.0) == base`.
-    pub(crate) fn lambda(&self, n_eff: f64) -> f64 {
+    pub(crate) fn lambda(&self, n_eff: f64, local_variance: f64) -> f64 {
+        self.lambda_for(n_eff, local_variance, self.kappa())
+    }
+
+    /// `λ = n_eff / (n_eff + κ · relative_noise)`.
+    ///
+    /// `relative_noise` is the neighbours' own dispersion measured against how
+    /// much residuals vary across the whole stage. It is the `σ²_noise` term
+    /// the empirical-Bayes derivation always called for, estimated LOCALLY
+    /// rather than pinned to one global constant:
+    ///
+    /// - neighbours in perfect agreement → `relative_noise → 0` → `λ → 1`
+    /// - neighbours as scattered as the population → `relative_noise ≈ 1` →
+    ///   `λ = n/(n+κ)`, the previous behaviour
+    /// - neighbours MORE scattered than the population → `λ` collapses, and the
+    ///   correction defers to the prior
+    ///
+    /// That last case is the one this fixes. Weighting by evidence QUANTITY
+    /// alone made the model most confident exactly where it was averaging two
+    /// different populations together — a large neighbourhood that disagrees
+    /// with itself scored as strong evidence.
+    fn lambda_for(&self, n_eff: f64, local_variance: f64, kappa: f64) -> f64 {
         if !n_eff.is_finite() || n_eff <= 0.0 {
             return 0.0;
         }
-        let kappa = self.kappa();
-        let lambda = n_eff / (n_eff + kappa);
+        let relative_noise = match self.residual_variance() {
+            Some(global) if global > 0.0 && local_variance.is_finite() && local_variance >= 0.0 => {
+                local_variance / global
+            }
+            // No spread estimate yet: fall back to the previous behaviour rather
+            // than inventing confidence from a statistic that does not exist.
+            _ => 1.0,
+        };
+        let lambda = n_eff / (n_eff + kappa * relative_noise);
         if lambda.is_finite() {
             lambda.clamp(0.0, 1.0)
         } else {
             0.0
         }
+    }
+
+    /// Variance of the residuals seen across the whole stage — the `σ²_signal`
+    /// scale that local dispersion is measured against.
+    fn residual_variance(&self) -> Option<f64> {
+        if self.residual_count < 2 {
+            return None;
+        }
+        let variance = self.residual_m2 / (self.residual_count - 1) as f64;
+        (variance.is_finite() && variance > 0.0).then_some(variance)
     }
 
     /// Score every candidate `κ` against a realised residual, and fold that
@@ -301,10 +374,20 @@ impl ShrinkageSelector {
     /// correction" rather than skipped — a candidate that abstains still has to
     /// answer for the residual it declined to predict, or abstaining would look
     /// free.
+    /// `prior` is the per-peer EWMA's own adjustment for this event, in the
+    /// same space as `actual_residual`.
+    ///
+    /// It is required, not optional, because the forecast being scored is the
+    /// COMPOSED one: `(1−λ)·prior + λ·r̂`. Scoring `λ·r̂` alone — as this did
+    /// before `compose_with_prior` existed — optimises a formula the predictor
+    /// no longer uses, and biases selection toward a large λ merely because the
+    /// correction beats ZERO. It would happily hand over from an accurate EWMA
+    /// to a noisier kernel estimate and call that an improvement.
     pub(crate) fn record(
         &mut self,
         estimates: &[Option<KernelEstimate>; BANDWIDTH_MULTIPLIERS.len()],
         actual_residual: f64,
+        prior: f64,
     ) {
         if !actual_residual.is_finite() {
             return;
@@ -325,19 +408,23 @@ impl ShrinkageSelector {
         }
 
         for (bandwidth_index, estimate) in estimates.iter().enumerate() {
-            let (n_eff, predicted) = match estimate {
+            let (n_eff, predicted, local_variance) = match estimate {
                 Some(estimate) if estimate.n_eff.is_finite() && estimate.residual.is_finite() => {
-                    (estimate.n_eff, estimate.residual)
+                    (estimate.n_eff, estimate.residual, estimate.variance)
                 }
-                _ => (0.0, 0.0),
+                _ => (0.0, 0.0, 0.0),
             };
+            let prior = if prior.is_finite() { prior } else { 0.0 };
             for (kappa_index, kappa) in KAPPA_GRID.iter().enumerate() {
-                let lambda = if n_eff > 0.0 {
-                    n_eff / (n_eff + kappa)
-                } else {
-                    0.0
-                };
-                let error = lambda * predicted - actual_residual;
+                // Same shrinkage the predictor will apply, dispersion included,
+                // so a candidate wins here only if it would genuinely have
+                // predicted better.
+                let lambda = self.lambda_for(n_eff, local_variance, *kappa);
+                // The same composition `compose_with_prior` forms, so the
+                // candidate that wins here is the candidate that would actually
+                // have predicted best.
+                let forecast = (1.0 - lambda) * prior + lambda * predicted;
+                let error = forecast - actual_residual;
                 if error.is_finite() {
                     self.squared_error[bandwidth_index][kappa_index] += error * error;
                 }
@@ -349,15 +436,7 @@ impl ShrinkageSelector {
     /// Standard deviation of observed residuals, once there are enough to make
     /// one meaningful.
     pub(crate) fn residual_sigma(&self) -> Option<f64> {
-        if self.residual_count < 2 {
-            return None;
-        }
-        let variance = self.residual_m2 / (self.residual_count - 1) as f64;
-        if variance.is_finite() && variance > 0.0 {
-            Some(variance.sqrt())
-        } else {
-            None
-        }
+        self.residual_variance().map(f64::sqrt)
     }
 
     /// Bound a log-space correction to `±3σ` of the observed residual spread.
@@ -548,8 +627,16 @@ mod tests {
         let estimate = Some(KernelEstimate {
             residual: predicted,
             n_eff,
+            // Dispersion matched to the spread these tests actually feed, so
+            // `relative_noise ≈ 1` and lambda reduces to `n/(n+kappa)`.
+            //
+            // NOT zero: zero dispersion means the neighbours agree exactly, which
+            // correctly drives lambda to 1 for EVERY kappa — making the kappa
+            // dimension inert and these tests unable to observe the thing they
+            // are about.
+            variance: 0.25,
         });
-        selector.record(&[estimate; BANDWIDTH_MULTIPLIERS.len()], actual);
+        selector.record(&[estimate; BANDWIDTH_MULTIPLIERS.len()], actual, 0.0);
     }
 
     #[test]
@@ -661,10 +748,10 @@ mod tests {
     #[test]
     fn lambda_is_zero_without_evidence() {
         let selector = ShrinkageSelector::new();
-        assert_eq!(selector.lambda(0.0), 0.0);
-        assert_eq!(selector.lambda(-1.0), 0.0);
-        assert_eq!(selector.lambda(f64::NAN), 0.0);
-        assert_eq!(selector.lambda(f64::INFINITY), 0.0);
+        assert_eq!(selector.lambda(0.0, 0.0), 0.0);
+        assert_eq!(selector.lambda(-1.0, 0.0), 0.0);
+        assert_eq!(selector.lambda(f64::NAN, 0.0), 0.0);
+        assert_eq!(selector.lambda(f64::INFINITY, 0.0), 0.0);
     }
 
     #[test]
@@ -673,7 +760,7 @@ mod tests {
         let mut previous = 0.0;
         for step in 1..500 {
             let n_eff = step as f64 * 0.5;
-            let lambda = selector.lambda(n_eff);
+            let lambda = selector.lambda(n_eff, 0.0);
             assert!(
                 (0.0..=1.0).contains(&lambda),
                 "lambda must stay in [0,1], got {lambda}"
@@ -694,7 +781,7 @@ mod tests {
     fn lambda_equals_half_at_n_eff_equal_kappa() {
         let selector = ShrinkageSelector::new();
         let kappa = selector.kappa();
-        assert!((selector.lambda(kappa) - 0.5).abs() < 1e-12);
+        assert!((selector.lambda(kappa, 0.0) - 0.5).abs() < 1e-12);
     }
 
     #[test]
@@ -729,6 +816,39 @@ mod tests {
         assert!(
             selector.kappa() >= 8.0,
             "pure noise should select a conservative kappa, got {}",
+            selector.kappa()
+        );
+    }
+
+    /// The selector must not hand over to a noisier kernel estimate just because
+    /// the correction beats doing nothing.
+    ///
+    /// Here the EWMA prior is exactly right (0.4) and the kernel estimate is
+    /// pure noise. Scoring `λ·r̂` alone would favour a small kappa, because any
+    /// λ>0 beats λ=0 when the target is 0.4 and the correction is centred near
+    /// it. Scoring the composed forecast sees that handing over DESTROYS an
+    /// accurate prior, and shrinks instead.
+    #[test]
+    fn selection_does_not_hand_over_from_an_accurate_prior_to_noise() {
+        let mut selector = ShrinkageSelector::new();
+        let mut state = 0xBEEFu64;
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let noisy = if state % 2 == 0 { 1.4 } else { -0.6 };
+            let estimate = Some(KernelEstimate {
+                residual: noisy,
+                n_eff: 8.0,
+                variance: 1.0,
+            });
+            selector.record(&[estimate; BANDWIDTH_MULTIPLIERS.len()], 0.4, 0.4);
+        }
+        let lambda = selector.lambda(8.0, 0.0);
+        assert!(
+            lambda < 0.5,
+            "with an exact prior and a noisy correction the selector must keep \
+             most of the prior, got lambda {lambda:.3} (kappa {})",
             selector.kappa()
         );
     }
@@ -960,7 +1080,7 @@ mod tests {
             "at d = 50h the weight underflows and there is no estimate at all"
         );
 
-        let correction = selector.lambda(near_zero.n_eff) * near_zero.residual;
+        let correction = selector.lambda(near_zero.n_eff, 0.0) * near_zero.residual;
         assert!(
             correction.abs() < 1e-20,
             "a negligible-evidence correction must be negligible, got {correction}"

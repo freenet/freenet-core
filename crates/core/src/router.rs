@@ -1113,32 +1113,74 @@ impl Clone for Router {
 /// Whether the residual correction replaces the legacy fixed-weight blend in
 /// live routing.
 ///
-/// Default **ON**. The variable now selects the LEGACY path, not the new one.
+/// Default **OFF** — the flip was attempted and the measurement said no.
 ///
-/// The fixed-weight blend it replaces is unprincipled by construction — its
-/// weight tracks how much data exists globally rather than whether there is
-/// evidence for the query at hand — and measured on both nova gateways it has
-/// NEGATIVE skill: across a 200-prediction window it caught none of five real
-/// failures and raised two full-confidence false alarms, scoring worse than a
-/// forecast that simply assumes the base rate.
+/// The fixed-weight blend is unprincipled by construction and measures NEGATIVE
+/// skill on both nova gateways, so enabling the replacement looked
+/// straightforward. It is not, and the reason is worth recording so nobody
+/// repeats the attempt on the same reasoning.
 ///
-/// Keeping that as the default pending "production evidence" was the wrong
-/// call: the evidence already existed, and the thing being protected was the
-/// status quo rather than the network. What genuinely blocked the flip was a
-/// defect in the replacement — an uninformed query fell back to the global
-/// curve, discarding the per-peer EWMA — which `compose_with_prior` fixes. With
-/// that in place there is no regime where the new path is worse: with no
-/// evidence it IS the peer-adjusted estimate, and with evidence it is the
-/// correction.
+/// Measured against the FULL legacy path — peer-adjusted isotonic *plus* the
+/// fixed-weight blend, which is what actually runs — on the recoverability
+/// harness:
 ///
-/// Set `FREENET_ROUTING_RESIDUAL_CORRECTION=0` to restore the legacy blend.
-/// That is a revert path for an operator who sees a regression, not a
-/// configuration anyone is expected to set.
+/// ```text
+/// overall         corrected / legacy = 1.169   (17% WORSE)
+/// peer-marginal                       = 1.004   (slightly worse)
+/// targeted                            = 0.960   (4% better)
+/// distance-only                       = 0.706   (better)
+/// ```
 ///
-/// Follows the `FREENET_*` convention already used for runtime toggles
-/// (`FREENET_DISABLE_LOGS` and friends); a restart-scoped switch here is
-/// equivalent to a CLI flag and needs no plumbing through every `Router::new`
-/// call site, several of which are in unrelated tests.
+/// So the trade is: 17% more error overall to gain 4% on the ~8% of events
+/// carrying a peer×contract effect. That is not a good trade, and it is the
+/// opposite of what an earlier revision of this comment claimed.
+///
+/// The earlier claim came from comparing against the peer-adjusted estimate
+/// ALONE, which omits the blend. That made the correction look ~2x better on
+/// the targeted case. The blend is evidently contributing real signal there —
+/// which is, after all, the case it was built for — so leaving it out of the
+/// baseline flattered the replacement.
+///
+/// # Why it underperforms, diagnosed
+///
+/// Not a confidence-calibration problem, though that was the first guess and it
+/// was wrong. Measured on ordinary (non-targeted) traffic, where the true
+/// correction is ~0, the model predicted `|r̂| ≈ 0.12` and applied ~78% of it,
+/// making that traffic 27% worse than the plain distance curve. That is where
+/// the overall loss comes from — not from the targeted case, which does improve.
+///
+/// The cause is the SHAPE OF THE NEIGHBOURHOOD. The peer feature is categorical:
+/// every observation for a peer sits at distance 0 in that dimension. So a query
+/// pulls in that peer's whole history regardless of contract, and a peer failing
+/// for ONE contract band yields a neighbourhood of a few residuals near +0.55
+/// and many near 0. Their kernel-weighted mean is ~0.12, describing neither
+/// population.
+///
+/// Shrinking harder does not help, and it is worth being precise about why:
+/// with `n_eff ≈ 128` the mean of that mixture is *precisely estimated*
+/// (standard error `σ/√n`), so the model is CORRECTLY confident about the mean.
+/// The mean is simply the wrong quantity. That is BIAS from a heterogeneous
+/// neighbourhood, and shrinkage only ever corrects VARIANCE. Adding a
+/// dispersion-aware `λ` (which the code now has, and which is a better-specified
+/// estimator regardless) moved the numbers by under 1%, exactly as this
+/// reasoning predicts.
+///
+/// What would actually address it: the kernel needs to localise in CONTRACT
+/// space while still admitting same-peer neighbours, and a single scalar
+/// bandwidth over a metric mixing one categorical dimension with three
+/// continuous ones cannot do that. Per-dimension bandwidths, or a different
+/// localisation entirely, is the next thing to try — a larger change than
+/// tuning, and one that should be measured against the FULL legacy path from
+/// the start.
+///
+/// Note the tension this leaves unresolved: production says the blend has
+/// negative skill; this simulation says it helps. Both cannot be right about
+/// the same thing, and the harness generates outcomes from a fixed `p*` that
+/// the absolute model is well placed to learn, so it may simply be a scenario
+/// the blend suits. Settling it needs production measurement of the composed
+/// path, not more simulation.
+///
+/// Set `FREENET_ROUTING_RESIDUAL_CORRECTION=1` to enable for an experiment.
 fn residual_correction_enabled() -> bool {
     // Tests override ahead of the cached read. Without this the flag is
     // structurally untestable: the `OnceLock` is resolved by whichever test
@@ -1159,7 +1201,7 @@ fn residual_correction_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("FREENET_ROUTING_RESIDUAL_CORRECTION")
             .map(|value| parse_correction_flag(&value))
-            .unwrap_or(true)
+            .unwrap_or(false)
     })
 }
 
@@ -1869,10 +1911,31 @@ impl Router {
                 })
         });
 
+        // The EWMA's own adjustment at THIS moment, per stage. Shrinkage is
+        // selected against the composed forecast `(1−λ)·prior + λ·r̂`, so the
+        // selector needs the prior it will be composed with; without it the
+        // selector optimises a formula the predictor no longer uses and can
+        // favour handing over from an accurate EWMA to a noisier correction.
+        let stage_prior = |estimator: &IsotonicEstimator| -> f64 {
+            match (
+                estimator.estimate_global(peer, contract_location),
+                estimator.estimate_retrieval_time(peer, contract_location),
+            ) {
+                (Ok(global), Ok(adjusted)) => estimator
+                    .adjustment_mode()
+                    .residual(adjusted, global)
+                    .unwrap_or(0.0),
+                _ => 0.0,
+            }
+        };
+
         routing_predictor::StageResiduals {
             failure,
             response_time,
             transfer_speed,
+            failure_prior: stage_prior(&self.failure_estimator),
+            response_time_prior: stage_prior(&self.response_start_time_estimator),
+            transfer_speed_prior: stage_prior(&self.transfer_rate_estimator),
         }
     }
 
