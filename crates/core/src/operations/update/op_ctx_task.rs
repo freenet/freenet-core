@@ -1978,6 +1978,11 @@ async fn drive_relay_broadcast_to(
     }
 
     // ── Step 4: apply broadcast via WASM merge ────────────────────────────
+    // Hoisted: step 6 needs the SAME origin this fan-out registered, to derive
+    // the covered peers' summaries (#5190). Re-resolving there would re-read
+    // the co-host population at a later instant.
+    let broadcast_origin =
+        resolve_covered_peers(op_manager, &key, &incoming_tx, sender_addr, &covered);
     let update_result = super::update_contract(
         op_manager,
         key,
@@ -1985,7 +1990,7 @@ async fn drive_relay_broadcast_to(
         RelatedContracts::default(),
         crate::contract::Priority::NetworkRelay,
         crate::node::ApplyOrigin::NetworkRelay,
-        resolve_covered_peers(op_manager, &key, &incoming_tx, sender_addr, &covered),
+        broadcast_origin.clone(),
     )
     .await;
 
@@ -2298,7 +2303,8 @@ async fn drive_relay_broadcast_to(
     // contract's REAL summary itself (#4923) — no caller-supplied value.
     let op_mgr = op_manager.clone();
     GlobalExecutor::spawn(async move {
-        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr).await;
+        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr, &broadcast_origin)
+            .await;
     });
 
     Ok(())
@@ -2932,6 +2938,9 @@ async fn apply_streaming_broadcast(
     }
 
     // Step 7: WASM merge.
+    // Same hoist as the non-streaming driver, same reason (#5190).
+    let broadcast_origin =
+        resolve_covered_peers(op_manager, &key, &incoming_tx, sender_addr, &covered);
     let update_result = super::update_contract(
         op_manager,
         key,
@@ -2939,7 +2948,7 @@ async fn apply_streaming_broadcast(
         RelatedContracts::default(),
         crate::contract::Priority::NetworkRelay,
         crate::node::ApplyOrigin::NetworkRelay,
-        resolve_covered_peers(op_manager, &key, &incoming_tx, sender_addr, &covered),
+        broadcast_origin.clone(),
     )
     .await;
 
@@ -3081,7 +3090,8 @@ async fn apply_streaming_broadcast(
     // caller-supplied value.
     let op_mgr = op_manager.clone();
     GlobalExecutor::spawn(async move {
-        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr).await;
+        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr, &broadcast_origin)
+            .await;
     });
 
     Ok(())
@@ -3424,15 +3434,78 @@ mod tests {
     /// it causes peers to repeatedly broadcast stale data.
     #[test]
     fn broadcast_to_spawns_proactive_summary() {
-        let src = include_str!("op_ctx_task.rs");
-        let driver_start = src
-            .find("async fn drive_relay_broadcast_to(")
-            .expect("drive_relay_broadcast_to not found");
-        let driver_src = &src[driver_start..];
+        // Bounded to the driver body. This previously sliced to END OF FILE,
+        // which swallowed the test module — including this assertion's own
+        // message, which contains the needle verbatim — so deleting the spawn
+        // left it green, and it could not tell this driver from the streaming
+        // one. See AGENTS.md, "WHEN writing a source-scrape pin test".
+        let body = broadcast_driver_body("async fn drive_relay_broadcast_to(");
         assert!(
-            driver_src.contains("send_proactive_summary_notification"),
+            body.contains("send_proactive_summary_notification"),
             "drive_relay_broadcast_to must spawn send_proactive_summary_notification \
              after a successful state change (mirrors legacy update.rs:806-819)."
+        );
+        assert_origin_is_threaded_to_the_notification(&body, "drive_relay_broadcast_to");
+    }
+
+    /// Body of one relay-broadcast driver, whitespace-stripped.
+    ///
+    /// Bounded at the next top-level fn (or the test module). All four
+    /// visibility spellings are candidates: matching only bare `async fn` let
+    /// the `drive_relay_broadcast_to` slice run ~190 lines past its own end,
+    /// swallowing two `pub(crate) async fn` siblings.
+    fn broadcast_driver_body(signature: &str) -> String {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found"));
+        let after = &src[start + 1..];
+        let end = [
+            "\nasync fn ",
+            "\npub(crate) async fn ",
+            "\npub(super) async fn ",
+            "\npub async fn ",
+            "\n#[cfg(test)]",
+        ]
+        .iter()
+        .filter_map(|m| after.find(m))
+        .min()
+        .unwrap_or(after.len());
+        src[start..start + 1 + end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// #5190: the derivation is only correct if the notification is handed the
+    /// origin THIS fan-out registered.
+    ///
+    /// `BroadcastOrigin::local()` has an empty covered set, so
+    /// `seed_covered_peer_summaries` would iterate nothing and silently derive
+    /// no summaries at all — the fix present but inert, with every behavioural
+    /// test still green because they exercise the emitter directly.
+    ///
+    /// The `resolve_covered_peers` count matters too: resolving a SECOND time
+    /// here rather than sharing the hoisted local would re-read the co-host
+    /// population at a later instant, so the derived set could disagree with
+    /// the one the fan-out actually suppressed.
+    fn assert_origin_is_threaded_to_the_notification(body: &str, driver: &str) {
+        assert!(
+            body.contains(
+                "send_proactive_summary_notification(&op_mgr,&key,sender_addr,&broadcast_origin,)"
+            ) || body.contains(
+                "send_proactive_summary_notification(&op_mgr,&key,sender_addr,&broadcast_origin)"
+            ),
+            "{driver} must hand the notification the fan-out's OWN origin \
+             (`&broadcast_origin`). A fresh `BroadcastOrigin::local()` carries an \
+             empty covered set, so the #5190 derivation would run over nothing \
+             and every unit test would stay green"
+        );
+        assert_eq!(
+            body.matches("resolve_covered_peers(").count(),
+            1,
+            "{driver} must resolve the origin EXACTLY once and share it between \
+             the apply and the notification"
         );
     }
 
@@ -6604,21 +6677,15 @@ mod tests {
     /// A invariant at `broadcast_to_spawns_proactive_summary`).
     #[test]
     fn broadcast_to_streaming_spawns_proactive_summary() {
-        let src = include_str!("op_ctx_task.rs");
-        let start = src
-            .find("async fn apply_streaming_broadcast(")
-            .expect("apply_streaming_broadcast not found");
-        let after = &src[start + 1..];
-        let end = after
-            .find("\nasync fn ")
-            .or_else(|| after.find("\n#[cfg(test)]"))
-            .unwrap_or(after.len());
-        let driver_src = &src[start..start + 1 + end];
+        let body = broadcast_driver_body("async fn apply_streaming_broadcast(");
         assert!(
-            driver_src.contains("send_proactive_summary_notification"),
+            body.contains("send_proactive_summary_notification"),
             "apply_streaming_broadcast must spawn \
              send_proactive_summary_notification on successful state change"
         );
+        // Parity: the two drivers were changed identically for #5190 and
+        // nothing else would notice them diverging.
+        assert_origin_is_threaded_to_the_notification(&body, "apply_streaming_broadcast");
     }
 
     /// Pin: the streaming RAII guard must remove from

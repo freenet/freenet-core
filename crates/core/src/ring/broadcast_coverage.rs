@@ -450,6 +450,16 @@ impl BroadcastOrigin {
         self.covered.len()
     }
 
+    /// The peers the delivering peer says it already reached.
+    ///
+    /// Exposed for `seed_covered_peer_summaries`: those peers applied the same
+    /// update we just did, so their post-merge summary equals ours and can be
+    /// derived rather than requested. `covers()` answers the suppression
+    /// question one peer at a time; this answers "who did it reach".
+    pub(crate) fn covered_peers(&self) -> impl Iterator<Item = &PeerKey> {
+        self.covered.iter()
+    }
+
     /// Merge two claims that are live for the same contract at the same time.
     ///
     /// Both halves narrow rather than widen, so the result is a claim BOTH
