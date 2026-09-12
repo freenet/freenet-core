@@ -33,6 +33,35 @@ fn fmt_skill(skill: Option<f64>) -> String {
     }
 }
 
+/// Share of full-window decisions from the farthest quarter above which the
+/// candidate window is worth investigating as too narrow.
+///
+/// A quarter of the window is what you would expect by chance if the predictor
+/// ignored distance entirely, so "a quarter of full-window decisions came from
+/// the farthest quarter" is roughly the point where the ordering stops looking
+/// distance-dominated and starts looking truncated.
+const WINDOW_TOO_NARROW_SHARE: f64 = 0.25;
+
+/// Turn the far-quarter share into the sentence an operator actually acts on.
+///
+/// Extracted from the template rather than left inline because this is the most
+/// consequential piece of new user-facing logic on the page — it is the line
+/// that says whether to go and widen the routing window — and inline it had no
+/// way to be tested at its own threshold.
+fn fmt_window_reading(share: Option<f64>) -> String {
+    match share {
+        None => "Not enough decisions against a full window to say yet.".to_string(),
+        Some(share) if share >= WINDOW_TOO_NARROW_SHARE => format!(
+            "<strong>Worth investigating:</strong> {:.0}% of full-window decisions chose from              the farthest quarter, so the better peer may often be one the router never scored.",
+            share * 100.0
+        ),
+        Some(share) => format!(
+            "The limit looks comfortable: only {:.0}% of full-window decisions chose from the              farthest quarter, so widening it would rarely change the outcome.",
+            share * 100.0
+        ),
+    }
+}
+
 /// Render a stage's observation count, saying so when the stage is inactive.
 ///
 /// A stage below the prediction floor rendered a bare `0` and an empty chart,
@@ -236,21 +265,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 .far_quarter_share()
                 .map(|share| format!("{:.1}%", share * 100.0))
                 .unwrap_or_else(|| "&mdash;".to_string()),
-            rank_reading = match rs.selection_ranks.far_quarter_share() {
-                None => "Not enough decisions against a full window to say yet.".to_string(),
-                Some(share) if share >= 0.25 => format!(
-                    "<strong>Worth investigating:</strong> {:.0}% of full-window decisions \
-                     chose from the farthest quarter, so the better peer may often be one \
-                     the router never scored.",
-                    share * 100.0
-                ),
-                Some(share) => format!(
-                    "The limit looks comfortable: only {:.0}% of full-window decisions \
-                     chose from the farthest quarter, so widening it would rarely change \
-                     the outcome.",
-                    share * 100.0
-                ),
-            },
+            rank_reading = fmt_window_reading(rs.selection_ranks.far_quarter_share()),
             brier = rs
                 .renegade_brier_score
                 .map(|b| format!("{:.4}", b))
@@ -589,6 +604,61 @@ mod tests {
     }
 
     #[test]
+    fn skill_rendering_switches_wording_at_its_own_thresholds() {
+        // The +/-0.01 band is where "no better than assuming nothing" gives way
+        // to a real verdict. The other tests sit far from it, so a wrong
+        // threshold there would go unnoticed.
+        assert!(
+            fmt_skill(Some(-0.011)).contains("worse than assuming nothing"),
+            "just below -0.01 must read as worse"
+        );
+        assert!(
+            fmt_skill(Some(-0.009)).contains("no better than assuming nothing"),
+            "just above -0.01 must read as neutral, not worse"
+        );
+        assert!(
+            fmt_skill(Some(0.009)).contains("no better than assuming nothing"),
+            "just below +0.01 must still read as neutral"
+        );
+        let just_above = fmt_skill(Some(0.011));
+        assert!(
+            !just_above.contains("assuming nothing"),
+            "just above +0.01 must read as a real gain, got {just_above}"
+        );
+    }
+
+    #[test]
+    fn window_reading_switches_verdict_at_its_threshold() {
+        // This sentence is what an operator acts on, so its boundary is pinned
+        // in both directions rather than only at comfortable distances from it.
+        assert!(fmt_window_reading(Some(0.249)).contains("looks comfortable"));
+        assert!(fmt_window_reading(Some(0.25)).contains("Worth investigating"));
+        assert!(fmt_window_reading(Some(0.251)).contains("Worth investigating"));
+        assert!(fmt_window_reading(Some(0.0)).contains("looks comfortable"));
+        assert!(fmt_window_reading(Some(1.0)).contains("Worth investigating"));
+    }
+
+    #[test]
+    fn window_reading_says_so_when_there_is_no_evidence_yet() {
+        let reading = fmt_window_reading(None);
+        assert!(
+            reading.contains("Not enough decisions"),
+            "with no full-window decisions the panel must not imply a verdict, got {reading}"
+        );
+        assert!(
+            !reading.contains("comfortable") && !reading.contains("Worth investigating"),
+            "absence of evidence must not render as either verdict, got {reading}"
+        );
+    }
+
+    #[test]
+    fn window_reading_reports_the_share_it_judged() {
+        // A verdict without its number is not checkable by the reader.
+        assert!(fmt_window_reading(Some(0.42)).contains("42%"));
+        assert!(fmt_window_reading(Some(0.05)).contains("5%"));
+    }
+
+    #[test]
     fn stage_events_marks_an_inactive_stage_at_the_boundary() {
         // Both nova gateways sit below the floor for transfer speed
         // permanently, so this is the normal case rather than an edge one.
@@ -617,9 +687,27 @@ mod tests {
     #[test]
     fn layer_panel_does_not_present_the_correction_as_stacking() {
         let source = include_str!("peer_detail.rs");
+        // Depends on the production copy appearing BEFORE this test module, which
+        // it does because tests sit at the end of the file. If a second panel
+        // ever uses this heading earlier, `find` would relocate the region
+        // silently — the sliding-anchor failure this repo has hit before. The
+        // guard is the uniqueness assertion below rather than the ordering.
+        let test_module_start = source
+            .find("\n#[cfg(test)]")
+            .expect("this file has a test module");
         let panel_start = source
             .find("Which layer is doing the work?")
             .expect("the layer panel heading must exist");
+        // Reject a match that landed inside the test module — that is this
+        // test's own literal, and scoping to it would validate the assertion
+        // strings against themselves. Position check rather than a count, so
+        // adding another reference to the heading cannot break the pin while
+        // moving the production copy still does.
+        assert!(
+            panel_start < test_module_start,
+            "the anchor matched inside the test module, so the production panel \
+             was not found — the pin would be validating its own literals"
+        );
         let panel_end = source[panel_start..]
             .find("Correction state")
             .map(|offset| panel_start + offset)

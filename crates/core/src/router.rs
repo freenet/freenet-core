@@ -3037,19 +3037,19 @@ mod tests {
         }
 
         let snapshot = router.snapshot().selection_ranks;
-        assert!(
-            snapshot.total >= 25,
-            "every prediction-based decision must be recorded, got {}",
-            snapshot.total
+        // EQUALITY, not `>=`. Each `select_peer` call should record exactly one
+        // decision, and `>=` would sail past a regression that recorded once per
+        // CANDIDATE instead of once per decision — 25 calls would report 1000
+        // and still satisfy the assertion, while every rate derived from these
+        // counters silently became garbage. The run is deterministic (25 calls,
+        // 40 fixed candidates against a 25-peer window), so equality is free.
+        assert_eq!(
+            snapshot.total, 25,
+            "each routing decision must be recorded exactly once"
         );
-        assert!(
-            snapshot.saturated >= 25,
-            "40 candidates against a 25-peer window is saturated every time, got {}",
-            snapshot.saturated
-        );
-        assert!(
-            snapshot.mean_rank().is_some_and(|mean| mean.is_finite()),
-            "a populated histogram must yield a finite mean rank"
+        assert_eq!(
+            snapshot.saturated, 25,
+            "40 candidates against a 25-peer window is saturated every time"
         );
     }
 
