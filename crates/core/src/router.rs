@@ -580,6 +580,18 @@ pub(crate) struct RouterSnapshotInfo {
     /// collector differences to get a slot-pressure eviction rate; it may overlap
     /// with `hosting_budget_evictions_total`. `None` until the ring is built.
     /// Per-node aggregate scalars.
+    ///
+    /// The budget is ALSO a moving target, which matters more to a collector than
+    /// to this node. `ring::hosting::cache::resident_overhead_budget_for` derives
+    /// it as a structural RESIDUAL (total RAM, less the baseline reservation, less
+    /// every declared cache ceiling, less the state-byte budget) and then mins it
+    /// against live memory signals, recomputed every 60s sweep — a known
+    /// limitation, #5334, deferred pending exactly this telemetry. So
+    /// `estimated / budget` graphed as a utilization ratio has a NON-STATIONARY
+    /// DENOMINATOR that moves with unrelated system memory pressure: a rise in
+    /// that ratio does not by itself mean the node took on more contracts. Graph
+    /// the numerator and denominator separately before reading a trend into the
+    /// ratio.
     pub hosting_resident_overhead_budget_bytes: Option<u64>,
     pub hosting_estimated_resident_overhead_bytes: Option<u64>,
     pub hosting_contract_slot_budget: Option<u64>,
