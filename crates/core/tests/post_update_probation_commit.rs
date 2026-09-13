@@ -89,6 +89,12 @@ const COMMIT_POLL_DEADLINE: Duration = Duration::from_secs(COMMIT_HEALTHY_UPTIME
 /// budget `persistence_roundtrip.rs` allows for the same thing.
 const NODE_READY_DEADLINE: Duration = Duration::from_secs(60);
 
+/// How long `spawn_ready` waits after the WS port answers before accepting the
+/// node as up. The node binds its WS API before its UDP transport, so a
+/// `--network-port` collision kills it shortly AFTER readiness; this is the
+/// window in which that shows up. Paid once per test against a ~65s runtime.
+const NODE_SETTLE: Duration = Duration::from_secs(2);
+
 /// Substring of the line `commit_probation` announces on the `Committed` branch
 /// ONLY.
 ///
@@ -401,26 +407,49 @@ fn spawn_ready(home: &Path) -> NodeProcess {
     for attempt in 1..=MAX_PORT_RETRY_ATTEMPTS {
         let mut node = NodeProcess::spawn(home, reserve_port(), reserve_port());
         match node.wait_until_ready(home) {
-            Ok(()) => return node,
-            Err(e) if is_port_collision(&e) => {
-                // Jitter 80-120ms, as the canary does, so parallel tests that
-                // collided do not re-collide in lockstep.
-                let jitter = 80
-                    + (std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .subsec_nanos()
-                        % 41) as u64;
-                eprintln!(
-                    "port collision on attempt {attempt}/{MAX_PORT_RETRY_ATTEMPTS}, \
-                     retrying in {jitter}ms"
-                );
-                std::thread::sleep(Duration::from_millis(jitter));
-                last = e;
-                // `node` drops here, killing and reaping the failed child.
+            Ok(()) => {
+                // Readiness is a TCP connect to the WS port, and the node binds
+                // that BEFORE its UDP transport — so a `--network-port`
+                // collision kills the node a moment AFTER it starts answering,
+                // and `wait_until_ready` returns Ok to a node already on its way
+                // out. Verified by execution: with that UDP port held the node
+                // logs "Failed to bind UDP socket to 127.0.0.1:NNNNN: Address
+                // already in use (os error 98)" and exits 42, and readiness wins
+                // the race first — so without this check the retry would cover
+                // only the narrow case where the collision beat readiness, and
+                // the usual case would surface ~60s later as an unexplained
+                // mid-window exit. Also verified in both directions: with the
+                // check removed and a port genuinely held, the committed test
+                // fails on "the node exited before the probation commit window
+                // elapsed"; with it restored, the same run retries and passes.
+                //
+                // A WS-port collision needs it for the opposite reason:
+                // `TcpStream::connect` succeeds against the OTHER process's
+                // listener, so readiness is spuriously true while our node dies.
+                std::thread::sleep(NODE_SETTLE);
+                let diagnostics = node.diagnostics(home);
+                if !is_port_collision(&diagnostics) {
+                    return node;
+                }
+                last = format!("lost a port race just after binding the WS API.{diagnostics}");
             }
+            Err(e) if is_port_collision(&e) => last = e,
             Err(e) => panic!("{e}"),
         }
+
+        // Jitter 80-120ms, as the canary does, so parallel tests that collided
+        // do not re-collide in lockstep. `node` is dropped at the end of the
+        // iteration, killing and reaping the failed child.
+        let jitter = 80
+            + (SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+                % 41) as u64;
+        eprintln!(
+            "port collision on attempt {attempt}/{MAX_PORT_RETRY_ATTEMPTS}, retrying in {jitter}ms"
+        );
+        std::thread::sleep(Duration::from_millis(jitter));
     }
     panic!(
         "could not get a free port pair in {MAX_PORT_RETRY_ATTEMPTS} attempts; last failure:\n\
