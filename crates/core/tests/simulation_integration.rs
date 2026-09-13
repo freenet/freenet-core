@@ -9028,6 +9028,146 @@ fn test_relay_route_events_multihop() {
     );
 }
 
+/// #4485: the router's failure-probability model must actually receive
+/// failure labels when routing dead-ends.
+///
+/// Before the fix a relay recorded a downstream `NotFound` as a SUCCESS and
+/// the GET/PUT/SUBSCRIBE originators recorded only their final success, so a
+/// production gateway saw 2 failures in 361 route events. Here the same
+/// 13-node topology (same seed) runs twice:
+///
+/// * **present** — the gateway PUTs a contract and every node GETs it. This is
+///   the health baseline: every GET must resolve (state lands on every node).
+/// * **absent** — every node GETs a contract that was never PUT. Every search
+///   dead-ends, and under `ambiguous_not_found_policy` (train as failure) each
+///   node must label at least the peer its attempt was forwarded to.
+///
+/// The failure count is read from each node's Router
+/// (`RouteOutcomeTotals`), not from a proxy counter, so deleting the labelling
+/// at the originator or the relay turns the absent-run assertion red.
+#[test_log::test]
+fn test_router_receives_failures_for_dead_end_gets() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4485_0000_0001;
+    let num_nodes = 12;
+
+    let run = |network_name: &'static str, get_present: bool| {
+        setup_deterministic_state(SEED);
+        let rt = create_runtime();
+        let sim = rt.block_on(async {
+            SimNetwork::new(
+                network_name,
+                1,         // gateways
+                num_nodes, // nodes
+                4,         // ring_max_htl
+                2,         // rnd_if_htl_above
+                5,         // max_connections
+                3,         // min_connections
+                SEED,
+            )
+            .await
+        });
+
+        let present = SimOperation::create_test_contract(0x85);
+        let present_id = *present.key().id();
+        register_crdt_contract(present_id);
+        // Never PUT anywhere: every GET for it dead-ends.
+        let absent_id = *SimOperation::create_test_contract(0x86).key().id();
+
+        let mut operations = vec![ScheduledOperation::new(
+            NodeLabel::gateway(network_name, 0),
+            SimOperation::Put {
+                contract: present.clone(),
+                state: SimOperation::create_crdt_state(1, 0x85),
+                subscribe: true,
+            },
+        )];
+        for i in 1..=num_nodes {
+            operations.push(ScheduledOperation::new(
+                NodeLabel::node(network_name, i),
+                SimOperation::Get {
+                    contract_id: if get_present { present_id } else { absent_id },
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+
+        let result = sim.run_controlled_simulation(
+            SEED,
+            operations,
+            Duration::from_secs(400),
+            Duration::from_secs(120),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "{network_name}: simulation failed: {:?}",
+            result.turmoil_result.err()
+        );
+        (result, present.key())
+    };
+
+    // ── present: health baseline ────────────────────────────────────────────
+    let (present_result, present_key) = run("route-failures-present", true);
+    let nodes_without_state: Vec<usize> = (1..=num_nodes)
+        .filter(|i| {
+            present_result
+                .node_storages
+                .get(&NodeLabel::node("route-failures-present", *i))
+                .is_none_or(|s| s.get_stored_state(&present_key).is_none())
+        })
+        .collect();
+    assert!(
+        nodes_without_state.is_empty(),
+        "every GET for a PUT contract must still resolve (GET success rate \
+         must not regress); nodes without state: {nodes_without_state:?}"
+    );
+    let (present_failures, present_successes) = present_result.aggregate_route_outcome_totals();
+    // Observed at this seed: 0 failures / 20 successes. Not pinned to exactly
+    // zero: a GET that meets one NotFound before its Found is CORRECTLY a
+    // failure label, and whether that happens depends on topology, not on the
+    // labelling. What must hold is that resolving GETs train mostly positive.
+    assert!(
+        present_successes > 0 && present_failures * 4 <= present_successes,
+        "GETs that all resolve must train the router overwhelmingly on \
+         successes: {present_failures} failures / {present_successes} successes"
+    );
+
+    // ── absent: every GET dead-ends ─────────────────────────────────────────
+    let (absent_result, _) = run("route-failures-absent", false);
+    let (absent_failures, absent_successes) = absent_result.aggregate_route_outcome_totals();
+    let nodes_without_failures: Vec<usize> = (1..=num_nodes)
+        .filter(|i| {
+            absent_result
+                .node_route_outcome_totals(&NodeLabel::node("route-failures-absent", *i))
+                .is_none_or(|(failures, _)| failures == 0)
+        })
+        .collect();
+
+    tracing::info!(
+        present_failures,
+        present_successes,
+        absent_failures,
+        absent_successes,
+        "route outcome totals"
+    );
+
+    assert!(
+        nodes_without_failures.is_empty(),
+        "every node that issued a dead-end GET must feed at least one failure \
+         to its own router (the peer its attempt was forwarded to). Nodes whose \
+         router saw no failure: {nodes_without_failures:?}. Totals: \
+         absent={absent_failures} failures / {absent_successes} successes, \
+         present={present_failures} failures / {present_successes} successes."
+    );
+    assert!(
+        absent_failures > present_failures,
+        "dead-end GETs must produce more failure labels than resolving GETs: \
+         absent={absent_failures}, present={present_failures}"
+    );
+}
+
 /// Sparse-hosting GET reachability via **relay-side multi-hop forwarding**.
 ///
 /// A GET whose **first-choice candidate does not host the contract** must still
