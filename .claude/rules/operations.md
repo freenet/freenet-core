@@ -22,7 +22,10 @@ Every operation runs as a task-per-transaction driver: each `Transaction`
 is owned and driven by a single spawned task; state lives in task
 locals. Drivers publish their own `HostResult` via `result_router_tx`
 and own routing/retry state in task locals. `OpManager` carries no
-per-op DashMaps.
+per-op state DashMaps; the only `Transaction`-keyed registries are the
+RAII-guarded handoffs between a client retry loop and its own
+originator-loopback relay (`stream_progress_registry`, `attempt_hop_registry`),
+whose entries are removed by the loop's guard on every exit.
 
 Driver entry points:
 
@@ -43,6 +46,32 @@ post-terminal stream-assembly failure as a retryable attempt failure
 (#4345) — post-terminal side effects that can fail retryably belong in
 such a wrapper, never inside the loop's Terminal arm (pinned by
 `drive_retry_loop_terminal_arm_does_not_call_advance`).
+
+## Route-outcome labelling (#4485)
+
+The router's failure model is only as good as its labels. Before #4485 a
+relay recorded a downstream `NotFound` as a success and originators recorded
+only their final success, so production routers saw ~0.5 % failures.
+
+```
+WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
+(reply classified, timeout, send failure) on an originator or relay driver:
+  → Label non-success outcomes through the op's
+    `operations::route_attempt::RouteAttemptRecorder` (one per operation),
+    never a hand-inlined RouteEvent. Timeout / PeerDisconnected → Failure now;
+    NotFound → held until the op resolves; `contract_exists()` on any reply
+    that proves the contract exists; the recorder's Drop applies
+    `ambiguous_not_found_policy()` to the rest.
+  → Blame the peer the request ACTUALLY went to. GET/PUT originators send to
+    their own loopback relay, which picks the real hop; read it from the
+    per-attempt `AttemptHopRegistry` slot (the loopback relay fills it). The
+    driver's `current_target` is a guess and must not be blamed.
+  → Failures feed the router only (`Ring::record_route_failure`), never
+    `peer_health`: a NotFound or an end-to-end timeout is not a reason to
+    evict a connection.
+  → A local callback drop (`NotificationError`) and an unexpected reply blame
+    nobody.
+```
 
 ## Wire-variant dispatch
 
