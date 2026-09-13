@@ -1893,6 +1893,21 @@ impl Ring {
             // (CPU / broadcast fan-out) dominated the node's total. Nonzero =
             // the trigger is firing; runaway = floors/share miscalibrated.
             snapshot.hosting_cost_evictions_total = Some(hosting.cost_evictions_total);
+            // Resident-overhead pressure axis (#5325). These were computed and
+            // rendered on the node's own dashboard from the day the axis landed,
+            // but never mirrored here, so the collector could not see the SECOND
+            // eviction pressure at all: a node shedding purely under slot
+            // pressure reported a low state-byte occupancy and nothing else. Same
+            // hand-mirror footgun as the gauges above — pinned by
+            // `hosting_cache_stats_fields_are_all_mirrored`, which fails when a
+            // `HostingCacheStats` field has no reader in this block.
+            snapshot.hosting_resident_overhead_budget_bytes =
+                Some(hosting.resident_overhead_budget_bytes);
+            snapshot.hosting_estimated_resident_overhead_bytes =
+                Some(hosting.estimated_resident_overhead_bytes);
+            snapshot.hosting_contract_slot_budget = Some(hosting.contract_slot_budget);
+            snapshot.hosting_resident_overhead_evictions_total =
+                Some(hosting.resident_overhead_evictions_total);
             // Local notification-delivery outcomes (#4681). PER-NODE counters
             // (see HostingManager), read once per snapshot — no per-event
             // stream. Read from the manager, not the stats snapshot, for the
@@ -9836,4 +9851,338 @@ pub(crate) enum RingError {
     NoHostingPeers(ContractInstanceId),
     #[error("Peer has not joined the network yet (no ring location established)")]
     PeerNotJoined,
+}
+
+#[cfg(test)]
+mod hosting_stats_mirror_source_tests {
+    //! Source-scrape pin: every `HostingCacheStats` field must be mirrored into
+    //! `RouterSnapshotInfo` by `emit_router_snapshot_telemetry`, INTO THE FIELD
+    //! THAT MATCHES IT.
+    //!
+    //! The telemetry path is hand-mirrored twice over (`HostingCacheStats` ->
+    //! `RouterSnapshotInfo` -> the OTLP JSON body), and nothing in the type
+    //! system connects the hops. The resident-overhead pressure axis (#5325)
+    //! was computed, rendered on the node's own dashboard, and dropped on the
+    //! floor at THIS step for its whole life: the collector could not see the
+    //! second eviction pressure at all, so a node evicting purely under slot
+    //! pressure looked idle in fleet telemetry.
+    //!
+    //! The pin asserts the WHOLE assignment, not merely that the field is read
+    //! somewhere in the function — the same shape as
+    //! `contract_exec_export_maps_each_field_to_its_own_counter`, and for the
+    //! same reason its doc gives: a swap "compiles cleanly and emits a plausible
+    //! number that is measuring the opposite thing". Here a swapped pair would
+    //! report every node as over its resident-overhead budget. A presence-only
+    //! check is also satisfied by `let _ = hosting.x;`, by an assignment into the
+    //! WRONG destination (which additionally clobbers a live gauge), and by a
+    //! field name left behind in a comment.
+    //!
+    //! It checks the FIRST hop only. The second hop (`RouterSnapshotInfo` ->
+    //! JSON) is guarded by the per-gauge pins in `tracing::telemetry`, including
+    //! `router_snapshot_json_includes_resident_overhead_gauges`; it has no
+    //! structural pin of its own, which is a known gap, not an oversight.
+
+    /// Fields whose destination is a key in the `NetworkEfficiencyV1` struct
+    /// literal rather than a `snapshot.hosting_*` assignment, with that key.
+    /// These are the histogram arms; their names are deliberately abbreviated at
+    /// the destination, so the mechanical `hosting_<field>` rule does not apply
+    /// and the expected statement has to be spelled out.
+    const STRUCT_LITERAL_DESTINATIONS: &[(&str, &str)] = &[
+        ("eviction_victim_counts", "vict_n"),
+        ("eviction_victim_bytes", "vict_b"),
+        ("hosting_begins", "host_begin"),
+        ("read_count_hist", "host_reads"),
+        ("genuine_access_recency", "host_recency"),
+    ];
+
+    /// Fields deliberately NOT mirrored to telemetry. Each entry needs a reason:
+    /// adding one is a decision to make a stat invisible to the collector, which
+    /// is exactly what this pin exists to stop happening by accident.
+    ///
+    /// Empty today, so `not_mirrored_exclusions_carry_a_reason` below cannot
+    /// currently fail. That is deliberate — it arms the escape hatch before
+    /// anyone uses it — but it means the test name overstates present coverage;
+    /// do not read it as evidence that anything was checked.
+    const DELIBERATELY_NOT_MIRRORED: &[(&str, &str)] = &[];
+
+    /// Every field on `HostingCacheStats`. An exact count, not a floor: the
+    /// scrape below can only under-count (a declaration shape it cannot parse),
+    /// and a floor set below the true count lets exactly that go unnoticed.
+    /// Adding a field means bumping this deliberately AND mirroring the field.
+    const EXPECTED_HOSTING_CACHE_STATS_FIELDS: usize = 19;
+
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        // ring.rs has inline `#[cfg(test)]` annotations on individual `use`
+        // declarations near the top of the file, so a plain
+        // `find("#[cfg(test)]")` would cut the file off before the function we
+        // want to scrape. Anchor on the first *top-level* test module instead.
+        // Keep this comment: without it the next editor "simplifies" the anchor
+        // and the scrape silently starts returning the wrong region.
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    /// Body of the item starting at `signature_prefix`, brace-balanced. Bounding
+    /// to the item is load-bearing: an unbounded search over an 8000-line file
+    /// would match this module's own assertion strings and pass vacuously. (The
+    /// `production_source` cutoff makes that structurally impossible here too,
+    /// since this module sits past it — belt and braces.)
+    fn item_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..].find('{').expect("item must have a body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces while extracting {signature_prefix}");
+    }
+
+    /// `body` with `//` comments removed and whitespace collapsed.
+    ///
+    /// Both halves are load-bearing. Comments must go because `str::contains`
+    /// over raw source cannot tell a statement from `// snapshot.hosting_x =
+    /// Some(hosting.x);`, so commenting a mirror out — what someone actually
+    /// does while debugging, which is precisely when the pin is the only thing
+    /// still watching — would otherwise keep it green. Whitespace must collapse
+    /// because rustfmt wraps these assignments across two lines.
+    ///
+    /// Stripping `//` inside a string literal would be wrong, but only in the
+    /// strict direction: it can make the pin fail spuriously, never pass
+    /// spuriously. There are no such literals in the scraped function today.
+    fn strip_comments_and_normalize(body: &str) -> String {
+        let uncommented: Vec<&str> = body
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect();
+        uncommented
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Field names declared on `HostingCacheStats`, in declaration order.
+    ///
+    /// Fails LOUDLY on any line it does not recognise rather than skipping it.
+    /// A scraper that silently drops an unparseable declaration fails OPEN: the
+    /// field is never checked for a mirror, which is the exact omission this
+    /// module exists to catch. `pub(crate)` is the shape that bit an earlier
+    /// draft — `HostingCacheStats` is itself `pub(crate)`, so a contributor
+    /// writing `pub(crate)` on a field is entirely natural.
+    fn hosting_cache_stats_fields() -> Vec<String> {
+        const CACHE_SRC: &str = include_str!("ring/hosting/cache.rs");
+        let body = item_body(CACHE_SRC, "pub(crate) struct HostingCacheStats {");
+        let mut fields = Vec::new();
+        for raw in body.lines() {
+            let mut line = raw.trim();
+            if line.is_empty() || line.starts_with("///") || line.starts_with("//") {
+                continue;
+            }
+            // An inline attribute (`#[doc(hidden)] pub x: u64,`) must not hide a
+            // field: strip the attribute and keep reading the same line.
+            while let Some(rest) = line.strip_prefix("#[") {
+                match rest.find(']') {
+                    Some(close) => line = rest[close + 1..].trim(),
+                    None => break,
+                }
+            }
+            if line.is_empty() {
+                continue;
+            }
+            let decl = line
+                .strip_prefix("pub(crate) ")
+                .or_else(|| line.strip_prefix("pub "))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "unrecognised line in HostingCacheStats: {raw:?}. Every line in \
+                         that struct must be blank, a comment, an attribute, or a \
+                         `pub`/`pub(crate)` field declaration. If a new shape is \
+                         legitimate, teach this scraper about it — do NOT let it skip \
+                         the line, because an unscraped field is never checked for a \
+                         mirror, which is the omission this module exists to catch."
+                    )
+                });
+            let (name, _) = decl.split_once(':').unwrap_or_else(|| {
+                panic!("HostingCacheStats field declaration has no `:`: {raw:?}")
+            });
+            fields.push(name.trim().to_string());
+        }
+        assert_eq!(
+            fields.len(),
+            EXPECTED_HOSTING_CACHE_STATS_FIELDS,
+            "scraped {} HostingCacheStats fields, expected {}: {fields:?}. If you added \
+             or removed a field, bump EXPECTED_HOSTING_CACHE_STATS_FIELDS deliberately \
+             (and mirror the new field). If you did not, the scrape has gone wrong and \
+             this pin is measuring less than it claims — fix the scrape, do not relax \
+             the count.",
+            fields.len(),
+            EXPECTED_HOSTING_CACHE_STATS_FIELDS,
+        );
+        fields
+    }
+
+    /// The exact statement that must appear for `field`.
+    fn expected_mirror(field: &str) -> String {
+        match STRUCT_LITERAL_DESTINATIONS
+            .iter()
+            .find(|(name, _)| *name == field)
+        {
+            Some((_, key)) => format!("{key}: hosting.{field},"),
+            None => format!("snapshot.hosting_{field} = Some(hosting.{field});"),
+        }
+    }
+
+    #[test]
+    fn hosting_cache_stats_fields_are_all_mirrored() {
+        let body = item_body(
+            production_source(),
+            "async fn emit_router_snapshot_telemetry(",
+        );
+        let norm = strip_comments_and_normalize(body);
+
+        // The mirror reads every stat off one binding. Anchoring on it gives a
+        // directed failure if the read moves, instead of 19 confusing ones.
+        assert!(
+            norm.contains("let hosting = ring.hosting_manager.hosting_cache_stats();"),
+            "emit_router_snapshot_telemetry must bind the hosting stats as \
+             `hosting`; if that binding was renamed, update this pin's expected \
+             statements too — they all read through it."
+        );
+
+        let mut missing = Vec::new();
+        for field in hosting_cache_stats_fields() {
+            if DELIBERATELY_NOT_MIRRORED
+                .iter()
+                .any(|(name, _)| *name == field)
+            {
+                continue;
+            }
+            let expected = expected_mirror(&field);
+            if !norm.contains(&expected) {
+                missing.push(expected);
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "HostingCacheStats fields not mirrored into RouterSnapshotInfo by \
+             emit_router_snapshot_telemetry. Expected statements not found: \
+             {missing:#?}\n\nEvery stat must reach `RouterSnapshotInfo` (and from \
+             there the OTLP body) into the field that matches it, or be listed in \
+             DELIBERATELY_NOT_MIRRORED with a reason. A stat that exists but is not \
+             exported is invisible to fleet telemetry — see #5325, where the \
+             resident-overhead eviction axis was dropped exactly here. A stat \
+             exported under the WRONG name is worse: it reads as a plausible number \
+             measuring the opposite thing."
+        );
+    }
+
+    /// The expected-statement table must actually describe the destinations, not
+    /// merely be self-consistent: every `STRUCT_LITERAL_DESTINATIONS` entry names
+    /// a real `HostingCacheStats` field. A stale entry here would silently excuse
+    /// a field from the mechanical rule without anyone noticing.
+    #[test]
+    fn struct_literal_destinations_name_real_fields() {
+        let fields = hosting_cache_stats_fields();
+        for (field, key) in STRUCT_LITERAL_DESTINATIONS {
+            assert!(
+                fields.iter().any(|f| f == field),
+                "STRUCT_LITERAL_DESTINATIONS names {field:?} (destination key \
+                 {key:?}), which is not a HostingCacheStats field. Remove the stale \
+                 entry — while it is here, a field by that name is exempt from the \
+                 mechanical `snapshot.hosting_<field>` rule for no reason."
+            );
+        }
+    }
+
+    /// The exclusion list is an escape hatch, so make using it deliberate: an
+    /// entry with no reason is the shape that turns this pin ornamental. Note
+    /// this cannot fail while the list is empty — see the const's doc.
+    #[test]
+    fn not_mirrored_exclusions_carry_a_reason() {
+        for (name, reason) in DELIBERATELY_NOT_MIRRORED {
+            assert!(
+                reason.len() > 20,
+                "DELIBERATELY_NOT_MIRRORED entry {name:?} needs a real reason, \
+                 got {reason:?}"
+            );
+        }
+    }
+
+    /// The two properties the scrape helpers must have, checked directly rather
+    /// than inferred from the pin passing: a commented-out mirror must not count,
+    /// and rustfmt's line wrapping must not stop a mirror counting.
+    #[test]
+    fn normalization_drops_comments_and_rejoins_wrapped_statements() {
+        let commented = "            // snapshot.hosting_x = Some(hosting.x);\n";
+        assert!(
+            !strip_comments_and_normalize(commented)
+                .contains("snapshot.hosting_x = Some(hosting.x);"),
+            "a commented-out mirror must not satisfy the pin"
+        );
+
+        let wrapped = "            snapshot.hosting_x =\n                Some(hosting.x);\n";
+        assert!(
+            strip_comments_and_normalize(wrapped).contains("snapshot.hosting_x = Some(hosting.x);"),
+            "a mirror rustfmt wrapped across two lines must still satisfy the pin"
+        );
+
+        let trailing = "            snapshot.hosting_x = Some(hosting.x); // why\n";
+        assert!(
+            strip_comments_and_normalize(trailing)
+                .contains("snapshot.hosting_x = Some(hosting.x);"),
+            "a trailing comment must not hide the statement in front of it"
+        );
+    }
+
+    /// Asserting the whole statement is what makes a transposition visible; a
+    /// presence-only check (`body.contains("hosting.<field>")`) would not see it,
+    /// and a swapped pair here would report every node as over its
+    /// resident-overhead budget. Checked directly so the property is evidenced
+    /// rather than asserted in a doc comment.
+    #[test]
+    fn expected_mirror_pins_the_destination_not_just_the_read() {
+        let e = expected_mirror("resident_overhead_budget_bytes");
+        assert_eq!(
+            e,
+            "snapshot.hosting_resident_overhead_budget_bytes = \
+             Some(hosting.resident_overhead_budget_bytes);"
+        );
+        // A transposed assignment does NOT contain the expected statement.
+        let transposed = "snapshot.hosting_resident_overhead_budget_bytes = \
+                          Some(hosting.estimated_resident_overhead_bytes);";
+        assert!(!transposed.contains(&e));
+        // Neither does a bare read, nor a read into the wrong destination.
+        assert!(!"let _ = hosting.resident_overhead_budget_bytes;".contains(&e));
+        assert!(
+            !"snapshot.hosting_current_bytes = Some(hosting.resident_overhead_budget_bytes);"
+                .contains(&e)
+        );
+        // The histogram arms keep their abbreviated destination keys.
+        assert_eq!(
+            expected_mirror("read_count_hist"),
+            "host_reads: hosting.read_count_hist,"
+        );
+    }
 }
