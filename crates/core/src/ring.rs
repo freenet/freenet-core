@@ -209,6 +209,9 @@ const FORWARDED_DEMAND_WEIGHT: f64 = 0.1;
 const GOVERNANCE_TICK_INTERVAL: Duration = Duration::from_secs(60);
 
 use connection_backoff::ConnectionBackoff;
+
+/// How often connected-peer attributes are written to the routing dataset.
+const ROUTING_DATASET_PEER_INTERVAL: Duration = Duration::from_secs(60);
 pub use connection_backoff::ConnectionFailureReason;
 pub(crate) use peer_connection_backoff::PeerConnectionBackoff;
 
@@ -854,6 +857,20 @@ impl Ring {
                 Duration::from_secs(60 * 5),
             )),
         );
+
+        // Peer-attribute snapshots for the opt-in routing dataset (#4485). Spawned
+        // only when an operator enabled recording, so a default node — and every
+        // simulation — runs no extra task and consumes no extra timer.
+        if let Some(dataset) = crate::router::dataset::global() {
+            task_monitor.register(
+                "record_routing_dataset_peers",
+                GlobalExecutor::spawn(Self::record_routing_dataset_peers(
+                    ring.clone(),
+                    dataset,
+                    ROUTING_DATASET_PEER_INTERVAL,
+                )),
+            );
+        }
 
         // Spawn periodic contract-directed CONNECT task.
         // When a peer is a "subscription root" (closest to contract among neighbors),
@@ -1734,6 +1751,92 @@ impl Ring {
     ///
     /// This captures the isotonic regression curves and model state, including the
     /// connect forward estimator if available via OpManager.
+    /// Periodically record the attributes of every connected peer into the
+    /// routing dataset, keyed like its route events so the two join offline.
+    async fn record_routing_dataset_peers(
+        ring: Arc<Self>,
+        dataset: &'static crate::router::dataset::RoutingDataset,
+        interval_duration: Duration,
+    ) {
+        let shutdown = ring.shutdown_token();
+        let mut interval = tokio::time::interval(interval_duration);
+        loop {
+            if sleep_or_shutdown(&shutdown, async {
+                interval.tick().await;
+            })
+            .await
+            {
+                break;
+            }
+            let peers = ring.routing_dataset_peer_attributes();
+            dataset.record_peers(ring.time_source.system_time_now(), peers);
+        }
+    }
+
+    /// Snapshot connected-peer attributes. Takes each lock on its own, never
+    /// nested, so it cannot participate in a lock-order inversion.
+    fn routing_dataset_peer_attributes(&self) -> Vec<crate::router::dataset::PeerAttributes> {
+        use crate::router::dataset::{PeerAttributes, peer_hash};
+
+        let connections: Vec<Connection> = self
+            .connection_manager
+            .get_connections_by_location()
+            .into_values()
+            .flatten()
+            .collect();
+        let gateways: Vec<TransportPublicKey> = self
+            .upgrade_op_manager()
+            .map(|op_manager| {
+                op_manager
+                    .configured_gateways
+                    .iter()
+                    .map(|gateway| gateway.pub_key().clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let bytes: HashMap<SocketAddr, (u64, u64)> = crate::transport::metrics::TRANSPORT_METRICS
+            .per_peer_snapshot()
+            .into_iter()
+            .map(|(addr, sent, received)| (addr, (sent, received)))
+            .collect();
+
+        let mut peers: Vec<PeerAttributes> = connections
+            .iter()
+            .map(|connection| {
+                let peer = &connection.location;
+                let addr = peer.socket_addr();
+                let transfer = addr.and_then(|addr| bytes.get(&addr).copied());
+                PeerAttributes {
+                    peer: peer_hash(peer),
+                    location: peer.location().map(|location| location.as_f64()),
+                    connected_s: connection.duration_ms() as f64 / 1000.0,
+                    is_configured_gateway: gateways.contains(peer.pub_key()),
+                    version: addr
+                        .and_then(|addr| self.connection_manager.remote_version(addr))
+                        .map(|(major, minor, patch)| format!("{major}.{minor}.{patch}")),
+                    routing_successes: None,
+                    routing_failures: None,
+                    bytes_sent: transfer.map(|(sent, _)| sent),
+                    bytes_received: transfer.map(|(_, received)| received),
+                }
+            })
+            .collect();
+
+        let health = self.connection_manager.peer_health.lock();
+        for (attributes, connection) in peers.iter_mut().zip(&connections) {
+            if let Some((successes, failures)) = connection
+                .location
+                .socket_addr()
+                .and_then(|addr| health.counts(&addr))
+            {
+                attributes.routing_successes = Some(successes);
+                attributes.routing_failures = Some(failures);
+            }
+        }
+        drop(health);
+        peers
+    }
+
     async fn emit_router_snapshot_telemetry(ring: Arc<Self>, interval_duration: Duration) {
         let shutdown = ring.shutdown_token();
         let mut interval = tokio::time::interval(interval_duration);
