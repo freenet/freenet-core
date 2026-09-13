@@ -671,19 +671,30 @@ pub fn commit_probation(current_version: &str) {
             CommitOutcome::Nothing => {}
         }
         if let Some(line) = announcement {
-            // `writeln!` on the stderr handle, NOT `eprintln!`: the macro
-            // panics on a write error (EPIPE once the supervisor's reader is
-            // gone; a Windows child that inherited invalid standard handles),
-            // and this runs on a tokio worker. An observability line must never
-            // be able to take the process down — `panic = "abort"` sits
-            // commented out in `crates/core/Cargo.toml`, and under it an EPIPE
-            // at t=60s would abort the node, which exits non-zero, which the
-            // post-stop handler scores as a probation CRASH. Three of those
-            // roll the node back: the announcement of a successful commit would
-            // itself have caused the rollback it reports disarming.
-            let _broken_stderr = writeln!(std::io::stderr(), "{line}");
+            announce(&mut std::io::stderr(), &line);
         }
     }
+}
+
+/// Write one announcement line, swallowing a write error.
+///
+/// **Must not panic.** `eprintln!` — which this replaced — panics on a write
+/// error (EPIPE once the supervisor's reader is gone; a Windows child that
+/// inherited invalid standard handles), and [`commit_probation`] runs on a
+/// tokio worker. An observability line must never be able to take the process
+/// down: `panic = "abort"` sits commented out in `crates/core/Cargo.toml`, and
+/// under it an EPIPE at t=60s would abort the node, which exits non-zero, which
+/// the post-stop handler scores as a probation CRASH. Three of those roll the
+/// node back, so the announcement of a successful commit would itself have
+/// caused the rollback it reports disarming.
+///
+/// Taken as `impl Write` rather than writing to `std::io::stderr()` inline so
+/// that property is testable at all — a test cannot break the real stderr. See
+/// `tests::a_broken_stderr_does_not_panic_the_announcement`, which drives a
+/// writer that fails every call and goes RED against either panicking form
+/// (`eprintln!`, or a `.unwrap()`/`.expect()` on this `writeln!`).
+fn announce(out: &mut impl Write, line: &str) {
+    let _broken_stderr = writeln!(out, "{line}");
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1385,6 +1396,123 @@ mod tests {
             read_probation_at(dir.path()).map(|s| s.crash_count),
             None,
             "the foreign marker is dropped, not incremented"
+        );
+    }
+
+    /// A stderr that fails every write must NOT panic the announcement.
+    ///
+    /// `commit_probation` runs on a tokio worker from `bin/freenet.rs`'s commit
+    /// timer, and the panicking form this replaced (`eprintln!`) would unwind it
+    /// on EPIPE — which happens once a supervisor's reader is gone, and on a
+    /// Windows child that inherited invalid standard handles. With
+    /// `panic = "abort"` (commented out one line away in `crates/core/
+    /// Cargo.toml`) that unwind becomes a process abort at t=60s: a non-zero
+    /// exit, scored by `handle_post_stop_at` as a probation crash, three of
+    /// which roll the node back. The line announcing a successful commit would
+    /// have caused the rollback it reports disarming.
+    ///
+    /// The point of `announce` taking `impl Write` is that this is testable at
+    /// all: a test cannot break the real `std::io::stderr()`.
+    #[test]
+    fn a_broken_stderr_does_not_panic_the_announcement() {
+        /// Fails every call, the way a pipe whose reader has gone does.
+        struct BrokenPipe {
+            writes: usize,
+        }
+        impl Write for BrokenPipe {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+        }
+
+        let mut out = BrokenPipe { writes: 0 };
+        // Every announced outcome, so a future branch that reaches for a
+        // panicking macro of its own is covered too.
+        for outcome in [
+            CommitOutcome::Committed,
+            CommitOutcome::ClearedStale {
+                marker_version: "0.2.122".to_string(),
+            },
+            CommitOutcome::CommitFailed {
+                marker_version: "0.2.123".to_string(),
+                error: "Permission denied (os error 13)".to_string(),
+            },
+            CommitOutcome::StaleClearFailed {
+                marker_version: "0.2.122".to_string(),
+                error: "Read-only file system (os error 30)".to_string(),
+            },
+        ] {
+            let line = commit_announcement(&outcome, "0.2.123").expect("announced");
+            announce(&mut out, &line);
+        }
+
+        // Premise check: the writer really was exercised, so a future refactor
+        // that stops calling it cannot leave this passing vacuously.
+        assert!(
+            out.writes >= 4,
+            "the failing writer was not actually written to, so this test proved nothing about \
+             panicking on a write error; got {} write(s)",
+            out.writes
+        );
+    }
+
+    /// The commit must not do its blocking work on a tokio worker.
+    ///
+    /// `commit_probation` does synchronous filesystem I/O and then takes the
+    /// process-global stderr lock — which under the shipped systemd unit is a
+    /// journald socket, so a stopped or backed-up journald parks whatever thread
+    /// holds it, and every later `eprintln!` in the process queues behind it.
+    /// Parking a runtime worker there is a different failure from the panic
+    /// above and is not fixed by it, so it gets its own guard.
+    ///
+    /// A source scrape because there is nothing else to assert against: the call
+    /// site is one `GlobalExecutor::spawn` in another file's `main` path, with no
+    /// seam a test can reach. Scoped to that binding's block and loud on a moved
+    /// anchor (per `.claude/rules/bug-prevention-patterns.md`) rather than
+    /// widening to the rest of a 1000-line file, and it scrapes a DIFFERENT file
+    /// from the one it lives in, so it cannot be satisfied by its own assertion
+    /// strings.
+    #[test]
+    fn the_commit_runs_off_the_async_worker() {
+        const FREENET_MAIN: &str = include_str!("../freenet.rs");
+        const ANCHOR: &str = "let commit_probation_task = {";
+
+        assert_eq!(
+            FREENET_MAIN.matches(ANCHOR).count(),
+            1,
+            "`{ANCHOR}` no longer appears exactly once in bin/freenet.rs, so this pin cannot \
+             locate the commit timer. Re-anchor it rather than deleting it."
+        );
+        let after = FREENET_MAIN
+            .split_once(ANCHOR)
+            .expect("anchor counted above")
+            .1;
+        let block = after
+            .split_once("\n    };")
+            .unwrap_or_else(|| {
+                panic!("could not find the end of the `{ANCHOR}` block; re-anchor this pin")
+            })
+            .0;
+
+        let spawn_blocking = block.find("spawn_blocking(").unwrap_or_else(|| {
+            panic!(
+                "the probation commit no longer goes through `spawn_blocking`, so its \
+                 synchronous file I/O and its blocking stderr write run on a tokio worker — a \
+                 stalled journald then parks that worker and every later `eprintln!` behind it. \
+                 Block was:\n{block}"
+            )
+        });
+        let commit = block.find("commit_probation(").unwrap_or_else(|| {
+            panic!("the commit timer no longer calls `commit_probation`. Block was:\n{block}")
+        });
+        assert!(
+            spawn_blocking < commit,
+            "`commit_probation` must be called INSIDE `spawn_blocking`, not before it. \
+             Block was:\n{block}"
         );
     }
 
