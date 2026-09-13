@@ -115,21 +115,37 @@ pub struct ConfigArgs {
 
     /// Budget in bytes for hosted contract state. Once it is exceeded,
     /// contracts are evicted (least valuable first) and their on-disk state is
-    /// reclaimed. This counts contract state only; WASM code blobs and database
-    /// overhead are extra. Default: 1 GiB.
+    /// reclaimed. This counts contract state only, which is kept on disk (just
+    /// a small, separately bounded cache of it is held in memory); WASM code
+    /// blobs and database overhead are extra. Default: one eighth of system
+    /// RAM, clamped to 128 MiB - 1 GiB.
+    ///
+    /// Set it higher to contribute more disk to the network. The limit that
+    /// applies is the smaller of this value and the disk budget
+    /// (`--hosting-disk-pct`, capped by `--max-hosting-disk` at 32 GiB unless
+    /// you raise that too). The number of contracts hosted is limited
+    /// separately by available memory, so raising this does not make a node
+    /// take on more contracts than its memory can hold.
+    // Internal: the explicit value is passed to `HostingManager` unclamped;
+    // only the DEFAULT is RAM-scaled. The resident-overhead (contract-count)
+    // budget derives from `budget_for_ram(total_ram)`, not from this value, so
+    // an override cannot shrink it. Pinned by
+    // `explicit_state_budget_above_ram_clamp_survives_recompute`.
     #[arg(long, env = "MAX_HOSTING_STORAGE")]
     pub max_hosting_storage: Option<u64>,
 
     /// Fraction (0.0 to 1.0) of the disk space available to Freenet (`used +
-    /// free` on the data-dir mount) used to size the disk budget. Hosting
-    /// eviction uses whichever budget is smaller, memory or disk. Default: 0.5.
+    /// free` on the data-dir mount) used to size the disk budget. The
+    /// contract-state limit is the smaller of `--max-hosting-storage` and this
+    /// disk budget. Default: 0.5.
     // Internal (#4683): `effective_budget = min(ram_budget, disk_budget)`.
     #[arg(long, env = "HOSTING_DISK_PCT")]
     pub hosting_disk_pct: Option<f64>,
 
     /// Upper limit in bytes on the disk budget, so a host with a very large
-    /// data disk does not get an unbounded budget. This is the disk equivalent
-    /// of `--max-hosting-storage`. Default: 32 GiB.
+    /// data disk does not get an unbounded budget. To contribute more than
+    /// 32 GiB of contract state, raise both this and `--max-hosting-storage`.
+    /// Default: 32 GiB.
     // Internal: #4683.
     #[arg(long, env = "MAX_HOSTING_DISK")]
     pub max_hosting_disk: Option<u64>,

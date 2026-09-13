@@ -7960,6 +7960,79 @@ mod tests {
         );
     }
 
+    /// `--max-hosting-storage` is how an operator contributes disk to the
+    /// network, and this pins the two properties that make it safe to use for
+    /// that (#5647).
+    ///
+    /// 1. An explicit value far ABOVE the RAM-scaled default's 1 GiB clamp
+    ///    survives the 60s recompute, bounded only by the disk budget — and the
+    ///    32 GiB `--max-hosting-disk` default still caps it, which is why the
+    ///    help text tells an operator to raise both.
+    /// 2. Raising it does NOT raise the contract-COUNT limit. That budget is
+    ///    derived from `total_ram` alone, because per-contract resident memory
+    ///    is the real RAM cost (~0.8 MiB/contract measured across 714
+    ///    production peers in #5647), whereas contract state lives on disk. If
+    ///    the count budget ever started reading the configured state budget, a
+    ///    disk donor would be told it can hold hundreds of times more contracts
+    ///    than its memory supports.
+    #[test]
+    fn explicit_state_budget_above_ram_clamp_survives_recompute() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        // (1a) A 20 GiB contribution with the disk cap raised to 64 GiB and a
+        // roomy disk: disk_budget = min(0.5 * (1 + 200) GiB, 64 GiB) = 64 GiB,
+        // so the operator's 20 GiB is what binds.
+        let donor = HostingManager::new(20 * GIB);
+        donor.configure_disk_budget(0.5, 64 * GIB);
+        donor.seed_disk_tracker_for_test([(make_contract_key(1), GIB)]);
+        let eff = donor
+            .recompute_effective_budget(200 * GIB)
+            .expect("seeded → recompute runs");
+        assert_eq!(
+            eff,
+            20 * GIB,
+            "an explicit state budget must survive the recompute unclamped"
+        );
+        assert!(
+            eff > MAX_DEFAULT_HOSTING_BUDGET_BYTES,
+            "the RAM-scaled default's 1 GiB clamp must not apply to an explicit value"
+        );
+        assert_eq!(donor.hosting_budget_bytes(), 20 * GIB);
+
+        // (1b) The same kind of contribution under the DEFAULT disk cap is
+        // capped at 32 GiB — the documented reason to raise both options.
+        let capped = HostingManager::new(100 * GIB);
+        capped.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+        capped.seed_disk_tracker_for_test([(make_contract_key(2), GIB)]);
+        let eff = capped
+            .recompute_effective_budget(500 * GIB)
+            .expect("seeded → recompute runs");
+        assert_eq!(
+            eff, DEFAULT_MAX_HOSTING_DISK_BYTES,
+            "without raising --max-hosting-disk, the 32 GiB disk cap binds"
+        );
+
+        // (2) The contract-count budget is identical whether the node contributes
+        // 1 GiB or 20 GiB of state: same host, same live signals, same result.
+        let total_ram = 4 * GIB;
+        let pool_size = 4;
+        let live_signals = Some((GIB, 2 * GIB));
+        let default_node = HostingManager::new(GIB);
+        let default_count_budget =
+            default_node.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
+        let donor_count_budget =
+            donor.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
+        assert_eq!(
+            donor_count_budget, default_count_budget,
+            "contributing more disk must not change the RAM-derived contract-count budget"
+        );
+        assert_eq!(
+            donor.hosting_cache_stats().contract_slot_budget,
+            default_node.hosting_cache_stats().contract_slot_budget,
+            "contributing more disk must not change how many contracts the node may host"
+        );
+    }
+
     /// An unseeded (or absent) tracker makes the recompute a no-op: the cache
     /// keeps its RAM budget until the first seed, so early startup never installs
     /// a bogus zero/under-counted floor.
