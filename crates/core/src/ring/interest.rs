@@ -3141,7 +3141,8 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         let updated = match cursors.peek(peer) {
             Some(prev)
                 if len < prev.cycle_len
-                    && (entries_sent >= len || len.saturating_mul(2) < prev.cycle_len) =>
+                    && (entries_sent >= len
+                        || len + shrink_allowance(prev.cycle_len) < prev.cycle_len) =>
             {
                 // A round built against a SMALLER set than the cycle's own
                 // frame. Its last id is not a position in this cycle's ground,
@@ -3179,13 +3180,19 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 //   and `entries_sent % len` is `0` too, and ANY last id the
                 //   peer arranges passes. That is the vacuous case, and it is
                 //   reachable at any size (a 150-of-200 set sent whole).
-                // - `len * 2 < prev.cycle_len` — a MATERIAL shrink. Below that
-                //   the advance check is not vacuous, but it is still measured
-                //   in the peer's own index space, and a well-formed advance of
-                //   `k` positions inside a set the peer composed is an
-                //   arbitrary jump across the ground the cycle is sweeping. The
-                //   check proves the round is internally consistent; it says
-                //   nothing about where the cursor LANDS.
+                // - `len + shrink_allowance(cycle_len) < cycle_len` — the set
+                //   fell further below its own frame than a round is allowed to
+                //   skip. Below that the advance check is not vacuous, but it
+                //   is still measured in the peer's own index space, and a
+                //   well-formed advance of `k` positions inside a set the peer
+                //   composed is an arbitrary jump across the ground the cycle is
+                //   sweeping. The check proves the round is internally
+                //   consistent; it says nothing about where the cursor LANDS.
+                //   The contracts a round steps over are the ones we hold that
+                //   `sorted` omits, so the skip is bounded by
+                //   `cycle_len - len` and this threshold IS that bound — see
+                //   [`shrink_allowance`], and note a plain size test is
+                //   BYPASSABLE by padding below the cursor.
                 //   `probe_peer_pins_window_with_a_set_larger_than_the_limit`
                 //   and `probe_budget_cut_round_bypasses_the_frame_guard` are
                 //   that attack at two different sizes.
@@ -3436,6 +3443,39 @@ pub(crate) struct SummaryCursor {
 /// boundary-straddling reply) and self-correcting, so a run of three says the
 /// cursor is not being driven by well-formed rounds at all.
 const MAX_CONSECUTIVE_CURSOR_REJECTIONS: u8 = 3;
+
+/// How far below its own cycle frame a shared set may fall before a record
+/// built against it is refused.
+///
+/// This is a BOUND, not a strictness preference, and that is the whole reason
+/// it is a named function rather than an inline comparison. A round advertises
+/// entries drawn from `sorted`, so the contracts it steps over are the ones we
+/// hold that `sorted` omits: **a single round can skip at most
+/// `cycle_len - len` of them.** Whatever value this returns IS the maximum
+/// skip a peer can buy per round.
+///
+/// The peer buys it for nothing. The window only ever runs FORWARD from the
+/// cursor, so advertised ids at or below the cursor are never transmitted —
+/// they exist purely to inflate `len` past this test. A peer can therefore pad
+/// its `Interests` up to the cursor's position and still arrange for the window
+/// to end on a far id, which is why a test at half the frame permits a skip of
+/// half the ring. Found by review; `a_padded_round_that_skips_more_than_the_/// allowance_is_refused` pins it.
+///
+/// An eighth was chosen against measurement rather than taste. On a
+/// 200-contract frame losing elements to churn on alternate rounds, an eighth
+/// costs nothing (4 rounds, 0 rejections) up to a 12.5% dip and costs 6 rounds
+/// and 3 rejections beyond it, where the half-frame form stayed free to 50%.
+/// Ordinary churn is a percent or two — interest entries carry a 20-minute TTL
+/// swept every minute — so the surcharge lands only on a genuine bulk shed
+/// (eviction pressure), where it is bounded: the rejections drive the escape in
+/// [`InterestManager::begin_summary_window`], which re-frames within
+/// `MAX_CONSECUTIVE_CURSOR_REJECTIONS + 1` rounds.
+///
+/// The floor of 2 keeps a small set from having a zero allowance, where every
+/// one-element dip would be refused.
+fn shrink_allowance(cycle_len: usize) -> usize {
+    cycle_len.div_ceil(8).max(2)
+}
 
 impl SummaryCursor {
     /// A cursor that resumes the next window AT `origin`, beginning a cycle
@@ -8753,77 +8793,6 @@ mod tests {
         );
     }
 
-    /// An ORDINARY shrink — the shared set losing an element to churn — must
-    /// pass the frame guard.
-    ///
-    /// `sorted` is our interest index intersected with the hashes the peer
-    /// advertised, and both sides churn: interest entries carry a 20-minute TTL
-    /// and are swept every minute. A set one element below the cycle frame is
-    /// therefore routine, and the guard's earlier `len < cycle_len` form
-    /// rejected it outright.
-    ///
-    /// The cost of that was bandwidth, which is the scarce resource this whole
-    /// rotation exists to ration (#5153): a rejected round leaves the cursor
-    /// parked, so the NEXT round re-sends a byte-identical window. Measured
-    /// here, the un-narrowed guard needs 6 rounds and 3 rejections where the
-    /// narrowed one needs 4 and none — a 50% surcharge on ordinary churn, for
-    /// no coverage gain.
-    ///
-    /// Deliberately NOT an alternation between a full set and a tiny one: that
-    /// shape is `a_peer_that_shrinks_the_shared_set_cannot_pin_the_window` and
-    /// `probe_peer_pins_window_with_a_set_larger_than_the_limit`. The existing
-    /// churn test only ever GROWS the set (20 -> 40), which is why this bug had
-    /// no coverage.
-    #[test]
-    fn an_ordinary_shrink_is_not_rejected() {
-        const LEN: usize = 200;
-        const LIMIT: usize = 64;
-        const DROPPED: usize = 100;
-
-        let full = sorted_keys(0..LEN as u32);
-        // One contract drops out of the intersection on alternate rounds.
-        let dipped: Vec<ContractKey> = full
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != DROPPED)
-            .map(|(_, k)| *k)
-            .collect();
-        let always_present: HashSet<ContractInstanceId> = dipped.iter().map(|k| *k.id()).collect();
-
-        let (mgr, _clock) = make_manager();
-        let peer = make_peer_key(1);
-        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
-
-        let mut covered: HashSet<ContractInstanceId> = HashSet::new();
-        let mut rounds = 0usize;
-        while !always_present.is_subset(&covered) && rounds < 20 {
-            let set: &[ContractKey] = if rounds % 2 == 1 { &dipped } else { &full };
-            let start = mgr.begin_summary_window(&peer, set);
-            let window = rotation_window_indices(set.len(), start, LIMIT);
-            assert!(!window.is_empty(), "empty window on round {rounds}");
-            for &i in &window {
-                covered.insert(*set[i].id());
-            }
-            let last = *set[*window.last().expect("non-empty")].id();
-            mgr.record_summary_cursor(&peer, last, window.len(), set);
-            rounds += 1;
-        }
-
-        assert_eq!(
-            rounds,
-            LEN.div_ceil(LIMIT),
-            "a set dipping by one element must still cover its {} stable \
-             contracts in ceil({LEN}/{LIMIT}) rounds; took {rounds}",
-            always_present.len(),
-        );
-        assert_eq!(
-            mgr.summary_cursor_rejections(),
-            0,
-            "ordinary churn must not be rejected: a rejected round parks the \
-             cursor and the next round re-sends a byte-identical window"
-        );
-    }
-
     /// The peer must not be able to drive the rotation through the REJECTION
     /// ESCAPE HATCH.
     ///
@@ -8897,8 +8866,8 @@ mod tests {
     ///
     /// The two clauses of the frame guard cover different cases and neither
     /// implies the other; this pins the one the material-shrink clause misses.
-    /// A set at 136 of a 200 frame is well over half, so
-    /// `len * 2 < cycle_len` does not fire — but if the round sends the WHOLE
+    /// A set 7 below a 200 frame is well inside `shrink_allowance` (25), so the
+    /// allowance clause does not fire — but if the round sends the WHOLE
     /// of it, the advance check below is VACUOUS: a full-set round wraps to
     /// where it began, so its circular advance is `0` and `entries_sent % len`
     /// is `0` too, and any last id the peer arranges passes. The window ends on
@@ -8919,29 +8888,36 @@ mod tests {
     /// claiming more than the mechanism delivers, and would pass for the wrong
     /// reason.
     #[test]
-    fn a_whole_set_round_is_rejected_even_when_the_shrink_is_not_material() {
+    fn a_whole_set_round_is_rejected_even_inside_the_shrink_allowance() {
         const FRAME: usize = 200;
         let full = sorted_keys(0..FRAME as u32);
 
-        // One id below the cursor, everything else above it: 136 of 200, so
-        // `len * 2 < cycle_len` is false (272 >= 200) and only the whole-set
-        // clause can catch this.
+        // Omits only `full[1..=6]`, so the set is 193 of a 200 frame — a shrink
+        // of 7, WELL INSIDE `shrink_allowance` (25), so the allowance clause
+        // cannot fire and only the whole-set clause can catch this. What the
+        // omission buys is that `full[0]` becomes the ONLY advertised id at or
+        // below the cursor, which is where a whole-set round necessarily ends.
         let attack: Vec<ContractKey> = std::iter::once(full[0])
-            .chain(full[65..].iter().copied())
+            .chain(full[7..].iter().copied())
             .collect();
-        assert_eq!(attack.len(), 136);
+        assert_eq!(attack.len(), FRAME - 6);
         assert!(
-            attack.len() * 2 >= FRAME,
-            "the point of this test is a shrink the material clause ignores"
+            attack.len() + shrink_allowance(FRAME) >= FRAME,
+            "the point of this test is a shrink the ALLOWANCE clause ignores: \
+             {} + {} must reach {FRAME}",
+            attack.len(),
+            shrink_allowance(FRAME)
         );
 
         let (mgr, _clock) = make_manager();
         let peer = make_peer_key(1);
         mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
 
-        // One honest round, so there is a real cursor to drag.
+        // One honest round of 6 from origin 0 leaves the cursor on `full[5]`,
+        // so `full[0]` sits below it and `full[1..=4]` — which would otherwise
+        // be the whole-set round's landing point — are the omitted ids.
         let s = mgr.begin_summary_window(&peer, &full);
-        let w = rotation_window_indices(full.len(), s, 64);
+        let w = rotation_window_indices(full.len(), s, 6);
         mgr.record_summary_cursor(
             &peer,
             *full[*w.last().expect("non-empty")].id(),
@@ -9345,6 +9321,270 @@ mod tests {
         assert!(
             a_starts.len() > 1,
             "PROBE3 PINNED: all set_a rounds began at {a_starts:?}"
+        );
+    }
+
+    /// A padded round that would skip MORE than the allowance is refused; one
+    /// that skips less is accepted.
+    ///
+    /// This pins [`shrink_allowance`] as a BOUND rather than a taste, and it is
+    /// deliberately independent of the redraw. Measured on this tree, the
+    /// redraw at cycle completion already defeats the padding attack end to end
+    /// (see `a_padded_set_cannot_skip_a_chosen_contract_forever`, which starves
+    /// its target 51/64 with the redraw disabled and covers 64/64 with it on).
+    /// So an end-to-end coverage assertion cannot pin the threshold VALUE — it
+    /// passes for a half-frame threshold too. This asserts the mechanism
+    /// directly instead: the record is not applied.
+    ///
+    /// The padding is free to the peer, which is what makes the size test
+    /// bypassable at all. `sorted` is the intersection with the hashes the peer
+    /// advertised, the window only ever runs FORWARD from the cursor, and so
+    /// every advertised id at or below the cursor is never transmitted. It
+    /// costs the peer one hash in an `Interests` message and buys it one more
+    /// unit of `len`.
+    #[test]
+    fn a_padded_round_that_skips_more_than_the_allowance_is_refused() {
+        const FRAME: usize = 200;
+        const LIMIT: usize = 8;
+        let full = sorted_keys(0..FRAME as u32);
+        let allowance = shrink_allowance(FRAME);
+        assert_eq!(allowance, 25, "200 / 8");
+
+        // Walk the cursor to a known position with one honest round.
+        let seed_round = |mgr: &InterestManager<_>, peer: &PeerKey| {
+            let s = mgr.begin_summary_window(peer, &full);
+            let w = rotation_window_indices(full.len(), s, LIMIT);
+            mgr.record_summary_cursor(
+                peer,
+                *full[*w.last().expect("non-empty")].id(),
+                w.len(),
+                &full,
+            );
+        };
+
+        // OVER the allowance: omit 30 contracts (> 25). Padding below the
+        // cursor keeps `len` at 170, which clears a half-frame test (340 > 200)
+        // and is exactly the bypass this bound exists to close.
+        {
+            let padded: Vec<ContractKey> = full[..100]
+                .iter()
+                .chain(full[130..].iter())
+                .copied()
+                .collect();
+            assert_eq!(padded.len(), FRAME - 30);
+            assert!(
+                padded.len() * 2 > FRAME,
+                "must clear a half-frame test, or this is not the case at issue"
+            );
+            let (mgr, _c) = make_manager();
+            let peer = make_peer_key(1);
+            mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+            seed_round(&mgr, &peer);
+            let before = mgr.peek_summary_cursor(&peer).expect("cursor");
+
+            let s = mgr.begin_summary_window(&peer, &padded);
+            let w = rotation_window_indices(padded.len(), s, LIMIT);
+            mgr.record_summary_cursor(
+                &peer,
+                *padded[*w.last().expect("non-empty")].id(),
+                w.len(),
+                &padded,
+            );
+            assert_eq!(
+                mgr.peek_summary_cursor(&peer).expect("cursor"),
+                before,
+                "a round skipping 30 of a 200 frame (allowance {allowance}) \
+                 must not move the cursor"
+            );
+            assert!(mgr.summary_cursor_rejections() > 0, "and must be counted");
+        }
+
+        // UNDER the allowance: omit 20 contracts (< 25). Ordinary churn, and it
+        // must cost nothing at all.
+        {
+            let dipped: Vec<ContractKey> = full[..100]
+                .iter()
+                .chain(full[120..].iter())
+                .copied()
+                .collect();
+            assert_eq!(dipped.len(), FRAME - 20);
+            let (mgr, _c) = make_manager();
+            let peer = make_peer_key(2);
+            mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+            seed_round(&mgr, &peer);
+            let before = mgr.peek_summary_cursor(&peer).expect("cursor");
+
+            let s = mgr.begin_summary_window(&peer, &dipped);
+            let w = rotation_window_indices(dipped.len(), s, LIMIT);
+            mgr.record_summary_cursor(
+                &peer,
+                *dipped[*w.last().expect("non-empty")].id(),
+                w.len(),
+                &dipped,
+            );
+            assert_ne!(
+                mgr.peek_summary_cursor(&peer).expect("cursor"),
+                before,
+                "a dip inside the allowance is ordinary churn and must be \
+                 applied, not parked — a parked cursor re-sends a \
+                 byte-identical window next round (#5153)"
+            );
+            assert_eq!(
+                mgr.summary_cursor_rejections(),
+                0,
+                "and must not be charged"
+            );
+        }
+    }
+
+    /// SEPARATING CASE, ADAPTIVE: padding below the cursor lets a peer skip a
+    /// chosen contract forever, and the threshold is what bounds the skip.
+    ///
+    /// This is `fix3-5453`'s padding mechanism aimed at a TARGET rather than
+    /// run on a fixed rhythm. Their fixed-rhythm version passes here because
+    /// the redraw at cycle completion decorrelates a fixed cadence; it does not
+    /// stop a peer that watches the cursor.
+    ///
+    /// The peer advertises the WHOLE set — so `full[TARGET]` is genuinely
+    /// shared and we owe it an advertisement — except on the rounds where the
+    /// window would actually reach the target. On those it advertises
+    /// `full[0..TARGET]` plus one far id: the padding below the cursor is never
+    /// transmitted and exists only to inflate `len` past the guard, while the
+    /// far id carries the window over the target. The skip a round can buy is
+    /// `cycle_len - len`, so the threshold IS the maximum skip permitted, not a
+    /// strictness preference.
+    #[test]
+    fn a_padded_set_cannot_skip_a_chosen_contract_forever() {
+        const LIMIT: usize = 8;
+        const TARGET: usize = 50;
+        let full = sorted_keys(0..64);
+
+        // Omits the target and everything between it and the far id.
+        let padded: Vec<ContractKey> = full[0..TARGET]
+            .iter()
+            .copied()
+            .chain(std::iter::once(full[63]))
+            .collect();
+        assert!(
+            padded.len() * 2 > full.len(),
+            "the padded set must CLEAR a half-frame test ({} of {}), or this \
+             probe is not the separating case it claims to be",
+            padded.len(),
+            full.len()
+        );
+
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(11);
+        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+
+        let target_id = *full[TARGET].id();
+        let mut covered: HashSet<ContractInstanceId> = HashSet::new();
+        for _ in 0..400 {
+            // What the peer knows: the last id we sent it, hence where an
+            // honest window would begin.
+            let cursor = mgr.peek_summary_cursor(&peer).expect("cursor");
+            let honest_start = first_index_after(&full, &cursor) % full.len();
+            let honest = rotation_window_indices(full.len(), honest_start, LIMIT);
+            let reaches_target = honest.contains(&TARGET);
+
+            let set: &[ContractKey] = if reaches_target { &padded } else { &full };
+            let s = mgr.begin_summary_window(&peer, set);
+            let w = rotation_window_indices(set.len(), s, LIMIT);
+            for &i in &w {
+                covered.insert(*set[i].id());
+            }
+            mgr.record_summary_cursor(
+                &peer,
+                *set[*w.last().expect("non-empty")].id(),
+                w.len(),
+                set,
+            );
+        }
+
+        eprintln!(
+            "ADAPTIVE-PAD: target_covered={} covered={}/64 rejections={}",
+            covered.contains(&target_id),
+            covered.len(),
+            mgr.summary_cursor_rejections()
+        );
+        assert!(
+            covered.contains(&target_id),
+            "STARVED: full[{TARGET}] was advertised by the peer throughout but \
+             never sent back to it in 400 rounds; covered {} of 64",
+            covered.len()
+        );
+    }
+
+    /// SEPARATING CASE: a HALF-frame threshold (`len * 2 < cycle_len`) is
+    /// bypassable by PADDING the advertised set below the cursor.
+    ///
+    /// The padding is free to the peer. The window only ever runs FORWARD from
+    /// the cursor, so ids at or below it are never sent — they exist purely to
+    /// inflate `len` past whatever size test the guard applies. A peer can
+    /// therefore buy any `len` it likes up to the cursor's position, and still
+    /// arrange for the window to end on a far id.
+    ///
+    /// That is what makes the threshold's VALUE load-bearing rather than
+    /// cosmetic. The skip a round can carry is bounded by `cycle_len - len`, so
+    /// a test at half the frame permits a skip of half the ring.
+    #[test]
+    fn probe_padded_set_bypasses_a_half_frame_threshold() {
+        const LIMIT: usize = 8;
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(7);
+        let full = sorted_keys(0..64);
+        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+
+        // Everything up to full[46], plus one far id: |S| = 48, and
+        // 48 * 2 = 96 > 64, so a half-frame test does not fire. Forty of those
+        // 48 ids sit at or below where the cursor will be and are never sent.
+        let padded: Vec<ContractKey> = {
+            let mut v = full[0..47].to_vec();
+            v.push(full[63]);
+            v
+        };
+        assert_eq!(padded.len(), 48);
+        assert!(
+            padded.len() * 2 > full.len(),
+            "the set must CLEAR a half-frame test, or this probe is not the \
+             separating case it claims to be"
+        );
+
+        let mut covered = HashSet::new();
+        for _ in 0..20 {
+            // Five honest rounds walk the cursor to full[39].
+            for _ in 0..5 {
+                let s = mgr.begin_summary_window(&peer, &full);
+                let w = rotation_window_indices(full.len(), s, LIMIT);
+                for &i in &w {
+                    covered.insert(i);
+                }
+                mgr.record_summary_cursor(
+                    &peer,
+                    *full[*w.last().expect("non-empty")].id(),
+                    w.len(),
+                    &full,
+                );
+            }
+            // One padded round. The eight entries after full[39] are
+            // full[40..=46] and then full[63], so a perfectly well-formed
+            // advance of 8 carries the cursor 24 positions and skips
+            // full[47..=62] entirely.
+            let s = mgr.begin_summary_window(&peer, &padded);
+            let w = rotation_window_indices(padded.len(), s, LIMIT);
+            mgr.record_summary_cursor(
+                &peer,
+                *padded[*w.last().expect("non-empty")].id(),
+                w.len(),
+                &padded,
+            );
+        }
+
+        assert_eq!(
+            covered.len(),
+            full.len(),
+            "STARVED: 100 honest rounds covered {} of 64",
+            covered.len()
         );
     }
 
