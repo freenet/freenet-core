@@ -1553,7 +1553,15 @@ impl Router {
     }
 
     pub fn add_event(&mut self, event: RouteEvent) {
-        self.add_event_recording(event, dataset::global());
+        self.add_event_recording(event, dataset::RouteSource::Originator, dataset::global());
+    }
+
+    /// [`Self::add_event`] for an outcome observed by a relay hop about its
+    /// downstream peer. Identical for the model; distinguished only in the
+    /// routing dataset, because relays record outcomes under their own
+    /// conventions (see `record_relay_route_event`).
+    pub(crate) fn add_relay_event(&mut self, event: RouteEvent) {
+        self.add_event_recording(event, dataset::RouteSource::Relay, dataset::global());
     }
 
     /// [`Self::add_event`], recording the event into `dataset` when one is
@@ -1562,6 +1570,7 @@ impl Router {
     fn add_event_recording(
         &mut self,
         event: RouteEvent,
+        source: dataset::RouteSource,
         dataset: Option<&dataset::RoutingDataset>,
     ) {
         let was_below_threshold = !self.has_sufficient_routing_events();
@@ -1585,8 +1594,8 @@ impl Router {
             event.contract_location,
             if renegade_outcome.success { 0.0 } else { 1.0 },
         );
-        if let Some(dataset) = dataset {
-            dataset.record_route(self.route_record(&event, distance, forecasts));
+        if let Some(dataset) = dataset.filter(|dataset| dataset.is_recording()) {
+            dataset.record_route(self.route_record(&event, source, forecasts));
         }
         self.renegade_predictor.record(
             &event.peer,
@@ -1852,17 +1861,12 @@ impl Router {
         }
     }
 
-    /// Score every failure-prediction layer against what actually happened.
-    ///
-    /// MUST be called before the isotonic estimators ingest the event, for the
-    /// same reason the residuals are: a layer graded after the base model has
-    /// fitted the outcome is grading itself on the answer.
     /// The dataset record for one event, built from the state the forecasts
     /// were made in — i.e. before the event is ingested.
     fn route_record(
         &self,
         event: &RouteEvent,
-        distance: f64,
+        source: dataset::RouteSource,
         forecasts: Option<dataset::FailureForecasts>,
     ) -> dataset::RouteRecord {
         let (outcome, time_to_response_start_s, payload_bytes, payload_transfer_s) =
@@ -1880,18 +1884,15 @@ impl Router {
                 RouteOutcome::SuccessUntimed => ("success_untimed", None, None, None),
                 RouteOutcome::Failure => ("failure", None, None, None),
             };
+        let peer_location = event.peer.location();
         dataset::RouteRecord {
-            // Wall clock, not `TimeSource`: this record exists only on a
-            // production node an operator opted in, and its timestamps must join
-            // against wall-clock peer snapshots and logs offline.
-            t_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_millis() as u64)
-                .unwrap_or(0),
+            t_ms: dataset::now_ms(),
+            source,
             peer: dataset::peer_hash(&event.peer),
-            peer_location: event.peer.location().map(|location| location.as_f64()),
+            peer_location: peer_location.map(|location| location.as_f64()),
             contract_location: event.contract_location.as_f64(),
-            distance,
+            distance: peer_location
+                .map(|location| event.contract_location.distance(location).as_f64()),
             op: event.op_type.map(|op| op.as_str()),
             outcome,
             time_to_response_start_s,
@@ -1902,6 +1903,11 @@ impl Router {
         }
     }
 
+    /// Score every failure-prediction layer against what actually happened.
+    ///
+    /// MUST be called before the isotonic estimators ingest the event, for the
+    /// same reason the residuals are: a layer graded after the base model has
+    /// fitted the outcome is grading itself on the answer.
     fn score_failure_layers(
         &mut self,
         peer: &PeerKeyLocation,
@@ -2785,7 +2791,12 @@ mod tests {
         let recorder = dataset::RoutingDataset::open(&path, dataset::DEFAULT_MAX_BYTES).unwrap();
 
         let mut router = Router::new(&[]);
-        let peer = PeerKeyLocation::random();
+        // A key of its own: `PeerKeyLocation::random()` reuses one key per
+        // thread, which would make the peer-hash assertion below vacuous.
+        let peer = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            "192.0.2.10:31337".parse().unwrap(),
+        );
         let contract = Location::new(0.5);
 
         // Cold: nothing to forecast with yet, which the record must say rather
@@ -2797,6 +2808,7 @@ mod tests {
                 outcome: RouteOutcome::Failure,
                 op_type: Some(OpType::Put),
             },
+            dataset::RouteSource::Originator,
             Some(&recorder),
         );
 
@@ -2833,6 +2845,7 @@ mod tests {
                 },
                 op_type: Some(OpType::Get),
             },
+            dataset::RouteSource::Originator,
             Some(&recorder),
         );
         let adjusted_after = router
@@ -2866,6 +2879,9 @@ mod tests {
 
         let warm = routes[1];
         assert_eq!(warm["peer"], dataset::peer_hash(&peer));
+        assert_eq!(warm["source"], "originator");
+        let expected_distance = contract.distance(peer.location().unwrap()).as_f64();
+        assert!((warm["distance"].as_f64().unwrap() - expected_distance).abs() < 1e-12);
         assert_eq!(warm["contract_location"], 0.5);
         assert_eq!(warm["outcome"], "success");
         assert_eq!(warm["time_to_response_start_s"], 0.25);

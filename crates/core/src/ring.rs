@@ -1747,10 +1747,6 @@ impl Ring {
         self.event_register.register_events(events).await;
     }
 
-    /// Periodically emit a router model snapshot as an EventKind::RouterSnapshot event.
-    ///
-    /// This captures the isotonic regression curves and model state, including the
-    /// connect forward estimator if available via OpManager.
     /// Periodically record the attributes of every connected peer into the
     /// routing dataset, keyed like its route events so the two join offline.
     async fn record_routing_dataset_peers(
@@ -1768,75 +1764,78 @@ impl Ring {
             {
                 break;
             }
+            if !dataset.is_recording() {
+                break;
+            }
             let peers = ring.routing_dataset_peer_attributes();
-            dataset.record_peers(ring.time_source.system_time_now(), peers);
+            // The dataset's own clock, shared with route events so the two join.
+            dataset.record_peers(crate::router::dataset::now_ms(), peers);
         }
     }
 
-    /// Snapshot connected-peer attributes. Takes each lock on its own, never
-    /// nested, so it cannot participate in a lock-order inversion.
+    /// Snapshot connected-peer attributes. Each lock is taken on its own and
+    /// released before the next, so this cannot participate in a lock-order
+    /// inversion; assembly happens afterwards with no lock held.
     fn routing_dataset_peer_attributes(&self) -> Vec<crate::router::dataset::PeerAttributes> {
-        use crate::router::dataset::{PeerAttributes, peer_hash};
+        use crate::router::dataset::{PeerSnapshotInputs, peer_attributes};
 
-        let connections: Vec<Connection> = self
+        let connections: Vec<(PeerKeyLocation, f64)> = self
             .connection_manager
             .get_connections_by_location()
             .into_values()
             .flatten()
+            .map(|connection| {
+                let connected_s = connection.duration_ms() as f64 / 1000.0;
+                (connection.location, connected_s)
+            })
             .collect();
-        let gateways: Vec<TransportPublicKey> = self
-            .upgrade_op_manager()
-            .map(|op_manager| {
+        let addrs: Vec<SocketAddr> = connections
+            .iter()
+            .filter_map(|(peer, _)| peer.socket_addr())
+            .collect();
+        let gateways: Option<Vec<TransportPublicKey>> =
+            self.upgrade_op_manager().map(|op_manager| {
                 op_manager
                     .configured_gateways
                     .iter()
                     .map(|gateway| gateway.pub_key().clone())
                     .collect()
-            })
-            .unwrap_or_default();
-        let bytes: HashMap<SocketAddr, (u64, u64)> = crate::transport::metrics::TRANSPORT_METRICS
-            .per_peer_snapshot()
-            .into_iter()
-            .map(|(addr, sent, received)| (addr, (sent, received)))
-            .collect();
-
-        let mut peers: Vec<PeerAttributes> = connections
+            });
+        let versions: HashMap<SocketAddr, (u8, u8, u16)> = addrs
             .iter()
-            .map(|connection| {
-                let peer = &connection.location;
-                let addr = peer.socket_addr();
-                let transfer = addr.and_then(|addr| bytes.get(&addr).copied());
-                PeerAttributes {
-                    peer: peer_hash(peer),
-                    location: peer.location().map(|location| location.as_f64()),
-                    connected_s: connection.duration_ms() as f64 / 1000.0,
-                    is_configured_gateway: gateways.contains(peer.pub_key()),
-                    version: addr
-                        .and_then(|addr| self.connection_manager.remote_version(addr))
-                        .map(|(major, minor, patch)| format!("{major}.{minor}.{patch}")),
-                    routing_successes: None,
-                    routing_failures: None,
-                    bytes_sent: transfer.map(|(sent, _)| sent),
-                    bytes_received: transfer.map(|(_, received)| received),
-                }
+            .filter_map(|addr| {
+                self.connection_manager
+                    .remote_version(*addr)
+                    .map(|version| (*addr, version))
             })
             .collect();
+        let health: HashMap<SocketAddr, (u64, u64)> = {
+            let tracker = self.connection_manager.peer_health.lock();
+            addrs
+                .iter()
+                .filter_map(|addr| tracker.counts(addr).map(|counts| (*addr, counts)))
+                .collect()
+        };
+        let transfer: HashMap<SocketAddr, (u64, u64)> =
+            crate::transport::metrics::TRANSPORT_METRICS
+                .per_peer_snapshot()
+                .into_iter()
+                .map(|(addr, sent, received)| (addr, (sent, received)))
+                .collect();
 
-        let health = self.connection_manager.peer_health.lock();
-        for (attributes, connection) in peers.iter_mut().zip(&connections) {
-            if let Some((successes, failures)) = connection
-                .location
-                .socket_addr()
-                .and_then(|addr| health.counts(&addr))
-            {
-                attributes.routing_successes = Some(successes);
-                attributes.routing_failures = Some(failures);
-            }
-        }
-        drop(health);
-        peers
+        peer_attributes(&PeerSnapshotInputs {
+            connections: &connections,
+            gateways: gateways.as_deref(),
+            versions: &versions,
+            health: &health,
+            transfer: &transfer,
+        })
     }
 
+    /// Periodically emit a router model snapshot as an EventKind::RouterSnapshot event.
+    ///
+    /// This captures the isotonic regression curves and model state, including the
+    /// connect forward estimator if available via OpManager.
     async fn emit_router_snapshot_telemetry(ring: Arc<Self>, interval_duration: Duration) {
         let shutdown = ring.shutdown_token();
         let mut interval = tokio::time::interval(interval_duration);

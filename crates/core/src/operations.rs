@@ -962,7 +962,7 @@ pub(crate) fn record_relay_route_event(
         .ring
         .router
         .write()
-        .add_event(crate::router::RouteEvent {
+        .add_relay_event(crate::router::RouteEvent {
             peer: next_hop,
             contract_location,
             outcome,
