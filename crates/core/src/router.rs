@@ -1836,6 +1836,32 @@ impl Router {
     /// The adjustment space each estimator composes its per-peer correction in.
     /// Read from the estimators so the residual correction cannot drift out of
     /// step with them.
+    /// The per-peer EWMA's own adjustment per stage, in each estimator's own
+    /// space — the prior the correction's proposed deviation is tested against.
+    fn stage_priors(
+        &self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+    ) -> routing_predictor::StagePriors {
+        let prior = |estimator: &IsotonicEstimator| -> f64 {
+            match (
+                estimator.estimate_global(peer, contract_location),
+                estimator.estimate_retrieval_time(peer, contract_location),
+            ) {
+                (Ok(global), Ok(adjusted)) => estimator
+                    .adjustment_mode()
+                    .residual(adjusted, global)
+                    .unwrap_or(0.0),
+                _ => 0.0,
+            }
+        };
+        routing_predictor::StagePriors {
+            failure: prior(&self.failure_estimator),
+            response_time: prior(&self.response_start_time_estimator),
+            transfer_speed: prior(&self.transfer_rate_estimator),
+        }
+    }
+
     fn stage_modes(&self) -> routing_predictor::StageModes {
         routing_predictor::StageModes {
             failure: self.failure_estimator.adjustment_mode(),
@@ -1982,15 +2008,14 @@ impl Router {
             contract_location,
             distance,
             self.stage_modes(),
+            self.stage_priors(peer, contract_location),
         );
         // Scored exactly as the router composes it, EWMA prior included —
         // scoring a composition the router never forms would measure a predictor
         // that does not exist.
-        let corrected = residual::compose_with_prior(
+        let corrected = residual::compose(
             self.failure_estimator.adjustment_mode(),
             global,
-            adjusted,
-            corrections.failure.map_or(0.0, |c| c.lambda),
             corrections.failure.map_or(0.0, |c| c.value),
         )
         .clamp(0.0, 1.0);
@@ -2077,6 +2102,7 @@ impl Router {
                 target_location,
                 distance,
                 self.stage_modes(),
+                self.stage_priors(peer, target_location),
             )
         } else {
             routing_predictor::RoutingCorrections::default()
@@ -2138,13 +2164,10 @@ impl Router {
                 .failure_estimator
                 .estimate_global(peer, target_location)
             {
-                let correction = corrections.failure;
-                let corrected = residual::compose_with_prior(
+                let corrected = residual::compose(
                     modes.failure,
                     global.clamp(0.0, 1.0),
-                    isotonic_failure,
-                    correction.map_or(0.0, |c| c.lambda),
-                    correction.map_or(0.0, |c| c.value),
+                    corrections.failure.map_or(0.0, |c| c.value),
                 )
                 .clamp(0.0, 1.0);
                 if corrected.is_finite() {
@@ -2152,36 +2175,28 @@ impl Router {
                 }
             }
 
-            if let (Ok(global), Some(adjusted)) = (
-                self.response_start_time_estimator
-                    .estimate_global(peer, target_location),
-                time_estimate,
-            ) {
-                let correction = corrections.response_time;
-                let corrected = residual::compose_with_prior(
+            if let Ok(global) = self
+                .response_start_time_estimator
+                .estimate_global(peer, target_location)
+            {
+                let corrected = residual::compose(
                     modes.response_time,
                     global,
-                    adjusted,
-                    correction.map_or(0.0, |c| c.lambda),
-                    correction.map_or(0.0, |c| c.value),
+                    corrections.response_time.map_or(0.0, |c| c.value),
                 );
                 if corrected.is_finite() && corrected >= 0.0 {
                     time_to_response_start = corrected;
                 }
             }
 
-            if let (Ok(global), Some(adjusted)) = (
-                self.transfer_rate_estimator
-                    .estimate_global(peer, target_location),
-                transfer_estimate,
-            ) {
-                let correction = corrections.transfer_speed;
-                let corrected = residual::compose_with_prior(
+            if let Ok(global) = self
+                .transfer_rate_estimator
+                .estimate_global(peer, target_location)
+            {
+                let corrected = residual::compose(
                     modes.transfer_speed,
                     global,
-                    adjusted,
-                    correction.map_or(0.0, |c| c.lambda),
-                    correction.map_or(0.0, |c| c.value),
+                    corrections.transfer_speed.map_or(0.0, |c| c.value),
                 );
                 if corrected.is_finite() && corrected > 0.0 {
                     xfer_speed = corrected;
@@ -2650,7 +2665,7 @@ impl Router {
             failure_layers_evaluated: self.failure_skill_blended.count(),
             residual_correction_enabled: residual_correction_enabled(),
             residual_kappa: Some(shrinkage.failure_kappa),
-            residual_bandwidth: shrinkage.failure_bandwidth,
+            residual_bandwidth: None,
             residual_failure_events: shrinkage.failure_residual_events,
             residual_response_time_events: shrinkage.response_time_residual_events,
             residual_transfer_speed_events: shrinkage.transfer_speed_residual_events,

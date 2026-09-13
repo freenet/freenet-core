@@ -132,17 +132,6 @@ struct PredictionStage {
     model: Renegade<RoutingObservation>,
     max_observations: usize,
     count: usize,
-    /// Kernel bandwidth — the feature-space length scale at which "k neighbours"
-    /// stops being a local neighbourhood. `None` until the first training round
-    /// has enough data to estimate one, which keeps the correction inert rather
-    /// than guessing a scale.
-    bandwidth: Option<f64>,
-    /// Recently-added observations, used as query points when estimating the
-    /// bandwidth. Deliberately a recency window rather than a uniform sample of
-    /// the store: the observations are the same population queries land in, and
-    /// the time feature means recent points are where prediction actually
-    /// happens, so a recency-biased length scale is the relevant one.
-    bandwidth_samples: VecDeque<RoutingObservation>,
     /// Cached K from the last training. Used for immutable predictions.
     cached_k: usize,
     /// Number of observations when last trained (base for the retraining
@@ -166,8 +155,6 @@ impl PredictionStage {
             model: Renegade::new(),
             max_observations,
             count: 0,
-            bandwidth: None,
-            bandwidth_samples: VecDeque::new(),
             cached_k: DEFAULT_K,
             trained_at: 0,
             observations_since_train: 0,
@@ -179,10 +166,6 @@ impl PredictionStage {
         if !output.is_finite() {
             return;
         }
-        if self.bandwidth_samples.len() >= residual::BANDWIDTH_SAMPLE_POINTS {
-            self.bandwidth_samples.pop_front();
-        }
-        self.bandwidth_samples.push_back(obs.clone());
         self.model.add(obs, output);
         self.count += 1;
         self.observations_since_train += 1;
@@ -232,36 +215,6 @@ impl PredictionStage {
             self.cached_k = self.model.get_optimal_k();
             self.trained_at = self.model.len();
             self.observations_since_train = 0;
-            self.refresh_bandwidth();
-        }
-    }
-
-    /// Re-estimate the kernel bandwidth as the median distance from a sampled
-    /// observation to its k-th nearest neighbour.
-    ///
-    /// Runs inside `train()` so it shares that cadence rather than adding another
-    /// one, and costs `O(S log n)` for `S` samples instead of `O(n log n)`.
-    fn refresh_bandwidth(&mut self) {
-        if self.bandwidth_samples.is_empty() {
-            return;
-        }
-        // Measured at the KERNEL's neighbour count, not renegade's `k`: this is
-        // the length scale over which the kernel's own candidate set is spread,
-        // and the two are different quantities (see
-        // `KERNEL_CANDIDATE_NEIGHBOURS`). `+ 1` because each sample is itself in
-        // the store at distance 0.
-        let k = (KERNEL_CANDIDATE_NEIGHBOURS.min(self.model.len())).max(1) + 1;
-        let mut kth_distances = Vec::with_capacity(self.bandwidth_samples.len());
-        for sample in &self.bandwidth_samples {
-            let neighbors = self.model.query_k(sample, k);
-            // `query_k` returns neighbours sorted nearest-first, so the last is
-            // the farthest of the k considered.
-            if let Some(farthest) = neighbors.neighbors.last() {
-                kth_distances.push(farthest.distance);
-            }
-        }
-        if let Some(bandwidth) = residual::estimate_bandwidth(&mut kth_distances) {
-            self.bandwidth = Some(bandwidth);
         }
     }
 
@@ -274,36 +227,102 @@ impl PredictionStage {
     /// uninformed query yields `n_eff ≈ 0`, and the caller's shrinkage turns that
     /// into a correction of exactly zero, so a floor would be redundant: the
     /// evidence measure already encodes "I have nothing to say about this".
-    fn predict_kernel_multi(
-        &self,
-        query: &RoutingObservation,
-    ) -> Option<[Option<residual::KernelEstimate>; residual::BANDWIDTH_MULTIPLIERS.len()]> {
-        let base_bandwidth = self.bandwidth?;
+    /// Residual estimate from RENEGADE'S OWN predictor, with the dispersion of
+    /// the neighbourhood that produced it.
+    ///
+    /// # Why renegade's own k, and not a widened kernel
+    ///
+    /// An earlier version pulled 128 candidates out of `query_k` and
+    /// re-estimated with a hand-rolled Gaussian kernel whose bandwidth was
+    /// selected separately. That was a mistake, and the measurement is
+    /// unambiguous (mse on the recoverability harness, lower better):
+    ///
+    /// ```text
+    ///                   overall   targeted
+    /// legacy blend      0.0244    0.1060
+    /// widened kernel    0.0289    0.1181    worse on BOTH
+    /// renegade-native   0.0509    0.0661    38% BETTER on targeted
+    /// ```
+    ///
+    /// Renegade's cross-validated `k` localises correctly — it is the best
+    /// estimator of the three where there is actually signal. Widening the
+    /// neighbourhood was an attempt to cure the VARIANCE that a small `k`
+    /// carries, and it cured it by introducing BIAS: averaging across a
+    /// heterogeneous neighbourhood, which lost on both axes.
+    ///
+    /// The variance is real and still has to be dealt with — on the ~92% of
+    /// queries whose true residual is ~0, a small-k mean of "zero" is noise.
+    /// But the answer to variance is SHRINKAGE, not a wider neighbourhood, and
+    /// shrinkage is the caller's job here (see `residual::compose_with_prior`).
+    /// Widening conflated the two and got neither.
+    fn predict_native(&self, query: &RoutingObservation) -> Option<residual::KernelEstimate> {
         if self.model.is_empty() {
             return None;
         }
-        // ONE neighbour query, reused across every candidate bandwidth. The
-        // k-NN search is the expensive part; a kernel sum over an existing
-        // neighbour list is a handful of `exp` calls.
-        let candidates = KERNEL_CANDIDATE_NEIGHBOURS.min(self.model.len());
-        let neighbors = self.model.query_k(query, candidates);
+        let neighbors = self.model.query_k(query, self.cached_k);
         if neighbors.neighbors.is_empty() {
             return None;
         }
-        let pairs: Vec<(f64, f64)> = neighbors
+
+        // Renegade's own weighted mean — the estimator its k was selected for.
+        let residual = neighbors.weighted_mean();
+        if !residual.is_finite() {
+            return None;
+        }
+
+        // Dispersion under the SAME inverse-distance weights the mean uses, so
+        // the confidence measure describes the estimate it accompanies. Pairing
+        // a mean from one weighting with a variance from another is how the
+        // shrinkage failed to bite before.
+        let mut weight_sum = 0.0f64;
+        let mut variance_sum = 0.0f64;
+        let exact: Vec<&renegade_ml::Neighbor> = neighbors
             .neighbors
             .iter()
-            .map(|neighbor| (neighbor.distance, neighbor.output))
+            .filter(|neighbor| neighbor.distance == 0.0)
             .collect();
-
-        let mut estimates = [None; residual::BANDWIDTH_MULTIPLIERS.len()];
-        for (index, multiplier) in residual::BANDWIDTH_MULTIPLIERS.iter().enumerate() {
-            estimates[index] = residual::kernel_estimate(&pairs, base_bandwidth * multiplier);
+        let weighted: Vec<(f64, f64)> = if exact.is_empty() {
+            neighbors
+                .neighbors
+                .iter()
+                .filter(|neighbor| neighbor.distance > 0.0 && neighbor.distance.is_finite())
+                .map(|neighbor| (neighbor.weight / neighbor.distance, neighbor.output))
+                .collect()
+        } else {
+            // Mirrors `weighted_mean`'s exact-match short-circuit.
+            exact
+                .iter()
+                .map(|neighbor| (neighbor.weight, neighbor.output))
+                .collect()
+        };
+        for (weight, output) in &weighted {
+            if !weight.is_finite() || !output.is_finite() || *weight <= 0.0 {
+                continue;
+            }
+            weight_sum += weight;
+            let deviation = output - residual;
+            variance_sum += weight * deviation * deviation;
         }
-        Some(estimates)
+        if !(weight_sum > 0.0) {
+            return None;
+        }
+        let variance = variance_sum / weight_sum;
+
+        Some(residual::KernelEstimate {
+            residual,
+            // Neighbour COUNT is the evidence measure for this estimator: the
+            // inverse-distance weights are scale-free, so their sum is not an
+            // "is there anything nearby" signal. Renegade's own k already
+            // decides locality; this says how many observations back the mean.
+            n_eff: weighted.len() as f64,
+            variance: if variance.is_finite() && variance >= 0.0 {
+                variance
+            } else {
+                0.0
+            },
+        })
     }
 
-    /// Predict using the pre-trained model (immutable access).
     fn predict(&self, query: &RoutingObservation) -> Option<f64> {
         if self.model.len() < MIN_OBSERVATIONS_FOR_PREDICTION {
             return None;
@@ -617,11 +636,22 @@ pub(crate) struct StageModes {
     pub transfer_speed: AdjustmentMode,
 }
 
+/// The per-peer EWMA's own adjustment per stage, at prediction time.
+///
+/// Shrinkage is now a LOCAL test — "is the correction's proposed deviation from
+/// this prior distinguishable from its own sampling noise?" — so the prior has
+/// to be present when the correction is formed, not only when it is scored.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StagePriors {
+    pub failure: f64,
+    pub response_time: f64,
+    pub transfer_speed: f64,
+}
+
 /// Self-tuned model state, surfaced for the dashboard.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ShrinkageDiagnostics {
     pub failure_kappa: f64,
-    pub failure_bandwidth: Option<f64>,
     pub failure_residual_events: usize,
     pub failure_scored: u64,
     pub response_time_residual_events: usize,
@@ -641,10 +671,10 @@ fn shrink(
     selector: &residual::ShrinkageSelector,
     query: &RoutingObservation,
     mode: AdjustmentMode,
+    prior: f64,
 ) -> Option<Correction> {
-    let estimates = stage.predict_kernel_multi(query)?;
-    let estimate = estimates[selector.bandwidth_index()]?;
-    let lambda = selector.lambda(estimate.n_eff, estimate.variance);
+    let estimate = stage.predict_native(query)?;
+    let lambda = selector.lambda(estimate.n_eff, estimate.variance, estimate.residual, prior);
     let mut value = lambda * estimate.residual;
     // Only a multiplicative stage needs a spread bound: it recombines as
     // `base * exp(c)`, which is unbounded above, so one pathological residual
@@ -784,10 +814,7 @@ impl RoutingPredictor {
                 // Every bandwidth candidate is scored on the same event, so
                 // the grid is compared on identical data rather than on
                 // whichever events each happened to see.
-                let estimates = stage
-                    .predict_kernel_multi(&query)
-                    .unwrap_or([None; residual::BANDWIDTH_MULTIPLIERS.len()]);
-                selector.record(&estimates, actual_residual, prior);
+                selector.record(stage.predict_native(&query), actual_residual, prior);
             }
         }
 
@@ -902,9 +929,27 @@ impl RoutingPredictor {
         contract_location: Location,
         distance: f64,
         modes: StageModes,
+        priors: StagePriors,
     ) -> RoutingCorrections {
         let time = wall_clock_hours() - self.reference_time_hours;
-        self.predict_corrections_at_time(peer, contract_location, distance, modes, time)
+        self.predict_corrections_at_time(peer, contract_location, distance, modes, priors, time)
+    }
+
+    /// Residual estimated by RENEGADE'S OWN predictor at its own
+    /// cross-validated k — no hand-rolled kernel, no widened candidate set.
+    ///
+    /// Test-only, to measure whether bypassing renegade's estimator was the
+    /// mistake.
+    #[cfg(test)]
+    pub(crate) fn residual_predict_native(
+        &self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+        distance: f64,
+        time: f64,
+    ) -> Option<f64> {
+        let query = self.make_observation_immutable(peer, contract_location, distance, time);
+        self.failure_residual_stage.predict(&query)
     }
 
     pub(crate) fn predict_corrections_at_time(
@@ -913,6 +958,7 @@ impl RoutingPredictor {
         contract_location: Location,
         distance: f64,
         modes: StageModes,
+        priors: StagePriors,
         time: f64,
     ) -> RoutingCorrections {
         let query = self.make_observation_immutable(peer, contract_location, distance, time);
@@ -922,18 +968,21 @@ impl RoutingPredictor {
                 &self.failure_shrinkage,
                 &query,
                 modes.failure,
+                priors.failure,
             ),
             response_time: shrink(
                 &self.response_time_residual_stage,
                 &self.response_time_shrinkage,
                 &query,
                 modes.response_time,
+                priors.response_time,
             ),
             transfer_speed: shrink(
                 &self.transfer_speed_residual_stage,
                 &self.transfer_speed_shrinkage,
                 &query,
                 modes.transfer_speed,
+                priors.transfer_speed,
             ),
         }
     }
@@ -944,13 +993,6 @@ impl RoutingPredictor {
     pub(crate) fn shrinkage_diagnostics(&self) -> ShrinkageDiagnostics {
         ShrinkageDiagnostics {
             failure_kappa: self.failure_shrinkage.kappa(),
-            // The effective bandwidth, i.e. the estimated length scale times the
-            // multiplier the selector actually chose — reporting the raw length
-            // scale would describe a kernel the model is not using.
-            failure_bandwidth: self
-                .failure_residual_stage
-                .bandwidth
-                .map(|scale| scale * self.failure_shrinkage.bandwidth_multiplier()),
             failure_residual_events: self.failure_residual_stage.len(),
             failure_scored: self.failure_shrinkage.scored(),
             response_time_residual_events: self.response_time_residual_stage.len(),
@@ -1994,6 +2036,11 @@ mod recoverability {
         untargeted_mse_legacy: f64,
         untargeted_mse_global: f64,
         untargeted_scored: usize,
+        /// Error when the residual is estimated by RENEGADE'S OWN predictor —
+        /// its cross-validated k, its weighting — rather than by the hand-rolled
+        /// kernel over a much larger candidate set.
+        mse_native: f64,
+        targeted_mse_native: f64,
         /// Error of the PEER-ADJUSTED estimate alone — one layer of the status
         /// quo, kept for attribution rather than as the gate.
         ///
@@ -2041,6 +2088,8 @@ mod recoverability {
         let mut untargeted_err_legacy = 0.0;
         let mut untargeted_err_global = 0.0;
         let mut untargeted_scored = 0usize;
+        let mut err_native = 0.0;
+        let mut targeted_err_native = 0.0;
 
         for index in 0..events {
             let (peer_index, contract_value) = scenario.draw(model, index);
@@ -2070,7 +2119,20 @@ mod recoverability {
 
             if let (Some(base), Some(peer_adjusted)) = (base, peer_adjusted) {
                 let correction = predictor
-                    .predict_corrections_at_time(peer, contract, distance, modes, time)
+                    .predict_corrections_at_time(
+                        peer,
+                        contract,
+                        distance,
+                        modes,
+                        StagePriors {
+                            failure: isotonic
+                                .adjustment_mode()
+                                .residual(peer_adjusted, base)
+                                .unwrap_or(0.0),
+                            ..Default::default()
+                        },
+                        time,
+                    )
                     .failure;
                 // Composed exactly as the router does, EWMA prior included, so
                 // the harness measures the predictor that actually ships rather
@@ -2093,11 +2155,16 @@ mod recoverability {
                     _ => peer_adjusted,
                 };
 
-                let corrected = residual::compose_with_prior(
+                // RENEGADE-NATIVE: let renegade estimate the residual with its
+                // own cross-validated k and weighting, instead of pulling a much
+                // larger candidate set out of query_k and re-estimating.
+                let native_residual =
+                    predictor.residual_predict_native(peer, contract, distance, time);
+                let native = (peer_adjusted + native_residual.unwrap_or(0.0)).clamp(0.0, 1.0);
+
+                let corrected = residual::compose(
                     isotonic.adjustment_mode(),
                     base,
-                    peer_adjusted,
-                    correction.map_or(0.0, |c| c.lambda),
                     correction.map_or(0.0, |c| c.value),
                 )
                 .clamp(0.0, 1.0);
@@ -2110,11 +2177,13 @@ mod recoverability {
                     sum_err_base += (base - p_star).powi(2);
                     err_peer_adjusted += (peer_adjusted - p_star).powi(2);
                     err_legacy += (legacy - p_star).powi(2);
+                    err_native += (native - p_star).powi(2);
                     if scenario.is_targeted(peer_index, contract_value) {
                         targeted_err_corrected += (corrected - p_star).powi(2);
                         targeted_err_base += (base - p_star).powi(2);
                         targeted_err_peer_adjusted += (peer_adjusted - p_star).powi(2);
                         targeted_err_legacy += (legacy - p_star).powi(2);
+                        targeted_err_native += (native - p_star).powi(2);
                         targeted_scored += 1;
                     } else {
                         // r_hat is the UNSHRUNK kernel estimate: value/lambda.
@@ -2211,6 +2280,8 @@ mod recoverability {
             targeted_mse_peer_adjusted: targeted_err_peer_adjusted / targeted_scored.max(1) as f64,
             mse_legacy: err_legacy / n,
             targeted_mse_legacy: targeted_err_legacy / targeted_scored.max(1) as f64,
+            mse_native: err_native / n,
+            targeted_mse_native: targeted_err_native / targeted_scored.max(1) as f64,
             untargeted_mean_abs_rhat: untargeted_abs_rhat / untargeted_scored.max(1) as f64,
             untargeted_mean_lambda: untargeted_lambda / untargeted_scored.max(1) as f64,
             untargeted_mse_corrected: untargeted_err_corrected / untargeted_scored.max(1) as f64,
@@ -2430,6 +2501,36 @@ mod recoverability {
         eprintln!(
             "#4485 UNTARGETED (n={n:.0}): mean|r_hat| {rhat:.4}, mean lambda {lambda:.3}, \
              mse corrected {corrected:.4} vs legacy {legacy:.4} vs global {global:.4}"
+        );
+        let native = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.mse_native
+        });
+        let native_t = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.targeted_mse_native
+        });
+        let legacy_all = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.mse_legacy
+        });
+        let legacy_t = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.targeted_mse_legacy
+        });
+        let kernel_all = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.mse_corrected
+        });
+        let kernel_t = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
+            r.targeted_mse_corrected
+        });
+        eprintln!(
+            "#4485 ESTIMATOR COMPARISON (lower is better)\n\
+             \x20   legacy blend      overall {legacy_all:.4}  targeted {legacy_t:.4}\n\
+             \x20   kernel (mine)     overall {kernel_all:.4}  targeted {kernel_t:.4}  \
+             ratio {:.3} / {:.3}\n\
+             \x20   renegade-native   overall {native:.4}  targeted {native_t:.4}  \
+             ratio {:.3} / {:.3}",
+            kernel_all / legacy_all,
+            kernel_t / legacy_t,
+            native / legacy_all,
+            native_t / legacy_t,
         );
         eprintln!(
             "#4485 WHOLE-RUN baselines: peer-adjusted {peer_adjusted:.4}, \

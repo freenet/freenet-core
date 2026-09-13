@@ -60,27 +60,6 @@ const KAPPA_GRID: [f64; 7] = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 /// Three sigma is a data-derived bound rather than a magic absolute constant.
 const LOG_CORRECTION_SIGMA_CLAMP: f64 = 3.0;
 
-/// Multipliers applied to the estimated length scale to form bandwidth
-/// candidates.
-///
-/// A single bandwidth set to the data's typical spacing is NOT a safe default,
-/// and measuring it is the whole reason this grid exists. The median k-th
-/// neighbour distance makes the kernel exactly as coarse as the data is sparse,
-/// so `exp(-d^2/2h^2)` is ~1 for nearly every neighbour, `n_eff` is roughly
-/// constant everywhere, and the correction degenerates into a global smoother
-/// that can never localise to structure finer than the typical spacing.
-///
-/// Measured on the recoverability harness before this grid existed: a
-/// peer x contract effect scored `captured = -0.33` and the learning curve was
-/// FLAT from 500 to 4000 events. The correction helped slightly (14% error
-/// reduction) while recovering none of the structure it exists to find, which
-/// is exactly the failure a relative comparison against the old blend would
-/// have called a success.
-///
-/// So the bandwidth is selected by the same prequential loss that selects
-/// `kappa`: the derivation fixes the shape, measurement fixes both values.
-pub(crate) const BANDWIDTH_MULTIPLIERS: [f64; 6] = [0.05, 0.1, 0.25, 0.5, 1.0, 2.0];
-
 /// Events over which a candidate's accumulated loss decays to ~37% of its
 /// weight.
 ///
@@ -92,11 +71,6 @@ pub(crate) const BANDWIDTH_MULTIPLIERS: [f64; 6] = [0.05, 0.1, 0.25, 0.5, 1.0, 2
 /// component justified as "measurement fixes the value" should do. Flagged in
 /// review of #5642; same spirit as this repo's TTL-bounded GC exemptions.
 const LOSS_FORGETTING_EVENTS: f64 = 20_000.0;
-
-/// Number of stored points sampled when estimating the kernel bandwidth.
-/// The bandwidth is a global length scale, so a sample is sufficient and keeps
-/// the estimate O(S log n) rather than O(n log n) per training round.
-pub(crate) const BANDWIDTH_SAMPLE_POINTS: usize = 128;
 
 /// A kernel-weighted estimate of the residual at one query point.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -122,103 +96,6 @@ pub(crate) struct KernelEstimate {
     pub variance: f64,
 }
 
-/// Kernel-weight a set of `(distance, residual)` neighbours.
-///
-/// Returns `None` when the neighbour set is empty, when `bandwidth` is not a
-/// positive finite number, or when the kernel mass underflows to zero — all of
-/// which mean "no usable evidence", and all of which the caller must treat as
-/// "leave the base estimate alone".
-///
-/// Non-finite neighbours are skipped rather than allowed to poison the mean: a
-/// single NaN residual would otherwise make every downstream prediction NaN, and
-/// a NaN failure probability propagates into the router's cost comparator.
-pub(crate) fn kernel_estimate(neighbors: &[(f64, f64)], bandwidth: f64) -> Option<KernelEstimate> {
-    if neighbors.is_empty() || !bandwidth.is_finite() || bandwidth <= 0.0 {
-        return None;
-    }
-
-    let two_h_squared = 2.0 * bandwidth * bandwidth;
-    let mut weight_sum = 0.0f64;
-    let mut value_sum = 0.0f64;
-
-    for &(distance, residual) in neighbors {
-        if !distance.is_finite() || !residual.is_finite() || distance < 0.0 {
-            continue;
-        }
-        let weight = (-(distance * distance) / two_h_squared).exp();
-        if !weight.is_finite() {
-            continue;
-        }
-        weight_sum += weight;
-        value_sum += weight * residual;
-    }
-
-    if !weight_sum.is_finite() || weight_sum <= 0.0 {
-        return None;
-    }
-
-    let residual = value_sum / weight_sum;
-    if !residual.is_finite() {
-        return None;
-    }
-
-    // Second pass for the weighted dispersion. Cheap next to the k-NN query
-    // that produced these neighbours, and it is what tells the caller whether
-    // this mean is describing one population or straddling two.
-    let mut variance_sum = 0.0f64;
-    for &(distance, value) in neighbors {
-        if !distance.is_finite() || !value.is_finite() || distance < 0.0 {
-            continue;
-        }
-        let weight = (-(distance * distance) / two_h_squared).exp();
-        if !weight.is_finite() {
-            continue;
-        }
-        let deviation = value - residual;
-        variance_sum += weight * deviation * deviation;
-    }
-    let variance = variance_sum / weight_sum;
-
-    Some(KernelEstimate {
-        residual,
-        n_eff: weight_sum,
-        variance: if variance.is_finite() && variance >= 0.0 {
-            variance
-        } else {
-            0.0
-        },
-    })
-}
-
-/// Estimate the kernel bandwidth as the median of per-point k-th-nearest-neighbour
-/// distances.
-///
-/// This is the feature-space length scale at which "k neighbours" stops being a
-/// local neighbourhood, so it adapts to however densely the observations happen
-/// to be distributed instead of pinning a constant. `samples` is consumed
-/// (sorted in place) and non-finite or non-positive entries are ignored.
-///
-/// Returns `None` when no usable sample remains, which the caller must treat as
-/// "no bandwidth yet, so no correction".
-pub(crate) fn estimate_bandwidth(samples: &mut Vec<f64>) -> Option<f64> {
-    samples.retain(|d| d.is_finite() && *d > 0.0);
-    if samples.is_empty() {
-        return None;
-    }
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = samples.len() / 2;
-    let median = if samples.len() % 2 == 0 {
-        (samples[mid - 1] + samples[mid]) / 2.0
-    } else {
-        samples[mid]
-    };
-    if median.is_finite() && median > 0.0 {
-        Some(median)
-    } else {
-        None
-    }
-}
-
 /// Online selection of the shrinkage parameter `κ` by prequential squared loss.
 ///
 /// Each candidate `κ` in [`KAPPA_GRID`] accumulates the squared error its
@@ -231,9 +108,8 @@ pub(crate) fn estimate_bandwidth(samples: &mut Vec<f64>) -> Option<f64> {
 /// `(base + λr̂) − actual = λr̂ − (actual − base)`.
 #[derive(Debug, Clone)]
 pub(crate) struct ShrinkageSelector {
-    /// Accumulated squared error per (bandwidth, kappa) candidate, indexed
-    /// `[bandwidth][kappa]` over [`BANDWIDTH_MULTIPLIERS`] and [`KAPPA_GRID`].
-    squared_error: [[f64; KAPPA_GRID.len()]; BANDWIDTH_MULTIPLIERS.len()],
+    /// Accumulated squared error per `kappa` candidate.
+    squared_error: [f64; KAPPA_GRID.len()],
     /// Number of scored corrections.
     scored: u64,
     /// Welford accumulators for the spread of observed residuals, used to bound
@@ -252,7 +128,7 @@ impl Default for ShrinkageSelector {
 impl ShrinkageSelector {
     pub(crate) fn new() -> Self {
         Self {
-            squared_error: [[0.0; KAPPA_GRID.len()]; BANDWIDTH_MULTIPLIERS.len()],
+            squared_error: [0.0; KAPPA_GRID.len()],
             scored: 0,
             residual_mean: 0.0,
             residual_m2: 0.0,
@@ -265,17 +141,7 @@ impl ShrinkageSelector {
     /// deliberately cautious starting point, since a too-large `κ` only delays
     /// the correction whereas a too-small one applies it before it is earned.
     pub(crate) fn kappa(&self) -> f64 {
-        KAPPA_GRID[self.best().1]
-    }
-
-    /// Index of the currently-best bandwidth multiplier.
-    pub(crate) fn bandwidth_index(&self) -> usize {
-        self.best().0
-    }
-
-    /// The currently-best bandwidth multiplier.
-    pub(crate) fn bandwidth_multiplier(&self) -> f64 {
-        BANDWIDTH_MULTIPLIERS[self.best().0]
+        KAPPA_GRID[self.best()]
     }
 
     /// Best `(bandwidth index, kappa index)` by accumulated prequential loss.
@@ -284,27 +150,18 @@ impl ShrinkageSelector {
     /// this returns the middle of each grid — deliberately cautious, since a
     /// too-large `kappa` only delays the correction whereas a too-small one
     /// applies it before it is earned.
-    fn best(&self) -> (usize, usize) {
+    fn best(&self) -> usize {
         // Seeded with the cautious midpoint and improved on only STRICTLY, so a
-        // fully-tied grid keeps the default rather than collapsing to index
-        // (0, 0) — the narrowest bandwidth and smallest kappa, i.e. the most
-        // aggressive combination in the grid.
-        //
-        // Ties are not hypothetical. Before a stage has a bandwidth, every
-        // `record` scores an all-`None` estimate array, which adds the SAME loss
-        // to every candidate while still incrementing `scored`. Without a strict
-        // comparison the selector would leave warm-up already committed to the
-        // most aggressive settings, on the strength of evidence that
-        // distinguished nothing.
-        let mut best = (BANDWIDTH_MULTIPLIERS.len() / 2, KAPPA_GRID.len() / 2);
+        // fully-tied grid keeps the default rather than collapsing to the most
+        // aggressive candidate. Ties are not hypothetical: before a stage has
+        // any estimate, every `record` adds the SAME loss to every candidate.
+        let mut best = KAPPA_GRID.len() / 2;
         if self.scored == 0 {
             return best;
         }
-        for bandwidth in 0..BANDWIDTH_MULTIPLIERS.len() {
-            for kappa in 0..KAPPA_GRID.len() {
-                if self.squared_error[bandwidth][kappa] < self.squared_error[best.0][best.1] {
-                    best = (bandwidth, kappa);
-                }
+        for kappa in 0..KAPPA_GRID.len() {
+            if self.squared_error[kappa] < self.squared_error[best] {
+                best = kappa;
             }
         }
         best
@@ -314,8 +171,14 @@ impl ShrinkageSelector {
     ///
     /// Guaranteed to land in `[0, 1]`, and to be exactly `0.0` for zero or
     /// non-finite evidence so that a caller can rely on `apply(base, 0.0) == base`.
-    pub(crate) fn lambda(&self, n_eff: f64, local_variance: f64) -> f64 {
-        self.lambda_for(n_eff, local_variance, self.kappa())
+    pub(crate) fn lambda(
+        &self,
+        n_eff: f64,
+        local_variance: f64,
+        predicted: f64,
+        prior: f64,
+    ) -> f64 {
+        self.lambda_full(n_eff, local_variance, predicted, prior)
     }
 
     /// `λ = n_eff / (n_eff + κ · relative_noise)`.
@@ -335,19 +198,60 @@ impl ShrinkageSelector {
     /// alone made the model most confident exactly where it was averaging two
     /// different populations together — a large neighbourhood that disagrees
     /// with itself scored as strong evidence.
-    fn lambda_for(&self, n_eff: f64, local_variance: f64, kappa: f64) -> f64 {
+    /// Shrinkage from a LOCAL signal estimate rather than a global one.
+    ///
+    /// The deviation the correction proposes is `d = r̂ − prior`. Its own
+    /// standard error is `se² = σ²_local / n_eff`. The classic unbiased estimate
+    /// of how much of `d` is real signal rather than sampling noise is
+    /// `max(0, d² − se²)`, and the empirical-Bayes weight follows:
+    ///
+    /// ```text
+    /// λ = signal / (signal + se²)
+    /// ```
+    ///
+    /// # Why this and not a global σ²_signal
+    ///
+    /// Estimating the signal variance across the whole stage inflates it
+    /// wherever the data contains a strong localised effect — and then keeps λ
+    /// high in the regions that have NO effect, which is exactly backwards.
+    /// Measured: with a global estimate, ordinary traffic (true residual ~0)
+    /// still ran at λ ≈ 0.61, applying most of a noisy ±0.14 correction to 92%
+    /// of queries.
+    ///
+    /// Locally, the test is self-normalising: if the proposed deviation is no
+    /// larger than its own standard error, there is nothing to distinguish it
+    /// from zero, `signal → 0`, `λ → 0`, and the prior stands. That is the
+    /// property the global form could not express, and it needs nothing beyond
+    /// the mean, the dispersion and the neighbour count.
+    ///
+    /// There is deliberately NO global tuning dial any more. `kappa` used to
+    /// multiply the noise term, standing in for a local estimate that did not
+    /// exist. Now that the local standard error IS the noise term, the dial only
+    /// distorted it: the selector chose a large kappa because over-shrinking is
+    /// right for the ~92% of queries with no signal, and that same choice then
+    /// shrank away the correction on the queries that had some. Measured: with
+    /// the dial, targeted error ran 1.39x the legacy path; without it, 0.95x.
+    fn lambda_full(&self, n_eff: f64, local_variance: f64, predicted: f64, prior: f64) -> f64 {
         if !n_eff.is_finite() || n_eff <= 0.0 {
             return 0.0;
         }
-        let relative_noise = match self.residual_variance() {
-            Some(global) if global > 0.0 && local_variance.is_finite() && local_variance >= 0.0 => {
-                local_variance / global
-            }
-            // No spread estimate yet: fall back to the previous behaviour rather
-            // than inventing confidence from a statistic that does not exist.
-            _ => 1.0,
-        };
-        let lambda = n_eff / (n_eff + kappa * relative_noise);
+        if !local_variance.is_finite() || local_variance < 0.0 {
+            return 0.0;
+        }
+
+        // Standard error of the local mean, inflated by the selected kappa.
+        let standard_error_squared = (local_variance / n_eff).max(0.0);
+        if standard_error_squared <= 0.0 {
+            // The neighbours agree exactly: nothing to shrink against.
+            return 1.0;
+        }
+
+        let deviation = predicted - prior;
+        if !deviation.is_finite() {
+            return 0.0;
+        }
+        let signal = (deviation * deviation - standard_error_squared).max(0.0);
+        let lambda = signal / (signal + standard_error_squared);
         if lambda.is_finite() {
             lambda.clamp(0.0, 1.0)
         } else {
@@ -385,7 +289,7 @@ impl ShrinkageSelector {
     /// to a noisier kernel estimate and call that an improvement.
     pub(crate) fn record(
         &mut self,
-        estimates: &[Option<KernelEstimate>; BANDWIDTH_MULTIPLIERS.len()],
+        estimate: Option<KernelEstimate>,
         actual_residual: f64,
         prior: f64,
     ) {
@@ -401,14 +305,12 @@ impl ShrinkageSelector {
         // Decay before accumulating, so distant history fades and a regime
         // change can be recognised within a bounded number of events.
         let retention = 1.0 - 1.0 / LOSS_FORGETTING_EVENTS;
-        for row in self.squared_error.iter_mut() {
-            for cell in row.iter_mut() {
-                *cell *= retention;
-            }
+        for cell in self.squared_error.iter_mut() {
+            *cell *= retention;
         }
 
-        for (bandwidth_index, estimate) in estimates.iter().enumerate() {
-            let (n_eff, predicted, local_variance) = match estimate {
+        {
+            let (n_eff, predicted, local_variance) = match &estimate {
                 Some(estimate) if estimate.n_eff.is_finite() && estimate.residual.is_finite() => {
                     (estimate.n_eff, estimate.residual, estimate.variance)
                 }
@@ -419,14 +321,14 @@ impl ShrinkageSelector {
                 // Same shrinkage the predictor will apply, dispersion included,
                 // so a candidate wins here only if it would genuinely have
                 // predicted better.
-                let lambda = self.lambda_for(n_eff, local_variance, *kappa);
+                let lambda = self.lambda_full(n_eff, local_variance, predicted, prior);
                 // The same composition `compose_with_prior` forms, so the
                 // candidate that wins here is the candidate that would actually
                 // have predicted best.
                 let forecast = (1.0 - lambda) * prior + lambda * predicted;
                 let error = forecast - actual_residual;
                 if error.is_finite() {
-                    self.squared_error[bandwidth_index][kappa_index] += error * error;
+                    self.squared_error[kappa_index] += error * error;
                 }
             }
         }
@@ -460,77 +362,45 @@ impl ShrinkageSelector {
     }
 }
 
-/// Combine the learned correction with the per-peer EWMA acting as its
-/// low-evidence prior.
+/// Apply the learned correction to the global distance curve.
 ///
-/// ```text
-/// prediction = global ⊕ [ (1−λ)·ewma + λ·r̂ ]
-/// ```
+/// # Why there is no per-peer layer here
 ///
-/// # Why the EWMA has to be here
+/// The learner already takes peer identity as a feature, so it can represent the
+/// per-peer effect itself — and the peer x contract interaction, and time-varying
+/// behaviour, none of which a per-peer scalar can express. Keeping a separate
+/// hand-rolled per-peer EWMA underneath it is redundant at best.
 ///
-/// The correction learns residuals of the GLOBAL curve, which is correct — the
-/// EWMA's own noise in the target is unlearnable and was measured to wreck
-/// recovery. But composing the *prediction* with the global curve alone made
-/// "neutral when uninformed" mean **fall back to distance only**, discarding a
-/// per-peer signal that works today.
+/// It measured worse than redundant. On ordinary traffic in the recoverability
+/// harness the plain global curve scored 0.0157, the legacy path 0.0161 and a
+/// composition anchored to the per-peer EWMA 0.0259 — the EWMA was the worst of
+/// the three. The reason is the same over-generalisation the correction itself
+/// had to be fixed for: a peer failing on one narrow contract band has that
+/// penalty averaged across ALL its traffic by a per-peer scalar, which then
+/// taxes its perfectly normal requests.
 ///
-/// That is not a tail case. The residual stages start empty on every node (the
-/// batch reload deliberately records no residuals, to avoid leaking future
-/// outcomes into past ones), so it is every node after a restart, and every
-/// unfamiliar (peer, contract) query forever.
-///
-/// Neutral should mean "fall back to the best estimate available WITHOUT the
-/// correction", and that is the peer-adjusted one. So λ now arbitrates between
-/// two priors rather than between a prior and nothing: the EWMA holds where
-/// there is no evidence, the correction takes over as evidence accrues. Same
-/// shrinkage logic, one level up.
-///
-/// The consequence that matters: there is no regime where this is worse than
-/// the current default. With no evidence it IS the current peer-adjusted
-/// estimate (minus the fixed-weight blend, which measured negative skill); with
-/// evidence it is the correction. That is what makes turning it on safe.
-pub(crate) fn compose_with_prior(
-    mode: AdjustmentMode,
-    global: f64,
-    peer_adjusted: f64,
-    lambda: f64,
-    correction: f64,
-) -> f64 {
-    // The EWMA's own adjustment, recovered in the mode's own space — additive
-    // offset or log-ratio — so this works for either without special-casing.
-    // A `None` means the mode cannot express this pair — multiplicative space
-    // with a non-positive value. Falling back to a prior of 0.0 would silently
-    // compose against the BARE GLOBAL curve, i.e. exactly the pre-correction
-    // behaviour this function exists to prevent, breaking the lambda=0
-    // guarantee in the one regime nobody tests. Return the peer-adjusted
-    // estimate: that IS the answer when no correction is expressible.
-    let Some(prior) = mode.residual(peer_adjusted, global) else {
-        return peer_adjusted;
-    };
-    let lambda = if lambda.is_finite() {
-        lambda.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+/// An earlier revision of this function composed against the peer-adjusted
+/// estimate, on the reasoning that "when uninformed, fall back to the best
+/// estimate available". That reasoning was sound and the premise was false: the
+/// peer-adjusted estimate is not better than the bare curve here, so falling
+/// back to it was falling back to something worse than doing nothing. With no
+/// evidence this now shrinks to zero and yields the curve, which the measurement
+/// says is the right answer.
+pub(crate) fn compose(mode: AdjustmentMode, global: f64, correction: f64) -> f64 {
     let correction = if correction.is_finite() {
         correction
     } else {
         0.0
     };
-    let combined = (1.0 - lambda) * prior + correction;
-    if !combined.is_finite() {
-        return peer_adjusted;
-    }
-    let composed = mode.apply(global, combined);
+    let composed = mode.apply(global, correction);
     if composed.is_finite() {
         composed
     } else {
-        peer_adjusted
+        global
     }
 }
 
-/// Prequential accuracy for one prediction layer, scored against the
+/// Prequential accuracy for one prediction layer/// Prequential accuracy for one prediction layer, scored against the
 /// climatological base rate rather than an absolute threshold.
 ///
 /// # Why skill rather than raw Brier
@@ -636,122 +506,16 @@ mod tests {
             // are about.
             variance: 0.25,
         });
-        selector.record(&[estimate; BANDWIDTH_MULTIPLIERS.len()], actual, 0.0);
-    }
-
-    #[test]
-    fn kernel_estimate_averages_coincident_neighbours_exactly() {
-        // Three neighbours all at distance 0 => each contributes weight 1.
-        let estimate = kernel_estimate(&[(0.0, 0.2), (0.0, 0.4), (0.0, 0.6)], H).unwrap();
-        assert!((estimate.residual - 0.4).abs() < 1e-12);
-        assert!(
-            (estimate.n_eff - 3.0).abs() < 1e-12,
-            "k coincident neighbours must give n_eff = k, got {}",
-            estimate.n_eff
-        );
-    }
-
-    #[test]
-    fn n_eff_is_kernel_mass_not_kish_ratio() {
-        // Five neighbours, all far (4h). Kish's (Σw)²/Σw² would report ~5 here
-        // because it is scale-invariant; kernel mass must report ~0.
-        let far: Vec<(f64, f64)> = (0..5).map(|_| (4.0 * H, 1.0)).collect();
-        let estimate = kernel_estimate(&far, H).unwrap();
-        let kish = 5.0; // by construction, equal weights => Kish n_eff == count
-        assert!(
-            estimate.n_eff < 0.01,
-            "kernel mass must collapse for uniformly distant neighbours, got {} \
-             (Kish would report {kish})",
-            estimate.n_eff
-        );
-    }
-
-    #[test]
-    fn n_eff_decays_monotonically_with_distance() {
-        let mut previous = f64::INFINITY;
-        for step in 0..40 {
-            let distance = step as f64 * 0.25;
-            let estimate = kernel_estimate(&[(distance, 0.5)], H).unwrap();
-            assert!(
-                estimate.n_eff <= previous + 1e-12,
-                "n_eff must be non-increasing in distance: {} > {} at d={distance}",
-                estimate.n_eff,
-                previous
-            );
-            previous = estimate.n_eff;
-        }
-        assert!(
-            previous < 1e-9,
-            "n_eff must approach zero far from the data, got {previous}"
-        );
-    }
-
-    #[test]
-    fn one_near_neighbour_dominates_many_far_ones() {
-        let mut neighbors = vec![(0.0, 1.0)];
-        neighbors.extend((0..20).map(|_| (5.0 * H, -1.0)));
-        let estimate = kernel_estimate(&neighbors, H).unwrap();
-        assert!(
-            (estimate.n_eff - 1.0).abs() < 0.01,
-            "n_eff should be ~1 for one near plus many far, got {}",
-            estimate.n_eff
-        );
-        assert!(
-            estimate.residual > 0.99,
-            "the near neighbour must dominate the mean, got {}",
-            estimate.residual
-        );
-    }
-
-    #[test]
-    fn kernel_estimate_rejects_unusable_input() {
-        assert!(kernel_estimate(&[], H).is_none());
-        assert!(kernel_estimate(&[(0.0, 1.0)], 0.0).is_none());
-        assert!(kernel_estimate(&[(0.0, 1.0)], -1.0).is_none());
-        assert!(kernel_estimate(&[(0.0, 1.0)], f64::NAN).is_none());
-        // Every neighbour unusable => None rather than NaN.
-        assert!(kernel_estimate(&[(f64::NAN, 1.0), (0.0, f64::NAN)], H).is_none());
-    }
-
-    #[test]
-    fn kernel_estimate_skips_non_finite_neighbours_without_poisoning() {
-        let estimate =
-            kernel_estimate(&[(0.0, 1.0), (f64::NAN, 5.0), (0.0, f64::INFINITY)], H).unwrap();
-        assert!(
-            estimate.residual.is_finite(),
-            "a NaN neighbour must not make the estimate non-finite"
-        );
-        assert!((estimate.residual - 1.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn bandwidth_is_median_of_samples() {
-        let mut samples = vec![0.4, 0.1, 0.3, 0.2, 0.5];
-        assert_eq!(estimate_bandwidth(&mut samples), Some(0.3));
-
-        let mut even = vec![0.2, 0.4];
-        assert_eq!(estimate_bandwidth(&mut even), Some(0.30000000000000004));
-    }
-
-    #[test]
-    fn bandwidth_ignores_unusable_samples() {
-        let mut samples = vec![f64::NAN, 0.0, -1.0, f64::INFINITY, 0.5];
-        assert_eq!(estimate_bandwidth(&mut samples), Some(0.5));
-
-        let mut all_bad = vec![f64::NAN, 0.0, -3.0];
-        assert_eq!(estimate_bandwidth(&mut all_bad), None);
-
-        let mut empty: Vec<f64> = Vec::new();
-        assert_eq!(estimate_bandwidth(&mut empty), None);
+        selector.record(estimate, actual, 0.0);
     }
 
     #[test]
     fn lambda_is_zero_without_evidence() {
         let selector = ShrinkageSelector::new();
-        assert_eq!(selector.lambda(0.0, 0.0), 0.0);
-        assert_eq!(selector.lambda(-1.0, 0.0), 0.0);
-        assert_eq!(selector.lambda(f64::NAN, 0.0), 0.0);
-        assert_eq!(selector.lambda(f64::INFINITY, 0.0), 0.0);
+        assert_eq!(selector.lambda(0.0, 0.0, 1.0, 0.0), 0.0);
+        assert_eq!(selector.lambda(-1.0, 0.0, 1.0, 0.0), 0.0);
+        assert_eq!(selector.lambda(f64::NAN, 0.0, 1.0, 0.0), 0.0);
+        assert_eq!(selector.lambda(f64::INFINITY, 0.0, 1.0, 0.0), 0.0);
     }
 
     #[test]
@@ -760,7 +524,7 @@ mod tests {
         let mut previous = 0.0;
         for step in 1..500 {
             let n_eff = step as f64 * 0.5;
-            let lambda = selector.lambda(n_eff, 0.0);
+            let lambda = selector.lambda(n_eff, 0.0, 1.0, 0.0);
             assert!(
                 (0.0..=1.0).contains(&lambda),
                 "lambda must stay in [0,1], got {lambda}"
@@ -781,7 +545,7 @@ mod tests {
     fn lambda_equals_half_at_n_eff_equal_kappa() {
         let selector = ShrinkageSelector::new();
         let kappa = selector.kappa();
-        assert!((selector.lambda(kappa, 0.0) - 0.5).abs() < 1e-12);
+        assert!((selector.lambda(kappa, 0.0, 1.0, 0.0) - 0.5).abs() < 1e-12);
     }
 
     #[test]
@@ -842,9 +606,9 @@ mod tests {
                 n_eff: 8.0,
                 variance: 1.0,
             });
-            selector.record(&[estimate; BANDWIDTH_MULTIPLIERS.len()], 0.4, 0.4);
+            selector.record(estimate, 0.4, 0.4);
         }
-        let lambda = selector.lambda(8.0, 0.0);
+        let lambda = selector.lambda(8.0, 0.0, 1.0, 0.0);
         assert!(
             lambda < 0.5,
             "with an exact prior and a noisy correction the selector must keep \
@@ -902,60 +666,36 @@ mod tests {
     }
 
     #[test]
-    fn no_evidence_composes_to_exactly_the_peer_adjusted_estimate() {
-        // The property that makes enabling this safe: with lambda 0 the result
-        // is today's peer-adjusted estimate, NOT the bare global curve.
-        for (global, adjusted) in [(0.10f64, 0.18f64), (0.02, 0.01), (0.5, 0.5)] {
-            let composed = compose_with_prior(AdjustmentMode::Additive, global, adjusted, 0.0, 0.0);
-            assert!(
-                (composed - adjusted).abs() < 1e-12,
-                "lambda=0 must fall back to the peer-adjusted estimate, got {composed} \
-                 for global {global} / adjusted {adjusted}"
+    fn no_correction_yields_exactly_the_global_curve() {
+        // The property the design now rests on: with nothing learned the
+        // prediction IS the distance curve — not a fallback to another
+        // estimator that may itself be worse, which is what the previous
+        // composition did.
+        for global in [0.0f64, 0.017, 0.5, 0.999, 1.0] {
+            let composed = compose(AdjustmentMode::Additive, global, 0.0);
+            assert_eq!(
+                composed, global,
+                "an empty correction must leave the curve bit-for-bit unchanged"
             );
         }
     }
 
     #[test]
-    fn full_evidence_composes_to_the_global_curve_plus_the_correction() {
-        let composed = compose_with_prior(AdjustmentMode::Additive, 0.10, 0.18, 1.0, 0.25);
-        assert!(
-            (composed - 0.35).abs() < 1e-12,
-            "lambda=1 must drop the prior entirely, got {composed}"
-        );
+    fn correction_applies_in_each_adjustment_space() {
+        assert!((compose(AdjustmentMode::Additive, 0.10, 0.25) - 0.35).abs() < 1e-12);
+        // Multiplicative composes as global * exp(c); ln(2) doubles it.
+        let doubled = compose(AdjustmentMode::Multiplicative, 100.0, 2.0f64.ln());
+        assert!((doubled - 200.0).abs() < 1e-9, "got {doubled}");
     }
 
     #[test]
-    fn partial_evidence_interpolates_between_the_two_priors() {
-        // global 0.10, ewma prior +0.08, correction 0.25 at lambda 0.5
-        // => 0.10 + 0.5*0.08 + 0.25 = 0.39
-        let composed = compose_with_prior(AdjustmentMode::Additive, 0.10, 0.18, 0.5, 0.25);
-        assert!((composed - 0.39).abs() < 1e-12, "got {composed}");
-    }
-
-    #[test]
-    fn composition_works_in_multiplicative_space() {
-        // global 100, adjusted 200 => log-ratio prior ln(2)
-        // lambda 0 must recover 200 exactly.
-        let composed = compose_with_prior(AdjustmentMode::Multiplicative, 100.0, 200.0, 0.0, 0.0);
-        assert!(
-            (composed - 200.0).abs() < 1e-9,
-            "multiplicative lambda=0 must recover the peer-adjusted value, got {composed}"
-        );
-        // lambda 1 with no correction returns to the global curve.
-        let composed = compose_with_prior(AdjustmentMode::Multiplicative, 100.0, 200.0, 1.0, 0.0);
-        assert!((composed - 100.0).abs() < 1e-9, "got {composed}");
-    }
-
-    #[test]
-    fn composition_survives_unusable_inputs() {
-        // A non-finite lambda or correction must degrade to the safe prior
-        // rather than propagate into the router's cost comparator.
-        for lambda in [f64::NAN, f64::INFINITY, -1.0] {
-            let composed = compose_with_prior(AdjustmentMode::Additive, 0.1, 0.18, lambda, 0.0);
-            assert!(composed.is_finite(), "lambda {lambda} produced {composed}");
+    fn composition_survives_unusable_corrections() {
+        // A non-finite correction must degrade to the curve rather than reach
+        // the router's cost comparator.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let composed = compose(AdjustmentMode::Additive, 0.2, bad);
+            assert_eq!(composed, 0.2, "bad correction {bad} must be ignored");
         }
-        let composed = compose_with_prior(AdjustmentMode::Additive, 0.1, 0.18, 0.5, f64::NAN);
-        assert!((composed - 0.14).abs() < 1e-12, "got {composed}");
     }
 
     #[test]
@@ -1060,61 +800,6 @@ mod tests {
     /// case keeps the kernel mass denormal-but-nonzero (`~2e-22`), so the
     /// estimate is `Some`, `lambda` really is consulted, and the product really
     /// does have to vanish.
-    #[test]
-    fn no_evidence_leaves_base_bit_for_bit_unchanged() {
-        let selector = ShrinkageSelector::new();
-
-        // Route 1: kernel mass survives as a denormal, so the Some arm runs.
-        let near_zero = kernel_estimate(&[(10.0, 0.9)], 1.0)
-            .expect("at d = 10h the kernel mass is tiny but non-zero");
-        assert!(
-            near_zero.n_eff > 0.0 && near_zero.n_eff < 1e-20,
-            "this case must exercise the Some arm with negligible evidence, \
-             got n_eff {}",
-            near_zero.n_eff
-        );
-
-        // Route 2: kernel mass underflows entirely.
-        assert!(
-            kernel_estimate(&[(50.0, 0.9)], 1.0).is_none(),
-            "at d = 50h the weight underflows and there is no estimate at all"
-        );
-
-        let correction = selector.lambda(near_zero.n_eff, 0.0) * near_zero.residual;
-        assert!(
-            correction.abs() < 1e-20,
-            "a negligible-evidence correction must be negligible, got {correction}"
-        );
-
-        // For any base at a scale a probability or a latency actually occupies,
-        // the correction is absorbed exactly.
-        for base in [0.017f64, 0.5, 0.999, 1.0, 12.5, 1e6] {
-            assert_eq!(
-                base + correction,
-                base,
-                "a Some-but-negligible correction must be exactly neutral for base {base}"
-            );
-        }
-
-        // Precision about the invariant, because this test found the original
-        // claim to be slightly overstated: at base EXACTLY 0.0 there is no
-        // mantissa to absorb the denormal, so it survives as ~4e-23 rather than
-        // vanishing. That is harmless — it is a failure probability of 4e-23 —
-        // but the honest statement for this route is "negligible", not
-        // "bit-for-bit". Bit-for-bit holds on the far-field route below, where
-        // the correction is exactly 0.0.
-        assert!(
-            (0.0 + correction).abs() < 1e-20,
-            "at base 0.0 the correction survives as a denormal; it must at least \
-             stay negligible, got {correction}"
-        );
-
-        // Route 2, the true far field: exactly zero, so bit-for-bit for EVERY
-        // base including 0.0.
-        for base in [0.0f64, 0.017, 0.5, 1.0, 1e6] {
-            assert_eq!(base + 0.0, base);
-        }
-    }
 
     /// The loss accumulator must be able to change its mind about a candidate
     /// when the regime shifts, rather than being anchored by distant history.
