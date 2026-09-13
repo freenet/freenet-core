@@ -957,8 +957,14 @@ impl RoutingPredictor {
         self.predict_at_time(peer, contract_location, distance, time)
     }
 
-    /// Predict at a specific time (for testing).
-    fn predict_at_time(
+    /// Predictor time for a wall-clock reading in hours since the epoch, i.e.
+    /// exactly what [`Self::predict`] computes from the current clock.
+    pub(crate) fn time_at(&self, wall_clock_hours: f64) -> f64 {
+        wall_clock_hours - self.reference_time_hours
+    }
+
+    /// Predict at a specific predictor time (see [`Self::time_at`]).
+    pub(crate) fn predict_at_time(
         &self,
         peer: &PeerKeyLocation,
         contract_location: Location,
@@ -1118,7 +1124,7 @@ impl RoutingPredictor {
 /// Note: For full deterministic simulation testing, this should be replaced
 /// with TimeSource. Currently, the _at_time() methods allow controlled time
 /// in tests, and batch loading passes original timestamps.
-fn wall_clock_hours() -> f64 {
+pub(crate) fn wall_clock_hours() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1795,26 +1801,26 @@ mod tests {
 /// `0` for a climatology forecast, `1` for the oracle — an absolute scale rather
 /// than "better than the variant we happened to compare against".
 #[cfg(test)]
-mod recoverability {
+pub(crate) mod recoverability {
     use super::*;
     use crate::config::GlobalRng;
     use crate::router::isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 
     /// Events before scoring starts, so the isotonic base has a curve to be
     /// corrected and the comparison is not dominated by cold start.
-    const WARMUP_EVENTS: usize = 300;
+    pub(crate) const WARMUP_EVENTS: usize = 300;
 
     /// Sized from production: nova's gateways hold 4,155 and 2,745 failure
     /// observations. A mechanism that needs materially more than this cannot
     /// work on a real node however elegant it is, so the budget is the
     /// assertion, not an implementation detail.
-    const RECOVERY_BUDGET_EVENTS: usize = 2_000;
+    pub(crate) const RECOVERY_BUDGET_EVENTS: usize = 2_000;
 
     const PEER_COUNT: usize = 12;
 
     /// What generated the outcomes. Each isolates one capability.
     #[derive(Debug, Clone, Copy, PartialEq)]
-    enum Model {
+    pub(crate) enum Model {
         /// `p* = f(distance)` only. The isotonic base should capture this and
         /// the correction should add ~nothing.
         DistanceOnly,
@@ -1843,12 +1849,12 @@ mod recoverability {
     /// Half-width of a targeted contract band.
     const BAND: f64 = 0.02;
 
-    struct Scenario {
-        peers: Vec<PeerKeyLocation>,
+    pub(crate) struct Scenario {
+        pub(crate) peers: Vec<PeerKeyLocation>,
     }
 
     impl Scenario {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Scenario {
                 peers: (0..PEER_COUNT).map(|_| PeerKeyLocation::random()).collect(),
             }
@@ -1867,7 +1873,7 @@ mod recoverability {
             (self.peer_location(peer_index) + offset).rem_euclid(1.0)
         }
 
-        fn is_targeted(&self, peer_index: usize, contract: f64) -> bool {
+        pub(crate) fn is_targeted(&self, peer_index: usize, contract: f64) -> bool {
             TARGETED.iter().any(|&(target, offset)| {
                 target == peer_index
                     && ring_distance(contract, self.band_centre(target, offset)) < BAND
@@ -1875,7 +1881,7 @@ mod recoverability {
         }
 
         /// The generating probability. Known exactly, which is the whole point.
-        fn true_probability(
+        pub(crate) fn true_probability(
             &self,
             model: Model,
             peer_index: usize,
@@ -1915,7 +1921,7 @@ mod recoverability {
 
         /// Draw the next event, biased so targeted pairs are sampled often
         /// enough to be learnable but stay a small minority of traffic.
-        fn draw(&self, model: Model, index: usize) -> (usize, f64) {
+        pub(crate) fn draw(&self, model: Model, index: usize) -> (usize, f64) {
             let targeted_turn = model == Model::PeerContract && index % 12 == 0;
             if targeted_turn {
                 let (peer_index, offset) = TARGETED[(index / 12) % TARGETED.len()];
@@ -2082,7 +2088,7 @@ mod recoverability {
     }
 
     /// Average a metric over seeds, so a threshold is not riding on one draw.
-    const SEEDS: [u64; 5] = [
+    pub(crate) const SEEDS: [u64; 5] = [
         0x4485_0001,
         0x4485_0002,
         0x4485_0003,

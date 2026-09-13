@@ -33,6 +33,18 @@ fn fmt_skill(skill: Option<f64>) -> String {
     }
 }
 
+/// Render the hierarchical estimator's selected forgetting horizon.
+///
+/// `None` means two different things depending on whether the stage has any
+/// events, and the reader needs to know which.
+fn fmt_horizon(events: usize, hours: Option<f64>) -> String {
+    match (events, hours) {
+        (0, _) => "&mdash; (no events yet)".to_string(),
+        (_, None) => "none &mdash; remembers its whole window".to_string(),
+        (_, Some(hours)) => format!("{hours} h"),
+    }
+}
+
 /// Share of full-window decisions from the farthest quarter above which the
 /// candidate window is worth investigating as too narrow.
 ///
@@ -172,13 +184,17 @@ pub fn peer_detail_html(address_str: &str) -> String {
 
                 <h3 style="margin-top: 1em;">Which layer is doing the work?</h3>
                 <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">Each layer&rsquo;s <strong>skill</strong> against simply assuming the average failure rate. <strong>0 means no better than that assumption; negative means worse.</strong> Skill rather than a raw score because failures are rare, and on a rare event a raw score mostly measures the rarity: at a {base_rate} failure rate, a forecast that never predicts failure at all scores {clim_brier} and looks excellent.</p>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">These are <strong>two routes from the same starting point</strong>, not one running total. Both begin at the distance-only estimate. The established route adds a per-peer offset and then the Renegade blend; the correction route instead learns what the distance-only estimate gets wrong for this exact peer and contract, and <strong>replaces</strong> the per-peer offset rather than stacking on it. Compare the two end points, not the rows in order.</p>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">The first rows are <strong>two routes from the same starting point</strong>, not one running total. Both begin at the distance-only estimate. The established route adds a per-peer offset and then the Renegade blend; the correction route instead learns what the distance-only estimate gets wrong for this exact peer and contract, and <strong>replaces</strong> the per-peer offset rather than stacking on it. Compare the end points, not the rows in order.</p>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">The hierarchical row is a <strong>separate, self-contained model</strong>, not a step after the others. It fits its own distance curve over a longer window, then adds an offset for the peer and for the peer on this part of the ring, each weighted by how much evidence stands behind it: a peer seen a handful of times barely moves the estimate, a peer seen thousands of times moves it fully. It replaces all of the above rather than adding to any of them. It is new, so compare its score with the established route&rsquo;s before trusting it.</p>
                 <div class="info-grid">
                     <div class="info-label">Both routes start at: distance only</div><div class="info-value">{skill_global}</div>
                     <div class="info-label">&#8627; established: + per-peer offset</div><div class="info-value">{skill_adjusted}</div>
                     <div class="info-label">&#8627; established: + Renegade blend{blend_note}</div><div class="info-value">{skill_blended}</div>
                     <div class="info-label">&#8627; correction: distance only + residual{corrected_note}</div><div class="info-value">{skill_corrected}</div>
+                    <div class="info-label">Hierarchical: own curve + evidence-weighted offsets{hierarchical_note}</div><div class="info-value">{skill_hierarchical}</div>
                     <div class="info-label">Scored predictions</div><div class="info-value">{layers_eval}</div>
+                    <div class="info-label">Scored predictions: hierarchical</div><div class="info-value">{hierarchical_eval}</div>
+                    <div class="info-label">Hierarchical forgetting horizon</div><div class="info-value">{hierarchical_horizon}</div>
                 </div>
 
                 <h3 style="margin-top: 1em;">Is the candidate window too narrow?</h3>
@@ -224,16 +240,29 @@ pub fn peer_detail_html(address_str: &str) -> String {
             skill_adjusted = fmt_skill(rs.failure_skill_adjusted),
             skill_blended = fmt_skill(rs.failure_skill_blended),
             skill_corrected = fmt_skill(rs.failure_skill_corrected),
-            blend_note = if rs.residual_correction_enabled {
+            blend_note = if rs.residual_correction_enabled || rs.hierarchical_routing_enabled {
                 " &mdash; superseded"
             } else {
                 " &mdash; in use"
             },
-            corrected_note = if rs.residual_correction_enabled {
+            corrected_note = if rs.hierarchical_routing_enabled {
+                " &mdash; superseded"
+            } else if rs.residual_correction_enabled {
                 " &mdash; in use"
             } else {
                 " &mdash; measured, not applied"
             },
+            skill_hierarchical = fmt_skill(rs.failure_skill_hierarchical),
+            hierarchical_note = if rs.hierarchical_routing_enabled {
+                " &mdash; in use"
+            } else {
+                " &mdash; measured, not applied"
+            },
+            hierarchical_eval = rs.hierarchical_failure_evaluated,
+            hierarchical_horizon = fmt_horizon(
+                rs.hierarchical_failure_events,
+                rs.hierarchical_failure_horizon_hours
+            ),
             layers_eval = rs.failure_layers_evaluated,
             corr_enabled = if rs.residual_correction_enabled {
                 "Yes"
@@ -628,6 +657,19 @@ mod tests {
     }
 
     #[test]
+    fn horizon_rendering_distinguishes_no_events_from_no_forgetting() {
+        assert!(fmt_horizon(0, None).contains("no events yet"));
+        assert!(fmt_horizon(0, Some(6.0)).contains("no events yet"));
+        let whole = fmt_horizon(120, None);
+        assert!(
+            whole.contains("whole window"),
+            "an active stage with no forgetting must say so, got {whole}"
+        );
+        assert_eq!(fmt_horizon(120, Some(1.5)), "1.5 h");
+        assert_eq!(fmt_horizon(120, Some(24.0)), "24 h");
+    }
+
+    #[test]
     fn window_reading_switches_verdict_at_its_threshold() {
         // This sentence is what an operator acts on, so its boundary is pinned
         // in both directions rather than only at comfortable distances from it.
@@ -717,6 +759,23 @@ mod tests {
         assert!(
             panel.contains("replaces"),
             "the panel must say the correction REPLACES the per-peer offset"
+        );
+        assert!(
+            panel.contains("separate, self-contained model")
+                && panel.contains("replaces all of the above"),
+            "the hierarchical row must be presented as its own model that replaces \
+             the others, not as another step in a running total"
+        );
+        assert!(
+            panel.contains("{skill_hierarchical}"),
+            "the hierarchical skill must be rendered inside the layer panel"
+        );
+        assert!(
+            !panel.contains(r#"<div class="info-label">+ hierarchical"#)
+                && !panel.contains(r#"<div class="info-label">&#8627; hierarchical"#)
+                && !panel.contains(r#"<div class="info-label">&#8627; Hierarchical"#),
+            "the hierarchical row must not be labelled as a branch of, or a term \
+             added to, the rows above it"
         );
         assert!(
             !panel.contains(r#"<div class="info-label">+ residual correction"#),

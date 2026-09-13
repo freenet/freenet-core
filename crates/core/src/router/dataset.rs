@@ -160,6 +160,14 @@ pub(crate) struct FailureForecasts {
     pub lambda: Option<f64>,
     /// Effective evidence behind the correction, when one was formed.
     pub n_eff: Option<f64>,
+    /// The hierarchical empirical-Bayes estimator (#4485), once it has a curve.
+    pub hierarchical: Option<f64>,
+    /// `ln(seconds)` to response start the legacy stack would act on, forecast
+    /// for every event whether or not it turns out to be timed, so timing can be
+    /// scored offline on the timed subset. `None` without a timing estimate.
+    pub log_response_time_legacy: Option<f64>,
+    /// The same forecast from the hierarchical estimator.
+    pub log_response_time_hierarchical: Option<f64>,
 }
 
 /// One observed routing outcome.
@@ -651,6 +659,9 @@ mod tests {
                 corrected: 0.12,
                 lambda: Some(0.5),
                 n_eff: Some(4.0),
+                hierarchical: Some(0.11),
+                log_response_time_legacy: Some(-1.5),
+                log_response_time_hierarchical: None,
             }),
         }
     }
@@ -718,6 +729,12 @@ mod tests {
         assert_eq!(lines[1]["peer"], "00000000000000aa");
         assert_eq!(lines[1]["outcome"], "failure");
         assert_eq!(lines[1]["forecasts"]["corrected"], 0.12);
+        assert_eq!(lines[1]["forecasts"]["hierarchical"], 0.11);
+        assert_eq!(lines[1]["forecasts"]["log_response_time_legacy"], -1.5);
+        assert!(
+            lines[1]["forecasts"]["log_response_time_hierarchical"].is_null(),
+            "an absent forecast must be recorded as null, not omitted or zero"
+        );
         assert_eq!(lines[2]["kind"], "peers");
         assert_eq!(lines[2]["t_ms"], 7);
         assert_eq!(lines[2]["peers"][0]["is_configured_gateway"], true);
