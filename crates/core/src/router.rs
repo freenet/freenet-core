@@ -1069,6 +1069,25 @@ pub(crate) struct Router {
     /// for the candidate-window size. See [`SelectionRankStats`].
     #[serde(skip)]
     selection_ranks: SelectionRankStats,
+    /// Cumulative outcome counts over every [`Self::add_event`], never
+    /// windowed. See [`RouteOutcomeTotals`].
+    #[serde(skip)]
+    outcome_totals: RouteOutcomeTotals,
+}
+
+/// Cumulative success / failure counts of the route events this router has
+/// ingested since it was built (#4485).
+///
+/// The isotonic estimators hold a rolling window of at most 500 events, so
+/// they cannot say how many failures were ever observed; these counters can.
+/// They exist so tests (and a future diagnostic) can check that the failure
+/// model is actually receiving failure labels, the defect #4485 fixed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RouteOutcomeTotals {
+    /// `RouteOutcome::Failure` events.
+    pub failures: u64,
+    /// `RouteOutcome::Success` and `RouteOutcome::SuccessUntimed` events.
+    pub successes: u64,
 }
 
 impl Clone for Router {
@@ -1106,6 +1125,7 @@ impl Clone for Router {
             failure_skill_blended: residual::SkillTracker::new(),
             failure_skill_corrected: residual::SkillTracker::new(),
             selection_ranks: SelectionRankStats::default(),
+            outcome_totals: self.outcome_totals,
         }
     }
 }
@@ -1542,6 +1562,7 @@ impl Router {
             failure_skill_blended: residual::SkillTracker::new(),
             failure_skill_corrected: residual::SkillTracker::new(),
             selection_ranks: SelectionRankStats::default(),
+            outcome_totals: RouteOutcomeTotals::default(),
         }
     }
 
@@ -1554,6 +1575,12 @@ impl Router {
     pub fn add_event(&mut self, event: RouteEvent) {
         let was_below_threshold = !self.has_sufficient_routing_events();
         let op_type = event.op_type;
+        match event.outcome {
+            RouteOutcome::Failure => self.outcome_totals.failures += 1,
+            RouteOutcome::Success { .. } | RouteOutcome::SuccessUntimed => {
+                self.outcome_totals.successes += 1;
+            }
+        }
 
         // Feed renegade predictor (before isotonic, which moves event.peer)
         let distance = event
@@ -1685,6 +1712,24 @@ impl Router {
                 "Router transitioning from distance-based to prediction-based routing"
             );
         }
+    }
+
+    /// Cumulative outcome counts. See [`RouteOutcomeTotals`].
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(crate) fn outcome_totals(&self) -> RouteOutcomeTotals {
+        self.outcome_totals
+    }
+
+    /// Every `(peer address, result)` pair currently held in the failure
+    /// estimator's rolling window, in insertion order (`1.0` = failure,
+    /// `0.0` = success). Test-only: lets a driver test assert WHICH peer a
+    /// route event blamed.
+    #[cfg(test)]
+    pub(crate) fn failure_window_for_test(&self) -> Vec<(Option<std::net::SocketAddr>, f64)> {
+        self.failure_estimator
+            .raw_events_for_test()
+            .map(|e| (e.peer.socket_addr(), e.result))
+            .collect()
     }
 
     /// The `consider_n_closest_peers` closest candidates, plus HOW MANY were

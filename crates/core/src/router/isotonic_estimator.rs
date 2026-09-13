@@ -555,6 +555,12 @@ impl IsotonicEstimator {
         self.global_regression.len()
     }
 
+    /// The raw events in the rolling window, oldest first. Test-only.
+    #[cfg(test)]
+    pub(crate) fn raw_events_for_test(&self) -> impl Iterator<Item = &IsotonicEvent> {
+        self.raw_events.iter()
+    }
+
     /// The per-peer adjustment mode this estimator was constructed with.
     ///
     /// Was `cfg(test)` while only the router test `estimators_use_intended_adjustment_modes`

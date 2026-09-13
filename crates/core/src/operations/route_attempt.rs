@@ -330,6 +330,185 @@ impl Drop for AttemptHopGuard {
     }
 }
 
+/// Shared harness for the per-op driver tests: a real `OpManager` whose event
+/// loop is replaced by a script, standing in for the originator-loopback relay
+/// and the network behind it.
+#[cfg(test)]
+pub(crate) mod driver_test_support {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::message::{MessageStats, NetMessage};
+    use crate::node::{OpExecutionPayload, OpManager, WaiterReply};
+    use crate::ring::{Location, PeerKeyLocation};
+
+    /// What the scripted event loop does with one outbound attempt.
+    pub(crate) struct Step {
+        /// The peer the (simulated) loopback relay forwards the attempt to.
+        /// `None` = no remote peer was attempted.
+        pub hop: Option<PeerKeyLocation>,
+        /// What the waiter receives.
+        pub answer: Answer,
+    }
+
+    /// How the scripted event loop answers one attempt's waiter.
+    #[allow(clippy::large_enum_variant)] // test harness; one value per attempt
+    pub(crate) enum Answer {
+        /// Deliver this terminal reply.
+        Reply(NetMessage),
+        /// Wake the waiter with `PeerDisconnected` for the hop (the connection
+        /// was pruned mid-flight, #4313).
+        PeerDisconnected,
+        /// Never answer, so the attempt times out.
+        Never,
+        /// Drop the waiter without an answer: the driver sees a local
+        /// `NotificationError`, which is not the peer's doing.
+        DropWaiter,
+    }
+
+    /// Build a Local-mode `OpManager` with a known own address and `peers`
+    /// ring connections, returning the op-execution receiver the drivers send
+    /// attempts to. `guards` must be kept alive for the test's duration.
+    pub(crate) async fn op_manager_with_peers(
+        id: &str,
+        peers: usize,
+    ) -> (
+        Arc<OpManager>,
+        tokio::sync::mpsc::Receiver<OpExecutionPayload>,
+        Vec<PeerKeyLocation>,
+        Box<dyn std::any::Any>,
+    ) {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let crate::node::EventLoopNotificationsReceiver {
+            notifications_receiver,
+            op_execution_receiver,
+        } = notification_rx;
+        let (ops_ch_channel, ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:12000".parse().unwrap());
+
+        let mut added = Vec::new();
+        for i in 0..peers {
+            let kp = crate::transport::TransportKeypair::new();
+            let addr: SocketAddr = format!("127.0.0.1:{}", 30000 + i).parse().unwrap();
+            assert!(op_manager.ring.connection_manager.add_connection(
+                Location::new(0.1 + 0.2 * i as f64),
+                addr,
+                kp.public().clone(),
+                false,
+            ));
+            added.push(PeerKeyLocation::new(kp.public().clone(), addr));
+        }
+        let guards: Box<dyn std::any::Any> = Box::new((
+            notifications_receiver,
+            ch_channel,
+            wait_for_event,
+            result_router_rx,
+            task_monitor,
+        ));
+        (op_manager, op_execution_receiver, added, guards)
+    }
+
+    /// Serve outbound attempts of type `op` from `rx` with
+    /// `script(attempt_index, outbound, target_addr)`. Records the step's hop in
+    /// the attempt-hop registry exactly as the originator-loopback relay does,
+    /// then answers as scripted. Payloads of any other transaction type (the
+    /// ring's own background CONNECT traffic) are held open and not counted.
+    /// Returns the number of attempts served so far.
+    pub(crate) fn serve_attempts<F>(
+        op_manager: Arc<OpManager>,
+        mut rx: tokio::sync::mpsc::Receiver<OpExecutionPayload>,
+        op: crate::message::TransactionType,
+        mut script: F,
+    ) -> Arc<AtomicUsize>
+    where
+        F: FnMut(usize, &NetMessage, Option<SocketAddr>) -> Step + Send + 'static,
+    {
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+        tokio::spawn(async move {
+            let mut held_open = Vec::new();
+            while let Some((reply_tx, outbound, target)) = rx.recv().await {
+                if outbound.id().transaction_type() != op {
+                    held_open.push(reply_tx);
+                    continue;
+                }
+                let index = counter.fetch_add(1, Ordering::SeqCst);
+                let step = script(index, &outbound, target);
+                if let Some(hop) = &step.hop {
+                    op_manager
+                        .attempt_hop_registry()
+                        .record_hop(outbound.id(), hop);
+                }
+                match step.answer {
+                    Answer::Reply(reply) => {
+                        reply_tx
+                            .try_send(WaiterReply::Reply(reply))
+                            .expect("the attempt's waiter accepts its reply");
+                    }
+                    Answer::PeerDisconnected => {
+                        let peer = step
+                            .hop
+                            .as_ref()
+                            .and_then(|h| h.socket_addr())
+                            .unwrap_or_else(|| "127.0.0.1:1".parse().unwrap());
+                        reply_tx
+                            .try_send(WaiterReply::PeerDisconnected { peer })
+                            .expect("the attempt's waiter accepts the disconnect");
+                    }
+                    Answer::Never => held_open.push(reply_tx),
+                    Answer::DropWaiter => drop(reply_tx),
+                }
+            }
+        });
+        served
+    }
+
+    /// `(peer address, result)` for every event in the failure estimator's
+    /// window; `1.0` = failure.
+    pub(crate) fn failure_window(op_manager: &OpManager) -> Vec<(Option<SocketAddr>, f64)> {
+        op_manager.ring.router.read().failure_window_for_test()
+    }
+
+    /// Addresses blamed with a Failure, in order.
+    pub(crate) fn failed_addrs(op_manager: &OpManager) -> Vec<SocketAddr> {
+        failure_window(op_manager)
+            .into_iter()
+            .filter(|(_, r)| *r == 1.0)
+            .map(|(a, _)| a.expect("test peers have addresses"))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

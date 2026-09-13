@@ -543,6 +543,25 @@ impl ControlledSimulationResult {
             .is_some_and(|ring| ring.is_hosting_contract(key))
     }
 
+    /// `(failures, successes)` route events ingested by `label`'s router over
+    /// the whole run, or `None` if the node never published its Ring (#4485).
+    /// Cumulative, unlike the router's 500-event estimator windows.
+    pub fn node_route_outcome_totals(&self, label: &NodeLabel) -> Option<(u64, u64)> {
+        self.node_rings.get(label).map(|ring| {
+            let totals = ring.router.read().outcome_totals();
+            (totals.failures, totals.successes)
+        })
+    }
+
+    /// `(failures, successes)` route events summed over every node's router
+    /// (#4485). See [`Self::node_route_outcome_totals`].
+    pub fn aggregate_route_outcome_totals(&self) -> (u64, u64) {
+        self.node_rings
+            .values()
+            .map(|ring| ring.router.read().outcome_totals())
+            .fold((0, 0), |(f, s), t| (f + t.failures, s + t.successes))
+    }
+
     /// The protocol version `label`'s node had recorded for the peer at `addr`
     /// at the end of the run, or `None` if it never learned one (#5161).
     ///

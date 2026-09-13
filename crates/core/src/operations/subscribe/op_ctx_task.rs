@@ -4022,3 +4022,225 @@ mod tests {
         );
     }
 }
+
+/// Driver-level tests for the originator SUBSCRIBE's per-attempt route
+/// labelling (#4485): the real `drive_client_subscribe_inner` against a
+/// scripted event loop. SUBSCRIBE sends each attempt straight to its target
+/// (`send_to_and_await`), so the target the loop observes IS the attempted peer.
+#[cfg(test)]
+mod route_attempt_driver_tests {
+    use super::*;
+    use crate::message::MessageStats;
+    use crate::operations::route_attempt::driver_test_support::{
+        Answer, Step, failed_addrs, failure_window, op_manager_with_peers, serve_attempts,
+    };
+    use parking_lot::Mutex;
+
+    fn not_found(msg: &NetMessage, instance_id: ContractInstanceId) -> NetMessage {
+        NetMessage::from(SubscribeMsg::Response {
+            id: *msg.id(),
+            instance_id,
+            result: SubscribeMsgResult::NotFound,
+            hop_count: 1,
+        })
+    }
+
+    /// First attempt times out (labelled immediately), every later attempt
+    /// answers NotFound, and the subscribe exhausts: one failure per attempted
+    /// target, the NotFounds labelled only once the op has settled, and no
+    /// extra exhaustion event.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn attempts_are_labelled_against_their_targets_exactly_once() {
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers("sub-attempts", 3).await;
+        let instance_id = ContractInstanceId::new([47u8; 32]);
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let seen = targets.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |i, msg, target| {
+                seen.lock()
+                    .push(target.expect("subscribe attempts carry a target"));
+                Step {
+                    // SUBSCRIBE never reads the hop registry; leave it empty to
+                    // prove attribution does not depend on it.
+                    hop: None,
+                    answer: if i == 0 {
+                        Answer::Never
+                    } else {
+                        Answer::Reply(not_found(msg, instance_id))
+                    },
+                }
+            },
+        );
+
+        let outcome = drive_client_subscribe_inner(
+            &op_manager,
+            instance_id,
+            Transaction::new::<SubscribeMsg>(),
+            false,
+            Some(peers[0].clone()),
+        )
+        .await
+        .expect("driver returns an outcome");
+        assert!(matches!(outcome, DriverOutcome::Publish(Err(_))));
+
+        let targets = targets.lock().clone();
+        assert!(targets.len() >= 2, "several attempts must have been made");
+        assert_eq!(
+            failed_addrs(&op_manager),
+            // The timeout is labelled when it happens; the NotFounds when the
+            // recorder settles at return, in attempt order.
+            targets,
+        );
+        assert!(
+            failure_window(&op_manager).iter().all(|(_, r)| *r == 1.0),
+            "no success event: nothing subscribed"
+        );
+    }
+
+    /// A wire error that is NOT a dropped connection (a local callback drop)
+    /// blames nobody; a dropped connection blames the target.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn only_a_dropped_connection_blames_the_target() {
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers("sub-disconnect", 3).await;
+        let instance_id = ContractInstanceId::new([48u8; 32]);
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let seen = targets.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |i, msg, target| {
+                seen.lock()
+                    .push(target.expect("subscribe attempts carry a target"));
+                Step {
+                    hop: None,
+                    answer: match i {
+                        0 => Answer::DropWaiter,
+                        1 => Answer::PeerDisconnected,
+                        _ => Answer::Reply(not_found(msg, instance_id)),
+                    },
+                }
+            },
+        );
+        let _outcome = drive_client_subscribe_inner(
+            &op_manager,
+            instance_id,
+            Transaction::new::<SubscribeMsg>(),
+            false,
+            Some(peers[0].clone()),
+        )
+        .await
+        .expect("driver returns an outcome");
+        let targets = targets.lock().clone();
+        assert!(targets.len() >= 2);
+        assert_eq!(
+            failed_addrs(&op_manager),
+            targets[1..].to_vec(),
+            "the dropped waiter (attempt 0) must not be labelled; the \
+             disconnect (attempt 1) and every NotFound must be"
+        );
+    }
+
+    /// Source pin (relay side): `relay_subscribe_forward_once` labels a
+    /// downstream NotFound, timeout and send failure through the relay's
+    /// recorder and never records a NotFound as a success (#4485); a
+    /// `Subscribed` reply settles pending NotFounds; both the greedy forward
+    /// and the consult forward share the one recorder created in
+    /// `drive_relay_subscribe`.
+    #[test]
+    fn relay_subscribe_labels_downstream_outcomes_through_the_recorder() {
+        let src = include_str!("op_ctx_task.rs");
+        let fn_body = |sig: &str| -> &str {
+            let start = src.find(sig).expect("signature present");
+            let tests = src
+                .find("#[cfg(test)]\nmod route_attempt_driver_tests {")
+                .expect("test module");
+            assert!(start < tests, "`{sig}` matched inside the test module");
+            let end = src[start..].find("\n}\n").expect("fn end") + start;
+            &src[start..end]
+        };
+        let forward = fn_body("async fn relay_subscribe_forward_once(");
+        let not_found = forward
+            .find("result: SubscribeMsgResult::NotFound,")
+            .expect("NotFound arm");
+        let not_found_arm = &forward[not_found..];
+        let not_found_arm = &not_found_arm[..not_found_arm
+            .find("SubscribeForwardOutcome::NotFound {")
+            .expect("NotFound arm returns")];
+        assert!(
+            not_found_arm.contains("AttemptFailure::NotFound"),
+            "a downstream NotFound must go to the recorder as NotFound"
+        );
+        assert!(
+            !not_found_arm.contains("RouteOutcome::SuccessUntimed"),
+            "a downstream NotFound must not be recorded as a success"
+        );
+        assert!(forward.contains("AttemptFailure::Timeout"));
+        assert!(forward.contains("AttemptFailure::SendFailure"));
+        let subscribed = forward
+            .find("result: SubscribeMsgResult::Subscribed { key },")
+            .expect("Subscribed arm");
+        assert!(
+            forward[subscribed..not_found].contains("recorder.contract_exists();"),
+            "a Subscribed reply must settle pending NotFounds as failures"
+        );
+
+        let driver = fn_body("async fn drive_relay_subscribe(");
+        assert_eq!(
+            driver.matches("RouteAttemptRecorder::new(").count(),
+            1,
+            "one recorder per relay search"
+        );
+        assert!(driver.contains("AttemptOrigin::Relay"));
+        assert_eq!(
+            driver.matches("&mut recorder,").count(),
+            2,
+            "both the greedy forward and the consult forward must share it"
+        );
+    }
+
+    /// Source pin: the subscribe driver labels every non-success arm through
+    /// its recorder, gates the wire-error label on `PeerDisconnected`, and a
+    /// `Subscribed` reply settles pending NotFounds as failures before the
+    /// success event.
+    #[test]
+    fn subscribe_driver_routes_every_attempt_through_the_recorder() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_client_subscribe_inner(")
+            .expect("driver");
+        let end = src[start..].find("\n}\n").expect("fn end") + start;
+        let body = &src[start..end];
+        for needle in [
+            "AttemptFailure::SendFailure",
+            "AttemptFailure::Timeout",
+            "AttemptFailure::NotFound",
+        ] {
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "`{needle}` must be recorded exactly once in the driver"
+            );
+        }
+        let send_failure = body.find("AttemptFailure::SendFailure").unwrap();
+        assert!(
+            body[..send_failure]
+                .rfind("if matches!(err, OpError::PeerDisconnected { .. }) {")
+                .is_some_and(|p| send_failure - p < 300),
+            "the wire-error label must be gated on PeerDisconnected"
+        );
+        let subscribed = body.find("ReplyClass::Subscribed { key } =>").unwrap();
+        let exists = body[subscribed..]
+            .find("recorder.contract_exists();")
+            .expect("Subscribed arm must settle pending NotFounds")
+            + subscribed;
+        let success = body[subscribed..]
+            .find("op_manager.ring.routing_finished(route_event);")
+            .expect("success event")
+            + subscribed;
+        assert!(exists < success);
+    }
+}

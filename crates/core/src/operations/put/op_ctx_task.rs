@@ -7958,3 +7958,173 @@ mod tests {
         );
     }
 }
+
+/// Driver-level tests for the originator PUT's per-attempt route labelling
+/// (#4485): the real `drive_client_put_inner` against a scripted event loop
+/// playing the originator-loopback relay.
+#[cfg(test)]
+mod route_attempt_driver_tests {
+    use super::*;
+    use crate::message::MessageStats;
+    use crate::operations::route_attempt::driver_test_support::{
+        Answer, Step, failed_addrs, failure_window, op_manager_with_peers, serve_attempts,
+    };
+    use std::sync::atomic::Ordering;
+
+    fn contract() -> ContractContainer {
+        crate::operations::test_utils::make_test_contract(b"route-attempt-put")
+    }
+
+    fn stored(msg: &NetMessage, key: ContractKey) -> NetMessage {
+        NetMessage::from(PutMsg::Response {
+            id: *msg.id(),
+            key,
+            hop_count: 1,
+        })
+    }
+
+    async fn put(op_manager: &Arc<OpManager>, contract: ContractContainer) -> DriverOutcome {
+        drive_client_put_inner(
+            op_manager,
+            Transaction::new::<PutMsg>(),
+            contract,
+            RelatedContracts::default(),
+            WrappedState::new(vec![7, 7, 7]),
+            3,
+            false,
+            false,
+        )
+        .await
+        .expect("driver returns an outcome")
+    }
+
+    /// A timeout and a dropped connection are failures against the hops the
+    /// loopback relay really forwarded to; the success that follows is
+    /// credited to its own forwarded hop, and nothing is labelled twice.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn failed_attempts_blame_forwarded_hops_and_success_credits_its_hop() {
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers("put-attempts", 4).await;
+        let contract = contract();
+        let key = contract.key();
+        let hops = peers.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Put,
+            move |i, msg, _| match i {
+                0 => Step {
+                    hop: Some(hops[3].clone()),
+                    answer: Answer::Never,
+                },
+                1 => Step {
+                    hop: Some(hops[2].clone()),
+                    answer: Answer::PeerDisconnected,
+                },
+                _ => Step {
+                    hop: Some(hops[1].clone()),
+                    answer: Answer::Reply(stored(msg, key)),
+                },
+            },
+        );
+
+        let outcome = put(&op_manager, contract).await;
+        assert!(matches!(outcome, DriverOutcome::Publish(Ok(_))));
+        assert_eq!(
+            failure_window(&op_manager),
+            vec![
+                (peers[3].socket_addr(), 1.0),
+                (peers[2].socket_addr(), 1.0),
+                (peers[1].socket_addr(), 0.0),
+            ],
+            "one failure per failed attempt, then the success, each against \
+             the hop that attempt was forwarded to"
+        );
+        assert_eq!(op_manager.attempt_hop_registry().len(), 0);
+    }
+
+    /// Every attempt times out and the budget exhausts: one failure per
+    /// attempted hop, no extra exhaustion event.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn exhausted_timeouts_label_each_attempted_hop_once() {
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers("put-exhausted", 5).await;
+        let hops = peers.clone();
+        let served = serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Put,
+            move |i, _, _| Step {
+                hop: Some(hops[i % hops.len()].clone()),
+                answer: Answer::Never,
+            },
+        );
+
+        let outcome = put(&op_manager, contract()).await;
+        assert!(matches!(outcome, DriverOutcome::Publish(Err(_))));
+        let attempts = served.load(Ordering::SeqCst);
+        assert!(attempts >= 2, "the budget must allow several attempts");
+        let expected: Vec<_> = (0..attempts)
+            .map(|i| peers[i % peers.len()].socket_addr().unwrap())
+            .collect();
+        assert_eq!(failed_addrs(&op_manager), expected);
+        assert_eq!(failure_window(&op_manager).len(), attempts);
+    }
+
+    /// Attempts the loopback relay never forwarded blame nobody.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn attempts_with_no_forwarded_hop_record_nothing() {
+        let (op_manager, rx, _peers, _guards) = op_manager_with_peers("put-no-hop", 4).await;
+        let served = serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Put,
+            move |i, _, _| Step {
+                hop: None,
+                answer: if i == 1 {
+                    Answer::PeerDisconnected
+                } else {
+                    Answer::Never
+                },
+            },
+        );
+        let outcome = put(&op_manager, contract()).await;
+        assert!(matches!(outcome, DriverOutcome::Publish(Err(_))));
+        assert!(served.load(Ordering::SeqCst) >= 2);
+        assert!(failure_window(&op_manager).is_empty());
+    }
+
+    /// Source pin: the originator-loopback PUT relay reports its hop before
+    /// dispatching and clears it on each local dispatch failure.
+    #[test]
+    fn loopback_put_relay_records_and_clears_its_hop() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_put<CB>(")
+            .expect("drive_relay_put");
+        let end = src[start..].find("\n}\n").expect("fn end") + start;
+        let body = &src[start..end];
+        let loopback = body.find("if originator_loopback {").expect("loopback");
+        let record = body[loopback..]
+            .find(".record_hop(&incoming_tx, &next_peer);")
+            .expect("loopback PUT relay must record its hop")
+            + loopback;
+        let first_dispatch = body[loopback..]
+            .find("send_fire_and_forget(next_addr")
+            .expect("loopback dispatch")
+            + loopback;
+        assert!(record < first_dispatch);
+        let loopback_end = body[loopback..]
+            .find("return Ok(());")
+            .expect("loopback exit")
+            + loopback;
+        let failures = body[loopback..loopback_end]
+            .matches("return relay_put_finalize_local(")
+            .count();
+        let clears = body[loopback..loopback_end]
+            .matches(".clear_hop(&incoming_tx);")
+            .count();
+        assert_eq!(
+            failures, clears,
+            "every local dispatch failure in the loopback branch must clear the hop"
+        );
+    }
+}
