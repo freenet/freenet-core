@@ -1076,12 +1076,14 @@ pub(crate) struct Router {
 }
 
 /// Cumulative success / failure counts of the route events this router has
-/// ingested since it was built (#4485).
+/// ingested since it was built.
 ///
 /// The isotonic estimators hold a rolling window of at most 500 events, so
 /// they cannot say how many failures were ever observed; these counters can.
 /// They exist so tests (and a future diagnostic) can check that the failure
-/// model is actually receiving failure labels, the defect #4485 fixed.
+/// model is actually receiving failure labels (for most of its life it received
+/// almost none: relays labelled downstream NotFound a success and originators
+/// labelled only final successes).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RouteOutcomeTotals {
     /// `RouteOutcome::Failure` events.

@@ -8131,6 +8131,44 @@ mod route_attempt_driver_tests {
         assert!(failure_window(&op_manager).is_empty());
     }
 
+    /// Source pin: a streaming header re-surfaced after a later wire
+    /// exhaustion must not get a second terminal Failure. Its peer was charged
+    /// when its stream failed (`emit_get_route_failure`), and every later
+    /// attempt was labelled as it resolved. The conversion sets the flag and the
+    /// client driver's terminal route event is gated on it.
+    #[test]
+    fn resurfaced_streaming_header_does_not_double_count() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = |sig: &str| -> String {
+            let start = src.find(sig).expect("signature present");
+            let test_mod = src.find("#[cfg(test)]\nmod tests {").expect("test module");
+            assert!(start < test_mod, "`{sig}` matched inside the test module");
+            let end = src[start..].find("\n}\n").expect("fn end") + start;
+            src[start..end].to_string()
+        };
+        let wrapper = body("async fn drive_get_with_assembly_retry(");
+        let exhausted = wrapper
+            .find("RetryLoopOutcome::Exhausted(cause) => {")
+            .expect("exhausted arm");
+        let flag = wrapper[exhausted..]
+            .find("assembly.terminal_route_event_already_recorded = true;")
+            .expect("conversion must set the flag")
+            + exhausted;
+        let convert = wrapper[exhausted..]
+            .find("break RetryLoopOutcome::Done(Terminal::Streaming {")
+            .expect("conversion")
+            + exhausted;
+        assert!(flag < convert);
+        let client = body("async fn drive_client_get_inner(");
+        let gate = client
+            .find("if !streaming_assembly.terminal_route_event_already_recorded {")
+            .expect("terminal route event must be gated on the flag");
+        let event = client
+            .find("op_manager.ring.routing_finished(route_event);")
+            .expect("terminal route event");
+        assert!(gate < event);
+    }
+
     /// Source pin: the client GET driver gets a live recorder, the sub-op
     /// driver a disabled one, and the originator-loopback relay reports the
     /// hop it really forwards to before dispatching.
