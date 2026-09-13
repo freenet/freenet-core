@@ -123,18 +123,19 @@ pub struct ConfigArgs {
     ///
     /// Set it higher to contribute more disk to the network, but keep it a
     /// few GiB BELOW the disk budget. The disk budget is the smaller of
-    /// `--hosting-disk-pct` of the space available to Freenet and
-    /// `--max-hosting-disk` (default 32 GiB), and it counts WASM code and the
-    /// compile cache (up to about 512 MiB) as well as state. If this value is
-    /// equal to or above the disk budget, the node stops accepting new
-    /// contracts and state growth once code and cache fill the gap, instead of
-    /// evicting to make room. For example, with 100 GiB available and the
-    /// default `--hosting-disk-pct` of 0.5 the disk budget is about 50 GiB, so
-    /// setting this to 50 GiB leaves no headroom even if `--max-hosting-disk`
-    /// is raised. Allow more headroom if the node hosts many contracts with
-    /// distinct code, since WASM grows with those. The number of contracts
-    /// hosted is limited separately by available memory, so raising this does
-    /// not make a node take on more contracts than its memory can hold.
+    /// `--hosting-disk-pct` of the space available to Freenet (Freenet's own
+    /// usage plus free space) and `--max-hosting-disk` (default 32 GiB), and it
+    /// counts WASM code and the compile cache (up to about 512 MiB) as well as
+    /// state, so the headroom is for those. If this value is not at least that
+    /// far below the disk budget, the node can stop accepting new contracts
+    /// and state growth instead of evicting to make room. For example, with
+    /// 40 GiB available and default settings the disk budget is
+    /// min(0.5 x 40 GiB, 32 GiB) = 20 GiB, so set this to about 17 GiB; on a
+    /// larger disk the 32 GiB cap binds unless `--max-hosting-disk` is raised
+    /// too. Allow more headroom if the node hosts many contracts with distinct
+    /// code, since WASM grows with those. The number of contracts hosted is
+    /// limited separately by available memory, so raising this does not make a
+    /// node take on more contracts than its memory can hold.
     // Internal: the explicit value is passed to `HostingManager` unclamped;
     // only the DEFAULT is RAM-scaled. (One exception: a config.toml value of
     // exactly 1 GiB is the legacy flat-default sentinel and re-derives from RAM,
@@ -147,8 +148,9 @@ pub struct ConfigArgs {
     // compares STATE bytes against `min(this, disk_budget)` while the admission
     // gates (`admit_state_write` / `admit_state_update` / `admit_wasm_write`)
     // refuse against `disk_budget` using state + WASM + compile cache. Whenever
-    // this value is >= disk_budget there is a band where writes are refused and
-    // eviction never fires. It is phrased against the DISK BUDGET, not the
+    // this value is within (WASM + compile cache) of disk_budget, or above it,
+    // there is a band — state in (disk_budget - WASM - cache, min(this,
+    // disk_budget)] — where writes are refused and eviction never fires. It is phrased against the DISK BUDGET, not the
     // `--max-hosting-disk` flag, because `disk_budget = min(pct * (freenet_used
     // + free), cap)`: an operator giving "half the disk" at the default pct hits
     // the band via the pct term no matter how high the cap is set.
@@ -173,7 +175,8 @@ pub struct ConfigArgs {
     /// To contribute more than about 32 GiB of state, raise this so the disk
     /// budget stays a few GiB above `--max-hosting-storage`. Raising it has no
     /// effect if `--hosting-disk-pct` of the available disk space is already the
-    /// smaller limit; raise that instead. Default: 32 GiB.
+    /// smaller limit; raise that instead, leaving room for database overhead
+    /// and anything else on the disk. Default: 32 GiB.
     // Internal: #4683.
     #[arg(long, env = "MAX_HOSTING_DISK")]
     pub max_hosting_disk: Option<u64>,
