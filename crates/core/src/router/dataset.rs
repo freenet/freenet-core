@@ -25,7 +25,11 @@
 //!   forward-acceptance estimator is out of scope.
 //! - Events are tagged `originator` or `relay`: relay hops record outcomes under
 //!   their own conventions (see `record_relay_route_event`), and replays may need
-//!   to treat the two populations differently.
+//!   to treat the two populations differently. `originator` means the node
+//!   started the operation, which includes sub-operations it starts while
+//!   serving someone else, not only its own clients' requests.
+//! - A run may append after an earlier run's `truncated` line if that run
+//!   stopped with room to spare (a large record did not fit); split on `start`.
 //! - `t_ms` is absolute. The predictor's time feature is relative to process
 //!   start, so a replay re-bases on the `start` line that opens each run.
 //!
@@ -45,6 +49,10 @@
 //! anonymised: peers are keyed by a hash of their public key (linkable by anyone
 //! who holds the key), and ring locations are derived from masked IP addresses.
 //! Treat it like a node log.
+//!
+//! Give each node process its own path. The cap is enforced per process, and
+//! two writers appending to one file can interleave lines longer than the write
+//! buffer — so two gateways on one host must not share the variable's value.
 //!
 //! # Never blocks the caller
 //!
@@ -394,11 +402,17 @@ impl Writer {
         Ok(())
     }
 
-    fn record(&mut self, record: &Record) -> Result<(), WriteError> {
-        match record {
+    /// Write a record. One the cap turns away is counted as dropped, like any
+    /// other record that never reaches the file.
+    fn record(&mut self, record: &Record, dropped: &AtomicU64) -> Result<(), WriteError> {
+        let result = match record {
             Record::Route(route) => self.line(&Line::Route(route)),
             Record::Peers { t_ms, peers } => self.line(&Line::Peers { t_ms: *t_ms, peers }),
+        };
+        if let Err(WriteError::Cap) = result {
+            dropped.fetch_add(1, Ordering::Relaxed);
         }
+        result
     }
 
     fn flush(&mut self) -> Result<(), WriteError> {
@@ -424,6 +438,7 @@ fn write_loop(
         ),
         Err(WriteError::Io(error)) => tracing::warn!(
             %error,
+            dropped = dropped.load(Ordering::Relaxed),
             "routing dataset: write failed; recording stopped"
         ),
     }
@@ -453,6 +468,13 @@ fn run_writer(
 
     let result = drain(rx, &mut writer, dropped);
     if let Err(WriteError::Cap) = result {
+        // Records still queued behind the one that hit the cap will never be
+        // written; count them so the marker's total covers them. (A send landing
+        // in the instant between this and the writer marking itself stopped is
+        // still counted by the sender, just not in this line — the total here is
+        // exact up to that window.)
+        let queued = rx.try_iter().count() as u64;
+        dropped.fetch_add(queued, Ordering::Relaxed);
         // The marker may use the reserve. If even that is gone, an earlier run
         // already marked the file and this one adds nothing.
         let marker = Line::Truncated {
@@ -487,12 +509,12 @@ fn drain(
         };
         writer.report_drops(dropped)?;
         if let Some(record) = first {
-            writer.record(&record)?;
+            writer.record(&record, dropped)?;
             // Take whatever else is already queued, then flush: a busy node is
             // flushed every batch, not only when it happens to go idle.
             for _ in 1..MAX_RECORDS_PER_FLUSH {
                 match rx.try_recv() {
-                    Ok(record) => writer.record(&record)?,
+                    Ok(record) => writer.record(&record, dropped)?,
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         writer.flush()?;
@@ -710,7 +732,11 @@ mod tests {
         let dataset = write_queued(
             &path,
             cap,
-            vec![route("00000000000000aa"), route("00000000000000bb")],
+            vec![
+                route("00000000000000aa"),
+                route("00000000000000bb"),
+                route("00000000000000cc"),
+            ],
         );
 
         let lines = read_lines(&path);
@@ -720,6 +746,11 @@ mod tests {
             .collect();
         assert_eq!(kinds, ["start", "route", "truncated"], "{lines:?}");
         assert_eq!(lines[1]["peer"], "00000000000000aa");
+        assert_eq!(
+            lines[2]["dropped_total"], 2,
+            "the marker counts the record the cap turned away and the one still queued"
+        );
+        assert_eq!(dataset.dropped(), 2);
         let content_before_marker: u64 = std::fs::read_to_string(&path)
             .unwrap()
             .lines()
