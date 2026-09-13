@@ -558,6 +558,32 @@ pub(crate) struct RouterSnapshotInfo {
     /// contracts. Populated by `Ring` on the snapshot cadence. `None` until the
     /// ring is built. Per-node aggregate scalar.
     pub hosting_cost_evictions_total: Option<u64>,
+    /// Resident-overhead pressure axis (#5325), populated by `Ring` from the
+    /// `HostingManager` on the snapshot cadence. This is the SECOND, independent
+    /// eviction pressure: `hosting_budget_bytes` / `hosting_current_bytes` above
+    /// bound contract STATE bytes only, while this axis bounds the per-contract
+    /// resident bookkeeping that scales with hosted-contract COUNT, and either
+    /// can trigger a sweep on its own. Without these four, a node evicting
+    /// purely under slot pressure looks idle in telemetry — its state-byte
+    /// occupancy can sit at 13% while `hosting_resident_overhead_evictions_total`
+    /// climbs, which is exactly the confusion the fleet audit hit.
+    ///
+    /// `hosting_resident_overhead_budget_bytes` is the RAM-scaled ceiling;
+    /// `hosting_estimated_resident_overhead_bytes` is `contract_count *
+    /// ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`. Treat that pair as a
+    /// contract-COUNT ceiling wearing memory units, NOT as measured RAM: the
+    /// "used" side is a count multiplied by a flat estimate, so a collector that
+    /// renders it as memory will mislead (the node's own dashboard renders
+    /// `hosting_contract_slot_budget` — the same budget expressed as the slot
+    /// count it really bounds — for that reason).
+    /// `hosting_resident_overhead_evictions_total` is a monotonic counter the
+    /// collector differences to get a slot-pressure eviction rate; it may overlap
+    /// with `hosting_budget_evictions_total`. `None` until the ring is built.
+    /// Per-node aggregate scalars.
+    pub hosting_resident_overhead_budget_bytes: Option<u64>,
+    pub hosting_estimated_resident_overhead_bytes: Option<u64>,
+    pub hosting_contract_slot_budget: Option<u64>,
+    pub hosting_resident_overhead_evictions_total: Option<u64>,
     /// Local `UpdateNotification` deliveries dropped because the subscriber's
     /// channel was FULL (#4681). The subscriber's cached summary is invalidated
     /// at the same time, so the next update resyncs it with full state; a
@@ -2331,6 +2357,10 @@ impl Router {
             hosting_oom_valve_evictions_total: None,
             hosting_subscribed_evictions_total: None,
             hosting_cost_evictions_total: None,
+            hosting_resident_overhead_budget_bytes: None,
+            hosting_estimated_resident_overhead_bytes: None,
+            hosting_contract_slot_budget: None,
+            hosting_resident_overhead_evictions_total: None,
             notifications_dropped_channel_full: None,
             notifications_dropped_channel_closed: None,
             notifications_no_local_subscriber: None,

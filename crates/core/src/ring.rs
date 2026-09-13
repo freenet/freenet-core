@@ -1893,6 +1893,21 @@ impl Ring {
             // (CPU / broadcast fan-out) dominated the node's total. Nonzero =
             // the trigger is firing; runaway = floors/share miscalibrated.
             snapshot.hosting_cost_evictions_total = Some(hosting.cost_evictions_total);
+            // Resident-overhead pressure axis (#5325). These were computed and
+            // rendered on the node's own dashboard from the day the axis landed,
+            // but never mirrored here, so the collector could not see the SECOND
+            // eviction pressure at all: a node shedding purely under slot
+            // pressure reported a low state-byte occupancy and nothing else. Same
+            // hand-mirror footgun as the gauges above — pinned by
+            // `hosting_cache_stats_fields_are_all_mirrored`, which fails when a
+            // `HostingCacheStats` field has no reader in this block.
+            snapshot.hosting_resident_overhead_budget_bytes =
+                Some(hosting.resident_overhead_budget_bytes);
+            snapshot.hosting_estimated_resident_overhead_bytes =
+                Some(hosting.estimated_resident_overhead_bytes);
+            snapshot.hosting_contract_slot_budget = Some(hosting.contract_slot_budget);
+            snapshot.hosting_resident_overhead_evictions_total =
+                Some(hosting.resident_overhead_evictions_total);
             // Local notification-delivery outcomes (#4681). PER-NODE counters
             // (see HostingManager), read once per snapshot — no per-event
             // stream. Read from the manager, not the stats snapshot, for the
@@ -9836,4 +9851,140 @@ pub(crate) enum RingError {
     NoHostingPeers(ContractInstanceId),
     #[error("Peer has not joined the network yet (no ring location established)")]
     PeerNotJoined,
+}
+
+#[cfg(test)]
+mod hosting_stats_mirror_source_tests {
+    //! Source-scrape pin: every `HostingCacheStats` field must be mirrored into
+    //! `RouterSnapshotInfo` by `emit_router_snapshot_telemetry`.
+    //!
+    //! The telemetry path is hand-mirrored twice over (`HostingCacheStats` ->
+    //! `RouterSnapshotInfo` -> the OTLP JSON body), and nothing in the type
+    //! system connects the hops. The resident-overhead pressure axis (#5325)
+    //! was computed, rendered on the node's own dashboard, and dropped on the
+    //! floor at THIS step for its whole life: the collector could not see the
+    //! second eviction pressure at all, so a node evicting purely under slot
+    //! pressure looked idle in fleet telemetry. This pin makes the same
+    //! omission fail CI.
+    //!
+    //! It deliberately checks the FIRST hop only. The second hop
+    //! (`RouterSnapshotInfo` -> JSON) has its own per-gauge pins in
+    //! `tracing::telemetry`, including
+    //! `router_snapshot_json_includes_resident_overhead_gauges`.
+
+    /// Fields that are deliberately NOT mirrored to telemetry. Each entry needs
+    /// a reason: adding one is a decision to make a stat invisible to the
+    /// collector, which is exactly what this pin exists to stop happening by
+    /// accident.
+    const DELIBERATELY_NOT_MIRRORED: &[(&str, &str)] = &[];
+
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    /// Body of the item starting at `signature_prefix`, brace-balanced. Bounding
+    /// to the item is load-bearing: an unbounded `contains` over an 8000-line
+    /// file would match this module's own assertion strings and pass vacuously.
+    fn item_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..].find('{').expect("item must have a body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces while extracting {signature_prefix}");
+    }
+
+    fn hosting_cache_stats_fields() -> Vec<String> {
+        const CACHE_SRC: &str = include_str!("ring/hosting/cache.rs");
+        let body = item_body(CACHE_SRC, "pub(crate) struct HostingCacheStats {");
+        let fields: Vec<String> = body
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix("pub "))
+            .filter_map(|rest| rest.split_once(':'))
+            .map(|(name, _)| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect();
+        assert!(
+            fields.len() >= 10,
+            "expected to scrape the HostingCacheStats fields, got {fields:?} - the \
+             struct declaration or its `pub <name>: <ty>` shape changed, and this \
+             pin is now vacuous. Fix the scrape, do not delete the test."
+        );
+        fields
+    }
+
+    #[test]
+    fn hosting_cache_stats_fields_are_all_mirrored() {
+        let body = item_body(
+            production_source(),
+            "async fn emit_router_snapshot_telemetry(",
+        );
+        // The mirror reads every stat off one binding: `let hosting =
+        // ring.hosting_manager.hosting_cache_stats();`. Anchor on that binding
+        // so the pin fails if the read moves, rather than matching a field name
+        // that happens to appear in a comment elsewhere in the function.
+        assert!(
+            body.contains("let hosting = ring.hosting_manager.hosting_cache_stats();"),
+            "emit_router_snapshot_telemetry must bind the hosting stats as \
+             `hosting`; if that binding was renamed, update this pin's anchor \
+             too (it is what bounds the field check below)."
+        );
+
+        let mut missing = Vec::new();
+        for field in hosting_cache_stats_fields() {
+            if DELIBERATELY_NOT_MIRRORED
+                .iter()
+                .any(|(name, _)| *name == field)
+            {
+                continue;
+            }
+            if !body.contains(&format!("hosting.{field}")) {
+                missing.push(field);
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "HostingCacheStats fields with no reader in \
+             emit_router_snapshot_telemetry: {missing:?}. Every stat must reach \
+             `RouterSnapshotInfo` (and from there the OTLP body) or be listed in \
+             DELIBERATELY_NOT_MIRRORED with a reason. A stat that exists but is \
+             not exported is invisible to fleet telemetry - see #5325, where the \
+             resident-overhead eviction axis was dropped exactly here."
+        );
+    }
+
+    /// The exclusion list is an escape hatch, so make using it deliberate: an
+    /// entry with no reason is the shape that turns this pin ornamental.
+    #[test]
+    fn not_mirrored_exclusions_carry_a_reason() {
+        for (name, reason) in DELIBERATELY_NOT_MIRRORED {
+            assert!(
+                reason.len() > 20,
+                "DELIBERATELY_NOT_MIRRORED entry {name:?} needs a real reason, \
+                 got {reason:?}"
+            );
+        }
+    }
 }

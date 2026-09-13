@@ -1687,6 +1687,28 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     // to know WHY the ceiling is where it is can still get there. Estimated,
     // never measured — say so, since the whole failure this replaces was a
     // derived count reading as a memory measurement.
+    // The state-byte tile was labelled "RAM used" until 2026-09. It is not RAM:
+    // `used_bytes` is `HostingCacheStats::current_bytes`, the tracked contract
+    // STATE bytes, and `budget_bytes` is a RAM-DERIVED ceiling on that state
+    // (clamp(total_ram/8, 128 MiB, 1 GiB)) — derived from RAM, but bounding
+    // stored state, most of which is on disk. Reading it as resident memory
+    // produced a real support thread: an operator saw a 4 GB node "near full"
+    // while the process used well under 1 GB, and the node's home page was the
+    // reason. The node's actual RSS is the `memory_rss_bytes` /
+    // `memory_limit_bytes` pair from `node::resource_metrics` — a different
+    // measurement on a different card. Same failure the slot tile below already
+    // fixed; do NOT re-label this as memory.
+    let state_tooltip = format!(
+        "Contract STATE bytes, not the node's resident memory. The node tracks \
+         {used} of stored contract state against a {budget} ceiling. The ceiling is \
+         DERIVED from system RAM (one eighth of it, clamped to between 128 MB and \
+         1 GB) but what it bounds is stored state, most of which lives on disk — so \
+         this filling up does not mean the process is using that much memory. For \
+         the node's actual resident memory see the system resource figures.",
+        used = format_bytes(h.used_bytes),
+        budget = format_bytes(h.budget_bytes),
+    );
+
     let slot_tooltip = format!(
         "A contract-count ceiling, not a memory measurement. Each hosted contract is \
          charged a flat estimate for per-contract bookkeeping (subscriptions, redb/index \
@@ -1716,7 +1738,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             {binding}
             <div class="g-verdict-row">
                 <div class="g-norms">
-                    <div class="g-norm"><div class="g-norm-label">RAM used</div><div class="g-norm-value">{used} / {budget} ({pct:.0}%)</div></div>
+                    <div class="g-norm" title="{state_tooltip}"><div class="g-norm-label">Contract state</div><div class="g-norm-value">{used} / {budget} ({pct:.0}%)</div></div>
                     <div class="g-norm"><div class="g-norm-label">Headroom</div><div class="g-norm-value">{headroom}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Hosted</div><div class="g-norm-value">{count}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Budget evictions</div><div class="g-norm-value">{budget_evictions}</div></div>
@@ -1746,6 +1768,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             {footer}
         </div>"##,
         binding = binding,
+        state_tooltip = html_escape(&state_tooltip),
         used = format_bytes(h.used_bytes),
         budget = format_bytes(h.budget_bytes),
         pct = used_pct,

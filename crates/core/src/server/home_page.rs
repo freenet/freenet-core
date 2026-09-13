@@ -2567,7 +2567,21 @@ mod tests {
         );
         assert!(
             html.contains("64.0 MB / 256.0 MB"),
-            "RAM used/budget tile — got:\n{html}"
+            "contract-state used/budget tile — got:\n{html}"
+        );
+        // This tile was labelled "RAM used" until 2026-09 and it is not RAM: it
+        // is tracked contract STATE bytes against a RAM-DERIVED ceiling on that
+        // state. An operator read it as resident memory and reported a 4 GB node
+        // "near full" while the process was using under 1 GB. Pin both halves —
+        // the honest label present, and the misleading one gone.
+        assert!(
+            html.contains("Contract state"),
+            "state tile must be labelled as contract state, not memory — got:\n{html}"
+        );
+        assert!(
+            !html.contains(">RAM used<"),
+            "the state tile must not be labelled \"RAM used\": it measures \
+             contract state bytes, not the node's resident memory — got:\n{html}"
         );
         // Non-zero recently-read evictions are the miscalibration alarm: colored.
         assert!(
