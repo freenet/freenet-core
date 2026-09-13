@@ -2754,4 +2754,754 @@ mod recoverability {
             recovery.scored
         );
     }
+
+    // -----------------------------------------------------------------------
+    // k-NN generally vs renegade's metric learner vs its k selection.
+    //
+    // Diagnostic experiment, not a gate: every estimator below is fed the SAME
+    // event stream `run` generates (same RNG draw order, checked against `run`),
+    // predicts before the event is added, and is composed as
+    // `clamp(global + r_hat, 0, 1)`.
+    // -----------------------------------------------------------------------
+
+    /// One stored residual observation, in the feature space the router uses.
+    #[derive(Clone, Copy)]
+    struct ResidualPoint {
+        /// First-appearance id, as `get_or_assign_peer_id` assigns it.
+        peer_id: f64,
+        peer_index: usize,
+        contract: f64,
+        distance: f64,
+        time: f64,
+        residual: f64,
+    }
+
+    /// Per-feature distances identical to `RoutingObservation::feature_distances`
+    /// (peer categorical, contract on the ring, distance, time over 24h),
+    /// combined with FIXED hand-set weights. Nothing is learned.
+    fn fixed_distance(weights: [f64; 4], a: &ResidualPoint, b: &ResidualPoint) -> f64 {
+        let d = [
+            if (a.peer_id - b.peer_id).abs() < 0.5 {
+                0.0
+            } else {
+                1.0
+            },
+            ring_distance(a.contract, b.contract) * 2.0,
+            (a.distance - b.distance).abs() * 2.0,
+            ((a.time - b.time).abs() / 24.0).min(1.0),
+        ];
+        let total: f64 = weights.iter().sum();
+        d.iter()
+            .zip(weights.iter())
+            .map(|(d, w)| d * w)
+            .sum::<f64>()
+            / total
+    }
+
+    /// Renegade's own no-metric ("Gower") distance: equal weights.
+    const GOWER: [f64; 4] = [1.0, 1.0, 1.0, 1.0];
+    /// A priori "peer first" weighting, chosen before any run and not tuned:
+    /// any same-peer point is nearer than any different-peer point
+    /// (0.5 + 0.25 + 0.1 < 1.0), then contract, then distance, a little time.
+    const PEER_FIRST: [f64; 4] = [1.0, 0.5, 0.25, 0.1];
+
+    /// `(mean, variance, count)` of the first `k` sorted neighbours under
+    /// renegade's own `weighted_mean` semantics: inverse distance, with the
+    /// exact-match short-circuit. Count mirrors `predict_native`'s `n_eff`.
+    fn inverse_distance_stats(sorted: &[(f64, f64)], k: usize) -> Option<(f64, f64, f64)> {
+        let prefix = &sorted[..k.min(sorted.len())];
+        if prefix.is_empty() {
+            return None;
+        }
+        let exact: Vec<(f64, f64)> = prefix
+            .iter()
+            .filter(|(d, _)| *d == 0.0)
+            .map(|(_, r)| (1.0, *r))
+            .collect();
+        let weighted: Vec<(f64, f64)> = if exact.is_empty() {
+            prefix.iter().map(|(d, r)| (1.0 / d, *r)).collect()
+        } else {
+            exact
+        };
+        weighted_stats(&weighted)
+    }
+
+    fn uniform_stats(sorted: &[(f64, f64)], k: usize) -> Option<(f64, f64, f64)> {
+        let weighted: Vec<(f64, f64)> = sorted[..k.min(sorted.len())]
+            .iter()
+            .map(|(_, r)| (1.0, *r))
+            .collect();
+        weighted_stats(&weighted)
+    }
+
+    fn weighted_stats(weighted: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
+        let weight_sum: f64 = weighted.iter().map(|(w, _)| w).sum();
+        if weight_sum <= 0.0 || !weight_sum.is_finite() {
+            return None;
+        }
+        let mean = weighted.iter().map(|(w, r)| w * r).sum::<f64>() / weight_sum;
+        let variance = weighted
+            .iter()
+            .map(|(w, r)| w * (r - mean).powi(2))
+            .sum::<f64>()
+            / weight_sum;
+        Some((mean, variance, weighted.len() as f64))
+    }
+
+    /// Sorted `(distance, residual)` neighbours of `query`, nearest first,
+    /// truncated to `keep`.
+    fn sorted_neighbours(
+        history: &[ResidualPoint],
+        query: &ResidualPoint,
+        weights: [f64; 4],
+        keep: usize,
+    ) -> Vec<(f64, f64)> {
+        let mut all: Vec<(f64, f64)> = history
+            .iter()
+            .map(|p| (fixed_distance(weights, query, p), p.residual))
+            .collect();
+        let keep = keep.min(all.len());
+        if keep == 0 {
+            return Vec::new();
+        }
+        if keep < all.len() {
+            all.select_nth_unstable_by(keep - 1, |a, b| a.0.total_cmp(&b.0));
+            all.truncate(keep);
+        }
+        all.sort_by(|a, b| a.0.total_cmp(&b.0));
+        all
+    }
+
+    /// Renegade's own k-selection procedure (`compute_optimal_k_and_bandwidth`,
+    /// hard-k + inverse distance branch) reimplemented over a FIXED metric: LOO
+    /// over at most 200 step-sampled points, `max_k = ceil(sqrt(n))`.
+    fn loo_select_k(history: &[ResidualPoint], weights: [f64; 4]) -> usize {
+        let n = history.len();
+        if n <= 2 {
+            return n.max(1);
+        }
+        let max_k = ((n as f64).sqrt().ceil() as usize).max(1).min(n - 1);
+        let max_eval = 200.min(n);
+        let step = if n > max_eval { n / max_eval } else { 1 };
+        let mut errors_by_k = vec![0.0f64; max_k + 1];
+        let mut count = 0usize;
+        for i in (0..n).step_by(step).take(max_eval) {
+            let mut distances: Vec<(f64, f64)> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| {
+                    (
+                        fixed_distance(weights, &history[i], &history[j]),
+                        history[j].residual,
+                    )
+                })
+                .collect();
+            distances.sort_by(|a, b| a.0.total_cmp(&b.0));
+            distances.truncate(max_k);
+            count += 1;
+            let (mut weight_sum, mut value_sum) = (0.0, 0.0);
+            let (mut exact_w, mut exact_v, mut has_exact) = (0.0, 0.0, false);
+            for k in 1..=distances.len() {
+                let (dist, output) = distances[k - 1];
+                if dist == 0.0 {
+                    has_exact = true;
+                    exact_w += 1.0;
+                    exact_v += output;
+                } else if !has_exact {
+                    weight_sum += 1.0 / dist;
+                    value_sum += output / dist;
+                }
+                let predicted = if has_exact {
+                    exact_v / exact_w
+                } else {
+                    value_sum / weight_sum
+                };
+                errors_by_k[k] += (predicted - history[i].residual).powi(2);
+            }
+        }
+        let mut best_k = 1;
+        let mut best = f64::MAX;
+        for (k, &err) in errors_by_k.iter().enumerate().skip(1) {
+            let error = err / count.max(1) as f64;
+            if error < best {
+                best = error;
+                best_k = k;
+            }
+        }
+        best_k
+    }
+
+    #[derive(Default, Clone, Copy)]
+    struct Moments {
+        n: f64,
+        sum: f64,
+        sumsq: f64,
+    }
+
+    impl Moments {
+        fn add(&mut self, x: f64) {
+            self.n += 1.0;
+            self.sum += x;
+            self.sumsq += x * x;
+        }
+        fn mean(&self) -> f64 {
+            self.sum / self.n
+        }
+    }
+
+    /// Parametric hierarchical residual: `b_peer + b_{peer,band}`, each a
+    /// running mean shrunk toward its parent (peer-band -> peer -> 0) by
+    /// `n / (n + sigma^2 / tau^2)`, with `sigma^2` and both `tau^2` estimated
+    /// online by method of moments. No neighbours anywhere. Bands are uniform
+    /// and fixed a priori; NOT aligned to the harness's targeted bands.
+    struct Hierarchical {
+        bands: usize,
+        /// Bands over peer-to-contract DISTANCE instead of contract location.
+        by_distance: bool,
+        peers: HashMap<usize, Moments>,
+        cells: HashMap<(usize, usize), Moments>,
+    }
+
+    impl Hierarchical {
+        fn new(bands: usize, by_distance: bool) -> Self {
+            Hierarchical {
+                bands,
+                by_distance,
+                peers: HashMap::new(),
+                cells: HashMap::new(),
+            }
+        }
+
+        fn band(&self, contract: f64, distance: f64) -> usize {
+            let unit = if self.by_distance {
+                distance * 2.0
+            } else {
+                contract
+            };
+            ((unit * self.bands as f64).floor() as usize).min(self.bands - 1)
+        }
+
+        fn add(&mut self, point: &ResidualPoint) {
+            let band = self.band(point.contract, point.distance);
+            self.peers
+                .entry(point.peer_index)
+                .or_default()
+                .add(point.residual);
+            self.cells
+                .entry((point.peer_index, band))
+                .or_default()
+                .add(point.residual);
+        }
+
+        /// `(sigma2, tau2_band, tau2_peer)`.
+        fn variance_components(&self) -> Option<(f64, f64, f64)> {
+            // sigma^2: pooled within-cell variance.
+            let (mut ss, mut df) = (0.0, 0.0);
+            for cell in self.cells.values() {
+                if cell.n >= 2.0 {
+                    ss += cell.sumsq - cell.sum * cell.sum / cell.n;
+                    df += cell.n - 1.0;
+                }
+            }
+            if df < 2.0 {
+                return None;
+            }
+            let sigma2 = (ss / df).max(1e-9);
+
+            // tau^2 of band deviations around the peer mean. Under the null the
+            // deviation (ybar_pb - ybar_p) has variance sigma^2 (1/n_pb - 1/n_p).
+            let tau2_band = if self.bands > 1 {
+                let (mut acc, mut cells) = (0.0, 0.0);
+                for (&(peer, _), cell) in &self.cells {
+                    let parent = self.peers[&peer];
+                    if cell.n >= 2.0 {
+                        acc += (cell.mean() - parent.mean()).powi(2)
+                            - sigma2 * (1.0 / cell.n - 1.0 / parent.n);
+                        cells += 1.0;
+                    }
+                }
+                if cells > 0.0 {
+                    (acc / cells).max(0.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            // tau^2 of peer means around zero; per-observation noise at the peer
+            // level includes the band heterogeneity.
+            let peer_noise = sigma2 + tau2_band;
+            let (mut acc, mut peers) = (0.0, 0.0);
+            for peer in self.peers.values() {
+                if peer.n >= 2.0 {
+                    acc += peer.mean().powi(2) - peer_noise / peer.n;
+                    peers += 1.0;
+                }
+            }
+            let tau2_peer = if peers > 0.0 {
+                (acc / peers).max(0.0)
+            } else {
+                0.0
+            };
+            Some((sigma2, tau2_band, tau2_peer))
+        }
+
+        fn predict(&self, peer_index: usize, contract: f64, distance: f64) -> f64 {
+            let Some((sigma2, tau2_band, tau2_peer)) = self.variance_components() else {
+                return 0.0;
+            };
+            let Some(peer) = self.peers.get(&peer_index) else {
+                return 0.0;
+            };
+            let shrink = |n: f64, noise: f64, tau2: f64| {
+                if tau2 > 0.0 {
+                    n / (n + noise / tau2)
+                } else {
+                    0.0
+                }
+            };
+            let peer_effect = shrink(peer.n, sigma2 + tau2_band, tau2_peer) * peer.mean();
+            if self.bands == 1 {
+                return peer_effect;
+            }
+            match self.cells.get(&(peer_index, self.band(contract, distance))) {
+                Some(cell) => {
+                    peer_effect + shrink(cell.n, sigma2, tau2_band) * (cell.mean() - peer_effect)
+                }
+                None => peer_effect,
+            }
+        }
+    }
+
+    const UNIFORM_K_GRID: [usize; 3] = [5, 20, 80];
+
+    /// Row labels, in the order `run_estimators` fills them.
+    fn estimator_labels() -> Vec<String> {
+        let mut labels = vec![
+            "global curve alone".to_string(),
+            "legacy blend".to_string(),
+            "renegade, harness compose (peer-adj + r)".to_string(),
+            "R renegade (learned metric, its k, 1/d)".to_string(),
+            "R renegade + lambda".to_string(),
+        ];
+        for name in ["G gower", "P peer-first"] {
+            labels.push(format!("{name}, renegade's k, 1/d"));
+            labels.push(format!("{name}, renegade's k, 1/d +lam"));
+            labels.push(format!("{name}, own LOO k, 1/d"));
+            labels.push(format!("{name}, own LOO k, 1/d +lam"));
+            for k in UNIFORM_K_GRID {
+                labels.push(format!("{name}, k={k} uniform"));
+                labels.push(format!("{name}, k={k} uniform +lam"));
+            }
+        }
+        labels.push("H hier peer only".to_string());
+        labels.push("H hier peer x 8 contract bands".to_string());
+        labels.push("H hier peer x 4 contract bands".to_string());
+        labels.push("H hier peer x 8 distance bands".to_string());
+        labels
+    }
+
+    struct EstimatorRun {
+        overall: Vec<f64>,
+        targeted: Vec<f64>,
+        untargeted: Vec<f64>,
+        /// Mean renegade k over scored events.
+        renegade_k: f64,
+        /// Mean own-LOO k over scored events, per fixed weighting.
+        loo_k: [f64; 2],
+        /// Fraction of sampled scored events at which renegade's learned
+        /// metric was active (otherwise it had fallen back to Gower).
+        metric_active: f64,
+        /// Mean learned per-feature weights over samples where it was active.
+        metric_weights: [f64; 4],
+        /// `(fraction, renegade mse, gower-same-k mse)` over scored queries
+        /// where renegade AGREED with Gower-same-k, then where it did not.
+        agreement: [(f64, f64, f64); 2],
+    }
+
+    fn run_estimators(model: Model, events: usize, seed: u64) -> EstimatorRun {
+        let _guard = GlobalRng::seed_guard(seed);
+        let scenario = Scenario::new();
+        let rows = estimator_labels().len();
+        let mut isotonic = IsotonicEstimator::new(Vec::new(), EstimatorType::Positive);
+        let mut legacy_stage = PredictionStage::new(10_000);
+        let mut renegade = PredictionStage::new(10_000);
+        let mut peer_ids: HashMap<usize, u64> = HashMap::new();
+        let mut history: Vec<ResidualPoint> = Vec::new();
+        let mut loo_k = [DEFAULT_K; 2];
+        let mut loo_trained_at = 0usize;
+        let mut hierarchies = [
+            Hierarchical::new(1, false),
+            Hierarchical::new(8, false),
+            Hierarchical::new(4, false),
+            Hierarchical::new(8, true),
+        ];
+        // `lambda` does not read the selector's state (the kappa dial is gone);
+        // it is the local empirical-Bayes test, here shrinking toward zero.
+        let lambda_selector = residual::ShrinkageSelector::new();
+        let shrunk = |stats: Option<(f64, f64, f64)>| -> (f64, f64) {
+            match stats {
+                Some((mean, variance, n)) => {
+                    (mean, lambda_selector.lambda(n, variance, mean, 0.0) * mean)
+                }
+                None => (0.0, 0.0),
+            }
+        };
+
+        let mut err_all = vec![0.0; rows];
+        let mut err_t = vec![0.0; rows];
+        let mut err_u = vec![0.0; rows];
+        let (mut n_all, mut n_t, mut n_u) = (0usize, 0usize, 0usize);
+        let mut k_sum = 0.0;
+        let mut loo_k_sum = [0.0; 2];
+        let (mut metric_samples, mut metric_on) = (0usize, 0usize);
+        let mut weight_sum = [0.0; 4];
+        // [(count, renegade sq err, gower-same-k sq err); agree, disagree]
+        let mut agreement = [(0.0f64, 0.0f64, 0.0f64); 2];
+
+        for index in 0..events {
+            // Same draw order as `run`, so the event stream is identical.
+            let (peer_index, contract_value) = scenario.draw(model, index);
+            let peer = &scenario.peers[peer_index];
+            let contract = Location::try_from(contract_value).expect("contract within ring");
+            let distance = contract
+                .distance(peer.location().expect("peer has a location"))
+                .as_f64();
+            let time = index as f64 / 60.0;
+            let p_star = scenario.true_probability(model, peer_index, contract_value, distance);
+            let actual = if GlobalRng::random_range(0.0..1.0) < p_star {
+                1.0
+            } else {
+                0.0
+            };
+
+            let base = isotonic
+                .estimate_global(peer, contract)
+                .ok()
+                .map(|value| value.clamp(0.0, 1.0));
+            let peer_adjusted = isotonic
+                .estimate_retrieval_time(peer, contract)
+                .ok()
+                .map(|value| value.clamp(0.0, 1.0));
+
+            if let (Some(base), Some(peer_adjusted)) = (base, peer_adjusted) {
+                // Unknown peers get the next id, as `make_observation_immutable`.
+                let next_id = peer_ids.len() as u64;
+                let query = ResidualPoint {
+                    peer_id: *peer_ids.get(&peer_index).unwrap_or(&next_id) as f64,
+                    peer_index,
+                    contract: contract_value,
+                    distance,
+                    time,
+                    residual: 0.0,
+                };
+                let observation = RoutingObservation {
+                    peer_id: query.peer_id,
+                    contract_location: contract_value,
+                    distance,
+                    time,
+                };
+
+                // Each row's final prediction; rows 1-2 are not `global + r`.
+                let mut prediction = vec![base; rows];
+                prediction[1] = match legacy_stage.predict(&RoutingObservation {
+                    peer_id: peer_index as f64,
+                    contract_location: contract_value,
+                    distance,
+                    time,
+                }) {
+                    Some(value) if value.is_finite() => {
+                        let weight = (legacy_stage.len() as f64 / FAILURE_WEIGHT_RAMP_EVENTS)
+                            .min(MAX_RENEGADE_WEIGHT);
+                        (peer_adjusted * (1.0 - weight) + value.clamp(0.0, 1.0) * weight)
+                            .clamp(0.0, 1.0)
+                    }
+                    _ => peer_adjusted,
+                };
+                prediction[2] =
+                    (peer_adjusted + renegade.predict(&observation).unwrap_or(0.0)).clamp(0.0, 1.0);
+
+                let mut r_hat = vec![0.0; rows];
+                let renegade_stats = renegade
+                    .predict_native(&observation)
+                    .map(|e| (e.residual, e.variance, e.n_eff));
+                (r_hat[3], r_hat[4]) = shrunk(renegade_stats);
+
+                let mut row = 5;
+                for (w_index, weights) in [GOWER, PEER_FIRST].into_iter().enumerate() {
+                    let sorted = sorted_neighbours(&history, &query, weights, 128);
+                    (r_hat[row], r_hat[row + 1]) =
+                        shrunk(inverse_distance_stats(&sorted, renegade.cached_k));
+                    (r_hat[row + 2], r_hat[row + 3]) =
+                        shrunk(inverse_distance_stats(&sorted, loo_k[w_index]));
+                    row += 4;
+                    for k in UNIFORM_K_GRID {
+                        (r_hat[row], r_hat[row + 1]) = shrunk(uniform_stats(&sorted, k));
+                        row += 2;
+                    }
+                }
+                for hierarchy in &hierarchies {
+                    r_hat[row] = hierarchy.predict(peer_index, contract_value, distance);
+                    row += 1;
+                }
+                assert_eq!(row, rows, "every estimator row must be filled");
+                for (value, r) in prediction.iter_mut().zip(&r_hat).skip(3) {
+                    *value = (base + r).clamp(0.0, 1.0);
+                }
+
+                if index >= WARMUP_EVENTS {
+                    let targeted = scenario.is_targeted(peer_index, contract_value);
+                    // Attribution proxy: when renegade's metric is inactive its
+                    // estimate is the Gower k-NN at its own k (row 5), so
+                    // agreement marks "metric off at this query".
+                    let slot = usize::from((r_hat[3] - r_hat[5]).abs() > 1e-9);
+                    agreement[slot].0 += 1.0;
+                    agreement[slot].1 += (prediction[3] - p_star).powi(2);
+                    agreement[slot].2 += (prediction[5] - p_star).powi(2);
+                    for (i, value) in prediction.iter().enumerate() {
+                        let err = (value - p_star).powi(2);
+                        err_all[i] += err;
+                        if targeted {
+                            err_t[i] += err;
+                        } else {
+                            err_u[i] += err;
+                        }
+                    }
+                    n_all += 1;
+                    if targeted {
+                        n_t += 1;
+                    } else {
+                        n_u += 1;
+                    }
+                    k_sum += renegade.cached_k as f64;
+                    loo_k_sum[0] += loo_k[0] as f64;
+                    loo_k_sum[1] += loo_k[1] as f64;
+                    if index % 100 == 0 {
+                        let diagnostics = renegade.model.diagnostics();
+                        metric_samples += 1;
+                        if diagnostics.metric_active {
+                            metric_on += 1;
+                            if let Some(features) = diagnostics.feature_metrics {
+                                for f in features.iter().take(4) {
+                                    weight_sum[f.index] += f.weight;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Learn from the event, in the same order as `run`.
+                legacy_stage.add(
+                    RoutingObservation {
+                        peer_id: peer_index as f64,
+                        contract_location: contract_value,
+                        distance,
+                        time,
+                    },
+                    actual,
+                );
+                if legacy_stage.should_train() {
+                    legacy_stage.train();
+                }
+                if let Some(residual) = isotonic.adjustment_mode().residual(actual, base) {
+                    let id = {
+                        let next = peer_ids.len() as u64;
+                        *peer_ids.entry(peer_index).or_insert(next)
+                    };
+                    let point = ResidualPoint {
+                        peer_id: id as f64,
+                        residual,
+                        ..query
+                    };
+                    renegade.add(
+                        RoutingObservation {
+                            peer_id: point.peer_id,
+                            contract_location: contract_value,
+                            distance,
+                            time,
+                        },
+                        residual,
+                    );
+                    if renegade.should_train() {
+                        renegade.train();
+                    }
+                    history.push(point);
+                    for hierarchy in &mut hierarchies {
+                        hierarchy.add(&point);
+                    }
+                    let n = history.len();
+                    if n >= MIN_OBSERVATIONS_FOR_TRAINING
+                        && (loo_trained_at == 0 || n >= loo_trained_at + loo_trained_at / 2)
+                    {
+                        loo_k = [
+                            loo_select_k(&history, GOWER),
+                            loo_select_k(&history, PEER_FIRST),
+                        ];
+                        loo_trained_at = n;
+                    }
+                }
+            }
+
+            isotonic.add_event(IsotonicEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                result: actual,
+            });
+        }
+
+        let div = |v: Vec<f64>, n: usize| -> Vec<f64> {
+            v.into_iter().map(|e| e / n.max(1) as f64).collect()
+        };
+        let active = metric_on.max(1) as f64;
+        EstimatorRun {
+            overall: div(err_all, n_all),
+            targeted: div(err_t, n_t),
+            untargeted: div(err_u, n_u),
+            renegade_k: k_sum / n_all.max(1) as f64,
+            loo_k: [
+                loo_k_sum[0] / n_all.max(1) as f64,
+                loo_k_sum[1] / n_all.max(1) as f64,
+            ],
+            metric_active: metric_on as f64 / metric_samples.max(1) as f64,
+            metric_weights: weight_sum.map(|w| w / active),
+            agreement: agreement
+                .map(|(n, r, g)| (n / n_all.max(1) as f64, r / n.max(1.0), g / n.max(1.0))),
+        }
+    }
+
+    /// Is the renegade residual correction's weakness k-NN in general, its
+    /// learned metric, or its k selection? Diagnostic table only; the asserts
+    /// are sanity checks that the stream matches `run` and outputs are finite.
+    #[test]
+    fn knn_generally_vs_metric_learner_vs_k_selection() {
+        let labels = estimator_labels();
+        let models = [
+            Model::DistanceOnly,
+            Model::PeerMarginal,
+            Model::PeerContract,
+            Model::Noise,
+        ];
+        // Columns: DistOnly, PeerMarginal, PeerContract overall, PC targeted,
+        // PC untargeted, Noise.
+        let columns = 6;
+        // HARNESS QUIRK: the FIRST `PeerKeyLocation::random()` on a thread
+        // generates and caches a keypair from the seeded `GlobalRng`, so the
+        // first `run` on a fresh test thread sees a different scenario than
+        // every later call with the same seed. Warm the cache before any seeded
+        // run so all streams here (and the `run` cross-check) are identical.
+        let _ = PeerKeyLocation::random();
+        let mut per_seed: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); columns]; labels.len()];
+        let mut diagnostics = Vec::new();
+
+        for model in models {
+            for (seed_index, &seed) in SEEDS.iter().enumerate() {
+                let result = run_estimators(model, RECOVERY_BUDGET_EVENTS, seed);
+                if seed_index == 0 {
+                    // Sanity: the stream really is `run`'s stream.
+                    let reference = run(model, RECOVERY_BUDGET_EVENTS, seed);
+                    assert!(
+                        (result.overall[0] - reference.mse_base).abs() < 1e-12
+                            && (result.overall[1] - reference.mse_legacy).abs() < 1e-12,
+                        "{model:?}: comparison stream diverged from `run` \
+                         (global {} vs {}, legacy {} vs {})",
+                        result.overall[0],
+                        reference.mse_base,
+                        result.overall[1],
+                        reference.mse_legacy
+                    );
+                }
+                let cells: &[usize] = match model {
+                    Model::DistanceOnly => &[0],
+                    Model::PeerMarginal => &[1],
+                    Model::PeerContract => &[2, 3, 4],
+                    Model::Noise => &[5],
+                };
+                for (row, label) in labels.iter().enumerate() {
+                    assert!(result.overall[row].is_finite(), "{label} not finite");
+                    for &column in cells {
+                        let value = match column {
+                            3 => result.targeted[row],
+                            4 => result.untargeted[row],
+                            _ => result.overall[row],
+                        };
+                        per_seed[row][column].push(value);
+                    }
+                }
+                diagnostics.push((
+                    model,
+                    seed,
+                    result.renegade_k,
+                    result.loo_k,
+                    result.metric_active,
+                    result.metric_weights,
+                    result.agreement,
+                    result.targeted[3],
+                    result.targeted[5],
+                ));
+            }
+        }
+
+        let headers = [
+            "DistOnly",
+            "PeerMarg",
+            "PC all",
+            "PC targ",
+            "PC untarg",
+            "Noise",
+        ];
+        let mut table = String::from(
+            "\n#4485 KNN vs METRIC-LEARNER vs K-SELECTION \
+             (mse vs p*, mean of 5 seeds; lower is better)\n",
+        );
+        table.push_str(&format!("{:<44}", "estimator (global + r_hat)"));
+        for h in headers {
+            table.push_str(&format!("{h:>10}"));
+        }
+        table.push('\n');
+        for (row, label) in labels.iter().enumerate() {
+            table.push_str(&format!("{label:<44}"));
+            for values in &per_seed[row] {
+                let mean = values.iter().sum::<f64>() / values.len() as f64;
+                table.push_str(&format!("{mean:>10.4}"));
+            }
+            table.push('\n');
+        }
+        table.push_str("\nper-seed spread [min-max], same columns\n");
+        for (row, label) in labels.iter().enumerate() {
+            table.push_str(&format!("{label:<44}"));
+            for values in &per_seed[row] {
+                let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                table.push_str(&format!("  {min:.3}-{max:.3}"));
+            }
+            table.push('\n');
+        }
+        table.push_str(
+            "\nrenegade diagnostics per (model, seed): mean k, own-LOO k [gower, \
+             peer-first], metric-active fraction, mean learned weights when active \
+             [peer, contract, distance, time]\n",
+        );
+        for (model, seed, k, loo, active, weights, agree, r_t, g_t) in &diagnostics {
+            table.push_str(&format!(
+                "  {model:?} {seed:#x}: k {k:.1}, loo k [{:.1}, {:.1}], metric active \
+                 {active:.2}, weights [{:.2}, {:.2}, {:.2}, {:.2}]\n\
+                 \x20     agree-with-gower {:.2} (renegade {:.4} vs gower {:.4}), \
+                 disagree {:.2} (renegade {:.4} vs gower {:.4}); targeted renegade \
+                 {r_t:.4} vs gower {g_t:.4}\n",
+                loo[0],
+                loo[1],
+                weights[0],
+                weights[1],
+                weights[2],
+                weights[3],
+                agree[0].0,
+                agree[0].1,
+                agree[0].2,
+                agree[1].0,
+                agree[1].1,
+                agree[1].2
+            ));
+        }
+        eprintln!("{table}");
+    }
 }
