@@ -1854,6 +1854,10 @@ mod recoverability {
     use crate::config::GlobalRng;
     use crate::router::isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 
+    /// The broadened estimator bake-off (realistic base rates, long-tail
+    /// traffic, drift, natural targeted structure, timing, label noise).
+    mod bakeoff;
+
     /// Events before scoring starts, so the isotonic base has a curve to be
     /// corrected and the comparison is not dominated by cold start.
     const WARMUP_EVENTS: usize = 300;
