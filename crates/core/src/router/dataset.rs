@@ -427,9 +427,12 @@ fn write_loop(
     dropped: &AtomicU64,
     stopped: &AtomicBool,
 ) {
-    let outcome = run_writer(&rx, file, max_bytes, dropped);
+    let outcome = run_writer(&rx, file, max_bytes, dropped, stopped);
     // Mark stopped before the receiver drops, so callers stop building records.
     stopped.store(true, Ordering::Relaxed);
+    // Anything that slipped into the queue after the final drain is counted
+    // here, so the in-memory total stays exact even where the file's cannot.
+    dropped.fetch_add(rx.try_iter().count() as u64, Ordering::Relaxed);
     match outcome {
         Ok(()) => {}
         Err(WriteError::Cap) => tracing::info!(
@@ -449,6 +452,7 @@ fn run_writer(
     file: File,
     max_bytes: u64,
     dropped: &AtomicU64,
+    stopped: &AtomicBool,
 ) -> Result<(), WriteError> {
     // Appending to an existing recording counts its bytes against the cap. A
     // file without room for a start line gets nothing at all, so a restart loop
@@ -468,11 +472,12 @@ fn run_writer(
 
     let result = drain(rx, &mut writer, dropped);
     if let Err(WriteError::Cap) = result {
-        // Records still queued behind the one that hit the cap will never be
-        // written; count them so the marker's total covers them. (A send landing
-        // in the instant between this and the writer marking itself stopped is
-        // still counted by the sender, just not in this line — the total here is
-        // exact up to that window.)
+        // Stop producers FIRST, then count what is still queued, so the marker's
+        // total covers every record that will never be written. The one residual
+        // window is a sender that checked `is_recording` just before this store
+        // and enqueues just after the drain: its record is missing from the
+        // marker, though `write_loop` still adds it to the in-memory total.
+        stopped.store(true, Ordering::Relaxed);
         let queued = rx.try_iter().count() as u64;
         dropped.fetch_add(queued, Ordering::Relaxed);
         // The marker may use the reserve. If even that is gone, an earlier run
