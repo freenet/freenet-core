@@ -7968,13 +7968,17 @@ mod tests {
     ///    survives the 60s recompute, bounded only by the disk budget — and the
     ///    32 GiB `--max-hosting-disk` default still caps it, which is why the
     ///    help text tells an operator to raise both.
-    /// 2. Raising it does NOT raise the contract-COUNT limit. That budget is
-    ///    derived from `total_ram` alone, because per-contract resident memory
-    ///    is the real RAM cost (~0.8 MiB/contract measured across 714
-    ///    production peers in #5647), whereas contract state lives on disk. If
-    ///    the count budget ever started reading the configured state budget, a
-    ///    disk donor would be told it can hold hundreds of times more contracts
-    ///    than its memory supports.
+    /// 2. Raising it does NOT move the contract-COUNT limit, in either
+    ///    direction. That budget is derived from `total_ram` alone, because
+    ///    per-contract resident memory is the real RAM cost (~0.8 MiB/contract
+    ///    measured across 714 production peers in #5647), whereas contract state
+    ///    lives on disk. A regression that fed the configured state budget into
+    ///    it could SHRINK it (subtracting 20 GiB of "state" from RAM would floor
+    ///    a disk donor's count budget and evict everything it hosts) or GROW it
+    ///    (over-granting contracts its memory cannot hold). Checked on both the
+    ///    live-signal path and the structural path, because with live signals
+    ///    present `min()` can pick the live term and mask a change in the
+    ///    structural one.
     #[test]
     fn explicit_state_budget_above_ram_clamp_survives_recompute() {
         const GIB: u64 = 1024 * 1024 * 1024;
@@ -8013,23 +8017,34 @@ mod tests {
         );
 
         // (2) The contract-count budget is identical whether the node contributes
-        // 1 GiB or 20 GiB of state: same host, same live signals, same result.
+        // 1 GiB or 20 GiB of state: same host, same signals, same result — on
+        // BOTH paths through the formula.
         let total_ram = 4 * GIB;
         let pool_size = 4;
-        let live_signals = Some((GIB, 2 * GIB));
         let default_node = HostingManager::new(GIB);
-        let default_count_budget =
-            default_node.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
-        let donor_count_budget =
-            donor.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
-        assert_eq!(
-            donor_count_budget, default_count_budget,
-            "contributing more disk must not change the RAM-derived contract-count budget"
-        );
-        assert_eq!(
-            donor.hosting_cache_stats().contract_slot_budget,
-            default_node.hosting_cache_stats().contract_slot_budget,
-            "contributing more disk must not change how many contracts the node may host"
+        for (path, live_signals) in [
+            ("live-signal", Some((GIB, 2 * GIB))),
+            // No live signals: the structural residual is the only term, so a
+            // change to it cannot hide behind `min()` picking the live term.
+            ("structural", None),
+        ] {
+            let default_count_budget =
+                default_node.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
+            let donor_count_budget =
+                donor.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
+            assert_eq!(
+                donor_count_budget, default_count_budget,
+                "{path} path: contributing more disk must not change the RAM-derived \
+                 contract-count budget"
+            );
+        }
+        // Guard against the structural comparison passing vacuously because both
+        // values collapsed to the floor: on this host shape the structural term
+        // must sit above it, or equality proves nothing.
+        assert!(
+            default_node.recompute_resident_overhead_budget(total_ram, pool_size, None)
+                > cache::MIN_RESIDENT_OVERHEAD_BUDGET_BYTES,
+            "test shape must keep the structural term off its floor"
         );
     }
 
