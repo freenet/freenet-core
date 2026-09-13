@@ -1764,8 +1764,12 @@ impl Ring {
             {
                 break;
             }
+            // Skip, never leave the loop: this task is registered with the
+            // background task monitor, and any monitored task exiting ends the
+            // node. A recorder that reached its byte cap must not take a
+            // gateway down with it.
             if !dataset.is_recording() {
-                break;
+                continue;
             }
             let peers = ring.routing_dataset_peer_attributes();
             // The dataset's own clock, shared with route events so the two join.
@@ -7818,6 +7822,30 @@ mod k_closest_source_tests {
             }
         }
         assert_eq!(checked, 24, "expected exactly 24 export assignments");
+    }
+
+    /// The routing-dataset peer task is registered with the background task
+    /// monitor, and ANY monitored task exiting ends the node
+    /// (`p2p_impl.rs`, `wait_for_any_exit`). So its loop may leave only on
+    /// shutdown: a recorder that stops — at its byte cap, or on a write error —
+    /// must not take the gateway down. An earlier revision `break`ed there.
+    #[test]
+    fn routing_dataset_peer_task_exits_only_on_shutdown() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn record_routing_dataset_peers(");
+        let breaks = body.matches("break").count();
+        let returns = body.matches("return").count();
+        assert_eq!(
+            (breaks, returns),
+            (1, 0),
+            "record_routing_dataset_peers must leave its loop only on shutdown; \
+             any other exit ends the node"
+        );
+        let (before_break, _) = body.split_once("break").unwrap();
+        assert!(
+            before_break.contains("sleep_or_shutdown"),
+            "the single break must be the shutdown one"
+        );
     }
 
     /// Same mirror seam, for the contract-exec WASM counters. The export block
