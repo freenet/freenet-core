@@ -23,6 +23,7 @@ pub(crate) mod get;
 pub(crate) mod op_ctx;
 pub(crate) mod orphan_streams;
 pub(crate) mod put;
+pub(crate) mod route_attempt;
 pub(crate) mod stream_progress;
 pub(crate) mod subscribe;
 #[cfg(test)]
@@ -872,40 +873,34 @@ pub(crate) fn streaming_aware_attempt_timeout(
 
 /// Records a routing event observed by a relay/forwarding hop.
 ///
-/// Without this hook, only the operation's originator feeds events into the
-/// router. `OpOutcome::ContractOp*` is only produced for ops where
-/// `upstream_addr.is_none()`, and relay hops return `SendAndComplete` without
-/// going through `outcome()`. On a relay-heavy node the router would see
-/// almost no per-peer data, leaving the failure-probability model untrained
-/// and the per-peer dashboard panels empty even when MB of traffic flowed
-/// through each connection.
+/// Without this hook only the operation's originator would feed events into
+/// the router, and on a relay-heavy node the failure-probability model would
+/// stay untrained and the per-peer dashboard panels empty even when MB of
+/// traffic flowed through each connection.
 ///
-/// Call this at the relay-side response sites in each operation when the
-/// downstream peer the relay chose returns success or failure. Timeout and
-/// disconnect paths are already covered by `report_timeout_failure` in
-/// `node/op_state_manager.rs` via `failure_routing_info`.
+/// Call this at the relay-side SUCCESS sites of each operation, when the
+/// downstream peer the relay chose delivered. Non-success outcomes (timeouts,
+/// send failures, `NotFound`) go through
+/// [`route_attempt::RouteAttemptRecorder`], which owns the labelling rules for
+/// them, including when a downstream `NotFound` becomes a `Failure`. (Earlier
+/// revisions of this comment said timeouts were "already covered by
+/// `report_timeout_failure` in `node/op_state_manager.rs` via
+/// `failure_routing_info`". Both were deleted by the task-per-tx migration,
+/// #4053/#4065/#4076/#4087, and nothing replaced them until #4485.)
 ///
 /// # Outcome attribution
 ///
-/// The `outcome` argument matches the legacy originator-side semantics
-/// (see `OpOutcome::Contract*` and the per-op `outcome()` methods). In
-/// particular, **prompt `NotFound` from a downstream peer is recorded
-/// as `RouteOutcome::Failure`**, not Success. A peer that promptly
-/// answers "I don't host this contract" behaved correctly at the
-/// transport level, but the failure-probability model is asking "will
-/// this peer deliver the contract at this location?" and a `NotFound`
-/// reply means it won't — so for routing-decision purposes it's a
-/// negative signal for *that contract location*. The relay sites
-/// follow the same convention used by the originator's stalled-peer
-/// retry path (`get.rs:2686` and `report_timeout_failure` in
-/// `op_state_manager.rs`). Splitting transport-success from
-/// content-availability would require a new `RouteOutcome::NotHosted`
-/// variant and is out of scope here.
+/// A downstream `NotFound` is a `RouteOutcome::Failure` for routing purposes:
+/// the model asks "will routing via this peer deliver this contract?", and a
+/// `NotFound` means it did not. It is NOT a peer-health signal, which is why
+/// relay events (like every recorder event) feed the router only. How an
+/// ambiguous `NotFound` is labelled (one from a search that never proved the
+/// contract exists) is decided by
+/// [`route_attempt::ambiguous_not_found_policy`].
 ///
-/// `LocalCompletion` and unexpected-reply variants are also recorded as
-/// `Failure` against the downstream peer; these are "shouldn't happen"
-/// paths and recording them as failures matches the relay's decision to
-/// abandon that peer and try another.
+/// `LocalCompletion` and unexpected-reply variants are NOT recorded: whether
+/// they indicate a local bug or peer misbehaviour is unknown, and the invariant
+/// is one event per unambiguously attributable observation.
 ///
 /// # UPDATE exclusion
 ///
@@ -915,10 +910,8 @@ pub(crate) fn streaming_aware_attempt_timeout(
 /// streaming variants), so the relay never observes whether the downstream
 /// peer succeeded or failed. Recording only the local send-error path
 /// would bias the per-peer UPDATE failure rate to 100% by construction.
-/// `report_timeout_failure` in `op_state_manager.rs` still records UPDATE
-/// timeouts via `failure_routing_info` on the originator side; this is
-/// the same signal as for the other ops, just not augmented by relay
-/// observations.
+/// The UPDATE originator is fire-and-forget as well, so UPDATE feeds the
+/// router nothing, on either side.
 pub(crate) fn record_relay_route_event(
     op_manager: &OpManager,
     next_hop: PeerKeyLocation,
@@ -926,6 +919,25 @@ pub(crate) fn record_relay_route_event(
     outcome: crate::router::RouteOutcome,
     op_type: crate::node::network_status::OpType,
 ) {
+    count_relay_route_event(op_type);
+    // Feed only the routing model, NOT peer_health or topology_manager. See
+    // `Ring::record_route_event_router_only` for why.
+    op_manager
+        .ring
+        .record_route_event_router_only(crate::router::RouteEvent {
+            peer: next_hop,
+            contract_location,
+            outcome,
+            op_type: Some(op_type),
+        });
+}
+
+/// Advance the per-op-type `RELAY_*_ROUTE_EVENT_COUNT` test hook. A no-op in
+/// production builds. Shared by [`record_relay_route_event`] and the relay-side
+/// [`route_attempt::RouteAttemptRecorder`], so relay successes and relay
+/// failures both count.
+#[cfg_attr(not(any(test, feature = "testing")), allow(unused_variables))]
+pub(crate) fn count_relay_route_event(op_type: crate::node::network_status::OpType) {
     #[cfg(any(test, feature = "testing"))]
     {
         use std::sync::atomic::Ordering;
@@ -937,37 +949,6 @@ pub(crate) fn record_relay_route_event(
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
-    // Feed only the routing model — NOT peer_health or topology_manager.
-    //
-    // `Ring::routing_finished` also updates `peer_health` (which uses
-    // `std::time::Instant::now()` in `connection_manager.rs::PeerHealthTracker`
-    // around lines 182-203, a pre-existing TimeSource rule violation)
-    // and the topology_manager's `request_density_tracker`. An earlier
-    // iteration of this branch routed relay events through
-    // `routing_finished` and broke three strict-determinism tests
-    // (`test_strict_determinism_*` / `test_direct_runner_determinism` /
-    // `test_thundering_herd_connect_storm`). Bypassing those side
-    // effects fixed all three.
-    //
-    // CAVEAT: `Router::add_event` itself transitively calls
-    // `RoutingPredictor::record` → `wall_clock_hours()` → `SystemTime::now()`
-    // (see `router/routing_predictor.rs:608-614`). So the router path is
-    // not strictly TimeSource-clean either; the determinism tests pass
-    // because the wall-clock variance there is well below the events
-    // each test counts. Migrating both `peer_health` and
-    // `routing_predictor` to `TimeSource` would let
-    // `record_relay_route_event` go back to calling `routing_finished`
-    // straightforwardly. Tracked as a follow-up.
-    op_manager
-        .ring
-        .router
-        .write()
-        .add_event(crate::router::RouteEvent {
-            peer: next_hop,
-            contract_location,
-            outcome,
-            op_type: Some(op_type),
-        });
 }
 
 /// Test hook: counter incremented every time `record_relay_route_event`

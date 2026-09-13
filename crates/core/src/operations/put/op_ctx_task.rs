@@ -388,6 +388,14 @@ async fn drive_client_put_inner(
         /// `attempt_timeout`. `None` for non-streaming PUTs (fixed deadline,
         /// behaviour unchanged).
         stream_progress: Option<crate::operations::stream_progress::StreamProgress>,
+        /// Labels every non-success attempt for the router (#4485): PUT has no
+        /// `NotFound`, so in practice timeouts and dropped connections.
+        recorder: crate::operations::route_attempt::RouteAttemptRecorder,
+        /// The peer the `Terminal` attempt was actually forwarded to, as
+        /// recorded by the originator-loopback relay. `current_target` is only
+        /// driver-side bookkeeping (see the note at its initialisation), so the
+        /// success route event prefers this when present.
+        terminal_hop: Option<PeerKeyLocation>,
     }
 
     impl RetryDriver for PutRetryDriver<'_> {
@@ -459,6 +467,16 @@ async fn drive_client_put_inner(
         fn stream_progress(&self) -> Option<crate::operations::stream_progress::StreamProgress> {
             self.stream_progress.clone()
         }
+
+        fn attempt_recorder(
+            &mut self,
+        ) -> Option<&mut crate::operations::route_attempt::RouteAttemptRecorder> {
+            Some(&mut self.recorder)
+        }
+
+        fn on_terminal_hop(&mut self, hop: Option<PeerKeyLocation>) {
+            self.terminal_hop = hop;
+        }
     }
 
     let attempt_timeout =
@@ -521,6 +539,13 @@ async fn drive_client_put_inner(
         attempt_timeout,
         max_advancements,
         stream_progress,
+        recorder: crate::operations::route_attempt::RouteAttemptRecorder::new(
+            op_manager.ring.clone(),
+            Location::from(&key),
+            crate::node::network_status::OpType::Put,
+            crate::operations::route_attempt::AttemptOrigin::Originator,
+        ),
+        terminal_hop: None,
     };
 
     let loop_result = drive_retry_loop(op_manager, client_tx, "put", &mut driver).await;
@@ -537,9 +562,16 @@ async fn drive_client_put_inner(
             // Response. Without this, the router's prediction model never
             // receives PUT success feedback and simulation tests that check
             // route_outcome telemetry fail.
+            //
+            // Attributed to the hop the successful attempt was actually
+            // forwarded to (#4485), falling back to `current_target` only when
+            // no hop was recorded (a local completion), as before.
             let contract_location = Location::from(&reply_key);
             let route_event = RouteEvent {
-                peer: driver.current_target.clone(),
+                peer: driver
+                    .terminal_hop
+                    .clone()
+                    .unwrap_or_else(|| driver.current_target.clone()),
                 contract_location,
                 outcome: RouteOutcome::SuccessUntimed,
                 op_type: Some(crate::node::network_status::OpType::Put),
@@ -2160,6 +2192,14 @@ where
         // On a successful dispatch the downstream Response returns
         // directly to the originator via the bypass.
         let local_hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+        // Tell the client driver's retry loop which peer this attempt really
+        // went to, so its outcome is attributed to that peer (#4485). Recorded
+        // before the dispatch so a reply can never beat it; cleared on every
+        // local dispatch failure below (the PUT then finalizes locally and
+        // must not blame a peer that never received it).
+        op_manager
+            .attempt_hop_registry()
+            .record_hop(&incoming_tx, &next_peer);
         if upgrade_to_streaming {
             let stream_id = StreamId::next_operations();
             let metadata_msg = NetMessage::from(PutMsg::RequestStreaming {
@@ -2172,6 +2212,7 @@ where
                 subscribe: false,
             });
             if let Err(err) = ctx.send_fire_and_forget(next_addr, metadata_msg).await {
+                op_manager.attempt_hop_registry().clear_hop(&incoming_tx);
                 tracing::warn!(
                     tx = %incoming_tx,
                     contract = %key,
@@ -2209,6 +2250,7 @@ where
                 )
                 .await
             {
+                op_manager.attempt_hop_registry().clear_hop(&incoming_tx);
                 tracing::warn!(
                     tx = %incoming_tx,
                     contract = %key,
@@ -2240,6 +2282,7 @@ where
                 skip_list: new_skip_list,
             });
             if let Err(err) = ctx.send_fire_and_forget(next_addr, forward).await {
+                op_manager.attempt_hop_registry().clear_hop(&incoming_tx);
                 tracing::warn!(
                     tx = %incoming_tx,
                     contract = %key,

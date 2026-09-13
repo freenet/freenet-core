@@ -775,6 +775,19 @@ async fn drive_client_subscribe_inner(
     let renewal_deadline =
         is_renewal.then(|| tokio::time::Instant::now() + crate::ring::Ring::RENEWAL_TASK_BUDGET);
 
+    // Labels every non-success attempt for the router (#4485). Each attempt is
+    // sent straight to `current_target_addr` (`send_to_and_await`), so
+    // `current_target` IS the attempted peer. NotFounds are held until the
+    // subscribe resolves: a later `Subscribed` proves the contract exists and
+    // turns them into failures; any other exit drops the recorder and applies
+    // `ambiguous_not_found_policy`.
+    let mut recorder = crate::operations::route_attempt::RouteAttemptRecorder::new(
+        op_manager.ring.clone(),
+        crate::ring::Location::from(&instance_id),
+        crate::node::network_status::OpType::Subscribe,
+        crate::operations::route_attempt::AttemptOrigin::Originator,
+    );
+
     loop {
         // For renewals, clamp this attempt's wait to the budget remaining until
         // the task deadline (capped at `RENEWAL_PER_ATTEMPT_TIMEOUT`). When the
@@ -910,6 +923,14 @@ async fn drive_client_subscribe_inner(
                     error = %err,
                     "subscribe: send_and_await failed; advancing to next peer"
                 );
+                // Only a dropped connection is the peer's doing; a
+                // `NotificationError` is a local callback drop.
+                if matches!(err, OpError::PeerDisconnected { .. }) {
+                    recorder.record_attempt(
+                        Some(&current_target),
+                        crate::operations::route_attempt::AttemptFailure::SendFailure,
+                    );
+                }
                 match advance_to_next_peer(
                     op_manager,
                     &instance_id,
@@ -970,6 +991,10 @@ async fn drive_client_subscribe_inner(
                     timeout_secs = attempt_timeout.as_secs(),
                     is_renewal,
                     "subscribe: attempt timed out; advancing to next peer"
+                );
+                recorder.record_attempt(
+                    Some(&current_target),
+                    crate::operations::route_attempt::AttemptFailure::Timeout,
                 );
                 match advance_to_next_peer(
                     op_manager,
@@ -1049,6 +1074,9 @@ async fn drive_client_subscribe_inner(
                 // response-time estimator with zero observations from
                 // client-initiated subscribes. Restore that feedback so the
                 // peer dashboard's Response Time chart populates again.
+                // The subscription proves the contract exists: every earlier
+                // NotFound in this subscribe was a routing failure.
+                recorder.contract_exists();
                 let contract_location = crate::ring::Location::from(&key);
                 let route_event = crate::router::RouteEvent {
                     peer: current_target.clone(),
@@ -1110,6 +1138,10 @@ async fn drive_client_subscribe_inner(
                     attempts_at_hop,
                     outcome = "not_found",
                     "subscribe: NotFound from peer; advancing to next peer"
+                );
+                recorder.record_attempt(
+                    Some(&current_target),
+                    crate::operations::route_attempt::AttemptFailure::NotFound,
                 );
                 match advance_to_next_peer(
                     op_manager,
@@ -1833,6 +1865,16 @@ async fn drive_relay_subscribe(
     };
     new_visited.mark_visited(next_addr);
 
+    // Labels this relay's downstream attempts for the local router (#4485).
+    // Dropped when this function returns, which settles a NotFound that no
+    // consult overturned via `ambiguous_not_found_policy`.
+    let mut recorder = crate::operations::route_attempt::RouteAttemptRecorder::new(
+        op_manager.ring.clone(),
+        crate::ring::Location::from(&instance_id),
+        crate::node::network_status::OpType::Subscribe,
+        crate::operations::route_attempt::AttemptOrigin::Relay,
+    );
+
     // ── Step 3: Forward the single greedy routing hop, await Response ─────
     let outcome = relay_subscribe_forward_once(
         op_manager,
@@ -1843,6 +1885,7 @@ async fn drive_relay_subscribe(
         is_renewal,
         next_hop,
         next_addr,
+        &mut recorder,
     )
     .await;
 
@@ -1911,6 +1954,7 @@ async fn drive_relay_subscribe(
                         is_renewal,
                         consult_hop,
                         consult_addr,
+                        &mut recorder,
                     )
                     .await;
                     match consult_outcome {
@@ -2032,6 +2076,7 @@ async fn relay_subscribe_forward_once(
     is_renewal: bool,
     next_hop: PeerKeyLocation,
     next_addr: std::net::SocketAddr,
+    recorder: &mut crate::operations::route_attempt::RouteAttemptRecorder,
 ) -> SubscribeForwardOutcome {
     let new_htl = htl.saturating_sub(1);
     // Forward-failure / unexpected-variant depth for THIS relay.
@@ -2086,12 +2131,9 @@ async fn relay_subscribe_forward_once(
                 error = %err,
                 "SUBSCRIBE relay: send_to_and_await failed"
             );
-            crate::operations::record_relay_route_event(
-                op_manager,
-                next_hop,
-                crate::ring::Location::from(&instance_id),
-                crate::router::RouteOutcome::Failure,
-                crate::node::network_status::OpType::Subscribe,
+            recorder.record_attempt(
+                Some(&next_hop),
+                crate::operations::route_attempt::AttemptFailure::SendFailure,
             );
             // No reply — do NOT consult on the reused tx (Codex P2).
             return SubscribeForwardOutcome::Failed {
@@ -2106,12 +2148,9 @@ async fn relay_subscribe_forward_once(
                 timeout_secs = OPERATION_TTL.as_secs(),
                 "SUBSCRIBE relay: downstream timed out"
             );
-            crate::operations::record_relay_route_event(
-                op_manager,
-                next_hop,
-                crate::ring::Location::from(&instance_id),
-                crate::router::RouteOutcome::Failure,
-                crate::node::network_status::OpType::Subscribe,
+            recorder.record_attempt(
+                Some(&next_hop),
+                crate::operations::route_attempt::AttemptFailure::Timeout,
             );
             // Timed out with no reply — do NOT consult on the reused tx (Codex P2).
             return SubscribeForwardOutcome::Failed {
@@ -2142,6 +2181,10 @@ async fn relay_subscribe_forward_once(
                 phase = "relay_subscribe_bubble",
                 "SUBSCRIBE relay: downstream Subscribed; bubbling upstream"
             );
+            // A subscription proves the contract exists: an earlier NotFound
+            // in this relay's search (the greedy hop, before a consult) was a
+            // routing failure.
+            recorder.contract_exists();
             crate::operations::record_relay_route_event(
                 op_manager,
                 next_hop.clone(),
@@ -2160,21 +2203,22 @@ async fn relay_subscribe_forward_once(
             hop_count: downstream_hop_count,
             ..
         })) => {
-            // Downstream peer correctly answered NotFound. The peer behaved
-            // well at the protocol level — it just doesn't host this contract.
-            // Record SuccessUntimed so the model treats it as healthy.
+            // Downstream peer answered NotFound: routing via it did not
+            // deliver this contract. This used to be recorded as
+            // `SuccessUntimed` ("the peer behaved well"), which trained the
+            // failure model on positive labels for dead-ends (#4485). It is a
+            // routing failure; the recorder labels it once this relay's search
+            // resolves (see `ambiguous_not_found_policy`). It never reaches
+            // peer_health.
             tracing::debug!(
                 tx = %incoming_tx,
                 %instance_id,
                 phase = "relay_subscribe_bubble_not_found",
                 "SUBSCRIBE relay: downstream NotFound"
             );
-            crate::operations::record_relay_route_event(
-                op_manager,
-                next_hop,
-                crate::ring::Location::from(&instance_id),
-                crate::router::RouteOutcome::SuccessUntimed,
-                crate::node::network_status::OpType::Subscribe,
+            recorder.record_attempt(
+                Some(&next_hop),
+                crate::operations::route_attempt::AttemptFailure::NotFound,
             );
             SubscribeForwardOutcome::NotFound {
                 hop_count: downstream_hop_count,

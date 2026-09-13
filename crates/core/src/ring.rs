@@ -4055,6 +4055,44 @@ impl Ring {
         self.router.write().add_event(event);
     }
 
+    /// Feed a route event to the routing model ONLY, bypassing the
+    /// `peer_health` and `topology_manager` side effects of
+    /// [`Self::routing_finished`].
+    ///
+    /// Two reasons, both load-bearing:
+    ///
+    /// 1. **Peer health is not routing success.** `PeerHealthTracker` evicts a
+    ///    connection at a 90 % failure rate over 10 events, or after 10 minutes
+    ///    with one failure and no success. A `NotFound` (the peer does not have
+    ///    this contract) or an end-to-end timeout (anywhere down the chain) says
+    ///    nothing about whether the connection to the first hop is healthy, and
+    ///    feeding them in would evict healthy peers, most exposed a gateway that
+    ///    fields many requests for absent contracts.
+    /// 2. **Determinism.** `PeerHealthTracker` stamps `std::time::Instant::now()`
+    ///    (a pre-existing TimeSource rule violation). An earlier iteration of
+    ///    the relay hooks routed relay events through `routing_finished` and
+    ///    broke the strict-determinism tests (`test_strict_determinism_*`,
+    ///    `test_direct_runner_determinism`, `test_thundering_herd_connect_storm`).
+    ///
+    /// CAVEAT: `Router::add_event` itself reaches `RoutingPredictor::record` →
+    /// `wall_clock_hours()` → `SystemTime::now()`, so this path is not strictly
+    /// TimeSource-clean either; the determinism tests pass because that
+    /// variance is far below what they compare.
+    pub(crate) fn record_route_event_router_only(&self, event: crate::router::RouteEvent) {
+        self.router.write().add_event(event);
+    }
+
+    /// Record a routing FAILURE label for one attempt. Router only; see
+    /// [`Self::record_route_event_router_only`]. The sole production sink of
+    /// [`crate::operations::route_attempt::RouteAttemptRecorder`].
+    pub(crate) fn record_route_failure(&self, event: crate::router::RouteEvent) {
+        debug_assert!(
+            matches!(event.outcome, crate::router::RouteOutcome::Failure),
+            "record_route_failure called with a non-failure outcome"
+        );
+        self.record_route_event_router_only(event);
+    }
+
     // ==================== Subscription Management (Lease-Based) ====================
 
     /// Subscribe to a contract with a lease.

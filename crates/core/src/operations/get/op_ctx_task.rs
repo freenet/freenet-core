@@ -53,6 +53,7 @@ use crate::operations::op_ctx::{
 use crate::operations::OpError;
 use crate::operations::VisitedPeers;
 use crate::operations::bootstrap::bootstrap_gateway_target;
+use crate::operations::route_attempt::{AttemptFailure, AttemptOrigin, RouteAttemptRecorder};
 use crate::ring::{Location, PeerKeyLocation};
 use crate::router::{RouteEvent, RouteOutcome};
 use crate::tracing::{GetTerminalOutcome, StreamAbortCause};
@@ -438,6 +439,13 @@ async fn drive_client_get_inner(
         saw_not_found: false,
         requests_sent: 0,
         exhaustion_reason: None,
+        recorder: RouteAttemptRecorder::new(
+            op_manager.ring.clone(),
+            Location::from(&instance_id),
+            crate::node::network_status::OpType::Get,
+            AttemptOrigin::Originator,
+        ),
+        terminal_hop: None,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -631,25 +639,37 @@ async fn drive_client_get_inner(
                     _ => None,
                 }
             };
-            let route_event = RouteEvent {
-                peer: driver.current_target.clone(),
-                contract_location,
-                outcome: if host_result.is_ok() {
-                    timed_outcome.unwrap_or(RouteOutcome::SuccessUntimed)
-                } else {
-                    RouteOutcome::Failure
-                },
-                op_type: Some(crate::node::network_status::OpType::Get),
-            };
-            if let Some(log_event) =
-                crate::tracing::NetEventLog::route_event(&client_tx, &op_manager.ring, &route_event)
-            {
-                op_manager
-                    .ring
-                    .register_events(either::Either::Left(log_event))
-                    .await;
+            //
+            // Attributed to the hop the winning attempt was actually forwarded
+            // to (#4485), falling back to `current_target` only when no hop was
+            // recorded. Skipped when the terminal is a streaming header that
+            // the assembly wrapper re-surfaced after a later wire exhaustion:
+            // that header's peer was already charged a Failure when its stream
+            // failed, and every later attempt was labelled as it resolved, so a
+            // final event here would count one of them twice.
+            if !streaming_assembly.terminal_route_event_already_recorded {
+                let route_event = RouteEvent {
+                    peer: driver.terminal_route_peer(),
+                    contract_location,
+                    outcome: if host_result.is_ok() {
+                        timed_outcome.unwrap_or(RouteOutcome::SuccessUntimed)
+                    } else {
+                        RouteOutcome::Failure
+                    },
+                    op_type: Some(crate::node::network_status::OpType::Get),
+                };
+                if let Some(log_event) = crate::tracing::NetEventLog::route_event(
+                    &client_tx,
+                    &op_manager.ring,
+                    &route_event,
+                ) {
+                    op_manager
+                        .ring
+                        .register_events(either::Either::Left(log_event))
+                        .await;
+                }
+                op_manager.ring.routing_finished(route_event);
             }
-            op_manager.ring.routing_finished(route_event);
             crate::node::network_status::record_op_result(
                 crate::node::network_status::OpType::Get,
                 host_result.is_ok(),
@@ -854,6 +874,29 @@ struct GetRetryDriver<'a> {
     /// `debug!` log line that never ran in a release build and was never
     /// wired to reach the telemetry collector.
     exhaustion_reason: Option<crate::tracing::GetExhaustionReason>,
+    /// Labels every non-success attempt for the router (#4485). A client GET
+    /// gets a live recorder; a sub-op GET gets
+    /// [`RouteAttemptRecorder::disabled`] because sub-op GETs do not feed the
+    /// router. Dropped with the driver, which settles any still-ambiguous
+    /// `NotFound` attempts.
+    recorder: RouteAttemptRecorder,
+    /// The peer the most recent `Terminal` attempt was actually forwarded to,
+    /// as recorded by the originator-loopback relay. `None` when the reply was
+    /// produced locally. Terminal route events prefer it over
+    /// `current_target`, which is only this driver's own guess.
+    terminal_hop: Option<PeerKeyLocation>,
+}
+
+impl GetRetryDriver<'_> {
+    /// The peer a terminal route event for the current terminal should blame
+    /// or credit: the real forwarded hop when known, otherwise the pre-#4485
+    /// attribution (`current_target`), kept so terminal events that were
+    /// recorded before are still recorded.
+    fn terminal_route_peer(&self) -> PeerKeyLocation {
+        self.terminal_hop
+            .clone()
+            .unwrap_or_else(|| self.current_target.clone())
+    }
 }
 
 /// Terminal value for the GET driver.
@@ -1059,6 +1102,14 @@ impl RetryDriver for GetRetryDriver<'_> {
             }
         }
     }
+
+    fn attempt_recorder(&mut self) -> Option<&mut RouteAttemptRecorder> {
+        Some(&mut self.recorder)
+    }
+
+    fn on_terminal_hop(&mut self, hop: Option<PeerKeyLocation>) {
+        self.terminal_hop = hop;
+    }
 }
 
 // --- Assembly-retry wrapper (#4345) ---
@@ -1085,6 +1136,12 @@ struct AssemblyOutcome {
     total_fragments: Option<u32>,
     /// Classified cause of a streaming assembly failure; `None` on success.
     abort_cause: Option<StreamAbortCause>,
+    /// True when the returned `Done(Streaming)` is a remembered header
+    /// re-surfaced after the re-entered loop exhausted on the wire. Its peer
+    /// was already charged a route Failure when its stream failed, and each
+    /// later attempt was labelled when it resolved, so the caller must NOT
+    /// emit its usual terminal route event (#4485: no double counting).
+    terminal_route_event_already_recorded: bool,
 }
 
 /// Fragment progress from a streaming GET assembly attempt (#4345 telemetry),
@@ -1164,6 +1221,13 @@ async fn drive_get_with_assembly_retry(
     let outcome = loop {
         let result = drive_retry_loop(op_manager, attempt_tx, op_label, driver).await;
 
+        // Every terminal GET reply (an inline Found, a streaming header, or a
+        // local completion) proves the contract exists, so any earlier
+        // `NotFound` attempt in this operation was a genuine routing failure.
+        if matches!(result, RetryLoopOutcome::Done(_)) {
+            driver.recorder.contract_exists();
+        }
+
         // Only a streaming terminal has a post-loop assembly step;
         // everything else passes through unchanged. Match by reference
         // (the fields are all Copy) so `result` stays whole — every
@@ -1206,6 +1270,7 @@ async fn drive_get_with_assembly_retry(
                     // timed-outcome capture falls through to None.
                     driver.request_sent_at = None;
                     driver.response_received_at = None;
+                    assembly.terminal_route_event_already_recorded = true;
                     break RetryLoopOutcome::Done(Terminal::Streaming {
                         key,
                         stream_id,
@@ -1267,8 +1332,9 @@ async fn drive_get_with_assembly_retry(
             Err(e) => {
                 // Capture the failing peer BEFORE advance() replaces
                 // `current_target` — the routing penalty must land on
-                // the candidate whose header never became a stream.
-                let failed_target = driver.current_target.clone();
+                // the candidate whose header never became a stream: the hop
+                // that attempt was actually forwarded to, when recorded.
+                let failed_target = driver.terminal_route_peer();
                 // Capture the structured progress/cause for the terminal
                 // telemetry event BEFORE `e.message` is moved into
                 // `assembly.error`, so the emitted `get_terminal` carries WHERE
@@ -2340,6 +2406,12 @@ async fn drive_sub_op_get(
         saw_not_found: false,
         requests_sent: 0,
         exhaustion_reason: None,
+        // Sub-op GETs do not feed the router (see the terminal arms below).
+        recorder: RouteAttemptRecorder::disabled(
+            Location::from(&instance_id),
+            crate::node::network_status::OpType::Get,
+        ),
+        terminal_hop: None,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -3420,6 +3492,19 @@ where
 
     let mut retries: usize = 0;
 
+    // Labels this relay's downstream attempts for the local router (#4485).
+    // A downstream NotFound is held until this search resolves: a later
+    // Found (or a local fallback copy) proves the contract exists and turns it
+    // into a Failure; otherwise dropping the recorder at return applies
+    // `ambiguous_not_found_policy`. Timeouts and send failures are labelled
+    // immediately.
+    let mut recorder = RouteAttemptRecorder::new(
+        op_manager.ring.clone(),
+        Location::from(&instance_id),
+        crate::node::network_status::OpType::Get,
+        AttemptOrigin::Relay,
+    );
+
     // Terminal advertisement consult (hosting redesign piece C, invariant 5).
     // Lazily built the first time location routing is exhausted; each entry
     // is an advertised host to forward to (off the direct routing path).
@@ -3465,6 +3550,9 @@ where
                 // the key. Prefer any (stale) local fallback we already hold —
                 // existing behavior, not a dead-end.
                 if let Some((key, state, contract)) = local_fallback.take() {
+                    // A local copy proves the contract exists, so any
+                    // downstream NotFound in this search was a routing failure.
+                    recorder.contract_exists();
                     tracing::info!(
                         tx = %incoming_tx,
                         %instance_id,
@@ -3731,7 +3819,15 @@ where
         let originator_loopback = Some(upstream_addr) == own_addr;
         let mut ctx = op_manager.op_ctx(incoming_tx);
         if originator_loopback {
+            // Tell the client driver's retry loop which peer this attempt
+            // really went to, so its outcome is attributed to that peer
+            // (#4485). Recorded before the dispatch so a reply can never beat
+            // it; cleared if the dispatch fails locally.
+            op_manager
+                .attempt_hop_registry()
+                .record_hop(&incoming_tx, &peer);
             if let Err(err) = ctx.send_fire_and_forget(peer_addr, request).await {
+                op_manager.attempt_hop_registry().clear_hop(&incoming_tx);
                 tracing::warn!(
                     tx = %incoming_tx,
                     target = %peer,
@@ -3766,13 +3862,7 @@ where
                 // so future routing decisions de-prioritize this peer. Without
                 // this hook, only originator-side failures train the router
                 // and per-peer dashboard panels stay empty on relay-heavy nodes.
-                crate::operations::record_relay_route_event(
-                    op_manager,
-                    peer.clone(),
-                    crate::ring::Location::from(&instance_id),
-                    crate::router::RouteOutcome::Failure,
-                    crate::node::network_status::OpType::Get,
-                );
+                recorder.record_attempt(Some(&peer), AttemptFailure::SendFailure);
                 // No reply received — the awaited peer may reply late on the
                 // reused tx, so do NOT consult after this (Codex P2).
                 last_forward_failed = true;
@@ -3787,13 +3877,7 @@ where
                     timeout_secs = OPERATION_TTL.as_secs(),
                     "GET relay: attempt timed out; advancing to next peer"
                 );
-                crate::operations::record_relay_route_event(
-                    op_manager,
-                    peer.clone(),
-                    crate::ring::Location::from(&instance_id),
-                    crate::router::RouteOutcome::Failure,
-                    crate::node::network_status::OpType::Get,
-                );
+                recorder.record_attempt(Some(&peer), AttemptFailure::Timeout);
                 // Timed out with no reply — the peer may reply late on the
                 // reused tx, so do NOT consult after this (Codex P2).
                 last_forward_failed = true;
@@ -3838,7 +3922,9 @@ where
                 // Router. Without this hook, only originator-side successes
                 // train the failure-probability model and per-peer dashboard
                 // panels stay empty on relay-heavy nodes. In-memory only,
-                // safe to run before forwarding.
+                // safe to run before forwarding. The Found also proves the
+                // contract exists, which settles earlier NotFounds as failures.
+                recorder.contract_exists();
                 crate::operations::record_relay_route_event(
                     op_manager,
                     peer.clone(),
@@ -3932,6 +4018,10 @@ where
                 // `drive_relay_put_streaming`.
                 let own_addr = op_manager.ring.connection_manager.get_own_addr();
 
+                // A streaming header proves the contract exists, whether or not
+                // its stream is then delivered.
+                recorder.contract_exists();
+
                 tracing::info!(
                     tx = %incoming_tx,
                     %instance_id,
@@ -3979,13 +4069,7 @@ where
                         // instead of being re-selected. (AlreadyClaimed above
                         // is deliberately NOT counted — that's dedup, not a
                         // failure.)
-                        crate::operations::record_relay_route_event(
-                            op_manager,
-                            peer.clone(),
-                            crate::ring::Location::from(&instance_id),
-                            crate::router::RouteOutcome::Failure,
-                            crate::node::network_status::OpType::Get,
-                        );
+                        recorder.record_attempt(Some(&peer), AttemptFailure::SendFailure);
                         // Treat as a failed attempt — try another peer.
                         new_visited.mark_visited(peer_addr);
                         continue;
@@ -4232,24 +4316,19 @@ where
                 continue;
             }
             AttemptOutcome::Retry => {
-                // Downstream peer correctly answered NotFound. The peer
-                // behaved well at the protocol level — it just doesn't host
-                // this contract. Record `SuccessUntimed`: the failure-
-                // probability model should treat this peer as healthy, even
-                // though the relay tries another candidate for *this*
-                // contract location.
+                // Downstream peer answered NotFound: routing via it did not
+                // deliver this contract. This used to be recorded as
+                // `SuccessUntimed` ("the peer behaved well"), which trained the
+                // failure model on positive labels for dead-ends (#4485). It is
+                // a routing failure; the recorder labels it once this search
+                // resolves (see `ambiguous_not_found_policy`). It never reaches
+                // peer_health.
                 tracing::debug!(
                     tx = %incoming_tx,
                     target = %peer,
                     "GET relay: downstream returned NotFound; advancing to next peer"
                 );
-                crate::operations::record_relay_route_event(
-                    op_manager,
-                    peer.clone(),
-                    crate::ring::Location::from(&instance_id),
-                    crate::router::RouteOutcome::SuccessUntimed,
-                    crate::node::network_status::OpType::Get,
-                );
+                recorder.record_attempt(Some(&peer), AttemptFailure::NotFound);
                 // Mark the failed peer so future iterations don't re-select it.
                 new_visited.mark_visited(peer_addr);
                 // Loop iterates to next peer.
@@ -5068,6 +5147,11 @@ mod tests {
             saw_not_found: false,
             requests_sent: 0,
             exhaustion_reason: None,
+            recorder: RouteAttemptRecorder::disabled(
+                Location::from(&instance_id),
+                crate::node::network_status::OpType::Get,
+            ),
+            terminal_hop: None,
         };
 
         assert!(
@@ -5727,7 +5811,7 @@ mod tests {
         // never became a stream — capture it BEFORE advance() mutates
         // `current_target`.
         let capture_pos = err_body
-            .find("let failed_target = driver.current_target.clone()")
+            .find("let failed_target = driver.terminal_route_peer()")
             .expect("Err arm must capture the failing target");
         let advance_pos = err_body
             .find("driver.advance()")
@@ -7560,45 +7644,59 @@ mod tests {
         assert!(matches!(infra, super::SubOpGetOutcome::Infra(_)));
     }
 
-    /// Pin: each transport-level failure arm of `drive_relay_get_inner`
-    /// records a routing event for the failing peer. Without these
-    /// hooks, the per-peer dashboard's failure-probability model is
-    /// trained only on originated ops and the symptom this PR fixes
-    /// reappears for the relay path. Source-scrape because the
-    /// behaviour is positional inside the retry loop and a deletion
-    /// would not break any unit-test assertion otherwise.
+    /// Pin: each attempt-resolution arm of `drive_relay_get_inner` labels the
+    /// failing peer through the relay's `RouteAttemptRecorder`. Without these
+    /// hooks the per-peer failure-probability model is trained only on
+    /// originated ops (PR #4051), and a downstream NotFound recorded as a
+    /// success trains it on positive labels for dead-ends (#4485).
+    /// Source-scrape because the behaviour is positional inside the retry loop;
+    /// the recorder's own labelling rules are unit-tested in
+    /// `operations::route_attempt`.
     #[test]
     fn drive_relay_get_inner_records_route_events_on_transport_failure() {
         let src = include_str!("op_ctx_task.rs");
         let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
 
-        // The send_to_and_await error arm and the timeout arm must
-        // record `Failure` for the chosen peer. Identify each by its
-        // log-message phrase, then check the arm's body up to the
-        // `continue` for the helper call.
-        for log_phrase in [
-            "send_to_and_await failed; advancing to next peer",
-            "attempt timed out; advancing to next peer",
+        for (log_phrase, needle) in [
+            (
+                "send_to_and_await failed; advancing to next peer",
+                "recorder.record_attempt(Some(&peer), AttemptFailure::SendFailure);",
+            ),
+            (
+                "attempt timed out; advancing to next peer",
+                "recorder.record_attempt(Some(&peer), AttemptFailure::Timeout);",
+            ),
             // #4307: a downstream that advertised a ResponseStreaming header
             // but never delivered an assemblable stream is also a routing
-            // failure for that peer — same training as the transport arms.
-            "orphan stream claim failed; advancing to next peer",
+            // failure for that peer.
+            (
+                "orphan stream claim failed; advancing to next peer",
+                "recorder.record_attempt(Some(&peer), AttemptFailure::SendFailure);",
+            ),
+            // #4485: a downstream NotFound is a routing failure, labelled by
+            // the recorder once the search resolves — never SuccessUntimed.
+            (
+                "downstream returned NotFound; advancing",
+                "recorder.record_attempt(Some(&peer), AttemptFailure::NotFound);",
+            ),
         ] {
             let pos = body.unwrap_or_default_pos(log_phrase);
-            let after = &body[pos..pos + 1500.min(body.len() - pos)];
+            let arm = &body[pos..];
+            let arm = &arm[..arm.find("continue;").expect("arm must `continue;`")];
             assert!(
-                after.contains("record_relay_route_event")
-                    && after.contains("RouteOutcome::Failure"),
-                "drive_relay_get_inner arm for `{log_phrase}` must call \
-                 record_relay_route_event with RouteOutcome::Failure. \
-                 Without this, transport failures from relay-forwarded \
-                 GETs are dropped and the per-peer failure-probability \
-                 model regresses to the originator-only state that \
-                 motivated PR #4051."
+                arm.contains(needle),
+                "drive_relay_get_inner arm for `{log_phrase}` must call `{needle}`. \
+                 Arm:\n{arm}"
+            );
+            assert!(
+                !arm.contains("RouteOutcome::SuccessUntimed"),
+                "drive_relay_get_inner arm for `{log_phrase}` must not record a \
+                 success (#4485). Arm:\n{arm}"
             );
         }
 
-        // The InlineFound success arm must record SuccessUntimed.
+        // The InlineFound success arm must record SuccessUntimed and settle
+        // the search's pending NotFounds as failures (the contract exists).
         let pos = body.unwrap_or_default_pos("downstream returned Found");
         let after = &body[pos..pos + 1500.min(body.len() - pos)];
         assert!(
@@ -7607,20 +7705,34 @@ mod tests {
             "drive_relay_get_inner InlineFound arm must call \
              record_relay_route_event with RouteOutcome::SuccessUntimed."
         );
-
-        // The Retry/NotFound arm must record SuccessUntimed too — see
-        // the outcome-attribution rationale in operations.rs::record_relay_route_event
-        // rustdoc. A peer answering NotFound has not failed.
-        let pos = body.unwrap_or_default_pos("downstream returned NotFound; advancing");
-        let after = &body[pos..pos + 1500.min(body.len() - pos)];
         assert!(
-            after.contains("record_relay_route_event")
-                && after.contains("RouteOutcome::SuccessUntimed"),
-            "drive_relay_get_inner Retry (NotFound) arm must call \
-             record_relay_route_event with RouteOutcome::SuccessUntimed \
-             (NotFound is a correct protocol response, not a routing \
-             failure). Recording it as Failure would systematically \
-             de-prioritise peers that don't host the queried contract."
+            after.contains("recorder.contract_exists();"),
+            "drive_relay_get_inner InlineFound arm must call \
+             recorder.contract_exists() so an earlier NotFound in the same \
+             search is labelled a failure."
+        );
+        let streaming = body
+            .find("AttemptOutcome::Terminal(Terminal::Streaming {")
+            .expect("streaming arm");
+        let claim = body[streaming..]
+            .find("claim_or_wait(")
+            .expect("streaming arm claims the stream")
+            + streaming;
+        assert!(
+            body[streaming..claim].contains("recorder.contract_exists();"),
+            "a streaming header proves the contract exists; the streaming arm \
+             must call recorder.contract_exists() before its claim can fail"
+        );
+        let fallback = body
+            .find("local_fallback.take()")
+            .expect("local fallback arm");
+        assert!(
+            body[fallback..fallback + 400].contains("recorder.contract_exists();"),
+            "serving a local fallback copy proves the contract exists"
+        );
+        assert!(
+            body.contains("AttemptOrigin::Relay"),
+            "the relay GET recorder must count as a relay route event"
         );
     }
 
