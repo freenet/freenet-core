@@ -55,6 +55,19 @@
 //! Adding kNN on top recovers those pairs but fails the worst case (1.25-1.29,
 //! `t.drift`). A joint curve+hierarchy horizon was worse under curve drift
 //! (1.57) than letting the root level absorb it.
+//!
+//! # Follow-up: uniform absent keys, hot key, ranking (fixed before running)
+//!
+//! Naive labeling does NOT wash out when absent keys are uniform. MSE rises
+//! 1.5-1.8x (5% absent) and 6-9x (20%) over the clean level, about as much as
+//! with clustered keys. Ranking (`RANKING` table, lowest-predicted among the
+//! 10 nearest peers matching the lowest-`p*` peer) also falls. Naive vs
+//! delayed at the same absent share, which holds the event budget equal:
+//! best@10 is 7-11 points lower under naive, uniform or clustered. A 1% hot
+//! key is negligible either way. Caveat: absent ops consume attempts from the
+//! fixed event budget, so every noisy scenario also learns from fewer
+//! existing-contract events. Compare naive with delayed at equal share, not
+//! with clean.
 
 use super::*;
 
@@ -150,11 +163,23 @@ struct Spec {
     /// Share of ops targeting a contract that does not exist (every attempt
     /// fails). Absent keys cluster near `ABSENT_CLUSTERS` locations.
     absent_share: f64,
+    absent_layout: AbsentLayout,
     labeling: Labeling,
     /// `> 0`: the GLOBAL distance curve shifts up by this from mid-run on,
     /// for every peer. Added after run 1 as an adversarial check on the
     /// post-hoc long-window prior, which it should penalise.
     curve_shift: f64,
+}
+
+/// Where absent-contract keys fall (follow-up run, fixed before running).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AbsentLayout {
+    /// Near `ABSENT_CLUSTERS` locations, half-width `ABSENT_HALF_WIDTH`.
+    Clustered,
+    /// Uniform over the ring: the "blameless NotFounds wash out" assumption.
+    Uniform,
+    /// Every absent op polls exactly one key.
+    HotKey,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -182,6 +207,7 @@ impl Spec {
             drift_effect: 0.0,
             ops: false,
             absent_share: 0.0,
+            absent_layout: AbsentLayout::Clustered,
             labeling: Labeling::All,
             curve_shift: 0.0,
         }
@@ -196,7 +222,17 @@ impl Spec {
 }
 
 fn noise(name: &'static str, absent_share: f64, labeling: Labeling) -> Spec {
+    noise_with(name, absent_share, labeling, AbsentLayout::Clustered)
+}
+
+fn noise_with(
+    name: &'static str,
+    absent_share: f64,
+    labeling: Labeling,
+    absent_layout: AbsentLayout,
+) -> Spec {
     Spec {
+        absent_layout,
         marginal_sd: 0.08,
         attribute_step: 0.06,
         pairs: Pairs::Natural,
@@ -265,6 +301,38 @@ fn scenarios() -> Vec<Spec> {
         noise("f.ops-delayed", 0.0, Labeling::Delayed),
         noise("f.abs5-delayed", 0.05, Labeling::Delayed),
         noise("f.abs20-delayed", 0.20, Labeling::Delayed),
+        // Follow-up (fixed before running): uniform absent keys and a hot key.
+        noise_with(
+            "f.abs5-naive-uni",
+            0.05,
+            Labeling::All,
+            AbsentLayout::Uniform,
+        ),
+        noise_with(
+            "f.abs20-naive-uni",
+            0.20,
+            Labeling::All,
+            AbsentLayout::Uniform,
+        ),
+        noise_with(
+            "f.abs5-delayed-uni",
+            0.05,
+            Labeling::Delayed,
+            AbsentLayout::Uniform,
+        ),
+        noise_with(
+            "f.abs20-delayed-uni",
+            0.20,
+            Labeling::Delayed,
+            AbsentLayout::Uniform,
+        ),
+        noise_with("f.hotkey1-naive", 0.01, Labeling::All, AbsentLayout::HotKey),
+        noise_with(
+            "f.hotkey1-delayed",
+            0.01,
+            Labeling::Delayed,
+            AbsentLayout::HotKey,
+        ),
         Spec::timing("t.dist"),
         Spec {
             marginal_sd: 0.4,
@@ -418,9 +486,15 @@ impl World {
         }
         let absent = GlobalRng::random_range(0.0..1.0) < self.spec.absent_share;
         let contract = if absent {
-            let centre = self.absent_centres[GlobalRng::random_range(0..ABSENT_CLUSTERS)];
-            (centre + GlobalRng::random_range(-ABSENT_HALF_WIDTH..ABSENT_HALF_WIDTH))
-                .rem_euclid(1.0)
+            match self.spec.absent_layout {
+                AbsentLayout::Clustered => {
+                    let centre = self.absent_centres[GlobalRng::random_range(0..ABSENT_CLUSTERS)];
+                    (centre + GlobalRng::random_range(-ABSENT_HALF_WIDTH..ABSENT_HALF_WIDTH))
+                        .rem_euclid(1.0)
+                }
+                AbsentLayout::Uniform => GlobalRng::random_range(0.0..1.0),
+                AbsentLayout::HotKey => self.absent_centres[0],
+            }
         } else {
             GlobalRng::random_range(0.0..1.0)
         };
@@ -447,9 +521,25 @@ impl World {
     }
 
     fn near_absent(&self, contract: f64) -> bool {
-        self.absent_centres
+        let centres = match self.spec.absent_layout {
+            AbsentLayout::Clustered => &self.absent_centres[..],
+            AbsentLayout::Uniform => &[][..],
+            AbsentLayout::HotKey => &self.absent_centres[..1],
+        };
+        centres
             .iter()
             .any(|&c| ring_distance(contract, c) < NEAR_ABSENT)
+    }
+
+    /// Up to `RANK_CANDIDATES` peers nearest `contract`, nearest first.
+    fn nearest_peers(&self, contract: f64) -> Vec<usize> {
+        let mut all: Vec<usize> = (0..self.spec.peers).collect();
+        all.sort_by(|&a, &b| {
+            ring_distance(self.locations[a], contract)
+                .total_cmp(&ring_distance(self.locations[b], contract))
+        });
+        all.truncate(RANK_CANDIDATES);
+        all
     }
 
     fn draw(&self, index: usize) -> (usize, f64) {
@@ -1291,6 +1381,22 @@ const HIER_CONFIGS: [HierConfig; 6] = [
 /// Subsets scored separately.
 const SUBSETS: [&str; 5] = ["all", "targeted", "cold", "drifted", "near-abs"];
 
+/// Simulated routing decision (ops scenarios, existing contracts, after
+/// warm-up): pick the candidate with the lowest predicted failure among the
+/// `RANK_CANDIDATES` peers nearest the key, and compare with the truly best
+/// by `p*`. Ties go to the nearer peer, for truth and estimate alike.
+const RANK_CANDIDATES: usize = 10;
+const RANK_ROWS: [&str; 8] = [
+    "a  legacy blend (BASELINE)",
+    "b  global curve alone",
+    "-  peer-adjusted (global + EWMA)",
+    "c  kNN gower, LOO k +lam",
+    "d  H peer>8 contract bands",
+    "*d H* root>attr>peer>8c, long, horizon",
+    "*d H* on EB-shrunk long curve",
+    "   nearest peer (no model)",
+];
+
 #[derive(Clone)]
 struct RunResult {
     /// `[subset][row]` mse; NaN where the subset is empty.
@@ -1299,6 +1405,9 @@ struct RunResult {
     /// Estimated variance components of H(contract) at the end of the run,
     /// `[sigma2, tau2_cell, tau2_peer]`.
     components: [f64; 3],
+    /// Per `RANK_ROWS`: `[best@10 hits, regret@10 sum, best@3 hits, regret@3 sum]`.
+    ranking: [[f64; 4]; RANK_ROWS.len()],
+    decisions: usize,
 }
 
 /// Inverse-distance mean/variance over `(distance, value)` pairs, renegade's
@@ -1403,10 +1512,144 @@ fn run_bakeoff(spec: Spec, seed: u64) -> RunResult {
     let mut joint = Joint::new(star_config);
     let mut learned_since_rebuild = 0usize;
     let mut index = 0usize;
+    let mut ranking = [[0.0f64; 4]; RANK_ROWS.len()];
+    let mut decisions = 0usize;
     while index < EVENTS {
         let op = world.next_op(index);
         let contract_value = op.contract;
         let contract = Location::try_from(contract_value).expect("contract within ring");
+
+        // Ranking decision, before any attempt of this op is learned. Reads
+        // models only; draws no randomness, so the event stream is unchanged.
+        if spec.ops && !op.absent && index >= WARMUP_EVENTS {
+            let time = index as f64 / 60.0;
+            let candidates = world.nearest_peers(contract_value);
+            let snap_contract = hiers[1].snapshot(time);
+            let snaps_star = re_star.snapshots(time);
+            let star_selected = re_star.selected(time);
+            let snaps_shrunk = re_star_shrunk.snapshots(time);
+            let shrunk_selected = re_star_shrunk.selected(time);
+            let mut truths = Vec::new();
+            let mut scores: Vec<Vec<f64>> = vec![Vec::new(); RANK_ROWS.len()];
+            let mut complete = true;
+            for (rank_position, &cand) in candidates.iter().enumerate() {
+                let peer = &world.peers[cand];
+                let distance = contract
+                    .distance(peer.location().expect("peer has a location"))
+                    .as_f64();
+                let attribute = world.attribute[cand];
+                truths.push(world.truth(index, cand, contract_value, distance));
+                let (Some(global), Some(peer_adjusted)) = (
+                    iso.estimate_global(peer, contract).ok().map(finish),
+                    iso.estimate_retrieval_time(peer, contract).ok().map(finish),
+                ) else {
+                    complete = false;
+                    break;
+                };
+                let next_id = peer_ids.len() as u64;
+                let query = ResidualPoint {
+                    peer_id: *peer_ids.get(&cand).unwrap_or(&next_id) as f64,
+                    peer_index: cand,
+                    contract: contract_value,
+                    distance,
+                    time,
+                    residual: 0.0,
+                };
+                let observation = RoutingObservation {
+                    peer_id: query.peer_id,
+                    contract_location: contract_value,
+                    distance,
+                    time,
+                };
+                scores[0].push(match legacy_abs.predict(&observation) {
+                    Some(v) if v.is_finite() => {
+                        let w = (legacy_abs.len() as f64 / FAILURE_WEIGHT_RAMP_EVENTS)
+                            .min(MAX_RENEGADE_WEIGHT);
+                        finish(peer_adjusted * (1.0 - w) + v.clamp(0.0, 1.0) * w)
+                    }
+                    _ => peer_adjusted,
+                });
+                scores[1].push(global);
+                scores[2].push(peer_adjusted);
+                let knn: Vec<(f64, f64)> = neighbours(&history, &query, GOWER, loo_k[0])
+                    .iter()
+                    .map(|&(d, i)| (d, history[i].residual))
+                    .collect();
+                scores[3].push(finish(
+                    global
+                        + match idw(&knn) {
+                            Some((m, v, n)) => lam(n, v, m, 0.0) * m,
+                            None => 0.0,
+                        },
+                ));
+                scores[4].push(finish(
+                    global
+                        + hiers[1]
+                            .predict(
+                                snap_contract.as_ref(),
+                                cand,
+                                attribute,
+                                contract_value,
+                                distance,
+                            )
+                            .0,
+                ));
+                scores[5].push(match long.value(distance).map(finish) {
+                    Some(prior) => finish(
+                        prior
+                            + re_star.hiers[star_selected]
+                                .predict(
+                                    snaps_star[star_selected].as_ref(),
+                                    cand,
+                                    attribute,
+                                    contract_value,
+                                    distance,
+                                )
+                                .0,
+                    ),
+                    None => global,
+                });
+                scores[6].push(match shrunk_long.value(distance).map(finish) {
+                    Some(prior) => finish(
+                        prior
+                            + re_star_shrunk.hiers[shrunk_selected]
+                                .predict(
+                                    snaps_shrunk[shrunk_selected].as_ref(),
+                                    cand,
+                                    attribute,
+                                    contract_value,
+                                    distance,
+                                )
+                                .0,
+                    ),
+                    None => global,
+                });
+                scores[7].push(rank_position as f64);
+            }
+            if complete && candidates.len() >= 3 {
+                let argmin = |values: &[f64]| {
+                    let mut best = 0;
+                    for (i, v) in values.iter().enumerate() {
+                        if *v < values[best] {
+                            best = i;
+                        }
+                    }
+                    best
+                };
+                let best10 = argmin(&truths);
+                let best3 = argmin(&truths[..3]);
+                for (row, row_scores) in scores.iter().enumerate() {
+                    let chosen10 = argmin(row_scores);
+                    let chosen3 = argmin(&row_scores[..3]);
+                    ranking[row][0] += f64::from(u8::from(chosen10 == best10));
+                    ranking[row][1] += truths[chosen10] - truths[best10];
+                    ranking[row][2] += f64::from(u8::from(chosen3 == best3));
+                    ranking[row][3] += truths[chosen3] - truths[best3];
+                }
+                decisions += 1;
+            }
+        }
+
         pending.clear();
         let mut succeeded = false;
         for &peer_index in &op.candidates {
@@ -1869,6 +2112,8 @@ fn run_bakeoff(spec: Spec, seed: u64) -> RunResult {
             .collect(),
         counts,
         components,
+        ranking,
+        decisions,
     }
 }
 
@@ -2087,14 +2332,26 @@ fn bakeoff_report(seeds: &[u64], title: &str) {
             .expect("noise scenario present")
     };
     let clean = index_of("f.ops-clean");
-    let groups: [(&str, [&str; 3]); 2] = [
+    let groups: [(&str, [&str; 3]); 5] = [
         (
-            "(a) naive",
+            "(a) naive, clustered keys",
             ["f.ops-clean", "f.abs5-naive", "f.abs20-naive"],
         ),
         (
-            "(b) delayed",
+            "(b) delayed, clustered keys",
             ["f.ops-delayed", "f.abs5-delayed", "f.abs20-delayed"],
+        ),
+        (
+            "(c) naive, UNIFORM keys",
+            ["f.ops-clean", "f.abs5-naive-uni", "f.abs20-naive-uni"],
+        ),
+        (
+            "(d) delayed, UNIFORM keys",
+            ["f.ops-delayed", "f.abs5-delayed-uni", "f.abs20-delayed-uni"],
+        ),
+        (
+            "(e) hot key (1% of ops poll one absent key)",
+            ["f.ops-clean", "f.hotkey1-naive", "f.hotkey1-delayed"],
         ),
     ];
     let seed_mean =
@@ -2126,5 +2383,52 @@ fn bakeoff_report(seeds: &[u64], title: &str) {
             out.push_str(&format!("  worst {worst:.3}\n"));
         }
     }
+
+    // Ranking: does the estimator still pick the truly best candidate?
+    out.push_str(&format!(
+        "\n== RANKING (ops scenarios): best@{RANK_CANDIDATES} = fraction of decisions where the \
+         lowest-predicted candidate among the {RANK_CANDIDATES} nearest peers is the lowest-p* \
+         one; regret = mean p*(chosen) - p*(best); best@3 over the 3 nearest. Mean over seeds.\n"
+    ));
+    let rank_specs: Vec<usize> = specs
+        .iter()
+        .enumerate()
+        .filter(|(_, spec)| spec.ops)
+        .map(|(i, _)| i)
+        .collect();
+    out.push_str(&format!(
+        "{:<40}",
+        "estimator  (best@10 / regret@10 / best@3)"
+    ));
+    for &s in &rank_specs {
+        out.push_str(&format!("{:>22}", specs[s].name));
+    }
+    out.push('\n');
+    for (row, label) in RANK_ROWS.iter().enumerate() {
+        out.push_str(&format!("{label:<40}"));
+        for &s in &rank_specs {
+            let per = |k: usize| {
+                mean(
+                    &results[s]
+                        .iter()
+                        .map(|r| r.ranking[row][k] / r.decisions.max(1) as f64)
+                        .collect::<Vec<_>>(),
+                )
+            };
+            out.push_str(&format!("   {:.3}/{:.4}/{:.3}", per(0), per(1), per(2)));
+        }
+        out.push('\n');
+    }
+    out.push_str(&format!("{:<40}", "mean decisions per run"));
+    for &s in &rank_specs {
+        let d = mean(
+            &results[s]
+                .iter()
+                .map(|r| r.decisions as f64)
+                .collect::<Vec<_>>(),
+        );
+        out.push_str(&format!("{d:>22.0}"));
+    }
+    out.push('\n');
     eprintln!("{out}");
 }
