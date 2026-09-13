@@ -7967,7 +7967,8 @@ mod tests {
     /// 1. An explicit value far ABOVE the RAM-scaled default's 1 GiB clamp
     ///    survives the 60s recompute, bounded only by the disk budget — and the
     ///    32 GiB `--max-hosting-disk` default still caps it, which is why the
-    ///    help text tells an operator to raise both.
+    ///    help text tells an operator to keep the state budget below the disk
+    ///    budget rather than assume the flag alone is the limit.
     /// 2. Raising it does NOT move the contract-COUNT limit, in either
     ///    direction. That budget is derived from `total_ram` alone, because
     ///    per-contract resident memory is the real RAM cost (~0.8 MiB/contract
@@ -8004,7 +8005,7 @@ mod tests {
         assert_eq!(donor.hosting_budget_bytes(), 20 * GIB);
 
         // (1b) The same kind of contribution under the DEFAULT disk cap is
-        // capped at 32 GiB — the documented reason to raise both options.
+        // capped at 32 GiB — the disk budget, not the state flag, is the limit.
         let capped = HostingManager::new(100 * GIB);
         capped.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
         capped.seed_disk_tracker_for_test([(make_contract_key(2), GIB)]);
