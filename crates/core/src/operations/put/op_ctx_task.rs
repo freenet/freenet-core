@@ -541,7 +541,7 @@ async fn drive_client_put_inner(
         stream_progress,
         recorder: crate::operations::route_attempt::RouteAttemptRecorder::new(
             op_manager.ring.clone(),
-            Location::from(&key),
+            *key.id(),
             crate::node::network_status::OpType::Put,
             crate::operations::route_attempt::AttemptOrigin::Originator,
         ),

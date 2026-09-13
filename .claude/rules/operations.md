@@ -61,7 +61,9 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
     never a hand-inlined RouteEvent. Timeout / PeerDisconnected → Failure now;
     NotFound → held until the op resolves; `contract_exists()` on any reply
     that proves the contract exists; the recorder's Drop applies
-    `ambiguous_not_found_policy()` to the rest.
+    `ambiguous_not_found_policy()` to the rest (default Delayed: park in
+    `ring::parked_not_found`, train only on later evidence the contract
+    exists, never on expiry — naive training measurably degraded the model).
   → Blame the peer the request ACTUALLY went to. GET/PUT originators send to
     their own loopback relay, which picks the real hop; read it from the
     per-attempt `AttemptHopRegistry` slot (the loopback relay fills it). The

@@ -9028,23 +9028,27 @@ fn test_relay_route_events_multihop() {
     );
 }
 
-/// #4485: the router's failure-probability model must actually receive
-/// failure labels when routing dead-ends.
+/// #4485: dead-end route attempts must reach the router's failure model, but
+/// only once something proves the contract exists.
 ///
 /// Before the fix a relay recorded a downstream `NotFound` as a SUCCESS and
-/// the GET/PUT/SUBSCRIBE originators recorded only their final success, so a
-/// production gateway saw 2 failures in 361 route events. Here the same
-/// 13-node topology (same seed) runs twice:
+/// originators recorded only their final success, so a production gateway saw
+/// 2 failures in 361 route events. Under the delayed policy an operation that
+/// exhausts on `NotFound`s parks those attempts (they may be requests for a
+/// contract that does not exist) and trains them as failures only when this
+/// node later stores the contract's state.
 ///
-/// * **present** — the gateway PUTs a contract and every node GETs it. This is
-///   the health baseline: every GET must resolve (state lands on every node).
-/// * **absent** — every node GETs a contract that was never PUT. Every search
-///   dead-ends, and under `ambiguous_not_found_policy` (train as failure) each
-///   node must label at least the peer its attempt was forwarded to.
+/// The same 13-node topology (same seed) runs twice. Every node GETs a
+/// contract that has not been PUT (every search dead-ends and parks), then
+/// GETs it again:
 ///
-/// The failure count is read from each node's Router
-/// (`RouteOutcomeTotals`), not from a proxy counter, so deleting the labelling
-/// at the originator or the relay turns the absent-run assertion red.
+/// * **evidence** — the gateway PUTs the contract between the two rounds, so
+///   the second round resolves, each node stores the state, and its parked
+///   attempts are released as failures. This run is also the GET health
+///   baseline: every second-round GET must resolve.
+/// * **no evidence** — the contract is never PUT. Nothing may be released.
+///
+/// Counts are read from each node's parked store and Router, not a proxy.
 #[test_log::test]
 fn test_router_receives_failures_for_dead_end_gets() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
@@ -9052,10 +9056,10 @@ fn test_router_receives_failures_for_dead_end_gets() {
     const SEED: u64 = 0x4485_0000_0001;
     let num_nodes = 12;
 
-    let run = |network_name: &'static str, get_present: bool| {
+    let run = |network_name: &'static str, put_between_rounds: bool| {
         setup_deterministic_state(SEED);
         let rt = create_runtime();
-        let sim = rt.block_on(async {
+        let mut sim = rt.block_on(async {
             SimNetwork::new(
                 network_name,
                 1,         // gateways
@@ -9068,54 +9072,65 @@ fn test_router_receives_failures_for_dead_end_gets() {
             )
             .await
         });
+        // 15 s between operations: long enough that a node's first-round GET
+        // has finished before its second-round GET starts (at 5 s the last
+        // node's two GETs overlap and its second one never stores the state,
+        // which reproduces on the pre-#4485 base too), and short enough that
+        // the second round lands inside the parked-NotFound TTL (5 min).
+        sim.with_controlled_op_interval(Duration::from_secs(15));
 
-        let present = SimOperation::create_test_contract(0x85);
-        let present_id = *present.key().id();
-        register_crdt_contract(present_id);
-        // Never PUT anywhere: every GET for it dead-ends.
-        let absent_id = *SimOperation::create_test_contract(0x86).key().id();
+        let contract = SimOperation::create_test_contract(0x85);
+        let contract_id = *contract.key().id();
+        register_crdt_contract(contract_id);
 
-        let mut operations = vec![ScheduledOperation::new(
-            NodeLabel::gateway(network_name, 0),
-            SimOperation::Put {
-                contract: present.clone(),
-                state: SimOperation::create_crdt_state(1, 0x85),
-                subscribe: true,
-            },
-        )];
-        for i in 1..=num_nodes {
+        let get_round = |ops: &mut Vec<ScheduledOperation>| {
+            for i in 1..=num_nodes {
+                ops.push(ScheduledOperation::new(
+                    NodeLabel::node(network_name, i),
+                    SimOperation::Get {
+                        contract_id,
+                        return_contract_code: true,
+                        subscribe: false,
+                    },
+                ));
+            }
+        };
+        let mut operations = Vec::new();
+        get_round(&mut operations);
+        if put_between_rounds {
             operations.push(ScheduledOperation::new(
-                NodeLabel::node(network_name, i),
-                SimOperation::Get {
-                    contract_id: if get_present { present_id } else { absent_id },
-                    return_contract_code: true,
-                    subscribe: false,
+                NodeLabel::gateway(network_name, 0),
+                SimOperation::Put {
+                    contract: contract.clone(),
+                    state: SimOperation::create_crdt_state(1, 0x85),
+                    subscribe: true,
                 },
             ));
         }
+        get_round(&mut operations);
 
         let result = sim.run_controlled_simulation(
             SEED,
             operations,
-            Duration::from_secs(400),
-            Duration::from_secs(120),
+            Duration::from_secs(900),
+            Duration::from_secs(180),
         );
         assert!(
             result.turmoil_result.is_ok(),
             "{network_name}: simulation failed: {:?}",
             result.turmoil_result.err()
         );
-        (result, present.key())
+        (result, contract.key())
     };
 
-    // ── present: health baseline ────────────────────────────────────────────
-    let (present_result, present_key) = run("route-failures-present", true);
+    // ── evidence ────────────────────────────────────────────────────────────
+    let (with_evidence, key) = run("route-failures-evidence", true);
     let nodes_without_state: Vec<usize> = (1..=num_nodes)
         .filter(|i| {
-            present_result
+            with_evidence
                 .node_storages
-                .get(&NodeLabel::node("route-failures-present", *i))
-                .is_none_or(|s| s.get_stored_state(&present_key).is_none())
+                .get(&NodeLabel::node("route-failures-evidence", *i))
+                .is_none_or(|s| s.get_stored_state(&key).is_none())
         })
         .collect();
     assert!(
@@ -9123,48 +9138,59 @@ fn test_router_receives_failures_for_dead_end_gets() {
         "every GET for a PUT contract must still resolve (GET success rate \
          must not regress); nodes without state: {nodes_without_state:?}"
     );
-    let (present_failures, present_successes) = present_result.aggregate_route_outcome_totals();
-    // Observed at this seed: 0 failures / 20 successes. Not pinned to exactly
-    // zero: a GET that meets one NotFound before its Found is CORRECTLY a
-    // failure label, and whether that happens depends on topology, not on the
-    // labelling. What must hold is that resolving GETs train mostly positive.
-    assert!(
-        present_successes > 0 && present_failures * 4 <= present_successes,
-        "GETs that all resolve must train the router overwhelmingly on \
-         successes: {present_failures} failures / {present_successes} successes"
-    );
+    let (ev_parked, ev_released, ev_expired, ev_rejected) =
+        with_evidence.aggregate_parked_not_found_stats();
+    let (ev_failures, ev_successes) = with_evidence.aggregate_route_outcome_totals();
 
-    // ── absent: every GET dead-ends ─────────────────────────────────────────
-    let (absent_result, _) = run("route-failures-absent", false);
-    let (absent_failures, absent_successes) = absent_result.aggregate_route_outcome_totals();
-    let nodes_without_failures: Vec<usize> = (1..=num_nodes)
-        .filter(|i| {
-            absent_result
-                .node_route_outcome_totals(&NodeLabel::node("route-failures-absent", *i))
-                .is_none_or(|(failures, _)| failures == 0)
-        })
-        .collect();
+    // ── no evidence ─────────────────────────────────────────────────────────
+    let (without_evidence, _) = run("route-failures-no-evidence", false);
+    let (no_parked, no_released, no_expired, no_rejected) =
+        without_evidence.aggregate_parked_not_found_stats();
+    let (no_failures, no_successes) = without_evidence.aggregate_route_outcome_totals();
 
     tracing::info!(
-        present_failures,
-        present_successes,
-        absent_failures,
-        absent_successes,
-        "route outcome totals"
+        ev_parked,
+        ev_released,
+        ev_expired,
+        ev_rejected,
+        ev_failures,
+        ev_successes,
+        no_parked,
+        no_released,
+        no_expired,
+        no_rejected,
+        no_failures,
+        no_successes,
+        "parked NotFound and route outcome totals"
     );
 
     assert!(
-        nodes_without_failures.is_empty(),
-        "every node that issued a dead-end GET must feed at least one failure \
-         to its own router (the peer its attempt was forwarded to). Nodes whose \
-         router saw no failure: {nodes_without_failures:?}. Totals: \
-         absent={absent_failures} failures / {absent_successes} successes, \
-         present={present_failures} failures / {present_successes} successes."
+        no_parked > 0,
+        "dead-end GETs must park their ambiguous NotFound attempts \
+         (parked={no_parked})"
+    );
+    assert_eq!(
+        no_released, 0,
+        "with no evidence the contract exists, no parked attempt may be trained"
     );
     assert!(
-        absent_failures > present_failures,
-        "dead-end GETs must produce more failure labels than resolving GETs: \
-         absent={absent_failures}, present={present_failures}"
+        ev_released > 0,
+        "storing the contract after it was PUT must release the attempts parked \
+         by the first-round dead-ends (parked={ev_parked}, released={ev_released})"
+    );
+    assert!(
+        ev_released <= ev_parked,
+        "a parked attempt is released at most once \
+         (parked={ev_parked}, released={ev_released})"
+    );
+    // `*_rejected` is NOT asserted to be zero: every dead-end GET in this run
+    // targets the same absent key, so hub relays legitimately hit the
+    // per-contract cap. That is the cap doing its job (one hot missing key may
+    // not hold the store); a rejected attempt is simply never trained.
+    assert!(
+        ev_failures >= ev_released,
+        "every released attempt must reach a router as a failure: \
+         failures={ev_failures}, released={ev_released}"
     );
 }
 

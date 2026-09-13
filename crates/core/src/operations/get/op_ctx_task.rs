@@ -441,7 +441,7 @@ async fn drive_client_get_inner(
         exhaustion_reason: None,
         recorder: RouteAttemptRecorder::new(
             op_manager.ring.clone(),
-            Location::from(&instance_id),
+            instance_id,
             crate::node::network_status::OpType::Get,
             AttemptOrigin::Originator,
         ),
@@ -2408,7 +2408,7 @@ async fn drive_sub_op_get(
         exhaustion_reason: None,
         // Sub-op GETs do not feed the router (see the terminal arms below).
         recorder: RouteAttemptRecorder::disabled(
-            Location::from(&instance_id),
+            instance_id,
             crate::node::network_status::OpType::Get,
         ),
         terminal_hop: None,
@@ -3500,7 +3500,7 @@ where
     // immediately.
     let mut recorder = RouteAttemptRecorder::new(
         op_manager.ring.clone(),
-        Location::from(&instance_id),
+        instance_id,
         crate::node::network_status::OpType::Get,
         AttemptOrigin::Relay,
     );
@@ -5148,7 +5148,7 @@ mod tests {
             requests_sent: 0,
             exhaustion_reason: None,
             recorder: RouteAttemptRecorder::disabled(
-                Location::from(&instance_id),
+                instance_id,
                 crate::node::network_status::OpType::Get,
             ),
             terminal_hop: None,
@@ -7908,7 +7908,7 @@ mod route_attempt_driver_tests {
             exhaustion_reason: None,
             recorder: RouteAttemptRecorder::new(
                 op_manager.ring.clone(),
-                Location::from(&instance_id),
+                instance_id,
                 crate::node::network_status::OpType::Get,
                 AttemptOrigin::Originator,
             ),
@@ -8028,12 +8028,14 @@ mod route_attempt_driver_tests {
         );
     }
 
-    /// Every attempt answers NotFound and the retry budget exhausts: nothing
-    /// is labelled while the op could still prove existence, then settling
-    /// applies `ambiguous_not_found_policy` (train as failure): one Failure
-    /// per attempted hop, no extra exhaustion event.
+    /// Every attempt answers NotFound and the retry budget exhausts. The
+    /// NotFounds are ambiguous (the contract may not exist), so under the
+    /// delayed policy nothing is trained: each attempted hop is parked once,
+    /// with no extra exhaustion event. Later evidence that the contract exists
+    /// (this node storing its state) releases exactly those attempts as
+    /// failures, once.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn exhausted_all_not_found_labels_each_attempted_hop_once() {
+    async fn exhausted_all_not_found_parks_each_hop_until_evidence() {
         let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-exhausted", 5).await;
         let instance_id = ContractInstanceId::new([43u8; 32]);
         let hops = peers.clone();
@@ -8051,23 +8053,67 @@ mod route_attempt_driver_tests {
         let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
         let outcome = run(&op_manager, client_tx, &mut driver).await;
         assert!(matches!(outcome, RetryLoopOutcome::Exhausted(_)));
-        assert!(
-            failure_window(&op_manager).is_empty(),
-            "an ambiguous NotFound is not labelled before the op settles"
-        );
         drop(driver);
 
         let attempts = served.load(Ordering::SeqCst);
         assert!(attempts >= 2, "the budget must allow several attempts");
+        assert!(
+            failure_window(&op_manager).is_empty(),
+            "an ambiguous NotFound must not be trained when the op exhausts"
+        );
+        let stats = op_manager.ring.parked_not_found_stats();
+        assert_eq!(
+            (stats.parked, stats.live),
+            (attempts as u64, attempts as u64),
+            "one parked attempt per attempted hop, no extra exhaustion entry"
+        );
+
+        // Evidence: this node stores state for the contract.
+        let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([9u8; 32]));
+        op_manager.ring.commit_state_write(&key, 3);
         let expected: Vec<_> = (0..attempts)
             .map(|i| peers[i % peers.len()].socket_addr().unwrap())
             .collect();
         assert_eq!(failed_addrs(&op_manager), expected);
+        op_manager.ring.commit_state_write(&key, 3);
         assert_eq!(
             failure_window(&op_manager).len(),
             attempts,
-            "exhaustion must not add an event beyond the per-attempt labels"
+            "released attempts must not be trained twice"
         );
+        let stats = op_manager.ring.parked_not_found_stats();
+        assert_eq!((stats.released, stats.live), (attempts as u64, 0));
+    }
+
+    /// Parked attempts belong to their contract: evidence for a DIFFERENT
+    /// contract releases nothing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn evidence_for_another_contract_releases_nothing() {
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-other-key", 3).await;
+        let instance_id = ContractInstanceId::new([46u8; 32]);
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |_, msg, _| Step {
+                hop: Some(peers[1].clone()),
+                answer: Answer::Reply(not_found(msg, instance_id)),
+            },
+        );
+        let client_tx = Transaction::new::<GetMsg>();
+        let own = op_manager.ring.connection_manager.own_location();
+        let mut driver = client_driver(&op_manager, client_tx, instance_id, own);
+        let _ = run(&op_manager, client_tx, &mut driver).await;
+        drop(driver);
+        assert!(op_manager.ring.parked_not_found_stats().live > 0);
+
+        let other = ContractKey::from_id_and_code(
+            ContractInstanceId::new([47u8; 32]),
+            CodeHash::new([9u8; 32]),
+        );
+        op_manager.ring.commit_state_write(&other, 3);
+        assert!(failure_window(&op_manager).is_empty());
+        assert_eq!(op_manager.ring.parked_not_found_stats().released, 0);
     }
 
     /// An attempt the loopback relay never forwarded (no routing candidate,
@@ -8103,6 +8149,11 @@ mod route_attempt_driver_tests {
             "no forwarded hop means no route event: {:?}",
             failure_window(&op_manager)
         );
+        assert_eq!(
+            op_manager.ring.parked_not_found_stats().parked,
+            0,
+            "no forwarded hop means nothing to park"
+        );
     }
 
     /// The sub-op GET driver deliberately does not feed the router.
@@ -8122,13 +8173,12 @@ mod route_attempt_driver_tests {
         );
         let tx = Transaction::new::<GetMsg>();
         let mut driver = client_driver(&op_manager, tx, instance_id, peers[0].clone());
-        driver.recorder = RouteAttemptRecorder::disabled(
-            Location::from(&instance_id),
-            crate::node::network_status::OpType::Get,
-        );
+        driver.recorder =
+            RouteAttemptRecorder::disabled(instance_id, crate::node::network_status::OpType::Get);
         let _ = run(&op_manager, tx, &mut driver).await;
         drop(driver);
         assert!(failure_window(&op_manager).is_empty());
+        assert_eq!(op_manager.ring.parked_not_found_stats().parked, 0);
     }
 
     /// Source pin: a streaming header re-surfaced after a later wire

@@ -783,7 +783,7 @@ async fn drive_client_subscribe_inner(
     // `ambiguous_not_found_policy`.
     let mut recorder = crate::operations::route_attempt::RouteAttemptRecorder::new(
         op_manager.ring.clone(),
-        crate::ring::Location::from(&instance_id),
+        instance_id,
         crate::node::network_status::OpType::Subscribe,
         crate::operations::route_attempt::AttemptOrigin::Originator,
     );
@@ -1870,7 +1870,7 @@ async fn drive_relay_subscribe(
     // consult overturned via `ambiguous_not_found_policy`.
     let mut recorder = crate::operations::route_attempt::RouteAttemptRecorder::new(
         op_manager.ring.clone(),
-        crate::ring::Location::from(&instance_id),
+        instance_id,
         crate::node::network_status::OpType::Subscribe,
         crate::operations::route_attempt::AttemptOrigin::Relay,
     );
@@ -4088,12 +4088,15 @@ mod route_attempt_driver_tests {
 
         let targets = targets.lock().clone();
         assert!(targets.len() >= 2, "several attempts must have been made");
-        assert_eq!(
-            failed_addrs(&op_manager),
-            // The timeout is labelled when it happens; the NotFounds when the
-            // recorder settles at return, in attempt order.
-            targets,
-        );
+        // The timeout is labelled when it happens. The NotFounds are ambiguous
+        // (nothing proved the contract exists), so they are parked, not trained.
+        assert_eq!(failed_addrs(&op_manager), targets[..1].to_vec());
+        let stats = op_manager.ring.parked_not_found_stats();
+        assert_eq!(stats.parked, targets.len() as u64 - 1);
+        // Evidence releases every parked NotFound, in attempt order, once.
+        op_manager.ring.release_parked_not_found(&instance_id);
+        op_manager.ring.release_parked_not_found(&instance_id);
+        assert_eq!(failed_addrs(&op_manager), targets);
         assert!(
             failure_window(&op_manager).iter().all(|(_, r)| *r == 1.0),
             "no success event: nothing subscribed"
@@ -4138,9 +4141,16 @@ mod route_attempt_driver_tests {
         assert!(targets.len() >= 2);
         assert_eq!(
             failed_addrs(&op_manager),
-            targets[1..].to_vec(),
+            targets[1..2].to_vec(),
             "the dropped waiter (attempt 0) must not be labelled; the \
-             disconnect (attempt 1) and every NotFound must be"
+             disconnect (attempt 1) must be, immediately"
+        );
+        op_manager.ring.release_parked_not_found(&instance_id);
+        assert_eq!(
+            failed_addrs(&op_manager),
+            targets[1..].to_vec(),
+            "released NotFounds follow the disconnect; the dropped waiter \
+             still blames nobody"
         );
     }
 

@@ -553,6 +553,18 @@ impl ControlledSimulationResult {
         })
     }
 
+    /// `(parked, released, expired, rejected)` ambiguous-NotFound route
+    /// attempts summed over every node's parked store (#4485). See
+    /// `ring::parked_not_found`.
+    pub fn aggregate_parked_not_found_stats(&self) -> (u64, u64, u64, u64) {
+        self.node_rings
+            .values()
+            .map(|ring| ring.parked_not_found_stats())
+            .fold((0, 0, 0, 0), |(p, r, e, j), s| {
+                (p + s.parked, r + s.released, e + s.expired, j + s.rejected)
+            })
+    }
+
     /// `(failures, successes)` route events summed over every node's router
     /// (#4485). See [`Self::node_route_outcome_totals`].
     pub fn aggregate_route_outcome_totals(&self) -> (u64, u64) {
