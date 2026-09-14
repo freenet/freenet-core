@@ -1108,6 +1108,11 @@ pub(crate) struct Router {
     mean_transfer_size: Mean,
     consider_n_closest_peers: usize,
     /// Per-operation-type failure estimators (telemetry/dashboard only).
+    ///
+    /// All three `per_op_*` maps hold [`isotonic_estimator::FitPolicy::OnRead`]
+    /// estimators: nothing routes on them, so they keep their windows current
+    /// but fit only when the dashboard snapshot reads them, rather than paying a
+    /// full rebuild per event under `ring.router.write()` (#5662).
     per_op_failure: HashMap<OpType, IsotonicEstimator>,
     /// Per-operation-type response time estimators (telemetry/dashboard only).
     per_op_response_time: HashMap<OpType, IsotonicEstimator>,
@@ -1609,16 +1614,26 @@ impl Router {
             ),
             mean_transfer_size,
             consider_n_closest_peers: DEFAULT_CONSIDER_N_CLOSEST_PEERS,
+            // Dashboard-only, so they fit on read. See `FitPolicy`.
             per_op_failure: per_op_failure
                 .into_iter()
-                .map(|(k, v)| (k, IsotonicEstimator::new(v, EstimatorType::Positive)))
+                .map(|(k, v)| {
+                    (
+                        k,
+                        IsotonicEstimator::new_fit_on_read(
+                            v,
+                            EstimatorType::Positive,
+                            AdjustmentMode::Additive,
+                        ),
+                    )
+                })
                 .collect(),
             per_op_response_time: per_op_response_time
                 .into_iter()
                 .map(|(k, v)| {
                     (
                         k,
-                        IsotonicEstimator::new_with_mode(
+                        IsotonicEstimator::new_fit_on_read(
                             v,
                             EstimatorType::Positive,
                             AdjustmentMode::Multiplicative,
@@ -1628,7 +1643,16 @@ impl Router {
                 .collect(),
             per_op_transfer_rate: per_op_transfer_rate
                 .into_iter()
-                .map(|(k, v)| (k, IsotonicEstimator::new(v, EstimatorType::Negative)))
+                .map(|(k, v)| {
+                    (
+                        k,
+                        IsotonicEstimator::new_fit_on_read(
+                            v,
+                            EstimatorType::Negative,
+                            AdjustmentMode::Additive,
+                        ),
+                    )
+                })
                 .collect(),
             renegade_predictor,
             // Start empty on a reload for the same reason the residual stages do:
@@ -1733,11 +1757,13 @@ impl Router {
 
                 // Per-op-type estimators
                 if let Some(ot) = op_type {
+                    // The per-op estimators are dashboard-only, so they fit on
+                    // read rather than on every event. See `FitPolicy`.
                     self.per_op_response_time
                         .entry(ot)
                         .or_insert_with(|| {
                             // Multiplicative to match the global response-time estimator.
-                            IsotonicEstimator::new_with_mode(
+                            IsotonicEstimator::new_fit_on_read(
                                 std::iter::empty(),
                                 EstimatorType::Positive,
                                 AdjustmentMode::Multiplicative,
@@ -1751,7 +1777,11 @@ impl Router {
                     self.per_op_failure
                         .entry(ot)
                         .or_insert_with(|| {
-                            IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive)
+                            IsotonicEstimator::new_fit_on_read(
+                                std::iter::empty(),
+                                EstimatorType::Positive,
+                                AdjustmentMode::Additive,
+                            )
                         })
                         .add_event(IsotonicEvent {
                             peer: event.peer.clone(),
@@ -1774,7 +1804,11 @@ impl Router {
                         self.per_op_transfer_rate
                             .entry(ot)
                             .or_insert_with(|| {
-                                IsotonicEstimator::new(std::iter::empty(), EstimatorType::Negative)
+                                IsotonicEstimator::new_fit_on_read(
+                                    std::iter::empty(),
+                                    EstimatorType::Negative,
+                                    AdjustmentMode::Additive,
+                                )
                             })
                             .add_event(IsotonicEvent {
                                 contract_location: event.contract_location,
@@ -1799,7 +1833,11 @@ impl Router {
                     self.per_op_failure
                         .entry(ot)
                         .or_insert_with(|| {
-                            IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive)
+                            IsotonicEstimator::new_fit_on_read(
+                                std::iter::empty(),
+                                EstimatorType::Positive,
+                                AdjustmentMode::Additive,
+                            )
                         })
                         .add_event(IsotonicEvent {
                             peer: event.peer,
@@ -1946,15 +1984,22 @@ impl Router {
         // assuming nothing and better than it for the first time. See #4485.
         //
         // Three different quantities get called "captured" around here, and a
-        // reviewer who ran the test read the wrong one off it, so naming them:
+        // reviewer who ran the test read the wrong one off it, so naming them
+        // (all measured before #5658; see below for today's):
         //   -0.438  the global curve UNCORRECTED — what the harness prints as
-        //           `base`, and what you will see if you run it today
+        //           `base`
         //   -0.302  the CORRECTED estimate composing with the PEER-ADJUSTED
         //           base, i.e. the design this comment argues against. Not
         //           reproducible from the tree: that configuration is gone
         //   +0.055  the CORRECTED estimate composing with the global curve,
         //           i.e. what the code now does
         // The comparison that settles B5 is the second against the third.
+        //
+        // #5658 made the isotonic base exact (its rolling window had been
+        // corrupted between refits), which moved the two reproducible figures:
+        // the harness now prints `base` -0.133 and corrected +0.270. The -0.302
+        // was measured against the corrupted base and has not been re-measured,
+        // so the B5 comparison stands on pre-#5658 numbers.
         let failure = self
             .failure_estimator
             .estimate_global(peer, contract_location)
@@ -2477,23 +2522,23 @@ impl Router {
                 for ot in op_types {
                     let mut c = PerOpCurves::default();
                     if let Some(est) = self.per_op_failure.get(&ot) {
-                        let p = est.sampled_curve(0.0, 1.0, 50);
-                        c.failure_curve = p;
-                        c.failure_data_range = est.data_x_range();
+                        // One fit for both: these estimators fit on read.
+                        (c.failure_curve, c.failure_data_range) =
+                            est.sampled_curve_and_range(0.0, 1.0, 50);
                         c.failure_events = est.len();
                         c.failure_points = est.sampled_raw_points(100);
                     }
                     if let Some(est) = self.per_op_response_time.get(&ot) {
-                        let p = est.sampled_curve(0.0, f64::INFINITY, 50);
-                        c.response_time_curve = p;
-                        c.response_time_data_range = est.data_x_range();
+                        // One fit for both: these estimators fit on read.
+                        (c.response_time_curve, c.response_time_data_range) =
+                            est.sampled_curve_and_range(0.0, f64::INFINITY, 50);
                         c.response_time_events = est.len();
                         c.response_time_points = est.sampled_raw_points(100);
                     }
                     if let Some(est) = self.per_op_transfer_rate.get(&ot) {
-                        let p = est.sampled_curve(0.0, f64::INFINITY, 50);
-                        c.transfer_rate_curve = p;
-                        c.transfer_rate_data_range = est.data_x_range();
+                        // One fit for both: these estimators fit on read.
+                        (c.transfer_rate_curve, c.transfer_rate_data_range) =
+                            est.sampled_curve_and_range(0.0, f64::INFINITY, 50);
                         c.transfer_rate_events = est.len();
                         c.transfer_rate_points = est.sampled_raw_points(100);
                     }
@@ -2841,6 +2886,7 @@ pub enum RouteOutcome {
 
 #[cfg(test)]
 mod tests {
+    use super::isotonic_estimator::FitPolicy;
     use crate::ring::Distance;
 
     /// `NetworkEfficiencyV1`'s `futile` rustdoc, isolated from this test module
@@ -3124,6 +3170,23 @@ mod tests {
              stale, so the model drifts exactly as it did before #4808"
         );
 
+        // The per-op estimators used to be checked for staleness here too. Since
+        // #5662 they fit on read and keep no per-peer adjustments, so they can
+        // never owe a refit and that check could not fail. What CAN go wrong is
+        // the policy itself: a routing estimator switched to fit-on-read would
+        // route on an empty fit, and a dashboard one switched back would pay a
+        // full rebuild per event under the router write lock. Pin both sides.
+        for (label, est) in [
+            ("response_start_time", &router.response_start_time_estimator),
+            ("transfer_rate", &router.transfer_rate_estimator),
+            ("failure", &router.failure_estimator),
+        ] {
+            assert_eq!(
+                est.fit_policy(),
+                FitPolicy::EveryEvent,
+                "{label}: routing reads this estimator, so it must fit on every event"
+            );
+        }
         for (label, per_op) in [
             ("per_op_failure", &router.per_op_failure),
             ("per_op_response_time", &router.per_op_response_time),
@@ -3135,11 +3198,57 @@ mod tests {
                  or this guard is vacuous"
             );
             for (op_type, est) in per_op {
-                assert!(
-                    !est.is_stale_for_test(),
-                    "{label}[{op_type:?}] left stale by add_event"
+                assert_eq!(
+                    est.fit_policy(),
+                    FitPolicy::OnRead,
+                    "{label}[{op_type:?}] is dashboard-only and must fit on read"
                 );
             }
+        }
+
+        // `Router::new` builds the estimators from history by a separate path
+        // from `add_event`'s lazy inserts, so pin that path too.
+        let op_event = |outcome| RouteEvent {
+            peer: PeerKeyLocation::random(),
+            contract_location: Location::random(),
+            outcome,
+            op_type: Some(OpType::Get),
+        };
+        let from_history = Router::new(&[
+            op_event(RouteOutcome::Success {
+                time_to_response_start: Duration::from_millis(100),
+                payload_size: 5000,
+                payload_transfer_time: Duration::from_millis(50),
+            }),
+            op_event(RouteOutcome::Failure),
+        ]);
+        for (label, est) in [
+            (
+                "response_start_time",
+                &from_history.response_start_time_estimator,
+            ),
+            ("transfer_rate", &from_history.transfer_rate_estimator),
+            ("failure", &from_history.failure_estimator),
+        ] {
+            assert_eq!(
+                est.fit_policy(),
+                FitPolicy::EveryEvent,
+                "{label} built from history: routing reads it, so it must fit on every event"
+            );
+        }
+        for (label, per_op) in [
+            ("per_op_failure", &from_history.per_op_failure),
+            ("per_op_response_time", &from_history.per_op_response_time),
+            ("per_op_transfer_rate", &from_history.per_op_transfer_rate),
+        ] {
+            let est = per_op
+                .get(&OpType::Get)
+                .unwrap_or_else(|| panic!("sanity: the history must populate {label}"));
+            assert_eq!(
+                est.fit_policy(),
+                FitPolicy::OnRead,
+                "{label} built from history is dashboard-only and must fit on read"
+            );
         }
     }
 
@@ -3151,12 +3260,47 @@ mod tests {
     /// had no coverage at all until review pointed it out — the `OnceLock` made
     /// it structurally untestable, which is why `force_residual_correction`
     /// exists.
+    ///
+    /// Seeded (#5662), so every peer, contract and draw is the same on every
+    /// run, and a failure reproduces. `GlobalRng`'s seed is thread-local and
+    /// pins the thread index, and libtest runs each test on a fresh thread, so
+    /// parallel tests neither disturb this one nor are disturbed by it. The
+    /// guard must stay the first statement: `PeerKeyLocation::random` caches a
+    /// keypair per thread on first use, and generating it consumes draws.
+    ///
+    /// The seed is one that FAILS on the pre-fix code, so this is also a
+    /// regression test for #5658 rather than only a behaviour pin. On the
+    /// merge base (3884adcf) seeds 0..80 failed 3 times (33, 39, 79). Seed 39
+    /// failed there with enabled 0.749 against disabled 1.000: the corrupted
+    /// curve pinned the legacy blend at 1.0, as in #5658. It passes with the
+    /// exact fit. Any seed that passes on both is useless here, so do not
+    /// change it without re-running that search; the exactness itself is pinned
+    /// by `incremental_fit_matches_batch_after_every_event`.
+    ///
+    /// Seed 39 fails pre-fix only because of the exact scenario it builds, and
+    /// changing how many `GlobalRng` draws the generators consume (the
+    /// keypair-cache fix #5663 would) silently swaps in a different scenario,
+    /// which most likely passes on the pre-fix code too. So the scenario is
+    /// pinned: `SCENARIO_FINGERPRINT` hashes every location the test draws, and
+    /// the test fails with instructions when it changes.
     #[test]
     fn enabled_correction_changes_the_estimate_the_router_acts_on() {
+        let _guard = crate::config::GlobalRng::seed_guard(39);
+        // FNV-1a over the bits of every location the scenario draws. Fixed
+        // arithmetic, so the recorded value cannot drift with the Rust version
+        // the way `DefaultHasher`'s could.
+        fn record(fingerprint: &mut u64, location: Location) {
+            for byte in location.as_f64().to_bits().to_le_bytes() {
+                *fingerprint ^= u64::from(byte);
+                *fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        let mut fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
         let targeted_peer = PeerKeyLocation::random();
         let peer_location = targeted_peer
             .location()
             .expect("random peer has a location");
+        record(&mut fingerprint, peer_location);
         // A contract region close to this peer, so the distance-based model
         // expects it to do WELL there — the correction has to overcome the base.
         let targeted_contract =
@@ -3168,6 +3312,11 @@ mod tests {
         for index in 0..400 {
             let peer = PeerKeyLocation::random();
             let contract = Location::random();
+            record(
+                &mut fingerprint,
+                peer.location().expect("random peer has a location"),
+            );
+            record(&mut fingerprint, contract);
             let succeeded = index % 10 != 0;
             router.add_event(RouteEvent {
                 peer,
@@ -3192,9 +3341,13 @@ mod tests {
                 outcome: RouteOutcome::Failure,
                 op_type: Some(OpType::Get),
             });
+            // Drawn at the same point in the sequence as when it was written
+            // inline in the event below.
+            let elsewhere = Location::random();
+            record(&mut fingerprint, elsewhere);
             router.add_event(RouteEvent {
                 peer: targeted_peer.clone(),
-                contract_location: Location::random(),
+                contract_location: elsewhere,
                 outcome: RouteOutcome::Success {
                     time_to_response_start: Duration::from_millis(100),
                     payload_size: 5000,
@@ -3203,6 +3356,16 @@ mod tests {
                 op_type: Some(OpType::Get),
             });
         }
+
+        // Checked before the outcome, so a changed draw sequence reports itself
+        // rather than as a pass or fail of the behaviour under test.
+        const SCENARIO_FINGERPRINT: u64 = 0x6584_8286_03be_bd44;
+        assert_eq!(
+            fingerprint, SCENARIO_FINGERPRINT,
+            "the RNG draw sequence changed (e.g. #5663): seed 39 no longer builds the \
+             scenario that fails on the pre-fix code (fingerprint now {fingerprint:#018x}). \
+             Re-pick a seed that fails on the pre-fix code; see this test's doc"
+        );
 
         let disabled = {
             let _guard = force_residual_correction(false);
@@ -3219,6 +3382,10 @@ mod tests {
                 .failure_probability
         };
 
+        eprintln!(
+            "#5658 enabled {enabled:.6} disabled {disabled:.6} gap {:.6}",
+            enabled - disabled
+        );
         assert!(
             enabled.is_finite() && (0.0..=1.0).contains(&enabled),
             "the corrected failure probability must stay a probability, got {enabled}"
@@ -5671,9 +5838,16 @@ mod tests {
         assert!(get_curves.failure_events > 0);
         assert!(get_curves.response_time_events > 0);
         assert!(get_curves.transfer_rate_events > 0);
+        // These curves come from a fit built inside `snapshot()`, because the
+        // per-op estimators fit on read (#5662): non-empty shows that path works
+        // end to end, which the event counts above (read without fitting) do not.
+        assert!(!get_curves.failure_curve.is_empty());
+        assert!(!get_curves.response_time_curve.is_empty());
+        assert!(!get_curves.transfer_rate_curve.is_empty());
 
         let put_curves = &snap.per_op_curves["PUT"];
         assert!(put_curves.failure_events > 0);
+        assert!(!put_curves.failure_curve.is_empty());
         assert_eq!(put_curves.response_time_events, 0);
         assert_eq!(put_curves.transfer_rate_events, 0);
     }
