@@ -80,8 +80,17 @@
 //! with delayed on the confirmation seeds and about 5 points of best@10 lower
 //! on the original seeds, 12 points at 20% uniform. See the
 //! `LABELING POLICY COMPARISON` section of the report.
+//!
+//! # Follow-up 3: re-validation after the PR #5655 statistical review
+//!
+//! See `revalidate`: corrections to curve shrinkage, variance components and
+//! decayed counts, expectation timing scored in seconds, and a
+//! production-like traffic shape.
 
 use super::*;
+
+/// Re-validation after the PR #5655 statistical review.
+mod revalidate;
 
 /// Events per run. Same production-sized budget as the rest of the harness.
 const EVENTS: usize = RECOVERY_BUDGET_EVENTS;
@@ -113,6 +122,9 @@ const ABSENT_HALF_WIDTH: f64 = 0.02;
 /// centre form the `near-abs` subset.
 const NEAR_ABSENT: f64 = 0.05;
 const CONFIRMED_EXHAUSTED_SHARE: f64 = 0.5;
+/// Share of a peer's traffic sent to its home contract band when
+/// `Spec::home_band` is set.
+const HOME_BAND_SHARE: f64 = 0.9;
 
 // Post-hoc additions after run 1 (see the module docs' "Run 2" section).
 /// Learned events between refits of the long-window curve and rebuilds of the
@@ -185,6 +197,13 @@ struct Spec {
     /// for every peer. Added after run 1 as an adversarial check on the
     /// post-hoc long-window prior, which it should penalise.
     curve_shift: f64,
+    /// Events per run (default `EVENTS`).
+    events: usize,
+    /// Harness event rate: time in hours is `index / events_per_hour`.
+    events_per_hour: f64,
+    /// Production-like locality: each peer sends `HOME_BAND_SHARE` of its
+    /// traffic to one contract band (of 8) and the rest uniformly.
+    home_band: bool,
 }
 
 /// Where absent-contract keys fall (follow-up run, fixed before running).
@@ -229,6 +248,9 @@ impl Spec {
             absent_layout: AbsentLayout::Clustered,
             labeling: Labeling::All,
             curve_shift: 0.0,
+            events: EVENTS,
+            events_per_hour: 60.0,
+            home_band: false,
         }
     }
 
@@ -454,6 +476,7 @@ struct World {
     bad_band: Vec<Option<f64>>,
     zipf_cdf: Vec<f64>,
     absent_centres: Vec<f64>,
+    home_bands: Vec<usize>,
 }
 
 /// One routing operation: a contract and the peers it will try, in order.
@@ -513,6 +536,14 @@ impl World {
         } else {
             Vec::new()
         };
+        // Drawn last, and only when used, so every other world is unchanged.
+        let home_bands = if spec.home_band {
+            (0..spec.peers)
+                .map(|_| GlobalRng::random_range(0..HIER_BANDS))
+                .collect()
+        } else {
+            Vec::new()
+        };
         World {
             spec,
             peers,
@@ -522,6 +553,7 @@ impl World {
             bad_band,
             zipf_cdf,
             absent_centres,
+            home_bands,
         }
     }
 
@@ -608,6 +640,11 @@ impl World {
             return (peer, (centre + jitter).rem_euclid(1.0));
         }
         let peer = self.draw_peer();
+        if self.spec.home_band && GlobalRng::random_range(0.0..1.0) < HOME_BAND_SHARE {
+            let band = self.home_bands[peer] as f64;
+            let within: f64 = GlobalRng::random_range(0.0..1.0);
+            return (peer, ((band + within) / HIER_BANDS as f64).min(0.999_999));
+        }
         (peer, GlobalRng::random_range(0.0..1.0))
     }
 
@@ -638,13 +675,13 @@ impl World {
             effect += spec.pair_effect;
         }
         if spec.drift_effect > 0.0 {
-            let late = index >= EVENTS / 2;
+            let late = index >= spec.events / 2;
             let bad = (!late && peer % 4 == 0) || (late && peer % 4 == 1);
             if bad {
                 effect += spec.drift_effect;
             }
         }
-        if index >= EVENTS / 2 {
+        if index >= spec.events / 2 {
             effect += spec.curve_shift;
         }
         let shape = (2.0 * distance).sqrt();
@@ -1171,6 +1208,10 @@ impl Reanchored {
 struct Curve {
     horizon: Option<f64>,
     shrink: bool,
+    /// Correction 1 (stat review of PR #5655): one-way random-effects method
+    /// of moments for unequal block sizes, with `s2` the within-block variance
+    /// about the block means on `W - k` degrees of freedom.
+    anova: bool,
     fit: Option<pav_regression::IsotonicRegression<f64>>,
 }
 
@@ -1179,7 +1220,15 @@ impl Curve {
         Curve {
             horizon,
             shrink,
+            anova: false,
             fit: None,
+        }
+    }
+
+    fn new_anova() -> Curve {
+        Curve {
+            anova: true,
+            ..Curve::new(None, true)
         }
     }
 
@@ -1222,12 +1271,37 @@ impl Curve {
             }
         }
         let s2 = if sw > 0.0 { ss / sw } else { 0.0 };
-        let tau2 = (blocks
-            .iter()
-            .map(|b| (b.y() - grand).powi(2) - s2 / b.weight())
-            .sum::<f64>()
-            / blocks.len() as f64)
-            .max(0.0);
+        let (s2, tau2) = if self.anova {
+            let k = blocks.len() as f64;
+            let sum_wy2: f64 = window.iter().map(|r| weight(r) * r.y * r.y).sum();
+            let between: f64 = blocks.iter().map(|b| b.weight() * b.y() * b.y()).sum();
+            let df = total - k;
+            if df <= 0.0 {
+                self.fit = Some(fit);
+                return;
+            }
+            let s2 = ((sum_wy2 - between) / df).max(0.0);
+            let spread: f64 = blocks
+                .iter()
+                .map(|b| b.weight() * (b.y() - grand).powi(2))
+                .sum();
+            let denominator =
+                total - blocks.iter().map(|b| b.weight().powi(2)).sum::<f64>() / total;
+            let tau2 = if denominator > 0.0 {
+                ((spread - (k - 1.0) * s2) / denominator).max(0.0)
+            } else {
+                0.0
+            };
+            (s2, tau2)
+        } else {
+            let tau2 = (blocks
+                .iter()
+                .map(|b| (b.y() - grand).powi(2) - s2 / b.weight())
+                .sum::<f64>()
+                / blocks.len() as f64)
+                .max(0.0);
+            (s2, tau2)
+        };
         let shrunk: Vec<Point<f64>> = blocks
             .iter()
             .map(|b| {
@@ -1578,7 +1652,7 @@ fn run_bakeoff(spec: Spec, seed: u64) -> RunResult {
     let mut ranking = [[0.0f64; 6]; RANK_ROWS.len()];
     let mut decisions_targeted = 0usize;
     let mut decisions = 0usize;
-    while index < EVENTS {
+    while index < spec.events {
         let op = world.next_op(index);
         let contract_value = op.contract;
         let contract = Location::try_from(contract_value).expect("contract within ring");
@@ -1586,7 +1660,7 @@ fn run_bakeoff(spec: Spec, seed: u64) -> RunResult {
         // Ranking decision, before any attempt of this op is learned. Reads
         // models only; draws no randomness, so the event stream is unchanged.
         if spec.ops && !op.absent && index >= WARMUP_EVENTS {
-            let time = index as f64 / 60.0;
+            let time = index as f64 / spec.events_per_hour;
             let candidates = world.nearest_peers(contract_value);
             let snap_contract = hiers[1].snapshot(time);
             let snaps_star = re_star.snapshots(time);
@@ -1725,14 +1799,14 @@ fn run_bakeoff(spec: Spec, seed: u64) -> RunResult {
         pending.clear();
         let mut succeeded = false;
         for &peer_index in &op.candidates {
-            if index >= EVENTS {
+            if index >= spec.events {
                 break;
             }
             let peer = &world.peers[peer_index];
             let distance = contract
                 .distance(peer.location().expect("peer has a location"))
                 .as_f64();
-            let time = index as f64 / 60.0;
+            let time = index as f64 / spec.events_per_hour;
             let attribute = world.attribute[peer_index];
             let truth = world.truth(index, peer_index, contract_value, distance);
             let y = if op.absent { 1.0 } else { world.outcome(truth) };
@@ -1998,7 +2072,7 @@ fn run_bakeoff(spec: Spec, seed: u64) -> RunResult {
                         true,
                         world.in_pair(peer_index, contract_value),
                         peer_events[peer_index] < COLD_START_EVENTS,
-                        world.drift_changed(peer_index) && index >= EVENTS / 2,
+                        world.drift_changed(peer_index) && index >= spec.events / 2,
                         world.near_absent(contract_value),
                     ];
                     for (subset, &active) in in_subset.iter().enumerate() {
@@ -2171,7 +2245,7 @@ fn run_bakeoff(spec: Spec, seed: u64) -> RunResult {
     }
 
     let components = hiers[1]
-        .snapshot(EVENTS as f64 / 60.0)
+        .snapshot(spec.events as f64 / spec.events_per_hour)
         .map_or([f64::NAN; 3], |s| [s.sigma2, s.tau2_cell, s.tau2_peer]);
     RunResult {
         mse: err
