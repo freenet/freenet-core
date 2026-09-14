@@ -60,16 +60,21 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
     `operations::route_attempt::RouteAttemptRecorder` (one per operation),
     never a hand-inlined RouteEvent. Timeout / send failure / disconnect of
     the attempted peer → Failure now; NotFound → Failure ONLY with existence
-    proof in the same op (`contract_exists()`): state for the requested
-    contract, from a REMOTE contacted peer, that then passed validation in a
-    store here (accepted, or equal to this node's validated copy). A header,
-    a Found not yet stored, and a SUBSCRIBE (no state) are not proof;
-    without it, `ambiguous_not_found_policy()` (default Untrained: dropped).
+    proof in the same op (`contract_exists()`), which requires state for the
+    requested contract, from a REMOTE contacted peer, that this node stored.
+    A SUBSCRIBE reply carries no state, so SUBSCRIBE NotFounds are never
+    trained. Without proof, `ambiguous_not_found_policy()` (default
+    Untrained: dropped).
     A peer is labelled at most once per operation.
   → A timeout is blamed on the recorded hop only if the hop had at least
-    half of the attempt (`route_attempt::hop_had_budget_share`): a hop the
-    loopback relay forwarded to near the deadline did not stall it. A
-    cancelled stream, or a claim waiter dropped on this node, blames nobody.
+    half of the attempt (`route_attempt::hop_had_budget_share`), counted
+    from when the loopback relay's dispatch returned (`touch_hop`): a hop
+    reached near the deadline did not stall it.
+  → A failed GET stream claim or assembly is labelled per
+    `stream_failure_is_peer_caused`, which the client, the relay and the
+    test hook share: every assembly failure (a cancellation does not record
+    which side ended it) and a claim timeout blame the hop; a claim waiter
+    dropped on this node does not.
   → Never treat local evidence or later evidence as proof. This node's own
     (possibly stale) copy, a local completion, or a terminal with no recorded
     hop proves nothing about a remote peer. "The contract exists now" is not

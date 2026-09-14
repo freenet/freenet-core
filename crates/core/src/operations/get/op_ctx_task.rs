@@ -520,7 +520,7 @@ async fn drive_client_get_inner(
                     // phase for an envelope-bundled payload).
                     payload_size =
                         state.size() + contract.as_ref().map(|c| c.data().len()).unwrap_or(0);
-                    let validated_store = cache_contract_locally(
+                    let state_stored = cache_contract_locally(
                         op_manager,
                         *key,
                         state.clone(),
@@ -529,7 +529,7 @@ async fn drive_client_get_inner(
                         crate::ring::HostingCause::ClientGet,
                     )
                     .await;
-                    driver.note_validated_state(key, validated_store);
+                    driver.note_stored_state(key, state_stored);
                     *key
                 }
                 Terminal::Streaming {
@@ -1014,13 +1014,12 @@ fn classify(reply: NetMessage) -> AttemptOutcome<Terminal> {
 }
 
 impl GetRetryDriver<'_> {
-    /// Existence proof for this operation's routing labels (#5657): the
-    /// terminal's state was stored here and passed validation
-    /// (`validated_store`), it came from a remote peer this operation
-    /// contacted (a recorded hop), and it is for the requested contract.
-    /// Anything less proves nothing.
-    fn note_validated_state(&mut self, key: &ContractKey, validated_store: bool) {
-        if validated_store
+    /// Existence proof for this operation's routing labels (#5657): this
+    /// node stored the terminal's state (`state_stored`), it came from a
+    /// remote peer this operation contacted (a recorded hop), and it is for
+    /// the requested contract.
+    fn note_stored_state(&mut self, key: &ContractKey, state_stored: bool) {
+        if state_stored
             && self.terminal_hop.is_some()
             && is_existence_proof(&self.instance_id, key, None)
         {
@@ -1165,9 +1164,9 @@ struct AssemblyOutcome {
 struct StreamProgress {
     fragments_received: Option<u32>,
     total_fragments: Option<u32>,
-    /// The assembled state was stored and passed validation
-    /// (`cache_contract_locally`'s result).
-    validated_store: bool,
+    /// This node stored the assembled state (`cache_contract_locally`'s
+    /// result).
+    state_stored: bool,
 }
 
 /// Structured streaming-assembly failure (#4345 telemetry). `message` is the
@@ -1177,13 +1176,75 @@ struct StreamProgress {
 struct AssemblyFailure {
     message: String,
     cause: StreamAbortCause,
-    /// Whether the failure is attributable to the peer that sent the header.
-    /// False for a cancelled stream (which also covers this node tearing the
-    /// connection or stream down) and for a claim waiter dropped on this
-    /// node; only attributable failures are labelled (#5657).
+    /// Whether the failure is attributed to the peer the stream was claimed
+    /// from; see [`stream_failure_is_peer_caused`].
     peer_caused: bool,
     fragments_received: Option<u32>,
     total_fragments: Option<u32>,
+}
+
+impl AssemblyFailure {
+    /// `failure` as an [`AssemblyFailure`]: its terminal-event cause, and
+    /// whether the hop is labelled for it.
+    fn from_failure(
+        failure: &StreamFailure,
+        fragments_received: Option<u32>,
+        total_fragments: Option<u32>,
+    ) -> Self {
+        let (message, cause) = match failure {
+            StreamFailure::Claim(e) => (
+                format!("claim_or_wait: {e}"),
+                StreamAbortCause::ClaimTimeout,
+            ),
+            StreamFailure::Assembly(e) => (
+                format!("stream assembly: {e}"),
+                match e {
+                    StreamError::InactivityTimeout => StreamAbortCause::InactivityTimeout,
+                    StreamError::Cancelled | StreamError::NotFound => StreamAbortCause::Cancelled,
+                    StreamError::InvalidFragment { .. } => StreamAbortCause::PayloadInvalid,
+                },
+            ),
+        };
+        Self {
+            message,
+            cause,
+            peer_caused: stream_failure_is_peer_caused(failure),
+            fragments_received,
+            total_fragments,
+        }
+    }
+}
+
+/// A failed stream claim or stream assembly.
+#[derive(Clone, Debug)]
+pub(crate) enum StreamFailure {
+    Claim(OrphanStreamError),
+    Assembly(StreamError),
+}
+
+/// Whether a failed stream claim or assembly is attributed to the peer the
+/// stream was claimed from (#5657): the one classification the GET client,
+/// the GET relay and the assembly test hook share.
+///
+/// Every assembly failure is attributed, as before #5657. A stream is
+/// cancelled when the connection it arrives on closes, from either side, or
+/// when the idle-stream sweep reclaims it, and a cancellation does not record
+/// which, so it cannot be told apart from the sender going away. A claim that
+/// timed out is attributed too. A claim waiter dropped on this node, and a
+/// claim another task already owns, are not.
+pub(crate) fn stream_failure_is_peer_caused(failure: &StreamFailure) -> bool {
+    match failure {
+        StreamFailure::Claim(OrphanStreamError::Timeout) => true,
+        StreamFailure::Claim(
+            OrphanStreamError::WaiterCancelled | OrphanStreamError::AlreadyClaimed,
+        ) => false,
+        StreamFailure::Assembly(
+            StreamError::Cancelled
+            | StreamError::NotFound
+            | StreamError::InactivityTimeout
+            | StreamError::InvalidFragment { .. },
+        ) => true,
+    }
 }
 
 /// Drive the shared GET retry loop, treating stream-assembly failure
@@ -1337,7 +1398,7 @@ async fn drive_get_with_assembly_retry(
         .await
         {
             Ok(progress) => {
-                driver.note_validated_state(&key, progress.validated_store);
+                driver.note_stored_state(&key, progress.state_stored);
                 assembly.transfer_duration = Some(stream_start.elapsed());
                 assembly.error = None;
                 assembly.fragments_received = progress.fragments_received;
@@ -1360,10 +1421,8 @@ async fn drive_get_with_assembly_retry(
                     .terminal_hop
                     .clone()
                     .filter(|hop| hop.socket_addr() == Some(peer_addr));
-                // Only a failure the peer caused is labelled (see
-                // `AssemblyFailure::peer_caused`). A rejected local store is
-                // not an assembly failure at all: `cache_contract_locally`
-                // reports it as `validated_store`.
+                // Labelled only when attributed to the peer
+                // (`stream_failure_is_peer_caused`).
                 driver.recorder.record_attempt(
                     failed_hop.as_ref(),
                     AttemptFailure::SendFailure,
@@ -1475,7 +1534,7 @@ pub mod assembly_fault_injection {
     /// before/after to prove the retry path genuinely fired.
     pub static ASSEMBLY_RETRY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-    type Budget = (usize, super::StreamAbortCause);
+    type Budget = (usize, super::StreamFailure);
 
     fn budgets() -> &'static Mutex<HashMap<ContractKey, Budget>> {
         static BUDGETS: OnceLock<Mutex<HashMap<ContractKey, Budget>>> = OnceLock::new();
@@ -1484,29 +1543,39 @@ pub mod assembly_fault_injection {
 
     /// Arm `n` injected assembly failures for `key`, as claim timeouts.
     pub fn inject_failures(key: ContractKey, n: usize) {
-        inject_failures_with_cause(key, n, super::StreamAbortCause::ClaimTimeout);
+        inject_stream_failures(
+            key,
+            n,
+            super::StreamFailure::Claim(
+                crate::operations::orphan_streams::OrphanStreamError::Timeout,
+            ),
+        );
     }
 
-    /// Arm `n` injected assembly failures for `key` with `cause`.
-    pub(crate) fn inject_failures_with_cause(
+    /// Arm `n` injected `failure`s for `key`. They are classified exactly
+    /// like real ones (`stream_failure_is_peer_caused`).
+    pub(crate) fn inject_stream_failures(
         key: ContractKey,
         n: usize,
-        cause: super::StreamAbortCause,
+        failure: super::StreamFailure,
     ) {
-        budgets().lock().expect("poisoned").insert(key, (n, cause));
+        budgets()
+            .lock()
+            .expect("poisoned")
+            .insert(key, (n, failure));
     }
 
-    /// Consume one injected failure for `key`, if armed, returning its cause.
-    pub(crate) fn consume(key: &ContractKey) -> Option<super::StreamAbortCause> {
+    /// Consume one injected failure for `key`, if armed.
+    pub(crate) fn consume(key: &ContractKey) -> Option<super::StreamFailure> {
         let mut map = budgets().lock().expect("poisoned");
         match map.get_mut(key) {
-            Some((n, cause)) if *n > 0 => {
-                let cause = *cause;
+            Some((n, failure)) if *n > 0 => {
+                let failure = failure.clone();
                 *n -= 1;
                 if *n == 0 {
                     map.remove(key);
                 }
-                Some(cause)
+                Some(failure)
             }
             _ => None,
         }
@@ -1865,16 +1934,17 @@ async fn assemble_and_cache_stream(
     // Test-only deterministic fault injection (#4345). Returning before
     // the claim mirrors the production claim-timeout failure (the inbound
     // stream is left orphaned for GC), so the retry path is exercised
-    // end-to-end; classify it with the armed cause (ClaimTimeout unless a test
-    // chose another) for the terminal event.
+    // end-to-end. The armed failure (a claim timeout unless a test chose
+    // another) goes through the same classification as a real one.
     #[cfg(any(test, feature = "testing"))]
-    if let Some(cause) = assembly_fault_injection::consume(&expected_key) {
+    if let Some(failure) = assembly_fault_injection::consume(&expected_key) {
+        let injected = AssemblyFailure::from_failure(&failure, None, None);
         return Err(AssemblyFailure {
-            message: "injected stream assembly failure (assembly_fault_injection test hook)".into(),
-            peer_caused: !matches!(cause, StreamAbortCause::Cancelled),
-            cause,
-            fragments_received: None,
-            total_fragments: None,
+            message: format!(
+                "injected stream assembly failure (assembly_fault_injection test hook): {}",
+                injected.message
+            ),
+            ..injected
         });
     }
 
@@ -1898,13 +1968,11 @@ async fn assemble_and_cache_stream(
             // site) because this failure is owned by the claim layer, which
             // never reaches `assemble`.
             crate::node::network_status::record_stream_recv_abort_claim_timeout();
-            return Err(AssemblyFailure {
-                message: format!("claim_or_wait: {e}"),
-                cause: StreamAbortCause::ClaimTimeout,
-                peer_caused: !matches!(e, OrphanStreamError::WaiterCancelled),
-                fragments_received: None,
-                total_fragments: None,
-            });
+            return Err(AssemblyFailure::from_failure(
+                &StreamFailure::Claim(e),
+                None,
+                None,
+            ));
         }
     };
 
@@ -1919,18 +1987,11 @@ async fn assemble_and_cache_stream(
             // classified from the `StreamError` variant.
             let fragments_received = Some(handle.received_fragments() as u32);
             let total_fragments = Some(handle.total_fragments() as u32);
-            let cause = match e {
-                StreamError::InactivityTimeout => StreamAbortCause::InactivityTimeout,
-                StreamError::Cancelled | StreamError::NotFound => StreamAbortCause::Cancelled,
-                StreamError::InvalidFragment { .. } => StreamAbortCause::PayloadInvalid,
-            };
-            return Err(AssemblyFailure {
-                message: format!("stream assembly: {e}"),
-                peer_caused: !matches!(cause, StreamAbortCause::Cancelled),
-                cause,
+            return Err(AssemblyFailure::from_failure(
+                &StreamFailure::Assembly(e),
                 fragments_received,
                 total_fragments,
-            });
+            ));
         }
     };
 
@@ -1997,12 +2058,12 @@ async fn assemble_and_cache_stream(
     // but it uses its own inline assemble+cache with `local_client_access =
     // false`; this path is the originator, which IS the client requester, so
     // the sticky `local_client_access` flag applies here.
-    let validated_store =
+    let state_stored =
         cache_contract_locally(op_manager, payload.key, state, contract, true, cause).await;
     Ok(StreamProgress {
         fragments_received,
         total_fragments,
-        validated_store,
+        state_stored,
     })
 }
 
@@ -3897,6 +3958,9 @@ where
                 // owns the retry decision.
                 return Err(err);
             }
+            // Re-stamp now the request has left: time this node spent waiting
+            // to dispatch is not the hop's share of the attempt (#5657).
+            op_manager.attempt_hop_registry().touch_hop(&incoming_tx);
             // Exit driver: client driver owns the response handling.
             return Ok(());
         }
@@ -4049,8 +4113,8 @@ where
                 let state_present =
                     cache_contract_locally(op_manager, key, state, contract, false, hosting_cause)
                         .await;
-                // Existence proof (#5657) only once the Found's state passed
-                // validation here; it settles earlier NotFounds as failures.
+                // Existence proof (#5657) requires state this node stored; it
+                // settles earlier NotFounds as failures.
                 if state_present
                     && is_existence_proof(&instance_id, &key, reply_instance_id.as_ref())
                 {
@@ -4150,7 +4214,8 @@ where
                         // instead of being re-selected. (AlreadyClaimed above
                         // is deliberately NOT counted — that's dedup, not a
                         // failure.)
-                        recorder.record_attempt(Some(&peer), AttemptFailure::SendFailure, true);
+                        let blame = stream_failure_is_peer_caused(&StreamFailure::Claim(e));
+                        recorder.record_attempt(Some(&peer), AttemptFailure::SendFailure, blame);
                         // Treat as a failed attempt — try another peer.
                         new_visited.mark_visited(peer_addr);
                         continue;
@@ -4193,8 +4258,8 @@ where
                                         hosting_cause,
                                     )
                                     .await;
-                                    // Existence proof (#5657) only once the
-                                    // streamed state passed validation here.
+                                    // Existence proof (#5657) requires state
+                                    // this node stored.
                                     if stored
                                         && is_existence_proof(
                                             &instance_id,
@@ -4340,8 +4405,8 @@ where
                                     hosting_cause,
                                 )
                                 .await;
-                                // Existence proof (#5657) only once the
-                                // streamed state passed validation here.
+                                // Existence proof (#5657) requires state
+                                // this node stored.
                                 if stored
                                     && is_existence_proof(
                                         &instance_id,
@@ -7787,7 +7852,10 @@ mod tests {
             // failure for that peer.
             (
                 "orphan stream claim failed; advancing to next peer",
-                &["recorder.record_attempt(Some(&peer), AttemptFailure::SendFailure, true);"][..],
+                &[
+                    "stream_failure_is_peer_caused(&StreamFailure::Claim(e))",
+                    "recorder.record_attempt(Some(&peer), AttemptFailure::SendFailure, blame);",
+                ][..],
             ),
             // #5657: a downstream NotFound goes to the recorder (a failure
             // only if this search then finds the contract) — never
@@ -7816,10 +7884,10 @@ mod tests {
 
         // Read with comments stripped, so neither a comment nor commented-out
         // code satisfies (or trips) the pins below.
-        let code = crate::operations::route_attempt::driver_test_support::strip_comments(body);
+        let code = crate::contract::source_pin_util::strip_comments(body);
         // The InlineFound success arm records SuccessUntimed, and settles the
-        // search's pending NotFounds as failures only after the Found's state
-        // passed validation in `cache_contract_locally` (#5657).
+        // search's pending NotFounds as failures only after storing the
+        // Found's state in `cache_contract_locally` (#5657).
         let found_arm = &code[code
             .find("downstream returned Found")
             .expect("InlineFound arm")..];
@@ -7840,22 +7908,33 @@ mod tests {
             .expect("InlineFound arm settles pending NotFounds");
         assert!(
             cache < proof && found_arm[cache..proof].contains("if state_present"),
-            "existence proof requires state that passed validation: \
+            "existence proof requires state this node stored: \
              contract_exists() must follow the store and be gated on it"
         );
-        // A streaming header alone is not proof: the arm may settle pending
-        // NotFounds only after a validated store of the streamed state.
+        // Each streaming store settles pending NotFounds only after storing
+        // the streamed state, gated on that store's result (#5657).
         let streaming_arm = &code[code
             .find("AttemptOutcome::Terminal(Terminal::Streaming {")
             .expect("streaming arm")..];
-        let first_store = streaming_arm
-            .find("cache_contract_locally(")
-            .expect("streaming arm stores the streamed state");
-        assert!(
-            !streaming_arm[..first_store].contains("recorder.contract_exists();"),
-            "a streaming header is not existence proof; only a validated store \
-             of its state is"
+        let proofs: Vec<usize> = streaming_arm
+            .match_indices("recorder.contract_exists();")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            proofs.len(),
+            2,
+            "both streaming stores settle pending NotFounds"
         );
+        for at in proofs {
+            let store = streaming_arm[..at]
+                .rfind("cache_contract_locally(")
+                .expect("a store precedes each streaming contract_exists()");
+            assert!(
+                streaming_arm[store..at].contains("if stored"),
+                "existence proof requires state this node stored: each streaming \
+                 contract_exists() must be gated on its store's result"
+            );
+        }
         let fallback_arm = &code[code
             .find("local_fallback.take()")
             .expect("local fallback arm")..];
@@ -8031,8 +8110,8 @@ mod route_attempt_driver_tests {
         })
     }
 
-    /// [`found`] carrying contract code, so the receiving node's store can
-    /// validate it (the stub handler accepts it unless `reject_stores`).
+    /// [`found`] carrying contract code, so the receiving node can store it
+    /// (the stub handler accepts it unless `reject_stores`).
     fn found_with_code(msg: &NetMessage, instance_id: ContractInstanceId) -> NetMessage {
         NetMessage::from(GetMsg::Response {
             id: *msg.id(),
@@ -8046,6 +8125,52 @@ mod route_attempt_driver_tests {
             },
             hop_count: 1,
         })
+    }
+
+    /// [`streaming_header`] announcing that the stream carries the contract
+    /// code.
+    fn streaming_header_with_code(
+        msg: &NetMessage,
+        instance_id: ContractInstanceId,
+        stream_id: StreamId,
+    ) -> NetMessage {
+        NetMessage::from(GetMsg::ResponseStreaming {
+            id: *msg.id(),
+            instance_id,
+            stream_id,
+            key: key_for(instance_id),
+            total_size: 64,
+            includes_contract: true,
+        })
+    }
+
+    /// Register, as already arrived from `from`, a complete stream `stream_id`
+    /// carrying `instance_id`'s state and contract code, the way the transport
+    /// registers an inbound stream before its header is claimed.
+    fn register_stream(
+        op_manager: &OpManager,
+        from: SocketAddr,
+        stream_id: StreamId,
+        instance_id: ContractInstanceId,
+    ) {
+        let payload = GetStreamingPayload {
+            key: key_for(instance_id),
+            value: StoreResponse {
+                state: Some(WrappedState::new(vec![1, 2, 3])),
+                contract: Some(crate::operations::test_utils::make_test_contract(&[9u8; 8])),
+            },
+        };
+        let bytes = bincode::serialize(&payload).expect("payload encodes");
+        let handle = crate::transport::peer_connection::streaming::StreamHandle::new(
+            stream_id,
+            bytes.len() as u64,
+        );
+        handle
+            .push_fragment(1, bytes::Bytes::from(bytes))
+            .expect("the fragment is accepted");
+        op_manager
+            .orphan_stream_registry()
+            .register_orphan(from, stream_id, handle);
     }
 
     fn streaming_header(
@@ -8121,7 +8246,7 @@ mod route_attempt_driver_tests {
     }
 
     /// NotFound from the hop the loopback relay really forwarded to, then a
-    /// Found whose state passes validation here: the NotFound peer is labelled
+    /// Found this node stores: the NotFound peer is labelled
     /// a Failure (the contract exists), exactly once, and NOT the driver's own
     /// `current_target` guess; the success is credited to the delivering hop.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -8538,8 +8663,8 @@ mod route_attempt_driver_tests {
     /// Driver-level relay test: `drive_relay_get_inner` forwards to its greedy
     /// candidate, which answers NotFound, then consults an advertised host,
     /// which answers Found. The relay node's OWN router must get exactly one
-    /// Failure for the NotFound peer (the Found's state passed validation
-    /// here, proving existence in this search) and one success for the host.
+    /// Failure for the NotFound peer (this node stored the Found's state,
+    /// proving existence in this search) and one success for the host.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn relay_not_found_then_consulted_found_labels_both_peers_once() {
         let (op_manager, rx, peers, _guards, _store) =
@@ -8614,7 +8739,7 @@ mod route_attempt_driver_tests {
             "greedy forward, then the consulted host"
         );
         // Compared by peer, not order: the host's success is recorded before
-        // the store whose validated state then settles the greedy NotFound.
+        // the store that then settles the greedy NotFound.
         assert_eq!(
             by_peer(failure_window(&op_manager)),
             by_peer(vec![(Some(greedy_addr), 1.0), (Some(host_addr), 0.0)]),
@@ -8929,16 +9054,14 @@ mod route_attempt_driver_tests {
         }
     }
 
-    /// Existence proof requires state that passed validation (#5657): a
-    /// NotFound hop is labelled only once a later reply's state was stored
-    /// here. A reply for the requested contract whose store is rejected, or
-    /// that carries no contract code to store with, proves nothing.
+    /// Existence proof requires state this node stored (#5657): a NotFound
+    /// hop is labelled only once this node stored a later reply's state.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn unvalidated_reply_is_not_existence_proof() {
+    async fn not_found_is_trained_only_after_a_store() {
         for (label, with_code, rejected, proof) in [
-            ("get-state-validated", true, false, true),
-            ("get-state-rejected", true, true, false),
-            ("get-state-no-code", false, false, false),
+            ("get-stored", true, false, true),
+            ("get-store-refused", true, true, false),
+            ("get-no-code", false, false, false),
         ] {
             let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
             if rejected {
@@ -8989,12 +9112,12 @@ mod route_attempt_driver_tests {
     }
 
     /// Relay side of the same rule: the greedy hop's NotFound is settled as a
-    /// failure only once the consulted host's state passed validation here.
+    /// failure only once this node stored the consulted host's state.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn relay_unvalidated_reply_is_not_existence_proof() {
+    async fn relay_not_found_is_trained_only_after_a_store() {
         for (label, rejected) in [
-            ("get-relay-state-validated", false),
-            ("get-relay-state-rejected", true),
+            ("get-relay-stored", false),
+            ("get-relay-store-refused", true),
         ] {
             let (op_manager, rx, _store, upstream, greedy, host, _guards) =
                 relay_fixture(label, true).await;
@@ -9074,28 +9197,71 @@ mod route_attempt_driver_tests {
         }
     }
 
-    /// An assembly failure is labelled against the hop only when the peer
-    /// caused it (#5657): a cancelled stream, which also covers this node
-    /// tearing it down itself, blames nobody; a claim timeout blames the hop.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn cancelled_stream_is_not_labelled_against_the_hop() {
-        for (label, seed, cause, blamed) in [
+    /// The one stream-failure classification (#5657), exhaustively: every
+    /// assembly failure and a claim timeout are attributed to the peer; a
+    /// claim waiter dropped on this node and a claim another task owns are not.
+    #[test]
+    fn stream_failure_classification() {
+        use crate::operations::orphan_streams::OrphanStreamError as Claim;
+        for (failure, peer_caused) in [
+            (StreamFailure::Claim(Claim::Timeout), true),
+            (StreamFailure::Claim(Claim::WaiterCancelled), false),
+            (StreamFailure::Claim(Claim::AlreadyClaimed), false),
+            (StreamFailure::Assembly(StreamError::Cancelled), true),
+            (StreamFailure::Assembly(StreamError::NotFound), true),
             (
-                "get-stream-claim-timeout",
-                68u8,
-                StreamAbortCause::ClaimTimeout,
+                StreamFailure::Assembly(StreamError::InactivityTimeout),
                 true,
             ),
             (
-                "get-stream-cancelled",
+                StreamFailure::Assembly(StreamError::InvalidFragment {
+                    message: "bad".into(),
+                }),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                stream_failure_is_peer_caused(&failure),
+                peer_caused,
+                "{failure:?}"
+            );
+            assert_eq!(
+                AssemblyFailure::from_failure(&failure, None, None).peer_caused,
+                peer_caused,
+                "{failure:?}: the constructor applies the classification"
+            );
+        }
+    }
+
+    /// Driver level: a failed stream is labelled against its hop exactly when
+    /// the shared classification attributes it to the peer. The injected
+    /// failures go through the production classification.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stream_failure_labels_follow_the_shared_classification() {
+        use crate::operations::orphan_streams::OrphanStreamError as Claim;
+        for (label, seed, failure, blamed) in [
+            (
+                "get-stream-claim-timeout",
+                68u8,
+                StreamFailure::Claim(Claim::Timeout),
+                true,
+            ),
+            (
+                "get-stream-waiter-dropped",
                 69u8,
-                StreamAbortCause::Cancelled,
+                StreamFailure::Claim(Claim::WaiterCancelled),
                 false,
+            ),
+            (
+                "get-stream-cancelled",
+                74u8,
+                StreamFailure::Assembly(StreamError::Cancelled),
+                true,
             ),
         ] {
             let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
             let instance_id = ContractInstanceId::new([seed; 32]);
-            assembly_fault_injection::inject_failures_with_cause(key_for(instance_id), 1, cause);
+            assembly_fault_injection::inject_stream_failures(key_for(instance_id), 1, failure);
             let header_hop = peers[0].clone();
             let stream_id = StreamId::next_operations();
             serve_attempts(
@@ -9123,7 +9289,7 @@ mod route_attempt_driver_tests {
             );
             let client_tx = Transaction::new::<GetMsg>();
             // The stream is claimed from `current_target`, which is the
-            // header's hop here, so only the cause decides the label.
+            // header's hop here, so only the classification decides the label.
             let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
             let _outcome = run(&op_manager, client_tx, &mut driver).await;
             drop(driver);
@@ -9134,6 +9300,284 @@ mod route_attempt_driver_tests {
             };
             assert_eq!(failed_addrs(&op_manager), expected, "{label}");
         }
+    }
+
+    /// A real stream cancelled mid-transfer (no injection): the claim succeeds,
+    /// assembly reports the cancellation, and the hop is labelled.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn cancelled_stream_is_labelled_against_its_hop() {
+        let (op_manager, rx, peers, _guards) =
+            op_manager_with_peers("get-stream-really-cancelled", 3).await;
+        let instance_id = ContractInstanceId::new([75u8; 32]);
+        let stream_id = StreamId::next_operations();
+        let handle =
+            crate::transport::peer_connection::streaming::StreamHandle::new(stream_id, 4096);
+        handle.cancel();
+        op_manager
+            .orphan_stream_registry()
+            .register_orphan(addr(&peers[0]), stream_id, handle);
+        let header_hop = peers[0].clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |i, msg, _| {
+                if i == 0 {
+                    Step {
+                        hop: Some(header_hop.clone()),
+                        answer: Answer::Reply(streaming_header(msg, instance_id, stream_id, 4096)),
+                    }
+                } else {
+                    Step {
+                        hop: None,
+                        answer: Answer::Reply(not_found(msg, instance_id)),
+                    }
+                }
+            },
+        );
+        let client_tx = Transaction::new::<GetMsg>();
+        let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
+        let _outcome = run(&op_manager, client_tx, &mut driver).await;
+        drop(driver);
+        assert_eq!(failed_addrs(&op_manager), vec![addr(&peers[0])]);
+    }
+
+    /// Existence proof from a streamed reply requires state this node stored
+    /// (#5657): the NotFound hop is labelled only when the assembled stream's
+    /// state is stored.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn not_found_is_trained_only_after_a_streamed_store() {
+        for (label, seed, refused) in [
+            ("get-stream-stored", 76u8, false),
+            ("get-stream-store-refused", 77u8, true),
+        ] {
+            let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
+            if refused {
+                reject_stores(label);
+            }
+            let instance_id = ContractInstanceId::new([seed; 32]);
+            let stream_id = StreamId::next_operations();
+            // The stream is claimed from the driver's `current_target` after
+            // its advance; offer it from every peer so the pick does not matter.
+            for peer in &peers {
+                register_stream(&op_manager, addr(peer), stream_id, instance_id);
+            }
+            let (nf_hop, header_hop) = (peers[2].clone(), peers[1].clone());
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |i, msg, _| {
+                    if !is_request(msg) {
+                        return Step {
+                            hop: None,
+                            answer: Answer::DropWaiter,
+                        };
+                    }
+                    if i == 0 {
+                        Step {
+                            hop: Some(nf_hop.clone()),
+                            answer: Answer::Reply(not_found(msg, instance_id)),
+                        }
+                    } else {
+                        Step {
+                            hop: Some(header_hop.clone()),
+                            answer: Answer::Reply(streaming_header_with_code(
+                                msg,
+                                instance_id,
+                                stream_id,
+                            )),
+                        }
+                    }
+                },
+            );
+            let client_tx = Transaction::new::<GetMsg>();
+            let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
+            let (outcome, assembly) = run(&op_manager, client_tx, &mut driver).await;
+            drop(driver);
+            assert!(
+                matches!(outcome, RetryLoopOutcome::Done(Terminal::Streaming { .. }))
+                    && assembly.error.is_none(),
+                "{label}: the stream assembles either way: {:?}",
+                assembly.error
+            );
+            let expected = if refused {
+                vec![]
+            } else {
+                vec![addr(&peers[2])]
+            };
+            assert_eq!(failed_addrs(&op_manager), expected, "{label}");
+        }
+    }
+
+    /// Relay side: the greedy hop's NotFound is settled by a consulted host's
+    /// streamed reply only when the relay stores the assembled state.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_not_found_is_trained_only_after_a_streamed_store() {
+        for (label, refused) in [
+            ("get-relay-stream-stored", false),
+            ("get-relay-stream-store-refused", true),
+        ] {
+            let (op_manager, rx, _store, upstream, greedy, host, _guards) =
+                relay_fixture(label, true).await;
+            if refused {
+                reject_stores(label);
+            }
+            let instance_id = ContractInstanceId::new([53u8; 32]);
+            let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
+            let stream_id = StreamId::next_operations();
+            register_stream(&op_manager, host_addr, stream_id, instance_id);
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |_, msg, target| {
+                    let answer = if !is_request(msg) {
+                        Answer::DropWaiter
+                    } else if target == Some(greedy_addr) {
+                        Answer::Reply(not_found(msg, instance_id))
+                    } else if target == Some(host_addr) {
+                        Answer::Reply(streaming_header_with_code(msg, instance_id, stream_id))
+                    } else {
+                        Answer::Never
+                    };
+                    Step { hop: None, answer }
+                },
+            );
+            run_relay(&op_manager, &upstream).await;
+            let expected = if refused {
+                vec![(Some(host_addr), 0.0)]
+            } else {
+                vec![(Some(greedy_addr), 1.0), (Some(host_addr), 0.0)]
+            };
+            assert_eq!(
+                by_peer(failure_window(&op_manager)),
+                by_peer(expected),
+                "{label}"
+            );
+        }
+    }
+
+    /// A remote reply whose state equals the copy this node already holds is
+    /// existence proof too, contract code or not (#5657).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn reply_equal_to_the_held_copy_is_existence_proof() {
+        let label = "get-held-copy";
+        let (op_manager, rx, peers, _guards, store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let instance_id = ContractInstanceId::new([72u8; 32]);
+        // The reply's exact state; `found` carries no contract code.
+        *store.lock() = Some((key_for(instance_id), WrappedState::new(vec![1, 2, 3])));
+        let (nf_hop, found_hop) = (peers[2].clone(), peers[1].clone());
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |i, msg, _| {
+                if !is_request(msg) {
+                    return Step {
+                        hop: None,
+                        answer: Answer::DropWaiter,
+                    };
+                }
+                if i == 0 {
+                    Step {
+                        hop: Some(nf_hop.clone()),
+                        answer: Answer::Reply(not_found(msg, instance_id)),
+                    }
+                } else {
+                    Step {
+                        hop: Some(found_hop.clone()),
+                        answer: Answer::Reply(found(msg, instance_id)),
+                    }
+                }
+            },
+        );
+        let _outcome = drive_client_get_inner(
+            &op_manager,
+            Transaction::new::<GetMsg>(),
+            instance_id,
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(failed_addrs(&op_manager), vec![addr(&peers[2])]);
+    }
+
+    /// The originator-loopback relay stamps its hop once the dispatch has
+    /// returned (#5657): a dispatch held up on a full event-loop channel does
+    /// not count as the hop's share of the attempt.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn loopback_hop_is_stamped_after_its_dispatch() {
+        use crate::operations::route_attempt::{
+            driver_test_support::op_manager_with_peers_and_store_on, hop_had_budget_share,
+        };
+        let (op_manager, mut rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store_on("get-slow-dispatch", 3, Some(1)).await;
+        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+        let start = tokio::time::Instant::now();
+        let tx = Transaction::new::<GetMsg>();
+        let instance_id = ContractInstanceId::new([73u8; 32]);
+        let slot = op_manager.attempt_hop_registry().register(tx);
+        // Fill the one-slot channel (unless the ring's own traffic already
+        // did), so the relay's dispatch has to wait for it to drain.
+        let filler_tx = Transaction::new::<GetMsg>();
+        let filler = NetMessage::from(GetMsg::Request {
+            id: filler_tx,
+            instance_id,
+            fetch_contract: false,
+            htl: 1,
+            visited: VisitedPeers::new(&filler_tx),
+            subscribe: false,
+        });
+        let mut filler_ctx = op_manager.op_ctx(filler_tx);
+        let _filled = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            filler_ctx.send_fire_and_forget(own, filler),
+        )
+        .await;
+        let relay_manager = op_manager.clone();
+        let relay = tokio::spawn(async move {
+            let conn_manager = crate::operations::test_utils::MockNetworkBridge::new();
+            drive_relay_get_inner(
+                &relay_manager,
+                &conn_manager,
+                tx,
+                instance_id,
+                3,
+                own,
+                VisitedPeers::new(&tx),
+                false,
+                false,
+            )
+            .await
+        });
+        // The dispatch waits 40 s for the channel.
+        tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+        assert!(
+            slot.hop_record().is_some(),
+            "the hop is recorded before the dispatch"
+        );
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some((reply, _, _)) = rx.recv().await {
+                held.push(reply);
+            }
+        });
+        relay
+            .await
+            .expect("relay task")
+            .expect("the loopback dispatch succeeds");
+        let (_, stamped) = slot.hop_record().expect("the hop is still recorded");
+        assert!(
+            stamped >= start + std::time::Duration::from_secs(40),
+            "the hop must be stamped when its dispatch returned, not before it waited"
+        );
+        assert!(
+            !hop_had_budget_share(start, stamped, start + crate::config::OPERATION_TTL),
+            "a hop reached 40 s into a 60 s attempt did not have half of it"
+        );
     }
 
     /// Relay scenario shared by the relay tests: the relay's greedy candidate
@@ -9320,24 +9764,32 @@ mod route_attempt_driver_tests {
                 LabelMode::Current => 1.0,
                 LabelMode::Legacy => 0.0,
             };
-            // Compared by peer, not order: under the current rules the greedy
-            // NotFound is settled only after the host's state is stored.
-            assert_eq!(
-                by_peer(failure_window(&op_manager)),
-                by_peer(vec![
-                    (Some(greedy_addr), greedy_label),
-                    (Some(host_addr), 0.0)
-                ]),
-                "{mode:?}"
-            );
-            assert_eq!(
-                by_peer(recorded_sources(&op_manager)),
-                by_peer(vec![
-                    (Some(greedy_addr), RouteSource::Relay),
-                    (Some(host_addr), RouteSource::Relay),
-                ]),
-                "{mode:?}: relay labels are relay observations in both modes"
-            );
+            let window = failure_window(&op_manager);
+            let expected = vec![(Some(greedy_addr), greedy_label), (Some(host_addr), 0.0)];
+            let sources = recorded_sources(&op_manager);
+            let expected_sources = vec![
+                (Some(greedy_addr), RouteSource::Relay),
+                (Some(host_addr), RouteSource::Relay),
+            ];
+            match mode {
+                // Legacy order is main's: the greedy NotFound's SuccessUntimed
+                // is recorded when it arrives.
+                LabelMode::Legacy => {
+                    assert_eq!(window, expected, "{mode:?}");
+                    assert_eq!(sources, expected_sources, "{mode:?}");
+                }
+                // Compared by peer, not order: under the current rules the
+                // greedy NotFound is settled only after the host's state is
+                // stored.
+                LabelMode::Current => {
+                    assert_eq!(by_peer(window), by_peer(expected), "{mode:?}");
+                    assert_eq!(
+                        by_peer(sources),
+                        by_peer(expected_sources),
+                        "{mode:?}: relay labels are relay observations in both modes"
+                    );
+                }
+            }
         }
     }
 

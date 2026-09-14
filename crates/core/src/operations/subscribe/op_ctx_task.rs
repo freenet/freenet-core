@@ -1087,9 +1087,8 @@ async fn drive_client_subscribe_inner(
                 // response-time estimator with zero observations from
                 // client-initiated subscribes. Restore that feedback so the
                 // peer dashboard's Response Time chart populates again.
-                // Not existence proof (#5657): a `Subscribed` carries no state,
-                // so nothing in a SUBSCRIBE passes validation. Its NotFounds
-                // are left to `ambiguous_not_found_policy()`.
+                // Not existence proof (#5657): a `Subscribed` carries no state.
+                // Its NotFounds are left to `ambiguous_not_found_policy()`.
                 let contract_location = crate::ring::Location::from(&key);
                 let route_event = crate::router::RouteEvent {
                     peer: current_target.clone(),
@@ -4313,7 +4312,10 @@ mod route_attempt_driver_tests {
     /// proof). Neither labels anything.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn renewal_not_found_then_subscribed_labels_nothing() {
-        for (label, is_renewal) in [("sub-renew-proof", true), ("sub-plain-proof", false)] {
+        for (label, is_renewal) in [
+            ("sub-renewal-nf-then-subscribed", true),
+            ("sub-plain-nf-then-subscribed", false),
+        ] {
             let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
             let instance_id = ContractInstanceId::new([50u8; 32]);
             let targets = Arc::new(Mutex::new(Vec::new()));
@@ -4496,7 +4498,7 @@ mod route_attempt_driver_tests {
         );
         assert!(forward.contains("AttemptFailure::Timeout,"));
         assert!(
-            !crate::operations::route_attempt::driver_test_support::strip_comments(forward)
+            !crate::contract::source_pin_util::strip_comments(forward)
                 .contains("contract_exists()"),
             "a Subscribed carries no state, so it is never existence proof (#5657)"
         );
@@ -4554,8 +4556,7 @@ mod route_attempt_driver_tests {
             assert!(body.contains(gate_def), "missing gate `{gate_def}`");
         }
         assert!(
-            !crate::operations::route_attempt::driver_test_support::strip_comments(body)
-                .contains("contract_exists()"),
+            !crate::contract::source_pin_util::strip_comments(body).contains("contract_exists()"),
             "a Subscribed carries no state, so it is never existence proof (#5657)"
         );
     }
