@@ -90,6 +90,16 @@ slow-timeout = { period = "150s", terminate-after = 2 }
 # equipment, and an intermittent failure here is a finding, not noise to absorb.
 # A retry would turn "the commit sometimes does not happen" — the exact bug class
 # #5232 was filed about — back into a green run.
+#
+# The canary's comment is explicit that its retries = 0 is only safe BECAUSE its
+# one transient failure mode is handled by an in-test retry loop, and that half
+# does NOT come for free. These tests inherit it deliberately: `spawn_ready` in
+# post_update_probation_commit.rs retries a bind collision up to 5 times with
+# ±20% jitter, and retries ONLY that (any other early exit still panics on the
+# first attempt). Without it a lost port race would red the merge queue with no
+# retry anywhere — and these tests hold two ports for ~65s against the canary's
+# ~5s, so the exposure is over an order of magnitude larger. If that loop is
+# ever removed, this retries = 0 has to be revisited with it.
 [[profile.ci.overrides]]
 filter = "test(/probation_(is_committed|survives)/)"
 slow-timeout = { period = "300s", terminate-after = 2 }

@@ -89,13 +89,19 @@ const COMMIT_POLL_DEADLINE: Duration = Duration::from_secs(COMMIT_HEALTHY_UPTIME
 /// budget `persistence_roundtrip.rs` allows for the same thing.
 const NODE_READY_DEADLINE: Duration = Duration::from_secs(60);
 
+/// How long `spawn_ready` waits after the WS port answers before accepting the
+/// node as up. The node binds its WS API before its UDP transport, so a
+/// `--network-port` collision kills it shortly AFTER readiness; this is the
+/// window in which that shows up. Paid once per test against a ~65s runtime.
+const NODE_SETTLE: Duration = Duration::from_secs(2);
+
 /// Substring of the line `commit_probation` announces on the `Committed` branch
 /// ONLY.
 ///
 /// Deliberately not the leading "post-update probation passed" phrase: the
-/// ClearFailed branch — marker could not be removed, so rollback is still armed
-/// — needs to say the version ran healthily too, and a needle both lines shared
-/// would let this test report a commit while rollback was live.
+/// CommitFailed branch — marker could not be removed, so rollback is still
+/// armed — needs to say the version ran healthily too, and a needle both lines
+/// shared would let this test report a commit while rollback was live.
 /// `rollback.rs::tests::a_failed_clear_is_never_announced_as_a_pass` pins the
 /// two apart in microseconds, rather than after this test's 60s window.
 const COMMITTED_STDERR_NEEDLE: &str = "committed, auto-rollback disarmed";
@@ -302,23 +308,29 @@ impl NodeProcess {
 
     /// Block until the WS API accepts a TCP connection, so the commit window is
     /// timed from a node that is actually up rather than from `spawn`.
-    fn wait_until_ready(&mut self, dir: &Path) {
+    ///
+    /// Returns the failure as an `Err` rather than panicking so `spawn_ready`
+    /// can distinguish a lost port race — the one legitimately transient failure
+    /// here — from a real defect, and retry only the former. Everything it
+    /// returns is a panic message; nothing recovers except that one case.
+    fn wait_until_ready(&mut self, dir: &Path) -> Result<(), String> {
         let deadline = Instant::now() + NODE_READY_DEADLINE;
         while Instant::now() < deadline {
             if std::net::TcpStream::connect(("127.0.0.1", self.ws_port)).is_ok() {
-                return;
+                return Ok(());
             }
-            assert!(
-                !self.has_exited(),
-                "the node exited before its WS API came up.{}",
-                self.diagnostics(dir)
-            );
+            if self.has_exited() {
+                return Err(format!(
+                    "the node exited before its WS API came up.{}",
+                    self.diagnostics(dir)
+                ));
+            }
             std::thread::sleep(Duration::from_millis(500));
         }
-        panic!(
+        Err(format!(
             "the node's WS API never came up within {NODE_READY_DEADLINE:?}.{}",
             self.diagnostics(dir)
-        );
+        ))
     }
 
     /// Everything worth knowing when an assertion fails. The node's own stderr
@@ -365,6 +377,94 @@ impl Drop for NodeProcess {
             let _reaped = self.child.wait().is_ok();
         }
     }
+}
+
+/// `reserve_port` is a TOCTOU race, not a reservation: it binds an ephemeral
+/// TCP port, drops the listener, and hands the bare number to a node that binds
+/// it some milliseconds later. Worse for `--network-port`, which the node binds
+/// as **UDP** — a TCP bind proves nothing at all about that number's
+/// availability. Either port can be taken in between by a parallel test.
+///
+/// Nothing above absorbs that: `.config/nextest.toml` sets `retries = 0` for
+/// these tests deliberately (an intermittent failure in brick-safety equipment
+/// is a finding, not noise), so a lost race would red the merge queue with no
+/// retry. This is the same in-test retry loop the `test_ping_blocked_peers`
+/// canary relies on for the same reason — its `retries = 0` is only safe
+/// because `MAX_PORT_RETRY_ATTEMPTS` in `run_app_blocked_peers.rs` handles the
+/// collision inside the test. These tests hold two ports for ~65s against that
+/// canary's ~5s, so the exposure is over an order of magnitude larger and the
+/// loop matters more here, not less.
+const MAX_PORT_RETRY_ATTEMPTS: usize = 5;
+
+/// Spawn a node and wait for readiness, retrying ONLY a port collision.
+///
+/// Deliberately narrow: any other early exit (a rejected flag, an unparseable
+/// fixture, a panic at boot) is a real defect and panics on the first attempt
+/// with the node's own diagnostics, exactly as before. Retrying those would be
+/// the flake-laundering `retries = 0` exists to prevent.
+fn spawn_ready(home: &Path) -> NodeProcess {
+    let mut last = String::new();
+    for attempt in 1..=MAX_PORT_RETRY_ATTEMPTS {
+        let mut node = NodeProcess::spawn(home, reserve_port(), reserve_port());
+        match node.wait_until_ready(home) {
+            Ok(()) => {
+                // Readiness is a TCP connect to the WS port, and the node binds
+                // that BEFORE its UDP transport — so a `--network-port`
+                // collision kills the node a moment AFTER it starts answering,
+                // and `wait_until_ready` returns Ok to a node already on its way
+                // out. Verified by execution: with that UDP port held the node
+                // logs "Failed to bind UDP socket to 127.0.0.1:NNNNN: Address
+                // already in use (os error 98)" and exits 42, and readiness wins
+                // the race first — so without this check the retry would cover
+                // only the narrow case where the collision beat readiness, and
+                // the usual case would surface ~60s later as an unexplained
+                // mid-window exit. Also verified in both directions: with the
+                // check removed and a port genuinely held, the committed test
+                // fails on "the node exited before the probation commit window
+                // elapsed"; with it restored, the same run retries and passes.
+                //
+                // A WS-port collision needs it for the opposite reason:
+                // `TcpStream::connect` succeeds against the OTHER process's
+                // listener, so readiness is spuriously true while our node dies.
+                std::thread::sleep(NODE_SETTLE);
+                let diagnostics = node.diagnostics(home);
+                if !is_port_collision(&diagnostics) {
+                    return node;
+                }
+                last = format!("lost a port race just after binding the WS API.{diagnostics}");
+            }
+            Err(e) if is_port_collision(&e) => last = e,
+            Err(e) => panic!("{e}"),
+        }
+
+        // Jitter 80-120ms, as the canary does, so parallel tests that collided
+        // do not re-collide in lockstep. `node` is dropped at the end of the
+        // iteration, killing and reaping the failed child.
+        let jitter = 80
+            + (SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+                % 41) as u64;
+        eprintln!(
+            "port collision on attempt {attempt}/{MAX_PORT_RETRY_ATTEMPTS}, retrying in {jitter}ms"
+        );
+        std::thread::sleep(Duration::from_millis(jitter));
+    }
+    panic!(
+        "could not get a free port pair in {MAX_PORT_RETRY_ATTEMPTS} attempts; last failure:\n\
+         {last}"
+    );
+}
+
+/// Whether a node's early-exit diagnostics describe a bind collision.
+///
+/// Matches the canary's set: the message text plus both errno spellings, since
+/// `EADDRINUSE` is 98 on Linux and 48 on macOS/BSD.
+fn is_port_collision(diagnostics: &str) -> bool {
+    diagnostics.contains("Address already in use")
+        || diagnostics.contains("os error 98")
+        || diagnostics.contains("os error 48")
 }
 
 fn reserve_port() -> u16 {
@@ -418,8 +518,7 @@ fn probation_is_committed_after_a_healthy_uptime_window() {
         "fixture precondition: an armed marker with no crashes yet"
     );
 
-    let mut node = NodeProcess::spawn(home, reserve_port(), reserve_port());
-    node.wait_until_ready(home);
+    let mut node = spawn_ready(home);
 
     // ---- Assertion 1: committed, and said so ----
     //
@@ -444,6 +543,27 @@ fn probation_is_committed_after_a_healthy_uptime_window() {
     }
 
     let stderr = read_node_stderr(home);
+    // Checked BEFORE the generic "it never announced" assertion below, and the
+    // order is load-bearing rather than stylistic.
+    //
+    // `commit_probation` emits AT MOST ONE line per process (one call, from the
+    // commit timer), so stderr can never hold the Committed needle and the
+    // discarded-marker phrase at once. Placed after the `announced` assertion,
+    // this could therefore only run when `announced` was true — which is exactly
+    // when it cannot fire — so it was a dead assertion the PR body credited as a
+    // guard. Verified by applying the #5104 `v`-prefix regression it names: the
+    // run failed on the assertion below and never reached this one.
+    //
+    // Here it is the specific diagnosis for the commonest way that generic
+    // assertion fires, so the failure names the version comparison instead of
+    // leaving the reader to work out which of its two branches happened.
+    assert!(
+        !stderr.contains("discarded a post-update probation marker"),
+        "the marker was DISCARDED as belonging to another version rather than committed, so \
+         rollback protection was dropped without the version ever proving itself. The planted \
+         marker names {NODE_VERSION}, the same string the node commits, so this means the \
+         version comparison regressed (the #5104 `v`-prefix class).\n--- node stderr:\n{stderr}"
+    );
     assert!(
         announced,
         "#5232: the node ran for more than {COMMIT_HEALTHY_UPTIME_SECS}s but never announced \
@@ -454,13 +574,6 @@ fn probation_is_committed_after_a_healthy_uptime_window() {
          freenet` unable to tell a committed node from one accumulating strikes. That is the \
          misreading #5232 was filed on. Marker crash_count now: {:?}\n--- node stderr:\n{stderr}",
         probation_crash_count(home),
-    );
-    assert!(
-        !stderr.contains("discarded a post-update probation marker"),
-        "the marker was DISCARDED as belonging to another version rather than committed, so \
-         rollback protection was dropped without the version ever proving itself. The planted \
-         marker names {NODE_VERSION}, the same string the node commits, so this means the \
-         version comparison regressed (the #5104 `v`-prefix class).\n--- node stderr:\n{stderr}"
     );
     assert_eq!(
         probation_crash_count(home),
@@ -511,8 +624,7 @@ fn probation_survives_a_stop_inside_the_commit_window() {
 
     arm_probation(home, NODE_VERSION);
 
-    let mut node = NodeProcess::spawn(home, reserve_port(), reserve_port());
-    node.wait_until_ready(home);
+    let node = spawn_ready(home);
     // Stop well inside the window. `wait_until_ready` returns as soon as the WS
     // port answers, which is before the commit task's sleep elapses, so there is
     // no race to lose here — but assert it rather than trusting it.

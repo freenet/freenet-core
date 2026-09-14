@@ -2077,6 +2077,40 @@ fi
 # travel from the scripts into the prose.
 #
 # Pinned offline: this asserts the flag is present, not that the network agrees.
+# Scan the repository's TRACKED files, not everything on disk.
+#
+# `find "$SCRIPT_DIR/.."` walks whatever happens to be under the repo root, and
+# on a developer machine that includes nested git worktrees -- this checkout had
+# 115 of them under `.claude/worktrees/`, each a full copy of the tree. Every
+# scan below then saw ~115 stale `scripts/release.sh` and `RELEASE_RECOVERY.md`
+# files from older commits and reported them as drift, so BOTH the User-Agent
+# check and the enumeration check failed on a tree whose tracked files were
+# entirely correct. CI never saw it: a fresh checkout has no nested worktrees.
+#
+# That is worse than a missing check. AGENTS.md tells contributors to run these
+# scripts locally, and a check that is red on a healthy tree is one people learn
+# to skip -- the same alarm-fatigue failure that let `--disable-auto-update` sit
+# on `framework` for nine days.
+#
+# `git ls-files` is also the semantically right question: these assertions are
+# about what the REPOSITORY says, not about what is lying in the working
+# directory. The `find` fallback keeps the script usable outside a git checkout
+# (a release tarball), and excludes the same paths by name.
+repo_files() {
+    local root
+    root="$(cd "$SCRIPT_DIR/.." && pwd)"
+    if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        git -C "$root" ls-files -z -- "$@" 2>/dev/null \
+            | tr '\0' '\n' | sed "s|^|$root/|" | sort
+    else
+        local args=() pat
+        for pat in "$@"; do args+=(-o -name "$(basename "$pat")"); done
+        find "$root" -type f \( "${args[@]:1}" \) \
+            -not -path '*/.git/*' -not -path '*/target/*' \
+            -not -path '*/.claude/*' 2>/dev/null | sort
+    fi
+}
+
 # Logical lines, so a `\`-continued invocation whose `-A` sits on another line
 # is judged whole.
 UA_MISSING=""
@@ -2087,8 +2121,7 @@ UA_TOTAL=0
 # wrong-set class as the non-recursive script glob earlier in this file.
 UA_FILES=()
 while IFS= read -r _f; do UA_FILES+=("$_f"); done < <(
-    find "$SCRIPT_DIR/.." -type f \( -name '*.yml' -o -name '*.yaml' -o -name '*.sh' -o -name '*.md' \) \
-        -not -path '*/.git/*' -not -path '*/target/*' 2>/dev/null | sort
+    repo_files '*.yml' '*.yaml' '*.sh' '*.md'
 )
 for _f in "${UA_FILES[@]}"; do
     [[ -f "$_f" ]] || continue
@@ -2199,8 +2232,7 @@ while IFS= read -r _f; do
     elif [[ "$_n" -ge 3 ]]; then
         enum_copies+="$(basename "$_f"): contains $_n of the ${#CANON_ROWS[@]} enumeration rows"$'\n'
     fi
-done < <(find "$SCRIPT_DIR/.." -type f \( -name '*.sh' -o -name '*.md' -o -name '*.yml' \) \
-            -not -path '*/.git/*' -not -path '*/target/*' 2>/dev/null | sort)
+done < <(repo_files '*.sh' '*.md' '*.yml')
 
 if [[ "$canon_hits" -lt "${#CANON_ROWS[@]}" ]]; then
     fail "release.sh's canonical failure enumeration is incomplete ($canon_hits of ${#CANON_ROWS[@]} rows)" \
