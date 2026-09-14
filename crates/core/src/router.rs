@@ -3909,6 +3909,33 @@ mod tests {
         assert!(prediction.failure_probability.is_finite());
     }
 
+    /// The peer tables are sized from the configured connection cap, and
+    /// evictions under churn reach the snapshot the dashboard and telemetry read.
+    #[test]
+    fn peer_table_capacity_and_evictions_reach_the_snapshot() {
+        let _learn = force_hierarchical_routing(true);
+        let mut router = Router::new(&[]).with_max_connections(5);
+        assert_eq!(router.snapshot().hierarchical_peer_capacity, 64);
+        assert_eq!(router.snapshot().hierarchical_peer_evictions, 0);
+        add_relay_recorded_successes(&mut router, 300);
+        let snapshot = router.snapshot();
+        assert!(
+            snapshot.hierarchical_peer_evictions > 0,
+            "300 distinct peers through a 64-slot table must evict"
+        );
+        assert_eq!(
+            snapshot.hierarchical_peer_evictions,
+            router.hierarchical.total_evictions()
+        );
+        assert_eq!(
+            Router::new(&[])
+                .with_max_connections(1_000)
+                .snapshot()
+                .hierarchical_peer_capacity,
+            2_000
+        );
+    }
+
     /// Everyone must not pay for a shadow model nobody reads: with the flag off
     /// and no dataset recorder, the estimator learns nothing, and the snapshot
     /// says it is not computed rather than showing an empty model. A recorder
