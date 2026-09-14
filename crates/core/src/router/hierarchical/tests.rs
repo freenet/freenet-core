@@ -350,6 +350,44 @@ fn epoch_scaled_moments_equal_naive_forgetting() {
     assert!((sq_cells - level.sq_cells).abs() < 1e-9);
 }
 
+#[test]
+fn integer_rate_ratio_only_accepts_exact_small_powers() {
+    assert_eq!(integer_rate_ratio(24.0, 6.0), Some(4));
+    assert_eq!(integer_rate_ratio(6.0, 1.5), Some(4));
+    assert_eq!(integer_rate_ratio(24.0, 5.0), None);
+    assert_eq!(integer_rate_ratio(6.0, 6.0), None);
+    assert_eq!(integer_rate_ratio(1.5, 6.0), None);
+    assert_eq!(integer_rate_ratio(100.0, 1.0), None);
+}
+
+/// A refit derives faster horizons' weights as powers of slower ones; the
+/// result must equal plain exponential forgetting for every horizon.
+#[test]
+fn rebuilt_levels_equal_naive_exponential_forgetting() {
+    let _guard = GlobalRng::seed_guard(0x4485_4eb1);
+    let mut stage: Stage<u32> = Stage::with_limits(Target::LogResponseTime, 10_000, 64);
+    let mut times = Vec::new();
+    for i in 0..777u32 {
+        let time = i as f64 * 0.037;
+        times.push(time);
+        stage.observe(&(i % 9), uniform(), uniform() * 0.5, normal(), time);
+    }
+    let now = *times.last().unwrap();
+    stage.refit(now);
+    for level in &stage.levels {
+        let naive: f64 = times
+            .iter()
+            .map(|t| level.horizon_hours.map_or(1.0, |h| (-(now - t) / h).exp()))
+            .sum();
+        let rebuilt = level.root.n * level.scale(now);
+        assert!(
+            (rebuilt - naive).abs() < 1e-9 * naive.max(1.0),
+            "horizon {:?}: rebuilt n {rebuilt} vs naive {naive}",
+            level.horizon_hours
+        );
+    }
+}
+
 /// Method of moments recovers known variance components.
 #[test]
 fn variance_components_recover_the_generating_values() {
@@ -717,8 +755,9 @@ fn refit_and_prediction_cost_at_a_full_window() {
     stage.refit(now);
     assert_eq!(stage.sorted.len(), WINDOW_EVENTS);
 
-    let rounds = 20;
-    let mut total = std::time::Duration::ZERO;
+    // Phase-by-phase, mirroring `Stage::refit`, so a regression can be located.
+    let rounds = 20u32;
+    let mut phases = [std::time::Duration::ZERO; 4];
     for round in 0..rounds {
         for i in 0..REFIT_EVERY {
             stage.fresh.push(Event {
@@ -728,15 +767,29 @@ fn refit_and_prediction_cost_at_a_full_window() {
                 seq: stage.next_seq,
                 slot: (i % 200) as u32,
                 generation: 0,
-                band: (round % BANDS) as u8,
+                band: (round as usize % BANDS) as u8,
             });
             stage.next_seq += 1;
         }
-        let start = std::time::Instant::now();
-        stage.refit(now);
-        total += start.elapsed();
+        let mut lap = std::time::Instant::now();
+        let mut mark = |phase: usize| {
+            phases[phase] += lap.elapsed();
+            lap = std::time::Instant::now();
+        };
+        stage.merge_fresh();
+        mark(0);
+        stage.curve = Curve::fit_shrunk(&stage.sorted, true);
+        mark(1);
+        for level in &mut stage.levels {
+            level.reset(now);
+        }
+        assert!(stage.prepare());
+        mark(2);
+        stage.rebuild_levels(now);
+        mark(3);
     }
-    let per_refit = total / rounds as u32;
+    let [merge, curve, prepare, levels] = phases.map(|phase| phase / rounds);
+    let per_refit = merge + curve + prepare + levels;
 
     let queries = 25 * 3 * 1_000;
     let start = std::time::Instant::now();
@@ -748,9 +801,9 @@ fn refit_and_prediction_cost_at_a_full_window() {
     }
     let per_prediction = start.elapsed() / queries as u32;
     eprintln!(
-        "#4485 hierarchical cost: refit over {} events = {per_refit:?}; \
-         prediction = {per_prediction:?} (sum {acc:.3}); curve blocks {}",
-        WINDOW_EVENTS,
+        "#4485 hierarchical cost over {WINDOW_EVENTS} events: refit {per_refit:?} = merge \
+         {merge:?} + curve {curve:?} + re-anchor {prepare:?} + levels {levels:?}; \
+         prediction {per_prediction:?} (sum {acc:.3}); curve blocks {}",
         stage.curve.as_ref().map_or(0, |c| c.blocks.len())
     );
 }

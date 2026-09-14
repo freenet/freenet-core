@@ -111,6 +111,7 @@ const MIN_CURVE_POINTS: usize = 5;
 
 /// Contract-location bands per peer: `band = floor(8 * contract_location)`.
 pub(crate) const BANDS: usize = 8;
+const _: () = assert!(BANDS.is_power_of_two(), "band masking needs a power of two");
 
 /// Forgetting horizons, in hours. `None` forgets nothing inside the window.
 /// Powers of four down from 24h, as in the reference.
@@ -253,8 +254,9 @@ impl Curve {
         }
         let grand = blocks.iter().map(|block| block.w * block.y).sum::<f64>() / total;
         let (mut ss, mut sw) = (0.0, 0.0);
+        let mut cursor = 0;
         for event in window {
-            if let Some(fitted) = fit.value(event.distance) {
+            if let Some(fitted) = fit.value_sorted(event.distance, &mut cursor) {
                 ss += (event.y - fitted).powi(2);
                 sw += 1.0;
             }
@@ -282,10 +284,21 @@ impl Curve {
     }
 
     fn value(&self, x: f64) -> Option<f64> {
+        let mut cursor = self.blocks.partition_point(|block| block.x <= x);
+        self.value_sorted(x, &mut cursor)
+    }
+
+    /// [`Self::value`] for a non-decreasing sequence of queries: `cursor` is the
+    /// number of blocks at or left of the previous query (start at 0), advanced
+    /// in place, so a pass over the sorted window is linear, not `n log b`.
+    fn value_sorted(&self, x: f64, cursor: &mut usize) -> Option<f64> {
         if !x.is_finite() {
             return None;
         }
         let blocks = &self.blocks;
+        while *cursor < blocks.len() && blocks[*cursor].x <= x {
+            *cursor += 1;
+        }
         let centroid = Block {
             x: self.centroid.0,
             y: self.centroid.1,
@@ -295,7 +308,7 @@ impl Curve {
             0 => return None,
             1 => blocks[0].y,
             len => {
-                let above = blocks.partition_point(|block| block.x <= x);
+                let above = *cursor;
                 if above == 0 {
                     interpolate(blocks[0], centroid, x)
                 } else if above == len {
@@ -430,6 +443,43 @@ impl Level {
         let delta = 2.0 * before * weight + weight * weight;
         node.sq_cells += delta;
         self.sq_cells += delta;
+    }
+
+    /// Accumulate a whole prepared window into a freshly reset level. The
+    /// squared-count sums are left for `recount_squares`, which recomputes them
+    /// exactly anyway, so this loop does only the moment updates.
+    fn rebuild(&mut self, prepared: &mut [Prepared], weighting: Weighting) {
+        let mut root = Moments::default();
+        let nodes = &mut self.nodes;
+        for event in prepared.iter_mut() {
+            let weight = match weighting {
+                Weighting::Unit => 1.0,
+                Weighting::PowerOfPrevious(power) => {
+                    event.weight = event.weight.powi(power);
+                    event.weight
+                }
+                Weighting::Decay { hours, now } => {
+                    event.weight = ((event.time - now) / hours).exp();
+                    event.weight
+                }
+            };
+            let weighted = weight * event.residual;
+            let weighted_sq = weighted * event.residual;
+            root.n += weight;
+            root.sum += weighted;
+            root.sumsq += weighted_sq;
+            if let Some(node) = nodes.get_mut(event.slot as usize) {
+                node.peer.n += weight;
+                node.peer.sum += weighted;
+                node.peer.sumsq += weighted_sq;
+                // `band < BANDS` by construction; the mask spares a bounds check.
+                let cell = &mut node.cells[event.band as usize & (BANDS - 1)];
+                cell.n += weight;
+                cell.sum += weighted;
+                cell.sumsq += weighted_sq;
+            }
+        }
+        self.root = root;
     }
 
     fn evict(&mut self, slot: usize) {
@@ -598,7 +648,7 @@ impl<K: Hash + Eq + Clone> PeerTable<K> {
             keys: Vec::new(),
             slots: Vec::new(),
             free: Vec::new(),
-            capacity: capacity.max(1),
+            capacity: capacity.clamp(1, u32::MAX as usize - 1),
             use_clock: 0,
             evictions: 0,
         }
@@ -713,6 +763,40 @@ fn band_of(contract_location: f64) -> usize {
     ((contract_location * BANDS as f64).floor().max(0.0) as usize).min(BANDS - 1)
 }
 
+/// A windowed event reduced to what a hierarchy rebuild needs.
+#[derive(Debug, Clone, Copy)]
+struct Prepared {
+    residual: f64,
+    time: f64,
+    /// Scratch: the epoch-scaled weight at the level being rebuilt.
+    weight: f64,
+    /// `u32::MAX` when the event's peer has since been evicted. Never a valid
+    /// index: slots are bounded by the peer table's capacity.
+    slot: u32,
+    band: u8,
+}
+
+/// How a level weights prepared events during a rebuild.
+#[derive(Debug, Clone, Copy)]
+enum Weighting {
+    /// No forgetting.
+    Unit,
+    /// The previous level's weight raised to this power.
+    PowerOfPrevious(i32),
+    Decay {
+        hours: f64,
+        now: f64,
+    },
+}
+
+/// Exact small-integer ratio of two decay rates, if there is one, so a faster
+/// horizon's weight is a power of a slower one's instead of another `exp`.
+fn integer_rate_ratio(slower_hours: f64, faster_hours: f64) -> Option<i32> {
+    let ratio = slower_hours / faster_hours;
+    let rounded = ratio.round();
+    ((ratio - rounded).abs() < 1e-9 && (2.0..=16.0).contains(&rounded)).then_some(rounded as i32)
+}
+
 /// Read-only state of a stage, for the dashboard.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct StageDiagnostics {
@@ -754,6 +838,8 @@ pub(crate) struct Stage<K> {
     refits: u64,
     rejected: u64,
     orphaned_at_last_refit: usize,
+    /// Reused rebuild buffer, so a refit allocates nothing in steady state.
+    prepared: Vec<Prepared>,
 }
 
 impl<K: Hash + Eq + Clone> Stage<K> {
@@ -778,6 +864,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             refits: 0,
             rejected: 0,
             orphaned_at_last_refit: 0,
+            prepared: Vec::new(),
         }
     }
 
@@ -940,7 +1027,21 @@ impl<K: Hash + Eq + Clone> Stage<K> {
     fn refit(&mut self, now: f64) {
         self.refits += 1;
         self.since_refit = 0;
+        self.merge_fresh();
+        if let Some(curve) = Curve::fit_shrunk(&self.sorted, self.target.ascending()) {
+            self.curve = Some(curve);
+        }
+        for level in &mut self.levels {
+            level.reset(now);
+        }
+        if self.prepare() {
+            self.rebuild_levels(now);
+        }
+    }
 
+    /// Fold events learned since the last refit into the sorted window and drop
+    /// events that have left it.
+    fn merge_fresh(&mut self) {
         let oldest_live = self.next_seq.saturating_sub(self.window_capacity as u64);
         self.sorted.retain(|event| event.seq >= oldest_live);
         self.fresh.retain(|event| event.seq >= oldest_live);
@@ -964,35 +1065,66 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             }
             self.fresh.clear();
         }
+    }
 
-        if let Some(curve) = Curve::fit_shrunk(&self.sorted, self.target.ascending()) {
-            self.curve = Some(curve);
-        }
-        for level in &mut self.levels {
-            level.reset(now);
-        }
+    /// Re-anchor every windowed residual on the current curve. `false` without
+    /// a curve.
+    fn prepare(&mut self) -> bool {
         let Some(curve) = self.curve.as_ref() else {
-            return;
+            return false;
         };
-
+        // One pass to re-anchor every residual on the new curve (linear, since
+        // the window is sorted by distance), then one tight pass per level.
+        // Level-at-a-time keeps each level's node table hot in cache, and lets
+        // a faster horizon's weight be an integer power of the slower one's
+        // (24h -> 6h -> 1.5h are powers of four) rather than a fresh `exp`.
         let mut orphaned = 0;
+        let mut cursor = 0;
+        self.prepared.clear();
         for event in &self.sorted {
-            let Some(value) = curve.value(event.distance) else {
+            let Some(value) = curve.value_sorted(event.distance, &mut cursor) else {
                 continue;
             };
-            let residual = event.y - self.target.finish(value);
-            let slot = event.slot as usize;
-            let live = self.peers.generation(slot) == Some(event.generation);
+            let live = self.peers.generation(event.slot as usize) == Some(event.generation);
             if !live {
                 orphaned += 1;
             }
-            let slot = live.then_some(slot);
-            for level in &mut self.levels {
-                let weight = level.weight(event.time);
-                level.add(slot, event.band as usize, weight, residual);
-            }
+            self.prepared.push(Prepared {
+                residual: event.y - self.target.finish(value),
+                time: event.time,
+                weight: 1.0,
+                slot: if live { event.slot } else { u32::MAX },
+                band: event.band,
+            });
         }
         self.orphaned_at_last_refit = orphaned;
+
+        true
+    }
+
+    /// Accumulate the prepared window into every (already reset) level and
+    /// recompute its variance components.
+    fn rebuild_levels(&mut self, now: f64) {
+        let slots = self.peers.slots.len();
+        let mut previous_hours: Option<f64> = None;
+        for level in &mut self.levels {
+            if level.nodes.len() < slots {
+                level.nodes.resize(slots, PeerNode::default());
+            }
+            let weighting = match level.horizon_hours {
+                None => Weighting::Unit,
+                Some(hours) => {
+                    let weighting =
+                        match previous_hours.and_then(|slower| integer_rate_ratio(slower, hours)) {
+                            Some(power) => Weighting::PowerOfPrevious(power),
+                            None => Weighting::Decay { hours, now },
+                        };
+                    previous_hours = Some(hours);
+                    weighting
+                }
+            };
+            level.rebuild(&mut self.prepared, weighting);
+        }
         for level in &mut self.levels {
             level.recount_squares();
             level.components = level.compute_components();
