@@ -125,6 +125,8 @@ const CONFIRMED_EXHAUSTED_SHARE: f64 = 0.5;
 /// Share of a peer's traffic sent to its home contract band when
 /// `Spec::home_band` is set.
 const HOME_BAND_SHARE: f64 = 0.9;
+/// Fixed contract locations for the transfer-speed scenarios (8 per band).
+const SPEED_CONTRACT_POOL: usize = 64;
 
 // Post-hoc additions after run 1 (see the module docs' "Run 2" section).
 /// Learned events between refits of the long-window curve and rebuilds of the
@@ -143,6 +145,9 @@ const SELECTOR_FORGETTING_HOURS: f64 = DECAY_HOURS;
 enum Target {
     Failure,
     Timing,
+    /// Natural log of transfer speed in bytes/s; falls with distance. Used
+    /// only by `revalidate` (follow-up 4).
+    Speed,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -204,6 +209,9 @@ struct Spec {
     /// Production-like locality: each peer sends `HOME_BAND_SHARE` of its
     /// traffic to one contract band (of 8) and the rest uniformly.
     home_band: bool,
+    /// `> 0`: contracts are quantised to this many fixed locations, so the
+    /// same peer serves the same contract repeatedly at an identical distance.
+    contract_pool: usize,
 }
 
 /// Where absent-contract keys fall (follow-up run, fixed before running).
@@ -251,6 +259,15 @@ impl Spec {
             events: EVENTS,
             events_per_hour: 60.0,
             home_band: false,
+            contract_pool: 0,
+        }
+    }
+
+    const fn speed(name: &'static str) -> Spec {
+        Spec {
+            target: Target::Speed,
+            contract_pool: SPEED_CONTRACT_POOL,
+            ..Spec::failure(name)
         }
     }
 
@@ -633,6 +650,16 @@ impl World {
     }
 
     fn draw(&self, index: usize) -> (usize, f64) {
+        let (peer, contract) = self.draw_continuous(index);
+        if self.spec.contract_pool > 0 {
+            let k = self.spec.contract_pool as f64;
+            (peer, ((contract * k).floor().min(k - 1.0) + 0.5) / k)
+        } else {
+            (peer, contract)
+        }
+    }
+
+    fn draw_continuous(&self, index: usize) -> (usize, f64) {
         if self.spec.pairs == Pairs::Oversampled && index % 12 == 0 {
             let (peer, offset) = TARGETED[(index / 12) % TARGETED.len()];
             let centre = (self.locations[peer] + offset).rem_euclid(1.0);
@@ -664,7 +691,7 @@ impl World {
     }
 
     fn drift_changed(&self, peer: usize) -> bool {
-        self.spec.drift_effect > 0.0 && peer % 4 <= 1
+        self.spec.drift_effect != 0.0 && peer % 4 <= 1
     }
 
     /// Generating truth: `p*` (failure) or `mu* = E[ln ms]` (timing).
@@ -674,7 +701,7 @@ impl World {
         if self.in_pair(peer, contract) {
             effect += spec.pair_effect;
         }
-        if spec.drift_effect > 0.0 {
+        if spec.drift_effect != 0.0 {
             let late = index >= spec.events / 2;
             let bad = (!late && peer % 4 == 0) || (late && peer % 4 == 1);
             if bad {
@@ -694,6 +721,7 @@ impl World {
                 (base + effect).clamp(0.001, 0.999)
             }
             Target::Timing => 200f64.ln() + 1.5 * shape + effect,
+            Target::Speed => 1.0e6f64.ln() - 1.5 * shape + effect,
         }
     }
 
@@ -706,7 +734,7 @@ impl World {
                     0.0
                 }
             }
-            Target::Timing => truth + TIMING_NOISE_SD * standard_normal(),
+            Target::Timing | Target::Speed => truth + TIMING_NOISE_SD * standard_normal(),
         }
     }
 }
@@ -1212,6 +1240,11 @@ struct Curve {
     /// of moments for unequal block sizes, with `s2` the within-block variance
     /// about the block means on `W - k` degrees of freedom.
     anova: bool,
+    /// Falls with distance (transfer speed). Fitted as an ASCENDING PAV on the
+    /// negated target, which is exactly "order ties by the target's PAV
+    /// direction": `pav_regression` sorts equal distances by y descending,
+    /// which pools ties for an ascending fit but NOT for a descending one.
+    descending: bool,
     fit: Option<pav_regression::IsotonicRegression<f64>>,
 }
 
@@ -1221,8 +1254,17 @@ impl Curve {
             horizon,
             shrink,
             anova: false,
+            descending: false,
             fit: None,
         }
+    }
+
+    fn with_direction(self, descending: bool) -> Curve {
+        Curve { descending, ..self }
+    }
+
+    fn oriented(&self, y: f64) -> f64 {
+        if self.descending { -y } else { y }
     }
 
     fn new_anova() -> Curve {
@@ -1246,7 +1288,7 @@ impl Curve {
         };
         let points: Vec<Point<f64>> = window
             .iter()
-            .map(|r| Point::new_with_weight(r.distance, r.y, weight(r)))
+            .map(|r| Point::new_with_weight(r.distance, self.oriented(r.y), weight(r)))
             .collect();
         let Ok(fit) = IsotonicRegression::new_ascending(&points) else {
             return;
@@ -1266,7 +1308,7 @@ impl Curve {
         for r in window {
             if let Some(f) = fit.interpolate(r.distance) {
                 let w = weight(r);
-                ss += w * (r.y - f).powi(2);
+                ss += w * (self.oriented(r.y) - f).powi(2);
                 sw += w;
             }
         }
@@ -1274,6 +1316,7 @@ impl Curve {
         let (s2, tau2) = if self.anova {
             let k = blocks.len() as f64;
             let sum_wy2: f64 = window.iter().map(|r| weight(r) * r.y * r.y).sum();
+            // (y^2 is direction-invariant.)
             let between: f64 = blocks.iter().map(|b| b.weight() * b.y() * b.y()).sum();
             let df = total - k;
             if df <= 0.0 {
@@ -1322,7 +1365,7 @@ impl Curve {
         self.fit
             .as_ref()
             .and_then(|f| f.interpolate(distance))
-            .map(|v| v.max(0.0))
+            .map(|v| self.oriented(v).max(0.0))
     }
 }
 

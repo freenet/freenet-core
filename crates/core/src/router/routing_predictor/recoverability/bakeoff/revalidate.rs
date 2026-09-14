@@ -30,6 +30,25 @@
 //! Failure: the legacy blend. Timing in seconds: the legacy stack AS SHIPPED
 //! (raw units), which estimates arithmetic means natively. The log-space legacy
 //! blend exponentiated is a median and is reported for reference.
+//!
+//! # Follow-up 4 (fixed before running)
+//!
+//! - **7b, live root sums.** Row 7 froze `sum n^2` at refit and divided by live
+//!   decayed `n^2`. 7b keeps `sum n^2` live, decayed to query time as
+//!   production does. `live_root_sums_match_frozen_at_refit_and_diverge_after`
+//!   pins that the live sums equal the frozen ones at refit and diverge
+//!   afterwards; it was mutation-tested.
+//! - **7c, the LOO cancellation guard.** The rest-of-peer sums are built from
+//!   the other cells directly, and `tau2_peer` skips peers whose rest is below
+//!   `1e-6 * root.n`.
+//! - **Production cadence.** Window 10k, refit every `max(50, window/100)`
+//!   learned events once full. The `*-long` scenarios (15k events) engage it.
+//!   The quiet `q*` scenarios (6 events/h) put refits ~8h apart, where frozen
+//!   and live root sums differ most.
+//! - **Transfer speed.** Log speed falls with distance; contracts come from a
+//!   fixed pool of 64, so identical distances repeat. It is scored as routing
+//!   uses it: the expected transfer time of `PAYLOAD_BYTES`, in seconds. The
+//!   curve orders ties by the target's PAV direction (`Curve::descending`).
 
 use super::*;
 
@@ -41,7 +60,7 @@ const PROD_EVENTS_PER_HOUR: f64 = 600.0;
 
 const NODE_MIN: f64 = 1e-12;
 
-const REVAL_ROWS: [&str; 9] = [
+const REVAL_ROWS: [&str; 11] = [
     "a  legacy blend (log-space, exp = median)",
     "a' legacy as shipped (raw units)",
     "b  global curve alone",
@@ -51,9 +70,28 @@ const REVAL_ROWS: [&str; 9] = [
     "6  no attr + corrections 1-3, median timing",
     "7  no attr + corrections 1-3 + E[] timing",
     "8  7 + LOO descent (guarded)",
+    "7b 7 with LIVE root squared-count sums",
+    "7c 7b + LOO cancellation guard",
 ];
+const ROW_7: usize = 7;
+const ROW_7B: usize = 9;
+const ROW_7C: usize = 10;
 
-const REVAL_RANK_ROWS: [(usize, &str); 8] = [
+/// Payload for scoring transfer speed as routing uses it: expected transfer
+/// time `S / v`.
+const PAYLOAD_BYTES: f64 = 1.0e6;
+
+/// Production cadence: once the window is full, refit every
+/// `max(REBUILD_EVERY, LONG_WINDOW / 100)` learned events.
+fn refit_every(windowed: usize) -> usize {
+    if windowed >= LONG_WINDOW {
+        (LONG_WINDOW / 100).max(REBUILD_EVERY)
+    } else {
+        REBUILD_EVERY
+    }
+}
+
+const REVAL_RANK_ROWS: [(usize, &str); 10] = [
     (0, "a  legacy blend"),
     (2, "b  global curve alone"),
     (3, "3  H* EB with attribute"),
@@ -61,6 +99,8 @@ const REVAL_RANK_ROWS: [(usize, &str); 8] = [
     (5, "5  frozen, original formulas"),
     (6, "6/7 corrections 1-3"),
     (8, "8  + LOO descent"),
+    (ROW_7B, "7b live root sums"),
+    (ROW_7C, "7c 7b + LOO guard"),
     (usize::MAX, "   nearest peer (no model)"),
 ];
 
@@ -148,6 +188,129 @@ fn prod_scenarios() -> Vec<Spec> {
             },
             "pt.drift",
         ),
+        // Follow-up 4 (fixed before running): long runs, so the 10k window
+        // fills and production's slower refit cadence engages, and speed.
+        long(prod(
+            Spec {
+                drift_effect: 0.25,
+                ..Spec::failure("")
+            },
+            "p.drift-long",
+        )),
+        long(prod(
+            Spec {
+                drift_effect: 0.7,
+                ..Spec::timing("")
+            },
+            "pt.drift-long",
+        )),
+        prod(Spec::speed(""), "ps.dist"),
+        prod(speed_mixed(), "ps.mixed"),
+        prod(
+            Spec {
+                drift_effect: -0.7,
+                ..Spec::speed("")
+            },
+            "ps.drift",
+        ),
+        long(prod(
+            Spec {
+                drift_effect: -0.7,
+                ..Spec::speed("")
+            },
+            "ps.drift-long",
+        )),
+    ]
+}
+
+/// Events for the long production-like runs: past the 10k window.
+const LONG_EVENTS: usize = 15_000;
+
+fn long(mut spec: Spec) -> Spec {
+    spec.events = LONG_EVENTS;
+    spec
+}
+
+fn speed_mixed() -> Spec {
+    Spec {
+        marginal_sd: 0.4,
+        attribute_step: -0.25,
+        pairs: Pairs::Natural,
+        pair_effect: -0.8,
+        ..Spec::speed("")
+    }
+}
+
+/// Quiet-node shape (fixed before the follow-up-4 rerun): the base traffic at
+/// 6 events/h, so a refit every 50 events is ~8h apart, several multiples of
+/// the 1.5h horizon. This is where frozen root sums and live ones diverge; at
+/// the other shapes a refit is at most ~50 minutes old.
+const QUIET_EVENTS_PER_HOUR: f64 = 6.0;
+
+fn quiet(mut spec: Spec, name: &'static str) -> Spec {
+    spec.name = name;
+    spec.events_per_hour = QUIET_EVENTS_PER_HOUR;
+    spec
+}
+
+fn quiet_scenarios() -> Vec<Spec> {
+    vec![
+        quiet(
+            Spec {
+                drift_effect: 0.25,
+                ..Spec::failure("")
+            },
+            "q.drift",
+        ),
+        quiet(
+            Spec {
+                marginal_sd: 0.08,
+                curve_shift: 0.10,
+                ..Spec::failure("")
+            },
+            "q.curve-drift",
+        ),
+        quiet(
+            Spec {
+                drift_effect: 0.7,
+                ..Spec::timing("")
+            },
+            "qt.drift",
+        ),
+        quiet(
+            Spec {
+                marginal_sd: 0.4,
+                curve_shift: 0.5,
+                ..Spec::timing("")
+            },
+            "qt.curve-drift",
+        ),
+        quiet(
+            Spec {
+                drift_effect: -0.7,
+                ..Spec::speed("")
+            },
+            "qs.drift",
+        ),
+    ]
+}
+
+/// Transfer-speed scenarios at the bake-off's base traffic shape.
+fn speed_scenarios() -> Vec<Spec> {
+    vec![
+        Spec::speed("s.dist"),
+        Spec {
+            marginal_sd: 0.4,
+            ..Spec::speed("s.peer")
+        },
+        Spec {
+            name: "s.mixed",
+            ..speed_mixed()
+        },
+        Spec {
+            drift_effect: -0.7,
+            ..Spec::speed("s.drift")
+        },
     ]
 }
 
@@ -206,6 +369,13 @@ struct Comps {
 struct HierC {
     decay: Option<f64>,
     corrected: bool,
+    /// Row 7c: rest-of-peer sums built from the other cells directly, and
+    /// `tau2_peer` skipped when the rest is below `1e-6 * root.n`.
+    guard: bool,
+    /// Live decayed `sum_c n_c^2` and `sum_p N_p^2`, as `(value, time)`; each
+    /// squared count decays at twice the rate.
+    sq_cells: (f64, f64),
+    sq_peers: (f64, f64),
     root: Mom,
     peers: HashMap<usize, Mom>,
     cells: HashMap<(usize, usize), Mom>,
@@ -217,10 +387,13 @@ fn band_of(contract: f64) -> usize {
 }
 
 impl HierC {
-    fn new(decay: Option<f64>, corrected: bool) -> HierC {
+    fn new(decay: Option<f64>, corrected: bool, guard: bool) -> HierC {
         HierC {
             decay,
             corrected,
+            guard,
+            sq_cells: (0.0, 0.0),
+            sq_peers: (0.0, 0.0),
             root: Mom::default(),
             peers: HashMap::new(),
             cells: HashMap::new(),
@@ -228,7 +401,20 @@ impl HierC {
         }
     }
 
+    fn squared_at(&self, (value, t0): (f64, f64), now: f64) -> f64 {
+        value
+            * self
+                .decay
+                .map_or(1.0, |h| (-2.0 * (now - t0).max(0.0) / h).exp())
+    }
+
     fn add(&mut self, peer: usize, contract: f64, t: f64, r: f64) {
+        let d = self.decay;
+        let key = (peer, band_of(contract));
+        let cell_n = self.cells.get(&key).map_or(0.0, |m| m.at(t, d).n);
+        let peer_n = self.peers.get(&peer).map_or(0.0, |m| m.at(t, d).n);
+        self.sq_cells = (self.squared_at(self.sq_cells, t) + 2.0 * cell_n + 1.0, t);
+        self.sq_peers = (self.squared_at(self.sq_peers, t) + 2.0 * peer_n + 1.0, t);
         self.root.add(r, t, self.decay);
         self.peers.entry(peer).or_default().add(r, t, self.decay);
         self.cells
@@ -278,7 +464,33 @@ impl HierC {
         let s_cells: f64 = peer_sq.values().sum();
         let s_peers: f64 = peers.values().map(|m| m.n * m.n).sum();
 
-        let tau2_cell = if self.corrected {
+        let tau2_cell = if self.corrected && self.guard {
+            let mut by_peer: HashMap<usize, Vec<Mom>> = HashMap::new();
+            for (&(p, _), m) in &cells {
+                by_peer.entry(p).or_default().push(*m);
+            }
+            let (mut num, mut den) = (0.0, 0.0);
+            for list in by_peer.values() {
+                for (i, c) in list.iter().enumerate() {
+                    let (mut rest_n, mut rest_sum, mut rest_w2, mut rest_sq) = (0.0, 0.0, 0.0, 0.0);
+                    for (j, other) in list.iter().enumerate() {
+                        if j != i {
+                            rest_n += other.n;
+                            rest_sum += other.sum;
+                            rest_w2 += other.w2;
+                            rest_sq += other.n * other.n;
+                        }
+                    }
+                    if !self.gated(c) || rest_n <= NODE_MIN {
+                        continue;
+                    }
+                    num += (c.mean() - rest_sum / rest_n).powi(2)
+                        - sigma2 * (c.w2 / (c.n * c.n) + rest_w2 / (rest_n * rest_n));
+                    den += 1.0 + rest_sq / (rest_n * rest_n);
+                }
+            }
+            if den > 0.0 { (num / den).max(0.0) } else { 0.0 }
+        } else if self.corrected {
             let (mut num, mut den) = (0.0, 0.0);
             for (&(p, _), c) in &cells {
                 let parent = peers[&p];
@@ -314,7 +526,8 @@ impl HierC {
             let (mut num, mut den) = (0.0, 0.0);
             for (&p, m) in &peers {
                 let rest_n = root.n - m.n;
-                if !self.gated(m) || rest_n <= NODE_MIN {
+                let floor = if self.guard { 1e-6 * root.n } else { NODE_MIN };
+                if !self.gated(m) || rest_n <= floor {
                     continue;
                 }
                 let rest_mean = (root.sum - m.sum) / rest_n;
@@ -357,7 +570,14 @@ impl HierC {
 
     /// Posterior `(mean, variance, sigma2)` of the residual. Node statistics
     /// are read live; components are the frozen ones.
-    fn predict(&self, now: f64, peer: usize, contract: f64, loo: bool) -> (f64, f64, f64) {
+    fn predict(
+        &self,
+        now: f64,
+        peer: usize,
+        contract: f64,
+        loo: bool,
+        live: bool,
+    ) -> (f64, f64, f64) {
         let Some(c) = self.comps else {
             return (0.0, 0.0, 0.0);
         };
@@ -401,6 +621,14 @@ impl HierC {
                 (c.s_peers - m.n * m.n).max(0.0),
                 (c.s_cells - sp).max(0.0),
             )
+        } else if live {
+            (
+                root.n,
+                root.sum,
+                root.w2,
+                self.squared_at(self.sq_peers, now),
+                self.squared_at(self.sq_cells, now),
+            )
         } else {
             (root.n, root.sum, root.w2, c.s_peers, c.s_cells)
         };
@@ -440,15 +668,23 @@ impl HierC {
 /// selector per descent mode.
 struct ReC {
     hiers: Vec<HierC>,
-    /// Decayed loss per horizon for `[standard, loo]` descent.
-    loss: [Vec<(f64, f64)>; 2],
+    /// Decayed loss per horizon for `[standard, loo, live]` prediction.
+    loss: [Vec<(f64, f64)>; 3],
 }
 
+const MODE_STANDARD: usize = 0;
+const MODE_LOO: usize = 1;
+const MODE_LIVE: usize = 2;
+
 impl ReC {
-    fn new(corrected: bool) -> ReC {
+    fn new(corrected: bool, guard: bool) -> ReC {
         ReC {
-            hiers: HORIZONS.iter().map(|&h| HierC::new(h, corrected)).collect(),
+            hiers: HORIZONS
+                .iter()
+                .map(|&h| HierC::new(h, corrected, guard))
+                .collect(),
             loss: [
+                vec![(0.0, 0.0); HORIZONS.len()],
                 vec![(0.0, 0.0); HORIZONS.len()],
                 vec![(0.0, 0.0); HORIZONS.len()],
             ],
@@ -457,7 +693,7 @@ impl ReC {
 
     fn rebuild(&mut self, raw: &[Raw], now: f64, prior: impl Fn(&Raw) -> Option<f64>) {
         for (hier, &h) in self.hiers.iter_mut().zip(HORIZONS.iter()) {
-            *hier = HierC::new(h, hier.corrected);
+            *hier = HierC::new(h, hier.corrected, hier.guard);
         }
         for r in raw {
             if let Some(g) = prior(r) {
@@ -489,10 +725,16 @@ impl ReC {
         best
     }
 
-    fn predictions(&self, now: f64, peer: usize, contract: f64, loo: bool) -> Vec<(f64, f64, f64)> {
+    fn predictions(
+        &self,
+        now: f64,
+        peer: usize,
+        contract: f64,
+        mode: usize,
+    ) -> Vec<(f64, f64, f64)> {
         self.hiers
             .iter()
-            .map(|h| h.predict(now, peer, contract, loo))
+            .map(|h| h.predict(now, peer, contract, mode == MODE_LOO, mode == MODE_LIVE))
             .collect()
     }
 
@@ -513,9 +755,11 @@ impl ReC {
 
 #[derive(Clone)]
 struct RevalResult {
-    /// `[subset][row]`: log-space for timing (as the bake-off scored it).
+    /// `[subset][row]`: log-space for timing and speed.
     mse_log: Vec<Vec<f64>>,
-    /// `[subset][row]`: natural units (failure probability; timing seconds).
+    /// `[subset][row]`: natural units. Failure: probability. Timing: seconds
+    /// vs `E[seconds]`. Speed: expected transfer time of `PAYLOAD_BYTES` in
+    /// seconds vs `S * E[1/v]`.
     mse_nat: Vec<Vec<f64>>,
     counts: [usize; SUBSETS.len()],
     ranking: [[f64; 6]; REVAL_RANK_ROWS.len()],
@@ -523,6 +767,15 @@ struct RevalResult {
     /// End-of-run components of the selected-horizon hierarchy:
     /// `[sigma2, tau2_cell, tau2_peer]` for original (row 5) then corrected.
     components: [[f64; 3]; 2],
+    /// Speed: scored events where legacy's blended raw speed was not positive
+    /// (production falls back to "sorts last"; here the global curve is used).
+    legacy_speed_fallbacks: usize,
+    /// Over scored events, `(sum |p_7b - p_7|, max, sum |p_7c - p_7b|, max)` on
+    /// the model scale (probability, or log units), so a "no difference" result
+    /// can be told apart from a harness that never exercises the difference.
+    deltas: [f64; 4],
+    /// Refits after the window filled (production's slower cadence engaged).
+    slow_cadence_refits: usize,
 }
 
 struct PendingC {
@@ -534,26 +787,43 @@ struct PendingC {
     shrunk: Option<(f64, Vec<f64>)>,
     noattr: Option<(f64, Vec<f64>)>,
     frozen: Option<(f64, Vec<f64>)>,
-    corrected: Option<(f64, Vec<f64>, Vec<f64>)>,
+    /// `(prior, standard, loo, live)` residual predictions per horizon.
+    corrected: Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>)>,
+    /// `(prior, live)` for the guarded hierarchy.
+    guarded: Option<(f64, Vec<f64>)>,
 }
 
-fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
+/// `lean` skips rows 3 and 4 (the reference code's per-prediction component
+/// recomputation, the expensive part), reporting them as NaN.
+fn run_revalidate(spec: Spec, seed: u64, lean: bool) -> RevalResult {
     let _guard = GlobalRng::seed_guard(seed);
     let world = World::new(spec);
     let rows = REVAL_ROWS.len();
-    let timing = spec.target == Target::Timing;
+    let log_target = spec.target != Target::Failure;
+    let speed = spec.target == Target::Speed;
+    let direction = if speed {
+        EstimatorType::Negative
+    } else {
+        EstimatorType::Positive
+    };
 
-    let mut iso = IsotonicEstimator::new(Vec::new(), EstimatorType::Positive);
+    let mut iso = IsotonicEstimator::new(Vec::new(), direction);
+    // As shipped: response time multiplicative on raw seconds (here ms),
+    // transfer speed additive on raw bytes/s, both from the router.
     let mut iso_raw = IsotonicEstimator::new_with_mode(
         Vec::new(),
-        EstimatorType::Positive,
-        AdjustmentMode::Multiplicative,
+        direction,
+        if speed {
+            AdjustmentMode::Additive
+        } else {
+            AdjustmentMode::Multiplicative
+        },
     );
     let mut legacy_abs = PredictionStage::new(10_000);
     let mut legacy_abs_raw = PredictionStage::new(10_000);
     let mut peer_ids: HashMap<usize, u64> = HashMap::new();
     let mut peer_events = vec![0usize; spec.peers];
-    let (weight_ramp, clamp_unit) = if timing {
+    let (weight_ramp, clamp_unit) = if log_target {
         (TIMING_WEIGHT_RAMP_EVENTS, false)
     } else {
         (FAILURE_WEIGHT_RAMP_EVENTS, true)
@@ -569,14 +839,18 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
         attribute: false,
         ..attr_config
     };
-    let mut shrunk_long = Curve::new(None, true);
-    let mut anova_long = Curve::new_anova();
+    let mut shrunk_long = Curve::new(None, true).with_direction(speed);
+    let mut anova_long = Curve::new_anova().with_direction(speed);
     let mut re_attr = Reanchored::new(attr_config, &HORIZONS);
     let mut re_noattr = Reanchored::new(noattr_config, &HORIZONS);
-    let mut re_frozen = ReC::new(false);
-    let mut re_corrected = ReC::new(true);
+    let mut re_frozen = ReC::new(false, false);
+    let mut re_corrected = ReC::new(true, false);
+    let mut re_guarded = ReC::new(true, true);
     let mut raw: Vec<Raw> = Vec::new();
     let mut learned_since_rebuild = 0usize;
+    let mut slow_cadence_refits = 0usize;
+    let mut legacy_speed_fallbacks = 0usize;
+    let mut deltas = [0.0f64; 4];
 
     let mut err_log = vec![vec![0.0; rows]; SUBSETS.len()];
     let mut err_nat = vec![vec![0.0; rows]; SUBSETS.len()];
@@ -585,6 +859,13 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
     let mut decisions = 0usize;
     let mut pending: Vec<PendingC> = Vec::new();
     let hours = |index: usize| index as f64 / spec.events_per_hour;
+    // Log-space prediction plus expectation adjustment -> natural units.
+    let natural = |log_value: f64, adjust: f64| match spec.target {
+        Target::Failure => log_value,
+        Target::Timing => (log_value + adjust).exp() / 1000.0,
+        Target::Speed => PAYLOAD_BYTES * (-log_value + adjust).exp(),
+    };
+    let half_noise = TIMING_NOISE_SD * TIMING_NOISE_SD / 2.0;
     let mut index = 0usize;
 
     while index < spec.events {
@@ -595,13 +876,23 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
         if spec.ops && !op.absent && index >= WARMUP_EVENTS {
             let time = hours(index);
             let candidates = world.nearest_peers(contract_value);
-            let snaps_attr = re_attr.snapshots(time);
+            let snaps_attr = if lean {
+                Vec::new()
+            } else {
+                re_attr.snapshots(time)
+            };
             let sel_attr = re_attr.selected(time);
-            let snaps_noattr = re_noattr.snapshots(time);
+            let snaps_noattr = if lean {
+                Vec::new()
+            } else {
+                re_noattr.snapshots(time)
+            };
             let sel_noattr = re_noattr.selected(time);
-            let sel_frozen = re_frozen.selected(time, 0);
-            let sel_corr = re_corrected.selected(time, 0);
-            let sel_loo = re_corrected.selected(time, 1);
+            let sel_frozen = re_frozen.selected(time, MODE_STANDARD);
+            let sel_corr = re_corrected.selected(time, MODE_STANDARD);
+            let sel_loo = re_corrected.selected(time, MODE_LOO);
+            let sel_live = re_corrected.selected(time, MODE_LIVE);
+            let sel_guard = re_guarded.selected(time, MODE_LIVE);
             let mut truths = Vec::new();
             let mut scores: Vec<Vec<f64>> = vec![Vec::new(); REVAL_RANK_ROWS.len()];
             let mut complete = true;
@@ -634,6 +925,9 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
                     _ => peer_adjusted,
                 };
                 let old = |curve: &Curve, re: &Reanchored, snaps: &[Option<Snapshot>], h: usize| {
+                    if lean {
+                        return f64::NAN;
+                    }
                     curve.value(distance).map(finish).map_or(global, |g| {
                         finish(
                             g + re.hiers[h]
@@ -648,9 +942,19 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
                         )
                     })
                 };
-                let new = |curve: &Curve, re: &ReC, h: usize, loo: bool| {
+                let new = |curve: &Curve, re: &ReC, h: usize, mode: usize| {
                     curve.value(distance).map(finish).map_or(global, |g| {
-                        finish(g + re.hiers[h].predict(time, cand, contract_value, loo).0)
+                        finish(
+                            g + re.hiers[h]
+                                .predict(
+                                    time,
+                                    cand,
+                                    contract_value,
+                                    mode == MODE_LOO,
+                                    mode == MODE_LIVE,
+                                )
+                                .0,
+                        )
                     })
                 };
                 for (slot, &(row, _)) in REVAL_RANK_ROWS.iter().enumerate() {
@@ -659,9 +963,11 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
                         2 => global,
                         3 => old(&shrunk_long, &re_attr, &snaps_attr, sel_attr),
                         4 => old(&shrunk_long, &re_noattr, &snaps_noattr, sel_noattr),
-                        5 => new(&shrunk_long, &re_frozen, sel_frozen, false),
-                        6 => new(&anova_long, &re_corrected, sel_corr, false),
-                        8 => new(&anova_long, &re_corrected, sel_loo, true),
+                        5 => new(&shrunk_long, &re_frozen, sel_frozen, MODE_STANDARD),
+                        6 => new(&anova_long, &re_corrected, sel_corr, MODE_STANDARD),
+                        8 => new(&anova_long, &re_corrected, sel_loo, MODE_LOO),
+                        ROW_7B => new(&anova_long, &re_corrected, sel_live, MODE_LIVE),
+                        ROW_7C => new(&anova_long, &re_guarded, sel_guard, MODE_LIVE),
                         _ => position as f64,
                     });
                 }
@@ -724,6 +1030,7 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
                 noattr: None,
                 frozen: None,
                 corrected: None,
+                guarded: None,
             };
 
             if let (Some(global), Some(peer_adjusted)) = (global, peer_adjusted) {
@@ -735,8 +1042,6 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
                     time,
                 };
                 let weight = |len: usize| (len as f64 / weight_ramp).min(MAX_RENEGADE_WEIGHT);
-                // Log-space predictions (failure: probability) plus, per row, the
-                // log-space adjustment that turns a median into an expectation.
                 let mut prediction = vec![global; rows];
                 let mut expectation = vec![0.0; rows];
                 prediction[0] = match legacy_abs.predict(&observation) {
@@ -747,17 +1052,27 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
                     }
                     _ => peer_adjusted,
                 };
-                prediction[1] = if timing {
+                let mut fallback = false;
+                prediction[1] = if log_target {
                     match iso_raw.estimate_retrieval_time(peer, contract).ok() {
-                        Some(base_ms) => {
+                        Some(base_raw) => {
                             let blended = match legacy_abs_raw.predict(&observation) {
                                 Some(v) if v.is_finite() && v >= 0.0 => {
                                     let w = weight(legacy_abs_raw.len());
-                                    base_ms * (1.0 - w) + v * w
+                                    base_raw * (1.0 - w) + v * w
                                 }
-                                _ => base_ms,
+                                _ => base_raw,
                             };
-                            blended.max(1.0).ln()
+                            if speed {
+                                if blended > 0.0 {
+                                    blended.ln()
+                                } else {
+                                    fallback = true;
+                                    global
+                                }
+                            } else {
+                                blended.max(1.0).ln()
+                            }
                         }
                         None => prediction[0],
                     }
@@ -784,24 +1099,30 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
                         (g, per, re.selected(time))
                     })
                 };
-                match old_rows(&shrunk_long, &re_attr) {
-                    Some((g, per, sel)) => {
-                        prediction[3] = finish(g + per[sel]);
-                        pend.shrunk = Some((g, per));
+                if lean {
+                    prediction[3] = f64::NAN;
+                    prediction[4] = f64::NAN;
+                } else {
+                    match old_rows(&shrunk_long, &re_attr) {
+                        Some((g, per, sel)) => {
+                            prediction[3] = finish(g + per[sel]);
+                            pend.shrunk = Some((g, per));
+                        }
+                        None => prediction[3] = global,
                     }
-                    None => prediction[3] = global,
-                }
-                match old_rows(&shrunk_long, &re_noattr) {
-                    Some((g, per, sel)) => {
-                        prediction[4] = finish(g + per[sel]);
-                        pend.noattr = Some((g, per));
+                    match old_rows(&shrunk_long, &re_noattr) {
+                        Some((g, per, sel)) => {
+                            prediction[4] = finish(g + per[sel]);
+                            pend.noattr = Some((g, per));
+                        }
+                        None => prediction[4] = global,
                     }
-                    None => prediction[4] = global,
                 }
                 match shrunk_long.value(distance).map(finish) {
                     Some(g) => {
-                        let per = re_frozen.predictions(time, peer_index, contract_value, false);
-                        let sel = re_frozen.selected(time, 0);
+                        let per =
+                            re_frozen.predictions(time, peer_index, contract_value, MODE_STANDARD);
+                        let sel = re_frozen.selected(time, MODE_STANDARD);
                         prediction[5] = finish(g + per[sel].0);
                         pend.frozen = Some((g, per.iter().map(|p| p.0).collect()));
                     }
@@ -809,29 +1130,51 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
                 }
                 match anova_long.value(distance).map(finish) {
                     Some(g) => {
-                        let std = re_corrected.predictions(time, peer_index, contract_value, false);
-                        let loo = re_corrected.predictions(time, peer_index, contract_value, true);
-                        let s = std[re_corrected.selected(time, 0)];
-                        let l = loo[re_corrected.selected(time, 1)];
+                        let std = re_corrected.predictions(
+                            time,
+                            peer_index,
+                            contract_value,
+                            MODE_STANDARD,
+                        );
+                        let loo =
+                            re_corrected.predictions(time, peer_index, contract_value, MODE_LOO);
+                        let live =
+                            re_corrected.predictions(time, peer_index, contract_value, MODE_LIVE);
+                        let guarded =
+                            re_guarded.predictions(time, peer_index, contract_value, MODE_LIVE);
+                        let s = std[re_corrected.selected(time, MODE_STANDARD)];
+                        let l = loo[re_corrected.selected(time, MODE_LOO)];
+                        let b = live[re_corrected.selected(time, MODE_LIVE)];
+                        let c = guarded[re_guarded.selected(time, MODE_LIVE)];
                         prediction[6] = finish(g + s.0);
-                        prediction[7] = finish(g + s.0);
-                        expectation[7] = (s.2 + s.1) / 2.0;
+                        prediction[ROW_7] = finish(g + s.0);
+                        expectation[ROW_7] = (s.2 + s.1) / 2.0;
                         prediction[8] = finish(g + l.0);
                         expectation[8] = (l.2 + l.1) / 2.0;
-                        pend.corrected = Some((
-                            g,
-                            std.iter().map(|p| p.0).collect(),
-                            loo.iter().map(|p| p.0).collect(),
-                        ));
+                        prediction[ROW_7B] = finish(g + b.0);
+                        expectation[ROW_7B] = (b.2 + b.1) / 2.0;
+                        prediction[ROW_7C] = finish(g + c.0);
+                        expectation[ROW_7C] = (c.2 + c.1) / 2.0;
+                        let firsts =
+                            |v: &[(f64, f64, f64)]| v.iter().map(|p| p.0).collect::<Vec<_>>();
+                        pend.corrected = Some((g, firsts(&std), firsts(&loo), firsts(&live)));
+                        pend.guarded = Some((g, firsts(&guarded)));
                     }
                     None => {
-                        for row in 6..=8 {
+                        for row in [6, ROW_7, 8, ROW_7B, ROW_7C] {
                             prediction[row] = global;
                         }
                     }
                 }
 
                 if index >= WARMUP_EVENTS && !op.absent {
+                    legacy_speed_fallbacks += usize::from(fallback);
+                    let d_live = (prediction[ROW_7B] - prediction[ROW_7]).abs();
+                    let d_guard = (prediction[ROW_7C] - prediction[ROW_7B]).abs();
+                    deltas[0] += d_live;
+                    deltas[1] = deltas[1].max(d_live);
+                    deltas[2] += d_guard;
+                    deltas[3] = deltas[3].max(d_guard);
                     let in_subset = [
                         true,
                         world.in_pair(peer_index, contract_value),
@@ -839,11 +1182,7 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
                         world.drift_changed(peer_index) && index >= spec.events / 2,
                         world.near_absent(contract_value),
                     ];
-                    let truth_nat = if timing {
-                        (truth + TIMING_NOISE_SD * TIMING_NOISE_SD / 2.0).exp() / 1000.0
-                    } else {
-                        truth
-                    };
+                    let truth_nat = natural(truth, half_noise);
                     for (subset, &active) in in_subset.iter().enumerate() {
                         if !active {
                             continue;
@@ -851,12 +1190,8 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
                         counts[subset] += 1;
                         for row in 0..rows {
                             err_log[subset][row] += (prediction[row] - truth).powi(2);
-                            let natural = if timing {
-                                (prediction[row] + expectation[row]).exp() / 1000.0
-                            } else {
-                                prediction[row]
-                            };
-                            err_nat[subset][row] += (natural - truth_nat).powi(2);
+                            err_nat[subset][row] +=
+                                (natural(prediction[row], expectation[row]) - truth_nat).powi(2);
                         }
                     }
                 }
@@ -907,7 +1242,7 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
                 if legacy_abs.should_train() {
                     legacy_abs.train();
                 }
-                if timing {
+                if log_target {
                     legacy_abs_raw.add(observation, y.exp());
                     if legacy_abs_raw.should_train() {
                         legacy_abs_raw.train();
@@ -928,20 +1263,27 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
                     re_noattr.score(per, y - g, time);
                 }
                 if let Some((g, per)) = &pend.frozen {
-                    re_frozen.score(0, per, y - g, time);
+                    re_frozen.score(MODE_STANDARD, per, y - g, time);
                 }
-                if let Some((g, std, loo)) = &pend.corrected {
-                    re_corrected.score(0, std, y - g, time);
-                    re_corrected.score(1, loo, y - g, time);
+                if let Some((g, std, loo, live)) = &pend.corrected {
+                    re_corrected.score(MODE_STANDARD, std, y - g, time);
+                    re_corrected.score(MODE_LOO, loo, y - g, time);
+                    re_corrected.score(MODE_LIVE, live, y - g, time);
+                }
+                if let Some((g, live)) = &pend.guarded {
+                    re_guarded.score(MODE_LIVE, live, y - g, time);
                 }
                 raw.push(event);
                 if let Some(g) = shrunk_long.value(distance).map(finish) {
-                    re_attr.add(&event, g);
-                    re_noattr.add(&event, g);
+                    if !lean {
+                        re_attr.add(&event, g);
+                        re_noattr.add(&event, g);
+                    }
                     re_frozen.add(&event, g);
                 }
                 if let Some(g) = anova_long.value(distance).map(finish) {
                     re_corrected.add(&event, g);
+                    re_guarded.add(&event, g);
                 }
                 learned_since_rebuild += 1;
             }
@@ -950,21 +1292,30 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
                 contract_location: contract,
                 result: y,
             });
-            if timing {
+            if log_target {
                 iso_raw.add_event(IsotonicEvent {
                     peer: peer.clone(),
                     contract_location: contract,
                     result: y.exp(),
                 });
             }
-            if global.is_some() && (raw.len() < 100 || learned_since_rebuild >= REBUILD_EVERY) {
+            let cadence = refit_every(raw.len());
+            if global.is_some() && (raw.len() < 100 || learned_since_rebuild >= cadence) {
+                if cadence > REBUILD_EVERY {
+                    slow_cadence_refits += 1;
+                }
+                // Hierarchies see the same window as the curves.
+                let window = &raw[raw.len().saturating_sub(LONG_WINDOW)..];
                 let now = raw.last().map_or(0.0, |r| r.time);
                 shrunk_long.refit(&raw, now);
                 anova_long.refit(&raw, now);
-                re_attr.rebuild(&raw, |r| shrunk_long.value(r.distance).map(finish));
-                re_noattr.rebuild(&raw, |r| shrunk_long.value(r.distance).map(finish));
-                re_frozen.rebuild(&raw, now, |r| shrunk_long.value(r.distance).map(finish));
-                re_corrected.rebuild(&raw, now, |r| anova_long.value(r.distance).map(finish));
+                if !lean {
+                    re_attr.rebuild(window, |r| shrunk_long.value(r.distance).map(finish));
+                    re_noattr.rebuild(window, |r| shrunk_long.value(r.distance).map(finish));
+                }
+                re_frozen.rebuild(window, now, |r| shrunk_long.value(r.distance).map(finish));
+                re_corrected.rebuild(window, now, |r| anova_long.value(r.distance).map(finish));
+                re_guarded.rebuild(window, now, |r| anova_long.value(r.distance).map(finish));
                 learned_since_rebuild = 0;
             }
         }
@@ -972,7 +1323,7 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
 
     let end = hours(spec.events);
     let comps_of = |re: &ReC| {
-        let h = &re.hiers[re.selected(end, 0)];
+        let h = &re.hiers[re.selected(end, MODE_STANDARD)];
         h.comps
             .map_or([f64::NAN; 3], |c| [c.sigma2, c.tau2_cell, c.tau2_peer])
     };
@@ -993,17 +1344,22 @@ fn run_revalidate(spec: Spec, seed: u64) -> RevalResult {
         ranking,
         decisions,
         components: [comps_of(&re_frozen), comps_of(&re_corrected)],
+        legacy_speed_fallbacks,
+        deltas,
+        slow_cadence_refits,
     }
 }
 
 /// Natural-units baseline row: legacy blend for failure, legacy as shipped
-/// (raw units) for timing.
+/// (raw units) for timing and speed.
 fn baseline_row(spec: &Spec) -> usize {
-    if spec.target == Target::Timing { 1 } else { 0 }
+    if spec.target == Target::Failure { 0 } else { 1 }
 }
 
-fn revalidate_report(seeds: &[u64], title: &str) {
+fn revalidate_report(seeds: &[u64], title: &str, lean: bool) {
     let mut specs = scenarios();
+    specs.extend(speed_scenarios());
+    specs.extend(quiet_scenarios());
     let base_count = specs.len();
     specs.extend(prod_scenarios());
     let rows = REVAL_ROWS.len();
@@ -1016,7 +1372,7 @@ fn revalidate_report(seeds: &[u64], title: &str) {
         let _ = PeerKeyLocation::random();
         for name in ["f.mixed", "f.abs5-delayed", "t.mixed"] {
             let spec = *specs.iter().find(|s| s.name == name).expect("scenario");
-            let a = run_revalidate(spec, seeds[0]);
+            let a = run_revalidate(spec, seeds[0], false);
             let b = run_bakeoff(spec, seeds[0]);
             for (mine, theirs) in [(0, 0), (1, 1), (2, 2), (3, 27)] {
                 assert!(
@@ -1042,7 +1398,7 @@ fn revalidate_report(seeds: &[u64], title: &str) {
                             s,
                             seeds
                                 .iter()
-                                .map(|&seed| run_revalidate(spec, seed))
+                                .map(|&seed| run_revalidate(spec, seed, lean))
                                 .collect(),
                         )
                     })
@@ -1072,121 +1428,124 @@ fn revalidate_report(seeds: &[u64], title: &str) {
             .collect();
         if v.is_empty() { f64::NAN } else { mean(&v) }
     };
+    let ratio = |s: usize, sub: usize, row: usize| {
+        seed_mean(s, sub, row, true) / seed_mean(s, sub, baseline_row(&specs[s]), true)
+    };
 
     let mut out = format!(
-        "\n#4485 RE-VALIDATION after the PR #5655 statistical review ({title} {seeds:x?})\n\
-         natural units: failure probability; timing SECONDS vs E[seconds]. Baseline: legacy \
-         blend (failure), legacy as shipped (timing). p.* / pt.* = production-like \
-         (200 peers, Zipf, 90% home band, 600 ev/h, 6000 events).\n"
+        "\n#4485 RE-VALIDATION ({title} {seeds:x?}{})\n\
+         natural units: failure probability; timing SECONDS vs E[seconds]; speed = expected \
+         transfer time of {PAYLOAD_BYTES} bytes in SECONDS vs S*E[1/v]. Baseline: legacy blend \
+         (failure), legacy as shipped (timing, speed). p.* / pt.* / ps.* = production-like \
+         (200 peers, Zipf, 90% home band, 600 ev/h; *-long = {LONG_EVENTS} events, window fills).\n",
+        if lean { ", lean: rows 3-4 skipped" } else { "" }
     );
     out.push_str(&format!("{:<44}", "natural-units mse ratio vs baseline"));
     for spec in &specs {
         out.push_str(&format!("{:>16}", spec.name));
     }
-    out.push_str("   worst (scenario)   worst-prod   seed-worst\n");
+    out.push_str("   worst (scenario)   worst-prod   worst-speed   seed-worst\n");
     let mut worst_rows = Vec::new();
     for row in 0..rows {
         out.push_str(&format!("{:<44}", REVAL_ROWS[row]));
         let mut worst = (0.0f64, "");
-        let mut worst_prod = 0.0f64;
-        let mut seed_worst = 0.0f64;
+        let (mut worst_prod, mut worst_speed, mut seed_worst) = (0.0f64, 0.0f64, 0.0f64);
         for (s, spec) in specs.iter().enumerate() {
-            let b = baseline_row(spec);
-            let ratio = seed_mean(s, 0, row, true) / seed_mean(s, 0, b, true);
-            out.push_str(&format!("{ratio:>16.3}"));
-            if ratio > worst.0 {
-                worst = (ratio, spec.name);
+            let r = ratio(s, 0, row);
+            out.push_str(&format!("{r:>16.3}"));
+            if r > worst.0 {
+                worst = (r, spec.name);
             }
             if s >= base_count {
-                worst_prod = worst_prod.max(ratio);
+                worst_prod = worst_prod.max(r);
             }
-            for r in &results[s] {
-                seed_worst = seed_worst.max(r.mse_nat[0][row] / r.mse_nat[0][b]);
+            if spec.target == Target::Speed {
+                worst_speed = worst_speed.max(r);
+            }
+            let b = baseline_row(spec);
+            for run in &results[s] {
+                seed_worst = seed_worst.max(run.mse_nat[0][row] / run.mse_nat[0][b]);
             }
         }
         out.push_str(&format!(
-            "   {:.3} ({})   {worst_prod:.3}   {seed_worst:.3}\n",
+            "   {:.3} ({})   {worst_prod:.3}   {worst_speed:.3}   {seed_worst:.3}\n",
             worst.0, worst.1
         ));
-        worst_rows.push((row, worst, worst_prod));
+        worst_rows.push((row, worst, worst_prod, worst_speed));
     }
 
-    out.push_str("\n== absolute natural-units mse (mean over seeds), selected scenarios\n");
-    let shown: Vec<usize> = specs
-        .iter()
-        .enumerate()
-        .filter(|(i, s)| {
-            *i >= base_count
-                || [
-                    "f.dist",
-                    "f.mixed",
-                    "f.drift",
-                    "f.rare",
-                    "f.ops-untrained",
-                    "f.abs20-untrained-uni",
-                    "t.dist",
-                    "t.peer",
-                    "t.mixed",
-                    "t.drift",
-                    "t.curve-drift*",
-                ]
-                .contains(&s.name)
-        })
-        .map(|(i, _)| i)
-        .collect();
-    out.push_str(&format!("{:<44}", "estimator"));
-    for &s in &shown {
-        out.push_str(&format!("{:>22}", specs[s].name));
-    }
-    out.push('\n');
-    for row in 0..rows {
-        out.push_str(&format!("{:<44}", REVAL_ROWS[row]));
-        for &s in &shown {
-            out.push_str(&format!("{:>22.6}", seed_mean(s, 0, row, true)));
-        }
-        out.push('\n');
-    }
-    out.push_str(&format!(
-        "{:<44}",
-        "subset (targeted / cold / drifted) counts"
-    ));
-    for &s in &shown {
-        let c: Vec<f64> = (1..4)
+    // The rows this follow-up is about, one line per scenario.
+    out.push_str(
+        "\n== rows 7 / 7b / 7c per scenario: natural ratio vs baseline, then subset ratios \
+         (targeted / cold / drifted) for 7c, then natural mse of baseline and 7c\n",
+    );
+    for (s, spec) in specs.iter().enumerate() {
+        let subsets: Vec<String> = (1..4)
             .map(|sub| {
-                mean(
-                    &results[s]
-                        .iter()
-                        .map(|r| r.counts[sub] as f64)
-                        .collect::<Vec<_>>(),
-                )
+                let r = ratio(s, sub, ROW_7C);
+                if r.is_finite() {
+                    format!("{r:.2}")
+                } else {
+                    "-".into()
+                }
             })
             .collect();
         out.push_str(&format!(
-            "{:>22}",
-            format!("{:.0}/{:.0}/{:.0}", c[0], c[1], c[2])
+            "  {:<24} 7 {:.3}  7b {:.3}  7c {:.3}   7c subsets {:<16}  baseline {:.6}  7c {:.6}\n",
+            spec.name,
+            ratio(s, 0, ROW_7),
+            ratio(s, 0, ROW_7B),
+            ratio(s, 0, ROW_7C),
+            subsets.join("/"),
+            seed_mean(s, 0, baseline_row(spec), true),
+            seed_mean(s, 0, ROW_7C, true),
         ));
     }
-    out.push('\n');
+
     out.push_str(
-        "\n== subset natural ratios vs baseline (targeted / cold / drifted), selected scenarios\n",
+        "\n== prediction differences on the model scale, mean / max over scored events and seeds: \
+         |7b - 7| (live root sums), |7c - 7b| (LOO guard)\n",
     );
-    for row in 0..rows {
-        out.push_str(&format!("{:<44}", REVAL_ROWS[row]));
-        for &s in &shown {
-            let b = baseline_row(&specs[s]);
-            let cell: Vec<String> = (1..4)
-                .map(|sub| {
-                    let r = seed_mean(s, sub, row, true) / seed_mean(s, sub, b, true);
-                    if r.is_finite() {
-                        format!("{r:.2}")
-                    } else {
-                        "-".into()
-                    }
-                })
-                .collect();
-            out.push_str(&format!("{:>22}", cell.join("/")));
+    for (s, spec) in specs.iter().enumerate() {
+        let scored: f64 = results[s].iter().map(|r| r.counts[0] as f64).sum();
+        let sum = |k: usize| results[s].iter().map(|r| r.deltas[k]).sum::<f64>();
+        let max = |k: usize| results[s].iter().map(|r| r.deltas[k]).fold(0.0, f64::max);
+        out.push_str(&format!(
+            "  {:<24} live {:.2e} / {:.2e}   guard {:.2e} / {:.2e}\n",
+            spec.name,
+            sum(0) / scored.max(1.0),
+            max(1),
+            sum(2) / scored.max(1.0),
+            max(3)
+        ));
+    }
+
+    out.push_str("\n== transfer speed (natural = expected transfer time, seconds), all rows\n");
+    for (s, spec) in specs.iter().enumerate() {
+        if spec.target != Target::Speed {
+            continue;
         }
-        out.push('\n');
+        out.push_str(&format!("-- {}: ", spec.name));
+        for row in 0..rows {
+            out.push_str(&format!(
+                "[{}] {:.3} (mse {:.4})  ",
+                &REVAL_ROWS[row][..2],
+                ratio(s, 0, row),
+                seed_mean(s, 0, row, true)
+            ));
+        }
+        let fallbacks: usize = results[s].iter().map(|r| r.legacy_speed_fallbacks).sum();
+        out.push_str(&format!(
+            "legacy non-positive speed fallbacks: {fallbacks}\n"
+        ));
+    }
+
+    out.push_str("\n== slow-cadence refits (window full) per run, long scenarios\n");
+    for (s, spec) in specs.iter().enumerate() {
+        if spec.events > LONG_WINDOW {
+            let n: Vec<usize> = results[s].iter().map(|r| r.slow_cadence_refits).collect();
+            out.push_str(&format!("  {}: {n:?}\n", spec.name));
+        }
     }
 
     out.push_str("\n== RANKING best@10 / regret@10 / best@3 (ops scenarios)\n");
@@ -1248,45 +1607,102 @@ fn revalidate_report(seeds: &[u64], title: &str) {
     out.push_str(&format!(
         "\n== VERDICT per estimator (natural units, material = > {MATERIAL_RATIO})\n"
     ));
-    for (row, worst, worst_prod) in worst_rows {
+    for (row, worst, worst_prod, worst_speed) in worst_rows {
         out.push_str(&format!(
-            "{:<44} worst {:.3} ({}), worst production-like {:.3}: {}\n",
+            "{:<44} worst {:.3} ({}), production-like {:.3}, speed {:.3}: {}\n",
             REVAL_ROWS[row],
             worst.0,
             worst.1,
             worst_prod,
-            if worst.0 > MATERIAL_RATIO {
+            worst_speed,
+            if !worst.0.is_finite() || worst.0 == 0.0 {
+                "skipped"
+            } else if worst.0 > MATERIAL_RATIO {
                 "FAILS"
             } else {
                 "passes"
             }
         ));
     }
-
-    // Log-space view for continuity with the bake-off's earlier tables.
-    out.push_str("\n== log-space (bake-off scoring) worst ratio vs log-space legacy blend\n");
-    for row in 0..rows {
-        let mut worst = (0.0f64, "");
-        for (s, spec) in specs.iter().enumerate() {
-            let ratio = seed_mean(s, 0, row, false) / seed_mean(s, 0, 0, false);
-            if ratio > worst.0 {
-                worst = (ratio, spec.name);
-            }
-        }
-        out.push_str(&format!(
-            "{:<44} {:.3} ({})\n",
-            REVAL_ROWS[row], worst.0, worst.1
-        ));
-    }
     eprintln!("{out}");
+}
+
+/// The live squared-count sums must equal the frozen ones at the moment of a
+/// refit, and the root step must then diverge between the two as time passes
+/// with a non-zero root residual mean. Guards against 7b being vacuously equal
+/// to 7 because the live path is miswired.
+#[test]
+fn live_root_sums_match_frozen_at_refit_and_diverge_after() {
+    let mut hier = HierC::new(Some(1.5), true, false);
+    let mut t = 0.0;
+    for i in 0..400usize {
+        t += 0.02;
+        let peer = i % 7;
+        let contract = ((i * 37) % 64) as f64 / 64.0;
+        // Non-zero root mean, peer and cell structure, deterministic.
+        let r = 0.3 + 0.05 * peer as f64 + if (i * 13) % 5 == 0 { 0.2 } else { -0.05 };
+        hier.add(peer, contract, t, r);
+    }
+    hier.refresh(t);
+    let comps = hier.comps.expect("components");
+    let live_cells = hier.squared_at(hier.sq_cells, t);
+    let live_peers = hier.squared_at(hier.sq_peers, t);
+    assert!(
+        (live_cells - comps.s_cells).abs() <= 1e-9 * comps.s_cells,
+        "sum n_c^2: live {live_cells} vs frozen {}",
+        comps.s_cells
+    );
+    assert!(
+        (live_peers - comps.s_peers).abs() <= 1e-9 * comps.s_peers,
+        "sum N_p^2: live {live_peers} vs frozen {}",
+        comps.s_peers
+    );
+    // A peer with no node: its prediction is the root step alone, which is
+    // where the root noise term decides the answer. (Peer 3 has its own node,
+    // which dominates and hides most of the difference.)
+    let unseen = 99;
+    let at_refit = (
+        hier.predict(t, unseen, 0.4, false, false).0,
+        hier.predict(t, unseen, 0.4, false, true).0,
+    );
+    assert!((at_refit.0 - at_refit.1).abs() < 1e-12, "{at_refit:?}");
+    let later = t + 2.5;
+    let (frozen, live) = (
+        hier.predict(later, unseen, 0.4, false, false).0,
+        hier.predict(later, unseen, 0.4, false, true).0,
+    );
+    let (seen_frozen, seen_live) = (
+        hier.predict(later, 3, 0.4, false, false).0,
+        hier.predict(later, 3, 0.4, false, true).0,
+    );
+    assert!(
+        (frozen - live).abs() > 1e-3,
+        "frozen {frozen} vs live {live} 2.5h after a refit"
+    );
+    eprintln!(
+        "root sums, 2.5h after refit: unseen peer frozen {frozen:.4} vs live {live:.4}; \
+         seen peer frozen {seen_frozen:.4} vs live {seen_live:.4}"
+    );
 }
 
 #[test]
 fn revalidate_after_statistical_review() {
-    revalidate_report(&SEEDS, "original seeds");
+    revalidate_report(&SEEDS, "original seeds", false);
 }
 
 #[test]
 fn revalidate_after_statistical_review_confirmation_seeds() {
-    revalidate_report(&CONFIRMATION_SEEDS, "CONFIRMATION seeds");
+    revalidate_report(&CONFIRMATION_SEEDS, "CONFIRMATION seeds", false);
+}
+
+/// Follow-up 4: live root sums (7b), LOO cancellation guard (7c), production
+/// refit cadence, transfer speed. Lean: rows 3-4 skipped.
+#[test]
+fn revalidate_live_sums_guard_and_speed() {
+    revalidate_report(&SEEDS, "original seeds", true);
+}
+
+#[test]
+fn revalidate_live_sums_guard_and_speed_confirmation_seeds() {
+    revalidate_report(&CONFIRMATION_SEEDS, "CONFIRMATION seeds", true);
 }
