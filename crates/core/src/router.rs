@@ -1055,6 +1055,14 @@ pub(crate) struct RouterSnapshotInfo {
     /// recorder hit its byte cap); a consumer must not present it as live.
     #[serde(default)]
     pub hierarchical_computed: bool,
+    /// Whether the failure stage has a curve yet. Before it does, a `None`
+    /// horizon means "not active", not "forgets nothing".
+    #[serde(default)]
+    pub hierarchical_failure_active: bool,
+    /// A routing-dataset recorder is configured but has stopped (byte cap or
+    /// write error), which is why the estimator is not being computed.
+    #[serde(default)]
+    pub routing_dataset_stopped: bool,
     /// Timed successes whose response time was floored to 1 ms before the log.
     #[serde(default)]
     pub hierarchical_floored_response_times: u64,
@@ -1064,9 +1072,10 @@ pub(crate) struct RouterSnapshotInfo {
     pub hierarchical_non_speed_samples: u64,
     /// RMS error in SECONDS of the response time each model would act on, over
     /// the same events for both (both forecast, response timed), each error
-    /// clipped to 10x the largest outcome seen and the mean exponentially
-    /// forgotten over 24 estimator hours; `response_time_scored` counts events
-    /// ever scored. This measures CALIBRATION of the absolute estimate, not the
+    /// clipped to 10x that event's own outcome (1 ms floor) and the mean
+    /// exponentially forgotten over 24 estimator hours. `response_time_scored`
+    /// counts events ever scored; `response_time_weight` is the forgotten
+    /// weight behind the current means, which is what a verdict needs. This measures CALIBRATION of the absolute estimate, not the
     /// candidate ranking routing uses; see the promotion gate in
     /// `.claude/rules/ring.md` for how it is meant to be read.
     #[serde(default)]
@@ -1075,6 +1084,8 @@ pub(crate) struct RouterSnapshotInfo {
     pub response_time_rmse_secs_hierarchical: Option<f64>,
     #[serde(default)]
     pub response_time_scored: u64,
+    #[serde(default)]
+    pub response_time_weight: f64,
     /// The same for transfer time, `payload bytes / forecast speed`, over real
     /// payload transfers. Not a like-for-like contest: the hierarchical model
     /// targets `E[bytes / V]` while legacy estimates `bytes / E[V]`, so wherever
@@ -1085,6 +1096,8 @@ pub(crate) struct RouterSnapshotInfo {
     pub transfer_time_rmse_secs_hierarchical: Option<f64>,
     #[serde(default)]
     pub transfer_time_scored: u64,
+    #[serde(default)]
+    pub transfer_time_weight: f64,
     /// Lognormality check for the response-time stage: the within-cell log
     /// residual variance expectation timing uses, and the skewness and excess
     /// kurtosis of those residuals (both ~0 when log times are normal).
@@ -2575,15 +2588,15 @@ impl Router {
         };
         let hierarchical = observed.estimate;
         forecasts.hierarchical = observed.failure;
-        forecasts.log_response_time_hierarchical = hierarchical
-            .time_to_response_start_secs
-            .filter(|seconds| *seconds > 0.0)
-            .map(f64::ln);
+        // Both models' times pass through the same floor, for the dataset's log
+        // and for the seconds error alike: a 0 s forecast is scored as 1 ms, not
+        // dropped, so neither model's population loses events the other keeps.
+        let floor_time = |seconds: f64| seconds.max(hierarchical::MIN_RESPONSE_SECS);
+        let hierarchical_time = hierarchical.time_to_response_start_secs.map(floor_time);
+        let legacy_time = legacy.time_to_response_start_secs.map(floor_time);
+        forecasts.log_response_time_hierarchical = hierarchical_time.map(f64::ln);
         forecasts.log_transfer_speed_hierarchical = hierarchical.transfer_speed_bps.map(f64::ln);
-        forecasts.log_response_time_legacy = legacy
-            .time_to_response_start_secs
-            .filter(|seconds| *seconds > 0.0)
-            .map(f64::ln);
+        forecasts.log_response_time_legacy = legacy_time.map(f64::ln);
         forecasts.log_transfer_speed_legacy = legacy.transfer_speed_bps.map(f64::ln);
         if let Some(probability) = observed.failure {
             self.failure_skill_hierarchical
@@ -2591,11 +2604,9 @@ impl Router {
         }
         // Same population for both models: an event counts only when both
         // forecast it and it carries the measurement.
-        if let (Some(actual), Some(legacy_time), Some(hierarchical_time)) = (
-            actual.response_secs,
-            legacy.time_to_response_start_secs,
-            hierarchical.time_to_response_start_secs,
-        ) {
+        if let (Some(actual), Some(legacy_time), Some(hierarchical_time)) =
+            (actual.response_secs, legacy_time, hierarchical_time)
+        {
             self.response_time_error
                 .record(legacy_time, hierarchical_time, actual, now_hours);
         }
@@ -2652,11 +2663,11 @@ impl Router {
         // Availability as `predict_routing_outcome` treats it: a stage the
         // isotonic estimator cannot estimate is unknown to the cost formula.
         LegacyTimingForecast {
-            // Strictly positive, as the dataset records it and as the seconds
-            // error scores it, so the two instruments cover the same events.
+            // Zero is kept, as routing keeps it (`corrected >= 0.0`); the
+            // scoring floors both models' times alike rather than dropping it.
             time_to_response_start_secs: time_estimate
                 .map(|_| legacy.time_to_response_start)
-                .filter(|seconds| seconds.is_finite() && *seconds > 0.0),
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0),
             transfer_speed_bps: transfer_estimate
                 .map(|_| legacy.xfer_speed)
                 .filter(|speed| speed.is_finite() && *speed > 0.0),
@@ -3249,14 +3260,18 @@ impl Router {
             hierarchical_peer_evictions: self.hierarchical.total_evictions(),
             hierarchical_peer_capacity: hierarchical[0].peer_capacity,
             hierarchical_computed: hierarchical_computed(dataset),
+            hierarchical_failure_active: hierarchical[0].active,
+            routing_dataset_stopped: dataset.is_some_and(|dataset| !dataset.is_recording()),
             hierarchical_floored_response_times: self.hierarchical.floored_response_times(),
             hierarchical_non_speed_samples: self.hierarchical.non_speed_samples(),
             response_time_rmse_secs_legacy: self.response_time_error.rmse().map(|(l, _)| l),
             response_time_rmse_secs_hierarchical: self.response_time_error.rmse().map(|(_, h)| h),
             response_time_scored: self.response_time_error.count,
+            response_time_weight: self.response_time_error.weight,
             transfer_time_rmse_secs_legacy: self.transfer_time_error.rmse().map(|(l, _)| l),
             transfer_time_rmse_secs_hierarchical: self.transfer_time_error.rmse().map(|(_, h)| h),
             transfer_time_scored: self.transfer_time_error.count,
+            transfer_time_weight: self.transfer_time_error.weight,
             hierarchical_response_time_log_shape: hierarchical[1].into(),
             hierarchical_transfer_speed_log_shape: hierarchical[2].into(),
             failure_brier_blended: self.failure_skill_blended.brier(),
@@ -3364,17 +3379,29 @@ impl ObservedTiming {
 /// Forgetting horizon of the seconds-error comparison, in estimator hours.
 const ERROR_FORGETTING_HOURS: f64 = 24.0;
 
-/// Each model's error is clipped to this multiple of the largest outcome seen.
+/// Each model's error on an event is clipped to this multiple of THAT EVENT'S
+/// outcome (floored at [`ERROR_CLIP_FLOOR_SECS`]).
 ///
-/// A forecast off by more than ten times the slowest response ever observed
-/// carries no more information about calibration than one off by exactly
-/// that; unclipped, one near-zero speed forecast (a transfer time of 1e6 s)
-/// squares to 1e12 and settles the comparison for a day by itself.
+/// Unclipped, one near-zero speed forecast (a transfer time of 1e6 s) squares
+/// to 1e12 and settles the comparison by itself. The bound is per event, not
+/// the largest outcome seen: a lifetime or even a decayed maximum lets one
+/// ordinary slow transfer (600 s on a large payload) admit a 6000 s error on
+/// every small payload after it. Relative to its own outcome, a forecast ten
+/// times off is simply "an order of magnitude wrong", and a larger miss says
+/// nothing more about calibration. It needs no state, so there is nothing to
+/// decay.
 const ERROR_CLIP_MULTIPLE: f64 = 10.0;
 
-/// Scored events before the dashboard shows a verdict rather than "not enough
-/// data".
-pub(crate) const MIN_SCORED_FOR_VERDICT: u64 = 100;
+/// Floor on the clip's base, so a zero-length outcome does not clip every
+/// error to zero. One millisecond, the same floor the hierarchical response
+/// stage applies before taking logs.
+const ERROR_CLIP_FLOOR_SECS: f64 = hierarchical::MIN_RESPONSE_SECS;
+
+/// Forgotten event weight (see [`PairedErrorTracker`]) below which the
+/// dashboard shows "insufficient data" rather than a verdict. Gated on the
+/// forgotten weight, not the lifetime count: 100 events a week ago are not 100
+/// events of evidence now.
+pub(crate) const MIN_WEIGHT_FOR_VERDICT: f64 = 100.0;
 
 /// Prequential squared error in seconds of BOTH models on the same events,
 /// exponentially forgotten over [`ERROR_FORGETTING_HOURS`].
@@ -3389,9 +3416,8 @@ struct PairedErrorTracker {
     hierarchical: f64,
     /// Forgotten count, the denominator of both means.
     weight: f64,
-    /// Events ever scored, for the minimum-data check.
+    /// Events ever scored.
     count: u64,
-    max_actual: f64,
     last_hours: Option<f64>,
 }
 
@@ -3407,8 +3433,7 @@ impl PairedErrorTracker {
         {
             return;
         }
-        self.max_actual = self.max_actual.max(actual);
-        let clip = ERROR_CLIP_MULTIPLE * self.max_actual;
+        let clip = ERROR_CLIP_MULTIPLE * actual.max(ERROR_CLIP_FLOOR_SECS);
         let decay = self.last_hours.map_or(1.0, |then| {
             (-(now_hours - then).max(0.0) / ERROR_FORGETTING_HOURS).exp()
         });
@@ -3917,41 +3942,104 @@ mod tests {
     }
 
     /// One pathological legacy forecast (a near-zero speed, so a transfer time
-    /// of a million seconds) must neither dominate the comparison once it has
-    /// aged, nor, before that, count for more than the clip allows. Both models
-    /// are scored on exactly the same events, and a non-finite error for either
-    /// skips the event for both.
+    /// of a million seconds) must not dominate the comparison, even right after
+    /// an ordinary large outcome: the clip is relative to each event's own
+    /// outcome, so a 600 s transfer earlier cannot admit a 6000 s error on a
+    /// 0.1 s one. Both models are scored on exactly the same events, and a
+    /// non-finite error for either skips the event for both.
     #[test]
     fn seconds_error_is_clipped_forgotten_and_paired() {
         let mut tracker = PairedErrorTracker::default();
+        // An ordinary slow transfer, forecast well by both.
+        tracker.record(600.0, 600.0, 600.0, 0.0);
+        // Then the pathological legacy forecast on a small one.
         tracker.record(1.0e6, 0.2, 0.1, 0.0);
-        let (legacy, hierarchical) = tracker.rmse().unwrap();
+        let legacy_sq_after = tracker.legacy;
         assert!(
-            legacy <= ERROR_CLIP_MULTIPLE * 0.1 + 1e-12,
-            "the error must be clipped to 10x the largest outcome: {legacy}"
+            legacy_sq_after <= (ERROR_CLIP_MULTIPLE * 0.1).powi(2) + 1e-9,
+            "the small event's error must be clipped to 10x its own outcome, not the \
+             earlier 600 s: legacy squared error {legacy_sq_after}"
         );
-        assert!((hierarchical - 0.1).abs() < 1e-12);
+
+        // A zero outcome must not clip every error to zero.
+        let mut zero = PairedErrorTracker::default();
+        zero.record(0.5, 0.0, 0.0, 0.0);
+        let (legacy, hierarchical) = zero.rmse().unwrap();
+        assert!(
+            (legacy - ERROR_CLIP_MULTIPLE * ERROR_CLIP_FLOOR_SECS).abs() < 1e-12,
+            "a zero outcome clips at the floor, not at zero: {legacy}"
+        );
+        assert_eq!(hierarchical, 0.0);
 
         // Non-finite for one model: skipped for both.
         tracker.record(f64::INFINITY, 0.1, 0.1, 0.0);
         tracker.record(0.1, f64::NAN, 0.1, 0.0);
         assert_eq!(
-            tracker.count, 1,
+            tracker.count, 2,
             "a non-finite error must skip the event for both"
         );
 
-        // Three days of accurate traffic from both models afterwards.
-        for i in 0..3_000 {
-            let hours = 1.0 + i as f64 * 72.0 / 3_000.0;
-            tracker.record(0.11, 0.12, 0.1, hours);
+        // A day of small, accurate traffic from both models afterwards.
+        for i in 0..2_000 {
+            let hours = 1.0 + i as f64 * 24.0 / 2_000.0;
+            tracker.record(0.10, 0.13, 0.1, hours);
         }
         let (legacy, hierarchical) = tracker.rmse().unwrap();
         assert!(
             legacy < hierarchical,
-            "once aged out, the single bad legacy forecast must not decide the verdict: \
+            "a day later, the single bad legacy forecast must not decide the verdict: \
              legacy {legacy} vs hierarchical {hierarchical}"
         );
-        assert_eq!(tracker.count, 3_001);
+        assert_eq!(tracker.count, 2_002);
+        assert!(
+            tracker.weight < 2_000.0 && tracker.weight > 100.0,
+            "the verdict's weight is forgotten, not the lifetime count: {}",
+            tracker.weight
+        );
+    }
+
+    /// A 0 s legacy time forecast (routing acts on it) is scored at the floor
+    /// for both models, not dropped.
+    #[test]
+    fn zero_time_forecasts_are_floored_for_both_models_not_dropped() {
+        let _learn = force_hierarchical_routing(true);
+        let mut router = Router::new(&[]);
+        feed_mixed_traffic(&mut router, 300);
+        let mut forecasts = router
+            .score_failure_layers(&PeerKeyLocation::random(), Location::new(0.3), 0.0)
+            .map(|(forecasts, _)| forecasts);
+        let before = router.response_time_error.count;
+        router.score_hierarchical_layer(
+            forecasts.as_mut(),
+            hierarchical::Observed {
+                failure: Some(0.1),
+                estimate: hierarchical::Estimate {
+                    failure_probability: Some(0.1),
+                    time_to_response_start_secs: Some(0.2),
+                    transfer_speed_bps: None,
+                },
+            },
+            LegacyTimingForecast {
+                time_to_response_start_secs: Some(0.0),
+                transfer_speed_bps: None,
+            },
+            ObservedTiming {
+                response_secs: Some(0.1),
+                transfer: None,
+            },
+            0.0,
+            router.estimator_clock.hours(),
+        );
+        assert_eq!(
+            router.response_time_error.count,
+            before + 1,
+            "the event must be scored"
+        );
+        let recorded = forecasts.unwrap().log_response_time_legacy.unwrap();
+        assert!(
+            (recorded - hierarchical::MIN_RESPONSE_SECS.ln()).abs() < 1e-12,
+            "a 0 s forecast is recorded at the floor: {recorded}"
+        );
     }
 
     /// The per-event timing comparison must reuse the Renegade queries the

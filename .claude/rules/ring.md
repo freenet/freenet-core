@@ -225,18 +225,28 @@ WHEN touching either stack:
   → Its peer tables are sized from max_connections (peer_capacity), evict
     LRU in batches, and export evictions — do not hard-code a peer cap
 
-PROMOTION GATE: flipping the default is decided OFFLINE on the routing
-dataset, collected after #5653 (failure labels) is live: the hierarchical
-failure forecast's Brier score against legacy's, and the outcomes of the
-peers each model would have chosen, on real traffic. The live instruments
-are supporting evidence, not the gate:
+PROMOTION GATE, in two parts, both on data collected after #5653 (failure
+labels) is deployed:
+  (a) OFFLINE CALIBRATION, on the routing dataset: prequential failure Brier
+      score and seconds error for both models on the same events. This is
+      calibration of each model's estimate for the peer actually tried. It
+      does NOT measure ranking: the dataset records only the chosen peer and
+      its outcome, with no candidate sets and no exploration, so how a peer
+      the other model would have chosen would have fared is unobserved.
+      Offline ranking evaluation would need a per-decision candidate log
+      with exploration (future work).
+  (b) ON-FIELD A/B between gateways over the same window: gateway-2 with
+      FREENET_ROUTING_HIERARCHICAL on against gateway-1 on legacy, comparing
+      GET success rate, latency, and chosen-peer failure rate from the nodes'
+      telemetry.
+Live instruments behind (a):
   - hierarchical_* failure skill (same events as the legacy layers)
-  - response_time_rmse_secs_* / transfer_time_rmse_secs_* (paired, clipped to
-    10x the largest outcome, forgotten over 24h; "insufficient data" below
-    100 events). These measure CALIBRATION of the absolute estimate, not the
-    candidate RANKING routing uses. On transfer they are not like-for-like:
-    hierarchical targets E[bytes/V], legacy bytes/E[V], so wherever speeds
-    vary Jensen's inequality favours hierarchical by construction.
+  - response_time_rmse_secs_* / transfer_time_rmse_secs_* (paired, each error
+    clipped to 10x its own outcome with a 1 ms floor, forgotten over 24h;
+    "insufficient recent data" below forgotten weight 100). On transfer they
+    are not like-for-like: hierarchical targets E[bytes/V], legacy
+    bytes/E[V], so wherever speeds vary Jensen's inequality favours
+    hierarchical by construction.
   - hierarchical_*_log_shape (the lognormal assumption behind E[T])
 REPLAY CAVEAT: dataset forecasts are recorded at completion time on the
 estimator state then; routing acts on an estimate only once

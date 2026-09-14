@@ -39,6 +39,12 @@ fn fmt_skill(skill: Option<f64>) -> String {
 const NOT_COMPUTED: &str = "&mdash; not computed (enable FREENET_ROUTING_HIERARCHICAL, or set \
      FREENET_ROUTING_DATASET to record a routing dataset)";
 
+/// What the hierarchical rows show when a routing dataset recorder IS
+/// configured but stopped (byte cap or write error) before any event reached
+/// the estimator: telling the operator to set the variable would be wrong.
+const RECORDER_STOPPED_EMPTY: &str = "&mdash; not computed (the routing dataset recorder stopped \
+     before the estimator saw any event)";
+
 /// Whether the hierarchical readings are live, frozen, or absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Computation {
@@ -48,8 +54,10 @@ enum Computation {
     /// or failed to write). The readings are the soak's final numbers: worth
     /// showing, but never as if they were still moving.
     Frozen,
-    /// Never computed in this process.
+    /// Never computed in this process, and no stopped recorder explains why.
     Never,
+    /// A recorder was configured but stopped before any event was learned.
+    RecorderStoppedEmpty,
 }
 
 impl Computation {
@@ -58,6 +66,8 @@ impl Computation {
             Computation::Live
         } else if rs.hierarchical_failure_events > 0 || rs.hierarchical_failure_evaluated > 0 {
             Computation::Frozen
+        } else if rs.routing_dataset_stopped {
+            Computation::RecorderStoppedEmpty
         } else {
             Computation::Never
         }
@@ -70,6 +80,7 @@ fn hierarchical_reading(state: Computation, live: impl FnOnce() -> String) -> St
         Computation::Live => live(),
         Computation::Frozen => format!("frozen when computation stopped: {}", live()),
         Computation::Never => NOT_COMPUTED.to_string(),
+        Computation::RecorderStoppedEmpty => RECORDER_STOPPED_EMPTY.to_string(),
     }
 }
 
@@ -101,21 +112,27 @@ fn fmt_duration_secs(seconds: f64) -> String {
 /// This is the instrument for the promotion gate's "not worse in seconds", so
 /// it names which model is ahead rather than leaving two bare numbers.
 ///
-/// Below [`MIN_SCORED_FOR_VERDICT`] events it says so instead of naming a
-/// winner: a handful of timed events settles nothing.
-fn fmt_seconds_error(legacy: Option<f64>, hierarchical: Option<f64>, scored: u64) -> String {
+/// Below [`crate::router::MIN_WEIGHT_FOR_VERDICT`] of FORGOTTEN event weight it
+/// says so instead of naming a winner: a handful of recent timed events settles
+/// nothing, however many were scored long ago.
+fn fmt_seconds_error(
+    legacy: Option<f64>,
+    hierarchical: Option<f64>,
+    scored: u64,
+    weight: f64,
+) -> String {
     let (Some(legacy), Some(hierarchical)) = (legacy, hierarchical) else {
         return "&mdash; no event both models forecast yet".to_string();
     };
     let numbers = format!(
-        "legacy {}, hierarchical {} (n={scored})",
+        "legacy {}, hierarchical {} (n={scored}, recent weight {weight:.0})",
         fmt_duration_secs(legacy),
         fmt_duration_secs(hierarchical)
     );
-    if scored < crate::router::MIN_SCORED_FOR_VERDICT {
+    if weight < crate::router::MIN_WEIGHT_FOR_VERDICT {
         return format!(
-            "{numbers} &mdash; insufficient data (needs {})",
-            crate::router::MIN_SCORED_FOR_VERDICT
+            "{numbers} &mdash; insufficient recent data (needs weight {:.0})",
+            crate::router::MIN_WEIGHT_FOR_VERDICT
         );
     }
     let verdict = if hierarchical <= legacy {
@@ -156,7 +173,7 @@ fn fmt_log_shape(shape: &crate::router::LogResidualShape) -> String {
         return format!("&mdash; not enough data yet ({} residuals)", shape.events);
     };
     let verdict = if skew.abs() > LOG_SHAPE_WARNING || kurtosis.abs() > LOG_SHAPE_WARNING {
-        " &mdash; <strong>not lognormal</strong>: expected times may be understated"
+        " &mdash; <strong>not lognormal</strong>: expected times may be inaccurate"
     } else {
         " &mdash; consistent with lognormal"
     };
@@ -168,13 +185,15 @@ fn fmt_log_shape(shape: &crate::router::LogResidualShape) -> String {
 
 /// Render the hierarchical estimator's selected forgetting horizon.
 ///
-/// `None` means two different things depending on whether the stage has any
-/// events, and the reader needs to know which.
-fn fmt_horizon(events: usize, hours: Option<f64>) -> String {
-    match (events, hours) {
-        (0, _) => "&mdash; (no events yet)".to_string(),
-        (_, None) => "none &mdash; remembers its whole window".to_string(),
-        (_, Some(hours)) => format!("{hours} h"),
+/// `None` means "forgets nothing inside its window" only once the stage is
+/// active (has a curve). Before that it predicts nothing, and no horizon has
+/// been selected at all.
+fn fmt_horizon(active: bool, events: usize, hours: Option<f64>) -> String {
+    match (events, active, hours) {
+        (0, _, _) => "&mdash; (no events yet)".to_string(),
+        (_, false, _) => format!("&mdash; not active yet ({events} events, no curve)"),
+        (_, true, None) => "none &mdash; remembers its whole window".to_string(),
+        (_, true, Some(hours)) => format!("{hours} h"),
     }
 }
 
@@ -402,7 +421,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
             } else {
                 match state {
                     Computation::Live => " &mdash; measured, not applied",
-                    Computation::Frozen => " &mdash; stopped",
+                    Computation::Frozen | Computation::RecorderStoppedEmpty => " &mdash; stopped",
                     Computation::Never => " &mdash; off",
                 }
             },
@@ -423,14 +442,17 @@ pub fn peer_detail_html(address_str: &str) -> String {
             timing_error = hierarchical_reading(state, || fmt_seconds_error(
                 rs.response_time_rmse_secs_legacy,
                 rs.response_time_rmse_secs_hierarchical,
-                rs.response_time_scored
+                rs.response_time_scored,
+                rs.response_time_weight
             )),
             transfer_error = hierarchical_reading(state, || fmt_seconds_error(
                 rs.transfer_time_rmse_secs_legacy,
                 rs.transfer_time_rmse_secs_hierarchical,
-                rs.transfer_time_scored
+                rs.transfer_time_scored,
+                rs.transfer_time_weight
             )),
             hierarchical_horizon = hierarchical_reading(state, || fmt_horizon(
+                rs.hierarchical_failure_active,
                 rs.hierarchical_failure_events,
                 rs.hierarchical_failure_horizon_hours,
             )),
@@ -852,10 +874,14 @@ mod tests {
 
     #[test]
     fn seconds_error_rendering_names_the_verdict() {
-        assert!(fmt_seconds_error(Some(0.2), Some(0.1), 400).contains("hierarchical no worse"));
-        assert!(fmt_seconds_error(Some(0.2), Some(0.2), 400).contains("hierarchical no worse"));
-        assert!(fmt_seconds_error(Some(0.1), Some(0.2), 400).contains("hierarchical worse"));
-        assert!(fmt_seconds_error(None, Some(0.2), 0).contains("no event"));
+        assert!(
+            fmt_seconds_error(Some(0.2), Some(0.1), 400, 400.0).contains("hierarchical no worse")
+        );
+        assert!(
+            fmt_seconds_error(Some(0.2), Some(0.2), 400, 400.0).contains("hierarchical no worse")
+        );
+        assert!(fmt_seconds_error(Some(0.1), Some(0.2), 400, 400.0).contains("hierarchical worse"));
+        assert!(fmt_seconds_error(None, Some(0.2), 0, 0.0).contains("no event"));
     }
 
     /// Every hierarchical reading in the layer panel must go through the
@@ -906,19 +932,39 @@ mod tests {
         );
     }
 
+    /// The verdict needs recent evidence: a large lifetime count whose weight
+    /// has been forgotten is not enough.
     #[test]
-    fn seconds_error_needs_enough_events_for_a_verdict() {
-        let few = fmt_seconds_error(
-            Some(0.2),
-            Some(0.1),
-            crate::router::MIN_SCORED_FOR_VERDICT - 1,
-        );
+    fn seconds_error_needs_enough_recent_weight_for_a_verdict() {
+        let min = crate::router::MIN_WEIGHT_FOR_VERDICT;
+        let stale = fmt_seconds_error(Some(0.2), Some(0.1), 10_000, min - 1.0);
         assert!(
-            few.contains("insufficient data") && !few.contains("no worse"),
-            "{few}"
+            stale.contains("insufficient recent data") && !stale.contains("no worse"),
+            "10,000 events long forgotten must not produce a verdict: {stale}"
         );
-        let enough = fmt_seconds_error(Some(0.2), Some(0.1), crate::router::MIN_SCORED_FOR_VERDICT);
+        let enough = fmt_seconds_error(Some(0.2), Some(0.1), 150, min);
         assert!(enough.contains("hierarchical no worse"), "{enough}");
+    }
+
+    #[test]
+    fn a_recorder_stopped_before_any_event_is_not_told_to_set_the_variable() {
+        let stopped = hierarchical_reading(Computation::RecorderStoppedEmpty, || "x".to_string());
+        assert!(stopped.contains("stopped") && !stopped.contains("set FREENET_ROUTING_DATASET"));
+        let never = hierarchical_reading(Computation::Never, || "x".to_string());
+        assert!(never.contains("FREENET_ROUTING_DATASET"));
+    }
+
+    #[test]
+    fn lognormality_warning_does_not_assert_a_direction() {
+        let shape = crate::router::LogResidualShape {
+            sigma2: Some(0.25),
+            skewness: Some(-2.0),
+            excess_kurtosis: Some(0.0),
+            events: 400,
+        };
+        let text = fmt_log_shape(&shape);
+        assert!(text.contains("not lognormal") && text.contains("inaccurate"));
+        assert!(!text.contains("understated") && !text.contains("overstated"));
     }
 
     #[test]
@@ -947,15 +993,26 @@ mod tests {
 
     #[test]
     fn horizon_rendering_distinguishes_no_events_from_no_forgetting() {
-        assert!(fmt_horizon(0, None).contains("no events yet"));
-        assert!(fmt_horizon(0, Some(6.0)).contains("no events yet"));
-        let whole = fmt_horizon(120, None);
+        assert!(fmt_horizon(false, 0, None).contains("no events yet"));
+        assert!(fmt_horizon(true, 0, Some(6.0)).contains("no events yet"));
+        let inactive = fmt_horizon(false, 3, None);
+        assert!(
+            inactive.contains("not active yet") && !inactive.contains("whole window"),
+            "a stage with no curve must not read as forgetting nothing: {inactive}"
+        );
+        let frozen_inactive =
+            hierarchical_reading(Computation::Frozen, || fmt_horizon(false, 3, None));
+        assert!(
+            frozen_inactive.contains("frozen") && frozen_inactive.contains("not active yet"),
+            "frozen while inactive: {frozen_inactive}"
+        );
+        let whole = fmt_horizon(true, 120, None);
         assert!(
             whole.contains("whole window"),
             "an active stage with no forgetting must say so, got {whole}"
         );
-        assert_eq!(fmt_horizon(120, Some(1.5)), "1.5 h");
-        assert_eq!(fmt_horizon(120, Some(24.0)), "24 h");
+        assert_eq!(fmt_horizon(true, 120, Some(1.5)), "1.5 h");
+        assert_eq!(fmt_horizon(true, 120, Some(24.0)), "24 h");
     }
 
     #[test]
