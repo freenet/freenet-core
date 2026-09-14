@@ -91,8 +91,11 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
     and conditions, hop-less successes included, in both label modes
     (`route_attempt::report_originator_route_outcome`). Only the router label
     uses the recorded hop. Never move a health input to the hop.
-  → The GET stream claim stays on `current_target` here; claiming from the
-    recorded hop is a delivery fix that belongs with retry diversity (#5660).
+  → The GET stream claim uses the recorded hop, falling back to
+    `current_target` only when none was recorded. This is delivery, not
+    labelling, so it does not follow the kill switch: with retry diversity
+    (#5660) the loopback relay's pick often differs from `current_target`, and
+    the stream is registered under the hop it actually came from.
   → Every router label carries its routing-dataset source (#5648): the
     recorder passes its `AttemptOrigin` to the sink, and relay-observed
     events (recorder relay labels, legacy relay `SuccessUntimed`,
