@@ -1528,10 +1528,18 @@ fn a_fully_decayed_node_is_treated_as_absent() {
 
 /// Build a no-forgetting level and its prepared residuals from per-cell data.
 fn shape_of(cells: &[(usize, usize, Vec<f64>)]) -> ResidualShape {
-    shape_with(cells, ResidualShape::MIN_CELL_EVENTS)
+    // Through `measure`, the production entry point, so its per-cell minimum is
+    // what these tests exercise.
+    let (prepared, level) = shape_inputs(cells);
+    ResidualShape::measure(&prepared, &level)
 }
 
 fn shape_with(cells: &[(usize, usize, Vec<f64>)], min_cell_events: f64) -> ResidualShape {
+    let (prepared, level) = shape_inputs(cells);
+    ResidualShape::measure_with(&prepared, &level, min_cell_events)
+}
+
+fn shape_inputs(cells: &[(usize, usize, Vec<f64>)]) -> (Vec<Prepared>, Level) {
     let mut level = Level::new(None);
     let mut prepared = Vec::new();
     for (slot, band, values) in cells {
@@ -1547,7 +1555,7 @@ fn shape_with(cells: &[(usize, usize, Vec<f64>)], min_cell_events: f64) -> Resid
         }
     }
     level.recount_squares();
-    ResidualShape::measure_with(&prepared, &level, min_cell_events)
+    (prepared, level)
 }
 
 /// Exponential log residuals have skewness 2 and excess kurtosis 6; the
