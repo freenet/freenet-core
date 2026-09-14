@@ -452,6 +452,7 @@ async fn drive_client_get_inner(
         terminal_hop: None,
         not_found_hops: Vec::new(),
         asked_hops: Vec::new(),
+        steer_to_unasked: false,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -914,6 +915,10 @@ struct GetRetryDriver<'a> {
     /// the outcome. `advance` falls back to a candidate outside this set when
     /// its own `tried` guesses run out.
     asked_hops: Vec<SocketAddr>,
+    /// Set by `advance` when it falls back to a never-asked peer: from then on
+    /// every asked hop is a first-hop exclusion, so the relay's pick reaches
+    /// that peer (see `first_hop_exclusions`).
+    steer_to_unasked: bool,
 }
 
 /// Terminal value for the GET driver.
@@ -1136,9 +1141,15 @@ impl RetryDriver for GetRetryDriver<'_> {
                 // loopback relay actually asked, and after a timeout the two
                 // diverge: the relay may re-ask the stalled peer while the
                 // guess moves on. So the guesses can run out while a ring peer
-                // was never asked. Fall back to the closest such peer, spending
-                // the retry `advance_to_next_peer` already counted. This only
-                // changes anything where the driver would otherwise give up.
+                // was never asked. Rather than give up, spend the retry
+                // `advance_to_next_peer` already counted on the closest such
+                // peer. `current_target` alone would not get it there, since
+                // the loopback relay picks the hop: `steer_to_unasked` makes
+                // every hop already asked, timed-out ones included, a
+                // first-hop exclusion from now on, so the relay's pick lands
+                // on an unasked peer. Guesses run out only once every ring
+                // peer was guessed, which within the retry budget means a
+                // ring of three peers or fewer.
                 if matches!(
                     reason,
                     crate::tracing::GetExhaustionReason::NoRoutingCandidates
@@ -1155,6 +1166,7 @@ impl RetryDriver for GetRetryDriver<'_> {
                     if let Some((peer, addr)) = unasked {
                         self.tried.push(addr);
                         self.current_target = peer;
+                        self.steer_to_unasked = true;
                         return AdvanceOutcome::Next;
                     }
                 }
@@ -1193,9 +1205,22 @@ impl RetryDriver for GetRetryDriver<'_> {
     // candidate after it answered NotFound. Every NotFound hop is excluded,
     // `current_target` included: on a non-empty ring the client's pick never
     // reaches the wire, so exempting it would only let the relay re-ask a
-    // peer that already answered NotFound. Timed-out hops are not excluded.
+    // peer that already answered NotFound. Timed-out hops are not excluded,
+    // except once `advance` has steered to a never-asked peer after the
+    // driver's guesses ran out: from then on every asked hop is excluded, so
+    // the relay's pick reaches that peer. Exclusions only ever apply to the
+    // loopback relay's first-hop pick, and it ignores them if they cover every
+    // candidate.
     fn first_hop_exclusions(&self) -> Vec<SocketAddr> {
-        self.not_found_hops.clone()
+        let mut exclusions = self.not_found_hops.clone();
+        if self.steer_to_unasked {
+            for addr in &self.asked_hops {
+                if !exclusions.contains(addr) {
+                    exclusions.push(*addr);
+                }
+            }
+        }
+        exclusions
     }
 }
 
@@ -2611,6 +2636,7 @@ async fn drive_sub_op_get(
         terminal_hop: None,
         not_found_hops: Vec::new(),
         asked_hops: Vec::new(),
+        steer_to_unasked: false,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -5431,6 +5457,7 @@ mod tests {
             terminal_hop: None,
             not_found_hops: Vec::new(),
             asked_hops: Vec::new(),
+            steer_to_unasked: false,
         };
 
         assert!(
@@ -8334,6 +8361,7 @@ mod route_attempt_driver_tests {
             terminal_hop: None,
             not_found_hops: Vec::new(),
             asked_hops: Vec::new(),
+            steer_to_unasked: false,
         }
     }
 
@@ -10355,6 +10383,128 @@ mod route_attempt_driver_tests {
         assert_eq!(
             asked, ring,
             "each ring peer is asked exactly once: {picks:?}"
+        );
+        assert!(
+            matches!(
+                driver.exhaustion_reason,
+                Some(crate::tracing::GetExhaustionReason::NoRoutingCandidates)
+            ),
+            "every ring peer was asked, so the driver exhausts on routing candidates, \
+             not on its retry budget"
+        );
+    }
+
+    /// The REAL originator-loopback relay applies the first-hop exclusions its
+    /// retry loop registered: the excluded peer is not the first hop, and the
+    /// request it forwards does not carry it in the visited bloom, so relays
+    /// further along can still route through it. Without exclusions the same
+    /// relay picks that peer, so the exclusion is what moves the hop.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn loopback_relay_exclusions_skip_the_first_hop_and_stay_off_the_forwarded_bloom() {
+        for (label, exclude) in [
+            ("get-loopback-no-exclusion", false),
+            ("get-loopback-exclusion", true),
+        ] {
+            let (op_manager, mut rx, _peers, _guards, _store) =
+                op_manager_with_peers_and_store(label, 4).await;
+            let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+            let instance_id = ContractInstanceId::new([79u8; 32]);
+            let best = op_manager
+                .ring
+                .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+                .into_iter()
+                .next()
+                .unwrap();
+            let tx = Transaction::new::<GetMsg>();
+            let exclusions = if exclude { vec![addr(&best)] } else { vec![] };
+            let _slot = op_manager
+                .attempt_hop_registry()
+                .register_excluding(tx, exclusions);
+            let conn_manager = crate::operations::test_utils::MockNetworkBridge::new();
+            let result = drive_relay_get_inner(
+                &op_manager,
+                &conn_manager,
+                tx,
+                instance_id,
+                3,
+                own,
+                VisitedPeers::new(&tx),
+                false,
+                false,
+            )
+            .await;
+            assert!(result.is_ok(), "{label}: {result:?}");
+            // The loopback relay fire-and-forgets its forward: find it among
+            // the outbound messages (the ring's own traffic may be there too).
+            let mut forwarded = None;
+            while let Ok((_reply, outbound, target)) = rx.try_recv() {
+                if *outbound.id() == tx && is_request(&outbound) {
+                    forwarded = Some((outbound, target));
+                    break;
+                }
+            }
+            let (msg, target) = forwarded.expect("the loopback relay forwarded the request");
+            let target = target.expect("the forward names its peer");
+            if exclude {
+                assert_ne!(
+                    target,
+                    addr(&best),
+                    "{label}: the excluded peer must not be the first hop"
+                );
+                assert!(
+                    !request_bloom_marks(&msg, addr(&best)),
+                    "{label}: the forwarded visited bloom must not carry the exclusion"
+                );
+            } else {
+                assert_eq!(
+                    target,
+                    addr(&best),
+                    "{label}: without exclusions the relay picks the best candidate"
+                );
+            }
+        }
+    }
+
+    /// A closest peer that times out on every attempt keeps the driver's
+    /// guesses apart from the hops actually asked, so on a three-peer ring the
+    /// guesses run out while two peers were never asked. The last attempt must
+    /// then go to one of them rather than to the stalled peer again: `advance`
+    /// steers the relay there through the first-hop exclusions.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_stalled_closest_peer_does_not_absorb_the_last_attempt() {
+        let (op_manager, rx, _peers, _guards) =
+            op_manager_with_peers("get-stalled-closest", 3).await;
+        let instance_id = ContractInstanceId::new([80u8; 32]);
+        let view = op_manager.clone();
+        let hops = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = hops.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |_, msg, _| {
+                let (peer, peer_addr) =
+                    loopback_relay_pick(&view, msg).expect("the relay finds a candidate");
+                seen.lock().push(peer_addr);
+                Step {
+                    hop: Some(peer),
+                    answer: Answer::Never,
+                }
+            },
+        );
+        let client_tx = Transaction::new::<GetMsg>();
+        let mut driver = driver_as_client(&op_manager, client_tx, instance_id);
+        let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
+        assert!(matches!(outcome, RetryLoopOutcome::Exhausted(_)));
+        let hops = hops.lock().clone();
+        assert_eq!(hops.len(), 4, "one attempt per retry: {hops:?}");
+        assert!(
+            hops[..3].iter().all(|h| *h == hops[0]),
+            "precondition: the relay re-asks the stalled closest peer: {hops:?}"
+        );
+        assert_ne!(
+            hops[3], hops[0],
+            "the last attempt must go to a peer never asked: {hops:?}"
         );
     }
 

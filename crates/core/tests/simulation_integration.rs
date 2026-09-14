@@ -12150,11 +12150,20 @@ fn test_serve_during_demandless_copy_served_locally_never_dark() {
 ///
 /// The one host of a contract sits at the key and is the requester's first
 /// hop. It is crashed (messages silently dropped) when the GET starts and
-/// recovered moments later, so the GET's first attempt times out. GET retries
-/// avoid, as a first hop, only peers that answered NotFound; a peer that timed
-/// out stays eligible, so the retry reaches the recovered host and the GET
-/// succeeds. Excluding timed-out peers too would leave this GET no route to its
-/// only host.
+/// recovered moments later, so the GET's first attempt times out, and the
+/// retry must still reach the recovered host. The preconditions pin that the
+/// scenario really happened: the requester is connected to the host, and its
+/// own GET recorded a timeout.
+///
+/// What this sim does NOT discriminate is whether a timed-out hop is wrongly
+/// excluded from later first-hop picks: with exclusions scoped to the first
+/// hop, a retry that skipped the host would start from another peer, which
+/// forwards to the host (the node closest to the key) anyway. The unit test
+/// `a_timed_out_hop_is_retried_not_excluded` pins that property.
+///
+/// Under plain `cargo test` this can fail its precondition while other sims
+/// share the process (#5673): a concurrent `SimNetwork` drop clears the
+/// process-global crash callback, so the host never really crashes.
 #[test_log::test]
 fn test_get_retry_reaches_single_host_after_one_timeout() {
     use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
@@ -12267,30 +12276,23 @@ fn test_get_retry_reaches_single_host_after_one_timeout() {
 
     // Preconditions. Without them the outcome below says nothing about a
     // timed-out hop: this test once passed because the first attempt never
-    // timed out at all. The requester is connected to the host, which sits at
-    // the key, so the host is its closest candidate and its first hop; and its
-    // router holds a timeout label, so an attempt really timed out against
-    // the hop it was forwarded to.
-    // A node's live location can differ from the configured one in the last
-    // digits, and every other node sits at least 0.30 from the host.
-    let host_loc = node_locations[0];
-    let neighbors = result.node_neighbor_locations(&requester);
-    let ring_dist = |a: f64, b: f64| {
-        let d = (a - b).abs();
-        d.min(1.0 - d)
-    };
+    // timed out at all. The requester is connected to the host itself, checked
+    // by address because the gateway's location is not controlled, and the
+    // host sits at the key, so it is the requester's closest candidate and
+    // first hop. And the requester recorded a timeout as an ORIGINATOR, which
+    // can only be its own GET: labels it recorded while relaying the gateway's
+    // filler GETs do not count.
     assert!(
-        neighbors.iter().any(|loc| ring_dist(*loc, host_loc) < 0.05),
-        "precondition: the requester must be connected to the host (host at {host_loc}, \
-         requester neighbors {neighbors:?})"
+        result.node_is_connected_to(&requester, &host),
+        "precondition: the requester must be connected to the host"
     );
-    let (_, timeouts, _) = result
-        .node_route_failure_causes(&requester)
+    let own_timeouts = result
+        .node_originator_route_timeouts(&requester)
         .expect("the requester published its ring");
     assert!(
-        timeouts >= 1,
-        "precondition: an attempt of the requester's GET must have timed out against its \
-         first hop (timeout labels: {timeouts})"
+        own_timeouts >= 1,
+        "precondition: the requester's own GET must have timed out against its first hop \
+         (originator timeout labels: {own_timeouts})"
     );
 
     let requester_has_state = result
@@ -12495,7 +12497,10 @@ fn test_get_retries_resolve_close_cluster_dead_end_without_migration() {
         .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
     assert!(
         requester_has_state,
-        "with retry diversity the requester GET must resolve without migration"
+        "with retry diversity the requester GET must resolve without migration. This run \
+         has no margin (it resolves on the last attempt), so red here can also mean one \
+         more NotFound first hop in this topology rather than a retry-diversity \
+         regression: check the mechanism assertion below first"
     );
     let (not_found, _, _) = result
         .node_route_failure_causes(&requester)
