@@ -457,6 +457,29 @@ pub(crate) struct RouterSnapshotInfo {
     /// the soft limit (`EMFILE`) drove the v0.2.73 gateway crash-loop and was
     /// invisible to the collector at the time. See #4440.
     pub open_fds: Option<u64>,
+    /// Timeout route labels per peer since the previous snapshot (#5657),
+    /// as a histogram: how many peers collected 1, 2-3, 4-7 and 8+ timeout
+    /// labels in the window, the most any single peer collected, and how many
+    /// labels landed on peers beyond the tracking cap. Populated by `Ring`.
+    ///
+    /// Soak signal for CHAIN BLAME: an originator timeout is labelled against
+    /// the first hop although the stall may be anywhere down the chain. One
+    /// stuck host behind a popular key shows up here as a tail of first hops
+    /// with many labels (a high max and a populated 8+ bucket). Accepted for
+    /// router-only labels (they never reach `peer_health`), but watched.
+    /// No peer identities are exported.
+    #[serde(default)]
+    pub timeout_label_peers_1: Option<u64>,
+    #[serde(default)]
+    pub timeout_label_peers_2_3: Option<u64>,
+    #[serde(default)]
+    pub timeout_label_peers_4_7: Option<u64>,
+    #[serde(default)]
+    pub timeout_label_peers_8_plus: Option<u64>,
+    #[serde(default)]
+    pub timeout_label_max_per_peer: Option<u64>,
+    #[serde(default)]
+    pub timeout_labels_untracked: Option<u64>,
     /// The `RLIMIT_NOFILE` soft limit (the ceiling that triggers `EMFILE`), or
     /// `None` on non-unix. Populated by `Ring`; see [`open_fds`](Self::open_fds).
     pub fd_soft_limit: Option<u64>,
@@ -2347,6 +2370,12 @@ impl Router {
             connect_forward_peer_adjustments: None,
             // Node-health gauges populated by Ring on the snapshot cadence (#4440).
             open_fds: None,
+            timeout_label_peers_1: None,
+            timeout_label_peers_2_3: None,
+            timeout_label_peers_4_7: None,
+            timeout_label_peers_8_plus: None,
+            timeout_label_max_per_peer: None,
+            timeout_labels_untracked: None,
             fd_soft_limit: None,
             contract_module_cache_entries: None,
             contract_module_cache_total_bytes: None,

@@ -886,7 +886,7 @@ pub(crate) fn streaming_aware_attempt_timeout(
 /// revisions of this comment said timeouts were "already covered by
 /// `report_timeout_failure` in `node/op_state_manager.rs` via
 /// `failure_routing_info`". Both were deleted by the task-per-tx migration,
-/// #4053/#4065/#4076/#4087, and nothing replaced them until #4485.)
+/// #4053/#4065/#4076/#4087, and nothing replaced them until #5657.)
 ///
 /// # Outcome attribution
 ///

@@ -244,7 +244,7 @@ pub(crate) struct OpManager {
     /// `operations::stream_progress`.
     stream_progress_registry: Arc<StreamProgressRegistry>,
     /// Per-attempt record of the peer an originator's GET/PUT attempt was
-    /// actually forwarded to (#4485). Same two-task shape as
+    /// actually forwarded to (#5657). Same two-task shape as
     /// `stream_progress_registry`: the retry loop registers a slot keyed by the
     /// attempt `Transaction` (removed by an RAII guard), the originator-loopback
     /// relay fills it. See `operations::route_attempt`.
@@ -1688,7 +1688,7 @@ impl OpManager {
     }
 
     /// Per-attempt first-hop registry for originator route attribution
-    /// (#4485). See `operations::route_attempt::AttemptHopRegistry`.
+    /// (#5657). See `operations::route_attempt::AttemptHopRegistry`.
     pub(crate) fn attempt_hop_registry(
         &self,
     ) -> &Arc<crate::operations::route_attempt::AttemptHopRegistry> {

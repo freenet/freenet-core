@@ -47,9 +47,9 @@ post-terminal stream-assembly failure as a retryable attempt failure
 such a wrapper, never inside the loop's Terminal arm (pinned by
 `drive_retry_loop_terminal_arm_does_not_call_advance`).
 
-## Route-outcome labelling (#4485)
+## Route-outcome labelling (#5657)
 
-The router's failure model is only as good as its labels. Before #4485 a
+The router's failure model is only as good as its labels. Before #5657 a
 relay recorded a downstream `NotFound` as a success and originators recorded
 only their final success, so production routers saw ~0.5 % failures.
 
@@ -60,31 +60,45 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
     `operations::route_attempt::RouteAttemptRecorder` (one per operation),
     never a hand-inlined RouteEvent. Timeout / send failure / disconnect of
     the attempted peer → Failure now; NotFound → Failure ONLY when a later
-    reply in the same op proves the contract exists (`contract_exists()`);
-    otherwise `ambiguous_not_found_policy()` (default Untrained: dropped).
-    A peer is labelled at most once per operation.
-  → Never train a NotFound on evidence from OUTSIDE the op. "The contract
-    exists now" is not "it existed when the NotFound was returned": a GET
-    before a PUT gets correct NotFounds from exactly the peers the PUT then
-    stores at, and a store keyed on later evidence is a poisoning primitive
-    (GET K through a relay, then PUT K). Naive training on ambiguous
-    NotFounds measurably degraded the model (exp/estimator-bakeoff e26a92c1d).
+    Found or streaming header from a REMOTE contacted peer in the same op
+    proves the contract exists (`contract_exists()`); otherwise
+    `ambiguous_not_found_policy()` (default Untrained: dropped). A peer is
+    labelled at most once per operation.
+  → Never treat local evidence or later evidence as proof. This node's own
+    (possibly stale) copy, a local completion, or a terminal with no recorded
+    hop proves nothing about a remote peer. "The contract exists now" is not
+    "it existed when the NotFound was returned": a GET before a PUT gets
+    correct NotFounds from exactly the peers the PUT then stores at, and a
+    store keyed on later evidence is a poisoning primitive (GET K through a
+    relay, then PUT K). Naive training on ambiguous NotFounds measurably
+    degraded the model (exp/estimator-bakeoff e26a92c1d).
   → Blame or credit only the peer the request ACTUALLY went to. GET/PUT
     originators send to their own loopback relay, which picks the real hop;
     read it from the per-attempt `AttemptHopRegistry` slot (the loopback relay
     fills it). No recorded hop → no event, success or failure. The driver's
     `current_target` is a guess. Claim a streamed reply from the same hop.
-  → Carry the hops already tried into the next attempt's visited bloom /
-    skip list, or the loopback relay re-picks the same best candidate.
-  → Failures feed the router only (`Ring::record_route_failure`), never
-    `peer_health`: a NotFound or an end-to-end timeout is not a reason to
-    evict a connection. (PUT relay's own send/timeout failures still use
-    `record_relay_route_event`, which is router-only too.)
   → A local callback drop (`NotificationError`), a disconnect of some other
-    peer, and an unexpected reply blame nobody.
-  → SUBSCRIBE renewals label neither timeouts (the renewal's clamped budget,
-    not the peer) nor NotFounds (structural: the renewer hosts the contract
-    and sits in the visited bloom).
+    peer, and an unexpected reply blame nobody — on originators AND relays.
+  → SUBSCRIBE renewals: the originator labels neither its timeouts (its
+    clamped renewal budget, not the peer) nor NotFounds (structural: the
+    renewer hosts the contract and sits in the visited bloom). A RELAY
+    forwarding a renewal still labels a timeout: it waited the full
+    OPERATION_TTL for its hop.
+  → Router labels are router-only (`Ring::record_route_failure`): a NotFound
+    or an end-to-end timeout is not a reason to evict a connection. But keep
+    `peer_health`'s pre-existing failure inputs (a GET stream that never
+    arrived, a client GET whose delivery failed) via
+    `Ring::report_route_failure_to_peer_health`, or health-based eviction can
+    never fire.
+  → Chain blame is accepted for router-only labels: an originator timeout is
+    labelled against the first hop although the stall may be further down
+    the chain. Watch it with the `timeout_label_*` router-snapshot histogram.
+  → NOT YET MIGRATED: PUT relay's downstream forwarding still labels its own
+    send/timeout failures with `record_relay_route_event` (router-only too),
+    outside the recorder. Those failures are not in the per-cause counters.
+  → Kill switch: `FREENET_ROUTING_LEGACY_LABELS=1` restores the pre-#5657
+    labels exactly (`route_attempt::label_mode()`). Any label site outside
+    the recorder must branch on `recorder.mode()`.
 ```
 
 ## Wire-variant dispatch

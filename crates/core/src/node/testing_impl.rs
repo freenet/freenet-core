@@ -544,7 +544,7 @@ impl ControlledSimulationResult {
     }
 
     /// `(failures, successes)` route events ingested by `label`'s router over
-    /// the whole run, or `None` if the node never published its Ring (#4485).
+    /// the whole run, or `None` if the node never published its Ring (#5657).
     /// Cumulative, unlike the router's 500-event estimator windows.
     pub fn node_route_outcome_totals(&self, label: &NodeLabel) -> Option<(u64, u64)> {
         self.node_rings.get(label).map(|ring| {
@@ -555,7 +555,7 @@ impl ControlledSimulationResult {
 
     /// `(not_found, timeout, send_failure)` route failure labels `label`'s
     /// node fed its router, by cause, or `None` if the node never published
-    /// its Ring (#4485).
+    /// its Ring (#5657).
     pub fn node_route_failure_causes(&self, label: &NodeLabel) -> Option<(u64, u64, u64)> {
         self.node_rings
             .get(label)
@@ -563,7 +563,7 @@ impl ControlledSimulationResult {
     }
 
     /// `(failures, successes)` route events summed over every node's router
-    /// (#4485). See [`Self::node_route_outcome_totals`].
+    /// (#5657). See [`Self::node_route_outcome_totals`].
     pub fn aggregate_route_outcome_totals(&self) -> (u64, u64) {
         self.node_rings
             .values()

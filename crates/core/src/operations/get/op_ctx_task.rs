@@ -53,7 +53,9 @@ use crate::operations::op_ctx::{
 use crate::operations::OpError;
 use crate::operations::VisitedPeers;
 use crate::operations::bootstrap::bootstrap_gateway_target;
-use crate::operations::route_attempt::{AttemptFailure, AttemptOrigin, RouteAttemptRecorder};
+use crate::operations::route_attempt::{
+    AttemptFailure, AttemptOrigin, LabelMode, RouteAttemptRecorder,
+};
 use crate::ring::{Location, PeerKeyLocation};
 use crate::router::{RouteEvent, RouteOutcome};
 use crate::tracing::{GetTerminalOutcome, StreamAbortCause};
@@ -640,7 +642,7 @@ async fn drive_client_get_inner(
             };
             //
             // Credited to the hop the winning attempt was actually forwarded
-            // to (#4485). Recorded ONLY for a delivered success from a
+            // to (#5657). Recorded ONLY for a delivered success from a
             // recorded hop: a reply produced locally (local completion, a
             // loopback relay serving its own copy) contacted no peer, so it
             // must credit nobody. A failed delivery records nothing here: a
@@ -648,13 +650,43 @@ async fn drive_client_get_inner(
             // by `drive_get_with_assembly_retry` (router only, once per peer),
             // and a local store/validation failure after an inline Found is
             // not attributable to the peer.
-            if let (true, Some(hop)) = (host_result.is_ok(), driver.terminal_hop.clone()) {
-                let route_event = RouteEvent {
-                    peer: hop,
+            //
+            // Peer health is the exception: a failed delivery still reports a
+            // failure to `peer_health` (and the topology request counter)
+            // against `current_target`, exactly as `routing_finished` did on
+            // this path before #5657, so health-based eviction keeps its
+            // inputs. Only the router label is withheld.
+            //
+            // Under `LabelMode::Legacy` the whole pre-#5657 event is restored.
+            let final_event = match driver.recorder.mode() {
+                LabelMode::Legacy => Some(RouteEvent {
+                    peer: driver.current_target.clone(),
                     contract_location,
-                    outcome: timed_outcome.unwrap_or(RouteOutcome::SuccessUntimed),
+                    outcome: if host_result.is_ok() {
+                        timed_outcome.unwrap_or(RouteOutcome::SuccessUntimed)
+                    } else {
+                        RouteOutcome::Failure
+                    },
                     op_type: Some(crate::node::network_status::OpType::Get),
-                };
+                }),
+                LabelMode::Current => match (host_result.is_ok(), driver.terminal_hop.clone()) {
+                    (true, Some(hop)) => Some(RouteEvent {
+                        peer: hop,
+                        contract_location,
+                        outcome: timed_outcome.unwrap_or(RouteOutcome::SuccessUntimed),
+                        op_type: Some(crate::node::network_status::OpType::Get),
+                    }),
+                    (true, None) => None,
+                    (false, _) => {
+                        op_manager.ring.report_route_failure_to_peer_health(
+                            &driver.current_target,
+                            contract_location,
+                        );
+                        None
+                    }
+                },
+            };
+            if let Some(route_event) = final_event {
                 if let Some(log_event) = crate::tracing::NetEventLog::route_event(
                     &client_tx,
                     &op_manager.ring,
@@ -871,7 +903,7 @@ struct GetRetryDriver<'a> {
     /// `debug!` log line that never ran in a release build and was never
     /// wired to reach the telemetry collector.
     exhaustion_reason: Option<crate::tracing::GetExhaustionReason>,
-    /// Labels every non-success attempt for the router (#4485). A client GET
+    /// Labels every non-success attempt for the router (#5657). A client GET
     /// gets a live recorder; a sub-op GET gets
     /// [`RouteAttemptRecorder::disabled`] because sub-op GETs do not feed the
     /// router. Dropped with the driver, which settles any still-ambiguous
@@ -1200,10 +1232,16 @@ async fn drive_get_with_assembly_retry(
     let outcome = loop {
         let result = drive_retry_loop(op_manager, attempt_tx, op_label, driver).await;
 
-        // Every terminal GET reply (an inline Found, a streaming header, or a
-        // local completion) proves the contract exists, so any earlier
+        // A Found or a streaming header from a REMOTE peer this operation
+        // actually contacted proves the contract exists, so any earlier
         // `NotFound` attempt in this operation was a genuine routing failure.
-        if matches!(result, RetryLoopOutcome::Done(_)) {
+        // A local completion, or a terminal with no recorded hop (the loopback
+        // relay answered from this node's own copy), proves nothing.
+        if matches!(
+            result,
+            RetryLoopOutcome::Done(Terminal::InlineFound { .. } | Terminal::Streaming { .. })
+        ) && driver.terminal_hop.is_some()
+        {
             driver.recorder.contract_exists();
         }
 
@@ -1261,18 +1299,21 @@ async fn drive_get_with_assembly_retry(
             RetryLoopOutcome::Unexpected | RetryLoopOutcome::InfraError(_) => break result,
         };
 
-        // Claim from the hop this attempt was actually forwarded to (#4485):
+        // Claim from the hop this attempt was actually forwarded to (#5657):
         // relays pipe the stream hop-by-hop, so the fragments arrive from
         // that adjacent peer, and it is also the peer blamed if the stream
         // never arrives. `current_target` is only this driver's guess and
         // differed from the real hop on retries. It is used only when the
         // loopback relay recorded no hop (unreachable for a remote streaming
         // reply today), and then nobody is blamed.
-        let claim_from = driver
-            .terminal_hop
-            .as_ref()
-            .and_then(|h| h.socket_addr())
-            .or_else(|| driver.current_target.socket_addr());
+        let claim_from = match driver.recorder.mode() {
+            LabelMode::Legacy => driver.current_target.socket_addr(),
+            LabelMode::Current => driver
+                .terminal_hop
+                .as_ref()
+                .and_then(|h| h.socket_addr())
+                .or_else(|| driver.current_target.socket_addr()),
+        };
         let Some(peer_addr) = claim_from else {
             tracing::warn!(
                 %key,
@@ -1324,9 +1365,14 @@ async fn drive_get_with_assembly_retry(
                 // header re-surfaced after a later wire exhaustion cannot
                 // count it twice.
                 let failed_hop = driver.terminal_hop.clone();
-                driver
-                    .recorder
-                    .record_attempt(failed_hop.as_ref(), AttemptFailure::SendFailure);
+                driver.recorder.record_attempt(
+                    failed_hop.as_ref(),
+                    AttemptFailure::SendFailure,
+                    true,
+                );
+                // `current_target` as it was for this attempt, for the
+                // peer-health input below (captured before `advance()`).
+                let attempt_target = driver.current_target.clone();
                 // Capture the structured progress/cause for the terminal
                 // telemetry event BEFORE `e.message` is moved into
                 // `assembly.error`, so the emitted `get_terminal` carries WHERE
@@ -1343,6 +1389,33 @@ async fn drive_get_with_assembly_retry(
                             "get: stream assembly failed; \
                              retrying against next candidate (#4345)"
                         );
+                        // Peer health keeps its pre-#5657 input: a stream
+                        // that never arrived is a health failure, on the
+                        // advancing path only (when the budget is exhausted
+                        // the client driver's final outcome reports it), for
+                        // client GETs only. Now against the hop that sent the
+                        // header when one was recorded. The ROUTER label went
+                        // through the recorder above; under `LabelMode::Legacy`
+                        // the old `routing_finished` event is restored instead.
+                        if driver.recorder.feeds_router() {
+                            match driver.recorder.mode() {
+                                LabelMode::Legacy => {
+                                    emit_get_route_failure(
+                                        op_manager,
+                                        attempt_tx,
+                                        &attempt_target,
+                                        &key,
+                                    )
+                                    .await;
+                                }
+                                LabelMode::Current => {
+                                    op_manager.ring.report_route_failure_to_peer_health(
+                                        failed_hop.as_ref().unwrap_or(&attempt_target),
+                                        Location::from(&key),
+                                    );
+                                }
+                            }
+                        }
                         #[cfg(any(test, feature = "testing"))]
                         assembly_fault_injection::ASSEMBLY_RETRY_COUNT
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1370,6 +1443,32 @@ async fn drive_get_with_assembly_retry(
     };
 
     (outcome, assembly)
+}
+
+/// [`LabelMode::Legacy`] only: the pre-#5657 routing-failure observation
+/// for a candidate whose streaming header never became a completed stream,
+/// against `current_target`, through `routing_finished`.
+async fn emit_get_route_failure(
+    op_manager: &OpManager,
+    tx: Transaction,
+    peer: &PeerKeyLocation,
+    key: &ContractKey,
+) {
+    let route_event = RouteEvent {
+        peer: peer.clone(),
+        contract_location: Location::from(key),
+        outcome: RouteOutcome::Failure,
+        op_type: Some(crate::node::network_status::OpType::Get),
+    };
+    if let Some(log_event) =
+        crate::tracing::NetEventLog::route_event(&tx, &op_manager.ring, &route_event)
+    {
+        op_manager
+            .ring
+            .register_events(either::Either::Left(log_event))
+            .await;
+    }
+    op_manager.ring.routing_finished(route_event);
 }
 
 /// Test-only fault injection for `assemble_and_cache_stream` (#4345).
@@ -3442,7 +3541,7 @@ where
 
     let mut retries: usize = 0;
 
-    // Labels this relay's downstream attempts for the local router (#4485).
+    // Labels this relay's downstream attempts for the local router (#5657).
     // A downstream NotFound is held until this search resolves: a later
     // Found (or a local fallback copy) proves the contract exists and turns it
     // into a Failure; otherwise dropping the recorder at return applies
@@ -3500,9 +3599,9 @@ where
                 // the key. Prefer any (stale) local fallback we already hold —
                 // existing behavior, not a dead-end.
                 if let Some((key, state, contract)) = local_fallback.take() {
-                    // A local copy proves the contract exists, so any
-                    // downstream NotFound in this search was a routing failure.
-                    recorder.contract_exists();
+                    // NOT `recorder.contract_exists()`: this node's own copy may
+                    // be stale or held by nobody else, so it proves nothing
+                    // about what the downstream NotFound peer could reach.
                     tracing::info!(
                         tx = %incoming_tx,
                         %instance_id,
@@ -3771,7 +3870,7 @@ where
         if originator_loopback {
             // Tell the client driver's retry loop which peer this attempt
             // really went to, so its outcome is attributed to that peer
-            // (#4485). Recorded before the dispatch so a reply can never beat
+            // (#5657). Recorded before the dispatch so a reply can never beat
             // it; cleared if the dispatch fails locally.
             op_manager
                 .attempt_hop_registry()
@@ -3812,7 +3911,18 @@ where
                 // so future routing decisions de-prioritize this peer. Without
                 // this hook, only originator-side failures train the router
                 // and per-peer dashboard panels stay empty on relay-heavy nodes.
-                recorder.record_attempt(Some(&peer), AttemptFailure::SendFailure);
+                // Same gate as the client path: a local callback drop
+                // (`NotificationError`) or a disconnect of some other peer is
+                // not this hop's doing.
+                let own_hop_disconnected = matches!(
+                    &err,
+                    OpError::PeerDisconnected { peer } if *peer == peer_addr
+                );
+                recorder.record_attempt(
+                    Some(&peer),
+                    AttemptFailure::SendFailure,
+                    own_hop_disconnected,
+                );
                 // No reply received — the awaited peer may reply late on the
                 // reused tx, so do NOT consult after this (Codex P2).
                 last_forward_failed = true;
@@ -3827,7 +3937,7 @@ where
                     timeout_secs = OPERATION_TTL.as_secs(),
                     "GET relay: attempt timed out; advancing to next peer"
                 );
-                recorder.record_attempt(Some(&peer), AttemptFailure::Timeout);
+                recorder.record_attempt(Some(&peer), AttemptFailure::Timeout, true);
                 // Timed out with no reply — the peer may reply late on the
                 // reused tx, so do NOT consult after this (Codex P2).
                 last_forward_failed = true;
@@ -4019,7 +4129,7 @@ where
                         // instead of being re-selected. (AlreadyClaimed above
                         // is deliberately NOT counted — that's dedup, not a
                         // failure.)
-                        recorder.record_attempt(Some(&peer), AttemptFailure::SendFailure);
+                        recorder.record_attempt(Some(&peer), AttemptFailure::SendFailure, true);
                         // Treat as a failed attempt — try another peer.
                         new_visited.mark_visited(peer_addr);
                         continue;
@@ -4269,7 +4379,7 @@ where
                 // Downstream peer answered NotFound: routing via it did not
                 // deliver this contract. This used to be recorded as
                 // `SuccessUntimed` ("the peer behaved well"), which trained the
-                // failure model on positive labels for dead-ends (#4485). It is
+                // failure model on positive labels for dead-ends (#5657). It is
                 // a routing failure; the recorder labels it once this search
                 // resolves (see `ambiguous_not_found_policy`). It never reaches
                 // peer_health.
@@ -4278,7 +4388,7 @@ where
                     target = %peer,
                     "GET relay: downstream returned NotFound; advancing to next peer"
                 );
-                recorder.record_attempt(Some(&peer), AttemptFailure::NotFound);
+                recorder.record_attempt(Some(&peer), AttemptFailure::NotFound, true);
                 // Mark the failed peer so future iterations don't re-select it.
                 new_visited.mark_visited(peer_addr);
                 // Loop iterates to next peer.
@@ -5760,7 +5870,7 @@ mod tests {
         // The routing penalty must land on the hop whose header never
         // became a stream, recorded BEFORE advance() starts the next attempt.
         let capture_pos = err_body
-            .find(".record_attempt(failed_hop.as_ref(), AttemptFailure::SendFailure);")
+            .find("failed_hop.as_ref(),\n                    AttemptFailure::SendFailure,")
             .expect("Err arm must label the failing hop");
         let advance_pos = err_body
             .find("driver.advance()")
@@ -7577,7 +7687,7 @@ mod tests {
     /// failing peer through the relay's `RouteAttemptRecorder`. Without these
     /// hooks the per-peer failure-probability model is trained only on
     /// originated ops (PR #4051), and a downstream NotFound recorded as a
-    /// success trains it on positive labels for dead-ends (#4485).
+    /// success trains it on positive labels for dead-ends (#5657).
     /// Source-scrape because the behaviour is positional inside the retry loop;
     /// the recorder's own labelling rules are unit-tested in
     /// `operations::route_attempt`.
@@ -7586,41 +7696,48 @@ mod tests {
         let src = include_str!("op_ctx_task.rs");
         let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
 
-        for (log_phrase, needle) in [
+        for (log_phrase, needles) in [
             (
                 "send_to_and_await failed; advancing to next peer",
-                "recorder.record_attempt(Some(&peer), AttemptFailure::SendFailure);",
+                &[
+                    "AttemptFailure::SendFailure,",
+                    "own_hop_disconnected,",
+                    "OpError::PeerDisconnected { peer } if *peer == peer_addr",
+                ][..],
             ),
             (
                 "attempt timed out; advancing to next peer",
-                "recorder.record_attempt(Some(&peer), AttemptFailure::Timeout);",
+                &["recorder.record_attempt(Some(&peer), AttemptFailure::Timeout, true);"][..],
             ),
             // #4307: a downstream that advertised a ResponseStreaming header
             // but never delivered an assemblable stream is also a routing
             // failure for that peer.
             (
                 "orphan stream claim failed; advancing to next peer",
-                "recorder.record_attempt(Some(&peer), AttemptFailure::SendFailure);",
+                &["recorder.record_attempt(Some(&peer), AttemptFailure::SendFailure, true);"][..],
             ),
-            // #4485: a downstream NotFound is a routing failure, labelled by
-            // the recorder once the search resolves — never SuccessUntimed.
+            // #5657: a downstream NotFound goes to the recorder (a failure
+            // only if this search then finds the contract) — never
+            // SuccessUntimed.
             (
                 "downstream returned NotFound; advancing",
-                "recorder.record_attempt(Some(&peer), AttemptFailure::NotFound);",
+                &["recorder.record_attempt(Some(&peer), AttemptFailure::NotFound, true);"][..],
             ),
         ] {
             let pos = body.unwrap_or_default_pos(log_phrase);
             let arm = &body[pos..];
             let arm = &arm[..arm.find("continue;").expect("arm must `continue;`")];
-            assert!(
-                arm.contains(needle),
-                "drive_relay_get_inner arm for `{log_phrase}` must call `{needle}`. \
-                 Arm:\n{arm}"
-            );
+            for needle in needles {
+                assert!(
+                    arm.contains(needle),
+                    "drive_relay_get_inner arm for `{log_phrase}` must contain `{needle}`. \
+                     Arm:\n{arm}"
+                );
+            }
             assert!(
                 !arm.contains("RouteOutcome::SuccessUntimed"),
                 "drive_relay_get_inner arm for `{log_phrase}` must not record a \
-                 success (#4485). Arm:\n{arm}"
+                 success (#5657). Arm:\n{arm}"
             );
         }
 
@@ -7655,9 +7772,14 @@ mod tests {
         let fallback = body
             .find("local_fallback.take()")
             .expect("local fallback arm");
+        let fallback_arm = &body[fallback..];
+        let fallback_arm = &fallback_arm[..fallback_arm
+            .find("return Ok(());")
+            .expect("fallback arm returns")];
         assert!(
-            body[fallback..fallback + 400].contains("recorder.contract_exists();"),
-            "serving a local fallback copy proves the contract exists"
+            !fallback_arm.contains("recorder.contract_exists();"),
+            "this node's own (possibly stale) copy proves nothing about the \
+             downstream NotFound peer (#5657)"
         );
         assert!(
             body.contains("AttemptOrigin::Relay"),
@@ -7779,7 +7901,7 @@ mod tests {
     }
 }
 
-/// Driver-level tests for GET per-attempt route labelling (#4485). They run the
+/// Driver-level tests for GET per-attempt route labelling (#5657). They run the
 /// real drivers (`drive_client_get_inner`, `drive_get_with_assembly_retry`,
 /// `drive_relay_get_inner`) against a scripted event loop that plays the
 /// originator-loopback relay and the network, then read the real Router.
@@ -7936,7 +8058,7 @@ mod route_attempt_driver_tests {
 
     /// A timed-out attempt and an attempt whose connection to ITS hop dropped
     /// are each labelled a Failure immediately; a disconnect reported for a
-    /// DIFFERENT peer blames nobody (#4485 G); the later success adds no
+    /// DIFFERENT peer blames nobody (#5657 G); the later success adds no
     /// failure.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn timeout_and_own_hop_disconnect_blame_the_hop_other_disconnect_does_not() {
@@ -7981,7 +8103,7 @@ mod route_attempt_driver_tests {
     }
 
     /// A hop that times out on several attempts of one operation is labelled
-    /// a failure ONCE (#4485 C).
+    /// a failure ONCE (#5657 C).
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn repeated_timeouts_of_one_hop_are_labelled_once() {
         let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-dedup", 5).await;
@@ -8007,7 +8129,7 @@ mod route_attempt_driver_tests {
 
     /// Every attempt answers NotFound and the retry budget exhausts: the
     /// NotFounds are ambiguous (the contract may not exist, or not yet), so
-    /// nothing is trained (#4485 A).
+    /// nothing is trained (#5657 A).
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn exhausted_all_not_found_trains_nothing() {
         let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-exhausted", 5).await;
@@ -8036,70 +8158,85 @@ mod route_attempt_driver_tests {
         assert!(failure_window(&op_manager).is_empty());
     }
 
-    /// #4485 E: a streamed reply is claimed from the hop the attempt was
+    /// #5657 E: a streamed reply is claimed from the hop the attempt was
     /// actually forwarded to. The stream is registered at that hop's address
     /// only, so claiming from `current_target` would time out and fail the
     /// assembly.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn streamed_reply_is_claimed_from_the_forwarded_hop() {
-        let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-stream-claim", 3).await;
-        let instance_id = ContractInstanceId::new([50u8; 32]);
-        let stream_id = StreamId::next_operations();
-        let payload = bincode::serialize(&GetStreamingPayload {
-            key: key_for(instance_id),
-            value: StoreResponse {
-                state: Some(WrappedState::new(vec![5, 6, 7])),
-                contract: None,
-            },
-        })
-        .unwrap();
-        let total = payload.len() as u64;
-        let handle =
-            crate::transport::peer_connection::streaming::StreamHandle::new(stream_id, total);
-        handle
-            .push_fragment(1, bytes::Bytes::from(payload))
-            .expect("fragment accepted");
-        op_manager
-            .orphan_stream_registry()
-            .register_orphan(addr(&peers[2]), stream_id, handle);
-
-        let hop = peers[2].clone();
-        serve_attempts(
-            op_manager.clone(),
-            rx,
-            crate::message::TransactionType::Get,
-            move |i, msg, _| Step {
-                hop: Some(hop.clone()),
-                answer: if i == 0 {
-                    Answer::Reply(streaming_header(msg, instance_id, stream_id, total))
-                } else {
-                    Answer::Reply(not_found(msg, instance_id))
+        use crate::operations::route_attempt::{LabelMode, force_label_mode};
+        for mode in [LabelMode::Current, LabelMode::Legacy] {
+            let _mode = force_label_mode(mode);
+            let (op_manager, rx, peers, _guards) =
+                op_manager_with_peers(&format!("get-stream-claim-{mode:?}"), 3).await;
+            let instance_id = ContractInstanceId::new([50u8; 32]);
+            let stream_id = StreamId::next_operations();
+            let payload = bincode::serialize(&GetStreamingPayload {
+                key: key_for(instance_id),
+                value: StoreResponse {
+                    state: Some(WrappedState::new(vec![5, 6, 7])),
+                    contract: None,
                 },
-            },
-        );
-        let client_tx = Transaction::new::<GetMsg>();
-        let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
-        let (outcome, assembly) = run(&op_manager, client_tx, &mut driver).await;
-        assert!(matches!(
-            outcome,
-            RetryLoopOutcome::Done(Terminal::Streaming { .. })
-        ));
-        assert!(
-            assembly.error.is_none(),
-            "the stream must be claimed from the forwarded hop: {:?}",
-            assembly.error
-        );
-        drop(driver);
-        assert!(failure_window(&op_manager).is_empty());
+            })
+            .unwrap();
+            let total = payload.len() as u64;
+            let handle =
+                crate::transport::peer_connection::streaming::StreamHandle::new(stream_id, total);
+            handle
+                .push_fragment(1, bytes::Bytes::from(payload))
+                .expect("fragment accepted");
+            op_manager
+                .orphan_stream_registry()
+                .register_orphan(addr(&peers[2]), stream_id, handle);
+
+            let hop = peers[2].clone();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |i, msg, _| Step {
+                    hop: Some(hop.clone()),
+                    answer: if i == 0 {
+                        Answer::Reply(streaming_header(msg, instance_id, stream_id, total))
+                    } else {
+                        Answer::Reply(not_found(msg, instance_id))
+                    },
+                },
+            );
+            let client_tx = Transaction::new::<GetMsg>();
+            let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
+            let (outcome, assembly) = run(&op_manager, client_tx, &mut driver).await;
+            assert!(
+                matches!(outcome, RetryLoopOutcome::Done(Terminal::Streaming { .. })),
+                "{mode:?}"
+            );
+            match mode {
+                LabelMode::Current => {
+                    assert!(
+                        assembly.error.is_none(),
+                        "the stream must be claimed from the forwarded hop: {:?}",
+                        assembly.error
+                    );
+                    drop(driver);
+                    assert!(failure_window(&op_manager).is_empty());
+                }
+                // The kill switch restores the pre-#5657 claim from
+                // `current_target`, where this stream is not registered.
+                LabelMode::Legacy => assert!(
+                    assembly.error.is_some(),
+                    "legacy mode claims from current_target, not the hop"
+                ),
+            }
+        }
     }
 
-    /// #4485 E + no double counting: a streaming header whose stream never
-    /// arrives is labelled once against the hop that sent it, router only
-    /// (never peer_health), and when the retries then exhaust on the wire and
-    /// the header is re-surfaced as the terminal, the client driver's final
-    /// outcome adds no second failure. Later NotFounds stay untrained.
+    /// E + no double counting (#5657): a streaming header whose stream never
+    /// arrives is labelled once in the ROUTER against the hop that sent it, and
+    /// when the retries then exhaust on the wire and the header is re-surfaced
+    /// as the terminal, the client driver's final outcome adds no second router
+    /// label. peer_health still receives its pre-#5657 failure input.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn failed_stream_is_labelled_once_router_only_through_the_client_driver() {
+    async fn failed_stream_is_labelled_once_and_keeps_its_peer_health_input() {
         let (op_manager, rx, peers, _guards, _store) =
             op_manager_with_peers_and_store("get-stream-fail", 5).await;
         let instance_id = ContractInstanceId::new([51u8; 32]);
@@ -8175,19 +8312,22 @@ mod route_attempt_driver_tests {
             window.len() >= 2,
             "the NotFound peers after the proof: {window:?}"
         );
-        assert_eq!(
-            op_manager
-                .ring
-                .connection_manager
-                .peer_health
-                .lock()
-                .counts_for_test(addr(&peers[2])),
-            health_before,
-            "a route failure must never reach peer_health"
+        // The ROUTER label is the recorder's one Failure above; peer_health
+        // keeps its pre-#5657 input for a stream that never arrived.
+        let (_, health_failures) = op_manager
+            .ring
+            .connection_manager
+            .peer_health
+            .lock()
+            .counts_for_test(addr(&peers[2]))
+            .expect("tracked peer");
+        assert!(
+            health_failures > health_before.map_or(0, |(_, f)| f),
+            "a failed stream must still reach peer_health"
         );
     }
 
-    /// #4485 H: a success produced locally (the loopback relay served its own
+    /// #5657 H: a success produced locally (the loopback relay served its own
     /// copy, so no hop was recorded) credits nobody; the same success through a
     /// recorded hop credits exactly that hop.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -8373,19 +8513,484 @@ mod route_attempt_driver_tests {
         );
     }
 
+    /// #5657 item 2: the peer_health inputs that existed before #5657 still
+    /// drive health-based eviction. Repeated client GETs whose stream from one
+    /// hop never arrives must make that hop evictable.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stream_failures_still_make_a_hop_evictable() {
+        let (op_manager, rx, peers, _guards, _store) =
+            op_manager_with_peers_and_store("get-evict", 5).await;
+        let stuck = peers[2].clone();
+        let others = [peers[3].clone(), peers[4].clone()];
+        let stream_id = StreamId::next_operations();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            {
+                let mut seen = std::collections::HashSet::new();
+                move |i, msg, _| {
+                    let NetMessage::V1(NetMessageV1::Get(GetMsg::Request { instance_id, .. })) =
+                        msg
+                    else {
+                        return Step {
+                            hop: None,
+                            answer: Answer::DropWaiter,
+                        };
+                    };
+                    // Every GET's first attempt goes to the stuck hop and gets
+                    // a header whose stream never arrives; later attempts
+                    // answer NotFound from the other peers.
+                    if seen.insert(*instance_id) {
+                        Step {
+                            hop: Some(stuck.clone()),
+                            answer: Answer::Reply(streaming_header(
+                                msg,
+                                *instance_id,
+                                stream_id,
+                                64,
+                            )),
+                        }
+                    } else {
+                        Step {
+                            hop: Some(others[i % 2].clone()),
+                            answer: Answer::Reply(not_found(msg, *instance_id)),
+                        }
+                    }
+                }
+            },
+        );
+        for i in 0..12u8 {
+            let instance_id = ContractInstanceId::new([100 + i; 32]);
+            assembly_fault_injection::inject_failures(key_for(instance_id), 1);
+            let _ = drive_client_get_inner(
+                &op_manager,
+                Transaction::new::<GetMsg>(),
+                instance_id,
+                false,
+                false,
+                false,
+            )
+            .await
+            .expect("driver returns an outcome");
+        }
+        let unhealthy = op_manager
+            .ring
+            .connection_manager
+            .peer_health
+            .lock()
+            .unhealthy_peers(
+                op_manager.ring.connection_manager.min_connections,
+                op_manager.ring.connection_manager.connection_count(),
+            );
+        assert!(
+            unhealthy.contains(&addr(&peers[2])),
+            "the stuck hop must be evictable from its peer_health failures: {unhealthy:?}"
+        );
+    }
+
+    /// #5657 item 2: a client GET whose delivery fails (a Found arrived but
+    /// the local store has no state to return) keeps its pre-#5657
+    /// peer_health input against `current_target`, while the ROUTER gets no
+    /// label for it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn failed_delivery_keeps_its_peer_health_input_without_a_router_label() {
+        let (op_manager, rx, peers, _guards, _store) =
+            op_manager_with_peers_and_store("get-failed-delivery", 3).await;
+        let instance_id = ContractInstanceId::new([62u8; 32]);
+        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+        let initial = op_manager
+            .ring
+            .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+            .into_iter()
+            .next()
+            .unwrap();
+        let hop = peers
+            .iter()
+            .find(|p| addr(p) != addr(&initial))
+            .unwrap()
+            .clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |_, msg, _| {
+                if !is_request(msg) {
+                    return Step {
+                        hop: None,
+                        answer: Answer::DropWaiter,
+                    };
+                }
+                Step {
+                    hop: Some(hop.clone()),
+                    answer: Answer::Reply(found(msg, instance_id)),
+                }
+            },
+        );
+        let before = op_manager
+            .ring
+            .connection_manager
+            .peer_health
+            .lock()
+            .counts_for_test(addr(&initial))
+            .unwrap();
+        let outcome = drive_client_get_inner(
+            &op_manager,
+            Transaction::new::<GetMsg>(),
+            instance_id,
+            false,
+            false,
+            false,
+        )
+        .await
+        .expect("driver returns an outcome");
+        assert!(
+            matches!(outcome, DriverOutcome::Publish(Err(_))),
+            "the store stub holds no state, so delivery fails"
+        );
+        let after = op_manager
+            .ring
+            .connection_manager
+            .peer_health
+            .lock()
+            .counts_for_test(addr(&initial))
+            .unwrap();
+        assert_eq!(
+            after.1,
+            before.1 + 1,
+            "a failed delivery is a peer_health failure against current_target"
+        );
+        assert!(
+            failure_window(&op_manager).is_empty(),
+            "but not a router label: {:?}",
+            failure_window(&op_manager)
+        );
+    }
+
+    /// #5657 item 3: only a REMOTE reply proves the contract exists. A NotFound
+    /// followed by a terminal the loopback relay produced from this node's own
+    /// copy (no recorded hop: an inline Found or a local completion) labels
+    /// nothing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn local_terminal_after_not_found_is_not_proof() {
+        for (label, local_terminal_is_found) in
+            [("get-local-found", true), ("get-local-completion", false)]
+        {
+            let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
+            let instance_id = ContractInstanceId::new([60u8; 32]);
+            let hop = peers[2].clone();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |i, msg, _| match i {
+                    0 => Step {
+                        hop: Some(hop.clone()),
+                        answer: Answer::Reply(not_found(msg, instance_id)),
+                    },
+                    _ => Step {
+                        hop: None,
+                        answer: Answer::Reply(if local_terminal_is_found {
+                            found(msg, instance_id)
+                        } else {
+                            // The loopback Request echo is a local completion.
+                            msg.clone()
+                        }),
+                    },
+                },
+            );
+            let client_tx = Transaction::new::<GetMsg>();
+            let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
+            let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
+            assert!(matches!(outcome, RetryLoopOutcome::Done(_)), "{label}");
+            drop(driver);
+            assert!(
+                failure_window(&op_manager).is_empty(),
+                "{label}: a local terminal proves nothing: {:?}",
+                failure_window(&op_manager)
+            );
+        }
+    }
+
+    /// Relay scenario shared by the relay tests: the relay's greedy candidate
+    /// and, when `advertise_host`, an advertised host it can consult.
+    async fn relay_fixture(
+        label: &str,
+        advertise_host: bool,
+    ) -> (
+        Arc<OpManager>,
+        tokio::sync::mpsc::Receiver<crate::node::OpExecutionPayload>,
+        crate::operations::route_attempt::driver_test_support::LocalStore,
+        PeerKeyLocation,
+        PeerKeyLocation,
+        PeerKeyLocation,
+        Box<dyn std::any::Any>,
+    ) {
+        let (op_manager, rx, peers, guards, store) =
+            op_manager_with_peers_and_store(label, 4).await;
+        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+        let upstream = peers[0].clone();
+        let instance_id = ContractInstanceId::new([53u8; 32]);
+        let greedy = op_manager
+            .ring
+            .k_closest_potentially_hosting(&instance_id, [own, addr(&upstream)].as_slice(), 1)
+            .into_iter()
+            .next()
+            .expect("a greedy candidate");
+        let host = peers[1..]
+            .iter()
+            .find(|p| addr(p) != addr(&greedy))
+            .unwrap()
+            .clone();
+        if advertise_host {
+            op_manager.neighbor_hosting.handle_message(
+                host.pub_key(),
+                crate::message::NeighborHostingMessage::HostingAnnounce {
+                    added: vec![instance_id],
+                    removed: vec![],
+                    is_response: true,
+                },
+            );
+        }
+        (op_manager, rx, store, upstream, greedy, host, guards)
+    }
+
+    async fn run_relay(op_manager: &Arc<OpManager>, upstream: &PeerKeyLocation) {
+        let conn_manager = crate::operations::test_utils::MockNetworkBridge::new();
+        let result = drive_relay_get_inner(
+            op_manager,
+            &conn_manager,
+            Transaction::new::<GetMsg>(),
+            ContractInstanceId::new([53u8; 32]),
+            3,
+            addr(upstream),
+            VisitedPeers::new(&Transaction::new::<GetMsg>()),
+            false,
+            false,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// #5657 item 3, relay side: a downstream NotFound followed by the relay
+    /// serving its OWN stale copy labels nothing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_stale_local_copy_after_not_found_is_not_proof() {
+        let (op_manager, rx, store, upstream, greedy, _host, _guards) =
+            relay_fixture("get-relay-stale", false).await;
+        let instance_id = ContractInstanceId::new([53u8; 32]);
+        // A local copy with no local interest: the relay forwards first and
+        // falls back to it only after the downstream NotFound.
+        *store.lock() = Some((key_for(instance_id), WrappedState::new(vec![9, 9])));
+        let greedy_addr = addr(&greedy);
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |_, msg, target| Step {
+                hop: None,
+                answer: if is_request(msg) && target == Some(greedy_addr) {
+                    Answer::Reply(not_found(msg, instance_id))
+                } else {
+                    Answer::DropWaiter
+                },
+            },
+        );
+        run_relay(&op_manager, &upstream).await;
+        assert!(
+            failure_window(&op_manager).is_empty(),
+            "the relay's own stale copy proves nothing about the downstream \
+             NotFound peer: {:?}",
+            failure_window(&op_manager)
+        );
+    }
+
+    /// #5657 item 4: the relay's send-failure arm is gated like the client
+    /// path. A local callback drop and a disconnect of some OTHER peer blame
+    /// nobody; a disconnect of the hop itself blames it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_send_failure_blames_only_a_disconnect_of_its_hop() {
+        for (label, case) in [
+            ("get-relay-drop", 0u8),
+            ("get-relay-other-disconnect", 1),
+            ("get-relay-own-disconnect", 2),
+        ] {
+            let (op_manager, rx, _store, upstream, greedy, _host, _guards) =
+                relay_fixture(label, false).await;
+            let greedy_addr = addr(&greedy);
+            let greedy_hop = greedy.clone();
+            let bystander: SocketAddr = "127.0.0.1:1".parse().unwrap();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |_, msg, target| {
+                    if !is_request(msg) || target != Some(greedy_addr) {
+                        return Step {
+                            hop: None,
+                            answer: Answer::DropWaiter,
+                        };
+                    }
+                    Step {
+                        hop: Some(greedy_hop.clone()),
+                        answer: match case {
+                            0 => Answer::DropWaiter,
+                            1 => Answer::PeerDisconnectedFor(bystander),
+                            _ => Answer::PeerDisconnectedFor(greedy_addr),
+                        },
+                    }
+                },
+            );
+            run_relay(&op_manager, &upstream).await;
+            let expected = if case == 2 {
+                vec![(Some(greedy_addr), 1.0)]
+            } else {
+                vec![]
+            };
+            assert_eq!(failure_window(&op_manager), expected, "{label}");
+        }
+    }
+
+    /// #5657 item 6: `FREENET_ROUTING_LEGACY_LABELS` restores the pre-#5657
+    /// relay labels. The same greedy-NotFound-then-consulted-Found scenario
+    /// labels the NotFound peer a Failure under the current rules and a
+    /// SuccessUntimed under the legacy ones.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_labels_follow_the_legacy_switch() {
+        use crate::operations::route_attempt::{LabelMode, force_label_mode};
+        for mode in [LabelMode::Current, LabelMode::Legacy] {
+            let _mode = force_label_mode(mode);
+            let (op_manager, rx, _store, upstream, greedy, host, _guards) =
+                relay_fixture(&format!("get-relay-mode-{mode:?}"), true).await;
+            let instance_id = ContractInstanceId::new([53u8; 32]);
+            let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |_, msg, target| {
+                    let answer = if !is_request(msg) {
+                        Answer::DropWaiter
+                    } else if target == Some(greedy_addr) {
+                        Answer::Reply(not_found(msg, instance_id))
+                    } else if target == Some(host_addr) {
+                        Answer::Reply(found(msg, instance_id))
+                    } else {
+                        Answer::Never
+                    };
+                    Step { hop: None, answer }
+                },
+            );
+            run_relay(&op_manager, &upstream).await;
+            let greedy_label = match mode {
+                LabelMode::Current => 1.0,
+                LabelMode::Legacy => 0.0,
+            };
+            assert_eq!(
+                failure_window(&op_manager),
+                vec![(Some(greedy_addr), greedy_label), (Some(host_addr), 0.0)],
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// #5657 item 6, originator side: under the legacy switch the client GET
+    /// labels no attempt and credits its success to `current_target`, exactly
+    /// as before #5657; under the current rules the NotFound hop is labelled
+    /// and the delivering hop credited.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn client_labels_follow_the_legacy_switch() {
+        use crate::operations::route_attempt::{LabelMode, force_label_mode};
+        for mode in [LabelMode::Current, LabelMode::Legacy] {
+            let _mode = force_label_mode(mode);
+            let (op_manager, rx, peers, _guards, store) =
+                op_manager_with_peers_and_store(&format!("get-client-mode-{mode:?}"), 4).await;
+            let instance_id = ContractInstanceId::new([61u8; 32]);
+            *store.lock() = Some((key_for(instance_id), WrappedState::new(vec![1, 2, 3])));
+            let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+            let initial = op_manager
+                .ring
+                .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+                .into_iter()
+                .next()
+                .unwrap();
+            // The driver's own second pick (its `current_target` after one
+            // advance). The delivering hop is deliberately a DIFFERENT peer,
+            // so crediting `current_target` (legacy) and crediting the hop
+            // (current) are distinguishable.
+            let second = op_manager
+                .ring
+                .k_closest_potentially_hosting(&instance_id, [own, addr(&initial)].as_slice(), 1)
+                .into_iter()
+                .next()
+                .unwrap();
+            let others: Vec<_> = peers
+                .iter()
+                .filter(|p| addr(p) != addr(&initial) && addr(p) != addr(&second))
+                .cloned()
+                .collect();
+            let (nf_hop, found_hop) = (others[0].clone(), others[1].clone());
+            let (nf_addr, found_addr) = (addr(&nf_hop), addr(&found_hop));
+            let second_addr = addr(&second);
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |i, msg, _| {
+                    if !is_request(msg) {
+                        return Step {
+                            hop: None,
+                            answer: Answer::DropWaiter,
+                        };
+                    }
+                    if i == 0 {
+                        Step {
+                            hop: Some(nf_hop.clone()),
+                            answer: Answer::Reply(not_found(msg, instance_id)),
+                        }
+                    } else {
+                        Step {
+                            hop: Some(found_hop.clone()),
+                            answer: Answer::Reply(found(msg, instance_id)),
+                        }
+                    }
+                },
+            );
+            let outcome = drive_client_get_inner(
+                &op_manager,
+                Transaction::new::<GetMsg>(),
+                instance_id,
+                false,
+                false,
+                false,
+            )
+            .await
+            .expect("driver returns an outcome");
+            assert!(matches!(outcome, DriverOutcome::Publish(Ok(_))), "{mode:?}");
+            let window = failure_window(&op_manager);
+            match mode {
+                LabelMode::Current => assert_eq!(
+                    window,
+                    vec![(Some(nf_addr), 1.0), (Some(found_addr), 0.0)],
+                    "{mode:?}"
+                ),
+                // No attempt label; the success is credited to the driver's
+                // own `current_target`, not the hop that delivered.
+                LabelMode::Legacy => {
+                    assert_eq!(window, vec![(Some(second_addr), 0.0)], "{mode:?}");
+                }
+            }
+        }
+    }
+
     /// Source pin: the client GET driver gets a live recorder, the sub-op
     /// driver a disabled one, and the originator-loopback relay reports the
     /// hop it really forwards to before dispatching.
     #[test]
     fn get_drivers_wire_the_recorder_and_the_hop_registry() {
+        use crate::operations::route_attempt::driver_test_support::production_fn_body;
         let src = include_str!("op_ctx_task.rs");
-        let body = |sig: &str| -> String {
-            let start = src.find(sig).expect("signature present");
-            let test_mod = src.find("#[cfg(test)]\nmod tests {").expect("test module");
-            assert!(start < test_mod, "`{sig}` matched inside the test module");
-            let end = src[start..].find("\n}\n").expect("fn end") + start;
-            src[start..end].to_string()
-        };
+        let body = |sig: &str| production_fn_body(src, sig);
         let client = body("async fn drive_client_get_inner(");
         assert!(client.contains("recorder: RouteAttemptRecorder::new("));
         let sub_op = body("async fn drive_sub_op_get(");

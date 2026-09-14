@@ -388,7 +388,7 @@ async fn drive_client_put_inner(
         /// `attempt_timeout`. `None` for non-streaming PUTs (fixed deadline,
         /// behaviour unchanged).
         stream_progress: Option<crate::operations::stream_progress::StreamProgress>,
-        /// Labels every non-success attempt for the router (#4485): PUT has no
+        /// Labels every non-success attempt for the router (#5657): PUT has no
         /// `NotFound`, so in practice timeouts and dropped connections.
         recorder: crate::operations::route_attempt::RouteAttemptRecorder,
         /// The peer the `Terminal` attempt was actually forwarded to, as
@@ -564,10 +564,18 @@ async fn drive_client_put_inner(
             // route_outcome telemetry fail.
             //
             // Credited to the hop the successful attempt was actually
-            // forwarded to (#4485), and ONLY when one was recorded: a local
+            // forwarded to (#5657), and ONLY when one was recorded: a local
             // completion, or a loopback relay that finalized the PUT locally
             // after a failed dispatch, contacted no peer and credits nobody.
-            if let Some(hop) = driver.terminal_hop.clone() {
+            // Under `LabelMode::Legacy` the pre-#5657 attribution to
+            // `current_target` is restored.
+            let credited = match driver.recorder.mode() {
+                crate::operations::route_attempt::LabelMode::Legacy => {
+                    Some(driver.current_target.clone())
+                }
+                crate::operations::route_attempt::LabelMode::Current => driver.terminal_hop.clone(),
+            };
+            if let Some(hop) = credited {
                 let route_event = RouteEvent {
                     peer: hop,
                     contract_location: Location::from(&reply_key),
@@ -2194,7 +2202,7 @@ where
         // directly to the originator via the bypass.
         let local_hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
         // Tell the client driver's retry loop which peer this attempt really
-        // went to, so its outcome is attributed to that peer (#4485). Recorded
+        // went to, so its outcome is attributed to that peer (#5657). Recorded
         // before the dispatch so a reply can never beat it; cleared on every
         // local dispatch failure below (the PUT then finalizes locally and
         // must not blame a peer that never received it).
@@ -7961,7 +7969,7 @@ mod tests {
 }
 
 /// Driver-level tests for the originator PUT's per-attempt route labelling
-/// (#4485): the real `drive_client_put_inner` against a scripted event loop
+/// (#5657): the real `drive_client_put_inner` against a scripted event loop
 /// playing the originator-loopback relay.
 #[cfg(test)]
 mod route_attempt_driver_tests {
@@ -8070,30 +8078,44 @@ mod route_attempt_driver_tests {
         assert_eq!(failure_window(&op_manager).len(), attempts);
     }
 
-    /// #4485 H: a PUT that completes without a recorded hop (the loopback
+    /// #5657 H: a PUT that completes without a recorded hop (the loopback
     /// relay stored it locally and forwarded nowhere, or finalized locally
     /// after a failed dispatch) credits nobody.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn local_success_without_a_hop_credits_nobody() {
-        let (op_manager, rx, _peers, _guards) = op_manager_with_peers("put-local-success", 3).await;
-        let contract = contract();
-        let key = contract.key();
-        serve_attempts(
-            op_manager.clone(),
-            rx,
-            crate::message::TransactionType::Put,
-            move |_, msg, _| Step {
-                hop: None,
-                answer: Answer::Reply(stored(msg, key)),
-            },
-        );
-        let outcome = put(&op_manager, contract).await;
-        assert!(matches!(outcome, DriverOutcome::Publish(Ok(_))));
-        assert!(
-            failure_window(&op_manager).is_empty(),
-            "no peer was contacted, so no success may be credited: {:?}",
-            failure_window(&op_manager)
-        );
+        use crate::operations::route_attempt::{LabelMode, force_label_mode};
+        for mode in [LabelMode::Current, LabelMode::Legacy] {
+            let _mode = force_label_mode(mode);
+            let (op_manager, rx, _peers, _guards) =
+                op_manager_with_peers(&format!("put-local-success-{mode:?}"), 3).await;
+            let contract = contract();
+            let key = contract.key();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Put,
+                move |_, msg, _| Step {
+                    hop: None,
+                    answer: Answer::Reply(stored(msg, key)),
+                },
+            );
+            let outcome = put(&op_manager, contract).await;
+            assert!(matches!(outcome, DriverOutcome::Publish(Ok(_))), "{mode:?}");
+            let window = failure_window(&op_manager);
+            match mode {
+                LabelMode::Current => assert!(
+                    window.is_empty(),
+                    "no peer was contacted, so no success may be credited: {window:?}"
+                ),
+                // The kill switch restores the pre-#5657 credit to
+                // `current_target`.
+                LabelMode::Legacy => assert_eq!(
+                    window.iter().map(|(_, r)| *r).collect::<Vec<_>>(),
+                    vec![0.0],
+                    "legacy mode credits current_target: {window:?}"
+                ),
+            }
+        }
     }
 
     /// Attempts the loopback relay never forwarded blame nobody.
@@ -8123,12 +8145,11 @@ mod route_attempt_driver_tests {
     /// dispatching and clears it on each local dispatch failure.
     #[test]
     fn loopback_put_relay_records_and_clears_its_hop() {
-        let src = include_str!("op_ctx_task.rs");
-        let start = src
-            .find("async fn drive_relay_put<CB>(")
-            .expect("drive_relay_put");
-        let end = src[start..].find("\n}\n").expect("fn end") + start;
-        let body = &src[start..end];
+        use crate::operations::route_attempt::driver_test_support::production_fn_body;
+        let body = production_fn_body(
+            include_str!("op_ctx_task.rs"),
+            "async fn drive_relay_put<CB>(",
+        );
         let loopback = body.find("if originator_loopback {").expect("loopback");
         let record = body[loopback..]
             .find(".record_hop(&incoming_tx, &next_peer);")
@@ -8149,6 +8170,10 @@ mod route_attempt_driver_tests {
         let clears = body[loopback..loopback_end]
             .matches(".clear_hop(&incoming_tx);")
             .count();
+        assert!(
+            failures > 0,
+            "the loopback branch has local dispatch failures"
+        );
         assert_eq!(
             failures, clears,
             "every local dispatch failure in the loopback branch must clear the hop"

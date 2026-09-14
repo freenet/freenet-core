@@ -1,5 +1,5 @@
 //! Per-attempt route-outcome labelling for the router's failure-probability
-//! model (#4485).
+//! model (#5657).
 //!
 //! The router asks "if I route a request for this contract via this peer,
 //! will it deliver?". Before this module, the originator drivers for GET, PUT
@@ -24,12 +24,22 @@
 //! Each peer is labelled a failure at most ONCE per operation, however many
 //! times it timed out or answered `NotFound` within it.
 //!
-//! Failures here feed the router ONLY — never `peer_health` (whose 90 %
-//! failure-rate / zero-success criteria evict connections) and never the
-//! topology manager. A peer that promptly answers "I don't have this" is not
-//! an unhealthy connection, and an originator-side timeout covers the whole
-//! downstream chain, not just the first hop. See
-//! [`crate::ring::Ring::record_route_failure`].
+//! Failures here feed the router ONLY, never `peer_health` (whose 90 %
+//! failure-rate / zero-success criteria evict connections). A peer that
+//! promptly answers "I don't have this" is not an unhealthy connection, and an
+//! originator-side timeout covers the whole downstream chain, not just the
+//! first hop: CHAIN BLAME, accepted for router-only labels and watched through
+//! the `timeout_label_*` histogram on the router snapshot. The failure inputs
+//! `peer_health` always had (a GET stream that never arrived, a client GET
+//! whose delivery failed) are kept separately; see
+//! [`crate::ring::Ring::report_route_failure_to_peer_health`].
+//!
+//! Only a REMOTE reply is proof that the contract exists: a Found or a
+//! streaming header from a peer this operation contacted. This node's own
+//! copy, a local completion or later evidence proves nothing.
+//!
+//! `FREENET_ROUTING_LEGACY_LABELS=1` restores the pre-#5657 labels exactly
+//! ([`label_mode`]).
 //!
 //! # Attribution at the originator ([`AttemptHopRegistry`])
 //!
@@ -114,16 +124,89 @@ pub(crate) enum AttemptOrigin {
     Relay,
 }
 
-/// Where failure labels go. Implemented by [`crate::ring::Ring`] (router
-/// only); unit tests substitute a recording sink. `cause` is what the
-/// recorder was told about the attempt; it is counted, not trained on.
+/// Which labelling rules are in force. See [`label_mode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LabelMode {
+    /// The #5657 rules described in the module docs.
+    Current,
+    /// Exactly the labelling that shipped before #5657, restored by
+    /// `FREENET_ROUTING_LEGACY_LABELS=1`: originators label no attempt (only
+    /// their final outcome, against `current_target`), relays label a
+    /// downstream `NotFound` as `SuccessUntimed` and every transport failure
+    /// as `Failure`, and stream claims use `current_target`.
+    Legacy,
+}
+
+/// The labelling rules in force, from `FREENET_ROUTING_LEGACY_LABELS` (read
+/// once per process; `1`/`true`/`yes`/`on`, case-insensitive, selects
+/// [`LabelMode::Legacy`]; anything else, or unset, keeps
+/// [`LabelMode::Current`]). A kill switch for the soak: it restores the
+/// pre-#5657 router inputs without a rebuild.
+pub(crate) fn label_mode() -> LabelMode {
+    // Thread-local test override, for the same reason as the router's
+    // `residual_correction_enabled`: a process-global OnceLock is resolved by
+    // whichever test touches it first, which would make one branch untestable
+    // and let tests interfere under plain `cargo test`.
+    #[cfg(test)]
+    {
+        if let Some(mode) = TEST_LABEL_MODE.with(|cell| cell.get()) {
+            return mode;
+        }
+    }
+    static MODE: std::sync::OnceLock<LabelMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_legacy_labels(std::env::var("FREENET_ROUTING_LEGACY_LABELS").ok()))
+}
+
+/// Fail-safe parse of `FREENET_ROUTING_LEGACY_LABELS`: only an explicit
+/// affirmative value selects the legacy rules.
+fn parse_legacy_labels(value: Option<String>) -> LabelMode {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if matches!(v.as_str(), "1" | "true" | "yes" | "on") => LabelMode::Legacy,
+        _ => LabelMode::Current,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LABEL_MODE: std::cell::Cell<Option<LabelMode>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force a [`LabelMode`] on this thread until the guard drops. Test-only.
+#[cfg(test)]
+pub(crate) fn force_label_mode(mode: LabelMode) -> LabelModeGuard {
+    let previous = TEST_LABEL_MODE.with(|cell| cell.replace(Some(mode)));
+    LabelModeGuard { previous }
+}
+
+#[cfg(test)]
+pub(crate) struct LabelModeGuard {
+    previous: Option<LabelMode>,
+}
+
+#[cfg(test)]
+impl Drop for LabelModeGuard {
+    fn drop(&mut self) {
+        TEST_LABEL_MODE.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Where labels go. Implemented by [`crate::ring::Ring`] (router only); unit
+/// tests substitute a recording sink. `cause` is what the recorder was told
+/// about the attempt; it is counted, not trained on.
 pub(crate) trait RouteFailureSink: Send + Sync {
     fn record_route_failure(&self, event: RouteEvent, cause: AttemptFailure);
+    /// A non-failure event under [`LabelMode::Legacy`] (a relay's downstream
+    /// `NotFound` labelled `SuccessUntimed`). Router only.
+    fn record_legacy_route_event(&self, event: RouteEvent);
 }
 
 impl RouteFailureSink for crate::ring::Ring {
     fn record_route_failure(&self, event: RouteEvent, cause: AttemptFailure) {
         crate::ring::Ring::record_route_failure(self, event, cause);
+    }
+
+    fn record_legacy_route_event(&self, event: RouteEvent) {
+        crate::ring::Ring::record_route_event_router_only(self, event);
     }
 }
 
@@ -140,6 +223,7 @@ pub(crate) struct RouteAttemptRecorder {
     op_type: OpType,
     origin: AttemptOrigin,
     policy: AmbiguousNotFoundPolicy,
+    mode: LabelMode,
     pending_not_found: Vec<PeerKeyLocation>,
     /// Peers already labelled a failure in this operation. A peer is labelled
     /// at most once per operation.
@@ -154,33 +238,36 @@ impl RouteAttemptRecorder {
         op_type: OpType,
         origin: AttemptOrigin,
     ) -> Self {
-        Self::with_policy(
+        Self::with_rules(
             Some(sink),
             instance_id,
             op_type,
             origin,
             ambiguous_not_found_policy(),
+            label_mode(),
         )
     }
 
     /// A recorder that records nothing. Used by drivers that deliberately do
     /// not feed the router (sub-operation GETs).
     pub(crate) fn disabled(instance_id: ContractInstanceId, op_type: OpType) -> Self {
-        Self::with_policy(
+        Self::with_rules(
             None,
             instance_id,
             op_type,
             AttemptOrigin::Originator,
             ambiguous_not_found_policy(),
+            label_mode(),
         )
     }
 
-    pub(crate) fn with_policy(
+    pub(crate) fn with_rules(
         sink: Option<Arc<dyn RouteFailureSink>>,
         instance_id: ContractInstanceId,
         op_type: OpType,
         origin: AttemptOrigin,
         policy: AmbiguousNotFoundPolicy,
+        mode: LabelMode,
     ) -> Self {
         Self {
             sink,
@@ -188,10 +275,23 @@ impl RouteAttemptRecorder {
             op_type,
             origin,
             policy,
+            mode,
             pending_not_found: Vec::new(),
             failed: HashSet::new(),
             contract_known_to_exist: false,
         }
+    }
+
+    /// The labelling rules this recorder applies. Driver code that owns a
+    /// label outside the recorder (a terminal success, a stream claim) must
+    /// follow the same mode.
+    pub(crate) fn mode(&self) -> LabelMode {
+        self.mode
+    }
+
+    /// Whether this recorder feeds a router at all (false for sub-op GETs).
+    pub(crate) fn feeds_router(&self) -> bool {
+        self.sink.is_some()
     }
 
     /// Record a non-success outcome of one attempt.
@@ -199,14 +299,29 @@ impl RouteAttemptRecorder {
     /// `peer` is the peer the request was ACTUALLY sent to. `None` means no
     /// remote peer can be blamed and nothing is recorded — never substitute a
     /// guessed target here.
+    ///
+    /// `attributable` is false when the outcome is known not to be the peer's
+    /// doing under the current rules: a local callback drop, a disconnect of
+    /// some other peer, a renewal's clamped-budget timeout, a renewal
+    /// `NotFound`. Such outcomes are never labelled under
+    /// [`LabelMode::Current`]; under [`LabelMode::Legacy`] a relay labels them
+    /// as it did before #5657.
     pub(crate) fn record_attempt(
         &mut self,
         peer: Option<&PeerKeyLocation>,
         outcome: AttemptFailure,
+        attributable: bool,
     ) {
         let Some(peer) = peer else {
             return;
         };
+        if self.mode == LabelMode::Legacy {
+            self.record_legacy(peer, outcome);
+            return;
+        }
+        if !attributable {
+            return;
+        }
         match outcome {
             AttemptFailure::Timeout | AttemptFailure::SendFailure => {
                 self.emit_failure(peer.clone(), outcome);
@@ -222,10 +337,39 @@ impl RouteAttemptRecorder {
         }
     }
 
-    /// Evidence from THIS operation that the contract exists (a found reply, a
-    /// streaming header, a subscription, a local copy). Every pending
-    /// `NotFound` in this operation is a genuine routing failure; later ones
-    /// are labelled immediately. Idempotent.
+    /// Pre-#5657 labelling: originators label no attempt; a relay labels a
+    /// downstream `NotFound` `SuccessUntimed` and any transport failure
+    /// `Failure`, immediately.
+    fn record_legacy(&mut self, peer: &PeerKeyLocation, outcome: AttemptFailure) {
+        if self.origin != AttemptOrigin::Relay {
+            return;
+        }
+        match outcome {
+            AttemptFailure::Timeout | AttemptFailure::SendFailure => {
+                self.emit_failure(peer.clone(), outcome);
+            }
+            AttemptFailure::NotFound => {
+                let Some(sink) = &self.sink else {
+                    return;
+                };
+                crate::operations::count_relay_route_event(self.op_type);
+                sink.record_legacy_route_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: Location::from(&self.instance_id),
+                    outcome: RouteOutcome::SuccessUntimed,
+                    op_type: Some(self.op_type),
+                });
+            }
+        }
+    }
+
+    /// Evidence from THIS operation that the contract exists: a Found reply or
+    /// a streaming header from a REMOTE peer this operation actually contacted.
+    /// A local copy or a local completion is not proof (the copy may be stale
+    /// or held by this node alone). Every pending `NotFound` in this operation
+    /// is then a genuine routing failure; later ones are labelled immediately.
+    /// Idempotent. Has no effect under [`LabelMode::Legacy`], which never
+    /// holds pending `NotFound`s and never reads the flag.
     pub(crate) fn contract_exists(&mut self) {
         self.contract_known_to_exist = true;
         for peer in std::mem::take(&mut self.pending_not_found) {
@@ -558,6 +702,40 @@ pub(crate) mod driver_test_support {
         served
     }
 
+    /// The body of the PRODUCTION function whose signature starts with
+    /// `signature`, brace-matched. Panics when the signature is missing, is
+    /// found only inside a `#[cfg(test)] mod`, or matches more than once in
+    /// production code, so a moved or renamed function fails the pin loudly
+    /// instead of widening its region.
+    pub(crate) fn production_fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let production_end = source.find("#[cfg(test)]\nmod ").unwrap_or(source.len());
+        let production = &source[..production_end];
+        let matches = production.matches(signature).count();
+        assert_eq!(
+            matches, 1,
+            "`{signature}` must appear exactly once in production code (found {matches})"
+        );
+        let start = production.find(signature).unwrap();
+        let open = start
+            + source[start..]
+                .find('{')
+                .unwrap_or_else(|| panic!("`{signature}` has no body"));
+        let mut depth = 0usize;
+        for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open + 1..open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated body for `{signature}`");
+    }
+
     /// `(peer address, result)` for every event in the failure estimator's
     /// window; `1.0` = failure.
     pub(crate) fn failure_window(op_manager: &OpManager) -> Vec<(Option<SocketAddr>, f64)> {
@@ -585,11 +763,15 @@ mod tests {
     #[derive(Default)]
     struct VecSink {
         failures: Mutex<Vec<(RouteEvent, AttemptFailure)>>,
+        legacy: Mutex<Vec<RouteEvent>>,
     }
 
     impl RouteFailureSink for VecSink {
         fn record_route_failure(&self, event: RouteEvent, cause: AttemptFailure) {
             self.failures.lock().push((event, cause));
+        }
+        fn record_legacy_route_event(&self, event: RouteEvent) {
+            self.legacy.lock().push(event);
         }
     }
 
@@ -607,6 +789,16 @@ mod tests {
         fn causes(&self) -> Vec<AttemptFailure> {
             self.failures.lock().iter().map(|(_, c)| *c).collect()
         }
+        fn legacy_successes(&self) -> Vec<std::net::SocketAddr> {
+            self.legacy
+                .lock()
+                .iter()
+                .map(|e| {
+                    assert!(matches!(e.outcome, RouteOutcome::SuccessUntimed));
+                    e.peer.socket_addr().unwrap()
+                })
+                .collect()
+        }
     }
 
     fn id() -> ContractInstanceId {
@@ -618,14 +810,24 @@ mod tests {
         PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr)
     }
 
-    fn recorder(sink: &Arc<VecSink>, policy: AmbiguousNotFoundPolicy) -> RouteAttemptRecorder {
-        RouteAttemptRecorder::with_policy(
+    fn recorder_with(
+        sink: &Arc<VecSink>,
+        origin: AttemptOrigin,
+        policy: AmbiguousNotFoundPolicy,
+        mode: LabelMode,
+    ) -> RouteAttemptRecorder {
+        RouteAttemptRecorder::with_rules(
             Some(sink.clone() as Arc<dyn RouteFailureSink>),
             id(),
             OpType::Get,
-            AttemptOrigin::Originator,
+            origin,
             policy,
+            mode,
         )
+    }
+
+    fn recorder(sink: &Arc<VecSink>, policy: AmbiguousNotFoundPolicy) -> RouteAttemptRecorder {
+        recorder_with(sink, AttemptOrigin::Originator, policy, LabelMode::Current)
     }
 
     fn addr(p: &PeerKeyLocation) -> std::net::SocketAddr {
@@ -641,13 +843,50 @@ mod tests {
     }
 
     #[test]
+    fn legacy_labels_env_parsing_is_fail_safe() {
+        for value in ["1", "true", "TRUE", " yes ", "On"] {
+            assert_eq!(
+                parse_legacy_labels(Some(value.to_string())),
+                LabelMode::Legacy,
+                "{value:?}"
+            );
+        }
+        for value in ["0", "false", "", "2", "legacy", "enable"] {
+            assert_eq!(
+                parse_legacy_labels(Some(value.to_string())),
+                LabelMode::Current,
+                "{value:?}"
+            );
+        }
+        assert_eq!(parse_legacy_labels(None), LabelMode::Current);
+    }
+
+    #[test]
+    fn label_mode_override_is_scoped_to_its_guard() {
+        let outer = label_mode();
+        {
+            let _legacy = force_label_mode(LabelMode::Legacy);
+            assert_eq!(label_mode(), LabelMode::Legacy);
+            let sink = Arc::new(VecSink::default());
+            let rec = RouteAttemptRecorder::new(
+                sink as Arc<dyn RouteFailureSink>,
+                id(),
+                OpType::Get,
+                AttemptOrigin::Relay,
+            );
+            assert_eq!(rec.mode(), LabelMode::Legacy, "new() follows label_mode()");
+        }
+        assert_eq!(label_mode(), outer);
+    }
+
+    #[test]
     fn timeout_and_send_failure_are_labelled_immediately() {
         let sink = Arc::new(VecSink::default());
         let (a, b) = (peer(1), peer(2));
         let mut rec = recorder(&sink, AmbiguousNotFoundPolicy::Untrained);
-        rec.record_attempt(Some(&a), AttemptFailure::Timeout);
+        rec.record_attempt(Some(&a), AttemptFailure::Timeout, true);
         assert_eq!(sink.failed_peers(), vec![addr(&a)]);
-        rec.record_attempt(Some(&b), AttemptFailure::SendFailure);
+        rec.record_attempt(Some(&b), AttemptFailure::SendFailure, true);
         assert_eq!(sink.failed_peers(), vec![addr(&a), addr(&b)]);
         drop(rec);
         assert_eq!(sink.failed_peers().len(), 2, "drop must not re-emit");
@@ -655,6 +894,27 @@ mod tests {
             sink.causes(),
             vec![AttemptFailure::Timeout, AttemptFailure::SendFailure]
         );
+    }
+
+    #[test]
+    fn unattributable_outcomes_are_never_labelled_under_current_rules() {
+        for origin in [AttemptOrigin::Originator, AttemptOrigin::Relay] {
+            let sink = Arc::new(VecSink::default());
+            let a = peer(1);
+            let mut rec = recorder_with(
+                &sink,
+                origin,
+                AmbiguousNotFoundPolicy::Naive,
+                LabelMode::Current,
+            );
+            rec.record_attempt(Some(&a), AttemptFailure::SendFailure, false);
+            rec.record_attempt(Some(&a), AttemptFailure::Timeout, false);
+            rec.record_attempt(Some(&a), AttemptFailure::NotFound, false);
+            rec.contract_exists();
+            drop(rec);
+            assert!(sink.failed_peers().is_empty(), "{origin:?}");
+            assert!(sink.legacy_successes().is_empty(), "{origin:?}");
+        }
     }
 
     #[test]
@@ -666,13 +926,12 @@ mod tests {
             let sink = Arc::new(VecSink::default());
             let (a, b, c) = (peer(1), peer(2), peer(3));
             let mut rec = recorder(&sink, policy);
-            rec.record_attempt(Some(&a), AttemptFailure::NotFound);
-            rec.record_attempt(Some(&b), AttemptFailure::NotFound);
+            rec.record_attempt(Some(&a), AttemptFailure::NotFound, true);
+            rec.record_attempt(Some(&b), AttemptFailure::NotFound, true);
             assert!(sink.failed_peers().is_empty(), "{policy:?}: not yet proven");
             rec.contract_exists();
             assert_eq!(sink.failed_peers(), vec![addr(&a), addr(&b)], "{policy:?}");
-            // A NotFound after existence was proven is labelled immediately.
-            rec.record_attempt(Some(&c), AttemptFailure::NotFound);
+            rec.record_attempt(Some(&c), AttemptFailure::NotFound, true);
             rec.contract_exists();
             drop(rec);
             assert_eq!(
@@ -689,8 +948,8 @@ mod tests {
         let sink = Arc::new(VecSink::default());
         let (a, b) = (peer(1), peer(2));
         let mut rec = recorder(&sink, AmbiguousNotFoundPolicy::Untrained);
-        rec.record_attempt(Some(&a), AttemptFailure::NotFound);
-        rec.record_attempt(Some(&b), AttemptFailure::Timeout);
+        rec.record_attempt(Some(&a), AttemptFailure::NotFound, true);
+        rec.record_attempt(Some(&b), AttemptFailure::Timeout, true);
         drop(rec);
         assert_eq!(
             sink.failed_peers(),
@@ -704,15 +963,14 @@ mod tests {
         let sink = Arc::new(VecSink::default());
         let (a, b) = (peer(1), peer(2));
         let mut rec = recorder(&sink, AmbiguousNotFoundPolicy::Naive);
-        rec.record_attempt(Some(&a), AttemptFailure::NotFound);
-        rec.record_attempt(Some(&b), AttemptFailure::Timeout);
+        rec.record_attempt(Some(&a), AttemptFailure::NotFound, true);
+        rec.record_attempt(Some(&b), AttemptFailure::Timeout, true);
         assert_eq!(sink.failed_peers(), vec![addr(&b)]);
         drop(rec);
         assert_eq!(sink.failed_peers(), vec![addr(&b), addr(&a)]);
     }
 
-    /// A peer that fails several times in one operation (repeated timeouts,
-    /// repeated NotFounds, or a mix) is labelled a failure exactly once.
+    /// A peer that fails several times in one operation is labelled once.
     #[test]
     fn a_peer_is_labelled_at_most_once_per_operation() {
         for policy in [
@@ -722,15 +980,15 @@ mod tests {
             let sink = Arc::new(VecSink::default());
             let (a, b) = (peer(1), peer(2));
             let mut rec = recorder(&sink, policy);
-            rec.record_attempt(Some(&a), AttemptFailure::Timeout);
-            rec.record_attempt(Some(&a), AttemptFailure::Timeout);
-            rec.record_attempt(Some(&a), AttemptFailure::SendFailure);
-            rec.record_attempt(Some(&a), AttemptFailure::NotFound);
-            rec.record_attempt(Some(&b), AttemptFailure::NotFound);
-            rec.record_attempt(Some(&b), AttemptFailure::NotFound);
+            rec.record_attempt(Some(&a), AttemptFailure::Timeout, true);
+            rec.record_attempt(Some(&a), AttemptFailure::Timeout, true);
+            rec.record_attempt(Some(&a), AttemptFailure::SendFailure, true);
+            rec.record_attempt(Some(&a), AttemptFailure::NotFound, true);
+            rec.record_attempt(Some(&b), AttemptFailure::NotFound, true);
+            rec.record_attempt(Some(&b), AttemptFailure::NotFound, true);
             rec.contract_exists();
-            rec.record_attempt(Some(&b), AttemptFailure::NotFound);
-            rec.record_attempt(Some(&a), AttemptFailure::Timeout);
+            rec.record_attempt(Some(&b), AttemptFailure::NotFound, true);
+            rec.record_attempt(Some(&a), AttemptFailure::Timeout, true);
             drop(rec);
             assert_eq!(
                 sink.failed_peers(),
@@ -738,14 +996,61 @@ mod tests {
                 "{policy:?}: one failure per peer per operation"
             );
         }
-        // And for ambiguous NotFounds settled by the Naive policy.
         let sink = Arc::new(VecSink::default());
         let a = peer(1);
         let mut rec = recorder(&sink, AmbiguousNotFoundPolicy::Naive);
-        rec.record_attempt(Some(&a), AttemptFailure::NotFound);
-        rec.record_attempt(Some(&a), AttemptFailure::NotFound);
+        rec.record_attempt(Some(&a), AttemptFailure::NotFound, true);
+        rec.record_attempt(Some(&a), AttemptFailure::NotFound, true);
         drop(rec);
         assert_eq!(sink.failed_peers(), vec![addr(&a)]);
+    }
+
+    /// `FREENET_ROUTING_LEGACY_LABELS`: an originator labels no attempt at
+    /// all, and a relay labels exactly as before #5657 — a downstream
+    /// NotFound as SuccessUntimed (renewal or not, proof or not) and every
+    /// transport failure as Failure (attributable or not).
+    #[test]
+    fn legacy_mode_restores_pre_5657_labels() {
+        let sink = Arc::new(VecSink::default());
+        let (a, b) = (peer(1), peer(2));
+        let mut rec = recorder_with(
+            &sink,
+            AttemptOrigin::Originator,
+            AmbiguousNotFoundPolicy::Naive,
+            LabelMode::Legacy,
+        );
+        rec.record_attempt(Some(&a), AttemptFailure::Timeout, true);
+        rec.record_attempt(Some(&a), AttemptFailure::SendFailure, true);
+        rec.record_attempt(Some(&b), AttemptFailure::NotFound, true);
+        rec.contract_exists();
+        drop(rec);
+        assert!(
+            sink.failed_peers().is_empty(),
+            "legacy originators label nothing"
+        );
+        assert!(sink.legacy_successes().is_empty());
+
+        let sink = Arc::new(VecSink::default());
+        let (c, d, e) = (peer(3), peer(4), peer(5));
+        let mut rec = recorder_with(
+            &sink,
+            AttemptOrigin::Relay,
+            AmbiguousNotFoundPolicy::Untrained,
+            LabelMode::Legacy,
+        );
+        rec.record_attempt(Some(&a), AttemptFailure::NotFound, true);
+        rec.record_attempt(Some(&b), AttemptFailure::NotFound, false);
+        rec.record_attempt(Some(&c), AttemptFailure::SendFailure, false);
+        rec.record_attempt(Some(&d), AttemptFailure::Timeout, true);
+        rec.contract_exists();
+        rec.record_attempt(Some(&e), AttemptFailure::NotFound, true);
+        drop(rec);
+        assert_eq!(
+            sink.legacy_successes(),
+            vec![addr(&a), addr(&b), addr(&e)],
+            "every relay NotFound is a legacy SuccessUntimed"
+        );
+        assert_eq!(sink.failed_peers(), vec![addr(&c), addr(&d)]);
     }
 
     #[test]
@@ -755,9 +1060,9 @@ mod tests {
             let _untouched = recorder(&sink, AmbiguousNotFoundPolicy::Naive);
         }
         let mut rec = recorder(&sink, AmbiguousNotFoundPolicy::Naive);
-        rec.record_attempt(None, AttemptFailure::NotFound);
-        rec.record_attempt(None, AttemptFailure::Timeout);
-        rec.record_attempt(None, AttemptFailure::SendFailure);
+        rec.record_attempt(None, AttemptFailure::NotFound, true);
+        rec.record_attempt(None, AttemptFailure::Timeout, true);
+        rec.record_attempt(None, AttemptFailure::SendFailure, true);
         rec.contract_exists();
         drop(rec);
         assert!(sink.failed_peers().is_empty());
@@ -766,25 +1071,26 @@ mod tests {
     #[test]
     fn disabled_recorder_records_nothing() {
         let mut rec = RouteAttemptRecorder::disabled(id(), OpType::Get);
+        assert!(!rec.feeds_router());
         let a = peer(1);
-        rec.record_attempt(Some(&a), AttemptFailure::Timeout);
-        rec.record_attempt(Some(&a), AttemptFailure::NotFound);
+        rec.record_attempt(Some(&a), AttemptFailure::Timeout, true);
+        rec.record_attempt(Some(&a), AttemptFailure::NotFound, true);
         rec.contract_exists();
-        // No sink to observe: this pins that no path panics without one.
     }
 
     #[test]
     fn events_carry_contract_location_and_op_type() {
         let sink = Arc::new(VecSink::default());
         let a = peer(1);
-        let mut rec = RouteAttemptRecorder::with_policy(
+        let mut rec = RouteAttemptRecorder::with_rules(
             Some(sink.clone() as Arc<dyn RouteFailureSink>),
             id(),
             OpType::Subscribe,
             AttemptOrigin::Originator,
             AmbiguousNotFoundPolicy::Untrained,
+            LabelMode::Current,
         );
-        rec.record_attempt(Some(&a), AttemptFailure::Timeout);
+        rec.record_attempt(Some(&a), AttemptFailure::Timeout, true);
         let events = sink.failures.lock();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0.contract_location, Location::from(&id()));
@@ -797,7 +1103,6 @@ mod tests {
         let tx = Transaction::new::<GetMsg>();
         let a = peer(1);
 
-        // Unregistered tx: recording is a no-op and leaves nothing behind.
         registry.record_hop(&tx, &a);
         assert_eq!(registry.len(), 0);
 
@@ -811,7 +1116,6 @@ mod tests {
         drop(guard);
         assert_eq!(registry.len(), 0, "guard drop must remove the slot");
 
-        // A relay that records after the attempt resolved cannot leak.
         registry.record_hop(&tx, &a);
         assert_eq!(registry.len(), 0);
     }

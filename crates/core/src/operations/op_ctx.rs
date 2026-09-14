@@ -482,7 +482,7 @@ pub(crate) trait RetryDriver {
     }
 
     /// The recorder that labels this driver's non-success attempts for the
-    /// router's failure-probability model (#4485).
+    /// router's failure-probability model (#5657).
     ///
     /// Defaults to `None` (record nothing). When `Some`, [`drive_retry_loop`]
     /// reports every attempt that ended without a terminal reply to it,
@@ -513,7 +513,7 @@ fn record_attempt_failure<D: RetryDriver>(
     failure: crate::operations::route_attempt::AttemptFailure,
 ) {
     if let Some(recorder) = driver.attempt_recorder() {
-        recorder.record_attempt(hop.as_ref(), failure);
+        recorder.record_attempt(hop.as_ref(), failure, true);
     }
 }
 
@@ -721,7 +721,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 
         let request = driver.build_request(attempt_tx);
 
-        // Route attribution slot for this attempt (#4485). Registered BEFORE
+        // Route attribution slot for this attempt (#5657). Registered BEFORE
         // the send (Initialize-Before-Send): the originator-loopback relay that
         // picks the real first hop may run before `send_and_await` returns.
         // Dropped at the end of this iteration on every path, so a `continue`

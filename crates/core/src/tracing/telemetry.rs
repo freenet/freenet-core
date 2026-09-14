@@ -2704,6 +2704,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 // they never reach the collector — pinned by
                 // `router_snapshot_json_includes_fd_gauges`.
                 "open_fds": snapshot.open_fds,
+                // Chain-blame soak histogram (#5657); pinned by
+                // `router_snapshot_json_includes_timeout_label_histogram`.
+                "timeout_label_peers_1": snapshot.timeout_label_peers_1,
+                "timeout_label_peers_2_3": snapshot.timeout_label_peers_2_3,
+                "timeout_label_peers_4_7": snapshot.timeout_label_peers_4_7,
+                "timeout_label_peers_8_plus": snapshot.timeout_label_peers_8_plus,
+                "timeout_label_max_per_peer": snapshot.timeout_label_max_per_peer,
+                "timeout_labels_untracked": snapshot.timeout_labels_untracked,
                 "fd_soft_limit": snapshot.fd_soft_limit,
                 "contract_module_cache_entries": snapshot.contract_module_cache_entries,
                 "contract_module_cache_total_bytes": snapshot.contract_module_cache_total_bytes,
@@ -3473,6 +3481,31 @@ mod tests {
     /// hand-written `json!` block, so a new `RouterSnapshotInfo` field is
     /// silently dropped from central telemetry unless it is added there too
     /// (the #4009/#4010 manually-mirrored-telemetry footgun). See #4440.
+    #[test]
+    fn router_snapshot_json_includes_timeout_label_histogram() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.timeout_label_peers_1 = Some(11);
+        info.timeout_label_peers_2_3 = Some(12);
+        info.timeout_label_peers_4_7 = Some(13);
+        info.timeout_label_peers_8_plus = Some(14);
+        info.timeout_label_max_per_peer = Some(15);
+        info.timeout_labels_untracked = Some(16);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (field, value) in [
+            ("timeout_label_peers_1", 11),
+            ("timeout_label_peers_2_3", 12),
+            ("timeout_label_peers_4_7", 13),
+            ("timeout_label_peers_8_plus", 14),
+            ("timeout_label_max_per_peer", 15),
+            ("timeout_labels_untracked", 16),
+        ] {
+            assert_eq!(json[field], value, "{field} must reach the OTLP body");
+        }
+    }
+
     #[test]
     fn router_snapshot_json_includes_fd_gauges() {
         use arbitrary::{Arbitrary, Unstructured};

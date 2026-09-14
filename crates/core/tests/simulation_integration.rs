@@ -9028,7 +9028,7 @@ fn test_relay_route_events_multihop() {
     );
 }
 
-/// #4485: route attempts feed the router the right labels, per node.
+/// #5657: route attempts feed the router the right labels, per node.
 ///
 /// Before the fix a relay recorded a downstream `NotFound` as a SUCCESS and
 /// originators recorded only their final success, so a production gateway saw
@@ -9085,7 +9085,9 @@ fn test_router_receives_failures_for_dead_end_gets() {
         // decides which of its GETs lands in that dead window; at 15 s it is a
         // first-round GET, which this test does not require to resolve. Its
         // first-round timeouts are genuine routing failures caused by that bug,
-        // so the timeout assertion below excludes the node.
+        // so the timeout assertion below excludes the node. The #5654 fix
+        // (PR #5656) may remove that failure mode; revisit this exclusion
+        // and the spacing when it lands.
         sim.with_controlled_op_interval(Duration::from_secs(15));
         let mut ops = Vec::new();
         operations(&mut ops);
@@ -9228,16 +9230,25 @@ fn test_router_receives_failures_for_dead_end_gets() {
     );
     let (all_failures, all_successes) = evidence.aggregate_route_outcome_totals();
     assert!(all_successes > 0, "routers must receive success labels");
-    // #5654's node (see the spacing comment) times out for its own reasons.
-    let crash_timeouts: u64 = per_node
+    // Per node: of the nodes that were neither crashed nor #5654's node (see
+    // the spacing comment), at least MIN_NODES_WITH_TIMEOUT_LABELS must have
+    // fed their OWN router a timeout or send-failure label.
+    const MIN_NODES_WITH_TIMEOUT_LABELS: usize = 2;
+    let eligible: Vec<_> = per_node
         .iter()
         .filter(|(i, _, _)| !crashed.contains(i) && *i != num_nodes)
-        .map(|(_, (_, timeout, send_failure), _)| timeout + send_failure)
-        .sum();
+        .collect();
+    let labelled: Vec<usize> = eligible
+        .iter()
+        .filter(|(_, (_, timeout, send_failure), _)| timeout + send_failure > 0)
+        .map(|(i, _, _)| *i)
+        .collect();
     assert!(
-        crash_timeouts > 0,
-        "GETs forwarded into crashed peers must reach the routers as timeout \
-         failures (failures={all_failures}, per node={per_node:?})"
+        labelled.len() >= MIN_NODES_WITH_TIMEOUT_LABELS,
+        "at least {MIN_NODES_WITH_TIMEOUT_LABELS} of the {} eligible nodes must \
+         label a timeout or send failure after the crash; labelled: {labelled:?} \
+         (failures={all_failures}, per node={per_node:?})",
+        eligible.len()
     );
 }
 
