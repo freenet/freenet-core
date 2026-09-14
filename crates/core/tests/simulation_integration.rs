@@ -8313,6 +8313,112 @@ fn test_connect_despite_nat_partition() {
 }
 
 // =============================================================================
+// Gateway Zombie Sweep vs. an Unjoined Peer's Live Link (#5654)
+// =============================================================================
+
+/// Regression test for #5654: the gateway's zombie-transport sweep must not
+/// collect a link that a peer which cannot join the ring is still using.
+///
+/// **The bug.** With this seed, one node's every CONNECT is rejected (a
+/// saturated neighbourhood), so its gateway transport is its only route and is
+/// never in the gateway's ring. The gateway's zombie sweep judged that
+/// transport purely by AGE (`> 3 × transient_ttl`, 90s by default) and dropped
+/// it. The transport has no close message, so the peer was never told; it
+/// exempts its own gateway links from zombie cleanup and only notices a dead
+/// link after its 120s idle timeout. GETs it sent into the dead link timed out
+/// and reported NotFound for a contract that exists.
+///
+/// **The scenario.** 1 gateway + 12 nodes. Every node GETs a contract that has
+/// not been PUT yet, the gateway PUTs it, then every node GETs it again, with
+/// operations 5s apart. The second round is what is checked: every node must
+/// end up holding the state. At 5s spacing the last node's second-round GET
+/// lands inside the dead-link window on the unfixed base (the sweep dropping
+/// the link was confirmed as the cause by disabling the sweep, which made this
+/// pass). At 15s spacing a first-round GET lands there instead, which this
+/// assertion cannot see, so the spacing is load-bearing.
+#[test_log::test]
+fn test_gateway_zombie_sweep_keeps_unjoined_peers_live_link() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4485_0000_0001;
+    const NETWORK_NAME: &str = "gw-zombie-live-link";
+    let num_nodes = 12;
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new(
+            NETWORK_NAME,
+            1,         // gateways
+            num_nodes, // nodes
+            4,         // ring_max_htl
+            2,         // rnd_if_htl_above
+            5,         // max_connections
+            3,         // min_connections
+            SEED,
+        )
+        .await
+    });
+    sim.with_controlled_op_interval(Duration::from_secs(5));
+
+    let contract = SimOperation::create_test_contract(0x85);
+    let contract_id = *contract.key().id();
+    register_crdt_contract(contract_id);
+
+    let get_round = |ops: &mut Vec<ScheduledOperation>| {
+        for i in 1..=num_nodes {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(NETWORK_NAME, i),
+                SimOperation::Get {
+                    contract_id,
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+    };
+    let mut operations = Vec::new();
+    get_round(&mut operations);
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0x85),
+            subscribe: true,
+        },
+    ));
+    get_round(&mut operations);
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(900),
+        Duration::from_secs(180),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let key = contract.key();
+    let nodes_without_state: Vec<usize> = (1..=num_nodes)
+        .filter(|i| {
+            result
+                .node_storages
+                .get(&NodeLabel::node(NETWORK_NAME, *i))
+                .is_none_or(|s| s.get_stored_state(&key).is_none())
+        })
+        .collect();
+    assert!(
+        nodes_without_state.is_empty(),
+        "every second-round GET for a PUT contract must deliver state; nodes \
+         without state: {nodes_without_state:?} (#5654: the gateway's zombie \
+         sweep dropped an unjoined peer's only, still-used link)"
+    );
+}
+
+// =============================================================================
 // Connection Growth Stall Regression Test (PRs #3408, #3398, #3396, #3380)
 // =============================================================================
 
