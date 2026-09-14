@@ -328,11 +328,13 @@ struct Block {
 
 /// A monotone piecewise-linear curve.
 ///
-/// PAV and interpolation follow `pav_regression` 0.7 exactly (equal-`x` points
-/// ordered by descending `y` so they pool; queries outside the block range
-/// extrapolate along the line through the end block and the input centroid),
-/// pinned by `curve_matches_pav_regression`. Reimplemented because the crate
-/// re-sorts its input on every fit and the window here is already sorted.
+/// PAV and interpolation follow `pav_regression` 0.7 (queries outside the block
+/// range extrapolate along the line through the end block and the input
+/// centroid), pinned by `curve_matches_pav_regression`. One deliberate
+/// difference: equal-`x` points are ordered to pool in the curve's direction
+/// (see [`window_order`]), where the crate orders them by descending `y` for
+/// both. Reimplemented because the crate re-sorts its input on every fit and
+/// the window here is already sorted.
 #[derive(Debug, Clone)]
 struct Curve {
     /// Blocks in ascending `x`.
@@ -344,7 +346,9 @@ struct Curve {
 }
 
 impl Curve {
-    /// PAV over points already sorted by `(x asc, y desc)`.
+    /// PAV over points already in [`window_order`] for `ascending`: `x`
+    /// ascending, ties by `y` descending for an ascending curve and ascending
+    /// for a descending one.
     fn pav(points: impl Iterator<Item = Block>, ascending: bool) -> Option<Curve> {
         let mut blocks: Vec<Block> = Vec::new();
         let (mut sum_x, mut sum_y, mut sum_w) = (0.0, 0.0, 0.0);
@@ -382,7 +386,7 @@ impl Curve {
         })
     }
 
-    /// The shrunk curve over `window`, sorted by `(x, -y)`, using the one-way
+    /// The shrunk curve over `window` (in [`window_order`] for the target), using the one-way
     /// random-effects method of moments over the PAV blocks (module docs).
     fn fit_shrunk(window: &[Event], target: Target) -> Option<Curve> {
         if window.len() < target.min_curve_points() {
@@ -668,10 +672,17 @@ impl Level {
         self.orphan_w2 = orphan_w2;
     }
 
+    /// Drop a peer's node. Its events stay in the root (they are still in the
+    /// window) and become orphans, each a singleton peer and cell in the root's
+    /// squared-count sums, exactly as the next rebuild will count them. Taking
+    /// the node's squares out without adding the singletons back would
+    /// understate the root's noise until then.
     fn evict(&mut self, slot: usize) {
         if let Some(node) = self.nodes.get_mut(slot) {
-            self.sq_peers -= node.peer.n * node.peer.n;
-            self.sq_cells -= node.sq_cells;
+            let singletons = node.peer.w2;
+            self.sq_peers += singletons - node.peer.n * node.peer.n;
+            self.sq_cells += singletons - node.sq_cells;
+            self.orphan_w2 += singletons;
             *node = PeerNode::default();
         }
     }
@@ -1098,16 +1109,25 @@ impl ResidualShape {
             };
             let cell = node.cells[event.band as usize & (BANDS - 1)];
             let cell_n = cell.effective_n();
-            if cell_n < min_cell_events.max(2.0) {
+            if cell_n < min_cell_events.max(3.0) {
                 continue;
             }
-            // A deviation about the cell's own mean has variance scaled by
-            // (n-1)/n; rescale so cells of different sizes pool on one scale.
-            let e = (event.residual - cell.mean()) * (cell_n / (cell_n - 1.0)).sqrt();
+            // Deviations about a cell's own mean shrink its moments: the second
+            // by (n-1)/n and the third by (n-1)(n-2)/n^2. Each is reweighted by
+            // the inverse (the unbiased k-statistic factors), so cells of
+            // different sizes pool on one scale and a small cell's skewness is
+            // not understated. The fourth moment uses the second-moment
+            // rescaling only; its exact correction (the h-statistic) needs
+            // per-cell second moments too, so excess kurtosis still reads a
+            // little low in small cells (5.1 against a truth of 6 at n = 10 on
+            // exponential data), which is small beside the >1 departures the
+            // verdict looks for.
+            let raw = event.residual - cell.mean();
+            let e = raw * (cell_n / (cell_n - 1.0)).sqrt();
             let e2 = e * e;
             n += 1;
             m2 += e2;
-            m3 += e2 * e;
+            m3 += raw * raw * raw * cell_n * cell_n / ((cell_n - 1.0) * (cell_n - 2.0));
             m4 += e2 * e2;
         }
         if n < Self::MIN_EVENTS || m2 <= 0.0 {

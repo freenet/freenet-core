@@ -545,6 +545,92 @@ fn a_stale_secondary_band_does_not_bias_tau2_cell() {
     );
 }
 
+/// Right after an eviction, before any refit, the root's squared-count sums
+/// must already count the evicted peer's events as orphan singletons, exactly
+/// as the next rebuild will. Compared against that rebuild (no-forgetting
+/// level, so weights are 1 on both sides) rather than a recount, which reads
+/// the same `orphan_w2` it would be checking.
+#[test]
+fn eviction_folds_the_evicted_peer_into_orphans_before_the_next_refit() {
+    let _guard = GlobalRng::seed_guard(0x4485_0e71);
+    let mut stage: Stage<u32> = Stage::with_limits(Target::LogResponseTime, 10_000, 64);
+    let mut scratch = Scratch::default();
+    // Fill the table with 64 peers, several events each, then refit.
+    for i in 0..640u32 {
+        stage.observe(
+            &mut scratch,
+            &(i % 64),
+            uniform(),
+            uniform() * 0.5,
+            normal(),
+            0.0,
+        );
+    }
+    stage.refit(&mut scratch, 0.0);
+    assert_eq!(stage.levels[0].orphan_w2, 0.0);
+    // One new peer evicts the least-recently-used batch, with no refit after.
+    stage.observe(&mut scratch, &999, 0.3, 0.2, normal(), 0.0);
+    assert!(stage.peers.evictions > 0, "the scenario must evict");
+    assert!(stage.since_refit > 0, "and must not have refitted since");
+    let live = &stage.levels[0];
+    let (live_peers, live_cells, live_orphans) = (live.sq_peers, live.sq_cells, live.orphan_w2);
+    assert!(
+        live_orphans > 0.0,
+        "evicted events must be folded in as orphans"
+    );
+
+    stage.refit(&mut scratch, 0.0);
+    let rebuilt = &stage.levels[0];
+    assert!(
+        (live_peers - rebuilt.sq_peers).abs() < 1e-9
+            && (live_cells - rebuilt.sq_cells).abs() < 1e-9
+            && (live_orphans - rebuilt.orphan_w2).abs() < 1e-9,
+        "incremental after eviction ({live_peers}, {live_cells}, {live_orphans}) must equal \
+         the rebuild ({}, {}, {})",
+        rebuilt.sq_peers,
+        rebuilt.sq_cells,
+        rebuilt.orphan_w2
+    );
+}
+
+/// A peer holding all but a sliver of the root's weight leaves a leave-one-out
+/// rest that is cancellation noise. At a 1.5h horizon one active peer's events
+/// weigh ~1 while every other peer's are 30 hours stale (~2e-9 each), so the
+/// rest is ~1e-9 of the root. Without `ROOT_REST_FLOOR` that peer's contrast is
+/// read from the noise and `tau2_peer` comes out far from its truth of zero.
+#[test]
+fn a_dominant_peer_does_not_read_cancellation_noise_into_tau2_peer() {
+    let _guard = GlobalRng::seed_guard(0x4485_f100);
+    let (horizon, now) = (1.5, 30.0);
+    let mut level = Level::new(Some(horizon));
+    level.reset(now);
+    for band in 0..BANDS {
+        for _ in 0..200 {
+            let t = now - uniform() * 0.5;
+            level.add(Some(0), band, level.weight(t), 5.0 + normal());
+        }
+    }
+    for slot in 1..40 {
+        for band in 0..BANDS {
+            for _ in 0..5 {
+                level.add(Some(slot), band, level.weight(0.0), 5.0 + normal());
+            }
+        }
+    }
+    level.recount_squares();
+    let dominant = level.nodes[0].peer;
+    assert!(
+        level.root.n - dominant.n < ROOT_REST_FLOOR * level.root.n,
+        "the scenario must put the rest under the floor, or this test proves nothing"
+    );
+    let c = level.compute_components().expect("components exist");
+    assert!(
+        c.tau2_peer < 0.05,
+        "no peer effect exists; a dominant peer must not create one, got {}",
+        c.tau2_peer
+    );
+}
+
 /// A peer seen in one band only has no other cell to contrast against.
 #[test]
 fn single_band_peers_do_not_inform_tau2_cell() {
@@ -1083,7 +1169,10 @@ fn expected_timing_is_bounded_for_an_unknown_peer() {
     );
 }
 
-/// The hot structs stay at the sizes the published memory budget uses.
+/// The hot structs stay at the sizes the published memory budget uses. Exact
+/// only on 64-bit targets, where the budget was measured; the compile-time
+/// upper bounds apply everywhere.
+#[cfg(target_pointer_width = "64")]
 #[test]
 fn struct_sizes_match_the_memory_budget() {
     assert_eq!(std::mem::size_of::<Event>(), EVENT_BYTES);
@@ -1558,8 +1647,9 @@ fn shape_inputs(cells: &[(usize, usize, Vec<f64>)]) -> (Vec<Prepared>, Level) {
     (prepared, level)
 }
 
-/// Exponential log residuals have skewness 2 and excess kurtosis 6; the
-/// diagnostic must read them, not a value shrunk by the cell-mean centring.
+/// Exponential log residuals have skewness 2 and excess kurtosis 6. In
+/// 50-event cells the centring's shrinkage is already small; the n = 10 case is
+/// `residual_shape_skewness_is_unbiased_in_ten_event_cells`.
 #[test]
 fn residual_shape_recovers_the_moments_of_exponential_data() {
     let _guard = GlobalRng::seed_guard(0x4485_e8b0);
@@ -1581,15 +1671,42 @@ fn residual_shape_recovers_the_moments_of_exponential_data() {
     );
 }
 
-/// The per-cell minimum: deviations about a SMALL cell's mean shrink a skewed
-/// distribution's skewness (to ~0.4x at three events), and rescaling cannot fix
-/// a shape change. Most events here sit in three-event cells, so without the
-/// minimum the diagnostic would read exponential data as nearly symmetric.
+/// At the smallest contributing cell size, n = 10, centring shrinks the raw
+/// third moment to (n-1)(n-2)/n^2 = 0.72 of its value, so exponential data read
+/// about 1.7 instead of 2. The k-statistic weighting must recover 2.
+#[test]
+fn residual_shape_skewness_is_unbiased_in_ten_event_cells() {
+    let _guard = GlobalRng::seed_guard(0x4485_e810);
+    let cells: Vec<(usize, usize, Vec<f64>)> = (0..6_000)
+        .map(|i| {
+            let values = (0..10)
+                .map(|_| -uniform().max(f64::MIN_POSITIVE).ln())
+                .collect();
+            (i / BANDS, i % BANDS, values)
+        })
+        .collect();
+    let shape = shape_of(&cells);
+    let skew = shape.skewness.unwrap();
+    let kurtosis = shape.excess_kurtosis.unwrap();
+    eprintln!("n=10 exponential cells: skewness {skew}, excess kurtosis {kurtosis}");
+    assert!((skew - 2.0).abs() < 0.12, "skewness {skew} (truth 2)");
+    // Kurtosis keeps a documented residual shrink at n = 10; it must still
+    // read far past the verdict's threshold of 1.
+    assert!(
+        kurtosis > 4.0,
+        "excess kurtosis {kurtosis} (truth 6, documented shrink)"
+    );
+}
+
+/// The per-cell minimum: for skewed data, centring on a three-event cell's
+/// own mean shrinks the fourth moment far more than any rescaling of the
+/// second can undo, so exponential data (excess kurtosis 6) would read as
+/// barely heavy-tailed. Most events here sit in three-event cells.
 #[test]
 fn residual_shape_ignores_cells_too_small_to_show_their_shape() {
     let _guard = GlobalRng::seed_guard(0x4485_e8b3);
     let exponential = || -uniform().max(f64::MIN_POSITIVE).ln();
-    let mut cells: Vec<(usize, usize, Vec<f64>)> = (0..20_000)
+    let mut cells: Vec<(usize, usize, Vec<f64>)> = (0..30_000)
         .map(|i| {
             (
                 i / BANDS,
@@ -1598,48 +1715,54 @@ fn residual_shape_ignores_cells_too_small_to_show_their_shape() {
             )
         })
         .collect();
-    cells.extend((0..300).map(|i| {
+    cells.extend((0..600).map(|i| {
         (
-            20_000 / BANDS + 1 + i / BANDS,
+            30_000 / BANDS + 1 + i / BANDS,
             i % BANDS,
             (0..50).map(|_| exponential()).collect(),
         )
     }));
-    let skew = shape_of(&cells).skewness.unwrap();
+    let guarded = shape_of(&cells).excess_kurtosis.unwrap();
     assert!(
-        (skew - 2.0).abs() < 0.3,
-        "skewness {skew} must read the truth, 2"
+        guarded > 4.0,
+        "excess kurtosis {guarded} must read the heavy tail (truth 6)"
     );
-    let unguarded = shape_with(&cells, 2.0).skewness.unwrap();
+    let unguarded = shape_with(&cells, 3.0).excess_kurtosis.unwrap();
     assert!(
-        unguarded < 1.4,
-        "sanity: small cells must distort the reading, or this test proves nothing ({unguarded})"
+        unguarded < guarded - 1.5,
+        "sanity: three-event cells must distort the reading, or this test proves nothing \
+         (unguarded {unguarded}, guarded {guarded})"
     );
 }
 
 /// The rescaling: deviations about an n-event cell's mean have variance
-/// (n-1)/n. With the per-cell minimum lowered so it cannot hide the effect,
-/// pooling two-event cells with 500-event cells is a scale mixture that reads
-/// as excess kurtosis unless each deviation is rescaled.
+/// (n-1)/n. Normal deviations stay normal whatever the cell size, so the only
+/// thing that can distort pooled normal data is the SCALE: three-event cells
+/// at variance 2/3 pooled with 500-event cells at variance 1 are a scale
+/// mixture reading about +0.12 excess kurtosis unless each deviation is
+/// rescaled. The per-cell minimum is lowered so it cannot hide the effect.
 #[test]
 fn residual_shape_rescales_deviations_so_mixed_cell_sizes_pool() {
     let _guard = GlobalRng::seed_guard(0x4485_3c12);
-    let mut cells: Vec<(usize, usize, Vec<f64>)> = (0..25_000)
-        .map(|i| (i / BANDS, i % BANDS, (0..2).map(|_| normal()).collect()))
+    let mut cells: Vec<(usize, usize, Vec<f64>)> = (0..40_000)
+        .map(|i| (i / BANDS, i % BANDS, (0..3).map(|_| normal()).collect()))
         .collect();
-    cells.extend((0..100).map(|i| {
+    cells.extend((0..240).map(|i| {
         (
-            25_000 / BANDS + 1 + i / BANDS,
+            40_000 / BANDS + 1 + i / BANDS,
             i % BANDS,
             (0..500).map(|_| normal()).collect(),
         )
     }));
-    let kurtosis = shape_with(&cells, 2.0).excess_kurtosis.unwrap();
+    let shape = shape_with(&cells, 3.0);
+    let kurtosis = shape.excess_kurtosis.unwrap();
     assert!(
-        kurtosis.abs() < 0.1,
+        kurtosis.abs() < 0.05,
         "rescaled deviations from mixed cell sizes must read normal, got excess kurtosis {kurtosis}"
     );
+    assert!(shape.skewness.unwrap().abs() < 0.05);
 }
+
 /// Normal residuals in cells of very different sizes: small cells' centred
 /// deviations are non-normal and under-dispersed, so without the rescaling and
 /// the per-cell minimum they drag excess kurtosis negative.
