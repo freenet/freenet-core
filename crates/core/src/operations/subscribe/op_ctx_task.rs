@@ -4071,7 +4071,7 @@ mod route_attempt_driver_tests {
     use super::*;
     use crate::message::MessageStats;
     use crate::operations::route_attempt::driver_test_support::{
-        Answer, Step, failed_addrs, op_manager_with_peers, serve_attempts,
+        Answer, Step, failed_addrs, op_manager_with_peers, recorded_sources, serve_attempts,
     };
     use parking_lot::Mutex;
 
@@ -4298,6 +4298,15 @@ mod route_attempt_driver_tests {
             let forwarded = downstream.lock().expect("the relay forwarded downstream");
             let expected = if case == 2 { vec![forwarded] } else { vec![] };
             assert_eq!(failed_addrs(&op_manager), expected, "{label}");
+            let expected_sources: Vec<_> = expected
+                .iter()
+                .map(|a| (Some(*a), crate::router::dataset::RouteSource::Relay))
+                .collect();
+            assert_eq!(
+                recorded_sources(&op_manager),
+                expected_sources,
+                "{label}: a relay's labels are relay observations"
+            );
         }
     }
 

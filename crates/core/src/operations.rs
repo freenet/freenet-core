@@ -923,15 +923,17 @@ pub(crate) fn record_relay_route_event(
 ) {
     count_relay_route_event(op_type);
     // Feed only the routing model, NOT peer_health or topology_manager. See
-    // `Ring::record_route_event_router_only` for why.
-    op_manager
-        .ring
-        .record_route_event_router_only(crate::router::RouteEvent {
+    // `Ring::record_route_event_router_only` for why. Tagged `Relay` for the
+    // routing dataset (#5648).
+    op_manager.ring.record_route_event_router_only(
+        crate::router::RouteEvent {
             peer: next_hop,
             contract_location,
             outcome,
             op_type: Some(op_type),
-        });
+        },
+        crate::router::dataset::RouteSource::Relay,
+    );
 }
 
 /// Advance the per-op-type `RELAY_*_ROUTE_EVENT_COUNT` test hook. A no-op in

@@ -2567,7 +2567,53 @@ mod tests {
         );
         assert!(
             html.contains("64.0 MB / 256.0 MB"),
-            "RAM used/budget tile — got:\n{html}"
+            "contract-state used/budget tile — got:\n{html}"
+        );
+        // This tile was labelled "RAM used" until 2026-09 and it is not RAM: it
+        // is tracked contract STATE bytes against a ceiling on that state. An
+        // operator read it as resident memory and reported a 4 GB node "near
+        // full" while the process was using under 1 GB.
+        //
+        // Assert the whole label ELEMENT, not the phrase: the tooltip on this
+        // same tile contains "contract state" in prose, so an unanchored
+        // `contains` would survive deleting the label itself.
+        assert!(
+            html.contains(r#"<div class="g-norm-label">Contract state</div>"#),
+            "state tile must be labelled as contract state, not memory — got:\n{html}"
+        );
+        // Pin the INVARIANT, not one spelling of its violation: any memory word
+        // in this label re-creates the confusion, not just the string that
+        // shipped. (`.claude/rules/browser-assets.md` rule 2.)
+        for banned in [
+            "RAM used",
+            "Memory used",
+            "Mem used",
+            "RSS used",
+            "RAM",
+            "RSS",
+        ] {
+            assert!(
+                !html.contains(&format!(">{banned}<")),
+                "the state tile must not be labelled {banned:?}: it measures contract \
+                 state bytes, not the node's resident memory — got:\n{html}"
+            );
+        }
+        // The tooltip is the load-bearing half of the fix — the label says what
+        // the number is, the tooltip says what it is NOT. Dropping `title=` from
+        // the tile passed every test before this assertion existed.
+        assert!(
+            html.contains("Contract STATE bytes, not the node's resident memory"),
+            "the state tile must carry its corrective tooltip — got:\n{html}"
+        );
+        // The tooltip must not restate the RAM-scaled DEFAULT as if it were the
+        // only path: `budget_bytes` is "the RAM-scaled default, or the operator
+        // override", further tightened to min(RAM, disk). An operator running
+        // --max-hosting-storage would otherwise read a confident falsehood inside
+        // the tooltip whose whole purpose is to stop a misreading of this tile.
+        assert!(
+            html.contains("max-hosting-storage") && html.contains("disk budget"),
+            "the state tooltip must name the operator override and the disk-budget \
+             floor, not just the RAM-scaled default — got:\n{html}"
         );
         // Non-zero recently-read evictions are the miscalibration alarm: colored.
         assert!(
