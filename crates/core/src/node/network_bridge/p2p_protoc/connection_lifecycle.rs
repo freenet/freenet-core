@@ -1050,6 +1050,7 @@ impl P2pConnManager {
             conn_map_size = self.connections.len(),
             "[CONN_TRACK] INSERT: adding connection to HashMap"
         );
+        let now = Instant::now();
         self.connections.insert(
             peer_addr,
             ConnectionEntry {
@@ -1058,7 +1059,8 @@ impl P2pConnManager {
                 // when the peer sends its first message (e.g., ConnectRequest)
                 pub_key: peer_id.as_ref().map(|p| p.pub_key().clone()),
                 connection_id: conn_id,
-                created_at: Instant::now(),
+                created_at: now,
+                last_link_use_at: now,
                 remote_version,
             },
         );
@@ -1384,6 +1386,16 @@ impl P2pConnManager {
         match event {
             Some(ConnEvent::InboundMessage(mut inbound)) => {
                 let tx = *inbound.msg.id();
+
+                // Record that the remote is still routing through this transport,
+                // so the zombie sweep does not collect a link in use (#5654).
+                if let Some(remote_addr) = inbound.remote_addr {
+                    if counts_as_link_use(&inbound.msg) {
+                        if let Some(entry) = self.connections.get_mut(&remote_addr) {
+                            entry.last_link_use_at = Instant::now();
+                        }
+                    }
+                }
 
                 if let Some(remote_addr) = inbound.remote_addr {
                     if let Some(sender_peer) = extract_sender_from_message(&inbound.msg) {
