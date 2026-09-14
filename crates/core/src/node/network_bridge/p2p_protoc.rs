@@ -1588,10 +1588,14 @@ impl P2pConnManager {
                 // the backlog check below use `ZombieSweepState::slice_due`, so no
                 // slice starts within the required spacing of the previous one.
                 if zombie_sweep_state.slice_due(Instant::now(), true) {
-                    ctx.sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_state)
-                        .await;
+                    ctx.sweep_zombie_transports(
+                        &handshake_cmd_sender,
+                        &mut zombie_sweep_state,
+                        true,
+                    )
+                    .await;
                 }
-                zombie_sweep_state.report();
+                zombie_sweep_state.report(Instant::now());
 
                 // Periodic cleanup of pending_op_results: remove entries where the
                 // receiver has been dropped (closed sender). This is a safety net for
@@ -1620,7 +1624,7 @@ impl P2pConnManager {
                     state.last_pending_op_cleanup = Instant::now();
                 }
             } else if zombie_sweep_state.slice_due(Instant::now(), false) {
-                ctx.sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_state)
+                ctx.sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_state, false)
                     .await;
             }
 

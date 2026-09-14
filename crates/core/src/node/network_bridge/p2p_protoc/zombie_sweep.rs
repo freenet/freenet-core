@@ -6,7 +6,7 @@
 //! transport, so that transport is judged by how recently its remote sent a
 //! request over it instead ([`TransportActivity::idle`]). Transports kept only
 //! for that reason are capped per remote IP (IPv6: per /64) and globally, and
-//! the oldest are evicted first when a cap is exceeded.
+//! the least recently used are evicted first when a cap is exceeded.
 //!
 //! What this does not cover, deliberately:
 //!
@@ -97,17 +97,26 @@ pub(super) const ZOMBIE_BACKLOG_SWEEP_INTERVAL: Duration = Duration::from_secs(1
 const ZOMBIE_BACKLOG_IDLE_FACTOR: u32 = 4;
 
 /// How long the event loop waits after a slice that took `last_slice_took`
-/// before starting any other slice, from either call site (the 30s stats tick
-/// or a backlog): the longer of [`ZOMBIE_BACKLOG_SWEEP_INTERVAL`] and
-/// [`ZOMBIE_BACKLOG_IDLE_FACTOR`] × `last_slice_took`.
+/// before starting a spaced slice (see [`ZombieSweepState::slice_due`]): the
+/// longer of [`ZOMBIE_BACKLOG_SWEEP_INTERVAL`] and [`ZOMBIE_BACKLOG_IDLE_FACTOR`]
+/// × `last_slice_took`.
 ///
-/// The budget: sweep slices occupy at most one fifth of the event loop's time,
-/// and no slice starts straight after another. One fifth is the worst case of
-/// the stats-tick sweep before #5654 (a 6.4s slice every 30s is about 21%), and
-/// no single slice is longer than it was then. When drops are quick the spacing
-/// is 1s, so a backlog drains at up to 64 transports per second instead of 64
-/// per 30s; when every drop takes the full 100ms the spacing stretches to 25.6s,
-/// about the stats tick's own cadence.
+/// The cost, stated plainly:
+///
+/// - Under a sustained backlog, backlog slices can use up to 20% of the event
+///   loop's time for any slice of 250ms or longer (a slice of `d` is followed by
+///   at least `4d` of other work); shorter slices use less. Before #5654 the
+///   sweep reached 20% only when a 30s-tick slice took the full 6.4s. The total
+///   cost per zombie dropped is unchanged; it is paid sooner, and only on a node
+///   that already has more zombies due than one slice holds.
+/// - Stats-tick slices keep the 30s cadence they had before #5654 when the
+///   previous slice was also a tick slice, however long it took.
+/// - Combined worst case: no two slices run back to back, no single slice is
+///   longer than before (6.4s), and loop share stays within the pre-#5654 worst
+///   case of 6.4s every 30s (about 21%).
+///
+/// When drops are quick the spacing is 1s, so a backlog drains at up to 64
+/// transports per second instead of 64 per 30s.
 pub(super) fn slice_spacing(last_slice_took: Duration) -> Duration {
     ZOMBIE_BACKLOG_SWEEP_INTERVAL.max(last_slice_took.saturating_mul(ZOMBIE_BACKLOG_IDLE_FACTOR))
 }
@@ -387,7 +396,11 @@ pub(super) fn zombie_verdict(
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SweepCandidate {
     pub(super) addr: SocketAddr,
+    /// Time since the transport was established.
     pub(super) age: Duration,
+    /// Time since its remote last sent a request over it (see
+    /// [`TransportActivity::idle`]); orders cap eviction.
+    pub(super) idle: Duration,
     pub(super) verdict: ZombieVerdict,
 }
 
@@ -395,7 +408,7 @@ pub(super) struct SweepCandidate {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct ZombieSweepPlan {
     /// Transports that would have been kept for recent requests but exceeded
-    /// a cap, oldest first. Dropped before `zombies`.
+    /// a cap, least recently used first. Dropped before `zombies`.
     pub(super) over_cap: Vec<SocketAddr>,
     /// How many of `over_cap` exceeded the per-IP cap.
     pub(super) over_per_ip_cap: usize,
@@ -403,7 +416,8 @@ pub(super) struct ZombieSweepPlan {
     pub(super) over_global_cap: usize,
     /// Transports the uncapped rules reap, in map order.
     pub(super) zombies: Vec<SocketAddr>,
-    /// Transports kept alive by recent requests after the caps, youngest first.
+    /// Transports kept alive by recent requests after the caps, most recently
+    /// used first.
     pub(super) kept_for_link_use: Vec<SocketAddr>,
 }
 
@@ -448,20 +462,19 @@ pub(super) struct ZombieSlice {
 
 /// Apply the link-use caps to one sweep's verdicts.
 ///
-/// Transports kept for recent requests are admitted youngest first: at most
-/// `per_ip_cap` per [`link_use_exemption_key`], then at most `global_cap` in
-/// total. Anything beyond a cap falls back to the age rule and is reaped, the
-/// oldest first.
+/// Transports kept for recent requests are admitted most recently used first:
+/// at most `per_ip_cap` per [`link_use_exemption_key`], then at most
+/// `global_cap` in total. Anything beyond a cap falls back to the age rule and
+/// is reaped, the least recently used first (longest idle; ties broken by age,
+/// oldest first). This is the least-recently-used eviction
+/// `.claude/rules/code-style.md` asks of collections refreshed on every use.
 ///
-/// The order is by transport AGE, not by how recently the remote sent a
-/// request. `.claude/rules/code-style.md` asks refresh-on-use collections to
-/// evict rather than refuse, and names least-recently-used as the usual way.
-/// Here every exempt transport has sent a request within the last 90s, and
-/// recency is refreshed by the remote's own traffic, so an LRU order would let
-/// incumbents that keep sending requests keep their slots while newer
-/// transports were the ones evicted. Age cannot be refreshed, so exemptions
-/// rotate: a newcomer is always admitted, and it is the longest-held exemptions
-/// that give way.
+/// Every candidate here is already past the age threshold, so a brand-new
+/// transport never competes for a slot (it is `Keep` by age). Among the
+/// candidates, recency is what says a link is still carrying requests: a link
+/// used a second ago is kept in preference to one idle for most of the
+/// threshold. The absolute age bound, not this order, is what stops a busy link
+/// holding its exemption indefinitely.
 pub(super) fn plan_zombie_sweep(
     candidates: impl IntoIterator<Item = SweepCandidate>,
     per_ip_cap: usize,
@@ -477,8 +490,14 @@ pub(super) fn plan_zombie_sweep(
         }
     }
 
-    // Youngest first; the address breaks ties so the plan is deterministic.
-    exempt.sort_by(|a, b| a.age.cmp(&b.age).then_with(|| a.addr.cmp(&b.addr)));
+    // Most recently used first, then youngest; the address breaks remaining
+    // ties so the plan is deterministic.
+    exempt.sort_by(|a, b| {
+        a.idle
+            .cmp(&b.idle)
+            .then_with(|| a.age.cmp(&b.age))
+            .then_with(|| a.addr.cmp(&b.addr))
+    });
 
     let mut per_key: HashMap<(IpAddr, u16), usize> = HashMap::new();
     let mut over_cap: Vec<SweepCandidate> = Vec::new();
@@ -498,8 +517,13 @@ pub(super) fn plan_zombie_sweep(
         }
     }
 
-    // Oldest first.
-    over_cap.sort_by(|a, b| b.age.cmp(&a.age).then_with(|| a.addr.cmp(&b.addr)));
+    // Least recently used first, then oldest.
+    over_cap.sort_by(|a, b| {
+        b.idle
+            .cmp(&a.idle)
+            .then_with(|| b.age.cmp(&a.age))
+            .then_with(|| a.addr.cmp(&b.addr))
+    });
     plan.over_cap = over_cap.into_iter().map(|c| c.addr).collect();
     plan
 }
@@ -520,11 +544,9 @@ pub(super) fn plan_sweep(
         .map(|(addr, entry)| {
             let is_gateway = gateways.iter().any(|gw| gw.socket_addr() == Some(*addr));
             let age = now.saturating_duration_since(entry.created_at);
+            let idle = now.saturating_duration_since(entry.last_link_use_at);
             let verdict = zombie_verdict(
-                TransportActivity {
-                    age,
-                    idle: now.saturating_duration_since(entry.last_link_use_at),
-                },
+                TransportActivity { age, idle },
                 connection_manager.is_in_ring(*addr),
                 connection_manager.has_connection_or_pending(*addr),
                 is_gateway,
@@ -533,6 +555,7 @@ pub(super) fn plan_sweep(
             SweepCandidate {
                 addr: *addr,
                 age,
+                idle,
                 verdict,
             }
         })
@@ -545,6 +568,17 @@ pub(super) fn plan_sweep(
     (candidates, plan)
 }
 
+/// Which call site ran a sweep slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SliceKind {
+    /// No slice has run yet.
+    None,
+    /// The 30s stats tick.
+    Tick,
+    /// A backlog slice, between ticks.
+    Backlog,
+}
+
 /// Zombie sweep state for one event loop: when the next slice may run, and the
 /// figures reported at info level on the stats tick so they are visible in
 /// release builds.
@@ -553,14 +587,16 @@ pub(super) struct ZombieSweepState {
     /// Over-cap transports actually dropped, since the event loop started.
     pub(super) cap_evictions_total: u64,
     backlog: bool,
+    last_slice_kind: SliceKind,
     last_slice_end: Instant,
     last_slice_took: Duration,
-    // Figures from the latest plan, and drops since the last report.
-    last_link_use_exempt: usize,
-    last_over_per_ip_cap: usize,
-    last_over_global_cap: usize,
-    last_due: usize,
-    last_global_cap: usize,
+    // Figures from the plan of the most recent slice, and drops since the last
+    // report.
+    last_slice_link_use_exempt: usize,
+    last_slice_over_per_ip_cap: usize,
+    last_slice_over_global_cap: usize,
+    last_slice_due: usize,
+    last_slice_global_cap: usize,
     dropped_since_report: u64,
     cap_evictions_at_last_report: u64,
 }
@@ -570,13 +606,14 @@ impl ZombieSweepState {
         Self {
             cap_evictions_total: 0,
             backlog: false,
+            last_slice_kind: SliceKind::None,
             last_slice_end: now,
             last_slice_took: Duration::ZERO,
-            last_link_use_exempt: 0,
-            last_over_per_ip_cap: 0,
-            last_over_global_cap: 0,
-            last_due: 0,
-            last_global_cap: 0,
+            last_slice_link_use_exempt: 0,
+            last_slice_over_per_ip_cap: 0,
+            last_slice_over_global_cap: 0,
+            last_slice_due: 0,
+            last_slice_global_cap: 0,
             dropped_since_report: 0,
             cap_evictions_at_last_report: 0,
         }
@@ -584,15 +621,22 @@ impl ZombieSweepState {
 
     /// Record the plan a slice was cut from, for the next report.
     pub(super) fn record_plan(&mut self, plan: &ZombieSweepPlan, global_cap: usize) {
-        self.last_link_use_exempt = plan.kept_for_link_use.len();
-        self.last_over_per_ip_cap = plan.over_per_ip_cap;
-        self.last_over_global_cap = plan.over_global_cap;
-        self.last_due = plan.due();
-        self.last_global_cap = global_cap;
+        self.last_slice_link_use_exempt = plan.kept_for_link_use.len();
+        self.last_slice_over_per_ip_cap = plan.over_per_ip_cap;
+        self.last_slice_over_global_cap = plan.over_global_cap;
+        self.last_slice_due = plan.due();
+        self.last_slice_global_cap = global_cap;
     }
 
-    /// Record a slice that ran from `started` to `ended`.
-    pub(super) fn record_slice(&mut self, started: Instant, ended: Instant, slice: &ZombieSlice) {
+    /// Record a slice that ran from `started` to `ended`, run by the stats tick
+    /// (`stats_tick`) or as a backlog slice.
+    pub(super) fn record_slice(
+        &mut self,
+        started: Instant,
+        ended: Instant,
+        slice: &ZombieSlice,
+        stats_tick: bool,
+    ) {
         self.cap_evictions_total = self
             .cap_evictions_total
             .saturating_add(slice.over_cap_dropped as u64);
@@ -600,55 +644,78 @@ impl ZombieSweepState {
             .dropped_since_report
             .saturating_add(slice.reap.len() as u64);
         self.backlog = slice.backlog;
+        self.last_slice_kind = if stats_tick {
+            SliceKind::Tick
+        } else {
+            SliceKind::Backlog
+        };
         self.last_slice_took = ended.saturating_duration_since(started);
         self.last_slice_end = ended;
     }
 
-    /// The earliest instant the next slice may start: [`slice_spacing`] after
-    /// the previous slice ended.
-    fn next_slice_at(&self) -> Instant {
-        let spacing = slice_spacing(self.last_slice_took);
+    /// The earliest instant the next spaced slice may start: [`slice_spacing`]
+    /// after the previous slice ended. `None` if that instant is not
+    /// representable, which fails closed: no spaced slice runs.
+    fn next_slice_at(&self) -> Option<Instant> {
         self.last_slice_end
-            .checked_add(spacing)
-            .unwrap_or(self.last_slice_end)
+            .checked_add(slice_spacing(self.last_slice_took))
     }
 
-    /// Whether the event loop may start a sweep slice now. It is the ONE rule
-    /// for both callers: `stats_tick` is `true` on the regular 30s tick and
-    /// `false` otherwise. A slice runs only when there is a reason (a backlog, or
-    /// the tick) AND [`slice_spacing`] has passed since the previous slice ended,
-    /// so the stats tick cannot run a slice straight after a backlog slice.
+    /// Whether the event loop may start a sweep slice now. It is the one rule
+    /// for both call sites: `stats_tick` is `true` on the regular 30s tick and
+    /// `false` for the check after every event.
+    ///
+    /// - A stats-tick slice right after another stats-tick slice (or as the
+    ///   first slice) always runs. The tick's own 30s interval spaces those
+    ///   slices, exactly as before #5654.
+    /// - Every other slice needs a reason (a backlog, or the tick) and must
+    ///   start at least [`slice_spacing`] after the previous slice ended. So a
+    ///   backlog slice never follows a slice straight away, and neither does a
+    ///   tick slice that follows a backlog slice.
     pub(super) fn slice_due(&self, now: Instant, stats_tick: bool) -> bool {
-        (self.backlog || stats_tick) && now >= self.next_slice_at()
+        if stats_tick && self.last_slice_kind != SliceKind::Backlog {
+            return true;
+        }
+        (self.backlog || stats_tick) && self.next_slice_at().is_some_and(|at| now >= at)
     }
 
     /// When the event loop must wake for a backlog slice even if no event
     /// arrives. `None` without a backlog, so an idle node sets no timer.
     pub(super) fn backlog_deadline(&self) -> Option<Instant> {
-        self.backlog.then(|| self.next_slice_at())
+        if self.backlog {
+            self.next_slice_at()
+        } else {
+            None
+        }
     }
 
     /// Report the sweep at info level, once per stats tick, when there is
-    /// anything to report; then reset the since-last-report figures.
-    pub(super) fn report(&mut self) {
+    /// anything to report; then reset the since-last-report figures. The plan
+    /// figures are from the most recent slice, which may predate this tick when
+    /// the tick's own slice was not due; `last_slice_ago_ms` says how old they
+    /// are.
+    pub(super) fn report(&mut self, now: Instant) {
         let cap_evictions = self
             .cap_evictions_total
             .saturating_sub(self.cap_evictions_at_last_report);
-        if self.last_link_use_exempt > 0
-            || self.last_over_per_ip_cap > 0
-            || self.last_over_global_cap > 0
+        if self.last_slice_link_use_exempt > 0
+            || self.last_slice_over_per_ip_cap > 0
+            || self.last_slice_over_global_cap > 0
             || self.dropped_since_report > 0
             || self.backlog
         {
             tracing::info!(
-                link_use_exempt = self.last_link_use_exempt,
-                link_use_exempt_global_cap = self.last_global_cap,
+                last_slice_ago_ms = now
+                    .saturating_duration_since(self.last_slice_end)
+                    .as_millis(),
+                last_slice_link_use_exempt = self.last_slice_link_use_exempt,
+                last_slice_over_per_ip_cap = self.last_slice_over_per_ip_cap,
+                last_slice_over_global_cap = self.last_slice_over_global_cap,
+                last_slice_zombies_due = self.last_slice_due,
+                link_use_exempt_global_cap = self.last_slice_global_cap,
                 link_use_exempt_per_ip_cap = LINK_USE_EXEMPT_PER_IP_CAP,
-                over_per_ip_cap = self.last_over_per_ip_cap,
-                over_global_cap = self.last_over_global_cap,
-                zombies_due = self.last_due,
-                zombies_dropped = self.dropped_since_report,
-                cap_evictions,
+                zombies_dropped_since_last_report = self.dropped_since_report,
+                cap_evictions_since_last_report = cap_evictions,
                 cap_evictions_total = self.cap_evictions_total,
                 backlog = self.backlog,
                 "Zombie transport sweep (not promoted to ring)"
@@ -668,8 +735,11 @@ pub(super) enum LoopWake<T> {
 }
 
 /// Wait for the next event from `stream`, or, while a backlog exists, for its
-/// deadline. Without this a backlog would only be swept after some unrelated
-/// event, and a quiet node could stay over its link-use caps.
+/// deadline. This drains an EXISTING backlog on a quiet node, which would
+/// otherwise wait for some unrelated event. It does not start sweeping on a
+/// quiet node that has no backlog: that node still runs its first sweep of an
+/// interval only on the next event after the stats tick is due, as before
+/// #5654.
 ///
 /// `biased` toward the stream: events are the loop's work and are handled
 /// first. Under a steady event flow the timer arm may never win, which is fine,
@@ -699,7 +769,8 @@ impl P2pConnManager {
     /// Run one zombie sweep slice: plan it with [`plan_sweep`], drop at most
     /// [`MAX_ZOMBIE_CLEANUP_PER_CYCLE`] transports (over-cap evictions first),
     /// and record the slice in `state`, which decides when the next may run
-    /// ([`ZombieSweepState::slice_due`]).
+    /// ([`ZombieSweepState::slice_due`]). `stats_tick` says which call site ran
+    /// it.
     ///
     /// Per-slice logging is at debug; the info-level summary is emitted once per
     /// stats tick by [`ZombieSweepState::report`].
@@ -711,6 +782,7 @@ impl P2pConnManager {
         &mut self,
         handshake_cmd_sender: &HandshakeCommandSender,
         state: &mut ZombieSweepState,
+        stats_tick: bool,
     ) {
         let started = Instant::now();
         let op_manager = self.bridge.op_manager.clone();
@@ -742,7 +814,7 @@ impl P2pConnManager {
             &plan,
             link_use_exempt_global_cap(connection_manager.max_connections),
         );
-        state.record_slice(started, Instant::now(), &slice);
+        state.record_slice(started, Instant::now(), &slice, stats_tick);
 
         if !slice.reap.is_empty() {
             tracing::debug!(
@@ -750,6 +822,7 @@ impl P2pConnManager {
                 zombies_due = plan.due(),
                 over_cap_dropped = slice.over_cap_dropped,
                 backlog = slice.backlog,
+                stats_tick,
                 "Zombie sweep slice"
             );
         }
@@ -942,10 +1015,17 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn exempt(a: &str, age_secs: u64) -> SweepCandidate {
+    /// An exempt candidate idle for `idle_secs`, all of the same age, so the
+    /// cap order is decided by recency alone.
+    fn exempt(a: &str, idle_secs: u64) -> SweepCandidate {
+        exempt_aged(a, 1000, idle_secs)
+    }
+
+    fn exempt_aged(a: &str, age_secs: u64, idle_secs: u64) -> SweepCandidate {
         SweepCandidate {
             addr: addr(a),
             age: Duration::from_secs(age_secs),
+            idle: Duration::from_secs(idle_secs),
             verdict: ZombieVerdict::KeepForLinkUse,
         }
     }
@@ -959,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn per_ip_cap_evicts_oldest_from_that_ip() {
+    fn per_ip_cap_evicts_least_recently_used_from_that_ip() {
         let plan = plan_zombie_sweep(
             [
                 exempt("203.0.113.7:1000", 500),
@@ -984,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn global_cap_evicts_oldest_overall() {
+    fn global_cap_evicts_least_recently_used_overall() {
         let plan = plan_zombie_sweep(
             [
                 exempt("198.51.100.1:1", 400),
@@ -998,12 +1078,49 @@ mod tests {
         assert_eq!(
             plan.over_cap,
             vec![addr("198.51.100.1:1"), addr("198.51.100.3:1")],
-            "over-cap evictions are ordered oldest first"
+            "over-cap evictions are ordered least recently used first"
         );
         assert_eq!(plan.over_global_cap, 2);
         assert_eq!(
             plan.kept_for_link_use,
             vec![addr("198.51.100.2:1"), addr("198.51.100.4:1")]
+        );
+    }
+
+    /// Recency, not age, decides who keeps a slot: an old link used a second
+    /// ago is kept over a young link idle for most of the threshold. Equal
+    /// recency falls back to age, oldest evicted first.
+    #[test]
+    fn cap_eviction_is_least_recently_used_not_oldest() {
+        let plan = plan_zombie_sweep(
+            [
+                exempt_aged("198.51.100.1:1", 3000, 1),
+                exempt_aged("198.51.100.2:1", 200, 80),
+            ],
+            2,
+            1,
+        );
+        assert_eq!(plan.kept_for_link_use, vec![addr("198.51.100.1:1")]);
+        assert_eq!(plan.over_cap, vec![addr("198.51.100.2:1")]);
+
+        let tie = plan_zombie_sweep(
+            [
+                exempt_aged("198.51.100.1:1", 300, 20),
+                exempt_aged("198.51.100.2:1", 900, 20),
+                exempt_aged("198.51.100.3:1", 600, 20),
+            ],
+            2,
+            1,
+        );
+        assert_eq!(
+            tie.kept_for_link_use,
+            vec![addr("198.51.100.1:1")],
+            "equal recency: the youngest is kept"
+        );
+        assert_eq!(
+            tie.over_cap,
+            vec![addr("198.51.100.2:1"), addr("198.51.100.3:1")],
+            "equal recency: evicted oldest first"
         );
     }
 
@@ -1106,6 +1223,7 @@ mod tests {
         let mut candidates = vec![SweepCandidate {
             addr: addr("192.0.2.1:1"),
             age: Duration::from_secs(1000),
+            idle: Duration::from_secs(1000),
             verdict: ZombieVerdict::Reap,
         }];
         candidates.push(exempt("198.51.100.1:1", 500));
@@ -1113,6 +1231,7 @@ mod tests {
         candidates.push(SweepCandidate {
             addr: addr("192.0.2.2:1"),
             age: Duration::from_secs(60),
+            idle: Duration::from_secs(60),
             verdict: ZombieVerdict::Keep,
         });
         let plan = plan_zombie_sweep(candidates, 2, 1);
@@ -1132,6 +1251,7 @@ mod tests {
             .map(|i| SweepCandidate {
                 addr: SocketAddr::from(([192, 0, 2, 1], i + 1)),
                 age: Duration::from_secs(1000),
+                idle: Duration::from_secs(1000),
                 verdict: ZombieVerdict::Reap,
             })
             .collect();
@@ -1169,7 +1289,7 @@ mod tests {
         assert_eq!(first.over_cap_dropped, 3, "only three fit in this slice");
         let mut state = ZombieSweepState::new(Instant::now());
         let t = Instant::now();
-        state.record_slice(t, t, &first);
+        state.record_slice(t, t, &first, false);
         assert_eq!(state.cap_evictions_total, 3);
 
         // Next sweep: the three dropped are gone; the fourth is still over cap.
@@ -1179,7 +1299,7 @@ mod tests {
             .collect();
         let second = plan_zombie_sweep(remaining, 2, 1).slice(3);
         assert_eq!(second.over_cap_dropped, 1);
-        state.record_slice(t, t, &second);
+        state.record_slice(t, t, &second, false);
         assert_eq!(
             state.cap_evictions_total, 4,
             "four transports were evicted over cap, each counted once"
@@ -1191,6 +1311,7 @@ mod tests {
                 SweepCandidate {
                     addr: addr("192.0.2.1:1"),
                     age: Duration::from_secs(900),
+                    idle: Duration::from_secs(900),
                     verdict: ZombieVerdict::Reap,
                 },
                 exempt("198.51.100.1:1", 100),
@@ -1211,7 +1332,7 @@ mod tests {
         assert_eq!(
             slice_spacing(Duration::from_millis(250)),
             ZOMBIE_BACKLOG_SWEEP_INTERVAL,
-            "a quick slice waits the minimum interval"
+            "a 250ms slice waits the 1s minimum, 20% of loop time"
         );
         assert_eq!(
             slice_spacing(Duration::from_secs(3)),
@@ -1242,65 +1363,107 @@ mod tests {
             "no backlog and no tick: nothing to do"
         );
         assert!(state.backlog_deadline().is_none(), "no backlog, no timer");
-        assert!(
-            state.slice_due(t0 + Duration::from_secs(30), true),
-            "the tick runs a slice when nothing ran recently"
-        );
+        assert!(state.slice_due(t0, true), "the first tick runs a slice");
 
-        // A quick backlog slice: due again after the 1s minimum.
+        // A quick backlog slice: the next backlog slice is due after the 1s
+        // minimum, and a tick in between waits for the same spacing.
         let end = t0 + Duration::from_millis(50);
-        state.record_slice(t0, end, &backlog_slice(true));
+        state.record_slice(t0, end, &backlog_slice(true), false);
         assert_eq!(
             state.backlog_deadline(),
             Some(end + ZOMBIE_BACKLOG_SWEEP_INTERVAL)
         );
-        assert!(!state.slice_due(end + Duration::from_millis(999), false));
-        assert!(state.slice_due(end + Duration::from_millis(1000), false));
+        for stats_tick in [false, true] {
+            assert!(!state.slice_due(end + Duration::from_millis(999), stats_tick));
+            assert!(state.slice_due(end + Duration::from_millis(1000), stats_tick));
+        }
 
-        // A slow backlog slice: not due, from EITHER caller, until four times its
-        // duration has passed.
+        // A slow backlog slice: not due, from EITHER caller, until four times
+        // its duration has passed.
         let start = end + Duration::from_secs(2);
         let end = start + Duration::from_secs(3);
-        state.record_slice(start, end, &backlog_slice(true));
+        state.record_slice(start, end, &backlog_slice(true), false);
         for stats_tick in [false, true] {
             assert!(
                 !state.slice_due(end + Duration::from_millis(11_999), stats_tick),
-                "stats_tick={stats_tick}: the spacing applies to the tick too"
+                "stats_tick={stats_tick}: a slice after a backlog slice waits"
             );
             assert!(state.slice_due(end + Duration::from_secs(12), stats_tick));
         }
 
-        // A slice that clears the backlog: only the tick runs the next one, and
-        // still not before the spacing.
-        state.record_slice(end, end + Duration::from_secs(3), &backlog_slice(false));
-        let end = end + Duration::from_secs(3);
+        // A slow TICK slice that leaves a backlog: the next tick keeps the 30s
+        // cadence even though 4× the slice is longer than the rest of the
+        // interval, while a backlog slice still waits for the spacing.
+        let start = end + Duration::from_secs(30);
+        let end = start + Duration::from_millis(6_400);
+        state.record_slice(start, end, &backlog_slice(true), true);
+        let next_tick = start + Duration::from_secs(30);
+        assert!(
+            state.slice_due(next_tick, true),
+            "tick after tick: main's cadence"
+        );
+        assert!(
+            !state.slice_due(next_tick, false),
+            "a backlog slice after a tick slice waits the 25.6s spacing"
+        );
+        assert!(state.slice_due(end + Duration::from_millis(25_600), false));
+
+        // A slice that clears the backlog: only the tick runs the next one.
+        state.record_slice(end, end, &backlog_slice(false), true);
         assert!(state.backlog_deadline().is_none());
         assert!(!state.slice_due(end + Duration::from_secs(3600), false));
-        assert!(!state.slice_due(end + Duration::from_millis(11_999), true));
-        assert!(state.slice_due(end + Duration::from_secs(12), true));
+        assert!(state.slice_due(end + Duration::from_secs(30), true));
     }
 
+    /// If the next slice instant is not representable, no spaced slice runs and
+    /// no timer is set: the schedule fails closed rather than to zero spacing.
+    #[test]
+    fn unrepresentable_spacing_fails_closed() {
+        let t0 = Instant::now();
+        let mut state = ZombieSweepState::new(t0);
+        state.record_slice(t0, t0, &backlog_slice(true), false);
+        state.last_slice_took = Duration::MAX;
+        assert!(state.next_slice_at().is_none());
+        assert!(state.backlog_deadline().is_none());
+        for stats_tick in [false, true] {
+            assert!(!state.slice_due(t0 + Duration::from_secs(86_400), stats_tick));
+        }
+    }
+
+    /// One slice as run by `simulate_event_loop`.
+    #[derive(Clone, Copy, Debug)]
+    struct SimSlice {
+        start: Instant,
+        end: Instant,
+        tick: bool,
+    }
+
+    // The event loop's `STATS_LOG_INTERVAL`.
+    const STATS_TICK: Duration = Duration::from_secs(30);
+
     /// Interleave the event loop's two call sites exactly as it does: the 30s
-    /// stats tick (`slice_due(now, true)`) and the check after every event
-    /// (`slice_due(now, false)`), with an event every 100ms and every slice
-    /// taking `slice_took`. Returns each slice's (start, end).
+    /// stats tick (`slice_due(now, true)`, with the tick timer reset before the
+    /// sweep) and the check after every event (`slice_due(now, false)`), with
+    /// an event every 100ms and every slice taking `slice_took`.
     fn simulate_event_loop(
         slice_took: Duration,
         backlog: bool,
         horizon: Duration,
-    ) -> Vec<(Instant, Instant)> {
-        // The event loop's `STATS_LOG_INTERVAL`.
-        const STATS_TICK: Duration = Duration::from_secs(30);
+    ) -> Vec<SimSlice> {
         const EVENT_EVERY: Duration = Duration::from_millis(100);
         let t0 = Instant::now();
         let mut state = ZombieSweepState::new(t0);
         let mut last_stats_log = t0;
         let mut now = t0;
         let mut slices = Vec::new();
-        let mut run = |state: &mut ZombieSweepState, now: &mut Instant| {
+        let mut run = |state: &mut ZombieSweepState, now: &mut Instant, tick: bool| {
             let end = *now + slice_took;
-            state.record_slice(*now, end, &backlog_slice(backlog));
-            slices.push((*now, end));
+            state.record_slice(*now, end, &backlog_slice(backlog), tick);
+            slices.push(SimSlice {
+                start: *now,
+                end,
+                tick,
+            });
             *now = end;
         };
         while now < t0 + horizon {
@@ -1308,41 +1471,66 @@ mod tests {
             if now.saturating_duration_since(last_stats_log) > STATS_TICK {
                 last_stats_log = now;
                 if state.slice_due(now, true) {
-                    run(&mut state, &mut now);
+                    run(&mut state, &mut now, true);
                 }
             } else if state.slice_due(now, false) {
-                run(&mut state, &mut now);
+                run(&mut state, &mut now, false);
             }
         }
         slices
     }
 
-    /// No two slices run without the required spacing, whichever call site
-    /// runs them, so the stats tick cannot stack a slice straight after a
-    /// backlog slice. Loop share stays within one fifth.
+    /// Whichever call site runs them, consecutive slices keep their spacing:
+    /// two tick slices start at least 30s apart, and any other pair is at least
+    /// `slice_spacing` apart. So no slice runs straight after another, the tick
+    /// keeps main's 30s cadence even for slow slices, and loop share stays within
+    /// main's worst case (6.4s every 30s).
     #[test]
     fn stats_tick_and_backlog_slices_keep_the_spacing() {
         let horizon = Duration::from_secs(3600);
-        for took_ms in [50, 1_000, 5_000, 6_000, 6_400] {
-            let took = Duration::from_millis(took_ms);
-            let slices = simulate_event_loop(took, true, horizon);
-            assert!(slices.len() > 1, "took={took_ms}ms: slices must run");
-            for pair in slices.windows(2) {
-                let gap = pair[1].0.saturating_duration_since(pair[0].1);
+        let main_worst_share = 6.4 / 30.0 + 0.001;
+        for backlog in [true, false] {
+            for took_ms in [50, 250, 1_000, 5_000, 6_000, 6_200, 6_400] {
+                let took = Duration::from_millis(took_ms);
+                let slices = simulate_event_loop(took, backlog, horizon);
+                let ctx = format!("backlog={backlog} took={took_ms}ms");
+                assert!(slices.len() > 1, "{ctx}: slices must run");
+                for pair in slices.windows(2) {
+                    let (prev, next) = (pair[0], pair[1]);
+                    if prev.tick && next.tick {
+                        assert!(
+                            next.start.saturating_duration_since(prev.start) >= STATS_TICK,
+                            "{ctx}: two tick slices started less than 30s apart"
+                        );
+                    } else {
+                        let gap = next.start.saturating_duration_since(prev.end);
+                        assert!(
+                            gap >= slice_spacing(took),
+                            "{ctx}: a slice started {gap:?} after the previous ended, \
+                             less than the required {:?}",
+                            slice_spacing(took)
+                        );
+                    }
+                }
+                let busy: Duration = slices.iter().map(|s| s.end - s.start).sum();
+                let share = busy.as_secs_f64() / horizon.as_secs_f64();
                 assert!(
-                    gap >= slice_spacing(took),
-                    "took={took_ms}ms: a slice started {gap:?} after the previous \
-                     ended, less than the required {:?}",
-                    slice_spacing(took)
+                    share <= main_worst_share,
+                    "{ctx}: sweep slices used {:.1}% of the loop",
+                    share * 100.0
                 );
+                if !backlog {
+                    assert!(
+                        slices.iter().all(|s| s.tick),
+                        "{ctx}: without a backlog only the tick sweeps"
+                    );
+                    assert!(
+                        (110..=121).contains(&slices.len()),
+                        "{ctx}: one slice per 30s tick, as on main, got {}",
+                        slices.len()
+                    );
+                }
             }
-            let busy: Duration = slices.iter().map(|(s, e)| *e - *s).sum();
-            let share = busy.as_secs_f64() / horizon.as_secs_f64();
-            assert!(
-                share <= 0.21,
-                "took={took_ms}ms: sweep slices used {:.0}% of the loop",
-                share * 100.0
-            );
         }
 
         // Quick drops drain far faster than the stats tick alone.
@@ -1351,14 +1539,6 @@ mod tests {
             quick.len() > 3000,
             "a backlog of quick drops runs a slice about every second, got {}",
             quick.len()
-        );
-
-        // Without a backlog, slices run on the stats tick only.
-        let idle = simulate_event_loop(Duration::from_millis(50), false, horizon);
-        assert!(
-            (110..=121).contains(&idle.len()),
-            "one slice per 30s tick, got {}",
-            idle.len()
         );
     }
 
@@ -1391,6 +1571,7 @@ mod tests {
             connections: &mut BTreeMap<SocketAddr, ConnectionEntry>,
             state: &mut ZombieSweepState,
             cm: &crate::ring::ConnectionManager,
+            stats_tick: bool,
         ) -> usize {
             let started = Instant::now();
             let (_, plan) = plan_sweep(connections, &[], cm, started);
@@ -1398,13 +1579,14 @@ mod tests {
             for addr in &slice.reap {
                 connections.remove(addr);
             }
-            state.record_slice(started, Instant::now(), &slice);
+            state.record_slice(started, Instant::now(), &slice, stats_tick);
             slice.reap.len()
         }
 
         // The stats tick runs the first slice.
-        let mut state = ZombieSweepState::new(Instant::now() - Duration::from_secs(30));
-        let mut slices = vec![run_slice(&mut connections, &mut state, &cm)];
+        let mut state = ZombieSweepState::new(Instant::now());
+        assert!(state.slice_due(Instant::now(), true));
+        let mut slices = vec![run_slice(&mut connections, &mut state, &cm, true)];
         assert!(state.backlog_deadline().is_some());
 
         let mut events = futures::stream::pending::<()>();
@@ -1413,7 +1595,7 @@ mod tests {
                 match next_wake(&mut events, state.backlog_deadline()).await {
                     LoopWake::ZombieSweepDue => {
                         if state.slice_due(Instant::now(), false) {
-                            slices.push(run_slice(&mut connections, &mut state, &cm));
+                            slices.push(run_slice(&mut connections, &mut state, &cm, false));
                         }
                     }
                     LoopWake::Event(_) => unreachable!("the event stream never yields"),
@@ -1455,17 +1637,17 @@ mod tests {
         cm.max_connections = 8;
 
         let mut connections = BTreeMap::new();
-        // Three young transports from one IP, all in use and past the 180s age
-        // threshold.
-        for (port, age) in [(1, 200), (2, 210), (3, 220)] {
+        // Three transports from one IP, all past the 180s age threshold and in
+        // use; the youngest is the least recently used.
+        for (port, age, idle) in [(1, 220, 5), (2, 210, 6), (3, 200, 7)] {
             connections.insert(
                 SocketAddr::from(([203, 0, 113, 7], port)),
-                entry_at(now, age, 10),
+                entry_at(now, age, idle),
             );
         }
-        // Two older ones from other IPs, in use.
-        connections.insert(addr("198.51.100.1:1"), entry_at(now, 300, 10));
-        connections.insert(addr("198.51.100.2:1"), entry_at(now, 350, 10));
+        // Two from other IPs, used less recently.
+        connections.insert(addr("198.51.100.1:1"), entry_at(now, 300, 20));
+        connections.insert(addr("198.51.100.2:1"), entry_at(now, 350, 30));
         // One idle zombie and one young transport.
         connections.insert(addr("192.0.2.1:1"), entry_at(now, 400, 400));
         connections.insert(addr("192.0.2.2:1"), entry_at(now, 30, 30));
@@ -1479,9 +1661,12 @@ mod tests {
                 SocketAddr::from(([203, 0, 113, 7], 1)),
                 SocketAddr::from(([203, 0, 113, 7], 2)),
             ],
-            "the two youngest fill both the per-IP cap and the global cap of 2"
+            "the two most recently used fill both the per-IP cap and the global cap of 2"
         );
-        assert_eq!(plan.over_per_ip_cap, 1, "the third transport from one IP");
+        assert_eq!(
+            plan.over_per_ip_cap, 1,
+            "the third transport from one IP, the youngest but least recently used"
+        );
         assert_eq!(plan.over_global_cap, 2, "the two from other IPs");
         assert_eq!(
             plan.over_cap,
@@ -1490,7 +1675,7 @@ mod tests {
                 addr("198.51.100.1:1"),
                 SocketAddr::from(([203, 0, 113, 7], 3)),
             ],
-            "over-cap transports are ordered oldest first"
+            "over-cap transports are ordered least recently used first"
         );
     }
 
@@ -1520,7 +1705,7 @@ mod tests {
                 connections.remove(addr);
             }
             let end = t + Duration::from_millis(10);
-            state.record_slice(t, end, &slice);
+            state.record_slice(t, end, &slice, false);
             slices.push(slice.reap.len());
             if !slice.backlog {
                 break;
@@ -1580,32 +1765,55 @@ mod tests {
         );
     }
 
-    /// The body of the brace block that starts at the first `{` at or after
-    /// `anchor`, scanned with brace depth like `operations::connect`'s
-    /// `fn_body` pin helper, so a nested block does not end the region early.
-    fn braced_block_after<'a>(source: &'a str, anchor: &str) -> &'a str {
-        let start = source
-            .find(anchor)
-            .unwrap_or_else(|| panic!("anchor not found: {anchor}"));
-        let open = start
-            + source[start..]
+    /// The `(open, close)` byte offsets of the brace block that starts at the
+    /// first `{` at or after `from`, scanned with brace depth like
+    /// `operations::connect`'s `fn_body` pin helper, so a nested block does not
+    /// end the region early.
+    fn block_span(source: &str, from: usize) -> (usize, usize) {
+        let open = from
+            + source[from..]
                 .find('{')
-                .unwrap_or_else(|| panic!("{anchor} must open a block"));
-        let bytes = source.as_bytes();
+                .unwrap_or_else(|| panic!("no block after offset {from}"));
         let mut depth = 0i32;
-        for (i, b) in bytes.iter().enumerate().skip(open) {
+        for (i, b) in source.as_bytes().iter().enumerate().skip(open) {
             match b {
                 b'{' => depth += 1,
                 b'}' => {
                     depth -= 1;
                     if depth == 0 {
-                        return &source[open + 1..i];
+                        return (open, i);
                     }
                 }
                 _ => {}
             }
         }
-        panic!("unbalanced braces after {anchor}");
+        panic!("unbalanced braces after offset {from}");
+    }
+
+    fn find_unique(source: &str, anchor: &str) -> usize {
+        assert_eq!(
+            source.matches(anchor).count(),
+            1,
+            "anchor must occur exactly once: {anchor}"
+        );
+        source.find(anchor).unwrap()
+    }
+
+    /// The body of the brace block that starts at the first `{` at or after
+    /// `anchor`.
+    fn braced_block_after<'a>(source: &'a str, anchor: &str) -> &'a str {
+        let at = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("anchor not found: {anchor}"));
+        let (open, close) = block_span(source, at);
+        &source[open + 1..close]
+    }
+
+    /// `source` with all whitespace and trailing commas before `)` removed, so a
+    /// pin is not sensitive to how rustfmt wraps a call.
+    fn squash(source: &str) -> String {
+        let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        compact.replace(",)", ")")
     }
 
     fn calls_at_statement_position(body: &str, call: &str) -> usize {
@@ -1615,17 +1823,57 @@ mod tests {
     }
 
     /// The event loop uses the one scheduling rule at both call sites, wakes for
-    /// a backlog deadline, and reports on the stats tick. The rule itself is
-    /// tested above; this pins the wiring. It is a cross-file scrape of
-    /// `p2p_protoc.rs`.
+    /// a backlog deadline, reports on the stats tick, and runs the sweep check
+    /// on EVERY iteration: after the `let event = if let Some(result) = result
+    /// { .. } else { .. };` binding, not inside its event branch, or a timer
+    /// wake would run nothing. The rule itself is tested above; this pins the
+    /// wiring. It is a cross-file scrape of `p2p_protoc.rs`.
     #[test]
     fn event_loop_uses_one_sweep_schedule() {
         const SRC: &str = include_str!("../p2p_protoc.rs");
         const SWEEP: &str = "ctx.sweep_zombie_transports(";
+        const TICK: &str = "if last_stats_log.elapsed() > STATS_LOG_INTERVAL {";
+        const BACKLOG: &str = "} else if zombie_sweep_state.slice_due(Instant::now(), false) {";
 
-        let tick = braced_block_after(SRC, "if last_stats_log.elapsed() > STATS_LOG_INTERVAL {");
+        // The wake, then the event binding, then the sweep check, then dispatch.
+        let wake = find_unique(
+            SRC,
+            "zombie_sweep::next_wake(&mut select_stream, zombie_sweep_state.backlog_deadline())",
+        );
+        let bind = find_unique(SRC, "let event = if let Some(result) = result {");
+        let (_, then_close) = block_span(SRC, bind);
+        let after_then = &SRC[then_close + 1..];
+        assert!(
+            after_then.trim_start().starts_with("else {"),
+            "the event binding must be `if let Some(result) = result {{ .. }} else {{ .. }}`"
+        );
+        let (_, else_close) = block_span(SRC, then_close + 1);
+        assert!(
+            SRC[else_close + 1..].trim_start().starts_with(';'),
+            "the else block must end the `let event = ..;` binding"
+        );
+        let tick = find_unique(SRC, TICK);
+        assert!(
+            wake < bind && else_close < tick,
+            "the sweep check must come after the event binding, not inside its \
+             event branch, so a timer wake reaches it"
+        );
+        let (_, tick_close) = block_span(SRC, tick);
+        assert!(
+            SRC[tick_close..].starts_with(BACKLOG),
+            "the backlog check must be the `else if` of the stats tick"
+        );
+        let backlog = tick_close;
+        let (backlog_open, backlog_close) = block_span(SRC, backlog);
+        let dispatch = find_unique(SRC, "            match event {");
+        assert!(
+            backlog_close < dispatch,
+            "the sweep check must run before the event is dispatched"
+        );
+
+        let tick_body = &SRC[tick..tick_close];
         let tick_guard = braced_block_after(
-            tick,
+            tick_body,
             "if zombie_sweep_state.slice_due(Instant::now(), true)",
         );
         assert_eq!(
@@ -1633,32 +1881,30 @@ mod tests {
             1,
             "the stats tick must sweep only when slice_due(now, true) allows it"
         );
+        assert!(
+            squash(tick_guard).contains("&mutzombie_sweep_state,true)"),
+            "the tick slice must be recorded as a tick slice"
+        );
         assert_eq!(
-            calls_at_statement_position(tick, "zombie_sweep_state.report();"),
+            calls_at_statement_position(tick_body, "zombie_sweep_state.report(Instant::now());"),
             1,
             "the stats tick must report the sweep"
         );
 
-        let backlog = braced_block_after(
-            SRC,
-            "} else if zombie_sweep_state.slice_due(Instant::now(), false) {",
-        );
+        let backlog_body = &SRC[backlog_open + 1..backlog_close];
         assert_eq!(
-            calls_at_statement_position(backlog, SWEEP),
+            calls_at_statement_position(backlog_body, SWEEP),
             1,
             "a due backlog slice must run the sweep"
         );
-
+        assert!(
+            squash(backlog_body).contains("&mutzombie_sweep_state,false)"),
+            "the backlog slice must be recorded as a backlog slice"
+        );
         assert_eq!(
             SRC.matches(SWEEP).count(),
             2,
             "the sweep runs from exactly the two guarded call sites"
-        );
-        assert!(
-            SRC.contains(
-                "zombie_sweep::next_wake(&mut select_stream, zombie_sweep_state.backlog_deadline())"
-            ),
-            "the event loop must wake for the backlog deadline"
         );
     }
 
