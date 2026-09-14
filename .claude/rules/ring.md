@@ -195,6 +195,40 @@ WHEN routing fails (no peers):
   → Do NOT panic or unwrap
 ```
 
+### Routing Predictors (#4485)
+
+```
+Two prediction stacks exist in router.rs; exactly one reaches routing.
+
+  LEGACY (default): isotonic curve + per-peer EWMA + fixed-weight Renegade
+    blend (routing_predictor.rs), or with FREENET_ROUTING_RESIDUAL_CORRECTION=1
+    the residual correction in place of the blend.
+  HIERARCHICAL (router/hierarchical.rs): EB-shrunk isotonic prior, root >
+    peer > (peer, band) empirical-Bayes hierarchy, horizon chosen online.
+    Routes only with FREENET_ROUTING_HIERARCHICAL=1, and then takes precedence
+    over BOTH legacy variants for every stage it can estimate (a cold stage
+    falls back to legacy). Computed at all only when that flag is on or
+    FREENET_ROUTING_DATASET is recording — never as an everyone-pays shadow.
+
+WHEN touching either stack:
+  → Flags parse fail-safe (parse_routing_flag): only 1/true/yes/on enable
+  → Flag off must stay bit-identical to legacy (pinned by
+    disabled_hierarchical_estimator_leaves_every_prediction_bit_identical)
+  → The hierarchical estimator's time comes from the router's injected
+    TimeSource (Ring wires ring.time_source), never the host wall clock
+  → Its peer tables are sized from max_connections (peer_capacity), evict
+    LRU in batches, and export evictions — do not hard-code a peer cap
+
+PROMOTION GATE: flipping the default needs field data from a gateway soak
+collected AFTER #5653 (failure labels) is live, showing the hierarchical
+layer's prequential skill (dashboard / routing dataset) at least matching
+legacy for failure, and not worse in SECONDS for timing and transfer.
+
+REMOVAL PLAN: once promoted, a separate PR deletes Renegade, the per-peer
+EWMA adjustment path, the fixed blend and the residual correction. Do not
+add new dependencies on those pieces.
+```
+
 ## State Consistency Invariants
 
 ### Cross-Validation of Related Data Structures
