@@ -12479,7 +12479,10 @@ fn test_contract_stays_off_close_cluster_without_migration() {
 ///
 /// Mechanism: the requester's router labels each peer that answered NotFound at
 /// most once per operation, so two or more NotFound labels means two or more
-/// distinct first hops. MARGIN_TBD
+/// distinct first hops. That assertion is what pins the fix: the outcome has
+/// no margin, since the GET resolves on its fourth and last attempt, so one
+/// more NotFound first hop in this topology would turn it red with no
+/// regression in retry diversity.
 #[test_log::test]
 fn test_get_retries_resolve_close_cluster_dead_end_without_migration() {
     const NETWORK_NAME: &str = "get-placement-deadend-control";
