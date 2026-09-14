@@ -366,7 +366,18 @@ async fn run_network_node_with_signals(
                 commands::rollback::COMMIT_HEALTHY_UPTIME_SECS,
             ))
             .await;
-            commands::rollback::commit_probation(&version);
+            // `spawn_blocking`, not a direct call: `commit_probation` does
+            // synchronous filesystem work (`read_to_string`, `remove_file`) and
+            // then takes the process-global stderr lock to write one line. Under
+            // the shipped unit that stderr is a journald socket, so a stopped or
+            // backed-up journald would park a runtime WORKER — and every later
+            // `eprintln!` in the process queues behind the same lock. The commit
+            // itself is fire-and-forget either way, so the failure mode this
+            // avoids is entirely in the runtime, not here.
+            let _stderr_may_block = tokio::task::spawn_blocking(move || {
+                commands::rollback::commit_probation(&version);
+            })
+            .await;
         })
     };
 
