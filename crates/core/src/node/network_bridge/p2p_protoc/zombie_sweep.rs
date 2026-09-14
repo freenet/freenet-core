@@ -1103,6 +1103,28 @@ mod tests {
         assert_eq!(plan.kept_for_link_use, vec![addr("198.51.100.1:1")]);
         assert_eq!(plan.over_cap, vec![addr("198.51.100.2:1")]);
 
+        // Several over cap, where recency and age disagree: the drop order (the
+        // order a bounded slice takes them in) follows recency.
+        let order = plan_zombie_sweep(
+            [
+                exempt_aged("198.51.100.1:1", 3000, 1),
+                exempt_aged("198.51.100.2:1", 200, 80),
+                exempt_aged("198.51.100.3:1", 2500, 40),
+                exempt_aged("198.51.100.4:1", 400, 60),
+            ],
+            2,
+            1,
+        );
+        assert_eq!(
+            order.over_cap,
+            vec![
+                addr("198.51.100.2:1"),
+                addr("198.51.100.4:1"),
+                addr("198.51.100.3:1"),
+            ],
+            "over-cap transports are dropped longest idle first, not oldest first"
+        );
+
         let tie = plan_zombie_sweep(
             [
                 exempt_aged("198.51.100.1:1", 300, 20),
