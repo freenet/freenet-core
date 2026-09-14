@@ -164,6 +164,27 @@ pub(crate) struct FailureForecasts {
     pub lambda: Option<f64>,
     /// Effective evidence behind the correction, when one was formed.
     pub n_eff: Option<f64>,
+    /// The hierarchical empirical-Bayes estimator (#4485), once it has a curve.
+    pub hierarchical: Option<f64>,
+    /// FLOORED AT 1 ms: every `log_response_time_*` field is `ln(max(t, 0.001))`,
+    /// while routing acts on the unfloored value and `time_to_response_start_s`
+    /// is recorded raw. Floor `time_to_response_start_s` the same way before any
+    /// log-scale scoring against these, or a 0 s outcome becomes `-inf`.
+    ///
+    /// `ln(seconds)` to response start the legacy stack would act on (including
+    /// the residual correction when that flag is on), forecast for every event
+    /// whether or not it turns out to be timed, so timing can be scored offline
+    /// on the timed subset. `None` without a timing estimate, and recorded only
+    /// while the hierarchical estimator is computed.
+    pub log_response_time_legacy: Option<f64>,
+    /// The same forecast from the hierarchical estimator: `ln E[T]`, the value
+    /// routing would act on, not the log-scale location.
+    pub log_response_time_hierarchical: Option<f64>,
+    /// `ln(bytes/s)` of the transfer speed the legacy stack would act on.
+    pub log_transfer_speed_legacy: Option<f64>,
+    /// `ln(bytes/s)` of the hierarchical estimator's effective speed (so that
+    /// `bytes / speed` is its expected transfer time).
+    pub log_transfer_speed_hierarchical: Option<f64>,
 }
 
 /// One observed routing outcome.
@@ -275,7 +296,10 @@ enum Line<'a> {
 }
 
 enum Record {
-    Route(RouteRecord),
+    // Boxed: the forecasts make a route record several times the size of a
+    // peers record, and every slot of the bounded channel is sized to the
+    // largest variant.
+    Route(Box<RouteRecord>),
     Peers {
         t_ms: u64,
         peers: Vec<PeerAttributes>,
@@ -316,6 +340,15 @@ impl RoutingDataset {
         Ok(dataset)
     }
 
+    /// A handle that has already stopped, as after its byte cap or a write
+    /// error, for tests of callers that must notice.
+    #[cfg(test)]
+    pub(crate) fn stopped_for_test() -> Self {
+        let (dataset, _rx) = Self::unstarted();
+        dataset.stopped.store(true, Ordering::Relaxed);
+        dataset
+    }
+
     /// A handle whose writer has not been started; the caller owns the receiver.
     fn unstarted() -> (Self, Receiver<Record>) {
         let (tx, rx) = sync_channel(CHANNEL_CAPACITY);
@@ -334,7 +367,7 @@ impl RoutingDataset {
     }
 
     pub(crate) fn record_route(&self, record: RouteRecord) {
-        self.send(Record::Route(record));
+        self.send(Record::Route(Box::new(record)));
     }
 
     pub(crate) fn record_peers(&self, t_ms: u64, peers: Vec<PeerAttributes>) {
@@ -599,6 +632,18 @@ pub(crate) fn global() -> Option<&'static RoutingDataset> {
     None
 }
 
+/// Whether `FREENET_ROUTING_DATASET` is set, so a missing recorder means it
+/// failed to open rather than was never asked for.
+#[cfg(not(test))]
+pub(crate) fn configured() -> bool {
+    std::env::var_os(DATASET_PATH_ENV).is_some()
+}
+
+#[cfg(test)]
+pub(crate) fn configured() -> bool {
+    false
+}
+
 /// Read a recording once the asynchronous writer has produced what `want`
 /// describes — polling the artifact rather than sleeping a fixed amount.
 #[cfg(test)]
@@ -655,6 +700,11 @@ mod tests {
                 corrected: 0.12,
                 lambda: Some(0.5),
                 n_eff: Some(4.0),
+                hierarchical: Some(0.11),
+                log_response_time_legacy: Some(-1.5),
+                log_response_time_hierarchical: None,
+                log_transfer_speed_legacy: Some(9.0),
+                log_transfer_speed_hierarchical: None,
             }),
         }
     }
@@ -722,6 +772,14 @@ mod tests {
         assert_eq!(lines[1]["peer"], "00000000000000aa");
         assert_eq!(lines[1]["outcome"], "failure");
         assert_eq!(lines[1]["forecasts"]["corrected"], 0.12);
+        assert_eq!(lines[1]["forecasts"]["hierarchical"], 0.11);
+        assert_eq!(lines[1]["forecasts"]["log_response_time_legacy"], -1.5);
+        assert_eq!(lines[1]["forecasts"]["log_transfer_speed_legacy"], 9.0);
+        assert!(lines[1]["forecasts"]["log_transfer_speed_hierarchical"].is_null());
+        assert!(
+            lines[1]["forecasts"]["log_response_time_hierarchical"].is_null(),
+            "an absent forecast must be recorded as null, not omitted or zero"
+        );
         assert_eq!(lines[2]["kind"], "peers");
         assert_eq!(lines[2]["t_ms"], 7);
         assert_eq!(lines[2]["peers"][0]["is_configured_gateway"], true);

@@ -33,6 +33,180 @@ fn fmt_skill(skill: Option<f64>) -> String {
     }
 }
 
+/// What the hierarchical rows show when the estimator has never been computed
+/// in this process, so an empty reading is not mistaken for a model with
+/// nothing to say.
+const NOT_COMPUTED: &str = "&mdash; not computed (enable FREENET_ROUTING_HIERARCHICAL, or set \
+     FREENET_ROUTING_DATASET to record a routing dataset)";
+
+/// What the hierarchical rows show when a routing dataset recorder IS
+/// configured but stopped (byte cap or write error) before any event reached
+/// the estimator: telling the operator to set the variable would be wrong.
+const RECORDER_STOPPED_EMPTY: &str = "&mdash; not computed (the routing dataset recorder stopped \
+     before the estimator saw any event)";
+
+/// What the hierarchical rows show when `FREENET_ROUTING_DATASET` is set but
+/// the recorder could not be opened.
+const RECORDER_OPEN_FAILED: &str =
+    "&mdash; not computed (the routing dataset could not be opened; see the node log)";
+
+/// Whether the hierarchical readings are live, frozen, or absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Computation {
+    /// Being computed now.
+    Live,
+    /// Computed earlier, stopped since (a routing dataset that hit its byte cap
+    /// or failed to write). The readings are the soak's final numbers: worth
+    /// showing, but never as if they were still moving.
+    Frozen,
+    /// Never computed in this process, and no stopped recorder explains why.
+    Never,
+    /// A recorder was configured but stopped before any event was learned.
+    RecorderStoppedEmpty,
+    /// `FREENET_ROUTING_DATASET` is set but the recorder failed to open.
+    RecorderOpenFailed,
+}
+
+impl Computation {
+    fn of(rs: &crate::router::RouterSnapshotInfo) -> Self {
+        if rs.hierarchical_computed {
+            Computation::Live
+        } else if rs.hierarchical_failure_events > 0 || rs.hierarchical_failure_evaluated > 0 {
+            Computation::Frozen
+        } else if rs.routing_dataset_stopped {
+            Computation::RecorderStoppedEmpty
+        } else if rs.routing_dataset_open_failed {
+            Computation::RecorderOpenFailed
+        } else {
+            Computation::Never
+        }
+    }
+}
+
+/// Render one hierarchical reading according to whether it is live.
+fn hierarchical_reading(state: Computation, live: impl FnOnce() -> String) -> String {
+    match state {
+        Computation::Live => live(),
+        Computation::Frozen => format!("frozen when computation stopped: {}", live()),
+        Computation::Never => NOT_COMPUTED.to_string(),
+        Computation::RecorderStoppedEmpty => RECORDER_STOPPED_EMPTY.to_string(),
+        Computation::RecorderOpenFailed => RECORDER_OPEN_FAILED.to_string(),
+    }
+}
+
+/// The legacy rows' note when the hierarchical estimator routes. "Superseded"
+/// is a node-wide setting, not a per-query fact: a stage whose hierarchical
+/// curve is not warm yet still falls back to the legacy path for that query.
+const SUPERSEDED_BY_HIERARCHICAL: &str =
+    " &mdash; superseded (except where a hierarchical stage is not yet warm)";
+
+/// The blend row's note when the hierarchical estimator routes AND the residual
+/// correction is on: a cold hierarchical stage falls back to the correction, so
+/// the blend is not what the fallback uses either.
+const SUPERSEDED_BY_BOTH: &str = " &mdash; superseded (a cold hierarchical stage falls back to \
+     the correction, not to this blend)";
+
+/// A duration readable at any scale: µs below a millisecond, ms below a second.
+fn fmt_duration_secs(seconds: f64) -> String {
+    if seconds < 1e-3 {
+        format!("{:.0} &micro;s", seconds * 1e6)
+    } else if seconds < 1.0 {
+        format!("{:.1} ms", seconds * 1e3)
+    } else {
+        format!("{seconds:.2} s")
+    }
+}
+
+/// Render both models' RMS error in seconds on the same events.
+///
+/// This is the instrument for the promotion gate's "not worse in seconds", so
+/// it names which model is ahead rather than leaving two bare numbers.
+///
+/// Below [`crate::router::MIN_WEIGHT_FOR_VERDICT`] of FORGOTTEN event weight it
+/// says so instead of naming a winner: a handful of recent timed events settles
+/// nothing, however many were scored long ago.
+fn fmt_seconds_error(
+    legacy: Option<f64>,
+    hierarchical: Option<f64>,
+    scored: u64,
+    weight: f64,
+) -> String {
+    let (Some(legacy), Some(hierarchical)) = (legacy, hierarchical) else {
+        return "&mdash; no event both models forecast yet".to_string();
+    };
+    let numbers = format!(
+        "legacy {}, hierarchical {} (n={scored}, recent weight {weight:.0})",
+        fmt_duration_secs(legacy),
+        fmt_duration_secs(hierarchical)
+    );
+    if weight < crate::router::MIN_WEIGHT_FOR_VERDICT {
+        return format!(
+            "{numbers} &mdash; insufficient recent data (needs weight {:.0})",
+            crate::router::MIN_WEIGHT_FOR_VERDICT
+        );
+    }
+    let verdict = if hierarchical <= legacy {
+        "hierarchical no worse"
+    } else {
+        "hierarchical worse"
+    };
+    format!("{numbers} &mdash; {verdict}")
+}
+
+/// Render the hierarchical peer-table eviction count against its capacity.
+///
+/// Evictions mean churn is exceeding the headroom derived from
+/// `max_connections`, which an operator can act on, so a non-zero count says so.
+fn fmt_evictions(evictions: u64, capacity: usize) -> String {
+    if evictions == 0 {
+        format!("0 (capacity {capacity} per stage)")
+    } else {
+        format!(
+            "{evictions} (capacity {capacity} per stage) &mdash; churn exceeds the table's headroom"
+        )
+    }
+}
+
+/// Skewness or excess kurtosis beyond this reads as a departure from the
+/// lognormal assumption. For a normal sample of a few hundred the sampling
+/// standard error of either is about 0.1-0.3, so 1.0 is well clear of noise.
+const LOG_SHAPE_WARNING: f64 = 1.0;
+
+/// Render a timing stage's lognormality check.
+///
+/// Expectation timing is exact only for normal log residuals, so the reading an
+/// operator needs is whether that holds, said in words, with the numbers.
+fn fmt_log_shape(shape: &crate::router::LogResidualShape) -> String {
+    let (Some(sigma2), Some(skew), Some(kurtosis)) =
+        (shape.sigma2, shape.skewness, shape.excess_kurtosis)
+    else {
+        return format!("&mdash; not enough data yet ({} residuals)", shape.events);
+    };
+    let verdict = if skew.abs() > LOG_SHAPE_WARNING || kurtosis.abs() > LOG_SHAPE_WARNING {
+        " &mdash; <strong>not lognormal</strong>: expected times may be inaccurate"
+    } else {
+        " &mdash; consistent with lognormal"
+    };
+    format!(
+        "&sigma;&sup2; {sigma2:.3}, skew {skew:+.2}, excess kurtosis {kurtosis:+.2} (n={}){verdict}",
+        shape.events
+    )
+}
+
+/// Render the hierarchical estimator's selected forgetting horizon.
+///
+/// `None` means "forgets nothing inside its window" only once the stage is
+/// active (has a curve). Before that it predicts nothing, and no horizon has
+/// been selected at all.
+fn fmt_horizon(active: bool, events: usize, hours: Option<f64>) -> String {
+    match (events, active, hours) {
+        (0, _, _) => "&mdash; (no events yet)".to_string(),
+        (_, false, _) => format!("&mdash; not active yet ({events} events, no curve)"),
+        (_, true, None) => "none &mdash; remembers its whole window".to_string(),
+        (_, true, Some(hours)) => format!("{hours} h"),
+    }
+}
+
 /// Share of full-window decisions from the farthest quarter above which the
 /// candidate window is worth investigating as too narrow.
 ///
@@ -135,6 +309,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
 
     // Build routing model status card
     let model_card = if let Some(ref rs) = router_snapshot {
+        let state = Computation::of(rs);
         let total_events = rs.failure_events + rs.success_events;
         let peer_failure_events = peer_routing
             .as_ref()
@@ -172,13 +347,22 @@ pub fn peer_detail_html(address_str: &str) -> String {
 
                 <h3 style="margin-top: 1em;">Which layer is doing the work?</h3>
                 <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">Each layer&rsquo;s <strong>skill</strong> against simply assuming the average failure rate. <strong>0 means no better than that assumption; negative means worse.</strong> Skill rather than a raw score because failures are rare, and on a rare event a raw score mostly measures the rarity: at a {base_rate} failure rate, a forecast that never predicts failure at all scores {clim_brier} and looks excellent.</p>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">These are <strong>two routes from the same starting point</strong>, not one running total. Both begin at the distance-only estimate. The established route adds a per-peer offset and then the Renegade blend; the correction route instead learns what the distance-only estimate gets wrong for this exact peer and contract, and <strong>replaces</strong> the per-peer offset rather than stacking on it. Compare the two end points, not the rows in order.</p>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">The first rows are <strong>two routes from the same starting point</strong>, not one running total. Both begin at the distance-only estimate. The established route adds a per-peer offset and then the Renegade blend; the correction route instead learns what the distance-only estimate gets wrong for this exact peer and contract, and <strong>replaces</strong> the per-peer offset rather than stacking on it. Compare the end points, not the rows in order.</p>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">The hierarchical row is a <strong>separate, self-contained model</strong>, not a step after the others. It fits its own distance curve over a longer window, then adds an offset for the peer and for the peer on this part of the ring, each weighted by how much evidence stands behind it: a peer seen a handful of times barely moves the estimate, and a peer seen many times moves it only as far as the measured spread between peers justifies &mdash; if peers turn out not to differ, not at all. It replaces all of the above rather than adding to any of them, and is planned to replace them for good once it has proven itself. It is only computed while it routes or while the routing dataset is being recorded. It is new, so compare its score with the established route&rsquo;s before trusting it.</p>
                 <div class="info-grid">
                     <div class="info-label">Both routes start at: distance only</div><div class="info-value">{skill_global}</div>
                     <div class="info-label">&#8627; established: + per-peer offset</div><div class="info-value">{skill_adjusted}</div>
                     <div class="info-label">&#8627; established: + Renegade blend{blend_note}</div><div class="info-value">{skill_blended}</div>
                     <div class="info-label">&#8627; correction: distance only + residual{corrected_note}</div><div class="info-value">{skill_corrected}</div>
+                    <div class="info-label">Hierarchical: own curve + evidence-weighted offsets{hierarchical_note}</div><div class="info-value">{skill_hierarchical}</div>
                     <div class="info-label">Scored predictions</div><div class="info-value">{layers_eval}</div>
+                    <div class="info-label">Scored predictions: hierarchical</div><div class="info-value">{hierarchical_eval}</div>
+                    <div class="info-label">Hierarchical forgetting horizon</div><div class="info-value">{hierarchical_horizon}</div>
+                    <div class="info-label">Hierarchical peer-table evictions</div><div class="info-value">{hierarchical_evictions}</div>
+                    <div class="info-label">Hierarchical response-time log residuals</div><div class="info-value">{shape_response}</div>
+                    <div class="info-label">Hierarchical transfer-speed log residuals</div><div class="info-value">{shape_transfer}</div>
+                    <div class="info-label">Response-time error, RMS seconds</div><div class="info-value">{timing_error}</div>
+                    <div class="info-label">Transfer-time error, RMS seconds</div><div class="info-value">{transfer_error}</div>
                 </div>
 
                 <h3 style="margin-top: 1em;">Is the candidate window too narrow?</h3>
@@ -224,16 +408,65 @@ pub fn peer_detail_html(address_str: &str) -> String {
             skill_adjusted = fmt_skill(rs.failure_skill_adjusted),
             skill_blended = fmt_skill(rs.failure_skill_blended),
             skill_corrected = fmt_skill(rs.failure_skill_corrected),
-            blend_note = if rs.residual_correction_enabled {
+            blend_note = if rs.hierarchical_routing_enabled && rs.residual_correction_enabled {
+                SUPERSEDED_BY_BOTH
+            } else if rs.hierarchical_routing_enabled {
+                SUPERSEDED_BY_HIERARCHICAL
+            } else if rs.residual_correction_enabled {
                 " &mdash; superseded"
             } else {
                 " &mdash; in use"
             },
-            corrected_note = if rs.residual_correction_enabled {
+            corrected_note = if rs.hierarchical_routing_enabled {
+                SUPERSEDED_BY_HIERARCHICAL
+            } else if rs.residual_correction_enabled {
                 " &mdash; in use"
             } else {
                 " &mdash; measured, not applied"
             },
+            skill_hierarchical =
+                hierarchical_reading(state, || fmt_skill(rs.failure_skill_hierarchical)),
+            hierarchical_note = if rs.hierarchical_routing_enabled {
+                " &mdash; in use"
+            } else {
+                match state {
+                    Computation::Live => " &mdash; measured, not applied",
+                    Computation::Frozen | Computation::RecorderStoppedEmpty => " &mdash; stopped",
+                    Computation::RecorderOpenFailed => " &mdash; recorder failed to open",
+                    Computation::Never => " &mdash; off",
+                }
+            },
+            shape_response = hierarchical_reading(state, || {
+                fmt_log_shape(&rs.hierarchical_response_time_log_shape)
+            }),
+            shape_transfer = hierarchical_reading(state, || {
+                fmt_log_shape(&rs.hierarchical_transfer_speed_log_shape)
+            }),
+            hierarchical_evictions = hierarchical_reading(state, || {
+                fmt_evictions(
+                    rs.hierarchical_peer_evictions,
+                    rs.hierarchical_peer_capacity,
+                )
+            }),
+            hierarchical_eval =
+                hierarchical_reading(state, || { rs.hierarchical_failure_evaluated.to_string() }),
+            timing_error = hierarchical_reading(state, || fmt_seconds_error(
+                rs.response_time_rmse_secs_legacy,
+                rs.response_time_rmse_secs_hierarchical,
+                rs.response_time_scored,
+                rs.response_time_weight
+            )),
+            transfer_error = hierarchical_reading(state, || fmt_seconds_error(
+                rs.transfer_time_rmse_secs_legacy,
+                rs.transfer_time_rmse_secs_hierarchical,
+                rs.transfer_time_scored,
+                rs.transfer_time_weight
+            )),
+            hierarchical_horizon = hierarchical_reading(state, || fmt_horizon(
+                rs.hierarchical_failure_active,
+                rs.hierarchical_failure_events,
+                rs.hierarchical_failure_horizon_hours,
+            )),
             layers_eval = rs.failure_layers_evaluated,
             corr_enabled = if rs.residual_correction_enabled {
                 "Yes"
@@ -628,6 +861,174 @@ mod tests {
     }
 
     #[test]
+    fn eviction_rendering_flags_churn_and_says_when_not_computed() {
+        assert_eq!(fmt_evictions(0, 400), "0 (capacity 400 per stage)");
+        let churning = fmt_evictions(12, 400);
+        assert!(
+            churning.contains("12") && churning.contains("headroom"),
+            "{churning}"
+        );
+    }
+
+    /// The layer copy must not promise that evidence alone moves the estimate:
+    /// with no measured between-peer spread, a peer seen thousands of times
+    /// does not move it at all.
+    #[test]
+    fn layer_panel_does_not_overstate_what_evidence_buys() {
+        let source = include_str!("peer_detail.rs");
+        let start = source.find("pub fn peer_detail_html").unwrap();
+        let end = start + source[start..].find("\n#[cfg(test)]").unwrap();
+        let render = &source[start..end];
+        assert!(!render.contains("moves it fully"));
+        assert!(render.contains("if peers turn out not to differ, not at all"));
+    }
+
+    #[test]
+    fn seconds_error_rendering_names_the_verdict() {
+        assert!(
+            fmt_seconds_error(Some(0.2), Some(0.1), 400, 400.0).contains("hierarchical no worse")
+        );
+        assert!(
+            fmt_seconds_error(Some(0.2), Some(0.2), 400, 400.0).contains("hierarchical no worse")
+        );
+        assert!(fmt_seconds_error(Some(0.1), Some(0.2), 400, 400.0).contains("hierarchical worse"));
+        assert!(fmt_seconds_error(None, Some(0.2), 0, 0.0).contains("no event"));
+    }
+
+    /// Every hierarchical reading in the layer panel must go through the
+    /// computed check, so a stopped recorder cannot leave frozen counts on show.
+    #[test]
+    fn every_hierarchical_reading_is_gated_on_computation() {
+        let source = include_str!("peer_detail.rs");
+        let start = source.find("pub fn peer_detail_html").unwrap();
+        let end = start + source[start..].find("\n#[cfg(test)]").unwrap();
+        let render = &source[start..end];
+        for binding in [
+            "skill_hierarchical =",
+            "hierarchical_eval =",
+            "hierarchical_horizon =",
+            "hierarchical_evictions =",
+            "shape_response =",
+            "shape_transfer =",
+            "timing_error =",
+            "transfer_error =",
+        ] {
+            let at = render
+                .find(binding)
+                .unwrap_or_else(|| panic!("{binding} must be rendered"));
+            let next = render[at + binding.len()..]
+                .find(" = ")
+                .map_or(render.len(), |offset| at + binding.len() + offset);
+            assert!(
+                render[at..next].contains("hierarchical_reading(state"),
+                "{binding} must render through hierarchical_reading"
+            );
+        }
+    }
+
+    #[test]
+    fn hierarchical_readings_are_labelled_live_frozen_or_absent() {
+        let live = || "0.123".to_string();
+        assert_eq!(hierarchical_reading(Computation::Live, live), "0.123");
+        let frozen = hierarchical_reading(Computation::Frozen, live);
+        assert!(
+            frozen.contains("frozen") && frozen.contains("0.123"),
+            "a stopped soak's final numbers must stay visible, labelled: {frozen}"
+        );
+        let never = hierarchical_reading(Computation::Never, live);
+        assert!(never.contains("not computed") && !never.contains("0.123"));
+        assert!(
+            !NOT_COMPUTED.contains("  "),
+            "no runs of spaces in the copy"
+        );
+    }
+
+    /// The verdict needs recent evidence: a large lifetime count whose weight
+    /// has been forgotten is not enough.
+    #[test]
+    fn seconds_error_needs_enough_recent_weight_for_a_verdict() {
+        let min = crate::router::MIN_WEIGHT_FOR_VERDICT;
+        let stale = fmt_seconds_error(Some(0.2), Some(0.1), 10_000, min - 1.0);
+        assert!(
+            stale.contains("insufficient recent data") && !stale.contains("no worse"),
+            "10,000 events long forgotten must not produce a verdict: {stale}"
+        );
+        let enough = fmt_seconds_error(Some(0.2), Some(0.1), 150, min);
+        assert!(enough.contains("hierarchical no worse"), "{enough}");
+    }
+
+    #[test]
+    fn a_recorder_stopped_before_any_event_is_not_told_to_set_the_variable() {
+        let stopped = hierarchical_reading(Computation::RecorderStoppedEmpty, || "x".to_string());
+        assert!(stopped.contains("stopped") && !stopped.contains("set FREENET_ROUTING_DATASET"));
+        let never = hierarchical_reading(Computation::Never, || "x".to_string());
+        assert!(never.contains("FREENET_ROUTING_DATASET"));
+        let failed = hierarchical_reading(Computation::RecorderOpenFailed, || "x".to_string());
+        assert!(failed.contains("could not be opened") && !failed.contains("set FREENET"));
+    }
+
+    #[test]
+    fn lognormality_warning_does_not_assert_a_direction() {
+        let shape = crate::router::LogResidualShape {
+            sigma2: Some(0.25),
+            skewness: Some(-2.0),
+            excess_kurtosis: Some(0.0),
+            events: 400,
+        };
+        let text = fmt_log_shape(&shape);
+        assert!(text.contains("not lognormal") && text.contains("inaccurate"));
+        assert!(!text.contains("understated") && !text.contains("overstated"));
+    }
+
+    #[test]
+    fn durations_render_at_a_readable_scale() {
+        assert_eq!(fmt_duration_secs(0.000_42), "420 &micro;s");
+        assert_eq!(fmt_duration_secs(0.042), "42.0 ms");
+        assert_eq!(fmt_duration_secs(4.2), "4.20 s");
+    }
+
+    #[test]
+    fn log_shape_rendering_names_the_verdict_at_its_threshold() {
+        use crate::router::LogResidualShape;
+        let shape = |skew: f64, kurtosis: f64| LogResidualShape {
+            sigma2: Some(0.25),
+            skewness: Some(skew),
+            excess_kurtosis: Some(kurtosis),
+            events: 400,
+        };
+        assert!(fmt_log_shape(&shape(0.1, -0.2)).contains("consistent with lognormal"));
+        assert!(fmt_log_shape(&shape(0.99, 0.99)).contains("consistent with lognormal"));
+        assert!(fmt_log_shape(&shape(1.01, 0.0)).contains("not lognormal"));
+        assert!(fmt_log_shape(&shape(0.0, 1.01)).contains("not lognormal"));
+        assert!(fmt_log_shape(&shape(-1.5, 0.0)).contains("not lognormal"));
+        assert!(fmt_log_shape(&LogResidualShape::default()).contains("not enough data"));
+    }
+
+    #[test]
+    fn horizon_rendering_distinguishes_no_events_from_no_forgetting() {
+        assert!(fmt_horizon(false, 0, None).contains("no events yet"));
+        assert!(fmt_horizon(true, 0, Some(6.0)).contains("no events yet"));
+        let inactive = fmt_horizon(false, 3, None);
+        assert!(
+            inactive.contains("not active yet") && !inactive.contains("whole window"),
+            "a stage with no curve must not read as forgetting nothing: {inactive}"
+        );
+        let frozen_inactive =
+            hierarchical_reading(Computation::Frozen, || fmt_horizon(false, 3, None));
+        assert!(
+            frozen_inactive.contains("frozen") && frozen_inactive.contains("not active yet"),
+            "frozen while inactive: {frozen_inactive}"
+        );
+        let whole = fmt_horizon(true, 120, None);
+        assert!(
+            whole.contains("whole window"),
+            "an active stage with no forgetting must say so, got {whole}"
+        );
+        assert_eq!(fmt_horizon(true, 120, Some(1.5)), "1.5 h");
+        assert_eq!(fmt_horizon(true, 120, Some(24.0)), "24 h");
+    }
+
+    #[test]
     fn window_reading_switches_verdict_at_its_threshold() {
         // This sentence is what an operator acts on, so its boundary is pinned
         // in both directions rather than only at comfortable distances from it.
@@ -714,9 +1115,44 @@ mod tests {
             panel.contains("two routes from the same starting point"),
             "the panel must say the rows are alternative routes, not a running total"
         );
+        // Scoped to the correction's own paragraph: the hierarchical paragraph
+        // also says "replaces", which would satisfy a panel-wide search even if
+        // the correction's wording regressed.
+        let routes_start = panel
+            .find("two routes from the same starting point")
+            .expect("the routes paragraph exists");
+        let paragraph_start = panel[..routes_start]
+            .rfind("<p")
+            .expect("the routes sentence sits in a paragraph");
+        let paragraph_end = panel[routes_start..]
+            .find("</p>")
+            .map(|offset| routes_start + offset)
+            .expect("the routes paragraph closes");
+        let correction_paragraph = &panel[paragraph_start..paragraph_end];
         assert!(
-            panel.contains("replaces"),
-            "the panel must say the correction REPLACES the per-peer offset"
+            correction_paragraph.contains("<strong>replaces</strong> the per-peer offset"),
+            "the correction paragraph must say the correction REPLACES the per-peer offset"
+        );
+        assert!(
+            !correction_paragraph.contains("hierarchical"),
+            "the correction paragraph must be its own paragraph"
+        );
+        assert!(
+            panel.contains("separate, self-contained model")
+                && panel.contains("replaces all of the above"),
+            "the hierarchical row must be presented as its own model that replaces \
+             the others, not as another step in a running total"
+        );
+        assert!(
+            panel.contains("{skill_hierarchical}"),
+            "the hierarchical skill must be rendered inside the layer panel"
+        );
+        assert!(
+            !panel.contains(r#"<div class="info-label">+ hierarchical"#)
+                && !panel.contains(r#"<div class="info-label">&#8627; hierarchical"#)
+                && !panel.contains(r#"<div class="info-label">&#8627; Hierarchical"#),
+            "the hierarchical row must not be labelled as a branch of, or a term \
+             added to, the rows above it"
         );
         assert!(
             !panel.contains(r#"<div class="info-label">+ residual correction"#),

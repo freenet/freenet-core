@@ -195,6 +195,78 @@ WHEN routing fails (no peers):
   → Do NOT panic or unwrap
 ```
 
+### Routing Predictors (#4485)
+
+```
+Two prediction stacks exist in router.rs; exactly one reaches routing.
+
+  LEGACY (default): isotonic curve + per-peer EWMA + fixed-weight Renegade
+    blend (routing_predictor.rs), or with FREENET_ROUTING_RESIDUAL_CORRECTION=1
+    the residual correction in place of the blend.
+  HIERARCHICAL (router/hierarchical.rs): EB-shrunk isotonic prior, root >
+    peer > (peer, band) empirical-Bayes hierarchy, horizon chosen online.
+    Routes only with FREENET_ROUTING_HIERARCHICAL=1, and then takes precedence
+    over BOTH legacy variants for every stage it can estimate (a cold stage
+    falls back to legacy). Computed at all only when that flag is on or
+    FREENET_ROUTING_DATASET is recording — never as an everyone-pays shadow.
+
+WHEN touching either stack:
+  → Flags parse fail-safe (parse_routing_flag): only 1/true/yes/on enable
+  → Flag off must stay bit-identical to legacy (pinned by
+    disabled_hierarchical_estimator_leaves_every_prediction_bit_identical)
+  → The hierarchical estimator's time comes from the router's injected
+    TimeSource, never the host wall clock. Ring wires ring.time_source, an
+    InstantTimeSrc reading tokio's clock: it advances under a paused tokio
+    runtime (direct sim runner) but NOT under hosting_time_source_override.
+    Router-level tests inject a SharedMockTimeSource and advance it by hand.
+  → It is computed only while its flag is on or the routing dataset is
+    RECORDING (a stopped recorder stops it); readings then freeze, and the
+    dashboard shows "not computed now" rather than frozen values
+  → Its peer tables are sized from max_connections (peer_capacity), evict
+    LRU in batches, and export evictions — do not hard-code a peer cap
+
+PROMOTION GATE, in two parts, both on data collected after #5653 (failure
+labels) is deployed:
+  (a) OFFLINE CALIBRATION, on the routing dataset: prequential failure Brier
+      score and seconds error for both models on the same events. This is
+      calibration of each model's estimate for the peer actually tried. It
+      does NOT measure ranking: the dataset records only the chosen peer and
+      its outcome, with no candidate sets and no exploration, so how a peer
+      the other model would have chosen would have fared is unobserved.
+      Offline ranking evaluation would need a per-decision candidate log
+      with exploration (future work).
+  (b) ON-FIELD CROSSOVER between gateways: gateway-2 with
+      FREENET_ROUTING_HIERARCHICAL on against gateway-1 on legacy, then SWAP
+      which gateway has the flag halfway through the window. The two gateways
+      differ in connection population (address age, bootstrap-list position),
+      so a one-gateway-per-arm comparison is confounded by gateway identity;
+      compare WITHIN-gateway differences (flag on vs off on the same gateway)
+      in GET success rate, latency, and chosen-peer failure rate from the
+      nodes' telemetry.
+Live instruments behind (a):
+  - hierarchical_* failure skill (same events as the legacy layers)
+  - response_time_rmse_secs_* / transfer_time_rmse_secs_* (paired, each error
+    clipped to 10x its own outcome with a 1 ms floor, forgotten over 24h;
+    "insufficient recent data" below forgotten weight 100). On transfer they
+    are not like-for-like: hierarchical targets E[bytes/V], legacy
+    bytes/E[V], so wherever speeds vary Jensen's inequality favours
+    hierarchical by construction. The clip is also ONE-SIDED: forecasts are
+    non-negative, so only over-forecasts are ever trimmed, which under
+    heavy-tailed outcomes favours the higher forecaster (lognormal sigma 1.5:
+    20% of events clip at the mean forecast; the clipped-error minimiser is
+    1.3x the mean) and compounds the Jensen advantage. Gate (a) uses the
+    dataset's UNCLIPPED values and is unaffected.
+  - hierarchical_*_log_shape (the lognormal assumption behind E[T])
+REPLAY CAVEAT: dataset forecasts are recorded at completion time on the
+estimator state then; routing acts on an estimate only once
+has_sufficient_routing_events() holds and the flag is on. Filter offline
+analysis on prior_failure_events accordingly.
+
+REMOVAL PLAN: once promoted, a separate PR deletes Renegade, the per-peer
+EWMA adjustment path, the fixed blend and the residual correction. Do not
+add new dependencies on those pieces.
+```
+
 ## State Consistency Invariants
 
 ### Cross-Validation of Related Data Structures
