@@ -2830,7 +2830,8 @@ mod tests {
     ///    heavily, making it plausibly the worst drift case in the tree.
     /// 2. **An unbounded, remote-peer-keyed map.** `peer_adjustments` only ever
     ///    INSERTS on the incremental path (`add_event`); the ONLY thing that
-    ///    prunes it to the current window is a refit (see `IsotonicEstimator::fit`).
+    ///    prunes it to the current window is a refit (see `IsotonicEstimator::refit`,
+    ///    which rebuilds it with `anchor_peer_adjustments`).
     ///    `raw_events` is capped at `MAX_REGRESSION_POINTS`, but with no refit the
     ///    map was not capped by anything: it grew one entry per distinct peer ever
     ///    seen in CONNECT forwarding, for the node's whole life — the exact hazard
@@ -2870,7 +2871,8 @@ mod tests {
     /// `IsotonicEstimator::add_event` only ever INSERTS into `peer_adjustments`;
     /// nothing evicts from it. `raw_events` is capped at `MAX_REGRESSION_POINTS`,
     /// but the map is pruned to the current window only by a refit
-    /// (`IsotonicEstimator::fit` rebuilds it from `raw_events`). Because nothing
+    /// (`IsotonicEstimator::refit` rebuilds it from `raw_events`, via
+    /// `anchor_peer_adjustments`). Because nothing
     /// refit THIS estimator, and because it hangs off `OpManager` and so lives as
     /// long as the node, the map grew one entry per distinct peer ever seen in
     /// CONNECT forwarding, forever — an unbounded collection keyed by remote
