@@ -1495,43 +1495,52 @@ impl P2pConnManager {
                     ));
                 },
 
-                maybe_result = StreamExt::next(&mut select_stream) => {
-                    let Some(result) = maybe_result else {
-                        break;
-                    };
-                    result
+                // Also wakes for a zombie sweep backlog deadline, so a backlog
+                // drains on a quiet node (see `zombie_sweep::next_wake`).
+                wake = zombie_sweep::next_wake(&mut select_stream, zombie_sweep_state.backlog_deadline()) => {
+                    match wake {
+                        zombie_sweep::LoopWake::Event(Some(result)) => Some(result),
+                        zombie_sweep::LoopWake::Event(None) => break,
+                        zombie_sweep::LoopWake::ZombieSweepDue => None,
+                    }
                 },
             };
 
-            loop_iteration_count += 1;
+            let event = if let Some(result) = result {
+                loop_iteration_count += 1;
 
-            let event_type = match &result {
-                priority_select::SelectResult::Notification(_) => "notification",
-                priority_select::SelectResult::OpExecution(_) => "op_execution",
-                priority_select::SelectResult::PeerConnection(_) => "peer_connection",
-                priority_select::SelectResult::ConnBridge(_) => "conn_bridge",
-                priority_select::SelectResult::Handshake(_) => "handshake",
-                priority_select::SelectResult::NodeController(_) => "node_controller",
-                priority_select::SelectResult::ClientTransaction(_) => "client_transaction",
-                priority_select::SelectResult::ExecutorTransaction(_) => "executor_transaction",
+                let event_type = match &result {
+                    priority_select::SelectResult::Notification(_) => "notification",
+                    priority_select::SelectResult::OpExecution(_) => "op_execution",
+                    priority_select::SelectResult::PeerConnection(_) => "peer_connection",
+                    priority_select::SelectResult::ConnBridge(_) => "conn_bridge",
+                    priority_select::SelectResult::Handshake(_) => "handshake",
+                    priority_select::SelectResult::NodeController(_) => "node_controller",
+                    priority_select::SelectResult::ClientTransaction(_) => "client_transaction",
+                    priority_select::SelectResult::ExecutorTransaction(_) => "executor_transaction",
+                };
+
+                let process_start = Instant::now();
+
+                // Process the result using the existing handler
+                let event = ctx
+                    .process_select_result(result, &mut state, &handshake_cmd_sender)
+                    .await?;
+
+                let elapsed = process_start.elapsed();
+                if elapsed > SLOW_EVENT_THRESHOLD {
+                    slow_event_count += 1;
+                    tracing::warn!(
+                        event_type,
+                        elapsed_ms = elapsed.as_millis(),
+                        "Slow event loop iteration"
+                    );
+                }
+                event
+            } else {
+                // Woken only for a zombie sweep backlog slice; it runs below.
+                EventResult::Continue
             };
-
-            let process_start = Instant::now();
-
-            // Process the result using the existing handler
-            let event = ctx
-                .process_select_result(result, &mut state, &handshake_cmd_sender)
-                .await?;
-
-            let elapsed = process_start.elapsed();
-            if elapsed > SLOW_EVENT_THRESHOLD {
-                slow_event_count += 1;
-                tracing::warn!(
-                    event_type,
-                    elapsed_ms = elapsed.as_millis(),
-                    "Slow event loop iteration"
-                );
-            }
 
             // Periodic stats logging
             if last_stats_log.elapsed() > STATS_LOG_INTERVAL {
@@ -1575,11 +1584,14 @@ impl P2pConnManager {
                 last_stats_log = Instant::now();
 
                 // Zombie transport cleanup (see `zombie_sweep`). A slice drops at
-                // most MAX_ZOMBIE_CLEANUP_PER_CYCLE transports; when more are due,
-                // backlog slices run below on the schedule in
-                // `ZombieSweepState::backlog_slice_due`.
-                ctx.sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_state)
-                    .await;
+                // most MAX_ZOMBIE_CLEANUP_PER_CYCLE transports. Both this tick and
+                // the backlog check below use `ZombieSweepState::slice_due`, so no
+                // slice starts within the required spacing of the previous one.
+                if zombie_sweep_state.slice_due(Instant::now(), true) {
+                    ctx.sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_state)
+                        .await;
+                }
+                zombie_sweep_state.report();
 
                 // Periodic cleanup of pending_op_results: remove entries where the
                 // receiver has been dropped (closed sender). This is a safety net for
@@ -1607,7 +1619,7 @@ impl P2pConnManager {
                     }
                     state.last_pending_op_cleanup = Instant::now();
                 }
-            } else if zombie_sweep_state.backlog_slice_due(Instant::now()) {
+            } else if zombie_sweep_state.slice_due(Instant::now(), false) {
                 ctx.sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_state)
                     .await;
             }
