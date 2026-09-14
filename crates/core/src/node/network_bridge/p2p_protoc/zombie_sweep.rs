@@ -1278,6 +1278,33 @@ mod tests {
         );
     }
 
+    /// The event loop must run a backlog slice when
+    /// `ZombieSweepState::backlog_slice_due` says so. The decision itself is
+    /// tested above; this pins that the loop consults it unconditionally and
+    /// sweeps in response. It is a cross-file scrape of `p2p_protoc.rs`.
+    #[test]
+    fn event_loop_runs_backlog_slices_when_due() {
+        const SRC: &str = include_str!("../p2p_protoc.rs");
+        const GUARD: &str = "} else if zombie_sweep_state.backlog_slice_due(Instant::now()) {";
+        assert_eq!(
+            SRC.matches(GUARD).count(),
+            1,
+            "the event loop must gate backlog slices on backlog_slice_due, and only there"
+        );
+        let after = &SRC[SRC.find(GUARD).unwrap() + GUARD.len()..];
+        let body = &after[..after.find('}').expect("guarded block must close")];
+        let sweeps = body
+            .lines()
+            .filter(|l| l.trim_start().starts_with("ctx.sweep_zombie_transports("))
+            .count();
+        assert_eq!(sweeps, 1, "a due backlog slice must run the sweep: {body}");
+        assert_eq!(
+            SRC.matches("ctx.sweep_zombie_transports(").count(),
+            2,
+            "the sweep runs from the stats tick and from the backlog guard"
+        );
+    }
+
     // ---- request classification ----
 
     /// Every wire variant, with whether it restamps a transport.
