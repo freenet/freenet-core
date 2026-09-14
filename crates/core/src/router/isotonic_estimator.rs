@@ -1631,6 +1631,24 @@ mod tests {
     /// bookkeeping is easiest to get wrong: many points at one distance with
     /// different results (so removing "a point at that distance" is not the
     /// same as removing THE point), and a window where every distance is equal.
+    ///
+    /// # What "matches" means
+    ///
+    /// A fit is its pooled blocks plus a centroid (the mean of every point, used
+    /// to extrapolate past the ends), and `interpolate` is a pure function of
+    /// the two. Both are compared directly, to a relative tolerance of 1e-12:
+    /// the centroid is a sum, and the window hands points to the library in
+    /// sorted order while the reference gets them in arrival order, so the two
+    /// can differ in the last bit.
+    ///
+    /// Interpolated values are deliberately NOT compared. An earlier version
+    /// did, at fixed distances, and failed 58 of 200 runs on the
+    /// single-distance descending stream with the blocks bit-identical: with
+    /// every point at one distance, blocks and centroid sit within an ulp of
+    /// each other, interpolating divides by that ulp, and a one-ulp difference
+    /// in the centroid became a difference of 0.5 in estimates of order 1e15 (or
+    /// NaN, or inf). Those values are garbage either way; that the estimator can
+    /// produce them from a degenerate window is #5665.
     #[test]
     fn incremental_fit_matches_batch_after_every_event() {
         let peer = PeerKeyLocation::random();
@@ -1716,7 +1734,9 @@ mod tests {
             // states this pins.
             let mut estimator = IsotonicEstimator::new(std::iter::empty(), estimator_type);
             let mut window: VecDeque<Point<f64>> = VecDeque::new();
-            let mut worst = 0.0f64;
+            let close = |a: f64, b: f64, tolerance: f64| {
+                (a - b).abs() <= tolerance * (1.0 + a.abs().max(b.abs()))
+            };
             for (index, &(x, y)) in stream.iter().enumerate() {
                 let event = event_at_distance(&peer, x, y);
                 // The reference is built from the distance the estimator will
@@ -1737,16 +1757,36 @@ mod tests {
                     }
                 }
                 .expect("a fit without intersect_origin cannot fail");
-                for step in 0..=50 {
-                    let at = step as f64 / 100.0;
-                    let got = estimator
-                        .global_regression
-                        .interpolate(at)
-                        .expect("non-empty fit interpolates");
-                    let want = batch.interpolate(at).expect("non-empty fit interpolates");
-                    worst = worst.max((got - want).abs());
-                }
-                for point in estimator.global_regression.get_points() {
+
+                let got = estimator.global_regression.get_points_sorted();
+                let want = batch.get_points_sorted();
+                let blocks_match = got.len() == want.len()
+                    && got.iter().zip(&want).all(|(g, w)| {
+                        close(*g.x(), *w.x(), 1e-12)
+                            && close(*g.y(), *w.y(), 1e-12)
+                            && close(g.weight(), w.weight(), 1e-12)
+                    });
+                assert!(
+                    blocks_match,
+                    "{label}: after event {index} the incremental fit's blocks differ \
+                     from a batch fit over the same window; routing reads this fit \
+                     between refits.\n  incremental: {got:?}\n  batch:       {want:?}"
+                );
+
+                let (Some(got_centroid), Some(want_centroid)) = (
+                    estimator.global_regression.get_centroid_point(),
+                    batch.get_centroid_point(),
+                ) else {
+                    panic!("{label}: a non-empty fit must have a centroid");
+                };
+                assert!(
+                    close(*got_centroid.x(), *want_centroid.x(), 1e-12)
+                        && close(*got_centroid.y(), *want_centroid.y(), 1e-12),
+                    "{label}: after event {index} the centroid differs beyond rounding: \
+                     {got_centroid:?} vs {want_centroid:?}"
+                );
+
+                for point in &got {
                     assert!(
                         (0.0..=0.5).contains(point.x()) && (y_min..=y_max).contains(point.y()),
                         "{label}: after event {index} the fit holds the aggregate \
@@ -1756,11 +1796,6 @@ mod tests {
                     );
                 }
             }
-            assert!(
-                worst < 1e-9,
-                "{label}: the incremental fit diverged from a batch fit over the same \
-                 window by up to {worst}; routing reads this fit between refits"
-            );
             assert_eq!(estimator.raw_events.len(), MAX_REGRESSION_POINTS);
             assert_eq!(
                 estimator.sorted_points.as_slice().len(),
