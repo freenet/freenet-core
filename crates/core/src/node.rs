@@ -73,6 +73,8 @@ pub(crate) use network_bridge::p2p_protoc::{
 // its rustdoc), so re-exporting it unconditionally is an unused import in the
 // non-test build.
 #[cfg(test)]
+pub(crate) use network_bridge::event_loop_notification_channel_with_capacity;
+#[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use network_bridge::p2p_protoc::BROADCAST_TARGET_LIST_SHIPPED_IN;
 #[cfg(test)]

@@ -287,6 +287,14 @@ impl OrphanStreamRegistry {
         self.stream_waiters.len()
     }
 
+    /// Drop every registered waiter without delivering a stream, the way this
+    /// node's side of a claim can go away: each waiting claim then ends with
+    /// `WaiterCancelled`.
+    #[cfg(test)]
+    pub fn drop_waiters(&self) {
+        self.stream_waiters.clear();
+    }
+
     /// Start the background GC task for expired orphan streams.
     ///
     /// This spawns a task that runs periodically to clean up orphan streams

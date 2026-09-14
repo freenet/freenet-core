@@ -459,6 +459,35 @@ pub(crate) struct RouterSnapshotInfo {
     /// the soft limit (`EMFILE`) drove the v0.2.73 gateway crash-loop and was
     /// invisible to the collector at the time. See #4440.
     pub open_fds: Option<u64>,
+    /// Timeout route labels per peer since the previous snapshot (#5657),
+    /// as a histogram: how many peers collected 1, 2-3, 4-7 and 8+ timeout
+    /// labels in the window, the most any single peer collected, and how many
+    /// labels landed on peers beyond the tracking cap. Populated by `Ring`.
+    ///
+    /// Each window is one snapshot interval. The first runs from `Ring`
+    /// construction to the first snapshot (the loop skips its immediate first
+    /// tick), so it is the same length but covers the node's start-up routing.
+    /// Telemetry-only: there is no local dashboard view, because the window is
+    /// drained by the snapshot and a second reader would steal its labels.
+    ///
+    /// Soak signal for CHAIN BLAME: an originator timeout is labelled against
+    /// the first hop although the stall may be anywhere down the chain. One
+    /// stuck host behind a popular key shows up here as a tail of first hops
+    /// with many labels (a high max and a populated 8+ bucket). Accepted for
+    /// router-only labels (they never reach `peer_health`), but watched.
+    /// No peer identities are exported.
+    #[serde(default)]
+    pub timeout_label_peers_1: Option<u64>,
+    #[serde(default)]
+    pub timeout_label_peers_2_3: Option<u64>,
+    #[serde(default)]
+    pub timeout_label_peers_4_7: Option<u64>,
+    #[serde(default)]
+    pub timeout_label_peers_8_plus: Option<u64>,
+    #[serde(default)]
+    pub timeout_label_max_per_peer: Option<u64>,
+    #[serde(default)]
+    pub timeout_labels_untracked: Option<u64>,
     /// The `RLIMIT_NOFILE` soft limit (the ceiling that triggers `EMFILE`), or
     /// `None` on non-unix. Populated by `Ring`; see [`open_fds`](Self::open_fds).
     pub fd_soft_limit: Option<u64>,
@@ -1261,6 +1290,32 @@ pub(crate) struct Router {
     /// for the candidate-window size. See [`SelectionRankStats`].
     #[serde(skip)]
     selection_ranks: SelectionRankStats,
+    /// Cumulative outcome counts over every [`Self::add_event`], never
+    /// windowed. See [`RouteOutcomeTotals`].
+    #[serde(skip)]
+    outcome_totals: RouteOutcomeTotals,
+    /// Test-only: `(peer address, source)` of every ingested event, so driver
+    /// tests can assert which dataset tag an outcome was recorded under.
+    #[cfg(test)]
+    #[serde(skip)]
+    recorded_sources: Vec<(Option<std::net::SocketAddr>, dataset::RouteSource)>,
+}
+
+/// Cumulative success / failure counts of the route events this router has
+/// ingested since it was built.
+///
+/// The isotonic estimators hold a rolling window of at most 500 events, so
+/// they cannot say how many failures were ever observed; these counters can.
+/// They exist so tests (and a future diagnostic) can check that the failure
+/// model is actually receiving failure labels (for most of its life it received
+/// almost none: relays labelled downstream NotFound a success and originators
+/// labelled only final successes).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RouteOutcomeTotals {
+    /// `RouteOutcome::Failure` events.
+    pub failures: u64,
+    /// `RouteOutcome::Success` and `RouteOutcome::SuccessUntimed` events.
+    pub successes: u64,
 }
 
 impl Clone for Router {
@@ -1305,6 +1360,9 @@ impl Clone for Router {
             transfer_time_error: PairedErrorTracker::default(),
             failure_skill_hierarchical: residual::SkillTracker::new(),
             selection_ranks: SelectionRankStats::default(),
+            outcome_totals: self.outcome_totals,
+            #[cfg(test)]
+            recorded_sources: self.recorded_sources.clone(),
         }
     }
 }
@@ -1883,6 +1941,9 @@ impl Router {
             transfer_time_error: PairedErrorTracker::default(),
             failure_skill_hierarchical: residual::SkillTracker::new(),
             selection_ranks: SelectionRankStats::default(),
+            outcome_totals: RouteOutcomeTotals::default(),
+            #[cfg(test)]
+            recorded_sources: Vec::new(),
         }
     }
 
@@ -1934,6 +1995,15 @@ impl Router {
     ) {
         let was_below_threshold = !self.has_sufficient_routing_events();
         let op_type = event.op_type;
+        #[cfg(test)]
+        self.recorded_sources
+            .push((event.peer.socket_addr(), source));
+        match event.outcome {
+            RouteOutcome::Failure => self.outcome_totals.failures += 1,
+            RouteOutcome::Success { .. } | RouteOutcome::SuccessUntimed => {
+                self.outcome_totals.successes += 1;
+            }
+        }
 
         // Feed renegade predictor (before isotonic, which moves event.peer)
         let distance = event
@@ -2100,6 +2170,31 @@ impl Router {
                 "Router transitioning from distance-based to prediction-based routing"
             );
         }
+    }
+
+    /// Cumulative outcome counts. See [`RouteOutcomeTotals`].
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(crate) fn outcome_totals(&self) -> RouteOutcomeTotals {
+        self.outcome_totals
+    }
+
+    /// Every `(peer address, result)` pair currently held in the failure
+    /// estimator's rolling window, in insertion order (`1.0` = failure,
+    /// `0.0` = success). Test-only: lets a driver test assert WHICH peer a
+    /// route event blamed.
+    #[cfg(test)]
+    pub(crate) fn recorded_sources_for_test(
+        &self,
+    ) -> Vec<(Option<std::net::SocketAddr>, dataset::RouteSource)> {
+        self.recorded_sources.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failure_window_for_test(&self) -> Vec<(Option<std::net::SocketAddr>, f64)> {
+        self.failure_estimator
+            .raw_events_for_test()
+            .map(|e| (e.peer.socket_addr(), e.result))
+            .collect()
     }
 
     /// The `consider_n_closest_peers` closest candidates, plus HOW MANY were
@@ -3046,6 +3141,12 @@ impl Router {
             connect_forward_peer_adjustments: None,
             // Node-health gauges populated by Ring on the snapshot cadence (#4440).
             open_fds: None,
+            timeout_label_peers_1: None,
+            timeout_label_peers_2_3: None,
+            timeout_label_peers_4_7: None,
+            timeout_label_peers_8_plus: None,
+            timeout_label_max_per_peer: None,
+            timeout_labels_untracked: None,
             fd_soft_limit: None,
             contract_module_cache_entries: None,
             contract_module_cache_total_bytes: None,

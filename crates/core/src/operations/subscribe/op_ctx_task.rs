@@ -775,6 +775,21 @@ async fn drive_client_subscribe_inner(
     let renewal_deadline =
         is_renewal.then(|| tokio::time::Instant::now() + crate::ring::Ring::RENEWAL_TASK_BUDGET);
 
+    // Labels every non-success attempt for the router (#5657). Each attempt is
+    // sent straight to `current_target_addr` (`send_to_and_await`), so
+    // `current_target` IS the attempted peer. NotFounds are held until the
+    // subscribe resolves: a later `Subscribed` proves the contract exists and
+    // turns them into failures; any other exit drops the recorder and applies
+    // `ambiguous_not_found_policy` (not trained). Renewals are deliberately NOT
+    // started as "contract known to exist" even though the renewer holds it:
+    // see the NotFound arm for why their NotFounds are structural.
+    let mut recorder = crate::operations::route_attempt::RouteAttemptRecorder::new(
+        op_manager.ring.clone(),
+        instance_id,
+        crate::node::network_status::OpType::Subscribe,
+        crate::operations::route_attempt::AttemptOrigin::Originator,
+    );
+
     loop {
         // For renewals, clamp this attempt's wait to the budget remaining until
         // the task deadline (capped at `RENEWAL_PER_ATTEMPT_TIMEOUT`). When the
@@ -910,6 +925,18 @@ async fn drive_client_subscribe_inner(
                     error = %err,
                     "subscribe: send_and_await failed; advancing to next peer"
                 );
+                // Only a dropped connection TO THE ATTEMPTED PEER is its doing;
+                // a `NotificationError` is a local callback drop, and a
+                // disconnect of some other peer is not this target's fault.
+                let own_target_disconnected = matches!(
+                    &err,
+                    OpError::PeerDisconnected { peer } if *peer == current_target_addr
+                );
+                recorder.record_attempt(
+                    Some(&current_target),
+                    crate::operations::route_attempt::AttemptFailure::SendFailure,
+                    own_target_disconnected,
+                );
                 match advance_to_next_peer(
                     op_manager,
                     &instance_id,
@@ -970,6 +997,17 @@ async fn drive_client_subscribe_inner(
                     timeout_secs = attempt_timeout.as_secs(),
                     is_renewal,
                     "subscribe: attempt timed out; advancing to next peer"
+                );
+                // A renewal clamps the attempt deadline to its remaining task
+                // budget (at most `RENEWAL_PER_ATTEMPT_TIMEOUT`, 20 s, below
+                // `OPERATION_TTL`). Expiry of OUR shortened budget says nothing
+                // about the peer, which the relay chain still grants the full
+                // `OPERATION_TTL`, so only a full-length deadline is labelled.
+                let full_length_deadline = attempt_timeout >= OPERATION_TTL;
+                recorder.record_attempt(
+                    Some(&current_target),
+                    crate::operations::route_attempt::AttemptFailure::Timeout,
+                    full_length_deadline,
                 );
                 match advance_to_next_peer(
                     op_manager,
@@ -1049,6 +1087,8 @@ async fn drive_client_subscribe_inner(
                 // response-time estimator with zero observations from
                 // client-initiated subscribes. Restore that feedback so the
                 // peer dashboard's Response Time chart populates again.
+                // Not existence proof (#5657): a `Subscribed` carries no state.
+                // Its NotFounds are left to `ambiguous_not_found_policy()`.
                 let contract_location = crate::ring::Location::from(&key);
                 let route_event = crate::router::RouteEvent {
                     peer: current_target.clone(),
@@ -1110,6 +1150,17 @@ async fn drive_client_subscribe_inner(
                     attempts_at_hop,
                     outcome = "not_found",
                     "subscribe: NotFound from peer; advancing to next peer"
+                );
+                // Renewal NotFounds are never labelled: a renewal is sent by a
+                // node that already hosts the contract, and every hop marks
+                // its upstream chain in the visited bloom, so when the renewer
+                // is itself the best (or only) host near the key a NotFound is
+                // the structural result of the requester being excluded, not a
+                // routing failure of this peer.
+                recorder.record_attempt(
+                    Some(&current_target),
+                    crate::operations::route_attempt::AttemptFailure::NotFound,
+                    !is_renewal,
                 );
                 match advance_to_next_peer(
                     op_manager,
@@ -1833,6 +1884,16 @@ async fn drive_relay_subscribe(
     };
     new_visited.mark_visited(next_addr);
 
+    // Labels this relay's downstream attempts for the local router (#5657).
+    // Dropped when this function returns, which settles a NotFound that no
+    // consult overturned via `ambiguous_not_found_policy`.
+    let mut recorder = crate::operations::route_attempt::RouteAttemptRecorder::new(
+        op_manager.ring.clone(),
+        instance_id,
+        crate::node::network_status::OpType::Subscribe,
+        crate::operations::route_attempt::AttemptOrigin::Relay,
+    );
+
     // ── Step 3: Forward the single greedy routing hop, await Response ─────
     let outcome = relay_subscribe_forward_once(
         op_manager,
@@ -1843,6 +1904,7 @@ async fn drive_relay_subscribe(
         is_renewal,
         next_hop,
         next_addr,
+        &mut recorder,
     )
     .await;
 
@@ -1911,6 +1973,7 @@ async fn drive_relay_subscribe(
                         is_renewal,
                         consult_hop,
                         consult_addr,
+                        &mut recorder,
                     )
                     .await;
                     match consult_outcome {
@@ -2032,6 +2095,7 @@ async fn relay_subscribe_forward_once(
     is_renewal: bool,
     next_hop: PeerKeyLocation,
     next_addr: std::net::SocketAddr,
+    recorder: &mut crate::operations::route_attempt::RouteAttemptRecorder,
 ) -> SubscribeForwardOutcome {
     let new_htl = htl.saturating_sub(1);
     // Forward-failure / unexpected-variant depth for THIS relay.
@@ -2086,12 +2150,17 @@ async fn relay_subscribe_forward_once(
                 error = %err,
                 "SUBSCRIBE relay: send_to_and_await failed"
             );
-            crate::operations::record_relay_route_event(
-                op_manager,
-                next_hop,
-                crate::ring::Location::from(&instance_id),
-                crate::router::RouteOutcome::Failure,
-                crate::node::network_status::OpType::Subscribe,
+            // Same gate as the client path: a local callback drop
+            // (`NotificationError`) or a disconnect of some other peer is not
+            // this hop's doing.
+            let own_hop_disconnected = matches!(
+                &err,
+                OpError::PeerDisconnected { peer } if *peer == next_addr
+            );
+            recorder.record_attempt(
+                Some(&next_hop),
+                crate::operations::route_attempt::AttemptFailure::SendFailure,
+                own_hop_disconnected,
             );
             // No reply — do NOT consult on the reused tx (Codex P2).
             return SubscribeForwardOutcome::Failed {
@@ -2106,12 +2175,16 @@ async fn relay_subscribe_forward_once(
                 timeout_secs = OPERATION_TTL.as_secs(),
                 "SUBSCRIBE relay: downstream timed out"
             );
-            crate::operations::record_relay_route_event(
-                op_manager,
-                next_hop,
-                crate::ring::Location::from(&instance_id),
-                crate::router::RouteOutcome::Failure,
-                crate::node::network_status::OpType::Subscribe,
+            // Labelled even when the request is a renewal. The renewer's own
+            // attempt deadline is clamped to its renewal budget, which is why
+            // the ORIGINATOR does not label renewal timeouts; but this relay
+            // waited the full `OPERATION_TTL` for its downstream hop, so the
+            // expiry is that hop's (or its chain's) doing, exactly as for a
+            // non-renewal request.
+            recorder.record_attempt(
+                Some(&next_hop),
+                crate::operations::route_attempt::AttemptFailure::Timeout,
+                true,
             );
             // Timed out with no reply — do NOT consult on the reused tx (Codex P2).
             return SubscribeForwardOutcome::Failed {
@@ -2142,6 +2215,9 @@ async fn relay_subscribe_forward_once(
                 phase = "relay_subscribe_bubble",
                 "SUBSCRIBE relay: downstream Subscribed; bubbling upstream"
             );
+            // Not existence proof (#5657): a `Subscribed` carries no state, so
+            // the greedy hop's NotFound is left to `ambiguous_not_found_policy()`
+            // even when a consulted host then subscribes.
             crate::operations::record_relay_route_event(
                 op_manager,
                 next_hop.clone(),
@@ -2160,21 +2236,26 @@ async fn relay_subscribe_forward_once(
             hop_count: downstream_hop_count,
             ..
         })) => {
-            // Downstream peer correctly answered NotFound. The peer behaved
-            // well at the protocol level — it just doesn't host this contract.
-            // Record SuccessUntimed so the model treats it as healthy.
+            // Downstream peer answered NotFound: routing via it did not
+            // deliver this contract. This used to be recorded as
+            // `SuccessUntimed` ("the peer behaved well"), which trained the
+            // failure model on positive labels for dead-ends (#5657). It is a
+            // routing failure; the recorder labels it once this relay's search
+            // resolves (see `ambiguous_not_found_policy`). It never reaches
+            // peer_health.
             tracing::debug!(
                 tx = %incoming_tx,
                 %instance_id,
                 phase = "relay_subscribe_bubble_not_found",
                 "SUBSCRIBE relay: downstream NotFound"
             );
-            crate::operations::record_relay_route_event(
-                op_manager,
-                next_hop,
-                crate::ring::Location::from(&instance_id),
-                crate::router::RouteOutcome::SuccessUntimed,
-                crate::node::network_status::OpType::Subscribe,
+            // Not for renewals: the renewer hosts the contract and sits in the
+            // visited bloom, so a NotFound on its behalf can be the structural
+            // result of that exclusion (see `drive_client_subscribe_inner`).
+            recorder.record_attempt(
+                Some(&next_hop),
+                crate::operations::route_attempt::AttemptFailure::NotFound,
+                !is_renewal,
             );
             SubscribeForwardOutcome::NotFound {
                 hop_count: downstream_hop_count,
@@ -3975,6 +4056,508 @@ mod tests {
             paced, advance_arms,
             "every advance-and-retry arm must call sleep_before_retry() \
              before continue (#3808 spin-loop guard)"
+        );
+    }
+}
+
+/// Driver-level tests for the originator SUBSCRIBE's per-attempt route
+/// labelling (#5657): the real `drive_client_subscribe_inner` against a
+/// scripted event loop. SUBSCRIBE sends each attempt straight to its target
+/// (`send_to_and_await`), so the target the loop observes IS the attempted peer.
+#[cfg(test)]
+mod route_attempt_driver_tests {
+    use super::*;
+    use crate::message::MessageStats;
+    use crate::operations::route_attempt::driver_test_support::{
+        Answer, Step, failed_addrs, op_manager_with_peers, recorded_sources, serve_attempts,
+    };
+    use parking_lot::Mutex;
+
+    fn not_found(msg: &NetMessage, instance_id: ContractInstanceId) -> NetMessage {
+        NetMessage::from(SubscribeMsg::Response {
+            id: *msg.id(),
+            instance_id,
+            result: SubscribeMsgResult::NotFound,
+            hop_count: 1,
+        })
+    }
+
+    fn run_subscribe(
+        op_manager: &Arc<OpManager>,
+        instance_id: ContractInstanceId,
+        is_renewal: bool,
+        first_hop: PeerKeyLocation,
+    ) -> impl std::future::Future<Output = Result<DriverOutcome, OpError>> + '_ {
+        drive_client_subscribe_inner(
+            op_manager,
+            instance_id,
+            Transaction::new::<SubscribeMsg>(),
+            is_renewal,
+            Some(first_hop),
+        )
+    }
+
+    /// A full-length timeout is labelled immediately against its target; the
+    /// NotFounds that follow are ambiguous (nothing in the op proved the
+    /// contract exists) and are not trained. No extra exhaustion event.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn timeout_is_labelled_ambiguous_not_founds_are_not() {
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers("sub-attempts", 3).await;
+        let instance_id = ContractInstanceId::new([47u8; 32]);
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let seen = targets.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |i, msg, target| {
+                seen.lock()
+                    .push(target.expect("subscribe attempts carry a target"));
+                Step {
+                    // SUBSCRIBE never reads the hop registry; leave it empty to
+                    // prove attribution does not depend on it.
+                    hop: None,
+                    answer: if i == 0 {
+                        Answer::Never
+                    } else {
+                        Answer::Reply(not_found(msg, instance_id))
+                    },
+                }
+            },
+        );
+
+        let outcome = run_subscribe(&op_manager, instance_id, false, peers[0].clone())
+            .await
+            .expect("driver returns an outcome");
+        assert!(matches!(outcome, DriverOutcome::Publish(Err(_))));
+        let targets = targets.lock().clone();
+        assert!(targets.len() >= 2, "several attempts must have been made");
+        assert_eq!(failed_addrs(&op_manager), targets[..1].to_vec());
+    }
+
+    /// A local callback drop blames nobody, a disconnect of the TARGET blames
+    /// it, and a disconnect reported for a different peer blames nobody.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn only_a_dropped_connection_to_the_target_blames_it() {
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers("sub-disconnect", 4).await;
+        let instance_id = ContractInstanceId::new([48u8; 32]);
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let seen = targets.clone();
+        let bystander: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |i, msg, target| {
+                let target = target.expect("subscribe attempts carry a target");
+                seen.lock().push(target);
+                let answer = match i {
+                    0 => Answer::DropWaiter,
+                    1 => Answer::PeerDisconnectedFor(target),
+                    2 => Answer::PeerDisconnectedFor(bystander),
+                    _ => Answer::Reply(not_found(msg, instance_id)),
+                };
+                Step { hop: None, answer }
+            },
+        );
+        let _outcome = run_subscribe(&op_manager, instance_id, false, peers[0].clone())
+            .await
+            .expect("driver returns an outcome");
+        let targets = targets.lock().clone();
+        assert!(targets.len() >= 3, "{targets:?}");
+        assert_eq!(
+            failed_addrs(&op_manager),
+            targets[1..2].to_vec(),
+            "only the attempt whose own target disconnected is labelled"
+        );
+    }
+
+    /// A `Subscribed` carries no state, so it is never existence proof
+    /// (#5657): a NotFound followed by a subscription labels nothing at the
+    /// originator, and the NotFound is dropped untrained instead.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn subscribed_reply_is_not_existence_proof() {
+        let (op_manager, rx, peers, _guards) =
+            op_manager_with_peers("sub-subscribed-not-proof", 3).await;
+        let instance_id = ContractInstanceId::new([55u8; 32]);
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |i, msg, _| {
+                if !is_request(msg) {
+                    return Step {
+                        hop: None,
+                        answer: Answer::DropWaiter,
+                    };
+                }
+                Step {
+                    hop: None,
+                    answer: Answer::Reply(if i == 0 {
+                        not_found(msg, instance_id)
+                    } else {
+                        subscribed(msg, instance_id)
+                    }),
+                }
+            },
+        );
+        let outcome = run_subscribe(&op_manager, instance_id, false, peers[0].clone())
+            .await
+            .expect("driver returns an outcome");
+        assert!(
+            matches!(outcome, DriverOutcome::Publish(Ok(_))),
+            "the second attempt subscribes"
+        );
+        let failures = failed_addrs(&op_manager);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(op_manager.ring.untrained_not_found_count(), 1);
+    }
+
+    /// Relay side: the greedy hop's NotFound is not settled as a failure by a
+    /// consulted host's `Subscribed`, which carries no state (#5657).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_subscribed_reply_is_not_existence_proof() {
+        let label = "sub-relay-subscribed-not-proof";
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 4).await;
+        let instance_id = ContractInstanceId::new([57u8; 32]);
+        let upstream = peers[0].socket_addr().unwrap();
+        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+        let greedy = op_manager
+            .ring
+            .k_closest_potentially_hosting(&instance_id, [own, upstream].as_slice(), 1)
+            .into_iter()
+            .next()
+            .expect("a greedy candidate");
+        let host = peers[1..]
+            .iter()
+            .find(|p| p.socket_addr() != greedy.socket_addr())
+            .unwrap()
+            .clone();
+        op_manager.neighbor_hosting.handle_message(
+            host.pub_key(),
+            crate::message::NeighborHostingMessage::HostingAnnounce {
+                added: vec![instance_id],
+                removed: vec![],
+                is_response: true,
+            },
+        );
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let seen = targets.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |_, msg, target| {
+                if !is_request(msg) || target == Some(upstream) {
+                    return Step {
+                        hop: None,
+                        answer: Answer::DropWaiter,
+                    };
+                }
+                let mut seen = seen.lock();
+                seen.push(target);
+                let answer = if seen.len() == 1 {
+                    Answer::Reply(not_found(msg, instance_id))
+                } else {
+                    Answer::Reply(subscribed(msg, instance_id))
+                };
+                Step { hop: None, answer }
+            },
+        );
+        let _relay_result = drive_relay_subscribe(
+            &op_manager,
+            Transaction::new::<SubscribeMsg>(),
+            instance_id,
+            3,
+            VisitedPeers::new(&Transaction::new::<SubscribeMsg>()),
+            false,
+            upstream,
+        )
+        .await;
+        let targets = targets.lock().clone();
+        assert_eq!(
+            targets.len(),
+            2,
+            "{label}: greedy then consult: {targets:?}"
+        );
+        let failures = failed_addrs(&op_manager);
+        assert!(failures.is_empty(), "{label}: {failures:?}");
+    }
+
+    fn subscribed(msg: &NetMessage, instance_id: ContractInstanceId) -> NetMessage {
+        NetMessage::from(SubscribeMsg::Response {
+            id: *msg.id(),
+            instance_id,
+            result: SubscribeMsgResult::Subscribed {
+                key: freenet_stdlib::prelude::ContractKey::from_id_and_code(
+                    instance_id,
+                    freenet_stdlib::prelude::CodeHash::new([9u8; 32]),
+                ),
+            },
+            hop_count: 1,
+        })
+    }
+
+    fn is_request(msg: &NetMessage) -> bool {
+        matches!(
+            msg,
+            NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Request { .. }))
+        )
+    }
+
+    /// #5657 item 9: a renewal NotFound is not even held as ambiguous: the
+    /// renewer hosts the contract and is in the visited bloom, so its
+    /// NotFounds are structural. The same script on a non-renewal holds the
+    /// NotFound and drops it untrained (a `Subscribed` is not existence
+    /// proof). Neither labels anything.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn renewal_not_found_then_subscribed_labels_nothing() {
+        for (label, is_renewal) in [
+            ("sub-renewal-nf-then-subscribed", true),
+            ("sub-plain-nf-then-subscribed", false),
+        ] {
+            let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
+            let instance_id = ContractInstanceId::new([50u8; 32]);
+            let targets = Arc::new(Mutex::new(Vec::new()));
+            let seen = targets.clone();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Subscribe,
+                move |i, msg, target| {
+                    if !is_request(msg) {
+                        return Step {
+                            hop: None,
+                            answer: Answer::DropWaiter,
+                        };
+                    }
+                    seen.lock().push(target);
+                    Step {
+                        hop: None,
+                        answer: Answer::Reply(if i == 0 {
+                            not_found(msg, instance_id)
+                        } else {
+                            subscribed(msg, instance_id)
+                        }),
+                    }
+                },
+            );
+            let outcome = run_subscribe(&op_manager, instance_id, is_renewal, peers[0].clone())
+                .await
+                .expect("driver returns an outcome");
+            assert!(
+                matches!(outcome, DriverOutcome::Publish(Ok(_))),
+                "{label}: the second attempt subscribes"
+            );
+            let failures = failed_addrs(&op_manager);
+            assert!(failures.is_empty(), "{label}: {failures:?}");
+            assert_eq!(
+                op_manager.ring.untrained_not_found_count(),
+                if is_renewal { 0 } else { 1 },
+                "{label}: only a non-renewal NotFound is held as ambiguous"
+            );
+        }
+    }
+
+    /// #5657 item 4, relay side: `relay_subscribe_forward_once`'s send-failure
+    /// arm blames only a disconnect of its own hop. A local callback drop and a
+    /// disconnect of some other peer label nothing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_send_failure_blames_only_a_disconnect_of_its_hop() {
+        for (label, case) in [
+            ("sub-relay-drop", 0u8),
+            ("sub-relay-other-disconnect", 1),
+            ("sub-relay-own-disconnect", 2),
+        ] {
+            let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
+            let instance_id = ContractInstanceId::new([51u8; 32]);
+            let upstream = peers[0].socket_addr().unwrap();
+            let bystander: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+            let downstream = Arc::new(Mutex::new(None));
+            let seen = downstream.clone();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Subscribe,
+                move |_, msg, target| {
+                    if !is_request(msg) || target == Some(upstream) {
+                        return Step {
+                            hop: None,
+                            answer: Answer::DropWaiter,
+                        };
+                    }
+                    let target = target.expect("relay forwards carry a target");
+                    *seen.lock() = Some(target);
+                    Step {
+                        hop: None,
+                        answer: match case {
+                            0 => Answer::DropWaiter,
+                            1 => Answer::PeerDisconnectedFor(bystander),
+                            _ => Answer::PeerDisconnectedFor(target),
+                        },
+                    }
+                },
+            );
+            let _relay_result = drive_relay_subscribe(
+                &op_manager,
+                Transaction::new::<SubscribeMsg>(),
+                instance_id,
+                3,
+                VisitedPeers::new(&Transaction::new::<SubscribeMsg>()),
+                false,
+                upstream,
+            )
+            .await;
+            let forwarded = downstream.lock().expect("the relay forwarded downstream");
+            let expected = if case == 2 { vec![forwarded] } else { vec![] };
+            assert_eq!(failed_addrs(&op_manager), expected, "{label}");
+            let expected_sources: Vec<_> = expected
+                .iter()
+                .map(|a| (Some(*a), crate::router::dataset::RouteSource::Relay))
+                .collect();
+            assert_eq!(
+                recorded_sources(&op_manager),
+                expected_sources,
+                "{label}: a relay's labels are relay observations"
+            );
+        }
+    }
+
+    /// #5657 F: a renewal labels neither its timeouts (the deadline is the
+    /// renewal's own clamped budget, below `OPERATION_TTL`) nor its NotFounds
+    /// (structural: the renewer hosts the contract and is in the visited
+    /// bloom). The same script on a non-renewal labels the timeout.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn renewal_labels_neither_budget_timeouts_nor_not_founds() {
+        for (label, is_renewal) in [("sub-renewal", true), ("sub-not-renewal", false)] {
+            let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
+            let instance_id = ContractInstanceId::new([49u8; 32]);
+            let served = serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Subscribe,
+                move |i, msg, _| Step {
+                    hop: None,
+                    answer: if i == 0 {
+                        Answer::Never
+                    } else {
+                        Answer::Reply(not_found(msg, instance_id))
+                    },
+                },
+            );
+            let _outcome = run_subscribe(&op_manager, instance_id, is_renewal, peers[0].clone())
+                .await
+                .expect("driver returns an outcome");
+            assert!(
+                served.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+                "{label}"
+            );
+            let failures = failed_addrs(&op_manager);
+            if is_renewal {
+                assert!(failures.is_empty(), "{label}: {failures:?}");
+            } else {
+                assert_eq!(failures.len(), 1, "{label}: the timeout is labelled");
+            }
+        }
+    }
+
+    /// Source pin (relay side): `relay_subscribe_forward_once` labels a
+    /// downstream NotFound, timeout and send failure through the relay's
+    /// recorder and never records a NotFound as a success (#5657); a
+    /// `Subscribed` reply is never existence proof; both the greedy forward
+    /// and the consult forward share the one recorder created in
+    /// `drive_relay_subscribe`.
+    #[test]
+    fn relay_subscribe_labels_downstream_outcomes_through_the_recorder() {
+        use crate::operations::route_attempt::driver_test_support::production_fn_body;
+        let src = include_str!("op_ctx_task.rs");
+        let forward = production_fn_body(src, "async fn relay_subscribe_forward_once(");
+        let not_found = forward
+            .find("result: SubscribeMsgResult::NotFound,")
+            .expect("NotFound arm");
+        let not_found_arm = &forward[not_found..];
+        let not_found_arm = &not_found_arm[..not_found_arm
+            .find("SubscribeForwardOutcome::NotFound {")
+            .expect("NotFound arm returns")];
+        assert!(
+            not_found_arm.contains("AttemptFailure::NotFound,")
+                && not_found_arm.contains("!is_renewal,"),
+            "a downstream NotFound goes to the recorder, unattributable for renewals"
+        );
+        assert!(
+            !not_found_arm.contains("RouteOutcome::SuccessUntimed"),
+            "a downstream NotFound must not be recorded as a success"
+        );
+        let send_failure = forward
+            .find("AttemptFailure::SendFailure,")
+            .expect("send-failure label");
+        assert!(
+            forward[send_failure..send_failure + 120].contains("own_hop_disconnected,")
+                && forward.contains("OpError::PeerDisconnected { peer } if *peer == next_addr"),
+            "a relay send failure is attributable only to a disconnect of its own hop"
+        );
+        assert!(forward.contains("AttemptFailure::Timeout,"));
+        assert!(
+            !crate::contract::source_pin_util::strip_comments(forward)
+                .contains("contract_exists()"),
+            "a Subscribed carries no state, so it is never existence proof (#5657)"
+        );
+
+        let driver = production_fn_body(src, "async fn drive_relay_subscribe(");
+        assert_eq!(
+            driver.matches("RouteAttemptRecorder::new(").count(),
+            1,
+            "one recorder per relay search"
+        );
+        assert!(driver.contains("AttemptOrigin::Relay"));
+        assert_eq!(
+            driver.matches("&mut recorder,").count(),
+            2,
+            "both the greedy forward and the consult forward must share it"
+        );
+    }
+
+    /// Source pin: the subscribe driver labels every non-success arm through
+    /// its recorder, gates the wire-error label on `PeerDisconnected`, and
+    /// never treats a `Subscribed` reply as existence proof.
+    #[test]
+    fn subscribe_driver_routes_every_attempt_through_the_recorder() {
+        use crate::operations::route_attempt::driver_test_support::production_fn_body;
+        let body = production_fn_body(
+            include_str!("op_ctx_task.rs"),
+            "async fn drive_client_subscribe_inner(",
+        );
+        // Each non-success arm hands its outcome to the recorder exactly once,
+        // with the attributability decided by the named gate.
+        for (failure, gate_arg, gate_def) in [
+            (
+                "AttemptFailure::SendFailure,",
+                "own_target_disconnected,",
+                "OpError::PeerDisconnected { peer } if *peer == current_target_addr",
+            ),
+            (
+                "AttemptFailure::Timeout,",
+                "full_length_deadline,",
+                "let full_length_deadline = attempt_timeout >= OPERATION_TTL;",
+            ),
+            ("AttemptFailure::NotFound,", "!is_renewal,", "!is_renewal,"),
+        ] {
+            assert_eq!(
+                body.matches(failure).count(),
+                1,
+                "`{failure}` must be recorded exactly once in the driver"
+            );
+            let at = body.find(failure).unwrap();
+            let after = &body[at..at + 200.min(body.len() - at)];
+            assert!(
+                after.contains(gate_arg),
+                "`{failure}` must pass `{gate_arg}` as its attributability"
+            );
+            assert!(body.contains(gate_def), "missing gate `{gate_def}`");
+        }
+        assert!(
+            !crate::contract::source_pin_util::strip_comments(body).contains("contract_exists()"),
+            "a Subscribed carries no state, so it is never existence proof (#5657)"
         );
     }
 }

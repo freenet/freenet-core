@@ -249,10 +249,73 @@ pub(crate) struct AddConnectionOutcome {
     pub just_became_ready: bool,
 }
 
+/// Per-cause counts of route failure labels (#5657). See
+/// [`Ring::route_failure_cause_counts`].
+#[derive(Default)]
+struct RouteFailureCauseCounts {
+    /// Ambiguous NotFounds dropped untrained (no proof the contract exists).
+    untrained_not_found: std::sync::atomic::AtomicU64,
+    not_found: std::sync::atomic::AtomicU64,
+    timeout: std::sync::atomic::AtomicU64,
+    send_failure: std::sync::atomic::AtomicU64,
+}
+
+/// Distinct peers tracked per snapshot window by [`TimeoutLabelWindow`].
+/// Labels for peers beyond it are counted, not attributed.
+const TIMEOUT_LABEL_WINDOW_MAX_PEERS: usize = 4096;
+
+/// Timeout route labels per peer since the last router snapshot (#5657), for
+/// the chain-blame soak histogram on `RouterSnapshotInfo`. Bounded: at most
+/// [`TIMEOUT_LABEL_WINDOW_MAX_PEERS`] fixed-size entries, cleared every
+/// snapshot.
+#[derive(Default)]
+struct TimeoutLabelWindow {
+    per_peer: std::collections::HashMap<std::net::SocketAddr, u64>,
+    untracked: u64,
+}
+
+/// Histogram of one [`TimeoutLabelWindow`]:
+/// `(peers with 1, 2-3, 4-7, 8+ labels, max per peer, untracked labels)`.
+pub(crate) type TimeoutLabelHistogram = (u64, u64, u64, u64, u64, u64);
+
+impl TimeoutLabelWindow {
+    fn record(&mut self, addr: std::net::SocketAddr) {
+        if let Some(count) = self.per_peer.get_mut(&addr) {
+            *count += 1;
+        } else if self.per_peer.len() < TIMEOUT_LABEL_WINDOW_MAX_PEERS {
+            self.per_peer.insert(addr, 1);
+        } else {
+            self.untracked += 1;
+        }
+    }
+
+    fn take_histogram(&mut self) -> TimeoutLabelHistogram {
+        let (mut b1, mut b2, mut b4, mut b8, mut max) = (0, 0, 0, 0, 0);
+        for count in self.per_peer.values().copied() {
+            match count {
+                0 => {}
+                1 => b1 += 1,
+                2..=3 => b2 += 1,
+                4..=7 => b4 += 1,
+                _ => b8 += 1,
+            }
+            max = max.max(count);
+        }
+        let untracked = self.untracked;
+        *self = Self::default();
+        (b1, b2, b4, b8, max, untracked)
+    }
+}
+
 pub(crate) struct Ring {
     pub max_hops_to_live: usize,
     pub connection_manager: ConnectionManager,
     pub router: Arc<RwLock<Router>>,
+    /// Route failure labels fed to the router, by the attempt outcome that
+    /// produced them (#5657). Diagnostics only.
+    route_failure_causes: RouteFailureCauseCounts,
+    /// Timeout labels per peer since the last router snapshot (#5657).
+    timeout_label_window: parking_lot::Mutex<TimeoutLabelWindow>,
     pub live_tx_tracker: LiveTransactionTracker,
     hosting_manager: hosting::HostingManager,
     /// Per-contract record of detected CRDT-invariant violations (e.g. a
@@ -701,6 +764,8 @@ impl Ring {
         let ring = Ring {
             max_hops_to_live,
             router,
+            route_failure_causes: RouteFailureCauseCounts::default(),
+            timeout_label_window: parking_lot::Mutex::new(TimeoutLabelWindow::default()),
             connection_manager,
             // Production passes the Ring's default `Arc<InstantTimeSrc>`
             // (wall clock). Simulation tests can inject a controllable clock via
@@ -1905,6 +1970,18 @@ impl Ring {
             let (open_fds, fd_soft_limit) = read_fd_usage();
             snapshot.open_fds = open_fds;
             snapshot.fd_soft_limit = fd_soft_limit;
+
+            // Chain-blame soak histogram (#5657). Hand-mirrored into
+            // `event_kind_to_json` like every field here (pinned by
+            // `router_snapshot_json_includes_timeout_label_histogram`).
+            let (peers_1, peers_2_3, peers_4_7, peers_8_plus, max_per_peer, untracked) =
+                ring.take_timeout_label_histogram();
+            snapshot.timeout_label_peers_1 = Some(peers_1);
+            snapshot.timeout_label_peers_2_3 = Some(peers_2_3);
+            snapshot.timeout_label_peers_4_7 = Some(peers_4_7);
+            snapshot.timeout_label_peers_8_plus = Some(peers_8_plus);
+            snapshot.timeout_label_max_per_peer = Some(max_per_peer);
+            snapshot.timeout_labels_untracked = Some(untracked);
 
             // Nearest-neighbor ring-lattice completeness + probe health (#4760),
             // mirrored from the home-page ring-stats provider (see
@@ -4162,6 +4239,21 @@ impl Ring {
     }
 
     pub fn routing_finished(&self, event: crate::router::RouteEvent) {
+        self.report_route_outcome_to_health(&event);
+        self.router.write().add_event(event);
+    }
+
+    /// Everything [`Self::routing_finished`] does except feed the router: the
+    /// topology manager's outbound-request accounting and the `peer_health`
+    /// success or failure. `routing_finished` is exactly this plus
+    /// `Router::add_event`, so the two cannot drift.
+    ///
+    /// #5657 labels the ROUTER against the hop an attempt was actually
+    /// forwarded to. Peer health and topology keep their pre-#5657 inputs
+    /// unchanged (the originator's `current_target`, the same events, the same
+    /// conditions): changing them would change health-based eviction and the
+    /// request-density model, which #5657 does not set out to do.
+    pub(crate) fn report_route_outcome_to_health(&self, event: &crate::router::RouteEvent) {
         self.connection_manager
             .topology_manager
             .write()
@@ -4180,8 +4272,118 @@ impl Ring {
                 }
             }
         }
+    }
 
-        self.router.write().add_event(event);
+    /// Feed a route event to the routing model ONLY, bypassing the
+    /// `peer_health` and `topology_manager` side effects of
+    /// [`Self::routing_finished`].
+    ///
+    /// Two reasons, both load-bearing:
+    ///
+    /// 1. **Peer health is not routing success.** `PeerHealthTracker` evicts a
+    ///    connection at a 90 % failure rate over 10 events, or after 10 minutes
+    ///    with one failure and no success. A `NotFound` (the peer does not have
+    ///    this contract) or an end-to-end timeout (anywhere down the chain) says
+    ///    nothing about whether the connection to the first hop is healthy, and
+    ///    feeding them in would evict healthy peers, most exposed a gateway that
+    ///    fields many requests for absent contracts.
+    /// 2. **Determinism.** `PeerHealthTracker` stamps `std::time::Instant::now()`
+    ///    (a pre-existing TimeSource rule violation). An earlier iteration of
+    ///    the relay hooks routed relay events through `routing_finished` and
+    ///    broke the strict-determinism tests (`test_strict_determinism_*`,
+    ///    `test_direct_runner_determinism`, `test_thundering_herd_connect_storm`).
+    ///
+    /// CAVEAT: `Router::add_event` itself reaches `RoutingPredictor::record` →
+    /// `wall_clock_hours()` → `SystemTime::now()`, so this path is not strictly
+    /// TimeSource-clean either; the determinism tests pass because that
+    /// variance is far below what they compare.
+    ///
+    /// `source` tags the event in the opt-in routing dataset (#5648): `Relay`
+    /// for an outcome a relay hop observed about its downstream peer,
+    /// `Originator` for one observed by the node that started the operation.
+    /// The model treats both identically.
+    pub(crate) fn record_route_event_router_only(
+        &self,
+        event: crate::router::RouteEvent,
+        source: crate::router::dataset::RouteSource,
+    ) {
+        use crate::router::dataset::RouteSource;
+        let mut router = self.router.write();
+        match source {
+            RouteSource::Originator => router.add_event(event),
+            RouteSource::Relay => router.add_relay_event(event),
+        }
+    }
+
+    /// Record a routing FAILURE label for one attempt. Router only; see
+    /// [`Self::record_route_event_router_only`]. The sole production sink of
+    /// [`crate::operations::route_attempt::RouteAttemptRecorder`]; `cause` is
+    /// counted in [`Self::route_failure_cause_counts`].
+    pub(crate) fn record_route_failure(
+        &self,
+        event: crate::router::RouteEvent,
+        cause: crate::operations::route_attempt::AttemptFailure,
+        source: crate::router::dataset::RouteSource,
+    ) {
+        use crate::operations::route_attempt::AttemptFailure;
+        debug_assert!(
+            matches!(event.outcome, crate::router::RouteOutcome::Failure),
+            "record_route_failure called with a non-failure outcome"
+        );
+        let counter = match cause {
+            AttemptFailure::NotFound => &self.route_failure_causes.not_found,
+            AttemptFailure::Timeout => &self.route_failure_causes.timeout,
+            AttemptFailure::SendFailure => &self.route_failure_causes.send_failure,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cause == AttemptFailure::Timeout {
+            if let Some(addr) = event.peer.socket_addr() {
+                self.timeout_label_window.lock().record(addr);
+            }
+        }
+        self.record_route_event_router_only(event, source);
+    }
+
+    /// Count ambiguous `NotFound`s an operation dropped untrained (#5657).
+    /// Never trained on; lets a test prove NotFounds actually occurred.
+    pub(crate) fn record_untrained_not_founds(&self, count: u64) {
+        self.route_failure_causes
+            .untrained_not_found
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Ambiguous `NotFound`s dropped untrained on this node (#5657).
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(crate) fn untrained_not_found_count(&self) -> u64 {
+        self.route_failure_causes
+            .untrained_not_found
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Drain the per-peer timeout-label window into its histogram (#5657).
+    /// Called once per router snapshot, which is its only consumer: the
+    /// window is a drain, so no second reader (a local dashboard) can share
+    /// it without stealing labels from the telemetry export.
+    pub(crate) fn take_timeout_label_histogram(&self) -> TimeoutLabelHistogram {
+        self.timeout_label_window.lock().take_histogram()
+    }
+
+    /// These count only labels that went through the recorder. They do NOT
+    /// reconcile with `Router::outcome_totals().failures`: PUT relay's
+    /// downstream forwarding still labels its own failures through
+    /// `record_relay_route_event` (not yet migrated), and `LabelMode::Legacy`
+    /// restores `routing_finished` failure events that bypass them too.
+    ///
+    /// `(not_found, timeout, send_failure)` failure labels this node has fed
+    /// its router, by cause (#5657).
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(crate) fn route_failure_cause_counts(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.route_failure_causes.not_found.load(Relaxed),
+            self.route_failure_causes.timeout.load(Relaxed),
+            self.route_failure_causes.send_failure.load(Relaxed),
+        )
     }
 
     // ==================== Subscription Management (Lease-Based) ====================
@@ -5899,6 +6101,7 @@ impl Ring {
             // Periodic peer health check: evict peers with sustained routing failures.
             if last_health_check.elapsed() > HEALTH_CHECK_INTERVAL {
                 last_health_check = self.time_source.now();
+
                 let current_ring = self.connection_manager.connection_count();
                 let unhealthy = self
                     .connection_manager
@@ -9989,6 +10192,48 @@ pub(crate) enum RingError {
     NoHostingPeers(ContractInstanceId),
     #[error("Peer has not joined the network yet (no ring location established)")]
     PeerNotJoined,
+}
+
+#[cfg(test)]
+mod timeout_label_window_tests {
+    use super::{TIMEOUT_LABEL_WINDOW_MAX_PEERS, TimeoutLabelWindow};
+    use std::net::SocketAddr;
+
+    fn addr(i: usize) -> SocketAddr {
+        SocketAddr::from(([10, (i >> 16) as u8, (i >> 8) as u8, i as u8], 4000))
+    }
+
+    #[test]
+    fn histogram_buckets_labels_per_peer_and_resets() {
+        let mut window = TimeoutLabelWindow::default();
+        // peer 0: 1 label, peer 1: 3, peer 2: 5, peer 3: 9
+        for (peer, labels) in [(0, 1), (1, 3), (2, 5), (3, 9)] {
+            for _ in 0..labels {
+                window.record(addr(peer));
+            }
+        }
+        assert_eq!(window.take_histogram(), (1, 1, 1, 1, 9, 0));
+        assert_eq!(
+            window.take_histogram(),
+            (0, 0, 0, 0, 0, 0),
+            "each snapshot window starts empty"
+        );
+    }
+
+    #[test]
+    fn window_is_bounded_and_counts_overflow() {
+        let mut window = TimeoutLabelWindow::default();
+        for i in 0..TIMEOUT_LABEL_WINDOW_MAX_PEERS + 10 {
+            window.record(addr(i));
+        }
+        // A tracked peer keeps counting past the cap.
+        window.record(addr(0));
+        assert_eq!(window.per_peer.len(), TIMEOUT_LABEL_WINDOW_MAX_PEERS);
+        let (b1, b2, _, _, max, untracked) = window.take_histogram();
+        assert_eq!(untracked, 10);
+        assert_eq!(b1 + b2, TIMEOUT_LABEL_WINDOW_MAX_PEERS as u64);
+        assert_eq!(max, 2);
+    }
 }
 
 #[cfg(test)]

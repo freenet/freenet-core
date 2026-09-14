@@ -243,6 +243,12 @@ pub(crate) struct OpManager {
     /// stream-inactivity timeout instead of a fixed per-attempt deadline. See
     /// `operations::stream_progress`.
     stream_progress_registry: Arc<StreamProgressRegistry>,
+    /// Per-attempt record of the peer an originator's GET/PUT attempt was
+    /// actually forwarded to (#5657). Same two-task shape as
+    /// `stream_progress_registry`: the retry loop registers a slot keyed by the
+    /// attempt `Transaction` (removed by an RAII guard), the originator-loopback
+    /// relay fills it. See `operations::route_attempt`.
+    attempt_hop_registry: Arc<crate::operations::route_attempt::AttemptHopRegistry>,
     /// Size threshold in bytes above which streaming is used.
     pub streaming_threshold: usize,
     /// Backoff tracker for failed gateway connection attempts.
@@ -364,6 +370,7 @@ impl Clone for OpManager {
             request_router: self.request_router.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             stream_progress_registry: self.stream_progress_registry.clone(),
+            attempt_hop_registry: self.attempt_hop_registry.clone(),
             streaming_threshold: self.streaming_threshold,
             gateway_backoff: self.gateway_backoff.clone(),
             gateway_backoff_cleared: self.gateway_backoff_cleared.clone(),
@@ -586,6 +593,9 @@ impl OpManager {
             request_router,
             orphan_stream_registry,
             stream_progress_registry: Arc::new(StreamProgressRegistry::new()),
+            attempt_hop_registry: Arc::new(
+                crate::operations::route_attempt::AttemptHopRegistry::new(),
+            ),
             streaming_threshold,
             gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),
             gateway_backoff_cleared: Arc::new(tokio::sync::Notify::new()),
@@ -1675,6 +1685,14 @@ impl OpManager {
     /// looks it up to record per-fragment progress.
     pub(crate) fn stream_progress_registry(&self) -> &Arc<StreamProgressRegistry> {
         &self.stream_progress_registry
+    }
+
+    /// Per-attempt first-hop registry for originator route attribution
+    /// (#5657). See `operations::route_attempt::AttemptHopRegistry`.
+    pub(crate) fn attempt_hop_registry(
+        &self,
+    ) -> &Arc<crate::operations::route_attempt::AttemptHopRegistry> {
+        &self.attempt_hop_registry
     }
 
     /// Determines if streaming should be used for a payload of the given size.

@@ -480,6 +480,41 @@ pub(crate) trait RetryDriver {
     fn stream_progress(&self) -> Option<crate::operations::stream_progress::StreamProgress> {
         None
     }
+
+    /// The recorder that labels this driver's non-success attempts for the
+    /// router's failure-probability model (#5657).
+    ///
+    /// Defaults to `None` (record nothing). When `Some`, [`drive_retry_loop`]
+    /// reports every attempt that ended without a terminal reply to it,
+    /// attributed to the peer the loopback relay ACTUALLY forwarded the attempt
+    /// to (see [`crate::operations::route_attempt::AttemptHopRegistry`]):
+    /// a timeout or a dropped connection as a failure, and a
+    /// [`AttemptOutcome::Retry`] reply as a `NotFound`.
+    fn attempt_recorder(
+        &mut self,
+    ) -> Option<&mut crate::operations::route_attempt::RouteAttemptRecorder> {
+        None
+    }
+
+    /// Called when an attempt classified [`AttemptOutcome::Terminal`], with the
+    /// peer that attempt was actually forwarded to (`None` when the loopback
+    /// relay did not forward it, e.g. the reply was produced locally). Lets the
+    /// driver attribute its terminal success event to the real hop rather than
+    /// its own `current_target` guess. Default: ignore.
+    fn on_terminal_hop(&mut self, _hop: Option<crate::ring::PeerKeyLocation>) {}
+}
+
+/// Report one non-terminal attempt outcome to the driver's recorder, if any.
+/// The ONLY place [`drive_retry_loop`] labels an attempt; every non-terminal
+/// resolution arm calls it.
+fn record_attempt_failure<D: RetryDriver>(
+    driver: &mut D,
+    hop: Option<crate::ring::PeerKeyLocation>,
+    failure: crate::operations::route_attempt::AttemptFailure,
+) {
+    if let Some(recorder) = driver.attempt_recorder() {
+        recorder.record_attempt(hop.as_ref(), failure, true);
+    }
 }
 
 /// Maximum cheap, fast retries of a `NotificationError` (local callback
@@ -686,6 +721,14 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 
         let request = driver.build_request(attempt_tx);
 
+        // Route attribution slot for this attempt (#5657). Registered BEFORE
+        // the send (Initialize-Before-Send): the originator-loopback relay that
+        // picks the real first hop may run before `send_and_await` returns.
+        // Dropped at the end of this iteration on every path, so a `continue`
+        // or `return` cannot leak it.
+        let hop_slot = op_manager.attempt_hop_registry().register(attempt_tx);
+        let attempt_started = tokio::time::Instant::now();
+
         let attempt_timeout = driver.attempt_timeout();
         let mut ctx = op_manager.op_ctx(attempt_tx);
 
@@ -719,6 +762,14 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 await_streaming_attempt(&mut ctx, request, &progress).await
             }
         };
+
+        // The hop this attempt was forwarded to and when, read NOW (#5657): a
+        // loopback `record_hop` landing during the release await below would
+        // otherwise be blamed for a timeout that fired before the relay
+        // forwarded the request.
+        let attempt_resolved = tokio::time::Instant::now();
+        let hop_record = hop_slot.hop_record();
+        let attempt_hop = hop_record.as_ref().map(|(hop, _)| hop.clone());
 
         // Release the per-attempt pending_op_results slot regardless
         // of outcome. Without this, slots are only reclaimed by the
@@ -769,6 +820,22 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     error = %err,
                     "{op_label}: send_and_await failed; advancing"
                 );
+                // Only a dropped connection TO THE ATTEMPTED HOP is attributable
+                // to it. A `NotificationError` that outlived the infra-retry
+                // budget is a local callback drop, and a disconnect of some
+                // other peer is not this hop's doing.
+                let hop = attempt_hop;
+                let blame = match (&err, hop.as_ref().and_then(|h| h.socket_addr())) {
+                    (OpError::PeerDisconnected { peer }, Some(hop_addr)) => *peer == hop_addr,
+                    _ => false,
+                };
+                if blame {
+                    record_attempt_failure(
+                        driver,
+                        hop,
+                        crate::operations::route_attempt::AttemptFailure::SendFailure,
+                    );
+                }
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
                     AdvanceOutcome::Exhausted => {
@@ -790,6 +857,24 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     timeout_secs = cause.budget(attempt_timeout).as_secs(),
                     "{op_label}: attempt timed out; advancing"
                 );
+                // Blame the hop only if the loopback relay's local dispatch
+                // returned with a meaningful share of the attempt still to
+                // run: a hop dispatched near the deadline, or whose dispatch
+                // had not returned, did not stall it (#5657).
+                let blamed = hop_record
+                    .filter(|(_, dispatched_at)| {
+                        crate::operations::route_attempt::hop_had_budget_share(
+                            attempt_started,
+                            *dispatched_at,
+                            attempt_resolved,
+                        )
+                    })
+                    .map(|(hop, _)| hop);
+                record_attempt_failure(
+                    driver,
+                    blamed,
+                    crate::operations::route_attempt::AttemptFailure::Timeout,
+                );
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
                     AdvanceOutcome::Exhausted => {
@@ -805,6 +890,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 
         match driver.classify(reply) {
             AttemptOutcome::Terminal(value) => {
+                driver.on_terminal_hop(attempt_hop);
                 return RetryLoopOutcome::Done(value);
             }
             AttemptOutcome::Retry => {
@@ -814,6 +900,14 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     attempt = attempt_count,
                     outcome = "retry",
                     "{op_label}: peer indicated retry; advancing"
+                );
+                // `Retry` means the peer answered but could not serve the
+                // contract: GET's `NotFound` is its only producer, and PUT
+                // never returns it.
+                record_attempt_failure(
+                    driver,
+                    attempt_hop,
+                    crate::operations::route_attempt::AttemptFailure::NotFound,
                 );
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
@@ -861,6 +955,33 @@ mod tests {
     use crate::node::{EventLoopNotificationsReceiver, event_loop_notification_channel};
     use crate::operations::connect::ConnectMsg;
     use tokio::time::{Duration, timeout};
+
+    /// #5657 L2: the attempt's hop is read BEFORE the pending-slot release
+    /// await, and never re-read after it. A loopback `record_hop` landing
+    /// during that await must not be blamed for a timeout that fired before
+    /// the relay forwarded the request.
+    #[test]
+    fn attempt_hop_is_read_before_the_release_await() {
+        use crate::operations::route_attempt::driver_test_support::production_fn_body;
+        let body = production_fn_body(
+            include_str!("op_ctx.rs"),
+            "pub(crate) async fn drive_retry_loop<D: RetryDriver>(",
+        );
+        let read = body
+            .find("let hop_record = hop_slot.hop_record();")
+            .expect("the hop must be read once, into hop_record");
+        let release = body
+            .find("op_manager.release_pending_op_slot(attempt_tx).await;")
+            .expect("the retry loop releases the pending slot");
+        assert!(
+            read < release,
+            "the hop must be read before the release await"
+        );
+        assert!(
+            !body[release..].contains("hop_slot.hop"),
+            "no hop read may follow the release await"
+        );
+    }
 
     /// Behavioural pin on `drive_retry_loop`'s `AttemptOutcome::Terminal`
     /// arm: it MUST return `RetryLoopOutcome::Done(value)` synchronously,
