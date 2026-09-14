@@ -82,10 +82,12 @@ pub(super) const LINK_USE_EXEMPT_PER_IP_CAP: usize = 2;
 const LINK_USE_EXEMPT_MAX_CONNECTIONS_DIVISOR: usize = 4;
 
 /// Most zombie transports dropped in one sweep slice. Each drop involves
-/// topology pruning and orphaned-transaction handling, and can wait up to 100ms
-/// on a full per-connection channel, so this bounds event-loop latency per
-/// slice (64 × 100ms = ~6.4s worst case), exactly as on the 30s stats tick
-/// before #5654.
+/// topology pruning and orphaned-transaction handling, and its final send to
+/// the per-connection channel waits up to 100ms. Assuming drops stay within
+/// that send timeout, a slice takes at most about 6.4s (64 × 100ms). The prune,
+/// orphaned-transaction and ready-state work before that send is not under a
+/// timeout, so this is not a hard bound; the 30s stats-tick sweep before #5654
+/// had the same property.
 pub(super) const MAX_ZOMBIE_CLEANUP_PER_CYCLE: usize = 64;
 
 /// Minimum spacing between the end of one sweep slice and the start of the
@@ -111,9 +113,12 @@ const ZOMBIE_BACKLOG_IDLE_FACTOR: u32 = 4;
 ///   that already has more zombies due than one slice holds.
 /// - Stats-tick slices keep the 30s cadence they had before #5654 when the
 ///   previous slice was also a tick slice, however long it took.
-/// - Combined worst case: no two slices run back to back, no single slice is
-///   longer than before (6.4s), and loop share stays within the pre-#5654 worst
-///   case of 6.4s every 30s (about 21%).
+/// - Combined worst case, assuming drops stay within their 100ms send timeout
+///   (see [`MAX_ZOMBIE_CLEANUP_PER_CYCLE`]): no two slices run back to back, no
+///   single slice is longer than before (about 6.4s), and loop share stays
+///   within the pre-#5654 worst case of 6.4s every 30s (about 21%). A drop that
+///   stalls outside that timeout lengthens its slice here exactly as it did on
+///   the stats tick before #5654.
 ///
 /// When drops are quick the spacing is 1s, so a backlog drains at up to 64
 /// transports per second instead of 64 per 30s.
@@ -655,7 +660,8 @@ impl ZombieSweepState {
 
     /// The earliest instant the next spaced slice may start: [`slice_spacing`]
     /// after the previous slice ended. `None` if that instant is not
-    /// representable, which fails closed: no spaced slice runs.
+    /// representable. Backlog slices then fail closed (none runs, no timer);
+    /// the stats tick treats it as due, so the 30s sweep always comes back.
     fn next_slice_at(&self) -> Option<Instant> {
         self.last_slice_end
             .checked_add(slice_spacing(self.last_slice_took))
@@ -672,11 +678,14 @@ impl ZombieSweepState {
     ///   start at least [`slice_spacing`] after the previous slice ended. So a
     ///   backlog slice never follows a slice straight away, and neither does a
     ///   tick slice that follows a backlog slice.
+    /// - If the spaced instant is not representable, a backlog slice is not due
+    ///   but a tick slice is: sweeping can pause, never stop for good.
     pub(super) fn slice_due(&self, now: Instant, stats_tick: bool) -> bool {
-        if stats_tick && self.last_slice_kind != SliceKind::Backlog {
-            return true;
+        if stats_tick {
+            return self.last_slice_kind != SliceKind::Backlog
+                || self.next_slice_at().is_none_or(|at| now >= at);
         }
-        (self.backlog || stats_tick) && self.next_slice_at().is_some_and(|at| now >= at)
+        self.backlog && self.next_slice_at().is_some_and(|at| now >= at)
     }
 
     /// When the event loop must wake for a backlog slice even if no event
@@ -1437,19 +1446,30 @@ mod tests {
         assert!(state.slice_due(end + Duration::from_secs(30), true));
     }
 
-    /// If the next slice instant is not representable, no spaced slice runs and
-    /// no timer is set: the schedule fails closed rather than to zero spacing.
+    /// If the next slice instant is not representable, backlog slices fail
+    /// closed (none runs, no timer) rather than to zero spacing, but the stats
+    /// tick still runs, and once it has, the normal schedule resumes.
     #[test]
-    fn unrepresentable_spacing_fails_closed() {
+    fn unrepresentable_spacing_suppresses_backlog_slices_not_the_tick() {
         let t0 = Instant::now();
         let mut state = ZombieSweepState::new(t0);
         state.record_slice(t0, t0, &backlog_slice(true), false);
         state.last_slice_took = Duration::MAX;
         assert!(state.next_slice_at().is_none());
-        assert!(state.backlog_deadline().is_none());
-        for stats_tick in [false, true] {
-            assert!(!state.slice_due(t0 + Duration::from_secs(86_400), stats_tick));
-        }
+        assert!(state.backlog_deadline().is_none(), "no timer");
+        let later = t0 + Duration::from_secs(86_400);
+        assert!(
+            !state.slice_due(later, false),
+            "backlog slices stay suppressed"
+        );
+        assert!(state.slice_due(later, true), "the stats tick still sweeps");
+
+        // The tick's slice restores the normal schedule.
+        let end = later + Duration::from_millis(50);
+        state.record_slice(later, end, &backlog_slice(true), true);
+        assert!(state.next_slice_at().is_some());
+        assert!(!state.slice_due(end + Duration::from_millis(999), false));
+        assert!(state.slice_due(end + ZOMBIE_BACKLOG_SWEEP_INTERVAL, false));
     }
 
     /// One slice as run by `simulate_event_loop`.
